@@ -1139,12 +1139,13 @@
   }
   function formatContent(text) {
     if (!text) return '';
+    const safeText = escHtml(text);
     let html;
     if (typeof marked !== 'undefined') {
       marked.setOptions({ breaks: true, gfm: true, sanitize: false });
-      html = marked.parse(text);
+      html = marked.parse(safeText);
     } else {
-      html = escHtml(text).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n/g, '<br>');
+      html = safeText.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n/g, '<br>');
     }
     html = _sanitizeHtml(html);
     html = html.replace(/<img ([^>]*)>/g, '<img $1 class="chat-image-thumb chat-image-clickable">');
