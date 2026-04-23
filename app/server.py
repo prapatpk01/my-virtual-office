@@ -68,6 +68,11 @@ def _load_vo_config():
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
+    env_gateway_token = (
+        os.environ.get("VO_GATEWAY_TOKEN")
+        or os.environ.get("OPENCLAW_GATEWAY_TOKEN")
+    )
+
     # Auto-detect OpenClaw home — check env, config, then common paths
     oc_home = (
         os.environ.get("VO_OPENCLAW_PATH")
@@ -107,6 +112,7 @@ def _load_vo_config():
             "homePath": oc_home,
             "gatewayUrl": _env_or("VO_GATEWAY_URL", openclaw.get("gatewayUrl", "ws://127.0.0.1:18789")),
             "gatewayHttp": _env_or("VO_GATEWAY_HTTP", openclaw.get("gatewayHttp", "http://127.0.0.1:18789")),
+            "gatewayToken": env_gateway_token or openclaw.get("gatewayToken", ""),
         },
         "presence": {
             "statusDir": _env_or("VO_STATUS_DIR", presence.get("statusDir", "/data")),
@@ -3808,16 +3814,38 @@ _GW_LOCAL_HOST = _compute_local_host_header(GATEWAY_URL)
 
 
 def _get_gateway_token():
-    """Get the gateway auth token. Checks vo-config override first, then openclaw.json."""
-    # Check for user override in vo-config.json
-    vo_token = (VO_CONFIG.get("openclaw") or {}).get("gatewayToken", "")
+    """Get the gateway auth token.
+
+    Resolution order:
+    1. Explicit env var override
+    2. Fresh read from vo-config.json (user override saved in setup/settings)
+    3. Current in-memory VO_CONFIG copy
+    4. openclaw.json gateway auth token
+    """
+    env_token = os.environ.get("VO_GATEWAY_TOKEN") or os.environ.get("OPENCLAW_GATEWAY_TOKEN")
+    if env_token:
+        return env_token
+
+    cfg_path = _resolve_config_path()
+    for try_path in [cfg_path, os.path.join(os.path.dirname(__file__), "vo-config.json")]:
+        try:
+            with open(try_path, "r") as f:
+                cfg = json.load(f)
+            vo_token = ((cfg.get("openclaw") or {}).get("gatewayToken") or "").strip()
+            if vo_token:
+                return vo_token
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+            continue
+
+    vo_token = ((VO_CONFIG.get("openclaw") or {}).get("gatewayToken") or "").strip()
     if vo_token:
         return vo_token
+
     # Fall back to openclaw.json
     try:
         with open(CONFIG_PATH, "r") as f:
             cfg = json.load(f)
-        return cfg.get("gateway", {}).get("auth", {}).get("token", "")
+        return ((cfg.get("gateway", {}).get("auth", {}).get("token", "") or "").strip())
     except Exception:
         return ""
 
