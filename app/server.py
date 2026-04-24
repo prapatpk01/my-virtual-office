@@ -3679,21 +3679,36 @@ def get_agent_messages(agent_key, max_messages=500):
     try:
         with open(sessions_json_path, "r") as f:
             sessions = json.load(f)
-        # Find the most recently updated session (any type — main, telegram, etc.)
+        # Find the most recently updated session entry first. If its transcript
+        # file is missing (can happen after compaction/restart), do NOT fall
+        # back to an older session-store entry; that makes bubbles show stale
+        # cron/DM sessions. Instead, fall through to the newest real transcript
+        # file by mtime below.
         best_ts = 0
+        best_sid = ""
         for key, val in sessions.items():
             if not isinstance(val, dict):
                 continue
             ts = val.get("updatedAt", 0)
             sid = val.get("sessionId", "")
-            candidate = os.path.join(sessions_dir, f"{sid}.jsonl")
-            if ts > best_ts and os.path.exists(candidate):
+            if ts > best_ts:
                 best_ts = ts
+                best_sid = sid
+        if best_sid:
+            candidate = os.path.join(sessions_dir, f"{best_sid}.jsonl")
+            if os.path.exists(candidate):
                 jsonl_file = candidate
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     if not jsonl_file:
-        jsonls = glob.glob(os.path.join(sessions_dir, "*.jsonl"))
+        # Only consider primary transcript files named <uuid>.jsonl. Ignore
+        # trajectory/checkpoint/reset JSONL artifacts, which can be newer but
+        # are not suitable for chat bubbles.
+        uuid_jsonl = re.compile(r"^[0-9a-fA-F-]{36}\.jsonl$")
+        jsonls = [
+            p for p in glob.glob(os.path.join(sessions_dir, "*.jsonl"))
+            if uuid_jsonl.match(os.path.basename(p))
+        ]
         if jsonls:
             jsonl_file = max(jsonls, key=os.path.getmtime)
     if not jsonl_file:
