@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from websockets.asyncio.client import connect as ws_connect
 import glob
 import hashlib
+import email.utils
 import re
 import shutil
 import signal
@@ -4684,6 +4685,8 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 limit = 250
             self.wfile.write(json.dumps(self._get_sms_thread(phone, limit=limit)).encode())
+        elif request_path == "/sms-media":
+            self._handle_sms_media_proxy(query_params)
         elif request_path == "/sms-mode":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -6746,6 +6749,187 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         except Exception:
             return 0.0
 
+    def _is_twilio_media_url(self, url):
+        if not url:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(str(url))
+            return (parsed.scheme == "https" and parsed.netloc.lower() == "api.twilio.com"
+                    and parsed.path.startswith("/2010-04-01/Accounts/") and "/Media/" in parsed.path)
+        except Exception:
+            return False
+
+    def _sms_media_proxy_url(self, url, content_type=""):
+        if self._is_twilio_media_url(url):
+            query = {"url": url}
+            if content_type:
+                query["contentType"] = content_type
+            return "/sms-media?" + urllib.parse.urlencode(query)
+        return url
+
+    def _normalize_sms_media(self, entry):
+        media = []
+        def add_media(url, content_type="", filename=""):
+            url = str(url or "").strip()
+            if not url:
+                return
+            item = {"url": url, "contentType": str(content_type or "").strip(), "filename": str(filename or "").strip()}
+            item["proxyUrl"] = self._sms_media_proxy_url(item["url"], item["contentType"])
+            media.append(item)
+        raw_media = entry.get("media") or entry.get("mediaUrls") or entry.get("attachments")
+        if isinstance(raw_media, list):
+            for item in raw_media:
+                if isinstance(item, str):
+                    add_media(item)
+                elif isinstance(item, dict):
+                    add_media(item.get("url") or item.get("mediaUrl") or item.get("MediaUrl") or item.get("href"),
+                              item.get("contentType") or item.get("mediaContentType") or item.get("ContentType") or item.get("type"),
+                              item.get("filename") or item.get("name"))
+        elif isinstance(raw_media, dict):
+            add_media(raw_media.get("url") or raw_media.get("mediaUrl") or raw_media.get("MediaUrl") or raw_media.get("href"),
+                      raw_media.get("contentType") or raw_media.get("mediaContentType") or raw_media.get("ContentType") or raw_media.get("type"),
+                      raw_media.get("filename") or raw_media.get("name"))
+        try:
+            num_media = int(entry.get("NumMedia") or entry.get("numMedia") or entry.get("num_media") or 0)
+        except Exception:
+            num_media = 0
+        for idx in range(max(0, min(20, num_media))):
+            add_media(entry.get(f"MediaUrl{idx}") or entry.get(f"mediaUrl{idx}"),
+                      entry.get(f"MediaContentType{idx}") or entry.get(f"mediaContentType{idx}"))
+        deduped = []
+        seen = set()
+        for item in media:
+            key = (item.get("url"), item.get("contentType"), item.get("filename"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _twilio_api_get_json(self, url):
+        sms_cfg = VO_CONFIG.get("sms", {})
+        account_sid = sms_cfg.get("twilioAccountSid")
+        auth_token = sms_cfg.get("twilioAuthToken")
+        if not account_sid or not auth_token:
+            return None
+        credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode()).decode()
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Basic {credentials}")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode())
+
+    def _twilio_message_media(self, message_sid):
+        if not message_sid:
+            return []
+        cache = getattr(self.__class__, "_sms_twilio_media_cache", {})
+        now = time.time()
+        cached = cache.get(message_sid)
+        if cached and now - cached.get("ts", 0) < 300:
+            return cached.get("media", [])
+        sms_cfg = VO_CONFIG.get("sms", {})
+        account_sid = sms_cfg.get("twilioAccountSid")
+        if not account_sid:
+            return []
+        try:
+            data = self._twilio_api_get_json(f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages/{message_sid}/Media.json")
+            media = []
+            for item in (data or {}).get("media_list", []):
+                uri = item.get("uri") or ""
+                if uri.endswith(".json"):
+                    uri = uri[:-5]
+                url = "https://api.twilio.com" + uri if uri.startswith("/") else uri
+                if url:
+                    media.append({"url": url, "contentType": item.get("content_type") or "",
+                                  "filename": item.get("sid") or "MMS media",
+                                  "proxyUrl": self._sms_media_proxy_url(url, item.get("content_type") or "")})
+            cache[message_sid] = {"ts": now, "media": media}
+            self.__class__._sms_twilio_media_cache = cache
+            return media
+        except Exception:
+            return []
+
+    def _recent_twilio_messages_with_media(self):
+        cache = getattr(self.__class__, "_sms_twilio_recent_media_cache", None)
+        now = time.time()
+        if cache and now - cache.get("ts", 0) < 60:
+            return cache.get("messages", [])
+        sms_cfg = VO_CONFIG.get("sms", {})
+        account_sid = sms_cfg.get("twilioAccountSid")
+        if not account_sid:
+            return []
+        try:
+            data = self._twilio_api_get_json(f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json?PageSize=50")
+            messages = []
+            for msg in (data or {}).get("messages", []):
+                try:
+                    num_media = int(msg.get("num_media") or 0)
+                except Exception:
+                    num_media = 0
+                if num_media <= 0:
+                    continue
+                media = self._twilio_message_media(msg.get("sid"))
+                if not media:
+                    continue
+                try:
+                    sent_dt = email.utils.parsedate_to_datetime(msg.get("date_sent") or msg.get("date_created") or "")
+                except Exception:
+                    sent_dt = None
+                messages.append({"sid": msg.get("sid"), "from": self._normalize_sms_phone(msg.get("from")),
+                                 "to": self._normalize_sms_phone(msg.get("to")), "body": msg.get("body") or "",
+                                 "timestamp": sent_dt.timestamp() if sent_dt else 0, "media": media})
+            self.__class__._sms_twilio_recent_media_cache = {"ts": now, "messages": messages}
+            return messages
+        except Exception:
+            return []
+
+    def _enrich_sms_entries_with_twilio_media(self, entries):
+        candidates = [e for e in entries if not e.get("media") and e.get("type") in ("inbound", "outbound") and e.get("phone")]
+        if not candidates:
+            return entries
+        twilio_messages = self._recent_twilio_messages_with_media()
+        if not twilio_messages:
+            return entries
+        for entry in candidates:
+            entry_phone = self._normalize_sms_phone(entry.get("phone"))
+            body = entry.get("body") or ""
+            entry_ts = self._sms_sort_value(entry.get("timestamp"))
+            best = None
+            best_score = 999999
+            for msg in twilio_messages:
+                if entry_phone not in (msg.get("from"), msg.get("to")):
+                    continue
+                if body and msg.get("body") and body.strip() != msg.get("body", "").strip():
+                    continue
+                delta = abs((entry_ts or 0) - (msg.get("timestamp") or 0)) if entry_ts and msg.get("timestamp") else 0
+                if delta and delta > 900:
+                    continue
+                if delta < best_score:
+                    best = msg; best_score = delta
+            if best:
+                entry["sid"] = entry.get("sid") or best.get("sid")
+                entry["media"] = best.get("media") or []
+        return entries
+
+    def _handle_sms_media_proxy(self, query_params):
+        url = (query_params.get("url", [""])[0] or "").strip()
+        requested_type = (query_params.get("contentType", [""])[0] or "").strip()
+        if not self._is_twilio_media_url(url):
+            self.send_response(400); self.send_header("Content-Type", "text/plain"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(b"Invalid SMS media URL"); return
+        sms_cfg = VO_CONFIG.get("sms", {})
+        account_sid = sms_cfg.get("twilioAccountSid")
+        auth_token = sms_cfg.get("twilioAuthToken")
+        if not account_sid or not auth_token:
+            self.send_response(503); self.send_header("Content-Type", "text/plain"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(b"SMS media proxy is not configured"); return
+        try:
+            credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode()).decode()
+            req = urllib.request.Request(url)
+            req.add_header("Authorization", f"Basic {credentials}")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = resp.read(); content_type = resp.headers.get("Content-Type") or requested_type or "application/octet-stream"
+            self.send_response(200); self.send_header("Content-Type", content_type); self.send_header("Cache-Control", "private, max-age=3600"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(payload)
+        except Exception as e:
+            self.send_response(502); self.send_header("Content-Type", "text/plain"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(f"Could not fetch SMS media: {e}".encode())
+
     def _load_sms_contacts_map(self):
         contacts = {}
         for path in self._sms_contacts_paths():
@@ -6793,12 +6977,16 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                             if contact_name and (not entry.get("name") or entry.get("name") == "Unknown"):
                                 entry["name"] = contact_name
                         entry["timestamp"] = self._normalize_sms_timestamp(entry)
+                        media = self._normalize_sms_media(entry)
+                        if media:
+                            entry["media"] = media
                         key = (
                             entry.get("sid") or "",
                             entry.get("type") or "",
                             entry.get("phone") or "",
                             entry.get("timestamp") or "",
                             entry.get("body") or "",
+                            json.dumps(media, sort_keys=True),
                         )
                         if key in seen:
                             continue
@@ -6809,6 +6997,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 continue
         entries.sort(key=lambda item: self._sms_sort_value(item.get("timestamp")))
+        entries = self._enrich_sms_entries_with_twilio_media(entries)
         if limit and len(entries) > limit:
             entries = entries[-limit:]
         return entries
@@ -6831,7 +7020,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 "messageCount": 0,
             })
             thread["messageCount"] += 1
-            thread["lastMessage"] = message.get("body", "")
+            body = message.get("body", "")
+            media_count = len(message.get("media") or [])
+            thread["lastMessage"] = body or (f"📎 {media_count} media attachment" + ("s" if media_count != 1 else "") if media_count else "")
             thread["lastTimestamp"] = message.get("timestamp", "")
             thread["lastType"] = message.get("type", "")
             if (not thread.get("name") or thread.get("name") == "Unknown") and message.get("name"):
@@ -6898,9 +7089,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             "ownerAgent": self._get_sms_owner_agent_info(),
         }
         if messages:
-            thread["lastMessage"] = messages[-1].get("body", "")
-            thread["lastTimestamp"] = messages[-1].get("timestamp", "")
-            thread["lastType"] = messages[-1].get("type", "")
+            last = messages[-1]
+            media_count = len(last.get("media") or [])
+            thread["lastMessage"] = last.get("body", "") or (f"📎 {media_count} media attachment" + ("s" if media_count != 1 else "") if media_count else "")
+            thread["lastTimestamp"] = last.get("timestamp", "")
+            thread["lastType"] = last.get("type", "")
         return {"ok": True, "thread": thread, "messages": messages}
 
     def _send_sms_intervention(self, to, body, name="", sender="user"):

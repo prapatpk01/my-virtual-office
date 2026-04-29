@@ -3154,3 +3154,49 @@ button:active { transform: translateY(3px); box-shadow: none; }
 .skl-input { background: #12121e; border: 1px solid #2a2a4e; color: #eee; border-radius: 6px; padding: 8px 10px; font-size: 11px; width: 100%; box-sizing: border-box; }
 .skl-textarea { background: #12121e; border: 1px solid #2a2a4e; color: #eee; border-radius: 6px; padding: 10px; font-size: 11px; font-family: 'Courier New', monospace; min-height: 320px; resize: vertical; white-space: pre; width: 100%; box-sizing: border-box; }
 .skl-editor-actions { display: flex; gap: 8px; }
+
+/* SMS media attachments */
+.sms-media-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 7px;
+}
+.sms-media-item {
+    margin: 0;
+    max-width: 260px;
+}
+.sms-media-image,
+.sms-media-video {
+    display: block;
+    max-width: 100%;
+    max-height: 260px;
+    border-radius: 10px;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid rgba(255,255,255,0.12);
+}
+.sms-media-audio {
+    width: 240px;
+    max-width: 100%;
+}
+.sms-media-item figcaption,
+.sms-media-file {
+    margin-top: 4px;
+    font-size: 11px;
+    opacity: 0.82;
+}
+.sms-media-file {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    padding: 7px 8px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.10);
+}
+.sms-media-link {
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}

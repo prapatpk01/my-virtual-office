@@ -466,8 +466,53 @@
             label = `${thread.name && thread.name !== 'Unknown' ? thread.name : formatPhone(thread.phone)} · ${formatTime(msg.timestamp)}`;
         }
 
-        div.innerHTML = `<div class="sms-msg-meta">${escapeHtml(label)}</div><div class="sms-msg-body">${escapeHtml(msg.body || '')}</div>`;
+        const body = escapeHtml(msg.body || '');
+        const mediaHtml = renderMessageMedia(msg.media || msg.mediaUrls || msg.attachments || []);
+        div.innerHTML = `<div class="sms-msg-meta">${escapeHtml(label)}</div><div class="sms-msg-body">${body}${mediaHtml}</div>`;
         messagesDiv.appendChild(div);
+    }
+
+    function normalizeMessageMedia(media) {
+        if (!media) return [];
+        if (!Array.isArray(media)) media = [media];
+        return media.map((item, idx) => {
+            if (typeof item === 'string') {
+                return { url: item, proxyUrl: item, contentType: '', filename: `Media ${idx + 1}` };
+            }
+            if (!item || typeof item !== 'object') return null;
+            const url = item.proxyUrl || item.url || item.mediaUrl || item.MediaUrl || item.href || '';
+            if (!url) return null;
+            return {
+                url,
+                originalUrl: item.url || item.mediaUrl || item.MediaUrl || item.href || url,
+                contentType: item.contentType || item.mediaContentType || item.ContentType || item.type || '',
+                filename: item.filename || item.name || `Media ${idx + 1}`
+            };
+        }).filter(Boolean);
+    }
+
+    function renderMessageMedia(media) {
+        const items = normalizeMessageMedia(media);
+        if (!items.length) return '';
+        return `<div class="sms-media-list">${items.map(renderMediaItem).join('')}</div>`;
+    }
+
+    function renderMediaItem(item) {
+        const url = item.url;
+        const type = (item.contentType || '').toLowerCase();
+        const label = escapeHtml(item.filename || item.contentType || 'Open media');
+        const safeUrl = escapeHtml(url);
+        const link = `<a class="sms-media-link" href="${safeUrl}" target="_blank" rel="noopener">${label}</a>`;
+        if (type.startsWith('image/')) {
+            return `<figure class="sms-media-item"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="sms-media-image" src="${safeUrl}" alt="${label}" loading="lazy"></a><figcaption>${label}</figcaption></figure>`;
+        }
+        if (type.startsWith('video/')) {
+            return `<figure class="sms-media-item"><video class="sms-media-video" src="${safeUrl}" controls preload="metadata"></video><figcaption>${link}</figcaption></figure>`;
+        }
+        if (type.startsWith('audio/')) {
+            return `<figure class="sms-media-item"><audio class="sms-media-audio" src="${safeUrl}" controls preload="metadata"></audio><figcaption>${link}</figcaption></figure>`;
+        }
+        return `<div class="sms-media-file">📎 ${link}${type ? `<span>${escapeHtml(type)}</span>` : ''}</div>`;
     }
 
     async function sendSms() {
