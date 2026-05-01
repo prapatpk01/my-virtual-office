@@ -606,7 +606,12 @@
       if (role === 'tool' && displayContent.length > 3000) {
         displayContent = displayContent.substring(0, 2000) + '\n\n... [truncated - ' + displayContent.length + ' chars total] ...';
       }
-      const media = normalizeChatMedia(mediaItems);
+      const extractedMedia = extractMedia({ content: displayContent }, displayContent);
+      const media = normalizeChatMedia([...(mediaItems || []), ...extractedMedia]);
+      displayContent = displayContent.split(/\r?\n/).filter(line => {
+        const t = line.trim();
+        return !(t.match(/^\(attached file:\s*(.+?)\)$/i) || t.match(/^attached file:\s*(.+)$/i) || t.match(/^MEDIA:/i));
+      }).join('\n').trim();
       if (media.length) {
         bubble.appendChild(renderChatMedia(media));
       }
