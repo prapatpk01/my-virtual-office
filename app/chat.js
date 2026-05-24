@@ -12,6 +12,11 @@
 
   const MAX_INPUT_LINES = 15;
   const CHAT_STACK_GAP = 12;
+  const STREAM_RENDER_INTERVAL_MS = 80;
+  const TOOL_RENDER_INTERVAL_MS = 90;
+  const MAX_LIVE_TOOL_CARDS = 40;
+  const MAX_TOOL_PAYLOAD_CHARS = 6000;
+  const ACTIVE_RUN_RECOVERY_MS = 15000;
   const secondarySlotButtons = Array.from(document.querySelectorAll('[data-chat-slot-toggle]'));
   let activeSecondarySlot = null;
   const secondaryPanelPlaceholders = {
@@ -35,6 +40,13 @@
       this.currentRunId = null;
       this.streamingMsg = null;
       this.liveToolCards = new Map();
+      this.pendingToolEvents = new Map();
+      this.toolFlushTimer = null;
+      this.pendingStreamContent = '';
+      this.streamRenderTimer = null;
+      this.scrollFrame = null;
+      this.lastLiveEventAt = 0;
+      this.recoveryTimer = null;
       this.sessionModel = '—';
       this.contextWindow = 0;
       this.contextUsed = 0;
@@ -120,6 +132,11 @@
     resetConversation(systemText) {
       this.messages.innerHTML = '';
       this.streamingMsg = null;
+      this.pendingStreamContent = '';
+      if (this.streamRenderTimer) { clearTimeout(this.streamRenderTimer); this.streamRenderTimer = null; }
+      if (this.toolFlushTimer) { clearTimeout(this.toolFlushTimer); this.toolFlushTimer = null; }
+      if (this.recoveryTimer) { clearInterval(this.recoveryTimer); this.recoveryTimer = null; }
+      this.pendingToolEvents.clear();
       this.currentRunId = null;
       this.sessionModel = '—';
       this.contextWindow = 0;
@@ -290,17 +307,33 @@
       this.updateModelBar();
     }
 
-    async loadHistory() {
+    async loadHistory(opts = {}) {
       try {
         const res = await rpc('chat.history', { sessionKey: this.sessionKey, limit: 500 });
         if (res.ok && res.payload?.messages) {
+          const messages = res.payload.messages;
           this.messages.innerHTML = '';
-          for (const msg of res.payload.messages) {
+          for (const msg of messages) {
             const t = extractText(msg) || (typeof msg.content === 'string' ? msg.content : '');
             const ts = msg.timestamp || msg.ts || msg.message?.timestamp || null;
             const media = extractMedia(msg, t);
             const tools = extractToolItems(msg);
             if (t || media.length || tools.length) this.appendMessage(msg.role, t, ts, media, resolveMessageSender(msg, this), tools);
+          }
+          const lastMeaningful = [...messages].reverse().find(m => {
+            const t = extractText(m) || (typeof m.content === 'string' ? m.content : '');
+            return t || extractToolItems(m).length;
+          });
+          const role = lastMeaningful?.role || lastMeaningful?.message?.role || '';
+          if (opts.recoverFinal && role === 'assistant') {
+            this.streamingMsg = null;
+            this.pendingStreamContent = '';
+            this.liveToolCards.clear();
+            this.pendingToolEvents.clear();
+            this.currentRunId = null;
+            this.removeTypingIndicator();
+            this.clearActivityFeed();
+            this.stopRecoveryWatchdog();
           }
           this.scrollBottom();
         }
@@ -482,6 +515,8 @@
       rpc('chat.send', params).then(res => {
         if (res.ok && res.payload?.runId) {
           this.currentRunId = res.payload.runId;
+          this.markLiveEvent();
+          this.ensureRecoveryWatchdog();
           runOwners.set(res.payload.runId, { slotId: this.slotId, sessionKey: sendSessionKey });
         }
       }).catch(e => this.appendSystem('Failed to send: ' + e.message));
@@ -564,19 +599,23 @@
 
     handleChatEvent(payload) {
       if (!this.ownsPayload(payload)) return;
+      this.markLiveEvent();
       const text = extractText(payload);
       if (payload?.state === 'delta' || payload?.state === 'streaming') {
         if (!this.streamingMsg || this.streamingMsg.id !== payload.runId) {
           this.streamingMsg = { id: payload.runId, role: 'assistant', content: '' };
+          this.pendingStreamContent = '';
           this.appendStreamingMessage();
+          this.ensureRecoveryWatchdog();
         }
         if (text) {
-          this.streamingMsg.content = text;
-          this.updateStreamingMessage(this.streamingMsg.content);
+          this.pendingStreamContent = text;
+          this.scheduleStreamingRender();
         }
-        this.scrollBottom();
       } else if (payload?.state === 'final' || payload?.state === 'done') {
-        const finalText = text || (this.streamingMsg ? this.streamingMsg.content : '');
+        const finalText = text || this.pendingStreamContent || (this.streamingMsg ? this.streamingMsg.content : '');
+        this.flushStreamingRender(true);
+        this.flushToolEvents(true);
         this.clearActivityFeed();
         if (this.streamingMsg) {
           this.finalizeStreamingMessage(finalText);
@@ -588,6 +627,7 @@
         if (payload?.runId) this.finalizeRunToolCards(payload.runId);
         if (payload?.runId) runOwners.delete(payload.runId);
         this.currentRunId = null;
+        this.stopRecoveryWatchdog();
         this.scrollBottom();
       }
     }
@@ -602,26 +642,104 @@
       // Current OpenClaw emits tool activity as agent events:
       // { stream:"tool", data:{ phase:"start|update|result", name, toolCallId, args, result } }
       if (stream === 'tool' || payload?.type === 'tool_start' || payload?.type === 'tool_end' || payload?.type === 'tool_result') {
+        this.markLiveEvent();
         const tool = normalizeToolEvent(payload, phase === 'result' ? 'done' : 'running');
         const label = formatToolLabel(tool.name, coerceToolArgs(tool.arguments));
-        if (phase === 'start' || payload?.type === 'tool_start') {
-          this.updateTypingIndicator(label);
-          this.appendToolCall(payload);
-        } else if (phase === 'update') {
-          this.updateTypingIndicator(label);
-          this.updateToolCall(payload);
-        } else if (phase === 'result' || phase === 'end' || payload?.type === 'tool_end' || payload?.type === 'tool_result') {
-          this.finishToolCall(payload);
-          this.updateTypingIndicator('Processing...');
-        } else {
-          this.updateTypingIndicator(label);
-          this.appendToolCall(payload);
-        }
+        this.updateTypingIndicator((phase === 'result' || phase === 'end' || payload?.type === 'tool_end' || payload?.type === 'tool_result') ? 'Processing...' : label);
+        this.queueToolEvent(payload);
+        this.ensureRecoveryWatchdog();
         return;
       }
 
       if (payload?.type === 'thinking' || stream === 'lifecycle' && phase === 'start') {
         this.updateTypingIndicator('Thinking...');
+      }
+    }
+
+    markLiveEvent() {
+      this.lastLiveEventAt = Date.now();
+    }
+
+    scheduleStreamingRender() {
+      if (this.streamRenderTimer) return;
+      this.streamRenderTimer = setTimeout(() => this.flushStreamingRender(), STREAM_RENDER_INTERVAL_MS);
+    }
+
+    flushStreamingRender(force = false) {
+      if (this.streamRenderTimer) { clearTimeout(this.streamRenderTimer); this.streamRenderTimer = null; }
+      if (!this.streamingMsg) return;
+      if (!force && this.pendingStreamContent === this.streamingMsg.content) return;
+      this.streamingMsg.content = this.pendingStreamContent || this.streamingMsg.content || '';
+      this.updateStreamingMessage(this.streamingMsg.content);
+      this.scrollBottom();
+    }
+
+    queueToolEvent(payload) {
+      const key = this.toolKey(payload);
+      this.pendingToolEvents.set(key, payload);
+      if (!this.toolFlushTimer) this.toolFlushTimer = setTimeout(() => this.flushToolEvents(), TOOL_RENDER_INTERVAL_MS);
+    }
+
+    flushToolEvents(force = false) {
+      if (this.toolFlushTimer) { clearTimeout(this.toolFlushTimer); this.toolFlushTimer = null; }
+      if (!this.pendingToolEvents.size) return;
+      const events = [...this.pendingToolEvents.values()];
+      this.pendingToolEvents.clear();
+      for (const payload of events) {
+        const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
+        const phase = data.phase || payload?.phase || '';
+        if (phase === 'result' || phase === 'end' || payload?.type === 'tool_end' || payload?.type === 'tool_result') this.finishToolCall(payload);
+        else if (phase === 'update') this.updateToolCall(payload);
+        else this.appendToolCall(payload);
+      }
+      this.pruneToolCards();
+      this.scrollBottom();
+    }
+
+    pruneToolCards() {
+      const cards = [...this.messages.querySelectorAll('.chat-tool-msg')];
+      const extra = cards.length - MAX_LIVE_TOOL_CARDS;
+      if (extra <= 0) return;
+      for (const el of cards.slice(0, extra)) {
+        const key = el.dataset.toolKey;
+        if (key) this.liveToolCards.delete(key);
+        el.remove();
+      }
+      let notice = this.messages.querySelector('.chat-tool-pruned-notice');
+      if (!notice) {
+        notice = document.createElement('div');
+        notice.className = 'chat-msg system chat-tool-pruned-notice';
+        notice.innerHTML = '<div class="chat-bubble system-bubble">Earlier live tool activity was collapsed to keep the chat responsive.</div>';
+        this.messages.prepend(notice);
+      }
+    }
+
+    ensureRecoveryWatchdog() {
+      if (this.recoveryTimer) return;
+      this.lastLiveEventAt = this.lastLiveEventAt || Date.now();
+      this.recoveryTimer = setInterval(() => {
+        if (!this.currentRunId && !this.streamingMsg && !this.liveToolCards.size && !this.messages.querySelector('.typing-indicator')) return this.stopRecoveryWatchdog();
+        if (!connected) return;
+        if (Date.now() - this.lastLiveEventAt > ACTIVE_RUN_RECOVERY_MS) {
+          this.lastLiveEventAt = Date.now();
+          this.loadHistory({ recoverFinal: true }).catch(() => {});
+        }
+      }, ACTIVE_RUN_RECOVERY_MS);
+    }
+
+    stopRecoveryWatchdog() {
+      if (this.recoveryTimer) { clearInterval(this.recoveryTimer); this.recoveryTimer = null; }
+    }
+
+    handleSessionMessageEvent(payload) {
+      if (!this.ownsPayload(payload)) return;
+      const msg = payload?.message && typeof payload.message === 'object' ? payload.message : payload;
+      const role = msg?.role || payload?.role || '';
+      if (role === 'assistant') {
+        this.markLiveEvent();
+        this.loadHistory({ recoverFinal: true });
+      } else if (role === 'user') {
+        this.markLiveEvent();
       }
     }
 
@@ -738,7 +856,13 @@
     }
 
     clearActivityFeed() { this.messages.querySelectorAll('.chat-activity').forEach(el => el.remove()); }
-    scrollBottom() { this.messages.scrollTop = this.messages.scrollHeight; }
+    scrollBottom() {
+      if (this.scrollFrame) return;
+      this.scrollFrame = requestAnimationFrame(() => {
+        this.scrollFrame = null;
+        this.messages.scrollTop = this.messages.scrollHeight;
+      });
+    }
 
     toolKey(payload) {
       const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
@@ -766,6 +890,7 @@
       if (ind) this.messages.insertBefore(wrap, ind);
       else this.messages.appendChild(wrap);
       this.liveToolCards.set(key, wrap);
+      this.pruneToolCards();
       this.scrollBottom();
     }
 
@@ -1104,7 +1229,7 @@
       connected = false;
       ws = null;
       chatWindows.forEach(w => w.setStatus(`Disconnected (${evt.code})`, 'disconnected'));
-      if (primaryWindow.root.classList.contains('open')) setTimeout(connectGateway, 3000);
+      if (chatWindows.some(w => w.root.classList.contains('open') || w.currentRunId || w.streamingMsg)) setTimeout(connectGateway, 3000);
     };
     ws.onerror = () => chatWindows.forEach(w => w.setStatus('Connection error', 'disconnected'));
   }
@@ -1170,6 +1295,7 @@
     const { event, payload } = msg;
     if (event === 'chat') chatWindows.forEach(w => w.handleChatEvent(payload));
     if (event === 'agent') chatWindows.forEach(w => w.handleAgentEvent(payload));
+    if (event === 'session.message') chatWindows.forEach(w => w.handleSessionMessageEvent(payload));
   }
 
   function agentLabelFromId(agentId) {
@@ -1375,10 +1501,10 @@
 
   function formatToolPayload(value) {
     if (value == null || value === '') return '';
-    if (typeof value === 'string') return value.length > 6000 ? value.slice(0, 6000) + '\n… [truncated]' : value;
+    if (typeof value === 'string') return value.length > MAX_TOOL_PAYLOAD_CHARS ? value.slice(0, MAX_TOOL_PAYLOAD_CHARS) + '\n… [truncated]' : value;
     try {
       const s = JSON.stringify(value, null, 2);
-      return s.length > 6000 ? s.slice(0, 6000) + '\n… [truncated]' : s;
+      return s.length > MAX_TOOL_PAYLOAD_CHARS ? s.slice(0, MAX_TOOL_PAYLOAD_CHARS) + '\n… [truncated]' : s;
     } catch {
       return String(value);
     }

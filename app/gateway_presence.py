@@ -50,6 +50,8 @@ _last_updated_at = {}  # session_key → updatedAt timestamp (ms)
 _last_event_at = {}   # agent_id → timestamp (seconds)
 _last_event_task = {}  # agent_id → task description from event
 _run_agents = {}       # runId → agent_id
+_active_runs_by_agent = {}  # agent_id → set(runId); while non-empty the agent is working
+_active_tools_by_agent = {}  # agent_id → set(toolCallId); while non-empty the agent is working
 _finish_idle_at = {}   # agent_id → timestamp (seconds)
 
 # Manual override tracking
@@ -199,6 +201,51 @@ def _ensure_agent(agent_id, source="discovered"):
             _state[agent_id] = {"state": "idle", "task": "", "updated": 0, "source": source}
 
 
+def _mark_run_active(agent_id, run_id):
+    if not agent_id or not run_id:
+        return
+    _run_agents[run_id] = agent_id
+    _active_runs_by_agent.setdefault(agent_id, set()).add(run_id)
+
+
+def _mark_run_inactive(agent_id, run_id):
+    if not agent_id or not run_id:
+        return
+    runs = _active_runs_by_agent.get(agent_id)
+    if runs:
+        runs.discard(run_id)
+        if not runs:
+            _active_runs_by_agent.pop(agent_id, None)
+
+
+def _agent_has_active_run(agent_id):
+    return bool(_active_runs_by_agent.get(agent_id))
+
+
+def _mark_tool_active(agent_id, tool_id):
+    if not agent_id or not tool_id:
+        return
+    _active_tools_by_agent.setdefault(agent_id, set()).add(str(tool_id))
+
+
+def _mark_tool_inactive(agent_id, tool_id):
+    if not agent_id or not tool_id:
+        return
+    tools = _active_tools_by_agent.get(agent_id)
+    if tools:
+        tools.discard(str(tool_id))
+        if not tools:
+            _active_tools_by_agent.pop(agent_id, None)
+
+
+def _agent_has_active_tool(agent_id):
+    return bool(_active_tools_by_agent.get(agent_id))
+
+
+def _agent_has_active_activity(agent_id):
+    return _agent_has_active_run(agent_id) or _agent_has_active_tool(agent_id)
+
+
 def _set_working(agent_id, task="Working", source="gateway-event", run_id=None):
     if not agent_id or _is_manual_override_active(agent_id):
         return
@@ -208,7 +255,7 @@ def _set_working(agent_id, task="Working", source="gateway-event", run_id=None):
     _last_event_task[agent_id] = task or "Working"
     _finish_idle_at.pop(agent_id, None)
     if run_id:
-        _run_agents[run_id] = agent_id
+        _mark_run_active(agent_id, run_id)
     with _state_lock:
         _state[agent_id].update({
             "state": "working",
@@ -224,6 +271,11 @@ def _set_finishing(agent_id, source="gateway-lifecycle", run_id=None):
         return
     now = time.time()
     _ensure_agent(agent_id)
+    if run_id:
+        _mark_run_inactive(agent_id, run_id)
+    if _agent_has_active_activity(agent_id):
+        _set_working(agent_id, _last_event_task.get(agent_id) or "Working", source, None)
+        return
     _last_event_at[agent_id] = now
     _finish_idle_at[agent_id] = now + FINISHING_GRACE_SEC
     with _state_lock:
@@ -238,7 +290,7 @@ def _set_finishing(agent_id, source="gateway-lifecycle", run_id=None):
 
 
 def _set_idle(agent_id, source="gateway-idle"):
-    if not agent_id or _is_manual_override_active(agent_id):
+    if not agent_id or _is_manual_override_active(agent_id) or _agent_has_active_activity(agent_id):
         return
     now = time.time()
     _ensure_agent(agent_id)
@@ -302,6 +354,16 @@ def _format_tool_task(name, arguments):
     return f"Using {name}" if name else "Working"
 
 
+def _read_tool_id(payload, data=None):
+    data = data if isinstance(data, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return (
+        data.get("toolCallId") or data.get("tool_call_id") or data.get("callId") or data.get("id") or
+        payload.get("toolCallId") or payload.get("tool_call_id") or payload.get("callId") or payload.get("id")
+    )
+
+
 def _read_tool_name_and_args(data):
     if not isinstance(data, dict):
         return "", {}
@@ -350,7 +412,7 @@ def _process_event(event_type, payload):
         if stream == "lifecycle" or phase:
             if phase in ("start", "accepted", "running"):
                 _set_working(agent_id, "Working", "agent-lifecycle", run_id)
-            elif phase in ("end", "done", "final", "complete", "completed", "error", "aborted"):
+            elif phase in ("end", "done", "final", "complete", "completed", "error", "aborted", "cancelled", "canceled", "failed"):
                 _set_finishing(agent_id, "agent-lifecycle", run_id)
             else:
                 _set_working(agent_id, "Working", "agent-lifecycle", run_id)
@@ -361,6 +423,11 @@ def _process_event(event_type, payload):
             task = _format_tool_task(name, args)
             if task is None:
                 return
+            tool_id = _read_tool_id(payload, data)
+            if phase in ("result", "end", "done", "error", "aborted", "cancelled", "canceled", "failed"):
+                _mark_tool_inactive(agent_id, tool_id)
+            elif tool_id:
+                _mark_tool_active(agent_id, tool_id)
             _set_working(agent_id, task, f"agent-{stream}", run_id)
             return
 
@@ -373,13 +440,22 @@ def _process_event(event_type, payload):
         task = _format_tool_task(name, args)
         if task is None:
             return
+        phase = str(payload.get("phase") or data.get("phase") or payload.get("status") or "")
+        tool_id = _read_tool_id(payload, data)
+        if phase in ("result", "end", "done", "error", "aborted", "cancelled", "canceled", "failed"):
+            _mark_tool_inactive(agent_id, tool_id)
+        elif tool_id:
+            _mark_tool_active(agent_id, tool_id)
         _set_working(agent_id, task, "session-tool", run_id)
         return
 
     if event_type == "session.message":
         role = payload.get("role") or data.get("role")
         if role == "assistant":
-            _set_finishing(agent_id, "session-message", run_id)
+            # Assistant messages can appear between tool calls/stream phases. Do not
+            # let them flip an actively running agent out of working state.
+            if not _agent_has_active_activity(agent_id):
+                _set_finishing(agent_id, "session-message", run_id)
         elif role == "user":
             _set_working(agent_id, "Responding", "session-message", run_id)
         return
@@ -440,7 +516,7 @@ def _maintenance_tick():
         if now - last_at > IDLE_TIMEOUT_SEC:
             with _state_lock:
                 current = _state.get(agent_id, {}).get("state")
-            if current in ("working", "finishing"):
+            if current in ("working", "finishing") and not _agent_has_active_activity(agent_id):
                 _set_idle(agent_id, "event-idle-timeout")
 
 # ─── Meeting File Sync ────────────────────────────────────────────

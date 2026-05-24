@@ -30,6 +30,57 @@ import gateway_presence
 from zoneinfo import ZoneInfo
 
 
+def _normalize_presence_entry(entry):
+    """Normalize transient gateway/presence state aliases for UI rendering."""
+    if not isinstance(entry, dict):
+        return {"state": "offline", "task": "", "updated": 0, "source": "invalid"}
+    state = str(entry.get("state") or entry.get("status") or entry.get("presence") or entry.get("activity") or "offline").strip().lower()
+    state = {
+        "busy": "working",
+        "thinking": "working",
+        "processing": "working",
+        "responding": "working",
+        "running": "working",
+        "inference": "working",
+        "inferencing": "working",
+        "generating": "working",
+        "streaming": "working",
+        "executing": "working",
+        "command": "working",
+        "command_output": "working",
+        "tool": "working",
+        "tool_start": "working",
+        "running_command": "working",
+        "available": "idle",
+    }.get(state, state)
+    if state not in {"working", "finishing", "idle", "meeting", "break", "offline"}:
+        state = "offline" if not state else state
+    normalized = dict(entry)
+    normalized["state"] = state
+    normalized["task"] = str(entry.get("task") or "")
+    updated = entry.get("updated", 0)
+    normalized["updated"] = int(updated) if str(updated or "").isdigit() else updated
+    normalized["source"] = str(entry.get("source") or "legacy")
+    return normalized
+
+
+def _normalize_presence_map(data):
+    if not isinstance(data, dict):
+        return {}
+    result = {}
+    for key, value in data.items():
+        if key == "_meetings":
+            result[key] = value if isinstance(value, list) else []
+        elif isinstance(value, dict):
+            result[key] = _normalize_presence_entry(value)
+    return result
+
+
+def _get_normalized_presence_state():
+    gateway_presence._sync_meetings_from_file()
+    return _normalize_presence_map(gateway_presence.get_state())
+
+
 # ─── CONFIGURATION ───────────────────────────────────────────────
 def _env_or(key, fallback):
     """Return env var value if set and non-empty, else fallback."""
@@ -4419,9 +4470,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            # Sync meetings from file on every status poll (office.py writes here)
-            gateway_presence._sync_meetings_from_file()
-            state = gateway_presence.get_state()
+            state = _get_normalized_presence_state()
             self.wfile.write(json.dumps(state).encode())
         elif self.path == "/agents-list":
             self.send_response(200)
@@ -4870,12 +4919,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path == "/api/presence" or self.path.startswith("/api/presence/"):
             # Presence API — read from gateway_presence in-memory state
             if self.path == "/api/presence":
-                result = gateway_presence.get_state()
+                result = _get_normalized_presence_state()
             elif self.path == "/api/presence/debug":
                 result = gateway_presence.get_connection_status()
             else:
                 agent_id = self.path.split("/api/presence/")[1].strip("/")
-                result = gateway_presence.get_agent_state(agent_id)
+                result = _normalize_presence_entry(gateway_presence.get_agent_state(agent_id))
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
