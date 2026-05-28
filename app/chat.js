@@ -559,7 +559,15 @@
           const resp = await fetch('/api/hermes/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ agentId: this.getSelectedAgentId() || this.selectedAgentKey, message: text || '(attached files)' })
+            body: JSON.stringify({
+              agentId: this.getSelectedAgentId() || this.selectedAgentKey,
+              message: text || '(attached files)',
+              fromType: 'human',
+              fromDisplayName: 'User',
+              sourceApp: 'virtual-office',
+              sourceSurface: 'chat-window',
+              sourceLabel: 'Virtual Office Chat'
+            })
           });
           const data = await resp.json();
           this.removeTypingIndicator();

@@ -41,6 +41,12 @@ def _normalize_presence_entry(entry):
         "processing": "working",
         "responding": "working",
         "running": "working",
+        "reading": "working",
+        "reading_file": "working",
+        "reading-file": "working",
+        "analyzing": "working",
+        "planning": "working",
+        "reasoning": "working",
         "inference": "working",
         "inferencing": "working",
         "generating": "working",
@@ -61,6 +67,20 @@ def _normalize_presence_entry(entry):
     updated = entry.get("updated", 0)
     normalized["updated"] = int(updated) if str(updated or "").isdigit() else updated
     normalized["source"] = str(entry.get("source") or "legacy")
+    try:
+        updated_epoch = float(normalized.get("updated") or 0)
+    except (TypeError, ValueError):
+        updated_epoch = 0
+    source_lower = str(normalized.get("source") or "").lower()
+    task_lower = str(normalized.get("task") or "").strip().lower()
+    stale_limit_sec = 180 if (
+        "tool" in source_lower or "command" in source_lower or
+        any(token in task_lower for token in ("reading", "processing", "thinking", "running command", "editing", "writing", "searching", "fetching"))
+    ) else 45
+    if state in {"working", "finishing"} and updated_epoch > 0 and (time.time() - updated_epoch) > stale_limit_sec:
+        normalized["state"] = "idle"
+        normalized["task"] = ""
+        normalized["source"] = f"{normalized.get('source') or 'presence'}-stale-idle"
     return normalized
 
 
@@ -794,9 +814,35 @@ def _handle_hermes_chat(body):
     timeout = int(body.get("timeoutSec") or hermes_cfg.get("timeoutSec") or 600)
     profile = agent.get("profile") or agent.get("providerAgentId") or "default"
 
+    from_type = str(body.get("fromType") or body.get("senderType") or "").strip().lower()
+    is_human_source = from_type in {"human", "user", "chat", "ui"}
+    source_app = str(body.get("sourceApp") or body.get("app") or "virtual-office").strip() or "virtual-office"
+    source_surface = str(body.get("sourceSurface") or body.get("surface") or "chat-window").strip() or "chat-window"
+    source_label = str(body.get("sourceLabel") or "").strip()
+    sender_name = str(body.get("fromDisplayName") or body.get("displayName") or body.get("fromName") or "User").strip() or "User"
+    delivery_message = message
+    if is_human_source:
+        pretty_surface = source_label or ("Virtual Office Chat" if source_app == "virtual-office" and source_surface in {"chat-window", "chat"} else f"{source_app.replace('-', ' ').title()} {source_surface.replace('-', ' ').title()}".strip())
+        delivery_message = (
+            f"[A2A from=user name={json.dumps(sender_name)} to={agent.get('id') or agent_key} isUser=true sourceApp={json.dumps(source_app)} sourceSurface={json.dumps(source_surface)}]\n"
+            f"Message from {sender_name} via {pretty_surface}.\n\n"
+            f"{message}\n\n"
+            "Reply directly to the user. Do not call them Elix unless they identify as Elix."
+        )
+
     now_ms = int(time.time() * 1000)
     history = _load_hermes_history(profile)
-    history.append({"role": "user", "text": message, "ts": now_ms, "agentId": agent.get("id")})
+    history.append({
+        "role": "user",
+        "text": message,
+        "ts": now_ms,
+        "agentId": agent.get("id"),
+        "from": sender_name if is_human_source else "You",
+        "fromType": from_type or "",
+        "sourceApp": source_app if is_human_source else "",
+        "sourceSurface": source_surface if is_human_source else "",
+        "sourceLabel": source_label if is_human_source else "",
+    })
     _save_hermes_history(profile, history)
 
     gateway_presence.set_manual_override(agent.get("statusKey") or agent.get("id"), "working", "Hermes CLI task")
@@ -808,7 +854,7 @@ def _handle_hermes_chat(body):
             timeout_sec=timeout,
         )
         session_id = _get_hermes_session_id(profile)
-        result = provider.send_chat_message(profile, message, session_id=session_id, timeout_sec=timeout)
+        result = provider.send_chat_message(profile, delivery_message, session_id=session_id, timeout_sec=timeout)
         if result.get("sessionId"):
             _set_hermes_session_id(profile, result.get("sessionId"))
         reply = result.get("reply", "")
@@ -992,6 +1038,8 @@ def _merge_comm_events_into_agent_chat(result, per_agent_limit=500):
         cleaned = []
         for msg in msgs:
             msg_text = _extract_openclaw_text(msg.get("text"))
+            if not msg_text and not msg.get("media"):
+                continue
             if msg.get("text") != msg_text:
                 msg = dict(msg)
                 msg["text"] = msg_text
@@ -1036,10 +1084,12 @@ def _handle_agent_platform_comm_send(body):
     actual provider routing uses the existing agent-call abstraction, while the
     office owns the cross-platform log that future chat bubbles can render.
     """
+    from_type = str(body.get("fromType") or body.get("senderType") or "agent").strip().lower()
     from_agent_id = (body.get("fromAgentId") or body.get("from") or "").strip()
     to_agent_id = (body.get("toAgentId") or body.get("to") or "").strip()
     message = (body.get("message") or body.get("text") or "").strip()
-    if not from_agent_id:
+    is_human_source = from_type in {"human", "user", "chat", "ui"}
+    if not from_agent_id and not is_human_source:
         return {"ok": False, "error": "fromAgentId is required", "_status": 400}
     if not to_agent_id:
         return {"ok": False, "error": "toAgentId is required", "_status": 400}
@@ -1050,10 +1100,32 @@ def _handle_agent_platform_comm_send(body):
     if not to_agent:
         return {"ok": False, "error": f"Target agent '{to_agent_id}' not found", "_status": 404}
 
-    from_ref = _office_agent_ref(from_agent_id)
+    source_app = str(body.get("sourceApp") or body.get("app") or "virtual-office").strip() or "virtual-office"
+    source_surface = str(body.get("sourceSurface") or body.get("surface") or "agent-platform").strip() or "agent-platform"
+    source_label = str(body.get("sourceLabel") or "").strip()
+    if is_human_source:
+        display_name = str(body.get("fromDisplayName") or body.get("displayName") or body.get("fromName") or "User").strip() or "User"
+        from_ref = {
+            "id": str(body.get("fromId") or body.get("fromUserId") or "user").strip() or "user",
+            "nativeId": str(body.get("fromId") or body.get("fromUserId") or "user").strip() or "user",
+            "providerKind": "human",
+            "providerType": "chat-window",
+            "name": display_name,
+            "emoji": "",
+            "sourceApp": source_app,
+            "sourceSurface": source_surface,
+            "sourceLabel": source_label,
+        }
+    else:
+        from_ref = _office_agent_ref(from_agent_id)
     to_ref = _office_agent_ref(to_agent_id)
     conversation_id = (body.get("conversationId") or body.get("threadId") or f"{from_ref['id']}__{to_ref['id']}").strip()
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    metadata = dict(metadata)
+    metadata.setdefault("sourceApp", source_app)
+    metadata.setdefault("sourceSurface", source_surface)
+    if source_label:
+        metadata.setdefault("sourceLabel", source_label)
     timeout = int(body.get("timeoutSec") or body.get("timeout") or 600)
 
     inbound = _append_comm_event({
@@ -1067,15 +1139,27 @@ def _handle_agent_platform_comm_send(body):
         "visibleInOffice": True,
     })
 
-    sender_label = f"{from_ref.get('name') or from_ref['id']} {from_ref.get('emoji') or ''}".strip()
+    provider_prefixes = {
+        "openclaw": "OpenClaw",
+        "hermes": "Hermes",
+    }
+    if is_human_source:
+        sender_label = from_ref.get("name") or "User"
+        pretty_surface = source_label or ("Virtual Office Chat" if source_app == "virtual-office" and source_surface in {"chat-window", "chat"} else f"{source_app.replace('-', ' ').title()} {source_surface.replace('-', ' ').title()}".strip())
+        envelope_source = pretty_surface
+    else:
+        provider_label = provider_prefixes.get(str(from_ref.get("providerKind") or "").lower(), str(from_ref.get("providerKind") or "Agent").replace("-", " ").title())
+        base_name = f"{from_ref.get('name') or from_ref['id']} {from_ref.get('emoji') or ''}".strip()
+        sender_label = f"{provider_label}: {base_name}" if provider_label else base_name
+        envelope_source = "My Virtual Office AgentPlatform-to-AgentPlatform Communications"
     target_prompt = (
-        f"[A2A from={from_ref['id']} name={json.dumps(sender_label)} to={to_ref['id']} isUser=false]\n"
-        f"Message from {sender_label} via My Virtual Office AgentPlatform-to-AgentPlatform Communications.\n\n"
+        f"[A2A from={from_ref['id']} name={json.dumps(sender_label)} to={to_ref['id']} isUser={'true' if is_human_source else 'false'} sourceApp={json.dumps(source_app)} sourceSurface={json.dumps(source_surface)}]\n"
+        f"Message from {sender_label} via {envelope_source}.\n\n"
         f"{message}\n\n"
         "Reply directly to the sender. Keep the reply concise unless detail is needed."
     )
 
-    gateway_presence.set_manual_override(to_ref["id"], "working", f"Replying to {from_ref['name']}")
+    gateway_presence.set_manual_override(to_ref["id"], "working", f"Replying to {sender_label}")
     try:
         reply = _wf_call_agent(to_ref["id"], target_prompt, timeout=timeout, project_id="agent-platform-communications", task_id=conversation_id)
         ok = not str(reply or "").startswith("[ERROR]")

@@ -43,6 +43,11 @@ SESSIONS_BOOTSTRAP_LIMIT = 100
 # Short grace period after a lifecycle end before showing idle, to avoid UI flicker.
 FINISHING_GRACE_SEC = 12
 
+# Safety net for missed lifecycle/chat/tool terminal events. Fresh events keep
+# an agent working; stale run/tool ids must not pin status forever.
+ACTIVE_RUN_STALE_SEC = 90
+ACTIVE_TOOL_STALE_SEC = 45
+
 # Track last known updatedAt per session key for change detection during rare snapshots
 _last_updated_at = {}  # session_key → updatedAt timestamp (ms)
 
@@ -51,7 +56,9 @@ _last_event_at = {}   # agent_id → timestamp (seconds)
 _last_event_task = {}  # agent_id → task description from event
 _run_agents = {}       # runId → agent_id
 _active_runs_by_agent = {}  # agent_id → set(runId); while non-empty the agent is working
+_active_run_last_seen = {}  # runId → timestamp (seconds)
 _active_tools_by_agent = {}  # agent_id → set(toolCallId); while non-empty the agent is working
+_active_tool_last_seen = {}  # toolCallId → timestamp (seconds)
 _finish_idle_at = {}   # agent_id → timestamp (seconds)
 
 # Manual override tracking
@@ -206,11 +213,13 @@ def _mark_run_active(agent_id, run_id):
         return
     _run_agents[run_id] = agent_id
     _active_runs_by_agent.setdefault(agent_id, set()).add(run_id)
+    _active_run_last_seen[run_id] = time.time()
 
 
 def _mark_run_inactive(agent_id, run_id):
     if not agent_id or not run_id:
         return
+    _active_run_last_seen.pop(run_id, None)
     runs = _active_runs_by_agent.get(agent_id)
     if runs:
         runs.discard(run_id)
@@ -219,27 +228,55 @@ def _mark_run_inactive(agent_id, run_id):
 
 
 def _agent_has_active_run(agent_id):
-    return bool(_active_runs_by_agent.get(agent_id))
+    runs = _active_runs_by_agent.get(agent_id)
+    if not runs:
+        return False
+    now = time.time()
+    stale = {run_id for run_id in runs if now - _active_run_last_seen.get(run_id, 0) > ACTIVE_RUN_STALE_SEC}
+    if stale:
+        runs.difference_update(stale)
+        for run_id in stale:
+            _active_run_last_seen.pop(run_id, None)
+        if not runs:
+            _active_runs_by_agent.pop(agent_id, None)
+            return False
+    return True
 
 
 def _mark_tool_active(agent_id, tool_id):
     if not agent_id or not tool_id:
         return
-    _active_tools_by_agent.setdefault(agent_id, set()).add(str(tool_id))
+    tid = str(tool_id)
+    _active_tools_by_agent.setdefault(agent_id, set()).add(tid)
+    _active_tool_last_seen[tid] = time.time()
 
 
 def _mark_tool_inactive(agent_id, tool_id):
     if not agent_id or not tool_id:
         return
+    tid = str(tool_id)
+    _active_tool_last_seen.pop(tid, None)
     tools = _active_tools_by_agent.get(agent_id)
     if tools:
-        tools.discard(str(tool_id))
+        tools.discard(tid)
         if not tools:
             _active_tools_by_agent.pop(agent_id, None)
 
 
 def _agent_has_active_tool(agent_id):
-    return bool(_active_tools_by_agent.get(agent_id))
+    tools = _active_tools_by_agent.get(agent_id)
+    if not tools:
+        return False
+    now = time.time()
+    stale = {tool_id for tool_id in tools if now - _active_tool_last_seen.get(tool_id, 0) > ACTIVE_TOOL_STALE_SEC}
+    if stale:
+        tools.difference_update(stale)
+        for tool_id in stale:
+            _active_tool_last_seen.pop(tool_id, None)
+        if not tools:
+            _active_tools_by_agent.pop(agent_id, None)
+            return False
+    return True
 
 
 def _agent_has_active_activity(agent_id):
@@ -426,9 +463,14 @@ def _process_event(event_type, payload):
             tool_id = _read_tool_id(payload, data)
             if phase in ("result", "end", "done", "error", "aborted", "cancelled", "canceled", "failed"):
                 _mark_tool_inactive(agent_id, tool_id)
-            elif tool_id:
-                _mark_tool_active(agent_id, tool_id)
-            _set_working(agent_id, task, f"agent-{stream}", run_id)
+                if _agent_has_active_activity(agent_id):
+                    _set_working(agent_id, _last_event_task.get(agent_id) or task, f"agent-{stream}", run_id)
+                else:
+                    _set_finishing(agent_id, f"agent-{stream}", None)
+            else:
+                if tool_id:
+                    _mark_tool_active(agent_id, tool_id)
+                _set_working(agent_id, task, f"agent-{stream}", run_id)
             return
 
         # Any other agent stream means the run is alive.
@@ -444,9 +486,14 @@ def _process_event(event_type, payload):
         tool_id = _read_tool_id(payload, data)
         if phase in ("result", "end", "done", "error", "aborted", "cancelled", "canceled", "failed"):
             _mark_tool_inactive(agent_id, tool_id)
-        elif tool_id:
-            _mark_tool_active(agent_id, tool_id)
-        _set_working(agent_id, task, "session-tool", run_id)
+            if _agent_has_active_activity(agent_id):
+                _set_working(agent_id, _last_event_task.get(agent_id) or task, "session-tool", run_id)
+            else:
+                _set_finishing(agent_id, "session-tool", None)
+        else:
+            if tool_id:
+                _mark_tool_active(agent_id, tool_id)
+            _set_working(agent_id, task, "session-tool", run_id)
         return
 
     if event_type == "session.message":
