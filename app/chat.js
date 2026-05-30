@@ -17,6 +17,15 @@
   const MAX_LIVE_TOOL_CARDS = 40;
   const MAX_TOOL_PAYLOAD_CHARS = 6000;
   const ACTIVE_RUN_RECOVERY_MS = 15000;
+  const HERMES_APPROVAL_POLL_MS = 1500;
+  const HERMES_PROGRESS_STEPS = [
+    'Receive message from Virtual Office',
+    'Load Hermes profile and current session',
+    'Run Hermes CLI agent loop',
+    'Wait for model, tools, and task updates',
+    'Export public session activity',
+    'Render reply, tool calls, and task summary'
+  ];
   const secondarySlotButtons = Array.from(document.querySelectorAll('[data-chat-slot-toggle]'));
   let activeSecondarySlot = null;
   const secondaryPanelPlaceholders = {
@@ -47,6 +56,9 @@
       this.scrollFrame = null;
       this.lastLiveEventAt = 0;
       this.recoveryTimer = null;
+      this.hermesProgressTimers = [];
+      this.hermesApprovalPollTimer = null;
+      this.hermesApprovalLastId = '';
       this.sessionModel = '—';
       this.contextWindow = 0;
       this.contextUsed = 0;
@@ -136,6 +148,7 @@
       if (this.streamRenderTimer) { clearTimeout(this.streamRenderTimer); this.streamRenderTimer = null; }
       if (this.toolFlushTimer) { clearTimeout(this.toolFlushTimer); this.toolFlushTimer = null; }
       if (this.recoveryTimer) { clearInterval(this.recoveryTimer); this.recoveryTimer = null; }
+      this.stopHermesProgressTimers();
       this.pendingToolEvents.clear();
       this.currentRunId = null;
       this.sessionModel = '—';
@@ -211,6 +224,8 @@
       this.streamingMsg = null;
       this.syncAgentSelect();
       this.resetConversation(`${systemPrefix} ${opt.textContent.trim()}`);
+      if (this.isHermesSelected()) this.startHermesApprovalPolling();
+      else this.stopHermesApprovalPolling();
       if (connected) {
         this.loadHistory();
         this.fetchSessionInfo();
@@ -287,6 +302,60 @@
       return this.getSelectedProviderKind() === 'hermes' || String(this.sessionKey || '').startsWith('hermes:');
     }
 
+    startHermesApprovalPolling() {
+      if (!this.isHermesSelected() || this.hermesApprovalPollTimer) return;
+      this.pollHermesApproval().catch(() => {});
+      this.hermesApprovalPollTimer = setInterval(() => {
+        this.pollHermesApproval().catch(() => {});
+      }, HERMES_APPROVAL_POLL_MS);
+    }
+
+    stopHermesApprovalPolling() {
+      if (this.hermesApprovalPollTimer) {
+        clearInterval(this.hermesApprovalPollTimer);
+        this.hermesApprovalPollTimer = null;
+      }
+      this.hermesApprovalLastId = '';
+    }
+
+    async pollHermesApproval() {
+      if (!this.isHermesSelected() || !this.isVisibleForPolling()) return;
+      const agentId = this.getSelectedAgentId() || this.selectedAgentKey;
+      const res = await fetch('/api/hermes/approval/pending?agentId=' + encodeURIComponent(agentId));
+      const data = await res.json();
+      if (!data.ok || !data.pending) return;
+      this.appendHermesPendingApproval(data.pending, data.pending_count || 1);
+    }
+
+    appendHermesPendingApproval(approval, pendingCount = 1) {
+      if (!approval) return;
+      const approvalId = approval.approval_id || approval.id || '';
+      if (approvalId) {
+        const existing = [...this.messages.querySelectorAll('[data-approval-id]')].find(el => el.dataset.approvalId === approvalId);
+        if (existing) return;
+      }
+      const enriched = {
+        ...approval,
+        id: approvalId || approval.id,
+        approval_id: approvalId || approval.approval_id,
+        pending_count: pendingCount
+      };
+      this.hermesApprovalLastId = enriched.id || '';
+      this.appendMessage(
+        'assistant',
+        '',
+        Date.now(),
+        [],
+        {
+          label: this.agentSelect.selectedOptions[0]?.textContent.trim() || 'Hermes',
+          kind: 'agent',
+          approval: enriched
+        },
+        []
+      );
+      this.scrollBottom();
+    }
+
     async fetchSessionInfo() {
       let gatewayContext = 0;
       try {
@@ -324,15 +393,22 @@
     async loadHistory(opts = {}) {
       try {
         if (this.isHermesSelected()) {
+          this.startHermesApprovalPolling();
           const res = await fetch('/api/hermes/history?agentId=' + encodeURIComponent(this.getSelectedAgentId() || this.selectedAgentKey));
           const data = await res.json();
           if (data.ok && Array.isArray(data.messages)) {
             this.messages.innerHTML = '';
             for (const msg of data.messages) {
-              if (msg.text) this.appendMessage(msg.role, msg.text, msg.ts || Date.now(), [], msg.role === 'assistant' ? resolveMessageSender(msg, this) : { label: 'You', kind: 'human' });
+              if (msg.text || msg.thinking || msg.approval || (Array.isArray(msg.tools) && msg.tools.length)) {
+                const meta = msg.role === 'assistant'
+                  ? { ...resolveMessageSender(msg, this), thinking: msg.thinking || '', reasoningTokens: msg.reasoningTokens || 0, approval: msg.approval || null }
+                  : { label: 'You', kind: 'human' };
+                this.appendMessage(msg.role, msg.text || '', msg.ts || Date.now(), [], meta, normalizeHermesTools(msg.tools || []));
+              }
             }
             this.scrollBottom();
           }
+          await this.pollHermesApproval().catch(() => {});
           return;
         }
         const res = await rpc('chat.history', { sessionKey: this.sessionKey, limit: 500 });
@@ -553,8 +629,8 @@
       if (attachments?.length) params.attachments = attachments;
 
       if (this.isHermesSelected()) {
-        this.setStatus('Hermes working...', 'connecting');
-        this.updateTypingIndicator((this.agentSelect.selectedOptions[0]?.textContent.trim() || 'Hermes') + ' is thinking');
+        const hermesLabel = this.agentSelect.selectedOptions[0]?.textContent.trim() || 'Hermes';
+        const hermesProgress = this.startHermesProgress(hermesLabel);
         try {
           const resp = await fetch('/api/hermes/chat', {
             method: 'POST',
@@ -570,11 +646,27 @@
             })
           });
           const data = await resp.json();
+          this.finishHermesProgress(hermesProgress, true);
           this.removeTypingIndicator();
-          if (!resp.ok || data.ok === false) throw new Error(data.error || data.reply || resp.statusText);
-          this.appendMessage('assistant', data.reply || '', Date.now(), [], { label: this.agentSelect.selectedOptions[0]?.textContent.trim() || 'Hermes', kind: 'agent' });
+          if (!resp.ok || (data.ok === false && !data.approval)) throw new Error(data.error || data.reply || resp.statusText);
+          this.appendMessage(
+            'assistant',
+            data.reply || '',
+            Date.now(),
+            [],
+            {
+              label: this.agentSelect.selectedOptions[0]?.textContent.trim() || 'Hermes',
+              kind: 'agent',
+              thinking: data.thinking || '',
+              reasoningTokens: data.reasoningTokens || 0,
+              approval: data.approval || null
+            },
+            normalizeHermesTools(data.tools || [])
+          );
+          await this.pollHermesApproval().catch(() => {});
           this.setStatus('Hermes ready', 'connected');
         } catch (e) {
+          this.finishHermesProgress(hermesProgress, false, e.message);
           this.removeTypingIndicator();
           this.appendSystem('Hermes send failed: ' + e.message);
           this.setStatus('Hermes error', 'disconnected');
@@ -858,6 +950,12 @@
       }
       const senderHeader = renderSenderHeader(meta, role);
       if (senderHeader) bubble.appendChild(senderHeader);
+      if (role === 'assistant' && (meta.thinking || meta.reasoningTokens)) {
+        bubble.appendChild(renderThinkingCard(meta.thinking || `Reasoning trace stored by Hermes provider. Reasoning tokens: ${meta.reasoningTokens}`));
+      }
+      if (role === 'assistant' && meta.approval) {
+        bubble.appendChild(renderHermesApprovalCard(meta.approval, this));
+      }
       if (displayContent.trim()) {
         const textDiv = document.createElement('div');
         textDiv.innerHTML = formatContent(displayContent);
@@ -944,6 +1042,139 @@
     }
 
     clearActivityFeed() { this.messages.querySelectorAll('.chat-activity').forEach(el => el.remove()); }
+
+    stopHermesProgressTimers() {
+      if (!this.hermesProgressTimers?.length) return;
+      for (const timer of this.hermesProgressTimers) clearTimeout(timer);
+      this.hermesProgressTimers = [];
+    }
+
+    startHermesProgress(label) {
+      this.stopHermesProgressTimers();
+      const runId = 'hermes-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+      const planId = runId + ':plan';
+      this.currentRunId = runId;
+      this.setStatus('Hermes stream active...', 'connecting');
+      this.updateTypingIndicator(label + ' is running Hermes');
+      this.appendActivity(label + ': queued message');
+      this.appendToolCall({
+        runId,
+        data: {
+          toolCallId: planId,
+          phase: 'start',
+          name: 'Hermes task breakdown',
+          args: { willDo: HERMES_PROGRESS_STEPS },
+          result: 'Queued in Virtual Office. Waiting for Hermes to start.'
+        }
+      });
+      HERMES_PROGRESS_STEPS.forEach((step, idx) => {
+        const timer = setTimeout(() => {
+          this.appendActivity(label + ': ' + step.toLowerCase());
+          this.updateToolCall({
+            runId,
+            data: {
+              toolCallId: planId,
+              phase: 'update',
+              name: 'Hermes task breakdown',
+              args: {
+                done: HERMES_PROGRESS_STEPS.slice(0, idx),
+                now: step,
+                next: HERMES_PROGRESS_STEPS.slice(idx + 1)
+              },
+              partialResult: 'Running step ' + (idx + 1) + ' of ' + HERMES_PROGRESS_STEPS.length + ': ' + step
+            }
+          });
+          this.updateTypingIndicator(label + ' is working: ' + step.toLowerCase());
+        }, 250 + idx * 1400);
+        this.hermesProgressTimers.push(timer);
+      });
+      return { runId, planId, label };
+    }
+
+    finishHermesProgress(progress, ok, errorText = '') {
+      if (!progress) return;
+      this.stopHermesProgressTimers();
+      this.finishToolCall({
+        runId: progress.runId,
+        data: {
+          toolCallId: progress.planId,
+          phase: 'result',
+          name: 'Hermes task breakdown',
+          args: {
+            done: ok ? HERMES_PROGRESS_STEPS : HERMES_PROGRESS_STEPS.slice(0, 3),
+            next: ok ? [] : ['Review Hermes error in chat']
+          },
+          result: ok ? 'Hermes reply and session activity collected.' : (errorText || 'Hermes request failed.'),
+          isError: !ok
+        },
+        error: ok ? '' : errorText
+      });
+      this.appendActivity((progress.label || 'Hermes') + (ok ? ': stream complete' : ': stream failed'));
+      if (this.currentRunId === progress.runId) this.currentRunId = null;
+    }
+
+    async respondHermesApproval(approval, choice, card) {
+      if (!approval || !this.isHermesSelected()) return;
+      const buttons = card ? [...card.querySelectorAll('button')] : [];
+      buttons.forEach(btn => btn.disabled = true);
+      if (card) {
+        card.classList.add('responding');
+        const status = card.querySelector('.chat-approval-status');
+        if (status) status.textContent = choice === 'approve_once' ? 'Approving once...' : 'Denying...';
+      }
+      try {
+        const resp = await fetch('/api/hermes/approval/respond', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agentId: this.getSelectedAgentId() || this.selectedAgentKey,
+            approval,
+            approval_id: approval.approval_id || approval.id || '',
+            session_id: approval.session_id || approval.sessionId || '',
+            choice,
+            fromDisplayName: 'User'
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok || data.ok === false) throw new Error(data.error || data.reply || resp.statusText);
+        if (card) {
+          card.classList.remove('responding');
+          card.classList.add(choice === 'approve_once' ? 'approved' : 'denied');
+          const status = card.querySelector('.chat-approval-status');
+          if (status) status.textContent = choice === 'approve_once' ? 'approved once' : 'denied';
+        }
+        if (choice === 'approve_once' && (data.reply || data.thinking || data.approval || (Array.isArray(data.tools) && data.tools.length))) {
+          this.appendMessage(
+            'assistant',
+            data.reply || '',
+            Date.now(),
+            [],
+            {
+              label: this.agentSelect.selectedOptions[0]?.textContent.trim() || 'Hermes',
+              kind: 'agent',
+              thinking: data.thinking || '',
+              reasoningTokens: data.reasoningTokens || 0,
+              approval: data.approval || null
+            },
+            normalizeHermesTools(data.tools || [])
+          );
+          await this.pollHermesApproval().catch(() => {});
+        } else if (choice === 'deny') {
+          this.appendSystem('Hermes approval denied.');
+          await this.pollHermesApproval().catch(() => {});
+        }
+        this.setStatus('Hermes ready', 'connected');
+      } catch (e) {
+        buttons.forEach(btn => btn.disabled = false);
+        if (card) {
+          card.classList.remove('responding');
+          const status = card.querySelector('.chat-approval-status');
+          if (status) status.textContent = 'error';
+        }
+        this.appendSystem('Hermes approval failed: ' + e.message);
+        this.setStatus('Hermes error', 'disconnected');
+      }
+    }
     scrollBottom() {
       if (this.scrollFrame) return;
       this.scrollFrame = requestAnimationFrame(() => {
@@ -1501,6 +1732,18 @@
     return tools;
   }
 
+  function normalizeHermesTools(items) {
+    if (!Array.isArray(items)) return [];
+    return items.filter(Boolean).map((item) => ({
+      id: item.id || item.toolCallId || item.callId || '',
+      status: item.status || (item.error ? 'error' : 'done'),
+      name: item.name || item.toolName || item.tool_name || 'tool',
+      arguments: coerceToolArgs(item.arguments || item.args || item.input || {}),
+      result: item.result ?? item.output ?? item.content ?? '',
+      error: item.error || ''
+    }));
+  }
+
   function normalizeToolEvent(payload, fallbackStatus = 'running') {
     const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
     const phase = data.phase || payload?.phase || '';
@@ -1532,16 +1775,24 @@
 
     const summary = document.createElement('summary');
     summary.className = 'chat-tool-summary';
+    const dot = document.createElement('span');
+    dot.className = 'chat-tool-running-dot';
     const icon = document.createElement('span');
     icon.className = 'chat-tool-icon';
-    icon.textContent = tool.status === 'error' ? '⚠️' : tool.status === 'done' ? '✅' : '🔧';
-    const title = document.createElement('span');
-    title.className = 'chat-tool-title';
-    title.textContent = formatToolLabel(tool.name, coerceToolArgs(tool.arguments));
+    icon.textContent = toolIcon(tool);
+    const name = document.createElement('span');
+    name.className = 'chat-tool-name';
+    name.textContent = formatToolName(tool.name);
+    const preview = document.createElement('span');
+    preview.className = 'chat-tool-preview';
+    preview.textContent = formatToolPreview(tool);
+    const toggle = document.createElement('span');
+    toggle.className = 'chat-tool-toggle';
+    toggle.textContent = '▶';
     const state = document.createElement('span');
     state.className = 'chat-tool-state';
     state.textContent = tool.status === 'error' ? 'error' : tool.status === 'done' ? 'done' : 'running';
-    summary.append(icon, title, state);
+    summary.append(dot, icon, name, preview, toggle, state);
     details.appendChild(summary);
 
     const body = document.createElement('div');
@@ -1554,14 +1805,24 @@
 
   function updateToolCallCard(card, tool) {
     if (!card) return;
+    const previousStatus = card.classList.contains('running') ? 'running' : card.classList.contains('error') ? 'error' : card.classList.contains('done') ? 'done' : '';
     card.classList.remove('running', 'done', 'error');
     card.classList.add(tool.status || 'done');
+    if (previousStatus && previousStatus !== (tool.status || 'done')) {
+      card.classList.add('status-changed');
+      setTimeout(() => card.classList.remove('status-changed'), 850);
+      if ((tool.status === 'done' || tool.status === 'error') && card.open) {
+        setTimeout(() => { if (card.classList.contains('done') || card.classList.contains('error')) card.open = false; }, 900);
+      }
+    }
     const icon = card.querySelector('.chat-tool-icon');
-    if (icon) icon.textContent = tool.status === 'error' ? '⚠️' : tool.status === 'done' ? '✅' : '🔧';
+    if (icon) icon.textContent = toolIcon(tool);
     const state = card.querySelector('.chat-tool-state');
     if (state) state.textContent = tool.status === 'error' ? 'error' : tool.status === 'done' ? 'done' : 'running';
-    const title = card.querySelector('.chat-tool-title');
-    if (title) title.textContent = formatToolLabel(tool.name, coerceToolArgs(tool.arguments));
+    const name = card.querySelector('.chat-tool-name');
+    if (name) name.textContent = formatToolName(tool.name);
+    const preview = card.querySelector('.chat-tool-preview');
+    if (preview) preview.textContent = formatToolPreview(tool);
     const body = card.querySelector('.chat-tool-body');
     if (body) {
       body.innerHTML = '';
@@ -1580,6 +1841,80 @@
     pre.textContent = text || '—';
     section.append(h, pre);
     return section;
+  }
+
+  function renderThinkingCard(text) {
+    const details = document.createElement('details');
+    details.className = 'chat-thinking-card';
+    const summary = document.createElement('summary');
+    summary.className = 'chat-thinking-summary';
+    const label = document.createElement('span');
+    label.className = 'chat-thinking-title';
+    label.textContent = 'Thinking';
+    const state = document.createElement('span');
+    state.className = 'chat-tool-state';
+    state.textContent = 'trace';
+    const toggle = document.createElement('span');
+    toggle.className = 'chat-tool-toggle';
+    toggle.textContent = '▶';
+    summary.append('💡', label, toggle, state);
+    const body = document.createElement('div');
+    body.className = 'chat-thinking-body';
+    const pre = document.createElement('pre');
+    pre.textContent = String(text || '').trim();
+    body.appendChild(pre);
+    details.append(summary, body);
+    return details;
+  }
+
+  function renderHermesApprovalCard(approval, windowInstance) {
+    const card = document.createElement('div');
+    const status = String(approval.status || 'pending').toLowerCase();
+    card.className = 'chat-approval-card ' + (status.includes('denied') ? 'denied' : status.includes('approved') ? 'approved' : 'pending');
+    card.dataset.approvalId = approval.approval_id || approval.id || '';
+
+    const header = document.createElement('div');
+    header.className = 'chat-approval-header';
+    const icon = document.createElement('span');
+    icon.className = 'chat-approval-icon';
+    icon.textContent = status.includes('denied') ? '✕' : status.includes('approved') ? '✓' : '!';
+    const title = document.createElement('span');
+    title.className = 'chat-approval-title';
+    title.textContent = approval.title || 'Hermes approval required';
+    const state = document.createElement('span');
+    state.className = 'chat-approval-status';
+    const pendingCount = Number(approval.pending_count || approval.pendingCount || 0);
+    state.textContent = status === 'pending' && pendingCount > 1 ? `${pendingCount} pending` : (status === 'pending' ? 'pending' : status);
+    header.append(icon, title, state);
+
+    const desc = document.createElement('div');
+    desc.className = 'chat-approval-desc';
+    desc.textContent = approval.description || 'Hermes needs user approval before it can continue.';
+
+    const cmd = document.createElement('pre');
+    cmd.className = 'chat-approval-command';
+    cmd.textContent = approval.command || 'Approval-gated Hermes command';
+
+    card.append(header, desc, cmd);
+    if (status === 'pending') {
+      const actions = document.createElement('div');
+      actions.className = 'chat-approval-actions';
+      const allow = document.createElement('button');
+      allow.type = 'button';
+      allow.className = 'chat-approval-btn primary';
+      allow.textContent = 'Allow once';
+      allow.title = 'Retry this Hermes turn with approval bypass for this invocation only';
+      allow.addEventListener('click', () => windowInstance?.respondHermesApproval(approval, 'approve_once', card));
+      const deny = document.createElement('button');
+      deny.type = 'button';
+      deny.className = 'chat-approval-btn';
+      deny.textContent = 'Deny';
+      deny.title = 'Do not retry this blocked Hermes command';
+      deny.addEventListener('click', () => windowInstance?.respondHermesApproval(approval, 'deny', card));
+      actions.append(allow, deny);
+      card.appendChild(actions);
+    }
+    return card;
   }
 
   function coerceToolArgs(value) {
@@ -1834,6 +2169,7 @@
       case 'sessions_spawn': return '🤖 spawn: ' + truncate(args.agentId || '', 30) + (args.task ? ' — ' + truncate(args.task, 40) : '');
       case 'sessions_history': return '📜 history: ' + truncate(args.sessionKey || '', 40);
       case 'sessions_list': return '📋 sessions_list';
+      case 'todo': return '✅ tasks: ' + truncate(args.todos ? `${args.todos.length} updates` : args.content || args.id || '', 50);
       case 'memory_search': return '🧠 memory: ' + truncate(args.query || '', 50);
       case 'memory_get': return '🧠 memory_get: ' + truncate(args.path || '', 40);
       case 'web_search': return '🔍 search: ' + truncate(args.query || '', 50);
@@ -1844,6 +2180,64 @@
       case 'image': return '🖼️ image analysis';
       default: return '🔧 ' + (name || 'tool');
     }
+  }
+
+  function formatToolName(name) {
+    const raw = String(name || 'tool');
+    if (raw === 'Command') return 'command';
+    if (raw === 'Hermes task breakdown') return 'task plan';
+    return raw.replace(/^functions\./, '');
+  }
+
+  function toolIcon(tool) {
+    const name = String(tool?.name || '').toLowerCase();
+    if (tool?.status === 'error' || tool?.error) return '⚠️';
+    if (name.includes('task') || name === 'todo') return tool?.status === 'done' ? '✓' : '◌';
+    if (name.includes('read') || name.includes('fetch')) return '📄';
+    if (name.includes('write') || name.includes('edit')) return '✎';
+    if (name.includes('search')) return '⌕';
+    if (name.includes('browser')) return '◈';
+    if (tool?.status === 'done') return '✓';
+    return '⚡';
+  }
+
+  function formatToolPreview(tool) {
+    const args = coerceToolArgs(tool?.arguments || {});
+    const result = String(tool?.error || tool?.result || '').replace(/\s+/g, ' ').trim();
+    const pick = (...keys) => {
+      for (const key of keys) if (args[key]) return String(args[key]);
+      return '';
+    };
+    let preview = '';
+    switch (tool?.name) {
+      case 'exec':
+      case 'bash':
+      case 'Command':
+        preview = pick('command', 'description', 'value');
+        break;
+      case 'read':
+      case 'write':
+      case 'edit':
+        preview = pick('path', 'file_path', 'filePath');
+        break;
+      case 'sessions_send':
+        preview = pick('sessionKey', 'label', 'message');
+        break;
+      case 'sessions_spawn':
+        preview = [pick('agentId'), pick('task')].filter(Boolean).join(' · ');
+        break;
+      case 'todo':
+        preview = args.todos ? `${args.todos.length} task updates` : pick('content', 'id');
+        break;
+      case 'Hermes task breakdown':
+        preview = args.now || (Array.isArray(args.done) ? `${args.done.length} steps complete` : 'receive · run · export · render');
+        break;
+      default:
+        preview = pick('query', 'url', 'action', 'input', 'value');
+    }
+    if (!preview && result) preview = result;
+    if (!preview) preview = tool?.status === 'running' ? 'running...' : 'completed';
+    return preview.length > 90 ? preview.slice(0, 87) + '...' : preview;
   }
 
   updateChatStackLayout();

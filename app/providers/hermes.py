@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import time
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -147,7 +148,7 @@ class HermesProvider:
         except Exception as exc:
             return {"ok": False, "error": str(exc), "exitCode": None, "reply": ""}
 
-    def send_chat_message(self, profile: str, message: str, session_id: str | None = None, timeout_sec: int | None = None) -> dict[str, Any]:
+    def send_chat_message(self, profile: str, message: str, session_id: str | None = None, timeout_sec: int | None = None, yolo_once: bool = False) -> dict[str, Any]:
         """Send a message through Hermes chat, optionally resuming a session.
 
         Unlike ``send_message``/``hermes -z``, this uses the public
@@ -166,6 +167,8 @@ class HermesProvider:
         cmd.extend(["chat", "-Q"])
         if session_id:
             cmd.extend(["--resume", session_id])
+        if yolo_once:
+            cmd.append("--yolo")
         cmd.extend(["-q", message])
 
         try:
@@ -205,6 +208,46 @@ class HermesProvider:
             return {"ok": False, "error": "Hermes call timed out", "exitCode": None, "reply": "", "sessionId": session_id or ""}
         except Exception as exc:
             return {"ok": False, "error": str(exc), "exitCode": None, "reply": "", "sessionId": session_id or ""}
+
+    def export_session(self, profile: str, session_id: str, timeout_sec: int = 30) -> dict[str, Any]:
+        """Export one Hermes session through the public CLI JSONL surface."""
+        if not self.binary or not os.path.exists(self.binary):
+            return {"ok": False, "error": f"Hermes CLI not found at {self.binary}", "session": None}
+        if not session_id:
+            return {"ok": False, "error": "session_id is required", "session": None}
+
+        cmd = [self.binary]
+        if profile and profile != "default":
+            cmd.extend(["--profile", profile])
+        cmd.extend(["sessions", "export", "--session-id", session_id, "-"])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=int(timeout_sec),
+                env=self._subprocess_env(),
+            )
+            if result.returncode != 0:
+                return {"ok": False, "error": (result.stderr or result.stdout or "Hermes session export failed").strip()[:2000], "session": None}
+            sessions: list[dict[str, Any]] = []
+            for raw in (result.stdout or "").splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    sessions.append(item)
+            session = next((s for s in sessions if str(s.get("id") or "") == str(session_id)), sessions[0] if sessions else None)
+            return {"ok": bool(session), "session": session, "error": "" if session else "session not found in export"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "Hermes session export timed out", "session": None}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "session": None}
 
     def create_agent(self, name: str, role: str = "Hermes Agent", model: str | None = None, emoji: str = "⚕️", profile: str | None = None) -> dict[str, Any]:
         """Create a Hermes profile that Virtual Office treats as an agent.

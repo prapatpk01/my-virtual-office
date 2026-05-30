@@ -8039,6 +8039,41 @@ var chatScrollOffset = {}; // agentKey -> scroll offset (lines from bottom)
 var chatHoveredBubble = null; // agentKey of bubble mouse is over
 var _chatTooltip = null; // { x, y, text } for project indicator tooltip
 
+function getAgentChatActivityLines(msg) {
+    var lines = [];
+    if (!msg) return lines;
+    var tools = Array.isArray(msg.tools) ? msg.tools : [];
+    if (tools.length) {
+        var shown = tools.slice(-3);
+        for (var ti = 0; ti < shown.length; ti++) {
+            var t = shown[ti] || {};
+            var status = t.status || (t.error ? 'error' : 'done');
+            var name = t.name || t.toolName || t.tool_name || 'tool';
+            lines.push('[tool ' + status + '] ' + name);
+        }
+        if (tools.length > shown.length) lines.push('[tools] +' + (tools.length - shown.length) + ' more');
+    }
+    if (msg.thinking || msg.reasoningTokens) {
+        var reason = msg.thinking ? String(msg.thinking).replace(/\s+/g, ' ').trim() : ('reasoning tokens: ' + msg.reasoningTokens);
+        if (reason.length > 90) reason = reason.substring(0, 87) + '...';
+        lines.push('[thinking] ' + reason);
+    }
+    if (msg.approval) {
+        var approvalStatus = msg.approval.status || 'pending';
+        var approvalCommand = msg.approval.command || msg.approval.title || 'Hermes command';
+        if (approvalCommand.length > 82) approvalCommand = approvalCommand.substring(0, 79) + '...';
+        lines.push('[approval ' + approvalStatus + '] ' + approvalCommand);
+    }
+    return lines;
+}
+
+function getAgentChatActivitySignature(msg) {
+    if (!msg) return '';
+    var tools = Array.isArray(msg.tools) ? msg.tools : [];
+    var approval = msg.approval ? ((msg.approval.status || '') + ':' + (msg.approval.id || msg.approval.command || 'approval')) : '';
+    return tools.map(function(t) { return (t && (t.status || '') + ':' + (t.name || t.toolName || t.tool_name || 'tool')); }).join('|') + '|' + (msg.thinking || '') + '|' + (msg.reasoningTokens || 0) + '|' + approval;
+}
+
 function pollAgentChat() {
     var now = Date.now();
     if (now - lastChatPoll < 3000) return;
@@ -8054,7 +8089,7 @@ function pollAgentChat() {
         for (var key in data) {
             var msgs = data[key];
             var lastMsg = msgs[msgs.length - 1];
-            var lastText = lastMsg ? ((lastMsg.text || '') + (getAgentChatFirstImage(lastMsg) ? ' [image]' : '')) : '';
+            var lastText = lastMsg ? ((lastMsg.text || '') + (getAgentChatActivitySignature(lastMsg) ? ' [activity]' : '') + (getAgentChatFirstImage(lastMsg) ? ' [image]' : '')) : '';
             if (lastText !== chatLastMsg[key]) {
                 chatTypewriterState[key] = { charIdx: 0, targetText: lastText, done: false, msgIdx: msgs.length - 1 };
                 // On first load, keep minimized. After that, auto-expand on new messages.
@@ -8088,11 +8123,18 @@ function pollAgentChat() {
                 var prefix = timeTag + (isUser ? (senderLabel ? senderLabel + ': ' : 'IN: ') : '');
                 if (mi < msgs.length - 1) {
                     // Non-last messages: pre-wrap now (they never change)
-                    var displayText = msg.text;
+                    var displayText = msg.text || '';
+                    var activityLines = getAgentChatActivityLines(msg);
                     if (displayText.length > 350) displayText = displayText.substring(0, 347) + '...';
                     var lines = wrapChatText(prefix + displayText, 155);
                     for (var li = 0; li < lines.length; li++) {
                         wrapped.push({ text: lines[li], isUser: isUser });
+                    }
+                    for (var al = 0; al < activityLines.length; al++) {
+                        var actLines = wrapChatText(activityLines[al], 155);
+                        for (var ali = 0; ali < actLines.length; ali++) {
+                            wrapped.push({ text: actLines[ali], isUser: false, activity: true });
+                        }
                     }
                     var imgMedia = getAgentChatFirstImage(msg);
                     if (imgMedia) wrapped.push({ image: imgMedia, isUser: isUser });
@@ -8213,7 +8255,7 @@ function drawChatBubbles() {
             if (entry._lastMsg) {
                 // Last message — handle typewriter per-frame (only this one wraps)
                 var tw = chatTypewriterState[agent.statusKey];
-                var displayText = entry.msg.text;
+                var displayText = entry.msg.text || '';
                 if (tw && !tw.done && tw.msgIdx === msgs.length - 1) {
                     tw.charIdx = Math.min(tw.charIdx + 2, tw.targetText.length);
                     displayText = tw.targetText.substring(0, tw.charIdx);
@@ -8223,6 +8265,13 @@ function drawChatBubbles() {
                 var wrapped = wrapChatText(entry.prefix + displayText, 155);
                 for (var li = 0; li < wrapped.length; li++) {
                     renderedLines.push({ text: wrapped[li], isUser: entry.isUser });
+                }
+                var activityLines = getAgentChatActivityLines(entry.msg);
+                for (var al = 0; al < activityLines.length; al++) {
+                    var actWrapped = wrapChatText(activityLines[al], 155);
+                    for (var aw = 0; aw < actWrapped.length; aw++) {
+                        renderedLines.push({ text: actWrapped[aw], isUser: false, activity: true });
+                    }
                 }
                 var imgMedia = getAgentChatFirstImage(entry.msg);
                 if (imgMedia) renderedLines.push({ image: imgMedia, isUser: entry.isUser });
@@ -8387,8 +8436,10 @@ function drawChatBubbles() {
                 lineY += 58;
                 continue;
             }
-            ctx.fillStyle = ln.isUser ? '#4466aa' : '#222';
+            ctx.fillStyle = ln.activity ? '#7a5a00' : (ln.isUser ? '#4466aa' : '#222');
+            if (ln.activity) ctx.font = 'bold 8px Arial, sans-serif';
             ctx.fillText(ln.text, b.x + 5, lineY);
+            if (ln.activity) ctx.font = '9px Arial, sans-serif';
             lineY += 12;
         }
         // Scroll indicators
