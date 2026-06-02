@@ -678,11 +678,18 @@ async def _gateway_loop(gateway_url, gateway_token, origin, client_version="unkn
                 # Subscribe once; after this, presence is event-driven.
                 await _send_subscriptions_and_snapshot(ws)
 
-                await asyncio.gather(
-                    _message_reader(ws),
-                    _maintenance_loop(),
-                    _ping_loop(ws),
-                )
+                tasks = [
+                    asyncio.create_task(_message_reader(ws)),
+                    asyncio.create_task(_maintenance_loop()),
+                    asyncio.create_task(_ping_loop(ws)),
+                ]
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    task.result()
 
         except asyncio.CancelledError:
             break
