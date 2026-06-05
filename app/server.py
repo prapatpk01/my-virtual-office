@@ -73,11 +73,19 @@ def _normalize_presence_entry(entry):
         updated_epoch = 0
     source_lower = str(normalized.get("source") or "").lower()
     task_lower = str(normalized.get("task") or "").strip().lower()
+    # Gateway/session-derived work can be silent during long commands. Do not
+    # rewrite it to idle unless it is a legacy/manual source without run tracking.
+    has_gateway_source = source_lower.startswith(("agent-", "session-", "chat", "sessions-", "snapshot", "gateway"))
     stale_limit_sec = 180 if (
         "tool" in source_lower or "command" in source_lower or
         any(token in task_lower for token in ("reading", "processing", "thinking", "running command", "editing", "writing", "searching", "fetching"))
     ) else 45
-    if state in {"working", "finishing"} and updated_epoch > 0 and (time.time() - updated_epoch) > stale_limit_sec:
+    if (
+        not has_gateway_source
+        and state in {"working", "finishing"}
+        and updated_epoch > 0
+        and (time.time() - updated_epoch) > stale_limit_sec
+    ):
         normalized["state"] = "idle"
         normalized["task"] = ""
         normalized["source"] = f"{normalized.get('source') or 'presence'}-stale-idle"

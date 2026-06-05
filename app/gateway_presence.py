@@ -43,10 +43,10 @@ SESSIONS_BOOTSTRAP_LIMIT = 100
 # Short grace period after a lifecycle end before showing idle, to avoid UI flicker.
 FINISHING_GRACE_SEC = 12
 
-# Safety net for missed lifecycle/chat/tool terminal events. Fresh events keep
-# an agent working; stale run/tool ids must not pin status forever.
-ACTIVE_RUN_STALE_SEC = 90
-ACTIVE_TOOL_STALE_SEC = 45
+# Safety net for missed lifecycle/chat/tool terminal events. Quiet long-running
+# commands may not emit events for many minutes, so do not treat silence as idle.
+ACTIVE_RUN_STALE_SEC = 6 * 60 * 60
+ACTIVE_TOOL_STALE_SEC = 6 * 60 * 60
 
 # Track last known updatedAt per session key for change detection during rare snapshots
 _last_updated_at = {}  # session_key → updatedAt timestamp (ms)
@@ -558,12 +558,17 @@ def _maintenance_tick():
         if now >= idle_at:
             _set_idle(agent_id, "finish-grace-expired")
 
-    # working -> idle after no event activity.
+    # Do not convert quiet work to idle. Long-running tool calls can be silent
+    # for minutes; active run/tool ids are cleared by terminal events or by the
+    # long safety net above.
     for agent_id, last_at in list(_last_event_at.items()):
         if now - last_at > IDLE_TIMEOUT_SEC:
             with _state_lock:
                 current = _state.get(agent_id, {}).get("state")
             if current in ("working", "finishing") and not _agent_has_active_activity(agent_id):
+                source = str(_state.get(agent_id, {}).get("source") or "")
+                if source.startswith(("agent-", "session-", "chat", "sessions-", "snapshot")):
+                    continue
                 _set_idle(agent_id, "event-idle-timeout")
 
 # ─── Meeting File Sync ────────────────────────────────────────────
