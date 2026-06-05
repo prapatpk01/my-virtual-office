@@ -8055,6 +8055,67 @@ var chatScrollOffset = {}; // agentKey -> scroll offset (lines from bottom)
 var chatHoveredBubble = null; // agentKey of bubble mouse is over
 var _chatTooltip = null; // { x, y, text } for project indicator tooltip
 
+function truncateAgentChatActivity(text, limit) {
+    text = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!text) return '';
+    return text.length > limit ? text.substring(0, limit - 3) + '...' : text;
+}
+
+function getAgentChatToolArg(args, names) {
+    if (!args || typeof args !== 'object') return '';
+    for (var i = 0; i < names.length; i++) {
+        var value = args[names[i]];
+        if (value !== undefined && value !== null && value !== '') return String(value);
+    }
+    return '';
+}
+
+function stringifyAgentChatToolPayload(value) {
+    if (value === undefined || value === null || value === '') return '';
+    if (typeof value === 'string') return value;
+    try {
+        return JSON.stringify(value);
+    } catch (e) {
+        return String(value);
+    }
+}
+
+function formatAgentChatToolLine(tool) {
+    tool = tool || {};
+    var rawName = tool.name || tool.toolName || tool.tool_name || 'tool';
+    var name = String(rawName).replace(/^functions\./, '');
+    var args = tool.arguments || tool.args || tool.input || {};
+    var result = stringifyAgentChatToolPayload(tool.error || tool.result || tool.output);
+    var preview = '';
+
+    if (name === 'exec' || name === 'bash' || name === 'Command') {
+        preview = getAgentChatToolArg(args, ['command', 'cmd', 'description', 'value']);
+    } else if (name === 'read' || name === 'write' || name === 'edit') {
+        preview = getAgentChatToolArg(args, ['path', 'file_path', 'filePath', 'file']);
+    } else if (name === 'sessions_send') {
+        var target = getAgentChatToolArg(args, ['sessionKey', 'label', 'toAgentId']);
+        var message = getAgentChatToolArg(args, ['message', 'text', 'content']);
+        preview = [target, message].filter(Boolean).join(': ');
+    } else if (name === 'sessions_spawn') {
+        preview = [getAgentChatToolArg(args, ['agentId', 'agent']), getAgentChatToolArg(args, ['task', 'message'])].filter(Boolean).join(': ');
+    } else if (name === 'browser') {
+        preview = [getAgentChatToolArg(args, ['action', 'method']), getAgentChatToolArg(args, ['url', 'selector', 'text'])].filter(Boolean).join(': ');
+    } else if (name === 'web_search') {
+        preview = getAgentChatToolArg(args, ['query', 'q']);
+    } else if (name === 'web_fetch') {
+        preview = getAgentChatToolArg(args, ['url']);
+    } else if (name === 'process') {
+        preview = getAgentChatToolArg(args, ['action', 'status']);
+    } else {
+        preview = getAgentChatToolArg(args, ['query', 'url', 'action', 'input', 'value', 'message', 'path']);
+    }
+
+    if (!preview && result) preview = result;
+    if (!preview) preview = tool.status === 'running' ? 'running...' : 'completed';
+    var status = tool.error || tool.status === 'error' ? ' error' : '';
+    return name + status + ': ' + truncateAgentChatActivity(preview, 96);
+}
+
 function getAgentChatActivityLines(msg) {
     var lines = [];
     if (!msg) return lines;
@@ -8062,12 +8123,9 @@ function getAgentChatActivityLines(msg) {
     if (tools.length) {
         var shown = tools.slice(-3);
         for (var ti = 0; ti < shown.length; ti++) {
-            var t = shown[ti] || {};
-            var status = t.status || (t.error ? 'error' : 'done');
-            var name = t.name || t.toolName || t.tool_name || 'tool';
-            lines.push('[tool ' + status + '] ' + name);
+            lines.push(formatAgentChatToolLine(shown[ti]));
         }
-        if (tools.length > shown.length) lines.push('[tools] +' + (tools.length - shown.length) + ' more');
+        if (tools.length > shown.length) lines.push('+' + (tools.length - shown.length) + ' more tool calls');
     }
     if (msg.thinking || msg.reasoningTokens) {
         var reason = msg.thinking ? String(msg.thinking).replace(/\s+/g, ' ').trim() : ('reasoning tokens: ' + msg.reasoningTokens);
@@ -8452,10 +8510,8 @@ function drawChatBubbles() {
                 lineY += 58;
                 continue;
             }
-            ctx.fillStyle = ln.activity ? '#7a5a00' : (ln.isUser ? '#4466aa' : '#222');
-            if (ln.activity) ctx.font = 'bold 8px Arial, sans-serif';
+            ctx.fillStyle = ln.isUser ? '#4466aa' : '#222';
             ctx.fillText(ln.text, b.x + 5, lineY);
-            if (ln.activity) ctx.font = '9px Arial, sans-serif';
             lineY += 12;
         }
         // Scroll indicators
