@@ -73,15 +73,16 @@ def _normalize_presence_entry(entry):
         updated_epoch = 0
     source_lower = str(normalized.get("source") or "").lower()
     task_lower = str(normalized.get("task") or "").strip().lower()
-    # Gateway/session-derived work can be silent during long commands. Do not
-    # rewrite it to idle unless it is a legacy/manual source without run tracking.
-    has_gateway_source = source_lower.startswith(("agent-", "session-", "chat", "sessions-", "snapshot", "gateway"))
+    # Active lifecycle/tool sources can be silent during long commands. Generic
+    # chat/snapshot display states must still age out if maintenance missed the
+    # terminal event, otherwise disconnected apps can show stale working status.
+    has_active_work_source = source_lower.startswith(("agent-lifecycle", "agent-tool", "session-tool", "gateway"))
     stale_limit_sec = 180 if (
         "tool" in source_lower or "command" in source_lower or
         any(token in task_lower for token in ("reading", "processing", "thinking", "running command", "editing", "writing", "searching", "fetching"))
     ) else 45
     if (
-        not has_gateway_source
+        not has_active_work_source
         and state in {"working", "finishing"}
         and updated_epoch > 0
         and (time.time() - updated_epoch) > stale_limit_sec

@@ -540,7 +540,10 @@ def _process_sessions_list(sessions):
         _ensure_agent(agent_id, "snapshot")
         updated_at = s.get("updatedAt", 0) or s.get("lastMessageAt", 0) or 0
         _last_updated_at[key] = updated_at
-        if updated_at and ((now_ms - updated_at) / 1000) < IDLE_TIMEOUT_SEC:
+        session_status = str(s.get("status") or "").lower()
+        if session_status in ("done", "ended", "complete", "completed", "error", "aborted", "cancelled", "canceled", "failed"):
+            _set_idle(agent_id, "snapshot-session-ended")
+        elif updated_at and ((now_ms - updated_at) / 1000) < IDLE_TIMEOUT_SEC:
             _set_working(agent_id, _last_event_task.get(agent_id) or "Recently active", "snapshot")
 
 
@@ -558,17 +561,14 @@ def _maintenance_tick():
         if now >= idle_at:
             _set_idle(agent_id, "finish-grace-expired")
 
-    # Do not convert quiet work to idle. Long-running tool calls can be silent
-    # for minutes; active run/tool ids are cleared by terminal events or by the
-    # long safety net above.
+    # Quiet long-running tool calls are protected by active run/tool ids. If no
+    # active run/tool remains, stale gateway-derived display states must age out
+    # so missed terminal chat/snapshot events do not leave agents stuck working.
     for agent_id, last_at in list(_last_event_at.items()):
         if now - last_at > IDLE_TIMEOUT_SEC:
             with _state_lock:
                 current = _state.get(agent_id, {}).get("state")
             if current in ("working", "finishing") and not _agent_has_active_activity(agent_id):
-                source = str(_state.get(agent_id, {}).get("source") or "")
-                if source.startswith(("agent-", "session-", "chat", "sessions-", "snapshot")):
-                    continue
                 _set_idle(agent_id, "event-idle-timeout")
 
 # ─── Meeting File Sync ────────────────────────────────────────────
