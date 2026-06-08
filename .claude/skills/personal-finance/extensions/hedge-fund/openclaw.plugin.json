@@ -1,0 +1,49 @@
+{
+  "id": "hedge-fund",
+  "name": "Office Hedge Fund",
+  "description": "Multi-agent hedge fund with Research, Quant, Risk, and Execution teams for trading stocks, gold, and BTC",
+  "version": "1.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "alpacaApiKeyEnv": {
+        "type": "string",
+        "description": "Env var holding Alpaca API key",
+        "default": "ALPACA_API_KEY"
+      },
+      "alpacaApiSecretEnv": {
+        "type": "string",
+        "description": "Env var holding Alpaca API secret",
+        "default": "ALPACA_API_SECRET"
+      },
+      "alpacaEnv": {
+        "type": "string",
+        "enum": ["paper", "live"],
+        "description": "Trading environment",
+        "default": "paper"
+      },
+      "finnhubApiKeyEnv": {
+        "type": "string",
+        "description": "Env var holding Finnhub API key",
+        "default": "FINNHUB_API_KEY"
+      },
+      "maxPositionPct": {
+        "type": "number",
+        "description": "Max allocation to any single position as fraction of portfolio (0–1)",
+        "default": 0.15
+      },
+      "maxDrawdownPct": {
+        "type": "number",
+        "description": "Max portfolio drawdown before trading halt (0–1)",
+        "default": 0.10
+      },
+      "defaultUniverse": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Default trading universe (ticker symbols)",
+        "default": ["AAPL", "TSLA", "NVDA", "GLD", "BTCUSD"]
+      }
+    }
+  }
+}
