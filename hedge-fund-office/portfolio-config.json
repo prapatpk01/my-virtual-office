@@ -1,0 +1,83 @@
+{
+  "_name": "Quantum Capital Fund",
+  "_description": "Multi-strategy hedge fund — equities, ETFs, crypto",
+
+  "fund": {
+    "name": "Quantum Capital Fund",
+    "inceptionDate": "2026-01-01",
+    "currency": "USD",
+    "environment": "paper"
+  },
+
+  "trading": {
+    "universe": [
+      "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META",
+      "TSLA", "JPM", "V", "UNH",
+      "SPY", "QQQ", "GLD", "TLT", "IWM",
+      "BTCUSD", "ETHUSD"
+    ],
+    "baseNotionalPerTrade": 2000,
+    "maxPositionPct": 0.12,
+    "maxDrawdownPct": 0.08,
+    "maxOpenPositions": 10,
+    "minConfidenceScore": 40
+  },
+
+  "signals": {
+    "rsiOversoldThreshold": 30,
+    "rsiOverboughtThreshold": 70,
+    "sentimentWeight": 0.3,
+    "technicalWeight": 0.7,
+    "holdZone": 0.2
+  },
+
+  "risk": {
+    "sectorConcentrationLimit": 0.35,
+    "cryptoAllocationLimit": 0.15,
+    "etfAllocationLimit": 0.40,
+    "stopLossDefaultPct": 0.05,
+    "maxLeverage": 1.0,
+    "vatAllocationBuffer": 0.05
+  },
+
+  "schedule": {
+    "dailyCycleTime": "09:35",
+    "timezone": "America/New_York",
+    "marketOpenBuffer": 5,
+    "blackoutWindows": ["earnings_week", "fed_announcement_day"]
+  },
+
+  "teams": {
+    "manager":   { "agentId": "hf-manager",     "name": "Victoria Chen",  "role": "Fund Manager"      },
+    "research":  [
+      { "agentId": "hf-research-1", "name": "Dr. Emily Zhao", "role": "Research Analyst" },
+      { "agentId": "hf-research-2", "name": "Marcus Webb",    "role": "Research Analyst" },
+      { "agentId": "hf-research-3", "name": "Nina Patel",     "role": "Senior Analyst"   }
+    ],
+    "quant":     [
+      { "agentId": "hf-quant-1",    "name": "Kenji Tanaka",   "role": "Quant Analyst"    },
+      { "agentId": "hf-quant-2",    "name": "Aisha Okonkwo",  "role": "Quant Analyst"    }
+    ],
+    "risk":      [
+      { "agentId": "hf-risk-1",     "name": "Sam Rivera",     "role": "Risk Manager"     },
+      { "agentId": "hf-risk-2",     "name": "Chris Morgan",   "role": "Risk Analyst"     }
+    ],
+    "execution": [
+      { "agentId": "hf-execution-1","name": "Jordan Lee",     "role": "Execution Trader" },
+      { "agentId": "hf-execution-2","name": "Taylor Kim",     "role": "Execution Trader" }
+    ]
+  },
+
+  "dataSources": {
+    "priceData":   "alpaca",
+    "newsAndSentiment": "finnhub",
+    "secFilings":  "sec-edgar",
+    "economicData": "fred"
+  },
+
+  "envVars": {
+    "ALPACA_API_KEY":    "ALPACA_API_KEY",
+    "ALPACA_API_SECRET": "ALPACA_API_SECRET",
+    "FINNHUB_API_KEY":   "FINNHUB_API_KEY"
+  }
+}
