@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sentinel — Investment Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --navy:   #0d47a1;
+  --navy2:  #1565c0;
+  --navy3:  #1976d2;
+  --gold:   #f9a825;
+  --gold2:  #ffca28;
+  --bg:     #0a0e1a;
+  --bg2:    #111827;
+  --bg3:    #1c2538;
+  --card:   #1e293b;
+  --border: #2d3a52;
+  --text:   #e2e8f0;
+  --muted:  #94a3b8;
+  --green:  #22c55e;
+  --red:    #ef4444;
+  --amber:  #f59e0b;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;min-height:100vh}
+
+/* ── TOP BAR ── */
+.topbar{background:var(--bg2);border-bottom:2px solid var(--gold);padding:0 24px;display:flex;align-items:center;gap:16px;height:56px;position:sticky;top:0;z-index:100}
+.logo{font-size:20px;font-weight:800;color:var(--gold);letter-spacing:2px;text-transform:uppercase}
+.logo span{color:var(--text);font-weight:300;font-size:12px;display:block;letter-spacing:1px;margin-top:-2px}
+.nav{display:flex;gap:4px;margin-left:auto}
+.nav-btn{background:none;border:none;color:var(--muted);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;transition:all .15s;display:flex;align-items:center;gap:6px}
+.nav-btn:hover{background:var(--bg3);color:var(--text)}
+.nav-btn.active{background:var(--navy);color:white}
+.nav-icon{font-size:15px}
+.badge{background:var(--gold);color:#000;font-size:10px;font-weight:700;padding:1px 5px;border-radius:10px}
+
+/* ── CONTENT ── */
+.page{display:none;padding:24px;max-width:1400px;margin:0 auto}
+.page.active{display:block}
+
+/* ── CARDS ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px}
+.card-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:16px}
+.grid{display:grid;gap:16px}
+.g2{grid-template-columns:repeat(2,1fr)}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)}
+.g5{grid-template-columns:repeat(5,1fr)}
+@media(max-width:900px){.g4,.g5{grid-template-columns:repeat(2,1fr)}.g3{grid-template-columns:1fr}}
+@media(max-width:600px){.g2,.g3,.g4,.g5{grid-template-columns:1fr}}
+
+/* ── METRIC TILES ── */
+.metric{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
+.metric-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
+.metric-value{font-size:24px;font-weight:700;color:var(--text);line-height:1.1}
+.metric-sub{font-size:12px;color:var(--muted);margin-top:4px}
+.metric-badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 8px;border-radius:20px;margin-top:6px}
+.beat{background:#14532d;color:#4ade80}
+.ontarget{background:#1c3a5e;color:#60a5fa}
+.miss{background:#450a0a;color:#f87171}
+
+/* ── TABLE ── */
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{background:var(--navy);color:white;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;padding:10px 12px;text-align:right}
+.tbl th:first-child{text-align:left}
+.tbl td{padding:9px 12px;border-bottom:1px solid var(--border);text-align:right;font-size:13px}
+.tbl td:first-child{text-align:left}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr:hover td{background:rgba(255,255,255,.03)}
+.tbl .total-row td{background:var(--navy);font-weight:700;color:white}
+.pos{color:var(--green)}
+.neg{color:var(--red)}
+
+/* ── SECTION HEADER ── */
+.sec-header{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.sec-title{font-size:16px;font-weight:700;color:var(--text)}
+.sec-sub{font-size:12px;color:var(--muted)}
+.divider{border-top:1px solid var(--border);margin:24px 0}
+.gold-bar{width:4px;height:24px;background:var(--gold);border-radius:2px}
+
+/* ── STATUS PILLS ── */
+.pill{display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700}
+.pill-green{background:#14532d;color:#4ade80}
+.pill-red{background:#450a0a;color:#f87171}
+.pill-amber{background:#451a03;color:#fb923c}
+.pill-blue{background:#1e3a5f;color:#60a5fa}
+.pill-gold{background:#451a03;color:var(--gold2)}
+
+/* ── PROGRESS BAR ── */
+.progress-wrap{background:#1e293b;border-radius:99px;height:8px;overflow:hidden;margin-top:6px}
+.progress-fill{height:100%;border-radius:99px;transition:width .6s ease}
+
+/* ── CHART WRAPPER ── */
+.chart-box{position:relative;height:280px}
+.chart-box-sm{position:relative;height:220px}
+
+/* ── WATCHLIST ── */
+.wl-row{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border);gap:12px}
+.wl-row:last-child{border-bottom:none}
+.wl-ticker{font-weight:800;font-size:15px;width:60px;color:var(--gold)}
+.wl-name{flex:1;font-size:12px;color:var(--muted)}
+.wl-theme{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--navy);color:#93c5fd}
+.wl-thesis{font-size:12px;color:var(--text);flex:2}
+.wl-entry{text-align:right;font-size:12px;min-width:80px}
+
+/* ── MARKET ── */
+.market-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media(max-width:700px){.market-grid{grid-template-columns:1fr}}
+.market-item{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:14px}
+.market-name{font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.6px}
+.market-val{font-size:18px;font-weight:700}
+.market-chg{font-size:12px;margin-top:2px}
+
+/* ── REBALANCE ── */
+.action-sell{border-left:3px solid var(--red);padding-left:10px}
+.action-buy{border-left:3px solid var(--green);padding-left:10px}
+.cpi-box{border:1px solid var(--gold);border-radius:10px;padding:16px;background:rgba(249,168,37,.05)}
+.cpi-title{color:var(--gold);font-weight:700;font-size:13px;margin-bottom:10px}
+
+/* ── REPORT ── */
+.period-card{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:14px;display:flex;justify-content:space-between;align-items:center}
+
+/* ── FOOTER ── */
+footer{text-align:center;font-size:11px;color:var(--muted);padding:24px;border-top:1px solid var(--border);margin-top:40px}
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div class="logo">SENTINEL<span>Investment Dashboard — Q2/2026</span></div>
+  <nav class="nav">
+    <button class="nav-btn active" onclick="showPage('dashboard')" id="btn-dashboard">
+      <span class="nav-icon">📊</span> Dashboard
+    </button>
+    <button class="nav-btn" onclick="showPage('portfolio')" id="btn-portfolio">
+      <span class="nav-icon">💼</span> Portfolio
+    </button>
+    <button class="nav-btn" onclick="showPage('reports')" id="btn-reports">
+      <span class="nav-icon">📈</span> Reports
+    </button>
+    <button class="nav-btn" onclick="showPage('watchlist')" id="btn-watchlist">
+      <span class="nav-icon">🔍</span> Watchlist <span class="badge">6</span>
+    </button>
+    <button class="nav-btn" onclick="showPage('rebalance')" id="btn-rebalance">
+      <span class="nav-icon">⚖️</span> Rebalance
+    </button>
+  </nav>
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- PAGE: DASHBOARD                            -->
+<!-- ═══════════════════════════════════════════ -->
+<div class="page active" id="page-dashboard">
+
+  <!-- KPI Row -->
+  <div class="grid g5" style="margin-bottom:20px">
+    <div class="metric">
+      <div class="metric-label">NAV (USD)</div>
+      <div class="metric-value">$11,887</div>
+      <div class="metric-sub">≈ 389,417 THB</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Q2 Total Return</div>
+      <div class="metric-value pos">+9.53%</div>
+      <div class="metric-badge beat">BEAT 5.50% target</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">YTD 2026 Return</div>
+      <div class="metric-value pos">+10.22%</div>
+      <div class="metric-badge beat">BEAT 8.00% target</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Since Inception</div>
+      <div class="metric-value pos">+19.87%</div>
+      <div class="metric-sub">Nov 2025 – Jun 2026</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Dividend Yield (FWD)</div>
+      <div class="metric-value" style="color:var(--gold)">6.11%</div>
+      <div class="metric-badge ontarget">ON TARGET 5–6%</div>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:20px">
+    <!-- NAV Chart -->
+    <div class="card">
+      <div class="card-title">NAV Growth Since Inception (USD)</div>
+      <div class="chart-box"><canvas id="navChart"></canvas></div>
+    </div>
+    <!-- Returns vs Target -->
+    <div class="card">
+      <div class="card-title">Quarterly Returns vs Target</div>
+      <div class="chart-box"><canvas id="returnsChart"></canvas></div>
+    </div>
+  </div>
+
+  <div class="grid g3">
+    <!-- Portfolio Allocation Pie -->
+    <div class="card">
+      <div class="card-title">Portfolio Allocation</div>
+      <div class="chart-box-sm"><canvas id="allocChart"></canvas></div>
+    </div>
+    <!-- Dividend Summary -->
+    <div class="card">
+      <div class="card-title">Dividend Snapshot</div>
+      <div style="display:flex;flex-direction:column;gap:12px;margin-top:4px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--muted);font-size:12px">FWD Annual Dividend</span>
+          <span style="font-weight:700;color:var(--gold)">$764.37</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--muted);font-size:12px">Monthly Average (FWD)</span>
+          <span style="font-weight:700">$63.70</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--muted);font-size:12px">Q2 Dividend Received</span>
+          <span style="font-weight:700;color:var(--green)">$169.10</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--muted);font-size:12px">Total Since Inception</span>
+          <span style="font-weight:700">$778.36</span>
+        </div>
+        <div class="divider" style="margin:0"></div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--muted);font-size:12px">Payout Ratio (SI avg)</span>
+          <span style="font-weight:700">52.5%</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--muted);font-size:12px">Reinvestment Rate</span>
+          <span style="font-weight:700;color:var(--green)">47.5%</span>
+        </div>
+        <div style="margin-top:4px">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Reinvestment Progress (SI)</div>
+          <div class="progress-wrap">
+            <div class="progress-fill" style="width:47.5%;background:var(--green)"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- Market Conditions -->
+    <div class="card">
+      <div class="card-title">Market Conditions — Jun 2026</div>
+      <div style="display:flex;flex-direction:column;gap:10px;margin-top:4px">
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--muted);font-size:12px">S&amp;P 500</span>
+          <span style="font-weight:700">5,477 <span class="pos" style="font-size:11px">+YTD ~10.5%</span></span>
+        </div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--muted);font-size:12px">Fed Rate</span>
+          <span style="font-weight:700">3.50–3.75%</span>
+        </div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--muted);font-size:12px">Oil (Brent)</span>
+          <span style="font-weight:700 ;color:var(--amber)">~$120 <span style="font-size:11px;color:var(--muted)">(Iran war)</span></span>
+        </div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--muted);font-size:12px">USD/THB</span>
+          <span style="font-weight:700">32.76</span>
+        </div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--muted);font-size:12px">CAPE Ratio</span>
+          <span style="font-weight:700;color:var(--amber)">~36 (98th %ile)</span>
+        </div>
+        <div class="divider" style="margin:4px 0"></div>
+        <div class="cpi-box" style="margin-top:0;padding:10px">
+          <div class="cpi-title" style="font-size:11px;margin-bottom:6px">⚠️ CPI Report — Jun 10, 08:30 ET</div>
+          <div style="font-size:11px;color:var(--muted);line-height:1.6">
+            &lt;3.5% → Deploy fully<br>
+            3.5–4.0% → Deploy 50%<br>
+            &gt;4.0% → Hold cash
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- PAGE: PORTFOLIO                            -->
+<!-- ═══════════════════════════════════════════ -->
+<div class="page" id="page-portfolio">
+
+  <div class="sec-header">
+    <div class="gold-bar"></div>
+    <div>
+      <div class="sec-title">Portfolio Holdings</div>
+      <div class="sec-sub">30 June 2026 · NAV $11,887.00 · 3 Portfolios (post-rebalance)</div>
+    </div>
+  </div>
+
+  <!-- Summary by Portfolio -->
+  <div class="grid g4" style="margin-bottom:24px">
+    <div class="metric" style="border-left:4px solid #3b82f6">
+      <div class="metric-label">Sentinel Global</div>
+      <div class="metric-value">$2,993</div>
+      <div class="metric-sub">25.2% · Ret SI <span class="pos">+8.8%</span></div>
+      <div class="metric-sub" style="margin-top:4px">Div Yield ~4.5%</div>
+    </div>
+    <div class="metric" style="border-left:4px solid #a855f7">
+      <div class="metric-label">Gambit Alpha</div>
+      <div class="metric-value">$710</div>
+      <div class="metric-sub">6.0% · Ret SI <span class="neg">-2.6%</span></div>
+      <div class="metric-sub" style="margin-top:4px">Div Yield ~2.5%</div>
+    </div>
+    <div class="metric" style="border-left:4px solid #22c55e">
+      <div class="metric-label">Agis Diversify</div>
+      <div class="metric-value">$1,201</div>
+      <div class="metric-sub">10.1% · Ret SI <span class="neg">-1.7%</span></div>
+      <div class="metric-sub" style="margin-top:4px">Div Yield ~7.2%</div>
+    </div>
+    <div class="metric" style="border-left:4px solid var(--gold)">
+      <div class="metric-label">Kinetic Income</div>
+      <div class="metric-value">$6,983</div>
+      <div class="metric-sub">58.7% · Ret SI <span class="pos">+8.0%</span></div>
+      <div class="metric-sub" style="margin-top:4px">Div Yield ~10.2%</div>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:24px">
+    <div class="card">
+      <div class="card-title">Allocation by Portfolio</div>
+      <div class="chart-box"><canvas id="portPieChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Allocation by Asset Class</div>
+      <div class="chart-box"><canvas id="assetPieChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Holdings Table -->
+  <div class="card">
+    <div class="card-title">Individual Holdings (16 Positions)</div>
+    <div style="overflow-x:auto">
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>Portfolio</th>
+            <th>Ticker</th>
+            <th>Name</th>
+            <th>Units</th>
+            <th>Price</th>
+            <th>Value</th>
+            <th>Wt%</th>
+            <th>Return SI</th>
+            <th>Div Yield</th>
+          </tr>
+        </thead>
+        <tbody id="holdingsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- PAGE: REPORTS                              -->
+<!-- ═══════════════════════════════════════════ -->
+<div class="page" id="page-reports">
+
+  <!-- Performance History -->
+  <div class="sec-header">
+    <div class="gold-bar"></div>
+    <div>
+      <div class="sec-title">Performance History</div>
+      <div class="sec-sub">Sentinel Fund · Since Inception Nov 2025</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:24px">
+    <div style="overflow-x:auto">
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>Period</th>
+            <th>Start NAV</th>
+            <th>End NAV</th>
+            <th>Cap Gain</th>
+            <th>Cap Ret%</th>
+            <th>Dividend</th>
+            <th>Total Ret</th>
+            <th>Total Ret%</th>
+            <th>S&amp;P 500</th>
+          </tr>
+        </thead>
+        <tbody id="perfBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:24px">
+    <div class="card">
+      <div class="card-title">NAV Growth Over Time</div>
+      <div class="chart-box"><canvas id="navLineChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Returns by Period vs S&amp;P 500</div>
+      <div class="chart-box"><canvas id="retBarChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Monthly Cashflow -->
+  <div class="sec-header" style="margin-top:8px">
+    <div class="gold-bar"></div>
+    <div>
+      <div class="sec-title">Monthly Cashflow</div>
+      <div class="sec-sub">Nov 2025 – Jun 2026</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:24px">
+    <div style="overflow-x:auto">
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>Month</th>
+            <th>NAV (USD)</th>
+            <th>Invest</th>
+            <th>Withdraw</th>
+            <th>Dividend</th>
+            <th>Net CF</th>
+            <th>Cumul. Div</th>
+          </tr>
+        </thead>
+        <tbody id="cfBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:24px">
+    <div class="card">
+      <div class="card-title">Monthly Dividend vs Withdrawal</div>
+      <div class="chart-box"><canvas id="divWithdrawChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Cumulative Dividend Income</div>
+      <div class="chart-box"><canvas id="cumDivChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Dividend & Payout -->
+  <div class="sec-header">
+    <div class="gold-bar"></div>
+    <div>
+      <div class="sec-title">Dividend &amp; Payout Analysis</div>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:24px">
+    <div class="card">
+      <div class="card-title">Payout Ratio by Period</div>
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>Period</th>
+            <th>Dividend</th>
+            <th>Withdrawn</th>
+            <th>Reinvested</th>
+            <th>Payout%</th>
+          </tr>
+        </thead>
+        <tbody id="payoutBody"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="card-title">Forward Dividend Schedule (Jul 2026 – Jun 2027)</div>
+      <div class="chart-box"><canvas id="fwdDivChart"></canvas></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- PAGE: WATCHLIST                            -->
+<!-- ═══════════════════════════════════════════ -->
+<div class="page" id="page-watchlist">
+
+  <div class="grid g2" style="margin-bottom:24px">
+    <!-- Market Overview -->
+    <div class="card">
+      <div class="card-title">Market Overview — June 9, 2026</div>
+      <div class="market-grid">
+        <div class="market-item">
+          <div class="market-name">S&amp;P 500</div>
+          <div class="market-val">5,477</div>
+          <div class="market-chg pos">+10.5% YTD</div>
+        </div>
+        <div class="market-item">
+          <div class="market-name">NASDAQ</div>
+          <div class="market-val">17,340</div>
+          <div class="market-chg pos">+14.2% YTD</div>
+        </div>
+        <div class="market-item">
+          <div class="market-name">Brent Oil</div>
+          <div class="market-val" style="color:var(--amber)">$120.40</div>
+          <div class="market-chg neg">Iran war risk</div>
+        </div>
+        <div class="market-item">
+          <div class="market-name">USD/THB</div>
+          <div class="market-val">32.76</div>
+          <div class="market-chg" style="color:var(--muted)">Stable</div>
+        </div>
+        <div class="market-item">
+          <div class="market-name">Fed Funds Rate</div>
+          <div class="market-val">3.625%</div>
+          <div class="market-chg" style="color:var(--muted)">Hold — no cut Q2</div>
+        </div>
+        <div class="market-item">
+          <div class="market-name">10Y Treasury</div>
+          <div class="market-val">4.42%</div>
+          <div class="market-chg neg">Rising</div>
+        </div>
+      </div>
+      <div class="cpi-box" style="margin-top:16px">
+        <div class="cpi-title">⚠️ CPI Report — June 10, 2026 @ 08:30 ET</div>
+        <div style="font-size:12px;color:var(--text);line-height:1.8">
+          <span style="color:var(--green)">● Cool (&lt;3.5%)</span> — Deploy fully → SPMO/VOO/SCHD/RKLB/CRWV<br>
+          <span style="color:var(--amber)">● In-line (3.5–4.0%)</span> — Deploy 50% → SPMO/VOO only<br>
+          <span style="color:var(--red)">● Hot (&gt;4.0%)</span> — Hold cash, wait for dip
+        </div>
+      </div>
+    </div>
+
+    <!-- Investment Themes -->
+    <div class="card">
+      <div class="card-title">Investment Themes 2026</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="background:var(--bg3);border-radius:8px;padding:12px">
+          <div style="font-weight:700;color:var(--gold);font-size:13px;margin-bottom:4px">🤖 AI Infrastructure</div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6">Hyperscaler capex $300B+ in 2026. NVIDIA Rubin platform 2H launch. CoreWeave CRWV scaling GPU cloud. Power = key constraint → CSWC, NEE.</div>
+        </div>
+        <div style="background:var(--bg3);border-radius:8px;padding:12px">
+          <div style="font-weight:700;color:#60a5fa;font-size:13px;margin-bottom:4px">🚀 Space & Defense</div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6">Iran/Middle East conflict → defense spending. Rocket Lab RKLB capturing Falcon-9 small launch market. NASA/DoD contracts pipeline solid.</div>
+        </div>
+        <div style="background:var(--bg3);border-radius:8px;padding:12px">
+          <div style="font-weight:700;color:#a78bfa;font-size:13px;margin-bottom:4px">🎙️ AI Agents / Voice</div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6">SoundHound SOUN voice AI winning auto/retail contracts. PLTR agent OS for enterprise — 85% revenue growth YoY.</div>
+        </div>
+        <div style="background:var(--bg3);border-radius:8px;padding:12px">
+          <div style="font-weight:700;color:#34d399;font-size:13px;margin-bottom:4px">⚡ Energy / Commodities Hedge</div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6">Oil $120+ on Iran tensions. IXC global energy ETF or UROY uranium for power demand hedge. Inflation protection layer.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Watchlist Table -->
+  <div class="card">
+    <div class="card-title">Active Watchlist — Gambit Alpha Candidates</div>
+    <div id="watchlistTable"></div>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Existing positions note -->
+  <div class="grid g2">
+    <div class="card">
+      <div class="card-title">NVDA — Hold Thesis</div>
+      <div style="font-size:13px;line-height:1.8">
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <span style="color:var(--muted)">Current Price</span>
+          <span style="font-weight:700">$208.64</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <span style="color:var(--muted)">Analyst Target</span>
+          <span style="font-weight:700;color:var(--green)">$298–$311</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <span style="color:var(--muted)">Buy Ratings</span>
+          <span style="font-weight:700;color:var(--green)">73/76 analysts</span>
+        </div>
+        <div class="divider" style="margin:10px 0"></div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.7">
+          Rubin platform launch 2H 2026 is key catalyst. GB200 NVL72 cluster demand exceeding supply. Hold — do not sell into current weakness. Upside +43–49% to target.
+        </div>
+        <div style="margin-top:10px"><span class="pill pill-green">HOLD</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">PLTR — Hold Thesis</div>
+      <div style="font-size:13px;line-height:1.8">
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <span style="color:var(--muted)">Current Price</span>
+          <span style="font-weight:700">$136.47</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <span style="color:var(--muted)">Key Support</span>
+          <span style="font-weight:700;color:var(--amber)">$121.92</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <span style="color:var(--muted)">FY2026 Revenue Guide</span>
+          <span style="font-weight:700">$7.65B</span>
+        </div>
+        <div class="divider" style="margin:10px 0"></div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.7">
+          85% YoY revenue growth. AIP (AI Platform) enterprise adoption accelerating. Government + commercial dual moat. Overvalued by traditional metrics but growth justifies premium. Hold above $121.92 support.
+        </div>
+        <div style="margin-top:10px"><span class="pill pill-green">HOLD</span></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- PAGE: REBALANCE                            -->
+<!-- ═══════════════════════════════════════════ -->
+<div class="page" id="page-rebalance">
+
+  <div class="sec-header">
+    <div class="gold-bar"></div>
+    <div>
+      <div class="sec-title">Phase 1 Rebalance Plan</div>
+      <div class="sec-sub">June 9, 2026 · 4-Portfolio → 3-Portfolio Consolidation</div>
+    </div>
+  </div>
+
+  <!-- Phase 1 Sells -->
+  <div class="card action-sell" style="margin-bottom:20px">
+    <div class="card-title" style="color:var(--red)">🔴 SELL ORDERS — Execute at Market Open Today</div>
+    <div style="overflow-x:auto">
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Ticker</th>
+            <th>Action</th>
+            <th>Units</th>
+            <th>Price</th>
+            <th>Proceeds</th>
+            <th>P&amp;L%</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="sellBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Target Structure -->
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="card-title">Target 3-Portfolio Structure</div>
+      <div style="overflow-x:auto">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>Portfolio</th>
+              <th>Current%</th>
+              <th>Target%</th>
+              <th>Target Value</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Sentinel Global</td>
+              <td>25.2%</td>
+              <td style="color:var(--gold);font-weight:700">80%</td>
+              <td>$9,510</td>
+              <td><span class="pill pill-blue">Rebalance</span></td>
+            </tr>
+            <tr>
+              <td>Gambit Alpha</td>
+              <td>6.0%</td>
+              <td style="color:var(--gold);font-weight:700">8%</td>
+              <td>$950</td>
+              <td><span class="pill pill-green">Add</span></td>
+            </tr>
+            <tr>
+              <td>Agis Diversify</td>
+              <td>10.1%</td>
+              <td style="color:var(--gold);font-weight:700">12%</td>
+              <td>$1,427</td>
+              <td><span class="pill pill-amber">Monitor</span></td>
+            </tr>
+            <tr class="total-row">
+              <td>TOTAL</td>
+              <td>41.3%</td>
+              <td>100%</td>
+              <td>$11,887</td>
+              <td>—</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Before / After Portfolio Allocation</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;height:220px">
+        <div style="display:flex;flex-direction:column;align-items:center">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:8px;text-align:center">BEFORE (4 Portfolios)</div>
+          <canvas id="beforeChart" style="max-height:180px"></canvas>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:8px;text-align:center">AFTER (3 Portfolios)</div>
+          <canvas id="afterChart" style="max-height:180px"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Buy Orders (Post-CPI) -->
+  <div class="card action-buy" style="margin-bottom:20px">
+    <div class="card-title" style="color:var(--green)">🟢 BUY ORDERS — Execute AFTER CPI June 10 @ 08:30 ET</div>
+    <div style="overflow-x:auto">
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Ticker</th>
+            <th>Action</th>
+            <th>Est. Units</th>
+            <th>Target Price</th>
+            <th>Amount</th>
+            <th>Portfolio</th>
+            <th>Condition</th>
+          </tr>
+        </thead>
+        <tbody id="buyBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- CPI Decision Framework -->
+  <div class="cpi-box">
+    <div class="cpi-title" style="font-size:14px">⚠️ CPI Decision Framework — June 10, 2026</div>
+    <div class="grid g3" style="margin-top:12px">
+      <div style="background:rgba(34,197,94,.1);border:1px solid #16a34a;border-radius:8px;padding:12px">
+        <div style="color:var(--green);font-weight:700;font-size:13px;margin-bottom:6px">COOL — &lt;3.5%</div>
+        <div style="font-size:12px;color:var(--text);line-height:1.7">
+          Deploy all $4,095 proceeds<br>
+          Buy: SPMO $1,300 + VOO $1,400 + SCHD $650 + JAAA $100<br>
+          Gambit: RKLB $200–300 + CRWV $200–300
+        </div>
+      </div>
+      <div style="background:rgba(245,158,11,.1);border:1px solid #d97706;border-radius:8px;padding:12px">
+        <div style="color:var(--amber);font-weight:700;font-size:13px;margin-bottom:6px">IN-LINE — 3.5–4.0%</div>
+        <div style="font-size:12px;color:var(--text);line-height:1.7">
+          Deploy ~50% ($2,000)<br>
+          Buy: SPMO $1,000 + VOO $1,000<br>
+          Skip Gambit speculation for now
+        </div>
+      </div>
+      <div style="background:rgba(239,68,68,.1);border:1px solid #dc2626;border-radius:8px;padding:12px">
+        <div style="color:var(--red);font-weight:700;font-size:13px;margin-bottom:6px">HOT — &gt;4.0%</div>
+        <div style="font-size:12px;color:var(--text);line-height:1.7">
+          Hold all cash in SGOV/T-Bills<br>
+          Wait for market dip (-5% to -8%)<br>
+          Re-evaluate in 2–3 weeks
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  Sentinel Investment Report &nbsp;|&nbsp; Q2/2026 &nbsp;|&nbsp; Confidential &nbsp;|&nbsp; As of June 9, 2026
+</footer>
+
+<script>
+/* ══════════════════════════════════════════════
+   DATA
+══════════════════════════════════════════════ */
+const holdings = [
+  ["Sentinel Global","SPMO","S&P 500 Momentum",6.07,147.88,897.68,"29.99%","+18.06%","~0.8%"],
+  ["Sentinel Global","VOO","Vanguard S&P 500",0.99,679.68,672.68,"22.47%","+15.01%","~1.3%"],
+  ["Sentinel Global","SCHD","Schwab US Dividend",12.84,32.29,414.73,"13.85%","+3.77%","~3.7%"],
+  ["Sentinel Global","JAAA","Janus AAA CLO ETF",3.00,124.71,374.13,"12.50%","-0.03%","~6.5%"],
+  ["Sentinel Global","AVDV","Avantis Intl SC Val",3.00,106.27,318.76,"10.65%","-3.13%","~3.5%"],
+  ["Sentinel Global","DFIV","DFA Intl Value",5.75,54.87,315.17,"10.53%","-1.74%","~4.0%"],
+  ["Gambit Alpha","SGOV","iShares 0-3M T-Bill",4.39,99.00,434.52,"61.20%","+0.03%","~5.1%"],
+  ["Gambit Alpha","NVDA","NVIDIA Corp",0.87,208.64,181.55,"25.57%","-7.16%","~0.0%"],
+  ["Gambit Alpha","PLTR","Palantir Tech",0.69,136.47,93.86,"13.22%","-5.96%","~0.0%"],
+  ["Agis Diversify","O","Realty Income",7.00,60.02,420.17,"34.98%","-4.36%","~5.7%"],
+  ["Agis Diversify","MAIN","Main Street Capital",7.00,51.37,359.59,"29.95%","-4.61%","~9.8%"],
+  ["Agis Diversify","HSBC","HSBC Holdings",3.49,91.53,319.14,"26.58%","+7.17%","~4.2%"],
+  ["Agis Diversify","CIG","Cemig (Brazil)",50.00,2.04,101.93,"8.49%","-7.90%","~8.0%"],
+  ["Kinetic Income","GPIQ","GS Nasdaq PremIncome",75.00,57.62,4321.50,"61.88%","+10.69%","~11.5%"],
+  ["Kinetic Income","QDVO","Amplify CWP Enh Div",50.00,29.85,1492.50,"21.37%","+2.94%","~9.0%"],
+  ["Kinetic Income","BALI","Innovator MSCI EAFE",35.00,33.41,1169.35,"16.74%","+4.30%","~4.5%"],
+];
+
+const perf = [
+  ["Nov–Dec 2025 (SI)",9307.97,9933.84,625.87,"8.75%",452.36,1078.23,"13.61%","~4.0%"],
+  ["Q1 2026 (Jan–Mar)",10784.00,11007.41,223.41,"2.06%",157.00,380.41,"3.49%","~3.0%"],
+  ["Q2 2026 (Apr–Jun)",11007.41,11887.00,879.59,"8.00%",169.00,1048.59,"9.53%","~5.0%"],
+  ["2026 YTD",10784.00,11887.00,1103.00,"10.22%",326.00,1429.00,"13.24%","~10.5%"],
+  ["Since Inception",9307.97,11887.00,2579.03,"27.71%",778.36,3357.39,"36.07%","~14.5%"],
+];
+
+const cashflow = [
+  ["Nov 2025","~9,500",880.41,6.07,17.56,874.34,17.56],
+  ["Dec 2025",9933.84,8327.56,10.93,434.70,8316.63,452.26],
+  ["Jan 2026","~10,200",5160.43,0.00,49.00,5160.43,501.26],
+  ["Feb 2026","~10,400",192.47,83.33,49.00,109.14,550.26],
+  ["Mar 2026",11007.41,10273.53,0.00,59.00,10273.53,609.26],
+  ["Apr 2026","~11,200",0.00,40.49,52.00,-40.49,661.26],
+  ["May 2026","~11,500",488.52,27.95,47.00,460.57,708.26],
+  ["Jun 2026",11887.00,0.00,240.00,70.10,-240.00,778.36],
+];
+
+const payout = [
+  ["Nov 2025",17.56,6.07,11.49,"34.6%"],
+  ["Dec 2025",434.70,10.93,423.77,"2.5%"],
+  ["2025 Total",452.26,17.00,435.26,"3.8%"],
+  ["Q1 2026",157.00,83.33,73.67,"53.1%"],
+  ["Q2 2026*",169.10,308.44,-139.34,"182.5%"],
+  ["Since Inception",778.36,408.77,369.59,"52.5%"],
+];
+
+const sells = [
+  [1,"GPIQ","SELL",38,57.62,2189.56,"+10.69%","Reduce income concentration 36%→18%"],
+  [2,"BALI","SELL",35,33.41,1169.35,"+4.30%","Lock profit before CPI"],
+  [3,"AVDV","SELL",3,106.27,318.81,"-3.13%","Loss harvest / simplify"],
+  [4,"DFIV","SELL",5.75,54.87,315.50,"-1.74%","Loss harvest / simplify"],
+  [5,"CIG","SELL",50,2.04,102.00,"-7.90%","Loss harvest / exit EM risk"],
+  ["","TOTAL","","","",4095.22,"",""],
+];
+
+const buys = [
+  [1,"SPMO","BUY","~8.8","~$148","$1,300","Sentinel","After CPI"],
+  [2,"VOO","BUY","~2.0","~$680","$1,400","Sentinel","After CPI"],
+  [3,"SCHD","BUY","~20","~$32.50","$650","Sentinel","After CPI"],
+  [4,"JAAA","BUY","~0.8","~$125","$100","Sentinel","After CPI"],
+  [5,"RKLB","BUY","~14","~$21","$200–300","Gambit","CPI ≤4.0%"],
+  [6,"CRWV","BUY","~2","~$125","$200–300","Gambit","CPI ≤4.0%"],
+];
+
+const watchlist = [
+  {ticker:"RKLB",name:"Rocket Lab USA",theme:"Space/Defense",entry:"$18–22",
+   thesis:"Capturing Falcon-9 small launch market. NASA/DoD contracts. ESCAPADE Mars mission 2025. Neutron rocket 2026 catalyst. Competitive moat in vertical integration.",
+   conviction:"HIGH",action:"BUY post-CPI"},
+  {ticker:"CRWV",name:"CoreWeave",theme:"AI Infra",entry:"$110–130",
+   thesis:"GPU cloud scaling at hyperscaler speed. NVIDIA H100/H200 fleet. $23B revenue pipeline. Microsoft $10B contract. Pure-play AI infra play.",
+   conviction:"HIGH",action:"BUY post-CPI"},
+  {ticker:"SOUN",name:"SoundHound AI",theme:"AI Agents/Voice",entry:"$8–12",
+   thesis:"Voice AI platform winning auto (Mercedes, Stellantis), restaurant, healthcare. 85% gross margin. $150M+ ARR target 2026. Speculative high-risk.",
+   conviction:"MEDIUM",action:"Watchlist only"},
+  {ticker:"STX",name:"Seagate Technology",theme:"AI Storage",entry:"$90–100",
+   thesis:"AI data center storage demand. HAMR technology refresh cycle. Wait for pullback below $95.",
+   conviction:"MEDIUM",action:"Wait for pullback"},
+  {ticker:"IXC",name:"iShares Global Energy ETF",theme:"Energy Hedge",entry:"$38–42",
+   thesis:"Iran war risk → oil $120+. Diversified global energy exposure. Inflation hedge layer. Low correlation to tech.",
+   conviction:"LOW-MED",action:"Opportunistic"},
+  {ticker:"UROY",name:"Uranium Royalty Corp",theme:"Nuclear/Energy",entry:"$3–5",
+   thesis:"AI power demand surge → nuclear renaissance. Small position hedge. SMR deployment 2027+.",
+   conviction:"LOW",action:"Watchlist only"},
+];
+
+/* ══════════════════════════════════════════════
+   NAV / PAGE NAVIGATION
+══════════════════════════════════════════════ */
+function showPage(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('page-'+id).classList.add('active');
+  document.getElementById('btn-'+id).classList.add('active');
+  if(id==='reports' && !window._reportsBuilt){ buildReportCharts(); window._reportsBuilt=true; }
+}
+
+/* ══════════════════════════════════════════════
+   TABLE BUILDERS
+══════════════════════════════════════════════ */
+function fmt(n,d=2){ return typeof n==='number' ? n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}) : n; }
+function fmtUSD(n){ return typeof n==='number' ? '$'+fmt(n) : n; }
+
+// Holdings
+const hb = document.getElementById('holdingsBody');
+let lastPort = '';
+holdings.forEach(r => {
+  const isnew = r[0]!==lastPort; lastPort=r[0];
+  const ret = r[7];
+  const isPos = ret.startsWith('+');
+  const isNeg = ret.startsWith('-');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td style="font-size:11px;color:var(--muted)">${isnew?r[0]:''}</td>
+    <td style="font-weight:700;color:var(--gold)">${r[1]}</td>
+    <td style="font-size:12px">${r[2]}</td>
+    <td>${fmt(r[3],2)}</td>
+    <td>$${fmt(r[4])}</td>
+    <td style="font-weight:600">$${fmt(r[5])}</td>
+    <td>${r[6]}</td>
+    <td style="font-weight:700;color:${isPos?'var(--green)':isNeg?'var(--red)':'var(--text)'}">${r[7]}</td>
+    <td style="color:var(--amber)">${r[8]}</td>`;
+  hb.appendChild(tr);
+});
+
+// Performance
+const pb = document.getElementById('perfBody');
+perf.forEach((r,i) => {
+  const isTotal = i>=3;
+  const cr = parseFloat(r[4]);
+  const tr2 = parseFloat(r[7]);
+  pb.innerHTML += `<tr${isTotal?' style="font-weight:600"':''}>
+    <td>${r[0]}</td><td>${fmtUSD(r[1])}</td><td>${fmtUSD(r[2])}</td>
+    <td>${fmtUSD(r[3])}</td>
+    <td style="color:${cr>=0?'var(--green)':'var(--red)'};font-weight:700">${r[4]}</td>
+    <td>${fmtUSD(r[5])}</td><td style="font-weight:600">${fmtUSD(r[6])}</td>
+    <td style="color:${tr2>=0?'var(--green)':'var(--red)'};font-weight:700">${r[7]}</td>
+    <td style="color:var(--muted)">${r[8]}</td></tr>`;
+});
+
+// Cashflow
+const cfb = document.getElementById('cfBody');
+cashflow.forEach(r => {
+  const neg = typeof r[5]==='number' && r[5]<0;
+  cfb.innerHTML += `<tr>
+    <td style="font-weight:600">${r[0]}</td>
+    <td>${fmtUSD(r[1])}</td>
+    <td style="color:var(--green)">${fmtUSD(r[2])}</td>
+    <td style="color:var(--red)">${fmtUSD(r[3])}</td>
+    <td style="color:var(--amber)">${fmtUSD(r[4])}</td>
+    <td style="color:${neg?'var(--red)':'var(--green)'};font-weight:700">${fmtUSD(r[5])}</td>
+    <td>${fmtUSD(r[6])}</td></tr>`;
+});
+// Total row
+cfb.innerHTML += `<tr class="total-row">
+  <td>TOTAL</td><td>—</td>
+  <td>$25,322.92</td><td>$408.77</td><td>$778.36</td><td>$24,914.15</td><td>—</td></tr>`;
+
+// Payout
+const pyb = document.getElementById('payoutBody');
+payout.forEach(r => {
+  const isNeg = typeof r[3]==='number' && r[3]<0;
+  pyb.innerHTML += `<tr>
+    <td>${r[0]}</td>
+    <td>$${fmt(r[1])}</td>
+    <td style="color:var(--red)">$${fmt(r[2])}</td>
+    <td style="color:${isNeg?'var(--red)':'var(--green)'}">$${fmt(r[3])}</td>
+    <td style="font-weight:700">${r[4]}</td></tr>`;
+});
+
+// Sells
+const sb = document.getElementById('sellBody');
+sells.forEach(r => {
+  const isTot = r[1]==="TOTAL";
+  const plNeg = typeof r[6]==='string' && r[6].startsWith('-');
+  sb.innerHTML += `<tr${isTot?' class="total-row"':''}>
+    <td>${r[0]}</td>
+    <td style="font-weight:700;color:${isTot?'white':'var(--gold)'}">${r[1]}</td>
+    <td>${r[2]}</td><td>${r[3]}</td>
+    <td>${typeof r[4]==='number'?'$'+fmt(r[4]):r[4]}</td>
+    <td style="font-weight:700">$${fmt(r[5])}</td>
+    <td style="color:${plNeg?'var(--red)':'var(--green)'};font-weight:700">${r[6]}</td>
+    <td style="font-size:12px;color:${isTot?'white':'var(--muted)'}">${r[7]}</td></tr>`;
+});
+
+// Buys
+const bb = document.getElementById('buyBody');
+buys.forEach(r => {
+  const isGambit = r[6]==="Gambit";
+  bb.innerHTML += `<tr>
+    <td>${r[0]}</td>
+    <td style="font-weight:700;color:var(--gold)">${r[1]}</td>
+    <td style="color:var(--green);font-weight:700">${r[2]}</td>
+    <td>${r[3]}</td><td>${r[4]}</td>
+    <td style="font-weight:700">${r[5]}</td>
+    <td><span class="pill ${isGambit?'pill-gold':'pill-blue'}">${r[6]}</span></td>
+    <td style="font-size:12px;color:var(--muted)">${r[7]}</td></tr>`;
+});
+
+// Watchlist
+const wlc = document.getElementById('watchlistTable');
+watchlist.forEach(w => {
+  const convColor = w.conviction==="HIGH" ? "pill-green" : w.conviction==="MEDIUM" ? "pill-amber" : "pill-blue";
+  wlc.innerHTML += `<div class="wl-row">
+    <div class="wl-ticker">${w.ticker}</div>
+    <div class="wl-name">${w.name}</div>
+    <div class="wl-theme">${w.theme}</div>
+    <div class="wl-thesis">${w.thesis}</div>
+    <div class="wl-entry" style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+      <span style="font-weight:700;color:var(--gold)">${w.entry}</span>
+      <span class="pill ${convColor}">${w.conviction}</span>
+      <span style="font-size:11px;color:var(--muted)">${w.action}</span>
+    </div>
+  </div>`;
+});
+
+/* ══════════════════════════════════════════════
+   CHART DEFAULTS
+══════════════════════════════════════════════ */
+Chart.defaults.color = '#94a3b8';
+Chart.defaults.borderColor = '#2d3a52';
+Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+
+const NAVY = '#1565c0'; const GOLD = '#f9a825'; const GREEN = '#22c55e';
+const RED = '#ef4444';  const AMBER = '#f59e0b'; const PURPLE = '#a855f7';
+const TEAL = '#14b8a6';
+
+/* ── Dashboard: NAV line ── */
+new Chart(document.getElementById('navChart'), {
+  type:'line',
+  data:{
+    labels:['Nov 2025','Dec 2025','Mar 2026','Jun 2026'],
+    datasets:[{
+      label:'NAV (USD)',data:[9307.97,9933.84,11007.41,11887.00],
+      borderColor:GOLD,backgroundColor:'rgba(249,168,37,.12)',
+      borderWidth:3,pointBackgroundColor:GOLD,pointRadius:6,tension:.3,fill:true
+    }]
+  },
+  options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top'}},
+    scales:{y:{ticks:{callback:v=>'$'+v.toLocaleString()}}}}
+});
+
+/* ── Dashboard: Returns bar ── */
+new Chart(document.getElementById('returnsChart'), {
+  type:'bar',
+  data:{
+    labels:['Nov–Dec 2025','Q1 2026','Q2 2026'],
+    datasets:[
+      {label:'Capital Return%',data:[8.75,2.06,8.00],backgroundColor:NAVY,borderRadius:4},
+      {label:'Target (4%/qtr)',data:[4,4,4],backgroundColor:'rgba(249,168,37,.4)',borderRadius:4},
+      {label:'Total Return%',data:[13.61,3.49,9.53],backgroundColor:GREEN,borderRadius:4},
+    ]
+  },
+  options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top'}},
+    scales:{y:{ticks:{callback:v=>v+'%'}}}}
+});
+
+/* ── Dashboard: Portfolio Allocation pie ── */
+new Chart(document.getElementById('allocChart'), {
+  type:'doughnut',
+  data:{
+    labels:['Sentinel Global','Gambit Alpha','Agis Diversify','Kinetic Income'],
+    datasets:[{data:[25.2,6.0,10.1,58.7],
+      backgroundColor:[NAVY,PURPLE,GREEN,GOLD],
+      borderWidth:2,borderColor:'#1e293b'}]
+  },
+  options:{responsive:true,maintainAspectRatio:false,cutout:'55%',
+    plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:11}}}}}
+});
+
+/* ── Portfolio: Port pie ── */
+new Chart(document.getElementById('portPieChart'), {
+  type:'doughnut',
+  data:{
+    labels:['Sentinel Global','Gambit Alpha','Agis Diversify','Kinetic Income'],
+    datasets:[{data:[25.2,6.0,10.1,58.7],
+      backgroundColor:[NAVY,PURPLE,GREEN,GOLD],
+      borderWidth:2,borderColor:'#1e293b'}]
+  },
+  options:{responsive:true,maintainAspectRatio:false,cutout:'55%',
+    plugins:{legend:{position:'right',labels:{boxWidth:12}}}}
+});
+
+/* ── Portfolio: Asset class pie ── */
+new Chart(document.getElementById('assetPieChart'), {
+  type:'doughnut',
+  data:{
+    labels:['Income/Covered Call','Growth Equity','Buffer/Cash','Dividend Income','International','Speculative','Other'],
+    datasets:[{data:[48.9,13.2,16.6,10.0,5.3,2.3,3.7],
+      backgroundColor:[GOLD,'#3b82f6','#6b7280',GREEN,TEAL,RED,AMBER],
+      borderWidth:2,borderColor:'#1e293b'}]
+  },
+  options:{responsive:true,maintainAspectRatio:false,cutout:'50%',
+    plugins:{legend:{position:'right',labels:{boxWidth:10,font:{size:10}}}}}
+});
+
+/* ── Rebalance: Before/After donuts ── */
+new Chart(document.getElementById('beforeChart'), {
+  type:'doughnut',
+  data:{
+    labels:['Sentinel','Gambit','Agis','Kinetic'],
+    datasets:[{data:[25.2,6,10.1,58.7],
+      backgroundColor:[NAVY,PURPLE,GREEN,GOLD],
+      borderWidth:2,borderColor:'#1e293b'}]
+  },
+  options:{responsive:true,maintainAspectRatio:false,cutout:'45%',
+    plugins:{legend:{display:false}}}
+});
+new Chart(document.getElementById('afterChart'), {
+  type:'doughnut',
+  data:{
+    labels:['Sentinel','Gambit','Agis'],
+    datasets:[{data:[80,8,12],
+      backgroundColor:[NAVY,PURPLE,GREEN],
+      borderWidth:2,borderColor:'#1e293b'}]
+  },
+  options:{responsive:true,maintainAspectRatio:false,cutout:'45%',
+    plugins:{legend:{display:false}}}
+});
+
+/* ══════════════════════════════════════════════
+   REPORT CHARTS (lazy — built on tab switch)
+══════════════════════════════════════════════ */
+function buildReportCharts(){
+  const months = ['Nov 2025','Dec 2025','Jan 2026','Feb 2026','Mar 2026','Apr 2026','May 2026','Jun 2026'];
+  const dividends = [17.56,434.70,49.00,49.00,59.00,52.00,47.00,70.10];
+  const withdrawals = [6.07,10.93,0,83.33,0,40.49,27.95,240.00];
+  const cumDiv = [17.56,452.26,501.26,550.26,609.26,661.26,708.26,778.36];
+
+  /* NAV Line */
+  new Chart(document.getElementById('navLineChart'),{
+    type:'line',
+    data:{
+      labels:['Nov 2025','Dec 2025','Mar 2026','Jun 2026'],
+      datasets:[
+        {label:'NAV USD',data:[9307.97,9933.84,11007.41,11887.00],
+         borderColor:GOLD,backgroundColor:'rgba(249,168,37,.1)',
+         borderWidth:3,pointRadius:6,tension:.3,fill:true,yAxisID:'y'},
+        {label:'NAV THB',data:[304929,325432,360603,389417],
+         borderColor:TEAL,backgroundColor:'rgba(20,184,166,.1)',
+         borderWidth:2,pointRadius:5,tension:.3,fill:false,yAxisID:'y2'},
+      ]
+    },
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{position:'top'}},
+      scales:{
+        y:{position:'left',ticks:{callback:v=>'$'+v.toLocaleString()}},
+        y2:{position:'right',grid:{drawOnChartArea:false},ticks:{callback:v=>'฿'+v.toLocaleString()}}
+      }}
+  });
+
+  /* Returns bar */
+  new Chart(document.getElementById('retBarChart'),{
+    type:'bar',
+    data:{
+      labels:['Nov–Dec 2025','Q1 2026','Q2 2026'],
+      datasets:[
+        {label:'Sentinel Total Return',data:[13.61,3.49,9.53],backgroundColor:GOLD,borderRadius:4},
+        {label:'S&P 500',data:[4.0,3.0,5.0],backgroundColor:'rgba(59,130,246,.5)',borderRadius:4},
+        {label:'Target (5.5%/qtr)',data:[5.5,5.5,5.5],type:'line',borderColor:RED,pointRadius:5,borderDash:[5,4]},
+      ]
+    },
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{position:'top'}},
+      scales:{y:{ticks:{callback:v=>v+'%'}}}}
+  });
+
+  /* Div vs Withdrawal stacked bar */
+  new Chart(document.getElementById('divWithdrawChart'),{
+    type:'bar',
+    data:{labels:months,
+      datasets:[
+        {label:'Dividend',data:dividends,backgroundColor:'rgba(249,168,37,.8)',borderRadius:2},
+        {label:'Withdrawal',data:withdrawals,backgroundColor:'rgba(239,68,68,.7)',borderRadius:2},
+      ]
+    },
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{position:'top'}},
+      scales:{x:{stacked:true},y:{stacked:true,ticks:{callback:v=>'$'+v}}}}
+  });
+
+  /* Cumulative div line */
+  new Chart(document.getElementById('cumDivChart'),{
+    type:'line',
+    data:{labels:months,
+      datasets:[{label:'Cumulative Dividend (USD)',data:cumDiv,
+        borderColor:GREEN,backgroundColor:'rgba(34,197,94,.1)',
+        borderWidth:3,pointRadius:5,tension:.4,fill:true}]
+    },
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{position:'top'}},
+      scales:{y:{ticks:{callback:v=>'$'+v}}}}
+  });
+
+  /* Forward dividend bar */
+  const fwdMonths=['Jul\'26','Aug','Sep','Oct','Nov','Dec','Jan\'27','Feb','Mar','Apr','May','Jun'];
+  const fwdVals=[70.10,59.10,60.00,65.00,58.50,57.60,57.10,58.50,68.20,71.50,60.60,78.00];
+  new Chart(document.getElementById('fwdDivChart'),{
+    type:'bar',
+    data:{labels:fwdMonths,
+      datasets:[{label:'Est. Monthly Dividend (USD)',data:fwdVals,
+        backgroundColor:fwdMonths.map((_,i)=>i<6?'rgba(249,168,37,.9)':'rgba(249,168,37,.35)'),
+        borderRadius:3}]
+    },
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},
+        tooltip:{callbacks:{footer:items=>'Cumul: $'+[70.10,129.20,189.20,254.20,312.70,370.30,427.40,485.90,554.10,625.60,686.20,764.20][items[0].dataIndex].toFixed(2)}}},
+      scales:{y:{ticks:{callback:v=>'$'+v}}}}
+  });
+}
+</script>
+
+</body>
+</html>
