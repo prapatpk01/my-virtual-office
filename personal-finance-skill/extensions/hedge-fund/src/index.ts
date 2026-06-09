@@ -76,12 +76,15 @@ const plugin: {
     // Shared mutable fund config — all tools see the same object reference,
     // so hf_set_fund_config mutations are immediately visible to subsequent calls.
     const fundConfig: FundConfig = {
-      universe: ((cfg.defaultUniverse as string[]) ?? ["AAPL", "TSLA", "NVDA", "GLD", "BTCUSD"]).map(
-        s => s.toUpperCase()
-      ),
-      maxPositionPct: (cfg.maxPositionPct as number) ?? 0.15,
-      maxDrawdownPct: (cfg.maxDrawdownPct as number) ?? 0.10,
-      baseNotionalPerTrade: 1000,
+      universe: ((cfg.defaultUniverse as string[]) ?? [
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META",
+        "TSLA", "JPM", "V", "UNH",
+        "SPY", "QQQ", "GLD", "TLT", "IWM",
+        "BTCUSD", "ETHUSD",
+      ]).map(s => s.toUpperCase()),
+      maxPositionPct: (cfg.maxPositionPct as number) ?? 0.12,
+      maxDrawdownPct: (cfg.maxDrawdownPct as number) ?? 0.08,
+      baseNotionalPerTrade: (cfg.baseNotionalPerTrade as number) ?? 2000,
     }
 
     for (const tool of ALL_TOOLS) {

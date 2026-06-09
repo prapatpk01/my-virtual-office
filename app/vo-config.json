@@ -1,7 +1,7 @@
 {
   "_comment": "Default Virtual Office config — customize during setup or via environment variables",
   "office": {
-    "name": "Virtual Office",
+    "name": "Quantum Capital Fund",
     "port": 8090,
     "wsPort": 8091
   },
