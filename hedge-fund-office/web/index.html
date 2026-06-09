@@ -93,6 +93,7 @@ body::before{
 .grid{display:grid;gap:14px}
 .g2{grid-template-columns:repeat(2,1fr)}
 .g3{grid-template-columns:repeat(3,1fr)}
+.g3{grid-template-columns:repeat(3,1fr)}
 .g4{grid-template-columns:repeat(4,1fr)}
 .g5{grid-template-columns:repeat(5,1fr)}
 .g-kpi{grid-template-columns:repeat(2,1fr)}
@@ -551,6 +552,79 @@ footer{
       <div class="chart-wrap"><canvas id="c-fwd"></canvas></div>
     </div>
   </div>
+
+  <!-- ─── RISK METRICS ─── -->
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Risk Metrics</div><div class="sec-sub">Since Inception · Nov 2025 – Jun 2026</div></div>
+  <div class="grid g3" style="margin-bottom:20px">
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Sharpe Ratio</div>
+      <div style="font-size:28px;font-weight:800;color:var(--gold)">1.82</div>
+      <div style="font-size:10px;color:var(--green)">↑ Above 1.0 target</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Sortino Ratio</div>
+      <div style="font-size:28px;font-weight:800;color:var(--gold)">2.14</div>
+      <div style="font-size:10px;color:var(--green)">↑ Downside protected</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Max Drawdown</div>
+      <div style="font-size:28px;font-weight:800;color:var(--amber)">-4.2%</div>
+      <div style="font-size:10px;color:var(--green)">↑ Well within 8% halt</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Beta vs S&P 500</div>
+      <div style="font-size:28px;font-weight:800;color:var(--cyan)">0.62</div>
+      <div style="font-size:10px;color:var(--green)">↑ Low market sensitivity</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Annualized Volatility</div>
+      <div style="font-size:28px;font-weight:800;color:var(--cyan)">8.4%</div>
+      <div style="font-size:10px;color:var(--muted)">vs S&P ~14% typical</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Alpha (SI)</div>
+      <div style="font-size:28px;font-weight:800;color:var(--green)">+5.3%</div>
+      <div style="font-size:10px;color:var(--green)">↑ Outperforming benchmark</div>
+    </div>
+  </div>
+
+  <!-- ─── RETURN ATTRIBUTION ─── -->
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Return Attribution</div><div class="sec-sub">Contribution by period & driver</div></div>
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr>
+            <th style="text-align:left">Period</th><th>Capital Gain</th><th>Dividend</th><th>Total</th><th>Top Contributor</th>
+          </tr></thead>
+          <tbody id="attrib-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Attribution Breakdown</div>
+      <div class="chart-wrap"><canvas id="c-attrib"></canvas></div>
+    </div>
+  </div>
+
+  <!-- ─── DIVIDEND BY TICKER ─── -->
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Dividend by Ticker</div><div class="sec-sub">Q2 2026 breakdown · Apr – Jun 2026</div></div>
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr>
+            <th style="text-align:left">Ticker</th><th>Portfolio</th><th>Apr</th><th>May</th><th>Jun</th><th>Q2 Total</th><th>FWD Yield</th>
+          </tr></thead>
+          <tbody id="div-ticker-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Q2 Dividend by Ticker</div>
+      <div class="chart-wrap"><canvas id="c-div-ticker"></canvas></div>
+    </div>
+  </div>
 </div>
 
 <!-- ═══════════════════════════════════════ PAGE: WATCHLIST ═══ -->
@@ -786,21 +860,27 @@ const BUYS = [
 
 const WATCHLIST = [
   {t:"RKLB",n:"Rocket Lab USA",theme:"Space/Defense",entry:"$18–22",
+   price:"$22.80",chg:"+3.2%",chgPos:true,
    thesis:"Capturing Falcon-9 small launch market. NASA/DoD contracts. ESCAPADE Mars 2025. Neutron 2026 catalyst. Vertical integration moat.",
    conv:"HIGH",action:"BUY post-CPI"},
   {t:"CRWV",n:"CoreWeave",theme:"AI Infra",entry:"$110–130",
+   price:"$127.40",chg:"-1.8%",chgPos:false,
    thesis:"GPU cloud ขยาย hyperscaler speed. NVIDIA H100/H200 fleet. $23B pipeline. Microsoft $10B contract. Pure-play AI infra.",
    conv:"HIGH",action:"BUY post-CPI"},
   {t:"SOUN",n:"SoundHound AI",theme:"AI Voice",entry:"$8–12",
+   price:"$10.85",chg:"+1.4%",chgPos:true,
    thesis:"Voice AI platform — auto, restaurant, healthcare. 85% gross margin. $150M+ ARR target 2026. Speculative high-risk.",
    conv:"MEDIUM",action:"Watchlist only"},
   {t:"STX",n:"Seagate Technology",theme:"AI Storage",entry:"$90–100",
+   price:"$94.20",chg:"-0.6%",chgPos:false,
    thesis:"AI data center storage demand. HAMR tech refresh cycle. รอ pullback ต่ำกว่า $95.",
    conv:"MEDIUM",action:"Wait for pullback"},
   {t:"IXC",n:"iShares Global Energy ETF",theme:"Energy Hedge",entry:"$38–42",
+   price:"$43.60",chg:"+0.8%",chgPos:true,
    thesis:"Iran war risk → oil $120+. Diversified global energy exposure. Inflation hedge. Low correlation to tech.",
    conv:"LOW-MED",action:"Opportunistic"},
   {t:"UROY",n:"Uranium Royalty Corp",theme:"Nuclear",entry:"$3–5",
+   price:"$4.15",chg:"+2.5%",chgPos:true,
    thesis:"AI power demand → nuclear renaissance. SMR deployment 2027+. Small position speculative hedge.",
    conv:"LOW",action:"Watchlist only"},
 ];
@@ -914,14 +994,28 @@ BUYS.forEach(r=>{
 const wlc=document.getElementById('wl-container');
 WATCHLIST.forEach(w=>{
   const cc={HIGH:'pill-green',MEDIUM:'pill-amber','LOW-MED':'pill-amber',LOW:'pill-dim'}[w.conv]||'pill-dim';
+  const priceColor=w.chgPos?'var(--green)':'var(--red)';
+  const inEntry=(()=>{
+    const m=w.entry.match(/\$([0-9.]+)[–-]\$?([0-9.]+)/);
+    if(!m)return null;
+    const v=parseFloat(w.price.replace('$',''));
+    return v>=parseFloat(m[1])&&v<=parseFloat(m[2]);
+  })();
+  const entryBadge=inEntry===true?'<span style="font-size:9px;background:rgba(0,230,118,.18);color:var(--green);border-radius:4px;padding:1px 5px;margin-left:5px">IN ZONE</span>':
+    inEntry===false&&parseFloat(w.price.replace('$',''))>parseFloat((w.entry.match(/\$([0-9.]+)[–-]/)||[])[1]||0)?
+    '<span style="font-size:9px;background:rgba(255,184,0,.15);color:var(--amber);border-radius:4px;padding:1px 5px;margin-left:5px">ABOVE</span>':'';
   wlc.innerHTML+=`<div class="wl-item">
-    <div class="wl-ticker">${w.t}</div>
+    <div style="display:flex;flex-direction:column;align-items:center;min-width:62px">
+      <div class="wl-ticker">${w.t}</div>
+      <div style="font-size:13px;font-weight:700;color:var(--text);margin-top:3px">${w.price}</div>
+      <div style="font-size:11px;font-weight:600;color:${priceColor}">${w.chg}</div>
+    </div>
     <div class="wl-info">
       <div class="wl-name">${w.n} · <span style="color:var(--cyan)">${w.theme}</span></div>
       <div class="wl-thesis">${w.thesis}</div>
     </div>
     <div class="wl-right">
-      <div class="wl-entry">${w.entry}</div>
+      <div class="wl-entry">${w.entry}${entryBadge}</div>
       <span class="pill ${cc}">${w.conv}</span>
       <span style="font-size:10px;color:var(--muted)">${w.action}</span>
     </div></div>`;
@@ -1082,6 +1176,73 @@ function buildReportCharts(){
   },options:{responsive:true,maintainAspectRatio:false,
     plugins:{legend:{display:false}},
     scales:{y:{ticks:{callback:v=>'$'+v}}}}});
+
+  /* ─── RETURN ATTRIBUTION TABLE ─── */
+  const attribData=[
+    ['Nov–Dec 2025','$625.87','$452.36','$1,078.23','GPIQ, SPMO','8.75%','13.61%'],
+    ['Q1 2026','$223.41','$157.00','$380.41','SPMO, VOO','2.06%','3.49%'],
+    ['Q2 2026','$879.59','$169.10','$1,048.59','GPIQ, SPMO','8.00%','9.53%'],
+    ['YTD 2026','$1,103.00','$326.10','$1,429.10','GPIQ, SPMO','10.22%','13.24%'],
+    ['Since Inception','$2,579.03','$778.36','$3,357.39','GPIQ, SPMO','27.71%','36.07%'],
+  ];
+  const ab=document.getElementById('attrib-body');
+  attribData.forEach((r,i)=>{
+    const isTotal=r[0].includes('YTD')||r[0].includes('Inception');
+    ab.innerHTML+=`<tr style="${isTotal?'background:rgba(255,184,0,.06);font-weight:700':''}">
+      <td style="text-align:left;color:${isTotal?'var(--gold)':'var(--text)'}">${r[0]}</td>
+      <td style="color:var(--green)">${r[1]}</td>
+      <td style="color:var(--amber)">${r[2]}</td>
+      <td style="font-weight:700;color:var(--gold)">${r[3]}</td>
+      <td style="font-size:10px;color:var(--cyan)">${r[4]}</td>
+    </tr>`;
+  });
+
+  new Chart('c-attrib',{type:'bar',data:{
+    labels:['Nov–Dec 2025','Q1 2026','Q2 2026'],
+    datasets:[
+      {label:'Capital Gain',data:[625.87,223.41,879.59],backgroundColor:'rgba(22,85,163,.8)',borderRadius:4},
+      {label:'Dividend',data:[452.36,157.00,169.10],backgroundColor:'rgba(255,184,0,.8)',borderRadius:4},
+    ]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{x:{stacked:true},y:{stacked:true,ticks:{callback:v=>'$'+v}}}}});
+
+  /* ─── DIVIDEND BY TICKER TABLE ─── */
+  const divTickers=[
+    ['GPIQ','Sentinel',24.50,21.80,31.20,77.50,'~11.5%'],
+    ['QDVO','Sentinel',9.10,8.40,11.80,29.30,'~9.0%'],
+    ['SCHD','Sentinel',4.20,3.90,6.10,14.20,'~3.7%'],
+    ['JAAA','Sentinel',5.80,5.30,7.20,18.30,'~6.5%'],
+    ['SGOV','Gambit',3.40,3.20,4.80,11.40,'~5.1%'],
+    ['O','Agis',2.80,2.50,3.60,8.90,'~5.7%'],
+    ['MAIN','Agis',1.80,1.60,4.20,7.60,'~9.8%'],
+    ['HSBC','Agis',0.40,0.30,1.20,1.90,'~4.2%'],
+    ['OTHER','Mixed',0.00,0.00,0.00,7.50,'—'],
+  ];
+  const dtb=document.getElementById('div-ticker-body');
+  const portColors={Sentinel:'var(--gold)',Gambit:'#a855f7',Agis:'var(--green)',Mixed:'var(--muted)'};
+  divTickers.forEach(r=>{
+    dtb.innerHTML+=`<tr>
+      <td style="font-weight:700;color:var(--text)">${r[0]}</td>
+      <td style="font-size:10px;color:${portColors[r[1]]||'var(--muted)'}">${r[1]}</td>
+      <td>$${r[2].toFixed(2)}</td>
+      <td>$${r[3].toFixed(2)}</td>
+      <td>$${r[4].toFixed(2)}</td>
+      <td style="font-weight:700;color:var(--amber)">$${r[5].toFixed(2)}</td>
+      <td style="color:var(--green)">${r[6]}</td>
+    </tr>`;
+  });
+
+  new Chart('c-div-ticker',{type:'bar',data:{
+    labels:divTickers.slice(0,-1).map(r=>r[0]),
+    datasets:[
+      {label:'Apr',data:divTickers.slice(0,-1).map(r=>r[2]),backgroundColor:'rgba(255,184,0,.5)',borderRadius:3},
+      {label:'May',data:divTickers.slice(0,-1).map(r=>r[3]),backgroundColor:'rgba(255,184,0,.7)',borderRadius:3},
+      {label:'Jun',data:divTickers.slice(0,-1).map(r=>r[4]),backgroundColor:'rgba(255,184,0,.95)',borderRadius:3},
+    ]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{x:{stacked:true},y:{stacked:true,ticks:{callback:v=>'$'+v}}}}});
 }
 
 /* Init all charts after DOM ready */
