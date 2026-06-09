@@ -101,7 +101,7 @@ export const hfRunDailyCycleTool = {
 
       // ── 3. Risk Management Team ──
       const riskRes = await hfRiskReviewTool.handler(
-        { signals: signals.signals as any[] },
+        { signals: [...signals.signals] },
         context
       )
       if (!riskRes.success) return { success: false, error: `Risk review failed: ${riskRes.error}` }
@@ -117,7 +117,7 @@ export const hfRunDailyCycleTool = {
         return { success: false, error: "mode='full' requires confirm: true to submit live orders" }
       }
       const execRes = await hfExecuteTradesTool.handler(
-        { risk_decisions: risk.decisions as any[], confirm: true },
+        { risk_decisions: [...risk.decisions], confirm: true },
         context
       )
       if (!execRes.success) return { success: false, error: `Execution failed: ${execRes.error}` }

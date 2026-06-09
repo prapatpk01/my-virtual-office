@@ -548,6 +548,67 @@
       "type": "desk",
       "x": 720,
       "y": 680
+    },
+    {
+      "id": "hf_label_floor",
+      "type": "textLabel",
+      "x": 415,
+      "y": 548,
+      "text": "HEDGE FUND FLOOR",
+      "labelColor": "#ffd700",
+      "fontSize": 14
+    },
+    {
+      "id": "hf_whiteboard_signals",
+      "type": "whiteboard",
+      "x": 338,
+      "y": 558
+    },
+    {
+      "id": "hf_desk_research",
+      "type": "desk",
+      "x": 400,
+      "y": 578,
+      "assignedTo": "hf-research"
+    },
+    {
+      "id": "hf_desk_quant",
+      "type": "desk",
+      "x": 520,
+      "y": 578,
+      "assignedTo": "hf-quant"
+    },
+    {
+      "id": "hf_desk_risk",
+      "type": "desk",
+      "x": 400,
+      "y": 648,
+      "assignedTo": "hf-risk"
+    },
+    {
+      "id": "hf_desk_execution",
+      "type": "desk",
+      "x": 520,
+      "y": 648,
+      "assignedTo": "hf-execution"
+    },
+    {
+      "id": "hf_plant_1",
+      "type": "plant",
+      "x": 600,
+      "y": 598
+    },
+    {
+      "id": "hf_filing_1",
+      "type": "filingCabinet",
+      "x": 336,
+      "y": 608
+    },
+    {
+      "id": "hf_filing_2",
+      "type": "filingCabinet",
+      "x": 336,
+      "y": 648
     }
   ],
   "branches": [
@@ -570,6 +631,13 @@
       "name": "CEO",
       "emoji": "\ud83c\udfe2",
       "theme": "branch-orange"
+    },
+    {
+      "id": "HF",
+      "name": "Hedge Fund",
+      "emoji": "\ud83c\udfe6",
+      "theme": "branch-gold",
+      "color": "#ffd700"
     }
   ],
   "agents": [
@@ -582,6 +650,46 @@
       "gender": "M",
       "branch": "UNASSIGNED",
       "statusKey": "main"
+    },
+    {
+      "id": "hf-research",
+      "name": "Alex Chen",
+      "role": "Research Analyst",
+      "emoji": "\ud83d\udcca",
+      "color": "#4caf50",
+      "gender": "M",
+      "branch": "HF",
+      "statusKey": "hf-research"
+    },
+    {
+      "id": "hf-quant",
+      "name": "Max Park",
+      "role": "Quant Analyst",
+      "emoji": "\ud83d\udcc8",
+      "color": "#2196f3",
+      "gender": "M",
+      "branch": "HF",
+      "statusKey": "hf-quant"
+    },
+    {
+      "id": "hf-risk",
+      "name": "Sam Rivera",
+      "role": "Risk Manager",
+      "emoji": "\u26a0\ufe0f",
+      "color": "#ff9800",
+      "gender": "F",
+      "branch": "HF",
+      "statusKey": "hf-risk"
+    },
+    {
+      "id": "hf-execution",
+      "name": "Jordan Lee",
+      "role": "Execution Trader",
+      "emoji": "\u26a1",
+      "color": "#e91e63",
+      "gender": "M",
+      "branch": "HF",
+      "statusKey": "hf-execution"
     }
   ],
   "pet": {

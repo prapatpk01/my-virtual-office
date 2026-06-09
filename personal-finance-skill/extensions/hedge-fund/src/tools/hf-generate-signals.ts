@@ -63,10 +63,12 @@ export const hfGenerateSignalsTool = {
       const symbols = input.symbols.map(s => s.toUpperCase())
       const baseNotional = input.base_notional_per_trade ?? fundConfig.baseNotionalPerTrade
 
-      const barResults = await Promise.all(symbols.map(s => getHistoricalBars(config, s, 60)))
+      const barSettled = await Promise.allSettled(symbols.map(s => getHistoricalBars(config, s, 60)))
 
-      const signals: TradeSignal[] = symbols.map((symbol, i) => {
-        const closes = barResults[i]!.map(b => b.c)
+      const signals: TradeSignal[] = symbols.flatMap((symbol, i) => {
+        const settled = barSettled[i]!
+        if (settled.status === "rejected") return []
+        const closes = settled.value.map(b => b.c)
         const rsi = calcRSI(closes)
         const macd = calcMACD(closes)
         const sentimentScore =
