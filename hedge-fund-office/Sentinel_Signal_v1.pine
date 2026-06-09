@@ -1,0 +1,678 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// SENTINEL SIGNAL v1.0  |  Unified Technical Indicator
+// Merged & upgraded from: KMTF Technical v6.4 + MCDX Plus v2.0
+//
+// FIXES APPLIED vs originals:
+//   [F1] HMA — correct Hull formula (was avg of 2 EMAs)
+//   [F2] CVD — direction-based tick logic (was price-position proxy)
+//   [F3] BOS — confirmed bars only, no repaint
+//   [F4] MTF — equal 33/33/33 weighting + RSI zone >55/<45 (not >50)
+//   [F5] Stage — ATR-normalized thresholds (was hardcoded %, broke on crypto)
+//   [F6] Divergence — pivot-anchored (was fixed 5-bar offset = noisy)
+//   [F7] RSI in Sentiment — parabolic transform (raw RSI inverted at extremes)
+//   [F8] DWCS — fixed weights (was ADX-modulated = unstable threshold)
+//   [F9] WaveTrend — allowed in ranging market via extreme-zone mode
+//   [F10] Profit Chips — removed +25 hardcoded floor
+//   [F11] SMC (BOS/Sweep) — now feeds Scenario Engine (was always 0)
+//   [F12] auto_len — O(1) math.min() (was O(n) loop)
+//   [F13] VFI length — adaptive per timeframe (was fixed 130 bars)
+//   [F14] Signal cooldown — adaptive per timeframe (was fixed 3 bars = too short for ETF)
+//
+// Inputs: 25 (down from 150+) | Lines: ~680 (down from 2517)
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("Sentinel Signal v1.0", overlay=true,
+     max_labels_count=200, max_boxes_count=50,
+     max_lines_count=100,  max_bars_back=500)
+
+// ══════════════════════════════════════════════════════════════
+// §1 INPUTS
+// ══════════════════════════════════════════════════════════════
+G_MA    = "📈 Moving Averages"
+i_ma1   = input.int(20,  "EMA Fast",   group=G_MA, inline="1", minval=1)
+i_ma2   = input.int(50,  "EMA Mid",    group=G_MA, inline="1", minval=1)
+i_ma3   = input.int(200, "SMA Slow",   group=G_MA, inline="1", minval=1)
+i_hma   = input.int(21,  "HMA Len",    group=G_MA, inline="2", minval=3)
+i_bos   = input.bool(true, "BOS Line", group=G_MA, inline="2")
+
+G_CORE  = "⚙️ Core"
+i_rsi   = input.int(14, "RSI",    group=G_CORE, inline="1", minval=2)
+i_adx   = input.int(14, "ADX",    group=G_CORE, inline="1", minval=2)
+i_swing = input.int(10, "Swing",  group=G_CORE, inline="1", minval=3, maxval=30)
+i_atr   = input.int(14, "ATR",    group=G_CORE, inline="2", minval=2)
+i_volma = input.int(20, "Vol MA", group=G_CORE, inline="2", minval=5)
+
+G_SIG   = "🎯 Signal Gate"
+i_conf  = input.float(60., "Min Confidence %", group=G_SIG, minval=40., maxval=90., step=5.)
+i_rr    = input.float(1.5, "Min R:R",          group=G_SIG, minval=1.0, maxval=3.0, step=0.1)
+i_ftp   = input.float(1.618, "Fib Target",     group=G_SIG, step=0.1)
+i_tfc   = input.string("15m+1H+4H", "TF Combo", group=G_SIG, options=["15m+1H+4H","15m+1H+4H+D"])
+
+G_RISK  = "💰 Risk"
+i_acc   = input.float(11887., "Account USD", group=G_RISK, minval=100.)
+i_rpct  = input.float(1.0,    "Risk %",      group=G_RISK, minval=0.1, maxval=5., step=0.1)
+
+G_DSH   = "📊 Display"
+i_dpos  = input.string("Top Right","Dashboard",group=G_DSH,options=["Top Right","Top Left","Bottom Right","Bottom Left"])
+i_div   = input.bool(true, "Divergence Labels", group=G_DSH)
+i_fib   = input.bool(false,"Fibonacci",          group=G_DSH)
+
+G_MTF   = "🔢 MTF Timeframes"
+i_htf1  = input.timeframe("W",   "Weekly",   group=G_MTF, inline="1")
+i_htf2  = input.timeframe("D",   "Daily",    group=G_MTF, inline="1")
+i_htf3  = input.timeframe("240", "4-Hour",   group=G_MTF, inline="1")
+
+// ══════════════════════════════════════════════════════════════
+// §2 HELPERS
+// ══════════════════════════════════════════════════════════════
+f_clamp(v, lo, hi) => math.max(lo, math.min(hi, v))
+f_pos(p) =>
+    p=="Top Right"?position.top_right:p=="Bottom Right"?position.bottom_right:
+    p=="Top Left"?position.top_left:position.bottom_left
+
+// [F1] Correct Hull Moving Average formula
+// Original bug: hma = (ema_fast + ema_slow) / 2  ← just average of two EMAs
+f_hma(src, len) =>
+    h = math.round(len / 2)
+    s = math.round(math.sqrt(float(len)))
+    ta.wma(2.0 * ta.wma(src, h) - ta.wma(src, len), s)
+
+// Helper functions for security calls
+f_macdh() =>
+    [_, _, h] = ta.macd(close, 12, 26, 9)
+    h
+f_vr() =>
+    vm = ta.sma(volume, 20)
+    vm > 0 ? volume / vm : 1.
+
+// ══════════════════════════════════════════════════════════════
+// §3 MOVING AVERAGES
+// ══════════════════════════════════════════════════════════════
+ma1    = ta.ema(close, i_ma1)
+ma2    = ta.ema(close, i_ma2)
+ma3    = ta.sma(close, i_ma3)
+hma_v  = f_hma(close, i_hma)
+hma_up = hma_v > hma_v[1]
+
+plot(ma1,   "EMA20",  color=color.new(color.lime,   30), linewidth=1)
+plot(ma2,   "EMA50",  color=color.new(color.yellow, 30), linewidth=1)
+plot(ma3,   "SMA200", color=color.new(color.orange, 20), linewidth=2)
+plot(hma_v, "HMA",    color=hma_up?color.new(color.aqua,20):color.new(color.red,20), linewidth=2)
+
+// ══════════════════════════════════════════════════════════════
+// §4 CORE INDICATORS
+// ══════════════════════════════════════════════════════════════
+atr_v   = ta.atr(i_atr)
+vol_ma  = ta.sma(volume, i_volma)
+rsi_v   = ta.rsi(close, i_rsi)
+[ml, ms_m, mh] = ta.macd(close, 12, 26, 9)
+[adx_v, dip, dim] = ta.dmi(i_adx, i_adx)
+stoch_v = ta.stoch(close, high, low, 14)
+vol_r   = vol_ma > 0 ? volume / vol_ma : 1.
+roc5    = close > 0 ? (close - close[5]) / close[5] * 100. : 0.
+
+// [F2] CVD — direction-based (original used price-position proxy = unreliable OFS)
+float cvd_tick = close > open ? volume : close < open ? -volume : 0.
+var float cvd  = 0.
+cvd           := cvd + cvd_tick
+float cvd_sl   = cvd - cvd[5]
+bool  cvd_bull = cvd_sl > 0
+bool  cvd_bear = cvd_sl < 0
+
+bool vol_surge    = vol_r > 2.5
+bool vol_anom_bull= vol_r > 2.0 and close > open and (close-open)/math.max(high-low,syminfo.mintick) > 0.5
+bool vol_anom_bear= vol_r > 2.0 and close < open and (open-close)/math.max(high-low,syminfo.mintick) > 0.5
+
+// ══════════════════════════════════════════════════════════════
+// §5 BOS — confirmed bars only, no repaint
+// ══════════════════════════════════════════════════════════════
+var float sw_hi    = na
+var float sw_lo    = na
+var int   sw_hi_b  = 0
+var int   sw_lo_b  = 0
+float _rhi = ta.highest(high, i_swing)
+float _rlo = ta.lowest(low,  i_swing)
+
+// [F3] Only update swing levels on confirmed bars — prevents live-bar repaint
+if barstate.isconfirmed
+    if high >= _rhi
+        sw_hi  := high
+        sw_hi_b:= bar_index
+    if low <= _rlo
+        sw_lo  := low
+        sw_lo_b:= bar_index
+
+var int   ms_trend = 0
+var float bos_lv   = na
+float _body = (high-low) > 0 ? math.abs(close-open)/(high-low) : 0.
+bool bos_bull = barstate.isconfirmed and not na(sw_hi) and close > sw_hi and close > open and _body >= 0.40 and ms_trend <= 0
+bool bos_bear = barstate.isconfirmed and not na(sw_lo) and close < sw_lo and close < open and _body >= 0.40 and ms_trend >= 0
+
+if bos_bull
+    ms_trend := 1
+    bos_lv   := sw_lo
+if bos_bear
+    ms_trend := -1
+    bos_lv   := sw_hi
+
+// Liquidity sweep detection
+var bool bull_sw = false
+var bool bear_sw = false
+var int  _bcd = 0
+var int  _scd2 = 0
+_bcd  := math.max(0, _bcd  - 1)
+_scd2 := math.max(0, _scd2 - 1)
+if barstate.isconfirmed
+    if low  < sw_lo and close > sw_lo + atr_v*0.3 and _bcd  == 0
+        _bcd  := 5
+    if high > sw_hi and close < sw_hi - atr_v*0.3 and _scd2 == 0
+        _scd2 := 5
+bull_sw := _bcd  > 0
+bear_sw := _scd2 > 0
+
+plot(i_bos ? bos_lv : na, "BOS", color=ms_trend==1?color.new(color.fuchsia,20):color.new(color.orange,20), linewidth=1, style=plot.style_stepline_diamond)
+
+// Auto Fibonacci — anchors to confirmed BOS
+var float fib_hi = na
+var float fib_lo = na
+if bos_bull
+    fib_lo := sw_lo
+    fib_hi := sw_hi
+if bos_bear
+    fib_hi := sw_hi
+    fib_lo := sw_lo
+float fib_rng = not na(fib_hi) and not na(fib_lo) ? fib_hi - fib_lo : na
+var line[] _fl = array.new<line>()
+if i_fib and barstate.islast and not na(fib_rng) and fib_rng > 0
+    for _l in _fl
+        line.delete(_l)
+    array.clear(_fl)
+    float[] pcts = array.from(0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618)
+    bool up = ms_trend == 1
+    for p in pcts
+        float lvl  = up ? fib_hi - fib_rng*p : fib_lo + fib_rng*p
+        color  lc  = p==0.618?color.new(color.yellow,20):p==0.382?color.new(color.aqua,30):color.new(color.gray,55)
+        array.push(_fl, line.new(bar_index-20, lvl, bar_index+30, lvl, color=lc, width=p==0.618?2:1, style=line.style_dashed))
+
+// ══════════════════════════════════════════════════════════════
+// §6 MTF HIERARCHY
+// ══════════════════════════════════════════════════════════════
+w_c   = request.security(syminfo.tickerid, i_htf1, close,              lookahead=barmerge.lookahead_off)
+w_e20 = request.security(syminfo.tickerid, i_htf1, ta.ema(close,20),   lookahead=barmerge.lookahead_off)
+w_e50 = request.security(syminfo.tickerid, i_htf1, ta.ema(close,50),   lookahead=barmerge.lookahead_off)
+w_rsi = request.security(syminfo.tickerid, i_htf1, ta.rsi(close,14),   lookahead=barmerge.lookahead_off)
+d_c   = request.security(syminfo.tickerid, i_htf2, close,              lookahead=barmerge.lookahead_off)
+d_e20 = request.security(syminfo.tickerid, i_htf2, ta.ema(close,20),   lookahead=barmerge.lookahead_off)
+d_e50 = request.security(syminfo.tickerid, i_htf2, ta.ema(close,50),   lookahead=barmerge.lookahead_off)
+d_rsi = request.security(syminfo.tickerid, i_htf2, ta.rsi(close,14),   lookahead=barmerge.lookahead_off)
+h4_c  = request.security(syminfo.tickerid, i_htf3, close,              lookahead=barmerge.lookahead_off)
+h4_20 = request.security(syminfo.tickerid, i_htf3, ta.ema(close,20),   lookahead=barmerge.lookahead_off)
+h4_50 = request.security(syminfo.tickerid, i_htf3, ta.ema(close,50),   lookahead=barmerge.lookahead_off)
+h4_rs = request.security(syminfo.tickerid, i_htf3, ta.rsi(close,14),   lookahead=barmerge.lookahead_off)
+h4_at = request.security(syminfo.tickerid, i_htf3, ta.atr(14),         lookahead=barmerge.lookahead_off)
+h4_hi = request.security(syminfo.tickerid, i_htf3, ta.highest(high,20),lookahead=barmerge.lookahead_off)
+h4_lo = request.security(syminfo.tickerid, i_htf3, ta.lowest(low,20),  lookahead=barmerge.lookahead_off)
+
+// [F4] Equal 33/33/33 weighting (was 50/33/17 — weekly dominated)
+// [F4] RSI zone >55/<45 instead of >50 — less noise in ranging markets
+float ws = (w_c>w_e20?1.:-1.) + (w_e20>w_e50?1.:-1.) + (w_rsi>55.?1.:w_rsi<45.?-1.:0.)
+float ds = (d_c>d_e20?1.:-1.) + (d_e20>d_e50?1.:-1.) + (d_rsi>55.?1.:d_rsi<45.?-1.:0.)
+float hs = (h4_c>h4_20?1.:-1.) + (h4_20>h4_50?1.:-1.) + (h4_rs>55.?1.:h4_rs<45.?-1.:0.)
+float mtf_raw = ws + ds + hs                              // max ±9 (equal weighting)
+float mtf_sc  = f_clamp(mtf_raw / 9. * 100., -100., 100.)
+bool  mtf_flag= math.abs(mtf_sc) < 30.
+bool  w_bull  = ws >= 2.
+bool  w_bear  = ws <= -2.
+string mtf_str = mtf_sc>=60.?"BULL 3/3":mtf_sc>=30.?"BULL 2/3":mtf_sc<=-60.?"BEAR 3/3":mtf_sc<=-30.?"BEAR 2/3":"MIXED"
+
+// ══════════════════════════════════════════════════════════════
+// §7 MOMENTUM ENGINE — 4-phase (simplified from 6, clearer signals)
+// ══════════════════════════════════════════════════════════════
+float rs       = rsi_v - rsi_v[3]
+float ra       = rs - (rsi_v[3] - rsi_v[6])
+float rsi_mom  = f_clamp(rs * 2.5, -25., 25.)
+float mv       = mh - mh[2]
+float ma_c     = mv - (mh[2] - mh[4])
+float macd_mom = f_clamp(mv * 3., -20., 20.)
+float vwp_mom  = f_clamp(close>0?(close-close[5])/close[5]*vol_r*100.*1.5:0., -20., 20.)
+float cvd_mom  = f_clamp(cvd_sl / math.max(vol_ma,1.) * 30., -15., 15.)
+float st_mom   = f_clamp((stoch_v-50.) * 0.4, -20., 20.)
+float roc_mom  = f_clamp((roc5-roc5[3]) * 1.5, -10., 10.)
+float mom_sc   = f_clamp((rsi_mom+macd_mom+vwp_mom+cvd_mom+st_mom+roc_mom) / 90. * 100., -100., 100.)
+float mom_ac   = f_clamp(ra*0.3 + ma_c*2. + (roc5-roc5[3])*0.5, -10., 10.)
+
+// 4-phase momentum (was 6 — BUILD/ACCELERATE merged; RECOVERY/EXHAUST merged)
+bool mom_build = mom_ac > 0.5 and math.abs(mom_sc) > 20.
+bool mom_peak  = math.abs(mom_sc) > 55. and mom_ac < -0.3
+bool mom_fade  = mom_sc > 40. and mom_ac < 0. and mom_sc < mom_sc[1] and mh < mh[1]
+bool mom_revbot= mom_sc < -40. and mom_ac > 0. and mom_sc > mom_sc[1] and mh > mh[1]
+
+string mom_phase = mom_peak?"PEAK ⚠️":mom_fade?"FADING ↘":mom_build?"BUILDING ⚡":"NEUTRAL"
+
+// ══════════════════════════════════════════════════════════════
+// §8 TREND ENGINE — ATR-normalized stage
+// ══════════════════════════════════════════════════════════════
+float ma_al = ((close>ma1?1.:0.)+(close>ma2?1.:0.)+(close>ma3?1.:0.)+(ma1>ma2?1.:0.)+(ma2>ma3?1.:0.)) -
+              ((close<ma1?1.:0.)+(close<ma2?1.:0.)+(close<ma3?1.:0.)+(ma1<ma2?1.:0.)+(ma2<ma3?1.:0.))
+float adx_dir  = adx_v>=25.?(dip>dim?30.:-10.):adx_v>=15.?(dip>dim?10.:-5.):(dip>dim?3.:-3.)
+float dist_sc  = ma2 > 0 ? f_clamp((close-ma2)/ma2*200., -15., 15.) : 0.
+bool  hh = high > ta.highest(high,i_swing)[1]
+bool  hl = low  > ta.lowest(low,  i_swing)[1]
+bool  lh = high < ta.highest(high,i_swing)[1]
+bool  ll = low  < ta.lowest(low,  i_swing)[1]
+float st_sc = (hh?10.:0.)+(hl?10.:0.)-(lh?10.:0.)-(ll?10.:0.)
+float tr_sc = f_clamp(ma_al/5.*40. + adx_dir + dist_sc + st_sc, -100., 100.)
+
+// [F5] ATR-normalized stage — same thresholds work for BTC, ETF, single stock
+// Original: fixed % = wrong for crypto (BTC moves 8% in hours, ETF doesn't)
+float dist_atr = atr_v > 0 ? (close - ma2) / atr_v : 0.
+bool adx_rising = adx_v > adx_v[3]
+
+// Stage: 1=Accum, 2=Markup, 3=Extended, 4=Distribution (ATR-normalized)
+int mkt_stage = math.abs(dist_atr)<1.0 and adx_v<15.?1:
+                dist_atr>4.0 and (rsi_v>70. or mom_fade or vol_anom_bear)?4:
+                adx_v>=15. and close>ma2 and hma_up?2:
+                dist_atr>3.0 and rsi_v>60.?3:0
+string stage_s = mkt_stage==1?"S1:Accum":mkt_stage==2?"S2:Markup":mkt_stage==3?"S3:Extended":mkt_stage==4?"S4:Dist":"S0:Watch"
+
+bool tm_bear_ok = tr_sc > 30. and mom_sc < mom_sc[3] and mom_ac < -0.5 and rsi_v > 60.
+bool tm_bull_ok = tr_sc < -30. and mom_sc > mom_sc[3] and mom_ac > 0.5  and rsi_v < 40.
+
+// ══════════════════════════════════════════════════════════════
+// §9 DIVERGENCE — pivot-anchored (not fixed 5-bar)
+// ══════════════════════════════════════════════════════════════
+// [F6] Use confirmed pivot highs/lows as anchors
+// Original bug: low < low[5] — fixed 5-bar offset fires on noise in trends
+float piv_lo = ta.pivotlow(low,  i_swing, i_swing)
+float piv_hi = ta.pivothigh(high, i_swing, i_swing)
+
+var float last_plo = na;  var float prev_plo = na
+var float last_plr = na;  var float prev_plr = na
+var float last_phi = na;  var float prev_phi = na
+var float last_phr = na;  var float prev_phr = na
+
+if not na(piv_lo)
+    prev_plo := last_plo;  prev_plr := last_plr
+    last_plo := piv_lo;    last_plr := rsi_v[i_swing]
+if not na(piv_hi)
+    prev_phi := last_phi;  prev_phr := last_phr
+    last_phi := piv_hi;    last_phr := rsi_v[i_swing]
+
+bool bull_div  = not na(last_plo) and not na(prev_plo) and last_plo < prev_plo and last_plr > prev_plr
+bool bear_div  = not na(last_phi) and not na(prev_phi) and last_phi > prev_phi and last_phr < prev_phr
+bool h_bull_div= low  > low[5]  and rsi_v < rsi_v[5] and ms_trend == 1
+bool h_bear_div= high < high[5] and rsi_v > rsi_v[5] and ms_trend == -1
+
+if i_div and bull_div
+    label.new(bar_index-i_swing, last_plo-atr_v*0.8, "📐+", color=color.new(color.lime,20), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+if i_div and bear_div
+    label.new(bar_index-i_swing, last_phi+atr_v*0.8, "📐-", color=color.new(color.red,20), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// §10 VOLUME FLOW
+// ══════════════════════════════════════════════════════════════
+// [F13] Adaptive VFI length: 4H chart = 50 bars, Daily = 100 bars, Intraday = 30 bars
+// Original: fixed 130 bars = 21 days on 4H, VFI barely reacted to CPI/Fed
+int vfi_len = timeframe.in_seconds()<=900?20:timeframe.in_seconds()<=3600?30:timeframe.in_seconds()<=14400?50:100
+float vfi_typ  = hlc3
+float vfi_it   = math.log(vfi_typ) - math.log(nz(vfi_typ[1], vfi_typ))
+float vfi_vi   = ta.stdev(vfi_it, 30)
+float vfi_cut  = 0.2 * vfi_vi * close
+float vfi_vav  = ta.sma(volume, vfi_len)
+float vfi_va   = math.min(volume, vfi_vav * 2.)
+float vfi_mf   = vfi_typ - nz(vfi_typ[1], vfi_typ)
+float vfi_fl   = vfi_mf > vfi_cut ? vfi_va : vfi_mf < -vfi_cut ? -vfi_va : 0.
+float vfi_raw  = math.sum(vfi_fl, vfi_len) / math.max(vfi_vav, 1.)
+float vfi_s    = ta.ema(vfi_raw, 3)
+float vfi_hi_  = ta.highest(vfi_s, 100)
+float vfi_lo_  = ta.lowest(vfi_s,  100)
+float vfi_norm = vfi_hi_ != vfi_lo_ ? f_clamp((vfi_s-vfi_lo_)/(vfi_hi_-vfi_lo_)*100., 0., 100.) : 50.
+
+float obv_raw  = ta.obv
+float obv_mn   = ta.sma(obv_raw, 20)
+float obv_sd   = ta.stdev(obv_raw, 20)
+float obv_z    = obv_sd > 0 ? (obv_raw-obv_mn)/obv_sd : 0.
+float obv_norm = f_clamp((obv_z+3.)/6.*100., 0., 100.)
+bool  obv_up   = ta.ema(ta.change(obv_raw,3), 5) > 0
+
+float mh_hi   = ta.highest(mh, 100)
+float mh_lo   = ta.lowest(mh,  100)
+float macd_nm = mh_hi != mh_lo ? (mh-mh_lo)/(mh_hi-mh_lo)*100. : 50.
+
+// ══════════════════════════════════════════════════════════════
+// §11 DWCS v6 — stable weights + RSI sentiment fix
+// ══════════════════════════════════════════════════════════════
+
+// [F7] RSI Sentiment transform — parabolic (original: raw RSI inverted at extremes)
+// Bug: RSI=85 → sent_rsi=85 = "Super Bullish" but RSI 85 = reversal risk
+// Fix: oversold (RSI<30) = high bullish; overbought (RSI>70) = moderate (caution)
+f_rsi_sent(r) =>
+    r <= 30 ? f_clamp(80. - r, 50., 100.) :
+    r >= 70 ? f_clamp(120. - r, 30., 65.) :
+    r
+
+float sent_rsi  = f_rsi_sent(rsi_v)
+float sent_macd = macd_nm
+float sent_vfi  = vfi_norm
+float sent_obv  = obv_norm
+float sent_adx  = adx_v>=25. and dip>dim ? f_clamp(50.+adx_v*0.5,50.,100.) :
+                  adx_v>=25. and dip<dim ? f_clamp(50.-adx_v*0.5,0.,50.) : 50.
+float sent_raw  = sent_rsi*0.25 + sent_macd*0.20 + sent_vfi*0.25 + sent_obv*0.15 + sent_adx*0.15
+float sent_sc   = f_clamp(ta.ema(sent_raw, 4), 0., 100.)
+
+// WaveTrend
+float wt_ap  = hlc3
+float wt_esa = ta.ema(wt_ap, 10)
+float wt_d   = ta.ema(math.abs(wt_ap-wt_esa), 10)
+float wt_ci  = (wt_ap-wt_esa) / (0.015*math.max(wt_d, syminfo.mintick))
+float wt1    = ta.ema(wt_ci, 21)
+float wt2    = ta.sma(wt1, 4)
+float wtD    = wt1 - wt2
+float wt1s   = f_clamp((wt1+100.)/2., 0., 100.)
+var int wt_last = 0
+var int wt_age  = 0
+// [F9] WT in ranging: use extreme zones when ADX < 20 (original: completely suppressed)
+bool wt_trend_ok = adx_v >= 20.
+bool wt_range_ok = adx_v < 20.
+bool wt_buy  = (ta.crossover(wtD,  5.) and wt_trend_ok) or (wt_range_ok and ta.crossover(wt1, -40.))
+bool wt_sell = (ta.crossunder(wtD, -5.) and wt_trend_ok) or (wt_range_ok and ta.crossunder(wt1, 40.))
+if wt_buy
+    wt_last := 1;  wt_age := 0
+else if wt_sell
+    wt_last := -1; wt_age := 0
+else
+    wt_age := wt_age + 1
+    if wt_age >= 50
+        wt_last := 0
+float wt_dk  = wt_last==0?0.:math.max(0.,1.-float(wt_age)/50.)
+float wt_lyr = wt1s * wt_dk
+
+// CPK momentum
+float cpk_raw = ta.wma(ta.roc(close,14)+ta.roc(close,11), 10)
+// [F12] O(1) auto_len — original was O(n) loop on every bar
+int   Nr     = math.min(bar_index+1, 100)
+float cpk_hi = ta.highest(cpk_raw, 200)
+float cpk_lo = ta.lowest(cpk_raw,  200)
+float cpk    = cpk_hi != cpk_lo ? (cpk_raw-cpk_lo)/(cpk_hi-cpk_lo)*100. : 50.
+
+// Chips — [F10] Removed +25 hardcoded floor from profit_chips
+float lo_Nr = ta.lowest(low,  Nr)
+float hi_Nr = ta.highest(high, Nr)
+float rng_Nr = math.max(hi_Nr - lo_Nr, syminfo.mintick)
+// [F10] profit_chips: was clamp(... + 25, 0, 100) — floor 25 hid bearish signal
+float profit_chips = f_clamp((close*0.96 - lo_Nr) / rng_Nr * 100., 0., 100.)
+float lc_chips     = f_clamp(100. - (close*1.04 - lo_Nr) / rng_Nr * 100., 0., 100.)
+
+// Behavior patterns
+bool pump_dump  = vol_surge and close<open and high>ta.highest(high,20)[1] and profit_chips>60.
+bool capitul    = vol_r>3.0 and close<open and close<ta.lowest(close,10)[1]
+bool whale_dist = vol_r>3.0 and math.abs(ta.change(close,1))<atr_v*0.1 and profit_chips>60.
+bool blowoff    = rsi_v>78. and close>open and vol_r<0.9 and profit_chips>80.
+bool accum_sig  = profit_chips<35. and lc_chips>=20. and hma_up
+
+float l_beh = pump_dump?15.:blowoff?18.:whale_dist?25.:accum_sig?65.:capitul?35.:50.
+float l_trap= pump_dump?12.:whale_dist?25.:blowoff?18.:capitul?40.:50.
+
+// MTF contribution to DWCS (no extra security calls — reuse mtf_sc)
+float l_mtf = mtf_sc >= 0 ? f_clamp(50.+mtf_sc*0.5,50.,100.) : f_clamp(50.+mtf_sc*0.5,0.,50.)
+
+// [F8] DWCS stable fixed weights — no trend_strength modulation
+// Original bug: weights shifted with ADX, so DWCS=65 meant different things in trend vs range
+// Fix: constant weights → threshold 60/40 is consistent across all regimes
+// Weights: Sentiment 30, VFI 20, CPK 12, Behavior 15, Trap 10, WT 8, MTF 5
+float dwcs_raw = sent_sc*0.30 + vfi_norm*0.20 + cpk*0.12 + l_beh*0.15 + l_trap*0.10 + wt_lyr*0.08 + l_mtf*0.05
+float dwcs     = f_clamp(ta.ema(dwcs_raw, 5), 0., 100.)
+
+// ══════════════════════════════════════════════════════════════
+// §12 SCENARIO ENGINE — documented priority
+// ══════════════════════════════════════════════════════════════
+// [F11] SMC now feeds scenario: pa_bull_sc/pa_bear_sc connected to BOS/Sweep
+// Original bug: both always = 0 (declared but never updated)
+int pa_bull = ms_trend==1 and bos_bull?2:bull_sw?1:0
+int pa_bear = ms_trend==-1 and bos_bear?2:bear_sw?1:0
+
+// Priority order (documented):
+// P1 Extreme/Trap → P2 Smart Money → P3 Structural → P4 Directional → P5 Default
+string scenario = "NEUTRAL"
+if pump_dump                                                          // P1: Trap
+    scenario := "PUMP-DUMP 🚨"
+else if blowoff                                                       // P1: Trap
+    scenario := "BLOWOFF TOP 🚨"
+else if whale_dist                                                    // P2: Institutional
+    scenario := "WHALE DIST ⚠️"
+else if capitul                                                       // P2: Extreme
+    scenario := "CAPITULATION 🔻"
+else if ms_trend==1 and bos_bull and cvd_bull and vol_r>1.5           // P3: Smart Money Long
+    scenario := "SMART MONEY LONG 💎"
+else if ms_trend==-1 and bos_bear and cvd_bear and vol_r>1.5         // P3: Smart Money Short
+    scenario := "SMART MONEY SHORT 💎"
+else if dwcs>=65. and sent_sc>=60. and mtf_sc>=30.                   // P4: Strong bull
+    scenario := "STRONG BULL ▲"
+else if accum_sig and mtf_sc>=0. and obv_up                          // P4: Accumulation
+    scenario := "ACCUMULATION 📦"
+else if mkt_stage==2 and mom_build and ms_trend==1                   // P4: Markup
+    scenario := "MARKUP ⚡"
+else if tm_bull_ok                                                    // P4: Reversal
+    scenario := "BULL REVERSAL ↗"
+else if tm_bear_ok
+    scenario := "BEAR REVERSAL ↘"
+else if dwcs<=35. and sent_sc<=40. and mtf_sc<=-30.                  // P4: Strong bear
+    scenario := "STRONG BEAR ▼"
+else if mkt_stage==4                                                  // P4: Distribution
+    scenario := "DISTRIBUTION 📤"
+else if math.abs(mtf_sc)<30. and adx_v<20.                           // P5: Default
+    scenario := "RANGING ─"
+
+// ══════════════════════════════════════════════════════════════
+// §13 MULTI-TF ENTRY ENGINE
+// ══════════════════════════════════════════════════════════════
+m15_c  = request.security(syminfo.tickerid,"15", close,           lookahead=barmerge.lookahead_off)
+m15_e9 = request.security(syminfo.tickerid,"15", ta.ema(close,9), lookahead=barmerge.lookahead_off)
+m15_21 = request.security(syminfo.tickerid,"15", ta.ema(close,21),lookahead=barmerge.lookahead_off)
+m15_rs = request.security(syminfo.tickerid,"15", ta.rsi(close,14),lookahead=barmerge.lookahead_off)
+m15_mh = request.security(syminfo.tickerid,"15", f_macdh(),        lookahead=barmerge.lookahead_off)
+m15_at = request.security(syminfo.tickerid,"15", ta.atr(14),       lookahead=barmerge.lookahead_off)
+m15_vr = request.security(syminfo.tickerid,"15", f_vr(),           lookahead=barmerge.lookahead_off)
+h1_c   = request.security(syminfo.tickerid,"60", close,            lookahead=barmerge.lookahead_off)
+h1_e20 = request.security(syminfo.tickerid,"60", ta.ema(close,20), lookahead=barmerge.lookahead_off)
+h1_e50 = request.security(syminfo.tickerid,"60", ta.ema(close,50), lookahead=barmerge.lookahead_off)
+h1_rs  = request.security(syminfo.tickerid,"60", ta.rsi(close,14), lookahead=barmerge.lookahead_off)
+h1_mh  = request.security(syminfo.tickerid,"60", f_macdh(),         lookahead=barmerge.lookahead_off)
+h1_vr  = request.security(syminfo.tickerid,"60", f_vr(),            lookahead=barmerge.lookahead_off)
+h4_rs2 = request.security(syminfo.tickerid,"240",ta.rsi(close,14),  lookahead=barmerge.lookahead_off)
+h4_mh2 = request.security(syminfo.tickerid,"240",f_macdh(),          lookahead=barmerge.lookahead_off)
+h4_vr2 = request.security(syminfo.tickerid,"240",f_vr(),             lookahead=barmerge.lookahead_off)
+bool use_d = i_tfc == "15m+1H+4H+D"
+d_rs2  = request.security(syminfo.tickerid,"D",  ta.rsi(close,14),  lookahead=barmerge.lookahead_off)
+bool d_bull = d_c>d_e20 and d_e20>d_e50
+bool d_bear = d_c<d_e20 and d_e20<d_e50
+
+float sc15 = (m15_c>m15_e9 and m15_e9>m15_21?2.:m15_c<m15_e9 and m15_e9<m15_21?-2.:0.) +
+             (m15_rs>55.?1.5:m15_rs<45.?-1.5:0.) +
+             (m15_mh>m15_mh[1]?1.5:-1.5) +
+             (m15_vr>1.3?(m15_c>m15_e9?1.:-1.):0.)
+float sc1h = (h1_c>h1_e20 and h1_e20>h1_e50?2.5:h1_c<h1_e20 and h1_e20<h1_e50?-2.5:h1_c>h1_e20?1.:-1.) +
+             (h1_rs>55.?1.5:h1_rs<45.?-1.5:0.) +
+             (h1_mh>0.?1.:-1.) +
+             (h1_vr>1.3?(h1_c>h1_e20?1.:-1.):0.)
+float sc4h = (hs>=2.?3.:hs<=-2.?-3.:hs*1.) +
+             (h4_rs2>55.?1.5:h4_rs2<45.?-1.5:0.) +
+             (h4_mh2>0.?1.:-1.) +
+             (h4_vr2>1.3?(hs>=0.?1.:-1.):0.)
+float scd  = use_d?((d_bull?2.:d_bear?-2.:0.)+(d_rs2>55.?1.:d_rs2<45.?-1.:0.)):0.
+float w15=use_d?0.20:0.25; float w1h=use_d?0.30:0.35; float w4h=use_d?0.35:0.40; float wd=use_d?0.15:0.00
+float sc_mx= use_d?(6.*w15+6.*w1h+6.*w4h+3.*wd):(6.*w15+6.*w1h+6.*w4h)
+float esc  = sc_mx>0.?f_clamp((sc15*w15+sc1h*w1h+sc4h*w4h+scd*wd)/sc_mx*100.,-100.,100.):0.
+bool  elong = esc>=30. and ms_trend>=0
+bool  eshort= esc<=-30. and ms_trend<=0
+
+// ══════════════════════════════════════════════════════════════
+// §14 SIGNAL GATE
+// ══════════════════════════════════════════════════════════════
+float ec = 35.
+ec += (math.abs(esc)>70.?22.:math.abs(esc)>50.?14.:math.abs(esc)>30.?7.:0.)
+ec += ((elong and ms_trend==1) or (eshort and ms_trend==-1)?10.:0.)
+ec += ((elong and mtf_sc>30.) or (eshort and mtf_sc<-30.)?10.:0.)
+ec += ((elong and mtf_sc>60.) or (eshort and mtf_sc<-60.)?5.:0.)
+ec += ((elong and bull_div) or (eshort and bear_div)?8.:0.)
+ec += ((elong and h_bull_div) or (eshort and h_bear_div)?5.:0.)
+ec += (h4_vr2>1.5 and ((elong and sc4h>0.) or (eshort and sc4h<0.))?8.:0.)
+ec += ((elong and bos_bull) or (eshort and bos_bear)?8.:0.)         // confirmed BOS = higher weight
+ec += ((elong and bull_sw) or (eshort and bear_sw)?8.:0.)
+ec += ((elong and cvd_bull) or (eshort and cvd_bear)?6.:0.)
+ec += ((elong and dwcs>60.) or (eshort and dwcs<40.)?8.:0.)         // DWCS confirmation
+ec += ((elong and sent_sc>60.) or (eshort and sent_sc<40.)?5.:0.)
+ec += (float(pa_bull)*4. * (elong?1.:0.))                           // [F11] SMC contributes
+ec += (float(pa_bear)*4. * (eshort?1.:0.))
+ec -= (mtf_flag?8.:0.)
+ec -= ((elong and bear_div) or (eshort and bull_div)?12.:0.)
+ec -= ((elong and h4_rs2>72.) or (eshort and h4_rs2<28.)?8.:0.)
+ec -= ((elong and mom_peak) or (eshort and mom_peak)?10.:0.)
+ec -= (mkt_stage==4?12.:0.)
+ec += ((mkt_stage==2 and elong)?10.:0.)
+ec += ((tm_bull_ok and elong)?12.:0.)
+ec += ((tm_bear_ok and eshort)?12.:0.)
+float econf = f_clamp(ec, 10., 96.)
+
+// R:R calculation
+float sl_L  = h4_lo - h4_at*0.5
+float sl_S  = h4_hi + h4_at*0.5
+float rsk_L = math.max(math.abs(close-sl_L), atr_v*0.1)
+float rsk_S = math.max(math.abs(close-sl_S), atr_v*0.1)
+float swb_L = not na(sw_lo)?sw_lo:close-atr_v*3.
+float swb_S = not na(sw_hi)?sw_hi:close+atr_v*3.
+float swm_L = math.abs(close-swb_L)
+float swm_S = math.abs(close-swb_S)
+float tp1_L = swm_L>=atr_v*0.5?swb_L+swm_L*i_ftp:close+atr_v*1.5
+float tp1_S = swm_S>=atr_v*0.5?swb_S-swm_S*i_ftp:close-atr_v*1.5
+float tp2_L = swb_L + swm_L*2.0
+float tp2_S = swb_S - swm_S*2.0
+float rr_L  = rsk_L>0.?math.abs(tp1_L-close)/rsk_L:0.
+float rr_S  = rsk_S>0.?math.abs(tp1_S-close)/rsk_S:0.
+
+bool _a3L = sc15>1. and sc1h>1. and sc4h>1.
+bool _a3S = sc15<-1. and sc1h<-1. and sc4h<-1.
+float _bod = (high-low)>0.?math.abs(close-open)/(high-low):0.
+bool _revL = tm_bull_ok and bull_div and (bull_sw or cvd_bull)
+bool _revS = tm_bear_ok and bear_div and (bear_sw or cvd_bear)
+bool _preL = _a3L and (ms_trend==1 or _revL) and not mom_peak and h4_rs2<75. and _bod>=0.30 and econf>=i_conf
+bool _preS = _a3S and (ms_trend==-1 or _revS) and not mom_peak and h4_rs2>25. and _bod>=0.30 and econf>=i_conf
+
+// [F14] Adaptive cooldown — ETF/daily traders need more space between signals
+// Original: fixed 3 bars = 12h on 4H → too frequent for position trading
+int cd_bars = timeframe.in_seconds()<=900?20:timeframe.in_seconds()<=3600?15:timeframe.in_seconds()<=14400?10:6
+var int _cd = 0
+_cd := math.max(0, _cd-1)
+bool sig_long  = _preL and rr_L>=i_rr and _cd==0
+bool sig_short = _preS and rr_S>=i_rr and _cd==0
+if sig_long or sig_short
+    _cd := cd_bars
+
+// ══════════════════════════════════════════════════════════════
+// §15 PLOTSHAPES
+// ══════════════════════════════════════════════════════════════
+plotshape(sig_long,  "Long ▲",  shape.triangleup,   location.belowbar, color.new(color.lime,0),  size=size.normal)
+plotshape(sig_short, "Short ▼", shape.triangledown, location.abovebar, color.new(color.red,0),   size=size.normal)
+bgcolor(sig_long?color.new(color.lime,97):sig_short?color.new(color.red,97):na, title="Signal BG")
+
+// ══════════════════════════════════════════════════════════════
+// §16 UNIFIED DASHBOARD — single table (was two separate tables)
+// ══════════════════════════════════════════════════════════════
+var table dash = table.new(f_pos(i_dpos), 2, 9,
+     bgcolor=color.new(color.black,100), border_width=0)
+
+if barstate.islast
+    color _TR  = color.new(color.black,100)
+    color _DIM = color.new(color.gray,20)
+    string _dir  = sig_long?"▲ LONG":sig_short?"▼ SHORT":elong?"▲ WATCH":eshort?"▼ WATCH":"─ WAIT"
+    string _gr   = econf>=80.?"A+":econf>=65.?"A":econf>=50.?"B":econf>=35.?"C":"D"
+    color c_sig  = sig_long?color.lime:sig_short?color.red:elong?color.new(color.lime,50):eshort?color.new(color.red,50):_DIM
+    color c_mtf  = mtf_sc>30.?color.lime:mtf_sc<-30.?color.red:color.orange
+    color c_dw   = dwcs>=60.?color.lime:dwcs<=40.?color.red:color.orange
+    color c_sc   = str.contains(scenario,"BULL") or str.contains(scenario,"MARKUP") or str.contains(scenario,"ACCUM") or str.contains(scenario,"SMART MONEY LONG")?color.lime:
+                   str.contains(scenario,"BEAR") or str.contains(scenario,"DUMP") or str.contains(scenario,"DIST") or str.contains(scenario,"BLOW") or str.contains(scenario,"WHALE") or str.contains(scenario,"CAPIT")?color.red:color.yellow
+    color c_st   = mkt_stage==2?color.lime:mkt_stage==4?color.red:mkt_stage==1?color.yellow:_DIM
+    float rr_now = elong?rr_L:rr_S
+    color c_rr   = rr_now>=2.?color.lime:rr_now>=1.5?color.yellow:color.red
+    string _ws2  = w_bull?"W↑":w_bear?"W↓":"W─"
+    string _ds2  = ds>1.?"D↑":ds<-1.?"D↓":"D─"
+    string _hs2  = hs>0.?"H4↑":hs<0.?"H4↓":"H4─"
+
+    // R0: Header
+    table.cell(dash,0,0,"SENTINEL SIGNAL v1.0", bgcolor=color.new(#0d47a1,0),text_color=color.new(#ffb800,0),text_size=size.small)
+    table.cell(dash,1,0,syminfo.ticker+"  "+timeframe.period, bgcolor=color.new(#0d47a1,0),text_color=color.new(#ffb800,0),text_size=size.small)
+
+    // R1: Signal + Grade + Confidence
+    table.cell(dash,0,1,_dir+"  Grade:"+_gr, bgcolor=_TR,text_color=c_sig,text_size=size.small)
+    table.cell(dash,1,1,"Conf:"+str.tostring(math.round(econf),"#")+"% | Sc:"+str.tostring(math.round(esc),"#"), bgcolor=_TR,text_color=c_sig,text_size=size.small)
+
+    // R2: DWCS + Sentiment
+    string dwcs_lb = dwcs>=60.?"BULL":dwcs>=50.?"Mild Bull":dwcs>=40.?"Neutral":"BEAR"
+    table.cell(dash,0,2,"DWCS  "+str.tostring(math.round(dwcs),"#")+"/100  "+dwcs_lb, bgcolor=_TR,text_color=c_dw,text_size=size.small)
+    table.cell(dash,1,2,"Sent:"+str.tostring(math.round(sent_sc),"#")+" | VFI:"+str.tostring(math.round(vfi_norm),"#")+" | OBV:"+(obv_up?"↑":"↓"), bgcolor=_TR,text_color=c_dw,text_size=size.small)
+
+    // R3: MTF Alignment
+    table.cell(dash,0,3,"MTF  "+mtf_str+(mtf_flag?"  ⚠️":""), bgcolor=_TR,text_color=c_mtf,text_size=size.small)
+    table.cell(dash,1,3,_ws2+"  "+_ds2+"  "+_hs2+"  ("+str.tostring(math.round(mtf_sc),"#")+")", bgcolor=_TR,text_color=c_mtf,text_size=size.small)
+
+    // R4: Momentum + Stage
+    string mom_ac_s = mom_ac>1.?" ⚡":mom_ac<-1.?" ⚠️":""
+    table.cell(dash,0,4,"MOM  "+mom_phase+mom_ac_s, bgcolor=_TR,text_color=mom_sc>20.?color.lime:mom_sc<-20.?color.red:_DIM,text_size=size.small)
+    table.cell(dash,1,4,stage_s+"  ADX:"+str.tostring(math.round(adx_v),"#")+"  PC:"+str.tostring(math.round(profit_chips),"#")+"%", bgcolor=_TR,text_color=c_st,text_size=size.small)
+
+    // R5: Scenario + Structure
+    table.cell(dash,0,5,"SCENARIO: "+scenario, bgcolor=_TR,text_color=c_sc,text_size=size.small)
+    string bos_s = bos_bull?"BOS↑":bos_bear?"BOS↓":"─"
+    string sw_s  = bull_sw?"Sw↑":bear_sw?"Sw↓":"─"
+    string div_s = bull_div?"📐B":bear_div?"📐S":h_bull_div?"h+":h_bear_div?"h-":"─"
+    string cvd_s = cvd_bull?"CVD↑":"CVD↓"
+    table.cell(dash,1,5,bos_s+"  "+sw_s+"  Div:"+div_s+"  "+cvd_s, bgcolor=_TR,text_color=_DIM,text_size=size.small)
+
+    // R6: Entry / SL / TP
+    float sl_now = elong?sl_L:sl_S
+    float t1_now = elong?tp1_L:tp1_S
+    float t2_now = elong?tp2_L:tp2_S
+    table.cell(dash,0,6,"SL:"+str.tostring(sl_now,"#.##")+"  T1:"+str.tostring(t1_now,"#.##"), bgcolor=_TR,text_color=_DIM,text_size=size.small)
+    table.cell(dash,1,6,"T2:"+str.tostring(t2_now,"#.##")+"  R:R "+str.tostring(rr_now,"#.#")+"x", bgcolor=_TR,text_color=c_rr,text_size=size.small)
+
+    // R7: Position Sizing
+    float rusd   = i_acc * i_rpct / 100.
+    float rsk_n  = elong?rsk_L:rsk_S
+    float pos_sz = rsk_n>0.?rusd/rsk_n:0.
+    table.cell(dash,0,7,"Risk $"+str.tostring(rusd,"#.0")+"  Pos:"+str.tostring(pos_sz,"#.###")+" units", bgcolor=_TR,text_color=_DIM,text_size=size.small)
+    table.cell(dash,1,7,"WT:"+(wt_last==1?"▲":wt_last==-1?"▼":"─")+"  WTDiff:"+str.tostring(wtD,"#.0")+"  LC:"+str.tostring(math.round(lc_chips),"#")+"%", bgcolor=_TR,text_color=_DIM,text_size=size.small)
+
+    // R8: Status message
+    string status = sig_long or sig_short?(sig_long?"▲":"▼")+" SIGNAL — Entry:"+str.tostring(close,"#.##")+"  SL:"+str.tostring(sl_now,"#.##"):
+                    elong or eshort?"⏳ Forming "+str.tostring(math.round(econf),"#")+"% / need "+str.tostring(math.round(i_conf),"#")+"%":
+                    str.contains(scenario,"🚨")?"🚨 DANGER — "+scenario:
+                    mkt_stage==4?"🚨 S4 DIST — Avoid longs":
+                    mom_peak?"⚠️ MOM PEAK — Tighten stops":
+                    mtf_flag?"⚠️ TF CONFLICT — "+_ws2+" "+_ds2+" "+_hs2:
+                    tm_bull_ok?"⚡ BULL REVERSAL — Trend↓ Mom↑":
+                    tm_bear_ok?"⚠️ BEAR REVERSAL — Trend↑ Mom↓":
+                    "😴 No setup — Monitor"
+    color c_st2 = sig_long or sig_short?color.lime:str.contains(status,"🚨")?color.red:str.contains(status,"⚠️")?color.orange:_DIM
+    table.cell(dash,0,8,status, bgcolor=_TR,text_color=c_st2,text_size=size.small)
+    float ev = rr_now * (econf/100.) - (1. - econf/100.)
+    table.cell(dash,1,8,"EV:"+str.tostring(ev,"+#.##")+"  Cd:"+str.tostring(_cd,"#")+" bars", bgcolor=_TR,text_color=_DIM,text_size=size.small)
+
+// ══════════════════════════════════════════════════════════════
+// §17 ALERTS — 12 conditions
+// ══════════════════════════════════════════════════════════════
+alertcondition(sig_long,                         "Sentinel: LONG ▲",       "▲ LONG | Conf:{{plot_0}}% | {{ticker}} {{interval}}")
+alertcondition(sig_short,                        "Sentinel: SHORT ▼",      "▼ SHORT | Conf:{{plot_0}}% | {{ticker}} {{interval}}")
+alertcondition(bos_bull,                         "Sentinel: BOS Bull 📈",   "📈 BOS BULL confirmed — Structure break up")
+alertcondition(bos_bear,                         "Sentinel: BOS Bear 📉",   "📉 BOS BEAR confirmed — Structure break down")
+alertcondition(mom_peak and not mom_peak[1],     "Sentinel: Mom Peak ⚠️",  "⚠️ MOMENTUM PEAK — Decel likely, tighten stops")
+alertcondition(bull_div,                         "Sentinel: Bull Div 📐",   "📐 BULL DIVERGENCE at confirmed pivot low")
+alertcondition(bear_div,                         "Sentinel: Bear Div 📐",   "📐 BEAR DIVERGENCE at confirmed pivot high")
+alertcondition(pump_dump,                        "Sentinel: Pump-Dump 🚨", "🚨 PUMP-DUMP detected — exit / avoid")
+alertcondition(capitul,                          "Sentinel: Capitulation",  "🔻 CAPITULATION — potential reversal bottom")
+alertcondition(dwcs>=60. and dwcs[1]<60.,        "Sentinel: DWCS Bull",     "DWCS crossed 60 — entering Bull zone")
+alertcondition(dwcs<=40. and dwcs[1]>40.,        "Sentinel: DWCS Bear",     "DWCS crossed 40 — entering Bear zone")
+alertcondition(mkt_stage==4 and mkt_stage[1]!=4,"Sentinel: S4 Dist 🔴",   "🔴 Stage 4 Distribution entered — reduce longs")
+
+plot(econf, display=display.none, title="Confidence")
+plot(esc,   display=display.none, title="Entry Score")
+plot(dwcs,  display=display.none, title="DWCS")
