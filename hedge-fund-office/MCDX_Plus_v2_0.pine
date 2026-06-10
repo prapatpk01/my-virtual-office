@@ -1,0 +1,1693 @@
+//@version=6
+indicator(
+     title            = 'MCDX Plus v2.0'
+   , shorttitle       = 'MCDX+ v2.0'
+   , format           = format.price
+   , precision        = 2
+   , overlay          = false
+   , max_bars_back    = 5000
+   , max_boxes_count  = 500
+   , max_labels_count = 500
+   , max_lines_count  = 500
+   , max_polylines_count = 100
+   )
+
+// ============================================================
+// SECTION 1: INPUTS
+// ============================================================
+grDASH        = '● Dashboard & Table'
+ind           = input.bool(true,  'Show Table',         inline='d1', group=grDASH)
+show_ai_dash  = input.bool(true,  'Show Label Dash',    inline='d1', group=grDASH)
+show_sit      = input.bool(true,  'Show Detail Block',  inline='d1', group=grDASH)
+text_size     = input.string('SMALL','Table Size:', options=['TINY','SMALL','NORMAL','LARGE','HUGE'], inline='d2', group=grDASH)
+w             = input.int(14,'Width:', minval=8, maxval=24, inline='d2', group=grDASH)
+lbl_pos_inp   = input.string('Top Left','Label Pos:', options=['Top Left','Top Right','Bottom Left','Bottom Right','Center Left','Center Right'], inline='d3', group=grDASH)
+lbl_size_inp  = input.string('SMALL','Label Size:', options=['TINY','SMALL','NORMAL','LARGE'], inline='d3', group=grDASH)
+
+grC           = '● Custom Colors'
+col_pc        = input.color(#EB4C42,      'Profit Chips',   inline='c1', group=grC)
+col_pc2       = input.color(#FFB7C5,      'PC below SMA',   inline='c1', group=grC)
+col_fc        = input.color(#FFFF00,      'Float Chips',    inline='c2', group=grC)
+col_lc        = input.color(#39FF14,      'Locked Chips',   inline='c2', group=grC)
+col_smapc     = input.color(color.maroon, 'SMA PC',         inline='c3', group=grC)
+col_smalc     = input.color(#50C878,      'SMA LC',         inline='c3', group=grC)
+col_smafc     = input.color(#FFAE42,      'SMA FC',         inline='c4', group=grC)
+col_fund      = input.color(color.orange, 'Fund Sim',       inline='c4', group=grC)
+col_cpk_bull  = input.color(#2196F3,      'CPK Bull',       inline='c5', group=grC)
+col_cpk_bear  = input.color(#F44336,      'CPK Bear',       inline='c5', group=grC)
+col_dwcs_buy  = input.color(#00FF00,      'DWCS Buy',       inline='c6', group=grC)
+col_dwcs_sell = input.color(#FF0000,      'DWCS Sell',      inline='c6', group=grC)
+col_dwcs_mid  = input.color(color.gray,   'DWCS Neutral',   inline='c6', group=grC)
+col_flow_bull = input.color(#00E5FF,      'Flow Bull',      inline='c7', group=grC)
+col_flow_bear = input.color(#FF6D00,      'Flow Bear',      inline='c7', group=grC)
+col_sent_bull = input.color(#76FF03,      'Sentiment Bull', inline='c8', group=grC)
+col_sent_bear = input.color(#FF1744,      'Sentiment Bear', inline='c8', group=grC)
+col_reg_bull  = input.color(#00FF00,      'Regime Bull',    inline='c9', group=grC)
+col_reg_bear  = input.color(#FF0000,      'Regime Bear',    inline='c9', group=grC)
+col_reg_flat  = input.color(color.gray,   'Regime Flat',    inline='c9', group=grC)
+
+gr1           = '● MCDX Mode & Length'
+mcdx_mcd      = input.string('MCDX','Mode', options=['MCDX','MCD','Adaptive'], group=gr1)
+mcdx_rev      = input.string('12','Revision', options=['12','11'], group=gr1)
+mcdx_source   = input.source(close,'Source', inline='2', group=gr1)
+mcdx_length   = input.string('Auto','Length', options=['Auto','34-bar','50-bar','100-bar','Manual Input'], inline='2a', group=gr1)
+manual_len    = input.int(100,'Manual', minval=3, inline='2a', group=gr1)
+adaptive_sens = input.float(1.5,'Adaptive Sens', minval=0.5, step=0.1, inline='2b', group=gr1)
+
+gr3      = '● Plot: Profit / Float / Locked'
+all_show = input.bool(true,  'All',     inline='3a', group=gr3)
+pc_show  = input.bool(false, 'PC only', inline='3b', group=gr3)
+fc_show  = input.bool(false, 'FC only', inline='3c', group=gr3)
+lc_show  = input.bool(false, 'LC only', inline='3d', group=gr3)
+
+gr4         = '● SMA Lines'
+sma_pc_len  = input.int(10,'SMA PC', minval=1, inline='4a', group=gr4)
+sma_pc_show = input.bool(true,  'Show', inline='4a', group=gr4)
+sma_pc_lw   = input.int(1, 'LW', minval=1, maxval=4, inline='4a', group=gr4)
+sma_fc_len  = input.int(10,'SMA FC', minval=1, inline='4b', group=gr4)
+sma_fc_show = input.bool(false, 'Show', inline='4b', group=gr4)
+sma_fc_lw   = input.int(1, 'LW', minval=1, maxval=4, inline='4b', group=gr4)
+sma_lc_len  = input.int(10,'SMA LC', minval=1, inline='4c', group=gr4)
+sma_lc_show = input.bool(true,  'Show', inline='4c', group=gr4)
+sma_lc_lw   = input.int(1, 'LW', minval=1, maxval=4, inline='4c', group=gr4)
+
+gr5               = '● Golden / Death Cross'
+gc_show           = input.bool(true, 'GC', inline='5a', group=gr5)
+gc_label_offset_v = input.int(5,'GC Offset', step=1, inline='5a', group=gr5)
+dc_show           = input.bool(true, 'DC', inline='5b', group=gr5)
+dc_label_offset_v = input.int(5,'DC Offset', step=1, inline='5b', group=gr5)
+
+gr6               = '● Alerts: BC / OS / OB'
+bc_show           = input.bool(true,  'BC', inline='6a', group=gr6)
+bc_label_offset_v = input.int(20,'BC y', step=1, inline='6a', group=gr6)
+os_show           = input.bool(true,  'OS', inline='6b', group=gr6)
+os_label_offset_v = input.int(10,'OS y', step=1, inline='6b', group=gr6)
+ob_show           = input.bool(true,  'OB', inline='6c', group=gr6)
+ob_label_offset_v = input.int(80,'OB y', step=1, inline='6c', group=gr6)
+alert_min_conf    = input.int(55,'Min Confluence Conf%', minval=40, maxval=90, step=5, group=gr6)
+
+gr7                   = '● Fund Simulation'
+fundsim_show          = input.bool(false,'Show Fund Sim', group=gr7)
+
+gr8         = '● Reference Bands'
+band25_show = input.bool(true,'25', inline='8', group=gr8)
+band50_show = input.bool(true,'50', inline='8', group=gr8)
+band75_show = input.bool(true,'75', inline='8', group=gr8)
+
+grD          = '● DWCS & Engine Parameters'
+dwcs_buy     = input.int(60,'DWCS Buy Threshold',   inline='dw0', group=grD)
+dwcs_sell    = input.int(40,'DWCS Sell Threshold',  inline='dw0', group=grD)
+mfi_len      = input.int(14,'MFI Len',              inline='dw1', group=grD)
+cpk_roc1     = input.int(14,'CPK ROC1',             inline='cp1', group=grD)
+cpk_roc2     = input.int(11,'CPK ROC2',             inline='cp1', group=grD)
+cpk_wma      = input.int(10,'CPK WMA',              inline='cp2', group=grD)
+cpk_norm     = input.int(200,'CPK Norm',            inline='cp2', group=grD)
+adx_len      = input.int(14,'ADX Len',              inline='ad1', group=grD)
+adx_weak     = input.int(20,'ADX Weak',             inline='ad1', group=grD)
+adx_strong   = input.int(25,'ADX Strong',           inline='ad1', group=grD)
+bb_len       = input.int(20,'BB Len',               inline='bb1', group=grD)
+bb_width     = input.float(0.02,'Sideway BB%',      inline='bb1', group=grD)
+
+grVFL        = '● Volume Flow Indicators'
+vfi_len      = input.int(130,'VFI Length', minval=20, inline='vf1', group=grVFL)
+vfi_coef     = input.float(0.2,'VFI Coef', minval=0.05, step=0.05, inline='vf1', group=grVFL)
+vfi_smooth   = input.int(3,'VFI Smooth', minval=1, inline='vf2', group=grVFL)
+obv_z_len    = input.int(20,'OBV Z-Len', minval=10, inline='vf2', group=grVFL)
+vwap_dev_len = input.int(14,'VWAP-Delta Len', minval=5, inline='vf3', group=grVFL)
+flow_show    = input.bool(true,'Show Flow Line', inline='vf3', group=grVFL)
+flow_lw      = input.int(2,'LW', minval=1, maxval=4, inline='vf3', group=grVFL)
+
+grSENT       = '● Sentiment Engine'
+sent_rsi_w   = input.float(0.25,'RSI Wt',  minval=0.0, maxval=1.0, step=0.05, inline='s1', group=grSENT)
+sent_macd_w  = input.float(0.20,'MACD Wt', minval=0.0, maxval=1.0, step=0.05, inline='s1', group=grSENT)
+sent_vfi_w   = input.float(0.25,'VFI Wt',  minval=0.0, maxval=1.0, step=0.05, inline='s2', group=grSENT)
+sent_obv_w   = input.float(0.15,'OBV Wt',  minval=0.0, maxval=1.0, step=0.05, inline='s2', group=grSENT)
+sent_adx_w   = input.float(0.15,'ADX Wt',  minval=0.0, maxval=1.0, step=0.05, inline='s3', group=grSENT)
+sent_show    = input.bool(true,'Show Sentiment Area', inline='s3', group=grSENT)
+sent_lw      = input.int(2,'LW', minval=1, maxval=4, inline='s3', group=grSENT)
+
+grVOL         = '● Volume Overlay (Main Chart)'
+vol_ov_show   = input.bool(true, 'Show Volume Bars', inline='vo0', group=grVOL)
+vol_ov_ma_len = input.int(20,'Vol MA Len', minval=1, inline='vo1', group=grVOL)
+vol_ov_max_h  = input.float(20.0,'Max Height %', minval=5.0, maxval=50.0, step=1.0, inline='vo1', group=grVOL)
+vol_bull_transp  = input.int(70,'Bull Transp', minval=0, maxval=95, step=5, inline='vo2', group=grVOL)
+vol_bear_transp  = input.int(70,'Bear Transp', minval=0, maxval=95, step=5, inline='vo2', group=grVOL)
+vol_surge_transp = input.int(30,'Surge Transp', minval=0, maxval=95, step=5, inline='vo3', group=grVOL)
+
+grWT          = '● WaveTrend'
+wt_show       = input.bool(true,  'Show WT Lines',   inline='wt0', group=grWT)
+wt_sig_show   = input.bool(true,  'Show WT Signals', inline='wt0', group=grWT)
+wt_n1         = input.int(10,'WT Channel Len', minval=2, inline='wt1', group=grWT)
+wt_n2         = input.int(21,'WT Average Len', minval=2, inline='wt1', group=grWT)
+wt_cross_base = input.float(5.0,'WT Cross Thr (±)', minval=1.0, step=0.5, inline='wt2', group=grWT)
+wt_adx_thresh = input.float(20.0,'WT ADX Min', minval=5.0, step=1.0, inline='wt2', group=grWT)
+wt_dwcs_w     = input.float(0.08,'WT Weight DWCS', minval=0.0, maxval=0.30, step=0.01, inline='wt3', group=grWT)
+wt_decay_bars = input.int(50,'WT Decay (bars)', minval=5, maxval=200, step=5, inline='wt4', group=grWT)
+wt_lw         = input.int(1,'WT1 LW', minval=1, maxval=4, inline='wt5', group=grWT)
+col_wt1       = input.color(color.new(color.lime,30),'WT1', inline='wt5', group=grWT)
+col_wt2       = input.color(color.new(color.red, 50),'WT2', inline='wt5', group=grWT)
+
+grRSI         = '● RSI Settings'
+rsi_len       = input.int(14,'RSI Length', minval=2, inline='r1', group=grRSI)
+rsi_ob        = input.float(70.0,'RSI OB', minval=50.0, inline='r1', group=grRSI)
+rsi_os        = input.float(30.0,'RSI OS', maxval=50.0, inline='r1', group=grRSI)
+rsi_mid_ob    = input.float(60.0,'Mid-OB', minval=50.0, inline='r2', group=grRSI)
+rsi_mid_os    = input.float(40.0,'Mid-OS', maxval=50.0, inline='r2', group=grRSI)
+
+grMTF         = '● Multi-Timeframe Gate'
+mtf_enable    = input.bool(true,'Enable MTF', inline='m0', group=grMTF)
+mtf_tf        = input.timeframe('D','HTF', inline='m0', group=grMTF)
+mtf_dwcs_w    = input.float(0.08,'MTF Weight', minval=0.0, maxval=0.20, step=0.01, inline='m1', group=grMTF)
+mtf_len       = input.int(20,'HTF MA Len', minval=5, inline='m1', group=grMTF)
+
+grPA             = '● Price Action (SMC)'
+pa_enable        = input.bool(true,  'Enable SMC',        inline='pa0', group=grPA)
+pa_window_enable = input.bool(true,  'Window Limit',      inline='pa0', group=grPA)
+pa_window        = input.int(5000,   '',                  inline='pa0', group=grPA, minval=1000)
+pa_show_swing    = input.bool(true,  'Swing Structure',   inline='pa1', group=grPA)
+pa_swing_limit   = input.int(100,    '',                  inline='pa1', group=grPA, minval=10, maxval=200)
+pa_css_up        = input.color(#089981,'',                inline='pa1', group=grPA)
+pa_css_dn        = input.color(#f23645,'',                inline='pa1', group=grPA)
+pa_ms_mode       = input.string('Adjusted Points','Algo Logic', options=['Extreme Points','Adjusted Points'], inline='pa2', group=grPA)
+pa_ms_len        = input.int(5,'',                        inline='pa2', group=grPA, minval=2)
+pa_build_sweep   = input.bool(true,'Build Sweep (x)',     inline='pa2', group=grPA)
+pa_bubbles       = input.bool(true,'MS Bubbles',          inline='pa2', group=grPA)
+pa_ms_text       = input.string('Tiny','MS Text', options=['Tiny','Small','Normal','Large','Huge'], inline='pa3', group=grPA)
+pa_candle_css    = input.bool(false,'Color Candles',      inline='pa3', group=grPA)
+pa_show_mapping  = input.bool(false,'Mapping Structure',  inline='pa3', group=grPA)
+pa_mapping_css   = input.color(color.silver,'',           inline='pa3', group=grPA)
+pa_ob_show       = input.bool(true,'Order Blocks',        inline='ob0', group=grPA)
+pa_ob_last       = input.int(5,'Last',                    inline='ob0', group=grPA, minval=0)
+pa_ob_up_css     = input.color(color.new(#089981,90),'',  inline='ob0', group=grPA)
+pa_ob_dn_css     = input.color(color.new(#f23645,90),'',  inline='ob0', group=grPA)
+pa_ob_activity   = input.bool(true,'Buy/Sell Activity',   inline='ob1', group=grPA)
+pa_ob_act_up     = input.color(color.new(#089981,50),'',  inline='ob1', group=grPA)
+pa_ob_act_dn     = input.color(color.new(#f23645,50),'',  inline='ob1', group=grPA)
+pa_ob_breakers   = input.bool(false,'Show Breakers',      inline='ob2', group=grPA)
+pa_bb_up         = input.color(color.new(#089981,100),'', inline='ob2', group=grPA)
+pa_bb_dn         = input.color(color.new(#f23645,100),'', inline='ob2', group=grPA)
+pa_ob_mode       = input.string('Length','OB Construction', options=['Length','Full'], inline='ob3', group=grPA)
+pa_ob_len        = input.int(5,'',                        inline='ob3', group=grPA, minval=1)
+pa_ob_miti       = input.string('Close','OB Mitigation',  options=['Close','Wick','Avg'], inline='ob3', group=grPA)
+pa_ob_txt        = input.string('Normal','OB Metric Size', options=['Tiny','Small','Normal','Large','Huge','Auto'], inline='ob3', group=grPA)
+pa_ob_metric     = input.bool(true,'Show OB Metrics',     inline='ob4', group=grPA)
+pa_ob_midline    = input.bool(true,'OB Mid-Line',         inline='ob4', group=grPA)
+pa_ob_overlap    = input.bool(true,'Hide OB Overlap',     inline='ob4', group=grPA)
+pa_ob_which_lap  = input.string('Recent','',              options=['Recent','Old'], inline='ob4', group=grPA)
+pa_fvg_enable    = input.bool(false,'Fair Value Gap',     inline='fv0', group=grPA)
+pa_fvg_what      = input.string('FVG','',                 options=['FVG','Breakers'], inline='fv0', group=grPA)
+pa_fvg_num       = input.int(5,'Last',                    inline='fv0', group=grPA, minval=0)
+pa_fvg_up_css    = input.color(color.new(#089981,80),'',  inline='fv0', group=grPA)
+pa_fvg_dn_css    = input.color(color.new(#f23645,80),'',  inline='fv0', group=grPA)
+pa_fvg_src       = input.string('Close','FVG Mitigation', options=['Close','Wick','Avg'], inline='fv1', group=grPA)
+pa_fvg_thresh    = input.float(0.0,'FVG Threshold',       inline='fv1', group=grPA, minval=0, maxval=2, step=0.1)
+pa_fvg_overlap   = input.bool(true,'Hide FVG Overlap',    inline='fv1', group=grPA)
+pa_fvg_midline   = input.bool(true,'FVG Mid-Line',        inline='fv1', group=grPA)
+pa_fvg_extend    = input.bool(false,'Extend FVG',         inline='fv1', group=grPA)
+
+// ============================================================
+// SECTION 2: HELPERS
+// ============================================================
+bool mcdx_plot     = mcdx_mcd == 'MCDX'
+bool mcd_plot      = mcdx_mcd == 'MCD'
+bool adaptive_plot = mcdx_mcd == 'Adaptive'
+bool mcdx12        = mcdx_rev == '12'
+bool mcdx11        = mcdx_rev == '11'
+
+NoDecimal(float x)    => str.tostring(x, '#')
+OneDecimal(float x)   => str.tostring(x, '0.0')
+ThreeDecimal(float x) => str.tostring(x, '0.000')
+clamp(float v, float lo, float hi) => math.max(lo, math.min(hi, v))
+f_zlema(float src, int len) =>
+    float e1 = ta.ema(src, len)
+    float e2 = ta.ema(e1, len)
+    e1 + (e1 - e2)
+f_tsize(string s) =>
+    s == 'TINY' ? size.tiny : s == 'SMALL' ? size.small : s == 'NORMAL' ? size.normal : s == 'LARGE' ? size.large : size.huge
+fmcdx(float X, int N) =>
+    float lo = ta.lowest(low, N)
+    float hi = ta.highest(high, N)
+    clamp((X - lo) / math.max(hi - lo, syminfo.mintick) * 100, 0, 100)
+fmcd(float Xf, int Nf) =>
+    float lol   = ta.lowest(low, Nf)
+    float hoh   = ta.highest(high, Nf)
+    float denom = math.max(hoh - lol, 0.01)
+    float pcraw = (Xf - lol) / denom * 100
+    float al    = bar_index < 34 ? 0.05 : bar_index <= 50 ? 0.04 : bar_index <= 100 ? 0.03 : 0.025
+    float pcm   = 0.0
+    pcm := na(pcm[1]) ? pcraw : al * pcraw + (1.0 - al) * pcm[1]
+    clamp(pcm, 0, 100)
+fmcdx_pc(float X, int N) =>
+    float denom = math.max(ta.highest(high,N) - ta.lowest(low,N), syminfo.mintick)
+    (X - ta.lowest(low,N)) / denom * 100
+fmcdx_fc(float X, int N) =>
+    float denom = math.max(ta.highest(high,N) - ta.lowest(low,N), syminfo.mintick)
+    100 - (ta.highest(high,N) - X) / denom * 100 + 25
+fmcdx_avg(float H, float L, int N)   => (ta.highest(H,N) + ta.lowest(L,N)) / 2
+fmcdx_range(float H, float L, int N) =>  ta.highest(H,N) - ta.lowest(L,N)
+fr(float Xv, int Nv) =>
+    float denom = math.max(ta.highest(high,Nv) - ta.lowest(low,Nv), syminfo.mintick)
+    (Xv - ta.lowest(low,Nv)) / denom * 100
+fY(float Xv, int Nv, int Mv) =>
+    float alpha = float(Mv) / float(Nv)
+    float y = 0.0
+    y := na(y[1]) ? Xv : alpha * Xv + (1.0 - alpha) * y[1]
+    y
+
+// ============================================================
+// SECTION 3: BANDS & AUTO LENGTH
+// ============================================================
+hline(75, '75', color = band75_show ? color.black : color.new(color.black,100), linestyle=hline.style_dashed)
+hline(50, '50', color = band50_show ? color.black : color.new(color.black,100), linestyle=hline.style_dashed)
+hline(25, '25', color = band25_show ? color.black : color.new(color.black,100), linestyle=hline.style_dashed)
+
+int auto_len = 3
+for i = 3 to 100
+    if bar_index == i
+        auto_len := i
+        break
+    if bar_index >= 100
+        auto_len := 100
+        break
+int Nr = mcdx_length == 'Auto' ? auto_len : mcdx_length == '34-bar' ? 34 : mcdx_length == '50-bar' ? 50 : mcdx_length == '100-bar' ? 100 : mcdx_length == 'Manual Input' ? manual_len : auto_len
+
+// ============================================================
+// SECTION 4: CHIP CALCULATIONS
+// ============================================================
+float X          = mcdx_source
+float sma20      = ta.sma(X, 20)
+float mcdx_avg   = fmcdx_avg(high, low, Nr)
+float mcdx_avg50 = fmcdx_avg(high, low, 50)
+float mcdx_rng   = fmcdx_range(high, low, Nr)
+
+float Xpr        = mcdx_source * (bar_index <= 100 ? 0.98 : 0.96)
+float pcr_val    = fmcdx(Xpr, Nr)
+float sma_pcr    = ta.sma(pcr_val, sma_pc_len)
+float sma_pcr10  = ta.sma(pcr_val, 10)
+color pc_colorr  = pcr_val >= sma_pcr ? color.new(col_pc,10) : color.new(col_pc2,0)
+float Xfur       = mcdx_source * (bar_index <= 100 ? 1.02 : 1.04)
+float fcur_val   = fmcdx(Xfur, Nr)
+float fcr_val    = clamp(fcur_val - pcr_val, 0, 100)
+float sma_fcr    = ta.sma(fcr_val, sma_fc_len)
+float lcr_val    = clamp(100 - fcur_val, 0, 100)
+float sma_lcr    = ta.sma(lcr_val, sma_lc_len)
+
+float adaptive_pc_val   = clamp(fmcdx(Xpr,Nr) * adaptive_sens, 0, 100)
+float adaptive_fc_total = clamp(fmcdx(Xfur,Nr), 0, 100)
+float adaptive_fc_val   = clamp(adaptive_fc_total - adaptive_pc_val, 0, 100)
+float adaptive_lc_val   = clamp(100 - adaptive_fc_total, 0, 100)
+float adaptive_sma_pc   = ta.sma(adaptive_pc_val, sma_pc_len)
+color adaptive_pc_color = adaptive_pc_val >= adaptive_sma_pc ? color.new(col_pc,10) : color.new(col_pc2,0)
+
+float mcdr_pc       = fmcd(mcdx_source * (bar_index <= 100 ? 0.96 : 0.94), Nr)
+float mcdr_pc_sma   = ta.sma(mcdr_pc, 10)
+color mcdr_pc_color = mcdr_pc >= mcdr_pc_sma ? color.new(col_pc,10) : color.new(col_pc2,0)
+float mcdr_fcur     = clamp(fmcd(mcdx_source * (bar_index <= 100 ? 1.03 : 1.05), Nr), 0, 100)
+float mcdr_fc_val   = clamp(mcdr_fcur - mcdr_pc, 0, 100)
+float mcdr_lc_val   = clamp(100 - mcdr_fcur, 0, 100)
+float mcdr_lc_sma   = ta.sma(mcdr_lc_val, 10)
+
+float fc_raw        = fmcdx_fc(X, Nr)
+bool  fc_1          = Nr >= 100 ? close > open and low > sma20 and low > mcdx_avg and low > mcdx_avg50 : close > open and low > sma20 and low > mcdx_avg
+bool  fc_2          = Nr >= 100 ? close > open and close > sma20 and close > mcdx_avg and close > mcdx_avg50 : close > open and close > sma20 and close > mcdx_avg
+bool  fc_3          = Nr >= 100 ? close > sma20 and open > mcdx_avg and open > mcdx_avg50 and close > mcdx_avg50 and close > mcdx_avg : close > sma20 and open > mcdx_avg and close > mcdx_avg
+bool  fc_4          = Nr >= 100 ? close >= open and high > mcdx_avg and close > mcdx_avg50 : close >= open and high > mcdx_avg and close > mcdx_avg
+float float_chips   = clamp((fc_1 or fc_2 or fc_3 or fc_4) ? 100.0 : fc_raw, 0, 100)
+float pc_1          = fmcdx_pc(X, Nr)
+float pc_2          = (X - mcdx_avg) / math.max(mcdx_rng, syminfo.mintick) * 100
+float profit_chips  = clamp((pc_1 + pc_2) / 2 + 25, 0, 100)
+float sma_pc11      = ta.sma(profit_chips, sma_pc_len)
+color pc_color11    = profit_chips >= sma_pc11 ? color.new(col_pc,10) : color.new(col_pc2,0)
+
+float u_pc    = adaptive_plot ? adaptive_pc_val   : (mcdx12 and mcdx_plot ? pcr_val   : (mcdx11 and mcdx_plot ? profit_chips   : (mcd_plot ? mcdr_pc     : pcr_val)))
+float u_fctot = adaptive_plot ? adaptive_fc_total : (mcdx12 and mcdx_plot ? fcur_val  : (mcdx11 and mcdx_plot ? float_chips    : (mcd_plot ? mcdr_fcur   : fcur_val)))
+float u_fc    = adaptive_plot ? adaptive_fc_val   : (mcdx12 and mcdx_plot ? fcr_val   : (mcdx11 and mcdx_plot ? float_chips    : (mcd_plot ? mcdr_fc_val : fcr_val)))
+float u_lc    = adaptive_plot ? adaptive_lc_val   : (mcdx12 and mcdx_plot ? lcr_val   : (mcdx11 and mcdx_plot ? lcr_val        : (mcd_plot ? mcdr_lc_val : lcr_val)))
+float u_smapc = adaptive_plot ? ta.sma(adaptive_pc_val,sma_pc_len) : (mcdx12 and mcdx_plot ? sma_pcr : (mcdx11 and mcdx_plot ? sma_pc11 : (mcd_plot ? mcdr_pc_sma : sma_pcr)))
+float u_smafc = adaptive_plot ? ta.sma(adaptive_fc_val,sma_fc_len) : (mcdx12 and mcdx_plot ? sma_fcr : sma_fcr)
+float u_smalc = adaptive_plot ? ta.sma(adaptive_lc_val,sma_lc_len) : (mcdx12 and mcdx_plot ? sma_lcr : (mcd_plot ? mcdr_lc_sma : sma_lcr))
+color u_pccol = adaptive_plot ? adaptive_pc_color : (mcdx12 and mcdx_plot ? pc_colorr : (mcdx11 and mcdx_plot ? pc_color11 : (mcd_plot ? mcdr_pc_color : color.gray)))
+color u_fccol = (all_show or fc_show) ? color.new(col_fc,10) : lc_show ? color.white : na
+bool  u_gc    = ta.crossover(u_smapc, u_smalc)
+bool  u_dc    = ta.crossunder(u_smapc, u_smalc)
+
+// ============================================================
+// SECTION 5: CHIP PLOTS
+// ============================================================
+plot((all_show or lc_show) ? 100.0 : na,              'Locked', color=color.new(col_lc,0), linewidth=10, style=plot.style_columns)
+plot((all_show or fc_show or lc_show) ? u_fctot : na, 'Float',  color=u_fccol,             linewidth=10, style=plot.style_columns)
+plot((all_show or pc_show) ? u_pc : na,               'Profit', color=u_pccol,             linewidth=10, style=plot.style_columns)
+plot(sma_pc_show ? u_smapc : na, 'SMA PC', color=col_smapc, linewidth=sma_pc_lw)
+plot(sma_fc_show ? u_smafc : na, 'SMA FC', color=col_smafc, linewidth=sma_fc_lw)
+plot(sma_lc_show ? u_smalc : na, 'SMA LC', color=col_smalc, linewidth=sma_lc_lw)
+// [REMOVED - plot limit] plot(u_gc ? u_smapc : na, 'GC Bar', style=plot.style_columns, linewidth=2, color=color.purple)
+// [REMOVED - plot limit] plot(u_dc ? u_smapc : na, 'DC Bar', style=plot.style_columns, linewidth=2, color=color.gray)
+
+bool dd_cross_pcr    = ta.crossover(pcr_val, 75)
+bool dd_cross_adapc  = ta.crossover(adaptive_pc_val, 75)
+bool dd_cross_profit = ta.crossover(profit_chips, 75)
+bool any_dd = (mcdx12 and mcdx_plot and pcr_val > sma_pcr10 and close > open and dd_cross_pcr) or (adaptive_plot and adaptive_pc_val > adaptive_sma_pc and close > open and dd_cross_adapc) or (mcd_plot and mcdr_pc > mcdr_pc_sma and close > open and mcdr_pc[1] < 75 and mcdr_pc >= 75) or (mcdx11 and mcdx_plot and profit_chips > sma_pc11 and close > open and dd_cross_profit)
+// [REMOVED - plot limit] plot(any_dd ? 75.0 : na, 'DD Bar', style=plot.style_columns, linewidth=2, color=color.orange)
+plotshape(any_dd ? 75.0 : na, 'DD', shape.diamond, location.absolute, color.orange, text='DD', textcolor=color.black, size=size.tiny)
+
+// ============================================================
+// SECTION 6: BASE OSCILLATORS
+// ============================================================
+float vol_raw    = volume
+float p_vol      = nz(volume[1], 1.0)
+float vpc        = vol_raw * ta.change(close, 1)
+float vpcema1    = ta.ema(vpc, 13)
+float vpcema2    = ta.ema(vpcema1, 5)
+float bcs        = ta.stoch(close, high, low, 14)
+float bck        = ta.sma(bcs, 3)
+float bcd        = ta.sma(bck, 3)
+float hoph       = ta.highest(nz(high[1]), 2)
+float hopl       = ta.lowest(nz(low[1]), 2)
+float sma_vol20  = ta.sma(vol_raw, 20)
+float sma_vol50  = ta.sma(vol_raw, 50)
+float vol_ratio  = nz(vol_raw, 1.0) / math.max(sma_vol20, 1.0)
+bool  vol_surge  = vol_ratio > 2.0
+float price_range_norm = math.abs(ta.change(close,1)) / math.max(ta.atr(14), syminfo.mintick)
+
+bool trig    = vol_raw > sma_vol50 and vol_raw < 1.5 * p_vol and close > 1.03 * open and close > nz(close[1])
+bool onh     = vol_raw > 1.5 * p_vol and close > open and close > nz(close[1])
+bool hiu     = vol_raw > 1.5 * p_vol and vol_raw > sma_vol50 and vol_raw < 2.5 * sma_vol50 and close >= open and close > nz(close[1])
+bool huu     = vol_raw > 1.5 * p_vol and vol_raw > 2.5 * sma_vol50 and close >= open and close > nz(close[1])
+bool vol_all = trig or onh or hiu or huu
+
+BC2f(float Xb, int Nb) =>
+    float HOH = ta.highest(Xb, Nb)
+    float LOL = ta.lowest(Xb, Nb)
+    100 * (HOH - Xb) / math.max(HOH - LOL, syminfo.mintick)
+float bc2_val21 = BC2f(close, 21)
+float bc2_val42 = BC2f(close, 42)
+bool  bc2_xu21  = ta.crossunder(bc2_val21, 80)
+bool  bc2_xu42  = ta.crossunder(bc2_val42, 80)
+bool  bc2_raw   = bc2_xu21 and bc2_xu42
+float p1_u_pc = nz(u_pc[1], 50.0)
+float p2_u_pc = nz(u_pc[2], 50.0)
+float p1_u_lc = nz(u_lc[1], 50.0)
+float p2_u_lc = nz(u_lc[2], 50.0)
+bool bc1  = ((bck >= 10 and bck < 20) or (bck >= 50 and bck < 60)) and open <= sma20 and close >= sma20 and close > open and close > nz(close[1]) and vol_all
+bool bc2  = (p2_u_pc > p1_u_pc and p1_u_pc < u_pc and u_pc > u_smapc) and (p2_u_lc < p1_u_lc and p1_u_lc > u_lc and u_lc > 0) and bc2_raw and close > open
+bool bc_all = bc1 or bc2
+
+// ============================================================
+// SECTION 7: RSI / MACD / ADX
+// ============================================================
+float rsi_val      = ta.rsi(close, rsi_len)
+bool  rsi_ob_zone  = rsi_val >= rsi_ob
+bool  rsi_os_zone  = rsi_val <= rsi_os
+bool  rsi_mid_bull = rsi_val >= rsi_mid_ob and rsi_val < rsi_ob
+bool  rsi_mid_bear = rsi_val <= rsi_mid_os and rsi_val > rsi_os
+bool  rsi_bear_div = (close > ta.highest(close,5)[1] and rsi_val < ta.highest(rsi_val,5)[1] and rsi_val > rsi_ob - 10) and (close > ta.highest(close,8)[1] and rsi_val < ta.highest(rsi_val,8)[1])
+bool  rsi_bull_div = (close < ta.lowest(close,5)[1]  and rsi_val > ta.lowest(rsi_val,5)[1]  and rsi_val < rsi_os + 10) and (close < ta.lowest(close,8)[1]  and rsi_val > ta.lowest(rsi_val,8)[1])
+bool  rsi_exit_ob  = ta.crossunder(rsi_val, rsi_ob)
+bool  rsi_exit_os  = ta.crossover(rsi_val, rsi_os)
+bool  rsi_hidden_bull = close > ta.lowest(close,10)[1] and rsi_val < ta.lowest(rsi_val,10)[1] and rsi_val < 50
+bool  rsi_hidden_bear = close < ta.highest(close,10)[1] and rsi_val > ta.highest(rsi_val,10)[1] and rsi_val > 50
+
+string rsi_zone_lbl = rsi_ob_zone ? 'OB' : rsi_os_zone ? 'OS' : rsi_mid_bull ? 'MidBull' : rsi_mid_bear ? 'MidBear' : 'Neut'
+string rsi_div_lbl  = rsi_bear_div ? '[BearDiv]' : rsi_bull_div ? '[BullDiv]' : rsi_hidden_bull ? '[HidBull]' : rsi_hidden_bear ? '[HidBear]' : rsi_exit_ob ? '[ExitOB]' : rsi_exit_os ? '[ExitOS]' : ''
+string rsi_full_lbl = 'RSI ' + OneDecimal(rsi_val) + ' ' + rsi_zone_lbl + ' ' + rsi_div_lbl
+color  rsi_tbl_col  = rsi_ob_zone ? color.new(color.red,20) : rsi_os_zone ? color.new(color.lime,30) : rsi_mid_bull ? color.new(#FF8C00,40) : rsi_mid_bear ? color.new(#4FC3F7,40) : color.new(color.gray,60)
+
+[macdLine, signalLine, macdHist] = ta.macd(close, 12, 26, 9)
+float macd_lo        = ta.lowest(macdHist, 100)
+float macd_hi        = ta.highest(macdHist, 100)
+float macd_norm      = (macdHist - macd_lo) / math.max(macd_hi - macd_lo, 1e-6) * 100
+bool  macd_bull_cross = ta.crossover(macdLine, signalLine)
+bool  macd_bear_cross = ta.crossunder(macdLine, signalLine)
+bool  macd_hist_up    = macdHist > nz(macdHist[1], 0.0)
+bool  macd_hist_down  = macdHist < nz(macdHist[1], 0.0)
+bool  macd_hist_pos   = macdHist > 0
+bool  macd_hist_neg   = macdHist < 0
+bool  macd_zero_bull  = ta.crossover(macdLine, 0)
+bool  macd_zero_bear  = ta.crossunder(macdLine, 0)
+
+string macd_cross_lbl = macd_bull_cross ? '[▲Cross]' : macd_bear_cross ? '[▼Cross]' : macd_zero_bull ? '[▲Zero]' : macd_zero_bear ? '[▼Zero]' : ''
+string macd_zone_lbl  = macd_hist_pos and macd_hist_up ? 'Bull↑' : macd_hist_pos and macd_hist_down ? 'Bull↓' : macd_hist_neg and macd_hist_down ? 'Bear↓' : macd_hist_neg and macd_hist_up ? 'Bear↑' : 'Flat'
+string macd_full_lbl  = 'MACD ' + macd_zone_lbl + macd_cross_lbl + ' H=' + ThreeDecimal(macdHist)
+color  macd_tbl_col   = macd_bull_cross or macd_zero_bull ? color.new(color.lime,10) : macd_bear_cross or macd_zero_bear ? color.new(color.red,10) : macd_hist_pos and macd_hist_up ? color.new(color.lime,40) : macd_hist_neg and macd_hist_down ? color.new(color.red,40) : color.new(color.gray,60)
+
+[diPlus, diMinus, adx] = ta.dmi(adx_len, adx_len)
+bool  adx_trending  = adx >= adx_strong
+bool  adx_weak_zone = adx < adx_weak
+bool  adx_rising    = adx > nz(adx[1], adx)
+bool  di_bull       = diPlus > diMinus
+bool  di_bear       = diMinus > diPlus
+
+string adx_str_lbl  = adx >= adx_strong + 10 ? 'VStrong' : adx >= adx_strong ? 'Strong' : adx >= adx_weak ? 'Mod' : 'Weak'
+string adx_dir_lbl  = di_bull ? '+DI' + OneDecimal(diPlus) : '-DI' + OneDecimal(diMinus)
+string adx_full_lbl = 'ADX ' + OneDecimal(adx) + ' ' + adx_str_lbl + ' ' + adx_dir_lbl + (adx_rising ? '↑' : '↓')
+color  adx_tbl_col  = adx_trending and di_bull ? color.new(color.lime,30) : adx_trending and di_bear ? color.new(color.red,30) : adx_weak_zone ? color.new(color.gray,60) : color.new(#FF8C00,50)
+
+// ============================================================
+// SECTION 8: CPK / REGIME
+// ============================================================
+float mfi        = ta.mfi(close, mfi_len)
+float roc1       = ta.roc(close, cpk_roc1)
+float roc2       = ta.roc(close, cpk_roc2)
+float cpk_raw    = ta.wma(roc1 + roc2, cpk_wma)
+float cpk_hi2    = ta.highest(cpk_raw, cpk_norm)
+float cpk_lo2    = ta.lowest(cpk_raw, cpk_norm)
+float cpk        = cpk_hi2 != cpk_lo2 ? (cpk_raw - cpk_lo2) / (cpk_hi2 - cpk_lo2) * 100 : 50.0
+// [REMOVED - plot limit] plot(cpk, 'CPK', color=cpk_raw > 0 ? color.new(col_cpk_bull,20) : color.new(col_cpk_bear,20), linewidth=2)
+
+float basis      = ta.sma(close, bb_len)
+float dev        = ta.stdev(close, bb_len)
+float bb_w       = basis != 0 ? (basis + dev * 2 - (basis - dev * 2)) / basis * 100 : 0.0
+float l5_regime  = clamp(ta.ema((clamp(adx / 50.0, 0, 1) * clamp((diPlus - diMinus + 50.0) / 100.0, 0, 1) * clamp(1.0 - (bb_w / math.max(bb_width * 200.0, 1.0)), 0, 1)) * 100.0, 5), 0, 100)
+// [REMOVED - plot limit] plot(l5_regime, 'Regime', color=l5_regime > 70 ? col_reg_bull : l5_regime < 30 ? col_reg_bear : col_reg_flat, linewidth=2)
+
+// ============================================================
+// SECTION 9: VOLUME FLOW INDICATORS
+// ============================================================
+float vfi_typical = hlc3
+float vfi_inter   = math.log(vfi_typical) - math.log(nz(vfi_typical[1], vfi_typical))
+float vfi_vinter  = ta.stdev(vfi_inter, 30)
+float vfi_cutoff  = vfi_coef * vfi_vinter * close
+float vfi_vave    = ta.sma(volume, vfi_len)
+float vfi_vmax    = vfi_vave * 2.0
+float vfi_vol_adj = math.min(volume, vfi_vmax)
+float vfi_mf      = vfi_typical - nz(vfi_typical[1], vfi_typical)
+float vfi_flow_raw= vfi_mf > vfi_cutoff ? vfi_vol_adj : vfi_mf < -vfi_cutoff ? -vfi_vol_adj : 0.0
+float vfi_sum     = math.sum(vfi_flow_raw, vfi_len)
+float vfi_raw     = vfi_sum / math.max(vfi_vave, 1.0)
+float vfi_smoothed= ta.ema(vfi_raw, vfi_smooth)
+float vfi_hi      = ta.highest(vfi_smoothed, 200)
+float vfi_lo      = ta.lowest(vfi_smoothed, 200)
+float vfi_norm    = vfi_hi != vfi_lo ? clamp((vfi_smoothed - vfi_lo) / (vfi_hi - vfi_lo) * 100, 0, 100) : 50.0
+
+float obv_raw     = ta.obv
+float obv_mean    = ta.sma(obv_raw, obv_z_len)
+float obv_std     = ta.stdev(obv_raw, obv_z_len)
+float obv_z       = obv_std > 0 ? (obv_raw - obv_mean) / obv_std : 0.0
+float obv_norm    = clamp((obv_z + 3.0) / 6.0 * 100.0, 0, 100)
+float obv_slope   = ta.ema(ta.change(obv_raw, 3), 5)
+bool  obv_rising  = obv_slope > 0
+
+float vwap_val    = ta.vwap(close)
+float vwap_dev    = ta.stdev(close - vwap_val, vwap_dev_len)
+float vwap_delta  = close - vwap_val
+float vwap_score  = clamp(50.0 + (vwap_delta / math.max(vwap_dev, syminfo.mintick * 10)) * 25.0, 0, 100)
+bool  vwap_buyer_dom  = vwap_delta > 0 and close > open
+bool  vwap_seller_dom = vwap_delta < 0 and close < open
+
+float flow_score_raw = (vfi_norm * 0.50) + (obv_norm * 0.30) + (vwap_score * 0.20)
+float flow_score     = clamp(ta.ema(flow_score_raw, 3), 0, 100)
+string flow_status   = flow_score >= 70 ? 'STRONG BUY' : flow_score >= 60 ? 'BUY FLOW' : flow_score >= 55 ? 'Mild Buy' : flow_score <= 30 ? 'STRONG SELL' : flow_score <= 40 ? 'SELL FLOW' : flow_score <= 45 ? 'Mild Sell' : 'NEUTRAL'
+color  flow_color    = flow_score >= 60 ? col_flow_bull : flow_score <= 40 ? col_flow_bear : color.gray
+plot(flow_show ? flow_score : na, 'Flow Score', color=flow_color, linewidth=flow_lw)
+
+// ============================================================
+// SECTION 10: SENTIMENT ENGINE
+// ============================================================
+float sent_rsi_comp  = clamp(rsi_val, 0, 100)
+float sent_macd_comp = macd_norm
+float sent_vfi_comp  = vfi_norm
+float sent_obv_comp  = obv_norm
+float sent_adx_comp  = adx_trending and di_bull ? clamp(50 + adx * 0.5, 50, 100) : adx_trending and di_bear ? clamp(50 - adx * 0.5, 0, 50) : 50.0
+
+float sw_total = sent_rsi_w + sent_macd_w + sent_vfi_w + sent_obv_w + sent_adx_w
+float sw_rsi   = sw_total > 0 ? sent_rsi_w  / sw_total : 0.2
+float sw_macd  = sw_total > 0 ? sent_macd_w / sw_total : 0.2
+float sw_vfi   = sw_total > 0 ? sent_vfi_w  / sw_total : 0.25
+float sw_obv   = sw_total > 0 ? sent_obv_w  / sw_total : 0.15
+float sw_adx   = sw_total > 0 ? sent_adx_w  / sw_total : 0.20
+
+float sentiment_raw   = (sent_rsi_comp * sw_rsi) + (sent_macd_comp * sw_macd) + (sent_vfi_comp * sw_vfi) + (sent_obv_comp * sw_obv) + (sent_adx_comp * sw_adx)
+float sentiment_score = clamp(ta.ema(sentiment_raw, 4), 0, 100)
+float sent_comp_avg   = sentiment_score
+float sent_variance   = (math.pow(sent_rsi_comp - sent_comp_avg, 2) + math.pow(sent_macd_comp - sent_comp_avg, 2) + math.pow(sent_vfi_comp - sent_comp_avg, 2) + math.pow(sent_obv_comp - sent_comp_avg, 2) + math.pow(sent_adx_comp - sent_comp_avg, 2)) / 5.0
+float sent_confidence = clamp(100.0 - math.sqrt(sent_variance) * 1.2, 30, 95)
+string sent_status    = sentiment_score >= 70 ? 'GREED' : sentiment_score >= 60 ? 'BULLISH' : sentiment_score >= 55 ? 'Mild Bull' : sentiment_score <= 30 ? 'FEAR' : sentiment_score <= 40 ? 'BEARISH' : sentiment_score <= 45 ? 'Mild Bear' : 'NEUTRAL'
+color  sent_color     = sentiment_score >= 60 ? col_sent_bull : sentiment_score <= 40 ? col_sent_bear : color.gray
+string sent_conf_tier = sent_confidence >= 75 ? 'HIGH' : sent_confidence >= 55 ? 'MED' : sent_confidence >= 40 ? 'LOW' : 'VLOW'
+plot(sent_show ? sentiment_score : na, 'Sentiment', color=sent_color, linewidth=sent_lw, style=plot.style_area, histbase=50)
+
+// ============================================================
+// SECTION 11: FUND SIMULATION
+// ============================================================
+float tf_mult = 1.5
+if timeframe.in_seconds() <= 300
+    tf_mult := 0.5
+else if timeframe.in_seconds() <= 3600
+    tf_mult := 0.75
+else if timeframe.in_seconds() <= 14400
+    tf_mult := 1.0
+int fund_lb = math.max(int(30.0 * tf_mult), 5)
+float sim1_v5    = 3.0 * fY(fr(X, fund_lb), 5, 1) - 2.0 * fY(fY(fr(X, fund_lb), 5, 1), 3, 1)
+float fundsim_v5 = clamp(sim1_v5, 0, 100)
+float fundsim    = fundsim_v5
+float l3_fund    = fundsim_v5
+// [REMOVED - plot limit] plot(fundsim_show ? fundsim : na, 'Fund Sim', color=col_fund, linewidth=2)
+
+float vpc_ema13  = ta.ema(vpc, 13)
+float vpc_ema5   = ta.ema(vpc_ema13, 5)
+float vpc_ema26  = ta.ema(vpc, 26)
+float fund_vel   = clamp((vpc_ema5 - vpc_ema26) / math.max(math.abs(vpc_ema26), 1.0) * 50 + 50, 0, 100)
+bool  fund_accel = fund_vel > 65 and fund_vel > nz(fund_vel[1], 50)
+bool  fund_decel = fund_vel < 35 and fund_vel < nz(fund_vel[1], 50)
+bool  fundtrend  = fundsim > ta.sma(fundsim, 5)
+bool  fundmomentum = fundsim > 50
+bool  uptrend    = u_smapc > u_smalc
+
+// ============================================================
+// SECTION 12: TRAP / BEHAVIOR DETECTION
+// ============================================================
+bool absorption_buy  = vol_ratio > 1.5 and price_range_norm < 0.5 and close >= open
+bool absorption_sell = vol_ratio > 1.5 and price_range_norm < 0.5 and close < open
+bool trap_bull    = u_pc > 75 and u_pc < nz(u_pc[3],50) and vol_ratio < 0.8 and close > nz(close[3])
+bool pump_dump    = vol_surge and close < open and high > ta.highest(high,20)[1] and u_pc > 60
+bool capitulation = vol_ratio > 3.0 and close < open and bcd < 20 and close < ta.lowest(close,10)[1]
+bool whale_dist   = vol_ratio > 3.0 and ta.change(close,1) < ta.atr(14) * 0.1 and u_pc > 60
+bool blowoff_top  = rsi_val > 78 and close > open and vol_ratio < 0.9 and u_pc > 80 and macdHist < macdHist[1]
+bool rug_risk     = u_pc > 70 and vol_ratio < 0.7 and vol_raw < nz(vol_raw[1]) and nz(vol_raw[1]) < nz(vol_raw[2]) and u_pc < nz(u_pc[1],50)
+bool distribution = u_pc > 85 and u_lc > 5 and not uptrend and not fundtrend and not fundmomentum
+bool strong_hold  = (u_pc > 80 and u_lc <= 1 and uptrend and fundsim > u_smapc and fundtrend and fundmomentum) or (u_pc > 90 and u_fc < 10 and u_lc < 1)
+bool breakout_ready = u_pc > 50 and u_pc < 80 and u_lc < 10 and uptrend
+bool accumulation = u_pc < 40 and u_lc >= 20 and uptrend and fundsim > u_smalc and fundtrend and fundmomentum
+bool div_3way_bear = (ta.roc(close,5) > 0 and ta.roc(u_pc,5) < -2 and ta.roc(fundsim,5) < -2) and (ta.roc(close,8) > 0 and ta.roc(u_pc,8) < -3 and ta.roc(fundsim,8) < -3)
+bool div_3way_bull = (ta.roc(close,5) < 0 and ta.roc(u_pc,5) > 2  and ta.roc(fundsim,5) > 2)  and (ta.roc(close,8) < 0 and ta.roc(u_pc,8) > 3  and ta.roc(fundsim,8) > 3)
+
+// ============================================================
+// SECTION 13: OB / OS (Enhanced Multi-Factor)
+// ============================================================
+bool  ob_xu_bcd80 = ta.crossunder(bcd, 80)
+bool  ob_xu_bcd65 = ta.crossunder(bcd, 65)
+bool  ob_xu_bckbcd= ta.crossunder(bck, bcd)
+float ob_sma5     = ta.sma(close, 5)
+bool ob_base = (close < ob_sma5 and close < open and low < low[1] and ob_xu_bcd80) or (close < ob_sma5 and close < hopl and ob_xu_bcd65) or (close < ob_sma5 and close < open and ob_xu_bckbcd and bcd > 65 and bck > 65)
+bool ob_flow_confirm = vfi_norm < 55 or sentiment_score < 55 or rsi_bear_div
+bool ob = ob_base and ob_flow_confirm
+
+bool os_base = not bc_all and close > hoph and bcd <= 35 and vpcema1 > 0 and vpcema1 > vpcema2
+bool os_flow_confirm = vfi_norm > 45 or sentiment_score > 45 or rsi_bull_div
+bool os = os_base and os_flow_confirm
+
+plotshape(bc_show and bc_all ? float(bc_label_offset_v) : na, 'BC', shape.triangleup,   location.absolute, #00CC66,   text='BC', textcolor=color.black, size=size.small)
+plotshape(os_show and os     ? float(os_label_offset_v) : na, 'OS', shape.triangleup,   location.absolute, #00BFFF,   text='OS', textcolor=color.black, size=size.small)
+plotshape(ob_show and ob     ? float(ob_label_offset_v) : na, 'OB', shape.triangledown, location.absolute, color.red, text='OB', textcolor=color.black, size=size.small)
+
+var label[] gc_labels = array.new<label>()
+var label[] dc_labels = array.new<label>()
+var line[]  gc_lines  = array.new<line>()
+var line[]  dc_lines  = array.new<line>()
+if u_gc and gc_show
+    array.push(gc_labels, label.new(bar_index, low,  'GC', color=color.new(color.purple,40), style=label.style_label_up,   textcolor=color.white, size=size.normal, force_overlay=true))
+    array.push(gc_lines,  line.new(bar_index, close, bar_index + 15, close, color=color.purple, width=2, style=line.style_dotted, force_overlay=true))
+    if array.size(gc_labels) > 500
+        label.delete(array.shift(gc_labels))
+        line.delete(array.shift(gc_lines))
+if u_dc and dc_show
+    array.push(dc_labels, label.new(bar_index, high, 'DC', color=color.new(color.gray,30), style=label.style_label_down, textcolor=color.white, size=size.normal, force_overlay=true))
+    array.push(dc_lines,  line.new(bar_index, close, bar_index + 15, close, color=color.gray, width=2, style=line.style_dotted, force_overlay=true))
+    if array.size(dc_labels) > 500
+        label.delete(array.shift(dc_labels))
+        line.delete(array.shift(dc_lines))
+
+// ============================================================
+// SECTION 14: VOLUME OVERLAY (Faded + Toggleable)
+// ============================================================
+float vol_sma_ov  = ta.sma(volume, vol_ov_ma_len)
+float vol_hi_ov   = ta.highest(volume, 300)
+float price_lo_ov = ta.lowest(low, 300)
+float price_hi_ov = ta.highest(high, 300)
+float prange_ov   = math.max(price_hi_ov - price_lo_ov, syminfo.mintick)
+float vol_scale   = (prange_ov * (vol_ov_max_h / 100.0)) / math.max(vol_hi_ov, 1.0)
+bool  vol_above_ma = volume > vol_sma_ov
+int   bull_t = vol_above_ma ? vol_surge_transp : vol_bull_transp
+int   bear_t = vol_above_ma ? vol_surge_transp : vol_bear_transp
+color vol_ov_col = vol_ov_show ? (close >= open ? color.new(#00E676, bull_t) : color.new(#FF1744, bear_t)) : na
+
+var box[] vol_boxes = array.new<box>()
+if vol_ov_show and barstate.isconfirmed
+    float bot = price_lo_ov
+    float top = price_lo_ov + volume * vol_scale
+    array.push(vol_boxes, box.new(left=bar_index, top=top, right=bar_index + 1, bottom=bot, bgcolor=vol_ov_col, border_color=color.new(vol_ov_col, 90), border_width=1, force_overlay=true))
+    if array.size(vol_boxes) > 500
+        box.delete(array.shift(vol_boxes))
+float vol_ma_price = vol_ov_show ? price_lo_ov + vol_sma_ov * vol_scale : na
+// [REMOVED - plot limit] plot(vol_ma_price, 'Vol MA', color=color.new(color.yellow, 0), linewidth=1)
+
+// ============================================================
+// SECTION 15: WAVETREND ENGINE
+// ============================================================
+float wt_ap  = hlc3
+float wt_esa = ta.ema(wt_ap, wt_n1)
+float wt_d   = ta.ema(math.abs(wt_ap - wt_esa), wt_n1)
+float wt_ci  = (wt_ap - wt_esa) / (0.015 * math.max(wt_d, syminfo.mintick))
+float wt1    = ta.ema(wt_ci, wt_n2)
+float wt2    = ta.sma(wt1, 4)
+float wtDiff = wt1 - wt2
+
+float wt_thresh_raw = adaptive_plot ? (wt_cross_base / math.max(adaptive_sens, 0.5)) : wt_cross_base
+float wt_threshold  = ta.ema(wt_thresh_raw, 3)
+
+bool wt_adxAbove   = adx > wt_adx_thresh
+bool wt_adxCrossUp = ta.crossover(adx, wt_adx_thresh)
+bool wt_crossUp    = ta.crossover(wtDiff,  wt_threshold)
+bool wt_crossDown  = ta.crossunder(wtDiff, -wt_threshold)
+
+var int wt_lastSignal = 0
+var int wt_signal_age = 0
+bool wt_buyCondA  = wt_crossUp and wt_adxAbove
+bool wt_buyCondB  = wtDiff > wt_threshold and wt_adxCrossUp
+bool wt_buySignal = (wt_buyCondA or wt_buyCondB) and wt_lastSignal != 1
+bool wt_sellCondA = wt_crossDown and wt_adxAbove
+bool wt_sellCondB = wtDiff < -wt_threshold and wt_adxCrossUp
+bool wt_sellSignal = (wt_sellCondA or wt_sellCondB) and wt_lastSignal != -1
+
+if wt_buySignal
+    wt_lastSignal := 1
+    wt_signal_age := 0
+else if wt_sellSignal
+    wt_lastSignal := -1
+    wt_signal_age := 0
+else
+    wt_signal_age := wt_signal_age + 1
+    if wt_signal_age >= wt_decay_bars
+        wt_lastSignal := 0
+
+float wt_decay_factor = wt_lastSignal == 0 ? 0.0 : math.max(0.0, 1.0 - float(wt_signal_age) / float(wt_decay_bars))
+float l8_wt           = clamp((wt1 + 100.0) / 2.0, 0, 100)
+float wt1_scaled      = clamp((wt1 + 100.0) / 2.0, 0, 100)
+float wt2_scaled      = clamp((wt2 + 100.0) / 2.0, 0, 100)
+float wtDiff_scaled   = clamp((wtDiff + 100.0) / 2.0, 0, 100)
+
+plot(wt_show ? wt1_scaled    : na, 'WT1',    color=col_wt1, linewidth=wt_lw)
+plot(wt_show ? wt2_scaled    : na, 'WT2',    color=col_wt2, linewidth=1)
+plot(wt_show ? wtDiff_scaled : na, 'WTDiff', color=color.new(color.yellow, 65), style=plot.style_area)
+plotshape(wt_sig_show and wt_buySignal  ? wt1_scaled : na, 'WT Buy',  shape.circle, location.absolute, color.new(color.lime,0), size=size.small)
+plotshape(wt_sig_show and wt_sellSignal ? wt1_scaled : na, 'WT Sell', shape.circle, location.absolute, color.new(color.red, 0), size=size.small)
+
+// ============================================================
+// SECTION 16: DWCS v5.1 ENGINE
+// ============================================================
+float price_roc  = ta.roc(close, 7)
+float atr14      = ta.atr(14)
+float price_1bar = math.max(nz(close[1], close), syminfo.mintick)
+float atr_pct    = atr14 / price_1bar * 100.0
+float roc_range  = math.max(atr_pct * 2.5, 3.0)
+float roc_norm   = clamp((price_roc + roc_range) / (roc_range * 2.0) * 100.0, 0, 100)
+
+float vpc_l2     = ta.change(close, 1) * volume
+float vwm_raw    = ta.ema(vpc_l2, 14)
+float vwm_hi     = ta.highest(vwm_raw, 100)
+float vwm_lo     = ta.lowest(vwm_raw, 100)
+float vwm_norm   = vwm_hi != vwm_lo ? (vwm_raw - vwm_lo) / (vwm_hi - vwm_lo) * 100.0 : 50.0
+
+float vwm_rsi_w  = rsi_ob_zone or rsi_os_zone ? 0.45 : 0.35
+float roc_rsi_w  = rsi_ob_zone or rsi_os_zone ? 0.25 : 0.30
+float macd_rsi_w = 1.0 - vwm_rsi_w - roc_rsi_w
+float l2_momentum = clamp((vwm_norm * vwm_rsi_w) + (roc_norm * roc_rsi_w) + (macd_norm * macd_rsi_w), 0, 100)
+
+float htf_close = mtf_enable ? request.security(syminfo.tickerid, mtf_tf, close, lookahead=barmerge.lookahead_off) : close
+float htf_ma    = mtf_enable ? request.security(syminfo.tickerid, mtf_tf, ta.sma(close, mtf_len), lookahead=barmerge.lookahead_off) : ta.sma(close, mtf_len)
+float htf_rsi   = mtf_enable ? request.security(syminfo.tickerid, mtf_tf, ta.rsi(close, 14), lookahead=barmerge.lookahead_off) : rsi_val
+float l10_mtf   = mtf_enable ? clamp((htf_close > htf_ma ? 60.0 : 40.0) + (htf_rsi - 50.0) * 0.4, 0, 100) : 50.0
+
+float l6_behavior = strong_hold ? 75.0 : accumulation ? 65.0 : breakout_ready ? 60.0 : (distribution and not pump_dump) ? 20.0 : 50.0
+float l7_trap     = pump_dump ? 12.0 : trap_bull ? 30.0 : whale_dist ? 25.0 : blowoff_top ? 18.0 : fund_accel ? 72.0 : fund_decel ? 28.0 : absorption_buy ? 68.0 : 50.0
+float l1_banker   = u_pc
+float l4_cpk      = cpk
+float l8_wt_layer = l8_wt * wt_decay_factor
+
+float trend_strength = clamp(adx / 50.0, 0, 1)
+float wt_w  = wt_dwcs_w
+float m_w   = mtf_enable ? mtf_dwcs_w : 0.0
+float remain = 1.0 - wt_w - m_w
+float rw1 = 0.15 + 0.15 * trend_strength
+float rw2 = 0.15 + 0.10 * trend_strength
+float rw3 = 0.15
+float rw4 = 0.12
+float rw5 = 0.10
+float rw6 = 0.18 - 0.10 * trend_strength
+float rw7 = 0.15 - 0.15 * trend_strength
+float rw_sum = rw1 + rw2 + rw3 + rw4 + rw5 + rw6 + rw7
+float w1 = (rw1 / rw_sum) * remain
+float w2 = (rw2 / rw_sum) * remain
+float w3 = (rw3 / rw_sum) * remain
+float w4 = (rw4 / rw_sum) * remain
+float w5 = (rw5 / rw_sum) * remain
+float w6 = (rw6 / rw_sum) * remain
+float w7 = (rw7 / rw_sum) * remain
+
+float dwcs_raw = (l1_banker * w1) + (l2_momentum * w2) + (l3_fund * w3) + (l4_cpk * w4) + (l5_regime * w5) + (l6_behavior * w6) + (l7_trap * w7) + (l8_wt_layer * wt_w) + (l10_mtf * m_w)
+
+int zlema_len = 7
+if timeframe.in_seconds() <= 300
+    zlema_len := 3
+else if timeframe.in_seconds() <= 3600
+    zlema_len := 4
+else if timeframe.in_seconds() <= 14400
+    zlema_len := 5
+float dwcs = f_zlema(clamp(dwcs_raw, 0, 100), zlema_len)
+plot(dwcs, 'DWCS v5.1', color=dwcs > dwcs_buy ? col_dwcs_buy : dwcs < dwcs_sell ? col_dwcs_sell : col_dwcs_mid, linewidth=3)
+
+// Flow Confidence
+float fc_bull_agree = dwcs > 55 and flow_score > 55 and sentiment_score > 55 ? 10.0 : 0.0
+float fc_bear_agree = dwcs < 45 and flow_score < 45 and sentiment_score < 45 ? 10.0 : 0.0
+float fc_spread     = math.max(math.max(math.abs(dwcs - flow_score), math.abs(flow_score - sentiment_score)), math.abs(dwcs - sentiment_score))
+float flow_conf_raw = clamp((dwcs + flow_score + sentiment_score) / 3.0 + fc_bull_agree + fc_bear_agree - fc_spread * 0.3, 30, 95)
+float flow_confidence = ta.ema(flow_conf_raw, 3)
+string flow_conf_tier = flow_confidence >= 75 ? 'HIGH' : flow_confidence >= 55 ? 'MED' : flow_confidence >= 40 ? 'LOW' : 'VLOW'
+
+// ============================================================
+// SECTION 17: SCENARIO ENGINE
+// ============================================================
+int wt_bull_score = (wt_lastSignal == 1  and wt_decay_factor > 0.5) ? 1 : 0
+int wt_bear_score = (wt_lastSignal == -1 and wt_decay_factor > 0.5) ? 1 : 0
+int macd_bull_sc  = macd_bull_cross or macd_zero_bull ? 1 : (macd_hist_pos and macd_hist_up) ? 1 : 0
+int macd_bear_sc  = macd_bear_cross or macd_zero_bear ? 1 : (macd_hist_neg and macd_hist_down) ? 1 : 0
+int rsi_bull_sc   = rsi_exit_os or rsi_bull_div or rsi_hidden_bull ? 1 : 0
+int rsi_bear_sc   = rsi_exit_ob or rsi_bear_div or rsi_hidden_bear ? 1 : 0
+int adx_bull_sc   = adx_trending and di_bull ? 1 : 0
+int adx_bear_sc   = adx_trending and di_bear ? 1 : 0
+int flow_bull_sc  = flow_score > 60 ? 2 : flow_score > 55 ? 1 : 0
+int flow_bear_sc  = flow_score < 40 ? 2 : flow_score < 45 ? 1 : 0
+int sent_bull_sc  = sentiment_score > 60 ? 1 : 0
+int sent_bear_sc  = sentiment_score < 40 ? 1 : 0
+int vfi_bull_sc   = vfi_norm > 60 and obv_rising ? 1 : 0
+int vfi_bear_sc   = vfi_norm < 40 and not obv_rising ? 1 : 0
+var int pa_bull_sc = 0
+var int pa_bear_sc = 0
+
+int b_sc_raw = (l1_banker>60?2:l1_banker>50?1:0) + (l2_momentum>60?2:l2_momentum>50?1:0) + (l4_cpk>55?1:0) + (l3_fund>60?1:0) + (fundtrend?1:0) + (l5_regime>=90?2:l5_regime>=50?1:0) + (u_gc?2:0) + (bc_all?1:0) + (fund_accel?1:0) + (absorption_buy?1:0) + (div_3way_bull?2:0) + wt_bull_score + macd_bull_sc + rsi_bull_sc + adx_bull_sc + flow_bull_sc + sent_bull_sc + vfi_bull_sc
+int e_sc_raw = (l1_banker<35?2:l1_banker<45?1:0) + (l2_momentum<35?2:l2_momentum<45?1:0) + (l4_cpk<40?1:0) + (l3_fund<35?1:0) + (not fundtrend?1:0) + (l5_regime<=10?2:l5_regime<50?1:0) + (u_dc?2:0) + (ob?1:0) + (pump_dump?2:0) + (blowoff_top?2:0) + (div_3way_bear?2:0) + (whale_dist?1:0) + wt_bear_score + macd_bear_sc + rsi_bear_sc + adx_bear_sc + flow_bear_sc + sent_bear_sc + vfi_bear_sc
+float net = float(b_sc_raw - e_sc_raw)
+
+float dwcs_net_agree = net > 0 ? clamp((dwcs - 50.0) / 30.0, 0, 1) : net < 0 ? clamp((50.0 - dwcs) / 30.0, 0, 1) : 0.5
+float mtf_agree      = mtf_enable ? (net > 0 and l10_mtf > 55.0 ? 0.05 : net < 0 and l10_mtf < 45.0 ? 0.05 : -0.03) : 0.0
+float flow_agree_sc  = net > 0 and flow_score > 55 ? 0.05 : net < 0 and flow_score < 45 ? 0.05 : -0.02
+float sc_modifier    = clamp(dwcs_net_agree * 0.15 + mtf_agree + flow_agree_sc, -0.15, 0.20)
+
+string sc_name = 'NEUTRAL'
+float  sc_base = 50.0
+bool   mai_diverge = u_pc > 75 and fundsim < nz(fundsim[1]) and rsi_val > 65
+bool   mai_conflict = u_pc > 60 and l5_regime < 30
+
+if pump_dump
+    sc_name := 'PUMP-DUMP'
+    sc_base := 83.0
+else if div_3way_bear
+    sc_name := 'TRIPLE DIV'
+    sc_base := 85.0
+else if blowoff_top
+    sc_name := 'BLOWOFF'
+    sc_base := 80.0
+else if mai_diverge and net >= 2
+    sc_name := 'DIVERGENCE'
+    sc_base := 75.0
+else if whale_dist
+    sc_name := 'WHALE DIST'
+    sc_base := 73.0
+else if mai_conflict
+    sc_name := 'CONFLICT'
+    sc_base := 45.0
+else if distribution
+    sc_name := 'DISTRIBUTION'
+    sc_base := 70.0
+else if strong_hold
+    sc_name := 'STRONG HOLD'
+    sc_base := 78.0
+else if div_3way_bull
+    sc_name := 'TRIPLE ACC'
+    sc_base := 83.0
+else if accumulation and absorption_buy
+    sc_name := 'ACCUMULATION'
+    sc_base := 73.0
+else if capitulation
+    sc_name := 'CAPITULATION'
+    sc_base := 76.0
+else if bc_all and fund_accel
+    sc_name := 'REVERSAL'
+    sc_base := 68.0
+else if breakout_ready and fund_accel and vol_ratio > 1.3
+    sc_name := 'BREAKOUT'
+    sc_base := 70.0
+else if net >= 6
+    sc_name := 'STRONG BULL'
+    sc_base := math.min(88.0, 60.0 + net * 1.8)
+else if net >= 2
+    sc_name := 'MILD BULL'
+    sc_base := 55.0 + net * 1.5
+else if net <= -6
+    sc_name := 'STRONG BEAR'
+    sc_base := math.min(88.0, 60.0 + math.abs(net) * 1.8)
+else if net < 0
+    sc_name := 'WEAK BEAR'
+    sc_base := 50.0 + math.abs(net) * 1.0
+
+float sc_conf    = clamp(sc_base * (1.0 + sc_modifier), 30.0, 95.0)
+color sc_color   = sc_name == 'STRONG BULL' or sc_name == 'TRIPLE ACC' ? color.lime : sc_name == 'MILD BULL' or sc_name == 'ACCUMULATION' or sc_name == 'CAPITULATION' ? color.green : sc_name == 'BREAKOUT' or sc_name == 'REVERSAL' ? color.orange : sc_name == 'STRONG HOLD' ? #00FF88 : sc_name == 'DIVERGENCE' or sc_name == 'TRIPLE DIV' ? color.purple : sc_name == 'CONFLICT' ? color.yellow : sc_name == 'PUMP-DUMP' or sc_name == 'BLOWOFF' or sc_name == 'WHALE DIST' ? color.red : sc_name == 'DISTRIBUTION' or sc_name == 'STRONG BEAR' ? color.red : sc_name == 'WEAK BEAR' ? #FF6600 : color.gray
+string conf_tier = sc_conf >= 80 ? 'HIGH' : sc_conf >= 60 ? 'MED' : sc_conf >= 40 ? 'LOW' : 'VLOW'
+
+// ============================================================
+// SECTION 18: SMART MONEY CONCEPTS (SMC / PA)
+// ============================================================
+type pa_store
+    line    [] ln
+    label   [] lb
+    box     [] bx
+    linefill[] lf
+
+type pa_structure
+    int    zn    = 0
+    float  zz    = na
+    float  bos   = na
+    float  choch = na
+    int    loc   = 0
+    int    temp  = 0
+    int    trend = 0
+    int    start = 0
+    float  main  = na
+    int    xloc  = 0
+    bool   upsweep = false
+    bool   dnsweep = false
+    string txt   = na
+
+type pa_drawms
+    int    x1
+    int    x2
+    float  y
+    string txt
+    color  css
+    string style
+
+type pa_ob
+    bool  bull
+    float top
+    float btm
+    float avg
+    int   loc
+    color css
+    float vol
+    int   dir
+    int   move
+    int   blPOS
+    int   brPOS
+    int   xlocbl
+    int   xlocbr
+    bool  isbb   = false
+    int   bbloc  = 0
+
+type pa_FVG
+    float top     = na
+    float btm     = na
+    int   loc     = bar_index
+    bool  isbb    = false
+    int   bbloc   = 0
+    bool  israid  = false
+    float raidy   = na
+    int   raidloc = 0
+    int   raidx2  = 0
+    bool  active  = false
+    color raidcs  = na
+
+type pa_timer
+    bool start = false
+    int  count = 0
+
+var pa_store pa_bin = pa_store.new(array.new<line>(), array.new<label>(), array.new<box>(), array.new<linefill>())
+var pa_timer pa_lc  = pa_timer.new()
+
+if barstate.islast and pa_enable
+    for obj in pa_bin.ln
+        obj.delete()
+    for obj in pa_bin.lb
+        obj.delete()
+    for obj in pa_bin.bx
+        obj.delete()
+    for obj in pa_bin.lf
+        obj.delete()
+    pa_bin.ln.clear()
+    pa_bin.lb.clear()
+    pa_bin.bx.clear()
+    pa_bin.lf.clear()
+
+pa_invcol = color.new(color.white, 100)
+float pa_atr_base = ta.atr(200) / (5.0 / pa_ob_len)
+
+method pa_txSz(string s) =>
+    s == 'Tiny' ? size.tiny : s == 'Small' ? size.small : s == 'Normal' ? size.normal : s == 'Large' ? size.large : s == 'Huge' ? size.huge : size.normal
+
+pa_ghl() => [high[2], low[2], close[1], open[1], close, open, high, low, high[1], low[1], ta.atr(200)]
+
+method pa_find(pa_structure ms, bool use_max, bool sweep, bool useob) =>
+    float pmin = 99999999.0
+    float pmax = 0.0
+    int   idx  = 0
+    int   lim  = sweep ? (bar_index - ms.xloc) - 1 : (bar_index - ms.loc) - 1
+    lim := lim < 0 ? 0 : lim
+    if use_max
+        for i = 0 to lim
+            pmax := math.max(high[i], pmax)
+            pmin := pmax == high[i] ? low[i] : pmin
+            idx  := pmax == high[i] ? i : idx
+        if useob and high[idx + 1] > high[idx]
+            idx := idx + 1
+    else
+        for i = 0 to lim
+            pmin := math.min(low[i], pmin)
+            pmax := pmin == low[i] ? high[i] : pmax
+            idx  := pmin == low[i] ? i : idx
+        if useob and low[idx + 1] < low[idx]
+            idx := idx + 1
+    idx
+
+method pa_fnOB(pa_ob[] block, bool bull, float cords, int idx) =>
+    if pa_ob_show and pa_ob_last > 0
+        float ob_top = bull ? (pa_ob_mode == 'Length' ? math.min(low[idx] + pa_atr_base[idx], high[idx]) : high[idx]) : cords
+        float ob_btm = bull ? cords : (pa_ob_mode == 'Length' ? math.max(high[idx] - pa_atr_base[idx], low[idx]) : low[idx])
+        float ob_avg = math.avg(ob_top, ob_btm)
+        block.unshift(pa_ob.new(bull, ob_top, ob_btm, ob_avg, time[idx], bull ? pa_ob_up_css : pa_ob_dn_css, volume[idx], close[idx] > open[idx] ? 1 : -1, 1, 1, 1, time[idx], time[idx], false, 0))
+
+method pa_mitigated(pa_ob[] block) =>
+    if barstate.isconfirmed
+        int mi = 0
+        while mi < block.size()
+            pa_ob stuff = block.get(mi)
+            bool removed = false
+            bool mitig = false
+            if not stuff.isbb
+                if stuff.bull
+                    mitig := pa_ob_miti == 'Close' ? math.min(close,open) < stuff.btm : pa_ob_miti == 'Wick' ? low < stuff.btm : low < stuff.avg
+                else
+                    mitig := pa_ob_miti == 'Close' ? math.max(close,open) > stuff.top : pa_ob_miti == 'Wick' ? high > stuff.top : high > stuff.avg
+                if mitig
+                    stuff.isbb  := true
+                    stuff.bbloc := time
+                    if not pa_ob_breakers
+                        block.remove(mi)
+                        removed := true
+            else
+                bool clr = false
+                if stuff.bull
+                    clr := pa_ob_miti == 'Close' ? math.max(close,open) > stuff.top : pa_ob_miti == 'Wick' ? high > stuff.top : high > stuff.avg
+                else
+                    clr := pa_ob_miti == 'Close' ? math.min(close,open) < stuff.btm : pa_ob_miti == 'Wick' ? low < stuff.btm : low < stuff.avg
+                if clr
+                    block.remove(mi)
+                    removed := true
+            if not removed
+                mi := mi + 1
+
+pa_overlap(pa_ob[] bull, pa_ob[] bear) =>
+    if bull.size() > 1
+        for i = bull.size() - 1 to 1
+            pa_ob s = bull.get(i)
+            pa_ob c = bull.get(0)
+            int   v = pa_ob_which_lap == 'Recent' ? i : 0
+            bool  ov = (s.btm > c.btm and s.btm < c.top) or (s.top < c.top and s.btm > c.btm) or (s.top > c.top and s.btm < c.btm) or (s.top < c.top and s.top > c.btm)
+            if ov
+                bull.remove(v)
+    if bear.size() > 1
+        for i = bear.size() - 1 to 1
+            pa_ob s = bear.get(i)
+            pa_ob c = bear.get(0)
+            int   v = pa_ob_which_lap == 'Recent' ? i : 0
+            bool  ov = (s.btm > c.btm and s.btm < c.top) or (s.top < c.top and s.btm > c.btm) or (s.top > c.top and s.btm < c.btm) or (s.top < c.top and s.top > c.btm)
+            if ov
+                bear.remove(v)
+
+method pa_umt(pa_ob metric) =>
+    if metric.dir == 1
+        if metric.move == 1
+            metric.blPOS := metric.blPOS + 1
+            metric.move  := 2
+        else if metric.move == 2
+            metric.blPOS := metric.blPOS + 1
+            metric.move  := 3
+        else
+            metric.brPOS := metric.brPOS + 1
+            metric.move  := 1
+    else if metric.dir == -1
+        if metric.move == 1
+            metric.brPOS := metric.brPOS + 1
+            metric.move  := 2
+        else if metric.move == 2
+            metric.brPOS := metric.brPOS + 1
+            metric.move  := 3
+        else
+            metric.blPOS := metric.blPOS + 1
+            metric.move  := 1
+    int td = int(math.max(time - nz(time[1], time), 1))
+    metric.xlocbl := metric.loc + td * metric.blPOS
+    metric.xlocbr := metric.loc + td * metric.brPOS
+
+method pa_display(pa_ob id, pa_ob[] full, int i) =>
+    if not id.isbb
+        pa_bin.bx.unshift(box.new(top=id.top, bottom=id.btm, left=id.loc, right=time,   border_color=na,     bgcolor=id.css, xloc=xloc.bar_time, force_overlay=true))
+        pa_bin.bx.unshift(box.new(top=id.top, bottom=id.btm, left=time,   right=time+1, border_color=na,     bgcolor=id.css, xloc=xloc.bar_time, extend=extend.right, force_overlay=true))
+    else
+        pa_bin.bx.unshift(box.new(top=id.top, bottom=id.btm, left=id.loc,   right=id.bbloc, border_color=na,     bgcolor=id.css,                xloc=xloc.bar_time, force_overlay=true))
+        pa_bin.bx.unshift(box.new(top=id.top, bottom=id.btm, left=id.bbloc, right=time,     border_color=id.css, bgcolor=id.bull?pa_bb_up:pa_bb_dn, xloc=xloc.bar_time, border_width=2, force_overlay=true))
+        pa_bin.bx.unshift(box.new(top=id.top, bottom=id.btm, left=time,     right=time+1,   border_color=id.css, bgcolor=id.bull?pa_bb_up:pa_bb_dn, xloc=xloc.bar_time, extend=extend.right, force_overlay=true))
+    if pa_ob_activity
+        pa_bin.bx.unshift(box.new(top=id.top, bottom=id.avg, left=id.loc, right=id.xlocbl, border_color=na, bgcolor=pa_ob_act_up, xloc=xloc.bar_time, force_overlay=true))
+        pa_bin.bx.unshift(box.new(top=id.avg, bottom=id.btm, left=id.loc, right=id.xlocbr, border_color=na, bgcolor=pa_ob_act_dn, xloc=xloc.bar_time, force_overlay=true))
+    if pa_ob_midline
+        pa_bin.ln.unshift(line.new(x1=id.loc, x2=time, y1=id.avg, y2=id.avg, color=color.new(id.css,0), xloc=xloc.bar_time, style=line.style_dashed, force_overlay=true))
+    if pa_ob_metric and pa_ob_last > 0
+        int seq2 = math.min(pa_ob_last - 1, full.size() - 1)
+        if i == seq2
+            float tV2 = 0.0
+            for j2 = 0 to seq2
+                tV2 := tV2 + full.get(j2).vol
+            for y2 = 0 to seq2
+                pa_ob ids2 = full.get(y2)
+                float pct2 = tV2 > 0 ? math.floor(ids2.vol / tV2 * 100) : 0.0
+                pa_bin.lb.unshift(label.new(bar_index - 1, ids2.avg, textcolor=color.new(ids2.css,0), style=label.style_label_left, size=pa_ob_txt.pa_txSz(), color=pa_invcol, text=str.tostring(math.round(ids2.vol,3), format=format.volume) + ' (' + str.tostring(int(pct2)) + '%)', force_overlay=true))
+
+pa_overlapFVG(pa_FVG[] bl, pa_FVG[] br) =>
+    if bl.size() > 1
+        for i = bl.size() - 1 to 1
+            pa_FVG s = bl.get(i)
+            pa_FVG c = bl.get(0)
+            bool ov = (s.btm > c.btm and s.btm < c.top) or (s.top < c.top and s.btm > c.btm) or (s.top > c.top and s.btm < c.btm) or (s.top < c.top and s.top > c.btm)
+            if ov
+                bl.remove(i)
+    if br.size() > 1
+        for i = br.size() - 1 to 1
+            pa_FVG s = br.get(i)
+            pa_FVG c = br.get(0)
+            bool ov = (s.btm > c.btm and s.btm < c.top) or (s.top < c.top and s.btm > c.btm) or (s.top > c.top and s.btm < c.btm) or (s.top < c.top and s.top > c.btm)
+            if ov
+                br.remove(i)
+
+method pa_dispFVG(pa_FVG fvg, int i, bool bull) =>
+    color upcss = pa_fvg_up_css
+    color dncss = pa_fvg_dn_css
+    bool fvg_do_extend = pa_fvg_extend
+    if not fvg.isbb
+        pa_bin.bx.unshift(box.new(top=fvg.top, bottom=fvg.btm, left=fvg.loc, right=time, border_color=na, bgcolor=bull ? upcss : dncss, xloc=xloc.bar_time, extend=fvg_do_extend ? extend.right : extend.none, force_overlay=true))
+        if pa_fvg_midline
+            pa_bin.ln.unshift(line.new(x1=fvg.loc, x2=time, y1=math.avg(fvg.top,fvg.btm), y2=math.avg(fvg.top,fvg.btm), xloc=xloc.bar_time, color=color.new(bull ? upcss : dncss, 0), extend=fvg_do_extend ? extend.right : extend.none, force_overlay=true))
+    else
+        pa_bin.bx.unshift(box.new(top=fvg.top, bottom=fvg.btm, left=fvg.loc,   right=fvg.bbloc, border_color=na,              bgcolor=bull ? upcss : dncss,  xloc=xloc.bar_time, force_overlay=true))
+        pa_bin.bx.unshift(box.new(top=fvg.top, bottom=fvg.btm, left=fvg.bbloc, right=time,      border_color=bull ? dncss : upcss, bgcolor=bull ? dncss : upcss, xloc=xloc.bar_time, extend=fvg_do_extend ? extend.right : extend.none, force_overlay=true))
+
+pa_dFVG() =>
+    [h2, l2, c1, o1, c, o, h, l, h1, l1, fvatr] = pa_ghl()
+    var pa_FVG[] blFVG = array.new<pa_FVG>()
+    var pa_FVG[] brFVG = array.new<pa_FVG>()
+    bool cc    = timeframe.change()
+    bool upfvg = l > h2 and cc and c1 > l1 + (fvatr[1] * pa_fvg_thresh)
+    bool dnfvg = l2 > h and cc and c1 < h1 - (fvatr[1] * pa_fvg_thresh)
+    if upfvg[1]
+        blFVG.unshift(pa_FVG.new(l[1], h2[1], time[3], false, 0))
+    if dnfvg[1]
+        brFVG.unshift(pa_FVG.new(l2[1], h[1], time[3], false, 0))
+    if blFVG.size() > 0
+        for [i2, fvg] in blFVG
+            if not fvg.isbb
+                bool mitig = pa_fvg_src == 'Close' ? math.min(c,o) < fvg.btm : pa_fvg_src == 'Wick' ? l < fvg.btm : l < math.avg(fvg.top,fvg.btm)
+                if mitig
+                    fvg.isbb  := true
+                    fvg.bbloc := time
+                    if pa_fvg_what == 'FVG'
+                        blFVG.remove(i2)
+    if brFVG.size() > 0
+        for [i2, fvg] in brFVG
+            if not fvg.isbb
+                bool mitig = pa_fvg_src == 'Close' ? math.max(c,o) > fvg.top : pa_fvg_src == 'Wick' ? h > fvg.top : h > math.avg(fvg.top,fvg.btm)
+                if mitig
+                    fvg.isbb  := true
+                    fvg.bbloc := time
+                    if pa_fvg_what == 'FVG'
+                        brFVG.remove(i2)
+    if pa_fvg_overlap
+        pa_overlapFVG(blFVG, brFVG)
+    if barstate.islast
+        if blFVG.size() > 0 and pa_fvg_num > 0
+            for i2 = 0 to math.min(pa_fvg_num - 1, blFVG.size() - 1)
+                blFVG.get(i2).pa_dispFVG(i2, true)
+        if brFVG.size() > 0 and pa_fvg_num > 0
+            for i2 = 0 to math.min(pa_fvg_num - 1, brFVG.size() - 1)
+                brFVG.get(i2).pa_dispFVG(i2, false)
+
+pa_mapping() =>
+    var float map_up    = na
+    var float map_dn    = na
+    var float map_pt    = na
+    var int   map_tr    = 0
+    var int   map_start = na
+    var int   map_sm    = na
+    var int   map_proj  = na
+    var line     map_ln = na
+    var polyline map_pl = na
+    var chart.point[] pts = array.new<chart.point>()
+    if na(map_up)
+        map_up    := high
+        map_start := bar_index
+    if na(map_dn)
+        map_dn    := low
+        map_start := bar_index
+    if high > map_up
+        if map_tr == -1
+            float pmin2 = 99999999.0
+            int   pid2  = 0
+            int   lim2  = math.max(bar_index - map_start, 0)
+            for k = 0 to lim2
+                if low[k] < pmin2
+                    pmin2 := low[k]
+                    pid2  := k
+            pts.unshift(chart.point.from_time(time[pid2], low[pid2]))
+            map_pt    := low[pid2]
+            map_sm    := time[pid2]
+            map_start := bar_index
+        map_up   := high
+        map_dn   := low
+        map_proj := time
+        map_tr   := 1
+    if low < map_dn
+        if map_tr == 1
+            float pmax2 = 0.0
+            int   pid2  = 0
+            int   lim2  = math.max(bar_index - map_start, 0)
+            for k = 0 to lim2
+                if high[k] > pmax2
+                    pmax2 := high[k]
+                    pid2  := k
+            pts.unshift(chart.point.from_time(time[pid2], high[pid2]))
+            map_pt    := high[pid2]
+            map_sm    := time[pid2]
+            map_start := bar_index
+        map_up   := high
+        map_dn   := low
+        map_proj := time
+        map_tr   := -1
+    if barstate.islast
+        if not na(map_ln)
+            map_ln.delete()
+        if not na(map_pl)
+            map_pl.delete()
+        if not na(map_sm) and not na(map_proj)
+            map_ln := line.new(x1=map_sm, x2=map_proj, y1=map_pt, y2=map_tr == 1 ? map_up : map_dn, xloc=xloc.bar_time, color=color.red, force_overlay=true)
+        if pts.size() > 1
+            map_pl := polyline.new(pts, line_color=pa_mapping_css, xloc=xloc.bar_time, line_style=line.style_dashed, force_overlay=true)
+
+var int    pa_smc_trend = 0
+var string pa_smc_txt   = ''
+
+// ── pa_structure function (switch replaced with if/else if) ───
+pa_run_ms(color upcss, color dncss, bool draw, int limit) =>
+    var pa_structure ms   = pa_structure.new(start=0)
+    var pa_ob[]  blob     = array.new<pa_ob>()
+    var pa_ob[]  brob     = array.new<pa_ob>()
+    var pa_drawms[] bldw  = array.new<pa_drawms>()
+    var pa_drawms[] brdw  = array.new<pa_drawms>()
+    bool crossup = false
+    bool crossdn = false
+    var float up2 = na
+    var float dn2 = na
+    int idbull = ms.pa_find(false, false, true)
+    int idbear = ms.pa_find(true,  false, true)
+    float btmP = pa_ob_mode == 'Length' ? math.max(high[idbear] - pa_atr_base[idbear], low[idbear])  : low[idbear]
+    float topP = pa_ob_mode == 'Length' ? math.min(low[idbull]  + pa_atr_base[idbull], high[idbull]) : high[idbull]
+    float ph   = ta.pivothigh(high, pa_ms_len, pa_ms_len)
+    float pl2  = ta.pivotlow (low,  pa_ms_len, pa_ms_len)
+    var int[]   phn = array.new<int>  (1, na)
+    var int[]   pln = array.new<int>  (1, na)
+    var float[] php = array.new<float>(1, na)
+    var float[] plp = array.new<float>(1, na)
+    if not na(ph)
+        phn.unshift(bar_index - pa_ms_len)
+        php.unshift(high[pa_ms_len])
+    if not na(pl2)
+        pln.unshift(bar_index - pa_ms_len)
+        plp.unshift(low[pa_ms_len])
+    if php.size() > 0 and high > php.get(0)
+        php.clear()
+        phn.clear()
+    if plp.size() > 0 and low < plp.get(0)
+        plp.clear()
+        pln.clear()
+    if na(up2)
+        up2 := high
+    if na(dn2)
+        dn2 := low
+    if high > up2
+        up2     := high
+        dn2     := low
+        crossup := true
+    if low < dn2
+        up2     := high
+        dn2     := low
+        crossdn := true
+    if ms.start == 0
+        ms := pa_structure.new(bar_index, na, high, low, bar_index, bar_index, 0, 1, na, bar_index)
+        if draw
+            bldw.unshift(pa_drawms.new(time, time, high, 'CHoCH', upcss, line.style_dashed))
+            brdw.unshift(pa_drawms.new(time, time, low,  'CHoCH', dncss, line.style_dashed))
+    ms.upsweep := false
+    ms.dnsweep := false
+
+    // ── START == 1 (initialisation phase) ──
+    if ms.start == 1
+        if low <= ms.choch and close >= ms.choch and pa_build_sweep
+            ms.dnsweep := true
+            ms.choch   := low
+            ms.xloc    := bar_index
+            if draw
+                pa_drawms dw = brdw.get(0)
+                dw.x2    := time
+                dw.style := line.style_dotted
+                dw.txt   := 'x'
+                brdw.unshift(pa_drawms.new(time, time, low, 'CHoCH', dncss, line.style_dashed))
+        else if high >= ms.bos and close <= ms.bos and pa_build_sweep
+            ms.upsweep := true
+            ms.bos     := high
+            ms.xloc    := bar_index
+            if draw
+                pa_drawms dw = bldw.get(0)
+                dw.x2    := time
+                dw.style := line.style_dotted
+                dw.txt   := 'x'
+                bldw.unshift(pa_drawms.new(time, time, high, 'CHoCH', upcss, line.style_dashed))
+        else if close <= ms.choch
+            ms.txt   := 'choch'
+            pa_lc.start := true
+            pa_lc.count := 0
+            blob.pa_fnOB(true, topP, idbull)
+            ms.trend := -1
+            ms.choch := ms.bos
+            ms.bos   := na
+            ms.start := 2
+            ms.loc   := bar_index
+            ms.main  := low
+            ms.temp  := ms.loc
+            ms.xloc  := bar_index
+            if draw
+                pa_drawms dw = brdw.get(0)
+                dw.x2    := time
+                dw.style := line.style_solid
+        else if close >= ms.bos
+            ms.txt   := 'choch'
+            pa_lc.start := true
+            pa_lc.count := 0
+            brob.pa_fnOB(false, btmP, idbear)
+            ms.trend := 1
+            ms.bos   := na
+            ms.start := 2
+            ms.loc   := bar_index
+            ms.main  := high
+            ms.temp  := ms.loc
+            ms.xloc  := bar_index
+            if draw
+                pa_drawms dw = bldw.get(0)
+                dw.x2    := time
+                dw.style := line.style_solid
+
+    // ── START == 2, TREND == -1 (bearish structure) ──
+    if ms.start == 2 and ms.trend == -1
+        if low <= ms.main
+            ms.main := low
+            ms.temp := bar_index
+        if na(ms.bos) and crossup and close > open and close[1] > open[1]
+            ms.bos  := ms.main
+            ms.loc  := ms.temp
+            ms.xloc := ms.loc
+            if draw
+                brdw.unshift(pa_drawms.new(time[bar_index - ms.loc], time, low[bar_index - ms.loc], 'BOS', dncss, line.style_dashed))
+        if not na(ms.bos) and draw
+            pa_drawms dw = brdw.get(0)
+            dw.x2 := time
+        if draw
+            pa_drawms ch = bldw.get(0)
+            ch.x2 := time
+        // sweep BOS bear
+        if low <= ms.bos and close >= ms.bos and not na(ms.bos) and pa_build_sweep
+            ms.dnsweep := true
+            ms.bos     := low
+            ms.xloc    := bar_index
+            if draw
+                pa_drawms dw = brdw.get(0)
+                dw.x2    := time
+                dw.style := line.style_dotted
+                dw.txt   := 'x'
+                brdw.unshift(pa_drawms.new(time, time, low, 'BOS', dncss, line.style_dashed))
+        // BOS bear confirmed
+        else if close <= ms.bos and not na(ms.bos)
+            ms.txt   := 'bos'
+            ms.zz    := ms.bos
+            ms.zn    := bar_index
+            pa_lc.start := true
+            pa_lc.count := 0
+            brob.pa_fnOB(false, btmP, idbear)
+            int id2   = ms.pa_find(true, false, false)
+            ms.xloc  := bar_index
+            ms.bos   := na
+            ms.choch := high[id2]
+            ms.loc   := bar_index - id2
+            if draw
+                pa_drawms dw = brdw.get(0)
+                dw.x2    := time
+                dw.style := line.style_solid
+                pa_drawms ch = bldw.get(0)
+                ch.x1    := time[id2]
+                ch.x2    := time
+                ch.y     := high[id2]
+        // CHoCH bear → bull
+        else if close >= ms.choch
+            ms.txt   := 'choch'
+            ms.zz    := ms.choch
+            ms.zn    := bar_index
+            pa_lc.start := true
+            pa_lc.count := 0
+            blob.pa_fnOB(true, topP, idbull)
+            int id2   = ms.pa_find(false, false, false)
+            ms.choch := na(ms.bos) ? low[id2] : ms.bos
+            ms.bos   := na
+            ms.main  := high
+            ms.trend := 1
+            ms.loc   := bar_index
+            ms.xloc  := bar_index
+            ms.temp  := ms.loc
+            if draw
+                pa_drawms dw = bldw.get(0)
+                dw.x2    := time
+                dw.txt   := 'CHoCH'
+                dw.style := line.style_solid
+                pa_drawms ch = brdw.get(0)
+                ch.x2    := time
+                ch.y     := ms.choch
+                ch.txt   := 'CHoCH'
+
+    // ── START == 2, TREND == 1 (bullish structure) ──
+    if ms.start == 2 and ms.trend == 1
+        if high >= ms.main
+            ms.main := high
+            ms.temp := bar_index
+        if na(ms.bos) and crossdn and close < open and close[1] < open[1]
+            ms.bos  := ms.main
+            ms.loc  := ms.temp
+            ms.xloc := ms.loc
+            if draw
+                bldw.unshift(pa_drawms.new(time[bar_index - ms.loc], time, high[bar_index - ms.loc], 'BOS', upcss, line.style_dashed))
+        if not na(ms.bos) and draw
+            pa_drawms dw = bldw.get(0)
+            dw.x2 := time
+        if draw
+            pa_drawms ch = brdw.get(0)
+            ch.x2 := time
+        // sweep BOS bull
+        if high >= ms.bos and close <= ms.bos and not na(ms.bos) and pa_build_sweep
+            ms.upsweep := true
+            ms.bos     := high
+            ms.xloc    := bar_index
+            if draw
+                pa_drawms dw = bldw.get(0)
+                dw.x2    := time
+                dw.style := line.style_dotted
+                dw.txt   := 'x'
+                bldw.unshift(pa_drawms.new(time, time, high, 'BOS', upcss, line.style_dashed))
+        // BOS bull confirmed
+        else if close >= ms.bos and not na(ms.bos)
+            ms.txt   := 'bos'
+            ms.zz    := ms.bos
+            ms.zn    := bar_index
+            pa_lc.start := true
+            pa_lc.count := 0
+            blob.pa_fnOB(true, topP, idbull)
+            int id2   = ms.pa_find(false, false, false)
+            ms.xloc  := bar_index
+            ms.bos   := na
+            ms.choch := low[id2]
+            ms.loc   := bar_index - id2
+            if draw
+                pa_drawms dw = bldw.get(0)
+                dw.x2    := time
+                dw.style := line.style_solid
+                pa_drawms ch = brdw.get(0)
+                ch.x1    := time[id2]
+                ch.x2    := time
+                ch.y     := low[id2]
+        // sweep CHoCH bull
+        else if low <= ms.choch and close >= ms.choch and pa_build_sweep
+            ms.dnsweep := true
+            ms.choch   := low
+            ms.xloc    := bar_index
+            if draw
+                pa_drawms dw = brdw.get(0)
+                dw.x2    := time
+                dw.style := line.style_dotted
+                dw.txt   := 'x'
+                brdw.unshift(pa_drawms.new(time, time, low, 'CHoCH', dncss, line.style_dashed))
+        // CHoCH bull → bear
+        else if close <= ms.choch
+            ms.txt   := 'choch'
+            ms.zz    := ms.choch
+            ms.zn    := bar_index
+            pa_lc.start := true
+            pa_lc.count := 0
+            brob.pa_fnOB(false, btmP, idbear)
+            int id2   = ms.pa_find(true, false, false)
+            ms.choch := na(ms.bos) ? high[id2] : ms.bos
+            ms.bos   := na
+            ms.main  := low
+            ms.trend := -1
+            ms.loc   := bar_index
+            ms.temp  := ms.loc
+            if draw
+                pa_drawms dw = brdw.get(0)
+                dw.x2    := time
+                dw.txt   := 'CHoCH'
+                dw.style := line.style_solid
+                pa_drawms ch = bldw.get(0)
+                ch.x2    := time
+                ch.y     := ms.choch
+                ch.txt   := 'CHoCH'
+            ms.xloc := bar_index
+
+    if pa_ob_show and pa_ob_last > 0
+        if barstate.isconfirmed
+            blob.pa_mitigated()
+            brob.pa_mitigated()
+            if pa_ob_overlap
+                pa_overlap(blob, brob)
+        if blob.size() > 0
+            for [i2, metric] in blob
+                metric.pa_umt()
+        if brob.size() > 0
+            for [i2, metric] in brob
+                metric.pa_umt()
+        if barstate.islast
+            if blob.size() > 0
+                for i2 = 0 to math.min(pa_ob_last - 1, blob.size() - 1)
+                    blob.get(i2).pa_display(blob, i2)
+            if brob.size() > 0
+                for i2 = 0 to math.min(pa_ob_last - 1, brob.size() - 1)
+                    brob.get(i2).pa_display(brob, i2)
+    if barstate.islast and draw and bldw.size() > 0 and brdw.size() > 0
+        for i2 = 0 to bldw.size() - 1
+            pa_drawms obj = bldw.get(i2)
+            if i2 <= limit
+                line ln2 = line.new(x1=obj.x1, x2=obj.x2, y1=obj.y, y2=obj.y, color=obj.css, style=obj.style, xloc=xloc.bar_time, force_overlay=true)
+                pa_bin.ln.unshift(ln2)
+                label lb2 = label.new(x=int(math.avg(ln2.get_x1(), ln2.get_x2())), y=obj.y, xloc=xloc.bar_time, color=pa_invcol, style=label.style_label_down, textcolor=obj.css, size=pa_ms_text.pa_txSz(), text=obj.txt, force_overlay=true)
+                pa_bin.lb.unshift(lb2)
+                if pa_bubbles
+                    pa_bin.lb.unshift(label.new(x=obj.x1, y=obj.y, xloc=xloc.bar_time, color=color.new(obj.css,80), style=label.style_circle, size=size.tiny, force_overlay=true))
+        for i2 = 0 to brdw.size() - 1
+            pa_drawms obj = brdw.get(i2)
+            if i2 <= limit
+                line ln2 = line.new(x1=obj.x1, x2=obj.x2, y1=obj.y, y2=obj.y, color=obj.css, style=obj.style, xloc=xloc.bar_time, force_overlay=true)
+                pa_bin.ln.unshift(ln2)
+                label lb2 = label.new(x=int(math.avg(ln2.get_x1(), ln2.get_x2())), y=obj.y, xloc=xloc.bar_time, color=pa_invcol, style=label.style_label_up, textcolor=obj.css, size=pa_ms_text.pa_txSz(), text=obj.txt, force_overlay=true)
+                pa_bin.lb.unshift(lb2)
+                if pa_bubbles
+                    pa_bin.lb.unshift(label.new(x=obj.x1, y=obj.y, xloc=xloc.bar_time, color=color.new(obj.css,80), style=label.style_circle, size=size.tiny, force_overlay=true))
+    ms
+
+var pa_structure pa_ms = na
+if pa_enable
+    if pa_window_enable
+        if bar_index > last_bar_index - pa_window
+            pa_ms := pa_run_ms(pa_css_up, pa_css_dn, pa_show_swing, pa_swing_limit)
+    else
+        pa_ms := pa_run_ms(pa_css_up, pa_css_dn, pa_show_swing, pa_swing_limit)
+
+if not na(pa_ms)
+    pa_smc_trend := pa_ms.trend
+    pa_smc_txt   := na(pa_ms.txt) ? '' : pa_ms.txt
+
+color pa_candle_col = na
+if pa_enable and pa_candle_css and not na(pa_ms)
+    float fctr = pa_ms.txt == 'bos' ? 1.0 : 0.7
+    pa_candle_col := color.rgb(color.r(pa_ms.trend==1?pa_css_up:pa_css_dn)*fctr, color.g(pa_ms.trend==1?pa_css_up:pa_css_dn)*fctr, color.b(pa_ms.trend==1?pa_css_up:pa_css_dn)*fctr, 0)
+barcolor(pa_candle_col)
+
+if pa_enable and pa_fvg_enable
+    pa_dFVG()
+if pa_enable and pa_show_mapping
+    pa_mapping()
+
+// Update pa scores now that SMC engine has run
+pa_bull_sc := pa_enable ? int(math.round((pa_smc_trend == 1  and pa_smc_txt == 'bos' ? 2.0 : pa_smc_trend == 1  ? 1.0 : 0.0) * (timeframe.in_seconds() <= 300 ? 0.5 : timeframe.in_seconds() <= 900 ? 0.65 : timeframe.in_seconds() <= 3600 ? 0.80 : 1.0))) : 0
+pa_bear_sc := pa_enable ? int(math.round((pa_smc_trend == -1 and pa_smc_txt == 'bos' ? 2.0 : pa_smc_trend == -1 ? 1.0 : 0.0) * (timeframe.in_seconds() <= 300 ? 0.5 : timeframe.in_seconds() <= 900 ? 0.65 : timeframe.in_seconds() <= 3600 ? 0.80 : 1.0))) : 0
+
+string pa_smc_lbl = pa_smc_trend == 1 ? 'Bull ' + (pa_smc_txt == 'bos' ? '[BOS]' : '[CHoCH]') : pa_smc_trend == -1 ? 'Bear ' + (pa_smc_txt == 'bos' ? '[BOS]' : '[CHoCH]') : 'Init'
+color  pa_smc_col = pa_smc_trend == 1 ? color.new(#089981,20) : pa_smc_trend == -1 ? color.new(#f23645,20) : color.new(color.gray,60)
+
+bool pa_bos_bull   = pa_enable and pa_smc_trend == 1  and pa_smc_txt == 'bos'   and pa_smc_txt != pa_smc_txt[1]
+bool pa_choch_bear = pa_enable and pa_smc_trend == -1 and pa_smc_txt == 'choch' and pa_smc_txt != pa_smc_txt[1]
+
+// ============================================================
+// SECTION 19: SUMMARY TABLE — 6 rows: CHIPS / SIGNAL / RSI / MACD / ADX / WT
+// ============================================================
+
+// ── Shared helper strings (used by table + label dashboard) ──
+string wt_state_lbl = wt_buySignal ? 'BUY▲' : wt_sellSignal ? 'SELL▼' : wt_lastSignal == 1 ? 'L' + str.tostring(int(wt_decay_factor * 100)) + '%' : wt_lastSignal == -1 ? 'S' + str.tostring(int(wt_decay_factor * 100)) + '%' : 'Flat'
+string flow_short   = flow_score >= 60 ? 'BUY' : flow_score <= 40 ? 'SELL' : 'NEU'
+string sent_short   = sentiment_score >= 60 ? 'BULL' : sentiment_score <= 40 ? 'BEAR' : 'NEU'
+string htf_short    = mtf_enable ? (htf_close > htf_ma ? 'HTF:Bull' : 'HTF:Bear') : 'HTF:Off'
+string htf_lbl      = htf_short + ' RSI' + OneDecimal(htf_rsi)
+string flow_conf_lbl = flow_short + ' ' + NoDecimal(flow_score) + '%[' + flow_conf_tier + ']'
+string sent_conf_lbl = sent_short + ' ' + NoDecimal(sentiment_score) + '%[' + sent_conf_tier + ']'
+string vfi_obv_lbl  = 'VFI:' + NoDecimal(vfi_norm) + ' OBV:' + OneDecimal(obv_z)
+string smc_htf_lbl  = pa_smc_lbl + ' | ' + htf_short
+string dwcs_wt_lbl  = 'DWCS:' + NoDecimal(dwcs) + ' WT:' + wt_state_lbl
+string tbl_chips_lbl = 'PC' + NoDecimal(u_pc) + 'FC' + NoDecimal(u_fc) + 'LC' + NoDecimal(u_lc)
+
+// ── Row 0: CHIPS — PC / FC / LC ──────────────────────────────
+color chips_bg = u_pc > 75 ? color.new(col_pc, 20) : u_pc < 30 ? color.new(col_pc2, 20) : color.new(color.gray, 60)
+
+// ── Row 1: SIGNAL — trap / behavior detection ─────────────────
+string trap_short = pump_dump ? '⚠ PUMP-DUMP' : blowoff_top ? '⚠ BLOWOFF' : whale_dist ? '⚠ WHALE' : rug_risk ? '⚠ RUG RISK' : div_3way_bear ? '⚠ 3W-DIV' : trap_bull ? '⚠ BULL TRAP' : capitulation ? '✓ CAPITUL' : div_3way_bull ? '✓ 3W-BULL' : absorption_buy ? '✓ ABSORB' : strong_hold ? '✓ S.HOLD' : accumulation ? '✓ ACCUM' : distribution ? '• DISTRIB' : bc_all ? '✓ BOTCAT' : ob ? '• OB' : sc_name
+color trap_bg = pump_dump or blowoff_top or whale_dist or rug_risk or div_3way_bear or trap_bull ? color.new(color.red, 20) : capitulation or div_3way_bull or absorption_buy or strong_hold or accumulation or bc_all ? color.new(color.lime, 20) : ob or distribution ? color.new(color.orange, 30) : color.new(color.gray, 60)
+
+// ── Row 2: RSI ────────────────────────────────────────────────
+string rsi_div_short = rsi_bear_div ? ' BDiv' : rsi_bull_div ? ' BuDiv' : rsi_hidden_bull ? ' HBu' : rsi_hidden_bear ? ' HBe' : rsi_exit_os ? ' ExOS' : rsi_exit_ob ? ' ExOB' : ''
+string rsi_tbl_val  = 'RSI ' + OneDecimal(rsi_val) + ' ' + rsi_zone_lbl + rsi_div_short
+
+// ── Row 3: MACD ───────────────────────────────────────────────
+string macd_arr    = macd_bull_cross ? ' ▲X' : macd_bear_cross ? ' ▼X' : macd_zero_bull ? ' ▲0' : macd_zero_bear ? ' ▼0' : ''
+string macd_tbl_val = macd_zone_lbl + macd_arr + 'H:' + ThreeDecimal(macdHist)
+
+// ── Row 4: ADX ────────────────────────────────────────────────
+string adx_tbl_val = OneDecimal(adx) + ' ' + adx_str_lbl + ' ' + adx_dir_lbl + (adx_rising ? '↑' : '↓')
+
+// ── Row 5: WAVETREND ─────────────────────────────────────────
+string wt_tbl_val = wt_state_lbl + ' D:' + OneDecimal(wtDiff) + (wt_buySignal ? ' [BUY]' : wt_sellSignal ? ' [SELL]' : '')
+color  wt_tbl_bg  = wt_lastSignal == 1 ? color.new(color.lime, 20) : wt_lastSignal == -1 ? color.new(color.red, 20) : color.new(color.gray, 60)
+
+// ── Table ─────────────────────────────────────────────────────
+var table QTable = table.new(position.middle_right, 2, 6, border_width=1)
+if barstate.islast and ind
+    color hdr_bg  = color.new(color.black, 30)
+    color hdr_txt = color.silver
+    table.cell(QTable, 0, 0, 'CHIPS',  bgcolor=hdr_bg, text_color=hdr_txt, width=w)
+    table.cell(QTable, 0, 1, 'SIGNAL', bgcolor=hdr_bg, text_color=hdr_txt, width=w)
+    table.cell(QTable, 0, 2, 'RSI',    bgcolor=hdr_bg, text_color=hdr_txt, width=w)
+    table.cell(QTable, 0, 3, 'MACD',   bgcolor=hdr_bg, text_color=hdr_txt, width=w)
+    table.cell(QTable, 0, 4, 'ADX',    bgcolor=hdr_bg, text_color=hdr_txt, width=w)
+    table.cell(QTable, 0, 5, 'WT',     bgcolor=hdr_bg, text_color=hdr_txt, width=w)
+    table.cell(QTable, 1, 0, tbl_chips_lbl, bgcolor=chips_bg,    text_color=color.black, width=w)
+    table.cell(QTable, 1, 1, trap_short,    bgcolor=trap_bg,     text_color=color.black, width=w)
+    table.cell(QTable, 1, 2, rsi_tbl_val,   bgcolor=rsi_tbl_col, text_color=color.black, width=w)
+    table.cell(QTable, 1, 3, macd_tbl_val,  bgcolor=macd_tbl_col,text_color=color.black, width=w)
+    table.cell(QTable, 1, 4, adx_tbl_val,   bgcolor=adx_tbl_col, text_color=color.black, width=w)
+    table.cell(QTable, 1, 5, wt_tbl_val,    bgcolor=wt_tbl_bg,   text_color=color.black, width=w)
+    for r = 0 to 5
+        table.cell_set_text_size(QTable, 0, r, f_tsize(text_size))
+        table.cell_set_text_size(QTable, 1, r, f_tsize(text_size))
+
+// ============================================================
+// SECTION 20: AI LABEL DASHBOARD
+// ============================================================
+bool   is_left  = lbl_pos_inp == 'Top Left' or lbl_pos_inp == 'Bottom Left' or lbl_pos_inp == 'Center Left'
+bool   is_top   = lbl_pos_inp == 'Top Left' or lbl_pos_inp == 'Top Right'
+bool   is_bot   = lbl_pos_inp == 'Bottom Left' or lbl_pos_inp == 'Bottom Right'
+float  hl_y     = is_top ? 85.0 : is_bot ? 15.0 : 50.0
+string hl_style = is_left ? label.style_label_right : label.style_label_left
+string lbl_sz   = lbl_size_inp == 'TINY' ? size.tiny : lbl_size_inp == 'NORMAL' ? size.normal : lbl_size_inp == 'LARGE' ? size.large : size.small
+
+string trend_str = uptrend and l5_regime >= 90 ? 'STRONG UP' : uptrend and l5_regime >= 50 ? 'UPTREND' : uptrend ? 'WEAK UP' : not uptrend and l5_regime <= 10 ? 'STRONG DN' : not uptrend and l5_regime < 50 ? 'DOWNTREND' : 'SIDEWAYS'
+
+// ── Line 1: Headline ─────────────────────────────────────────
+string lbl_main = '● ' + trend_str + ' | ' + sc_name + ' ' + NoDecimal(sc_conf) + '%[' + conf_tier + ']'
+
+// ── FLOW block ───────────────────────────────────────────────
+string vfi_lbl  = vfi_norm > 70 ? 'VFI:heavy in' : vfi_norm > 55 ? 'VFI:in' : vfi_norm < 30 ? 'VFI:heavy out' : vfi_norm < 45 ? 'VFI:out' : 'VFI:neu'
+string obv_lbl  = obv_z > 1.5 ? 'OBV:xBull' : obv_z > 0.5 ? 'OBV:accum' : obv_z < -1.5 ? 'OBV:xBear' : obv_z < -0.5 ? 'OBV:dist' : 'OBV:neu'
+string vwap_lbl = vwap_buyer_dom ? 'VWAP:buyer' : vwap_seller_dom ? 'VWAP:seller' : vwap_delta > 0 ? 'VWAP:+' : 'VWAP:-'
+string flow_blk = '─ FLOW ' + flow_short + ' ' + NoDecimal(flow_score) + '% Conf=' + NoDecimal(flow_confidence) + '%[' + flow_conf_tier + ']' + '\n  ' + vfi_lbl + ' | ' + obv_lbl + ' | ' + vwap_lbl
+
+// ── SENTIMENT block ──────────────────────────────────────────
+string sent_blk = '─ SENT ' + sent_short + ' ' + NoDecimal(sentiment_score) + '% Conf=' + NoDecimal(sent_confidence) + '%[' + sent_conf_tier + ']'
+
+// ── DWCS + WT + SMC + HTF block ──────────────────────────────
+string wt_lbl  = wt_buySignal ? 'WT:BUY▲' : wt_sellSignal ? 'WT:SELL▼' : wt_lastSignal == 1 ? 'WT:Long' : wt_lastSignal == -1 ? 'WT:Short' : 'WT:Flat'
+string pa_lbl  = 'SMC:' + pa_smc_lbl
+string engine_blk = '─ D:' + NoDecimal(dwcs) + ' ' + wt_lbl + ' | ' + pa_lbl + ' | ' + htf_lbl
+
+// ── MARKET block ─────────────────────────────────────────────
+string sm_lbl  = l1_banker > 75 ? 'SM:HvyLong' : l1_banker > 55 ? 'SM:InPos' : l1_banker > 40 ? 'SM:Mixed' : 'SM:Reduce'
+string fd_lbl  = fundtrend and fundmomentum and l3_fund > 65 ? 'Fund:StrongIn' : fundtrend and fundmomentum ? 'Fund:In' : not fundtrend and l3_fund < 35 ? 'Fund:HvyOut' : 'Fund:Out'
+string vol_lbl = vol_ratio > 2.5 ? 'Vol:xHigh' : vol_ratio > 1.8 ? 'Vol:High' : vol_ratio > 1.3 ? 'Vol:↑' : vol_ratio < 0.5 ? 'Vol:Thin' : 'Vol:Norm'
+string trap_blk = trap_short != sc_name ? '⚡ ' + trap_short : ''
+string mkt_blk  = '─ ' + vol_lbl + ' | ' + sm_lbl + ' | ' + fd_lbl + (trap_blk != '' ? '\n  ' + trap_blk : '')
+
+var label lbl_ai = na
+if show_ai_dash and barstate.islast
+    label.delete(lbl_ai)
+    string detail_block = '\n' + flow_blk + '\n' + sent_blk + '\n' + engine_blk + '\n' + mkt_blk
+    string full_text = show_sit ? lbl_main + detail_block : lbl_main
+    lbl_ai := label.new(x=bar_index, y=hl_y, text=full_text, xloc=xloc.bar_index, yloc=yloc.price, color=color.new(color.white,100), textcolor=sc_color, style=hl_style, size=lbl_sz, textalign=text.align_left)
+
+// ============================================================
+// SECTION 21: ALERT CONDITIONS
+// ============================================================
+bool alert_flow_bull_ok = flow_score > alert_min_conf
+bool alert_flow_bear_ok = flow_score < (100 - alert_min_conf)
+
+alertcondition(wt_buySignal,                                                    title='WT Buy',                  message='WT BUY on {{ticker}} ({{interval}})')
+alertcondition(wt_sellSignal,                                                   title='WT Sell',                 message='WT SELL on {{ticker}} ({{interval}})')
+alertcondition(wt_buySignal and bc_all,                                         title='WT Buy + BC',             message='STRONG BUY: WT+BC on {{ticker}} ({{interval}})')
+alertcondition(wt_sellSignal and ob,                                            title='WT Sell + OB',            message='STRONG SELL: WT+OB on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(u_gc,                                                            title='Golden Cross',            message='Golden Cross on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(u_dc,                                                            title='Death Cross',             message='Death Cross on {{ticker}} ({{interval}})')
+alertcondition(wt_buySignal and alert_flow_bull_ok,                             title='WT Buy + Flow Bull',      message='FLOW BUY: WT+Flow on {{ticker}} ({{interval}})')
+alertcondition(wt_sellSignal and alert_flow_bear_ok,                            title='WT Sell + Flow Bear',     message='FLOW SELL: WT+Flow on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(bc_all and alert_flow_bull_ok,                                   title='BC + Flow Bull',          message='FLOW BC: BC+Flow on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(ob and alert_flow_bear_ok,                                       title='OB + Flow Bear',          message='FLOW OB: OB+Flow on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(macd_bull_cross,                                                 title='MACD Bull Cross',         message='MACD Bull on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(macd_bear_cross,                                                 title='MACD Bear Cross',         message='MACD Bear on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(macd_zero_bull,                                                  title='MACD Zero Bull',          message='MACD Zero Bull on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(macd_zero_bear,                                                  title='MACD Zero Bear',          message='MACD Zero Bear on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(rsi_exit_os,                                                     title='RSI Exit OS',             message='RSI exit OS on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(rsi_exit_ob,                                                     title='RSI Exit OB',             message='RSI exit OB on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(rsi_bull_div,                                                    title='RSI Bull Div',            message='RSI Bull Div on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(rsi_bear_div,                                                    title='RSI Bear Div',            message='RSI Bear Div on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(rsi_hidden_bull,                                                 title='RSI Hidden Bull',         message='RSI Hidden Bull on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(rsi_hidden_bear,                                                 title='RSI Hidden Bear',         message='RSI Hidden Bear on {{ticker}} ({{interval}})')
+alertcondition(wt_buySignal and macd_bull_cross and rsi_exit_os,                title='Triple Buy Conf',         message='TRIPLE BUY on {{ticker}} ({{interval}})')
+alertcondition(wt_sellSignal and macd_bear_cross and rsi_exit_ob,               title='Triple Sell Conf',        message='TRIPLE SELL on {{ticker}} ({{interval}})')
+alertcondition(wt_buySignal and macd_bull_cross and rsi_exit_os and alert_flow_bull_ok, title='Quad Buy Conf',   message='QUAD BUY on {{ticker}} ({{interval}})')
+alertcondition(wt_sellSignal and macd_bear_cross and rsi_exit_ob and alert_flow_bear_ok, title='Quad Sell Conf', message='QUAD SELL on {{ticker}} ({{interval}})')
+alertcondition(pump_dump,                                                       title='Pump-Dump',               message='DANGER: Pump-dump on {{ticker}} ({{interval}})')
+alertcondition(blowoff_top,                                                     title='Blowoff Top',             message='DANGER: Blowoff top on {{ticker}} ({{interval}})')
+alertcondition(whale_dist,                                                      title='Whale Dist',              message='DANGER: Whale dist on {{ticker}} ({{interval}})')
+alertcondition(div_3way_bear,                                                   title='3-Way Bear Div',          message='HIGH RISK: 3-way bear div on {{ticker}} ({{interval}})')
+alertcondition(div_3way_bull,                                                   title='3-Way Bull Conf',         message='INFO: 3-way bull conf on {{ticker}} ({{interval}})')
+alertcondition(rug_risk,                                                        title='Rug Risk',                message='WARNING: Rug risk on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(capitulation,                                                    title='Capitulation',            message='INFO: Capitulation on {{ticker}} ({{interval}})')
+bool alert_flow_bull_cross = ta.crossover(flow_score, 60)
+bool alert_flow_bear_cross = ta.crossunder(flow_score, 40)
+bool alert_sent_bull_cross = ta.crossover(sentiment_score, 60)
+bool alert_sent_bear_cross = ta.crossunder(sentiment_score, 40)
+alertcondition(alert_flow_bull_cross,                                           title='Flow Turns Bull',         message='FLOW: >60 bullish on {{ticker}} ({{interval}})')
+alertcondition(alert_flow_bear_cross,                                           title='Flow Turns Bear',         message='FLOW: <40 bearish on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(alert_sent_bull_cross,                                           title='Sentiment Turns Bull',    message='SENTIMENT: >60 bullish on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(alert_sent_bear_cross,                                           title='Sentiment Turns Bear',    message='SENTIMENT: <40 bearish on {{ticker}} ({{interval}})')
+alertcondition(pa_bos_bull,                                                     title='SMC BOS Bull',            message='SMC: Bull BOS on {{ticker}} ({{interval}})')
+alertcondition(pa_choch_bear,                                                   title='SMC CHoCH Bear',          message='SMC: Bear CHoCH on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(pa_bos_bull and bc_all,                                          title='SMC BOS + BC',            message='SMC+BC BUY on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(pa_choch_bear and u_dc,                                          title='SMC CHoCH + DC',          message='SMC+DC SELL on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(pa_bos_bull and wt_buySignal,                                    title='SMC BOS + WT Buy',        message='SMC+WT BUY on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(pa_choch_bear and wt_sellSignal,                                 title='SMC CHoCH + WT Sell',     message='SMC+WT SELL on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(pa_bos_bull and alert_flow_bull_ok,                              title='SMC BOS + Flow Bull',     message='SMC+FLOW BUY on {{ticker}} ({{interval}})')
+// [REMOVED alert] alertcondition(pa_choch_bear and alert_flow_bear_ok,                            title='SMC CHoCH + Flow Bear',   message='SMC+FLOW SELL on {{ticker}} ({{interval}})')
