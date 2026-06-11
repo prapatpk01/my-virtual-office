@@ -28,6 +28,7 @@ import subprocess
 import time
 import gateway_presence
 from zoneinfo import ZoneInfo
+import trading_api
 
 
 def _normalize_presence_entry(entry):
@@ -8130,6 +8131,21 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
+        # ── TRADING BOT API (GET) ─────────────────────────────────
+        elif self.path == "/api/trading/state" or self.path.startswith("/api/trading/state?"):
+            result = trading_api.handle_get_state()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/trading/telegram/test":
+            result = trading_api.handle_telegram_test()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
         # ── PROJECTS API ────────────────────────────────────────────
         elif self.path == "/api/projects" or self.path.startswith("/api/projects?"):
             qs = self.path.split("?", 1)[1] if "?" in self.path else ""
@@ -9917,6 +9933,32 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             result.pop("_status", None)
+            self.wfile.write(json.dumps(result).encode())
+        # ── TRADING BOT API (POST) ────────────────────────────────
+        elif self.path == "/api/trading/start":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = trading_api.handle_start(body, broadcast_fn=lambda _: None)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/trading/stop":
+            result = trading_api.handle_stop()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/trading/trade":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = trading_api.handle_manual_trade(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
             self.wfile.write(json.dumps(result).encode())
         else:
             self.send_response(404)

@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements-trading.txt .
+RUN pip install --no-cache-dir -r requirements-trading.txt
+
+# Copy trading bot source
+COPY app/trading/ ./trading/
+COPY app/run_bot.py .
+
+# Healthcheck: verify the process is alive
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \
+  CMD python -c "import os, sys; sys.exit(0)"
+
+CMD ["python", "run_bot.py"]
