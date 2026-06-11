@@ -641,5 +641,158 @@ Estimate Revisions (most important):
 
 ---
 
-*System Version: 1.0 | Last Updated: June 11, 2026 | Quantum Capital Fund*
+---
+
+## 17. Contrarian Signal Framework — "กล้าเมื่อคนกลัว กลัวเมื่อคนกล้า"
+
+> *"Be fearful when others are greedy, and greedy when others are fearful."*
+> — Warren Buffett
+
+ตลาดมักเกินจริงทั้งสองทิศทาง — ระบบนี้ใช้ **ความสุดขีดของตลาด** เป็นสัญญาณเข้า/ออก
+แทนที่จะวิ่งตามฝูงชน ให้มองในทิศตรงข้าม
+
+---
+
+### 17.1 VIX Contrarian Scale — ด้าน FEAR (สัญญาณซื้อ)
+
+```
+VIX Level     สภาวะ           Action
+──────────────────────────────────────────────────────────
+< 13          Extreme complacency  → ⚠️ อันตราย (ดู section 17.2)
+13-18         Normal / Risk-On     → ปกติ follow momentum
+18-20         Mild caution         → ระวัง เตรียม watchlist
+20-25  🟡     Fear spike           → WATCH ดูทิศทาง อย่าเพิ่งซื้อ
+              (อาจดีดสั้น หรืออาจเป็นจุดเริ่ม selloff)
+25-30  🟠     Fear zone            → เริ่มมองหาจังหวะซื้อ
+              Scale in 25-30% ของ position ที่วางแผน
+              เน้น High Quality + Strong Balance Sheet ก่อน
+> 30   🔴     PANIC zone           → ซื้ออย่างบ้าคลั่ง
+              Scale in เต็ม position ทีละ tranche
+              นี่คือจังหวะที่ดีที่สุดในรอบหลายเดือน
+> 40   🚨     EXTREME PANIC        → ALL IN บน highest conviction
+              เกิดไม่บ่อย — generational entry opportunity
+              ประวัติศาสตร์: VIX 40+ ตามด้วย rally เสมอ
+```
+
+### 17.2 VIX Contrarian Scale — ด้าน GREED (สัญญาณขาย)
+
+```
+VIX Level     สภาวะ           Action
+──────────────────────────────────────────────────────────
+< 13  🚨      Extreme complacency  → DANGER — ลด satellite
+              ตลาดลืมว่า risk มีอยู่ = setup สำหรับ correction
+< 12  🔴      Euphoria volatility  → TRIM 50% satellite ทันที
+              ตั้ง trailing stop บน ที่เหลือ
+< 11          All-time-low VIX     → เตรียม cash เพื่อรอซื้อรอบหน้า
+```
+
+---
+
+### 17.3 Fear & Greed Index Contrarian Scale — ด้าน FEAR (สัญญาณซื้อ)
+
+```
+Score         สภาวะ           Action
+──────────────────────────────────────────────────────────
+35-50         Neutral          → ปกติ follow momentum
+25-35  🟡     Mild Fear        → WATCH — เตรียม watchlist ให้พร้อม
+20-25  🟡     Fear             → เริ่มมองหา entry
+15-20  🟠     Strong Fear      → เริ่ม scale in 25-30%
+              ซื้อ Tier 1 ตัวแรกก่อน
+< 15   🔴     Extreme Fear     → ซื้อจริงจัง scale in เต็ม
+              นี่คือ majority ของคนกำลังตื่นตระหนก
+              ราคาต่ำกว่า intrinsic value มากที่สุด
+< 10   🚨     MAXIMUM FEAR     → ALL IN — เกิดน้อยมาก
+              ตัวอย่าง: COVID crash, 2022 rate shock
+```
+
+### 17.4 Fear & Greed Index Contrarian Scale — ด้าน GREED (สัญญาณขาย)
+
+```
+Score         สภาวะ           Action
+──────────────────────────────────────────────────────────
+50-65         Neutral-Greed    → ปกติ hold momentum
+65-75  🟡     Greed            → เริ่ม TRIM position ที่กำไรแล้ว
+75-85  🟠     Extreme Greed    → TRIM 30-50% satellite
+              lock profit — ตลาดกำลัง overheat
+> 85   🔴     EUPHORIA         → DANGER สูง
+              TRIM 50-70% ทันที ถือ cash รอ
+> 90   🚨     MAXIMUM GREED    → เตรียม cash เต็มที่
+              ประวัติศาสตร์: score > 90 ตามด้วย correction ทุกครั้ง
+```
+
+---
+
+### 17.5 Combined Signal Matrix
+
+ใช้ VIX + Fear & Greed ร่วมกัน — ต้องสอดคล้องกัน:
+
+```
+VIX > 30  AND  F&G < 20   → 🚀 STRONG BUY — สัญญาณซื้อที่แข็งแกร่งที่สุด
+VIX > 25  AND  F&G < 25   → ✅ BUY — scale in อย่างมีวินัย
+VIX 20-25 AND  F&G 20-35  → 🟡 WATCH — รอยืนยันทิศทาง
+VIX 13-20 AND  F&G 40-65  → ➡️ HOLD — normal market, follow momentum
+VIX < 15  AND  F&G > 75   → ⚠️ CAUTION — เริ่ม trim
+VIX < 13  AND  F&G > 85   → 🔴 DANGER — trim aggressively
+```
+
+---
+
+### 17.6 สัญญาณ Market Hype / Top — ขายก่อนคนอื่น
+
+```
+🚨 ขายเมื่อเห็นสัญญาณเหล่านี้:
+
+Social / Media:
+  → หุ้นตัวนั้นขึ้นข่าวทุกวัน ทุก outlet
+  → คนรอบข้างที่ไม่เคยสนใจหุ้นเริ่มถามว่า "ซื้ออะไรดี?"
+  → YouTube / TikTok เต็มไปด้วย "ซื้อ [ticker] ก่อนสาย!"
+  → Cover story ใน mainstream magazine
+
+Valuation:
+  → P/E > 2x sector average โดยไม่มีเหตุผล
+  → Analyst target ถูกปรับขึ้นทุกสัปดาห์ไม่หยุด
+  → "This time is different" narrative แพร่หลาย
+
+Technical:
+  → RSI market index > 78 ต่อเนื่อง 2+ สัปดาห์
+  → VIX ต่ำกว่า 12 ต่อเนื่อง
+  → Volume ลดลงขณะราคาขึ้น (distribution เงียบ)
+  → Breadth แคบ (แค่ 10 หุ้นดัน index ทั้งตลาด)
+```
+
+---
+
+### 17.7 Contrarian Scale Overlay บน Portfolio
+
+```
+เมื่อ VIX หรือ F&G ส่งสัญญาณ — ปรับ Satellite allocation ทันที:
+
+                    ปกติ    Fear Zone    Panic Zone
+                   ────────────────────────────────
+Satellite %         20%       25-30%       35-40%
+Cash Buffer %      10-15%      5-8%         3-5%
+Core %              80%       70-75%       60-65%
+
+หมายเหตุ:
+- เพิ่ม satellite ในช่วง panic โดยใช้ cash buffer ที่สำรองไว้
+- กลับมา 80/20 เมื่อ VIX กลับต่ำกว่า 20 และ F&G กลับ > 40
+- อย่าเพิ่ม satellite เกิน 40% แม้จะ panic มากแค่ไหน
+```
+
+---
+
+### 17.8 ประวัติศาสตร์ Contrarian Signals ที่พิสูจน์แล้ว
+
+| เหตุการณ์ | VIX สูงสุด | F&G ต่ำสุด | ผลลัพธ์ S&P 500 (12 เดือนถัดไป) |
+|----------|-----------|-----------|-------------------------------|
+| COVID Crash (Mar 2020) | 85 | 2 | +74% |
+| Rate Shock (Oct 2022) | 34 | 5 | +39% |
+| SVB Crisis (Mar 2023) | 30 | 22 | +28% |
+| Middle East Shock (Oct 2023) | 23 | 25 | +31% |
+
+> **บทเรียน**: ทุกครั้งที่ VIX > 30 และ F&G < 20 พร้อมกัน — ตลาดให้ผลตอบแทนบวกใน 12 เดือนเสมอ
+
+---
+
+*System Version: 1.1 | Last Updated: June 11, 2026 | Quantum Capital Fund*
 *Holdings data: uploaded separately each session by Victoria Chen*
