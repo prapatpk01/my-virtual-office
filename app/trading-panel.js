@@ -124,6 +124,25 @@ class TradingPanel {
               <label>Exchange Secret   <input id="cfg-api-secret" type="password" placeholder="leave blank for paper mode" /></label>
               <label>Anthropic Key (for AI Signal) <input id="cfg-anthropic-key" type="password" placeholder="sk-ant-..." /></label>
             </div>
+            <div class="tp-key-section">
+              <div class="tp-section-title">📲 Telegram Alerts</div>
+              <label>Bot Token
+                <input id="cfg-tg-token" type="password" placeholder="123456:ABC-xyz (from @BotFather)" />
+              </label>
+              <label>Chat ID
+                <input id="cfg-tg-chat" type="text" placeholder="your Telegram chat_id" />
+              </label>
+              <label>Min signal confidence for alert
+                <input id="cfg-tg-conf" type="number" value="0.5" min="0" max="1" step="0.05" />
+              </label>
+              <div style="display:flex;gap:6px;margin-top:4px;">
+                <button class="tp-btn tp-btn-config" id="tp-tg-test-btn" style="flex:1">📤 Test Message</button>
+                <span id="tp-tg-test-result" style="font-size:11px;align-self:center;color:#68d391"></span>
+              </div>
+              <div style="font-size:10px;color:#718096;margin-top:4px;line-height:1.5">
+                Commands from Telegram: /status /positions /trades /balance /start_bot /stop_bot /help
+              </div>
+            </div>
           </div>
           <div class="tp-modal-footer">
             <button class="tp-btn tp-btn-start" id="tp-save-config">Save & Apply</button>
@@ -152,9 +171,20 @@ class TradingPanel {
     $id('tp-config-btn').onclick = () => { $id('tp-config-modal').style.display = 'flex'; };
     $id('tp-modal-close').onclick = () => { $id('tp-config-modal').style.display = 'none'; };
     $id('tp-save-config').onclick = () => this._saveConfig();
+    $id('tp-tg-test-btn').onclick = () => this._testTelegram();
 
     // Load saved config
     this._loadConfig();
+  }
+
+  async _testTelegram() {
+    const res = await fetch('/api/trading/telegram/test');
+    const data = await res.json();
+    const el = document.getElementById('tp-tg-test-result');
+    if (el) {
+      el.textContent = data.ok ? '✓ Sent!' : '✗ ' + (data.error || 'failed');
+      el.style.color = data.ok ? '#68d391' : '#fc8181';
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -305,6 +335,9 @@ class TradingPanel {
       api_key:    $('cfg-api-key').value,
       api_secret: $('cfg-api-secret').value,
       anthropic_key: $('cfg-anthropic-key').value,
+      telegram_token:   $('cfg-tg-token').value,
+      telegram_chat_id: $('cfg-tg-chat').value,
+      tg_min_confidence: parseFloat($('cfg-tg-conf').value) || 0.5,
     };
   }
 
@@ -330,6 +363,9 @@ class TradingPanel {
         $('cfg-grid').checked = saved.strategies.grid_trading ?? false;
         $('cfg-ai').checked   = saved.strategies.ai_signal ?? false;
       }
+      if (saved.telegram_token)   $('cfg-tg-token').value = saved.telegram_token;
+      if (saved.telegram_chat_id) $('cfg-tg-chat').value  = saved.telegram_chat_id;
+      if (saved.tg_min_confidence) $('cfg-tg-conf').value = saved.tg_min_confidence;
     } catch {}
   }
 

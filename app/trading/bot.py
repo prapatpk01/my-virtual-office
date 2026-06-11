@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 from .connectors.base import BaseConnector
 from .strategies.base import BaseStrategy, Signal, SignalType
 from .risk_manager import RiskManager
+from .telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("trading_bot")
 
@@ -60,12 +61,14 @@ class TradingBot:
         risk_manager: Optional[RiskManager] = None,
         interval_seconds: int = 60,
         broadcast_fn: Optional[Callable[[dict], Any]] = None,
+        telegram: Optional[TelegramNotifier] = None,
     ):
         self.connector = connector
         self.strategies = strategies
         self.risk = risk_manager or RiskManager()
         self.interval = interval_seconds
         self._broadcast = broadcast_fn or (lambda x: None)
+        self.telegram = telegram
         self.state = BotState(paper=connector.paper)
         self._task: Optional[asyncio.Task] = None
         self._start_balance = 0.0
@@ -80,6 +83,12 @@ class TradingBot:
             logger.warning("Bot already running")
             return
         self.state.running = True
+        loop = asyncio.get_event_loop()
+        if self.telegram:
+            self.telegram.start_polling(loop)
+            strategy_names = [s.name for s in self.strategies]
+            symbols = list({s.symbol for s in self.strategies})
+            self.telegram.notify_bot_started(self.connector.paper, strategy_names, symbols)
         self._task = asyncio.create_task(self._run_loop())
         logger.info("TradingBot started (paper=%s, interval=%ds)", self.connector.paper, self.interval)
 
@@ -91,6 +100,9 @@ class TradingBot:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self.telegram:
+            self.telegram.stop_polling()
+            self.telegram.notify_bot_stopped()
         logger.info("TradingBot stopped")
 
     async def manual_signal(self, symbol: str, side: str, amount: float, reason: str = "manual"):
@@ -136,6 +148,10 @@ class TradingBot:
         if not self.risk.check_drawdown(self.state.total_balance):
             logger.warning("Max drawdown hit — bot paused")
             self.state.error = "Max drawdown reached. Trading paused."
+            if self.telegram:
+                self.telegram.notify_drawdown_halt(
+                    self.state.total_balance, self.risk._peak_balance
+                )
             self._broadcast_state()
             return
 
@@ -159,6 +175,8 @@ class TradingBot:
                 self._record_trade(trade)
                 self.risk.close_position(sym)
                 logger.info("Position closed by %s: %s", trigger, sym)
+                if self.telegram:
+                    self.telegram.notify_stop_event(sym, trigger, price, pnl)
 
         # Run each strategy
         new_signals = []
@@ -182,6 +200,8 @@ class TradingBot:
                 new_signals.append(sig_dict)
 
                 if signal.type != SignalType.HOLD:
+                    if self.telegram:
+                        self.telegram.notify_signal(sig_dict)
                     await self._execute_signal(signal, strategy.name)
 
             except Exception as e:
@@ -230,6 +250,9 @@ class TradingBot:
             )
             self._record_trade(trade)
             logger.info("[%s] %s %s @ %.4f (paper=%s)", strategy_name, side.upper(), sym, price, self.connector.paper)
+            if self.telegram:
+                self.telegram.notify_order(sym, side, amount, order.price,
+                                           strategy_name, self.connector.paper)
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
 

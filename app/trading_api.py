@@ -46,6 +46,7 @@ def _build_bot(config: dict, broadcast_fn: Callable):
     from trading.strategies.ai_signal import AISignalStrategy
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
+    from trading.telegram_notifier import TelegramNotifier
 
     exchange = config.get("exchange", "binance")
     symbols = config.get("symbols", ["BTC/USDT"])
@@ -88,13 +89,33 @@ def _build_bot(config: dict, broadcast_fn: Callable):
         max_open_positions=int(config.get("max_positions", 5)),
     )
 
-    return TradingBot(
+    # Telegram (optional)
+    tg_token = config.get("telegram_token", "").strip() or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    tg_chat  = config.get("telegram_chat_id", "").strip() or os.environ.get("TELEGRAM_CHAT_ID", "")
+    telegram = None
+    if tg_token and tg_chat:
+        telegram = TelegramNotifier(
+            token=tg_token,
+            chat_id=tg_chat,
+            min_confidence=float(config.get("tg_min_confidence", 0.5)),
+        )
+
+    bot = TradingBot(
         connector=connector,
         strategies=strategies,
         risk_manager=risk,
         interval_seconds=interval,
         broadcast_fn=broadcast_fn,
+        telegram=telegram,
     )
+
+    # Wire command callbacks so /start_bot and /stop_bot work from Telegram
+    if telegram:
+        telegram.get_state_fn  = bot.get_state
+        telegram.start_bot_fn  = lambda: handle_start(config, broadcast_fn)
+        telegram.stop_bot_fn   = lambda: handle_stop()
+
+    return bot
 
 
 # -----------------------------------------------------------------------
@@ -142,6 +163,25 @@ def handle_stop(bot_key: str = "default") -> dict:
         return {"ok": True, "message": "Bot stopped"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def handle_telegram_test(bot_key: str = "default") -> dict:
+    """Send a test message via Telegram to verify the connection."""
+    with _bot_lock:
+        bot = _bots.get(bot_key)
+    if not bot or not bot.telegram:
+        # Try env vars directly
+        import os
+        from trading.telegram_notifier import TelegramNotifier
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        if not token or not chat_id:
+            return {"ok": False, "error": "No Telegram token/chat_id configured"}
+        tg = TelegramNotifier(token=token, chat_id=chat_id)
+        tg.notify("✅ *Trading Bot* — Telegram test message OK!")
+        return {"ok": True, "message": "Test message sent"}
+    bot.telegram.notify("✅ *Trading Bot* — Telegram test message OK!")
+    return {"ok": True, "message": "Test message sent"}
 
 
 def handle_manual_trade(body: dict, bot_key: str = "default") -> dict:
