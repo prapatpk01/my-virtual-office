@@ -103,6 +103,8 @@ class TradingPanel {
                 <label><input type="checkbox" id="cfg-rsi" checked /> RSI + MACD</label>
                 <label><input type="checkbox" id="cfg-grid" /> Grid Trading</label>
                 <label><input type="checkbox" id="cfg-ai" /> AI Signal (Claude)</label>
+                <label><input type="checkbox" id="cfg-mcdx" /> MCDX Plus v2.0 📊</label>
+                <label><input type="checkbox" id="cfg-sentinel" /> Sentinel Signal v1.0 🎯</label>
               </div>
             </label>
             <label>Timeframe
