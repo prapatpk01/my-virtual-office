@@ -475,5 +475,171 @@ Next Quarter Plan:
 
 ---
 
+---
+
+## 16. Fundamental Analysis Framework — Equity Research
+
+ใช้ทุกครั้งก่อนตัดสินใจเข้า Satellite position (ทีม Research + Marcus Webb)
+
+---
+
+### 16.1 Growth Scorecard (40 pts)
+
+| Metric | คำถาม | เกณฑ์ผ่าน | คะแนน |
+|--------|-------|---------|-------|
+| Revenue Growth YoY | บริษัทโตเร็วแค่ไหน? | > 20% = 10pts / 10-20% = 5pts | /10 |
+| EPS Growth YoY | กำไรต่อหุ้นโต? | > 25% = 10pts / 10-25% = 5pts | /10 |
+| Revenue Guidance | management มองปีหน้าอย่างไร? | ขึ้น guidance = 10pts / คงที่ = 5pts | /10 |
+| Estimate Revision | นักวิเคราะห์ปรับ estimate ขึ้นไหม? | ปรับขึ้น = 10pts / คงที่ = 0pts | /10 |
+
+### 16.2 Quality Scorecard (30 pts)
+
+| Metric | คำถาม | เกณฑ์ผ่าน | คะแนน |
+|--------|-------|---------|-------|
+| Gross Margin Trend | margin ขยายตัวหรือหด? | ขยาย = 10pts / คงที่ = 5pts / หด = 0pts | /10 |
+| Free Cash Flow | FCF เป็นบวกไหม? | FCF > 0 และ FCF yield > 2% = 10pts | /10 |
+| ROIC / ROE | ใช้ทุนได้มีประสิทธิภาพ? | ROIC > 15% = 10pts / 10-15% = 5pts | /10 |
+
+### 16.3 Valuation Scorecard (20 pts)
+
+| Metric | Tech/Growth | Value/Income | คะแนน |
+|--------|------------|-------------|-------|
+| Forward P/E vs Sector avg | < sector avg = 10pts | < 15x = 10pts | /10 |
+| PEG Ratio (P/E ÷ Growth) | < 1.5 = 10pts / 1.5-2.5 = 5pts / > 2.5 = 0pts | — | /10 |
+
+> สำหรับ High-Growth (revenue > 40% YoY) ใช้ EV/Revenue แทน P/E
+> เกณฑ์: EV/Revenue < 10x = ถูก / 10-20x = Fair / > 20x = แพง
+
+### 16.4 Catalyst Scorecard (10 pts)
+
+| Catalyst Type | คะแนน |
+|--------------|-------|
+| Earnings ใน 4-8 สัปดาห์ + consensus beat expected | 10 |
+| Contract win / product launch ชัดเจน | 8 |
+| Sector re-rating event (IPO halo, M&A) | 7 |
+| General sector momentum เท่านั้น | 3 |
+
+---
+
+### 16.5 Total Fundamental Score
+
+```
+Growth   (40 pts): ____
+Quality  (30 pts): ____
+Valuation(20 pts): ____
+Catalyst (10 pts): ____
+─────────────────────
+TOTAL   (100 pts): ____
+
+≥ 75 pts  → GREEN  ✅ เข้าได้ (ร่วมกับ Sentinel Signal)
+50-74 pts → YELLOW 🟡 เข้าได้ถ้า technical แข็งมาก
+< 50 pts  → RED    ❌ ข้าม — fundamental ไม่รองรับ
+```
+
+---
+
+### 16.6 Red Flags — REJECT ทันที
+
+```
+🚩 Revenue growth ลดลงติดต่อกัน 2 ไตรมาส (deceleration)
+🚩 Gross margin หดลงมากกว่า 300 bps YoY
+🚩 Free Cash Flow ติดลบ และ burn rate > 6 เดือน
+🚩 Debt/Equity > 3x โดยไม่มี asset backing
+🚩 Guidance ถูกปรับลง (guidance cut) ใน 2 ไตรมาสล่าสุด
+🚩 Insider selling > 5% ของหุ้นใน 30 วัน (ยกเว้น pre-scheduled)
+🚩 Short interest > 20% ของ float
+🚩 Customer concentration > 50% จาก 1 ราย
+```
+
+---
+
+### 16.7 Key Metrics per Sector
+
+| Sector | Metric หลัก | Metric รอง |
+|--------|------------|-----------|
+| **AI / Semiconductor** | AI revenue growth %, custom chip backlog | Gross margin, R&D/Revenue |
+| **Cloud / SaaS** | ARR growth, NRR (Net Revenue Retention) | Rule of 40, CAC payback |
+| **Defense** | Backlog ($), backlog-to-revenue ratio | EBITDA margin, contract type |
+| **Energy / Nuclear** | Capacity additions (GW), PPA pricing | FCF, debt maturity |
+| **Biotech** | Pipeline stage, FDA timeline | Cash runway, partnership deals |
+| **Space / Satellite** | Launch cadence, backlog, gross margin % | R&D burn, government vs commercial mix |
+
+---
+
+### 16.8 Earnings Analysis Framework (Post-Earnings)
+
+```
+ขั้นตอนทันทีหลัง earnings ประกาศ:
+
+1. BEAT OR MISS?
+   Revenue: Actual vs Consensus est.
+   EPS:     Actual vs Consensus est.
+   → Beat both + Guidance up   = STRONG BUY signal
+   → Beat revenue, miss EPS    = NEUTRAL
+   → Miss revenue              = HOLD / EXIT depending on guidance
+
+2. GUIDANCE CHECK
+   Q+1 guidance vs current consensus?
+   Full-year guidance raised / maintained / lowered?
+   → Raised = PEAD setup (Post-Earnings Announcement Drift)
+   → Lowered = EXIT หรือ ลด position ทันที
+
+3. MANAGEMENT TONE
+   ฟัง Earnings call: bullish / cautious / defensive?
+   New products / contracts mentioned?
+   Margin trajectory commentary?
+
+4. PRICE ACTION POST-EARNINGS
+   Gap up > 5% on volume = momentum entry (buy breakout)
+   Gap down > 8% on beat = potential flush-reversal setup
+   Flat on beat = แผ่ว — ดู next catalyst ก่อน
+```
+
+---
+
+### 16.9 Valuation Quick Reference
+
+```
+GROWTH STOCKS (Revenue > 30% YoY):
+  Cheap:  Forward P/E < 30x  |  EV/Revenue < 8x  |  PEG < 1.0
+  Fair:   Forward P/E 30-50x |  EV/Revenue 8-15x |  PEG 1.0-1.5
+  Pricey: Forward P/E > 50x  |  EV/Revenue > 15x |  PEG > 2.0
+
+VALUE / DIVIDEND STOCKS:
+  Cheap:  P/E < 12x  |  P/B < 1.5x  |  Yield > 4%
+  Fair:   P/E 12-18x |  P/B 1.5-3x  |  Yield 2-4%
+  Pricey: P/E > 20x  |  P/B > 4x    |  Yield < 2%
+
+RULE OF 40 (SaaS):
+  Score = Revenue Growth % + FCF Margin %
+  > 40 = Excellent | 30-40 = Good | < 30 = Weak
+```
+
+---
+
+### 16.10 Analyst Consensus Check
+
+```
+ดูก่อนเข้า position ทุกครั้ง:
+
+Analyst Ratings:
+  % Buy > 70%   = Strong consensus bullish ✅
+  % Buy 50-70%  = Moderate consensus
+  % Buy < 40%   = Contrarian setup (risky)
+
+Price Target:
+  Current price vs median target:
+  Upside > 25%  = Significant upside ✅
+  Upside 10-25% = Reasonable
+  Upside < 10%  = Extended / priced in
+
+Estimate Revisions (most important):
+  Upward revisions in last 30 days = BULLISH signal ✅
+  Downward revisions              = WARNING ⚠️
+  No revisions                    = Neutral
+```
+
+---
+
 *System Version: 1.0 | Last Updated: June 11, 2026 | Quantum Capital Fund*
 *Holdings data: uploaded separately each session by Victoria Chen*
