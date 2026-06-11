@@ -1,0 +1,17 @@
+# Trading Bot dependencies
+# Install: pip install -r requirements-trading.txt
+
+# Async HTTP (Telegram API + Alpaca REST)
+aiohttp>=3.9.0
+
+# Crypto exchange connectivity (Binance, Bybit, OKX)
+ccxt>=4.2.0
+
+# Numerical calculations (indicators: EMA, RSI, MACD, etc.)
+numpy>=1.26.0
+
+# Anthropic SDK (only needed for AI Signal strategy)
+anthropic>=0.25.0
+
+# Optional: for loading .env file automatically
+# python-dotenv>=1.0.0
