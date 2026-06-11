@@ -1,3 +1,15 @@
+---
+name: investment-system
+description: >
+  Investment system skill for Quantum Capital Fund managed by Victoria Chen.
+  Covers the full Barbell Portfolio strategy (Core 80% / Satellite Alpha 20%),
+  Sentinel Signal v1.0 (RSI + MACD + Sentiment), momentum scan framework,
+  rotation rules, macro signals (2Y vs Fed Funds, VIX, CPI), Buy-Rumor-Sell-News
+  calendar, position sizing, risk management, and emergency protocols.
+  Target return: +24% per year. Use when managing or reviewing the fund portfolio,
+  finding new satellite positions, running momentum scans, or making buy/sell decisions.
+---
+
 # Quantum Capital Fund — Investment System Skill
 **Fund Manager**: Victoria Chen | **Currency**: USD | **Target Return**: +24% / year
 **Strategy**: Barbell Portfolio — Core 80% + Satellite Alpha 20%
