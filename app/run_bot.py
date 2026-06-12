@@ -69,8 +69,8 @@ def build_config() -> dict:
 
         # Strategies
         "strategies": {
-            "wt_adx":    _env_bool("STRATEGY_WT_ADX",    True),
-            "momentum":  _env_bool("STRATEGY_MOMENTUM",  True),
+            "wt_adx":   _env_bool("STRATEGY_WT_ADX",   True),
+            "macd_ema": _env_bool("STRATEGY_MACD_EMA",  True),
         },
 
         # Risk management
@@ -96,7 +96,7 @@ def build_bot(config: dict):
     from trading.connectors.binance_conn import BinanceConnector
     from trading.connectors.alpaca_conn import AlpacaConnector
     from trading.strategies.wt_adx_strategy import WTADXStrategy
-    from trading.strategies.momentum_strategy import MomentumStrategy
+    from trading.strategies.macd_ema_strategy import MACDEMAStrategy
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
     from trading.telegram_notifier import TelegramNotifier
@@ -124,8 +124,8 @@ def build_bot(config: dict):
     # Strategies
     strategies = []
     for sym in symbols:
-        if flags.get("wt_adx"):    strategies.append(WTADXStrategy(sym))
-        if flags.get("momentum"):  strategies.append(MomentumStrategy(sym))
+        if flags.get("wt_adx"):   strategies.append(WTADXStrategy(sym))
+        if flags.get("macd_ema"): strategies.append(MACDEMAStrategy(sym))
 
     if not strategies:
         strategies.append(WTADXStrategy(symbols[0]))
