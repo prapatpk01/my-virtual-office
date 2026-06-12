@@ -67,15 +67,10 @@ def build_config() -> dict:
         "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
 
-        # Strategies (set to "true" to enable)
+        # Strategies
         "strategies": {
-            "ma_crossover":  _env_bool("STRATEGY_MA_CROSSOVER",  True),
-            "rsi_macd":      _env_bool("STRATEGY_RSI_MACD",      True),
-            "grid_trading":  _env_bool("STRATEGY_GRID",          False),
-            "ai_signal":     _env_bool("STRATEGY_AI_SIGNAL",     False),
-            "mcdx":          _env_bool("STRATEGY_MCDX",          True),
-            "sentinel":      _env_bool("STRATEGY_SENTINEL",      False),
-            "rvol":          _env_bool("STRATEGY_RVOL",          True),
+            "wt_adx":    _env_bool("STRATEGY_WT_ADX",    True),
+            "momentum":  _env_bool("STRATEGY_MOMENTUM",  True),
         },
 
         # Risk management
@@ -100,13 +95,8 @@ def build_config() -> dict:
 def build_bot(config: dict):
     from trading.connectors.binance_conn import BinanceConnector
     from trading.connectors.alpaca_conn import AlpacaConnector
-    from trading.strategies.ma_crossover import MACrossoverStrategy
-    from trading.strategies.rsi_macd import RSIMACDStrategy
-    from trading.strategies.grid_trading import GridTradingStrategy
-    from trading.strategies.ai_signal import AISignalStrategy
-    from trading.strategies.mcdx_strategy import MCDXStrategy
-    from trading.strategies.sentinel_strategy import SentinelStrategy
-    from trading.strategies.rvol_strategy import RVolStrategy
+    from trading.strategies.wt_adx_strategy import WTADXStrategy
+    from trading.strategies.momentum_strategy import MomentumStrategy
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
     from trading.telegram_notifier import TelegramNotifier
@@ -115,9 +105,6 @@ def build_bot(config: dict):
     paper    = config["paper"]
     symbols  = config["symbols"]
     flags    = config["strategies"]
-
-    if config.get("anthropic_key"):
-        os.environ["ANTHROPIC_API_KEY"] = config["anthropic_key"]
 
     # Connector
     if exchange in ("binance", "bybit", "okx"):
@@ -137,16 +124,11 @@ def build_bot(config: dict):
     # Strategies
     strategies = []
     for sym in symbols:
-        if flags.get("ma_crossover"):   strategies.append(MACrossoverStrategy(sym))
-        if flags.get("rsi_macd"):       strategies.append(RSIMACDStrategy(sym))
-        if flags.get("grid_trading"):   strategies.append(GridTradingStrategy(sym))
-        if flags.get("ai_signal"):      strategies.append(AISignalStrategy(sym))
-        if flags.get("mcdx"):           strategies.append(MCDXStrategy(sym))
-        if flags.get("sentinel"):       strategies.append(SentinelStrategy(sym))
-        if flags.get("rvol"):           strategies.append(RVolStrategy(sym))
+        if flags.get("wt_adx"):    strategies.append(WTADXStrategy(sym))
+        if flags.get("momentum"):  strategies.append(MomentumStrategy(sym))
 
     if not strategies:
-        strategies.append(MACrossoverStrategy(symbols[0]))
+        strategies.append(WTADXStrategy(symbols[0]))
 
     risk = RiskManager(
         max_risk_per_trade_pct=config["risk_per_trade"],
