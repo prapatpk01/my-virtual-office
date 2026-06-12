@@ -74,7 +74,7 @@ def build_config() -> dict:
             "grid_trading":  _env_bool("STRATEGY_GRID",          False),
             "ai_signal":     _env_bool("STRATEGY_AI_SIGNAL",     False),
             "mcdx":          _env_bool("STRATEGY_MCDX",          True),
-            "sentinel":      _env_bool("STRATEGY_SENTINEL",      True),
+            "sentinel":      _env_bool("STRATEGY_SENTINEL",      False),
             "rvol":          _env_bool("STRATEGY_RVOL",          True),
         },
 
