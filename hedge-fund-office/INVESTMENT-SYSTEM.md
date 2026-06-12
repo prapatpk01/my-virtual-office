@@ -71,12 +71,15 @@ description: >
 ### การเรียกทีมทำงาน
 
 ```
-ทีม Research        → deep research, theme analysis, equity workbook, fund flows
-ทีม Quant           → Sentinel Signal, technical levels, chart setup
-ทีม Macro           → yield curve, Fed, inflation, regime + อ่านใจตลาด
-ทีม Investment      → (Research+Quant) จับ momentum & trend, เลือกจังหวะลงทุน
-ทีม Risk            → sizing, stop loss, concentration check
-Victoria Chen       → final decision, execution approval
+ลำดับทำงานทุกครั้ง:
+  1. ทีม Macro    → อ่านภาพตลาด, regime, yield curve, sentiment
+  2. ทีม Research → รับ macro context จาก Macro ก่อน แล้วค่อย scan/research
+                    → ส่งรายชื่อหุ้น + thesis ให้ทีม Quant
+  3. ทีม Quant    → รับหุ้นจาก Research → รัน Sentinel Signal, เช็ค technicals
+  4. ทีม Risk     → sizing, stop loss, concentration check
+  5. Victoria     → final decision, execution approval
+
+สรุปการส่งต่อ: Macro → Research → Quant → Risk → Victoria
 ```
 
 ### 1.1 Mandate เชิงลึก
@@ -606,30 +609,40 @@ Cybersecurity    — Zero-trust, AI-driven threats
 │    → Market Regime: Risk-On / Caution / Risk-Off    │
 │    → FOMC calendar + blackout dates                 │
 │    → Bond/credit/smart money read                   │
+│    ⬇ ส่ง Macro Brief → Research ก่อนเริ่ม scan     │
 ├─────────────────────────────────────────────────────┤
 │  Step 2: RESEARCH (Emily / Marcus / Nina)           │
+│    [รับ Macro Brief จาก Step 1 ก่อนเสมอ]            │
 │    → Run Momentum Scan §4 หรือ Watchlist §4.1       │
+│      (กรองเฉพาะ sector/theme ที่ Macro อนุมัติ)      │
 │    → Deep research per candidate                    │
 │    → Fundamental Scorecard §9                       │
 │    → Fund flow verification per theme               │
+│    ⬇ ส่ง Research List (ticker + thesis) → Quant   │
 ├─────────────────────────────────────────────────────┤
 │  Step 3: QUANT (Kenji / Aisha)                     │
+│    [รับ Research List จาก Step 2]                   │
 │    → Sentinel Signal v1.0 per candidate             │
 │    → Entry range: 10-day EMA ± 3%                  │
 │    → R:R calculation (reject if < 1:3)             │
 │    → Fibonacci targets (1.618 extension)            │
+│    ⬇ ส่ง Signal Report → Risk                      │
 ├─────────────────────────────────────────────────────┤
 │  Step 4: RISK (Chris Morgan)                        │
 │    → Position size per Beta tier                    │
 │    → Portfolio concentration check                  │
 │    → Stop loss placement (below 20-day EMA)         │
 │    → Cash buffer verification                       │
+│    ⬇ ส่ง Approved List → Victoria                  │
 ├─────────────────────────────────────────────────────┤
 │  Step 5: VICTORIA CHEN — Final Decision             │
 │    → Review all team inputs                         │
 │    → Approve / reject / modify                      │
 │    → Set limit orders + execution timing            │
 └─────────────────────────────────────────────────────┘
+
+กฎ: Research ห้าม scan โดยไม่มี macro context ก่อน
+    Quant ห้ามรัน signal โดยไม่มี research list ก่อน
 ```
 
 ---
