@@ -1,0 +1,1259 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sentinel — Investment Dashboard</title>
+<script src="https://unpkg.com/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+/* ═══ DESIGN TOKENS ═══ */
+:root {
+  --bg:       #050c1a;
+  --bg2:      #091424;
+  --bg3:      #0d1c30;
+  --card:     #0b1828;
+  --border:   rgba(255,184,0,0.12);
+  --border2:  rgba(0,191,255,0.12);
+  --gold:     #ffb800;
+  --gold2:    #ffd54f;
+  --cyan:     #00c8ff;
+  --navy:     #1655a3;
+  --green:    #00e676;
+  --red:      #ff4d4d;
+  --amber:    #ffab40;
+  --text:     #dce8f5;
+  --muted:    #6b8aaa;
+  --dim:      #344f6a;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg);color:var(--text);
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  font-size:14px;min-height:100vh;overflow-x:hidden;
+}
+
+/* ── ANIMATED BG GRID ── */
+body::before{
+  content:'';position:fixed;inset:0;
+  background-image:
+    linear-gradient(rgba(0,180,255,0.03) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,180,255,0.03) 1px,transparent 1px);
+  background-size:48px 48px;
+  pointer-events:none;z-index:0;
+}
+
+/* ── TOPBAR ── */
+.topbar{
+  background:rgba(5,12,26,0.95);
+  border-bottom:1px solid rgba(255,184,0,0.25);
+  padding:0 16px;display:flex;align-items:center;gap:12px;
+  height:52px;position:sticky;top:0;z-index:200;
+  backdrop-filter:blur(12px);
+}
+.logo-wrap{display:flex;align-items:center;gap:10px}
+.logo-icon{width:28px;height:28px;border:2px solid var(--gold);border-radius:6px;
+  display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--gold);font-weight:900}
+.logo-text{font-size:16px;font-weight:900;color:var(--gold);letter-spacing:3px;text-transform:uppercase}
+.logo-sub{font-size:9px;color:var(--muted);letter-spacing:1px}
+
+.nav{display:flex;gap:2px;margin-left:auto;overflow-x:auto;scrollbar-width:none}
+.nav::-webkit-scrollbar{display:none}
+.nav-btn{
+  background:none;border:none;color:var(--muted);
+  padding:6px 10px;border-radius:8px;cursor:pointer;
+  font-size:12px;font-weight:600;white-space:nowrap;
+  display:flex;align-items:center;gap:5px;transition:all .2s;
+  letter-spacing:.3px;
+}
+.nav-btn:hover{background:var(--bg3);color:var(--text)}
+.nav-btn.active{background:linear-gradient(135deg,rgba(255,184,0,.2),rgba(255,184,0,.08));
+  color:var(--gold);border:1px solid rgba(255,184,0,.3)}
+.nav-icon{font-size:14px}
+.badge{background:var(--gold);color:#000;font-size:9px;font-weight:800;padding:1px 5px;border-radius:10px;line-height:1.4}
+
+/* ── CPI ALERT BANNER ── */
+.alert-banner{
+  background:linear-gradient(90deg,rgba(255,171,64,.12),rgba(255,171,64,.05),rgba(255,171,64,.12));
+  border-bottom:1px solid rgba(255,171,64,.3);
+  padding:7px 16px;display:flex;align-items:center;gap:8px;
+  font-size:12px;position:sticky;top:52px;z-index:190;
+  backdrop-filter:blur(8px);
+}
+.alert-banner strong{color:var(--amber)}
+.alert-dot{width:7px;height:7px;background:var(--amber);border-radius:50%;
+  animation:pulse 1.5s ease-in-out infinite;flex-shrink:0}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.3)}}
+
+/* ── PAGES ── */
+.page{display:none;padding:20px 16px 40px;max-width:1440px;margin:0 auto;position:relative;z-index:1}
+.page.active{display:block}
+
+/* ── GRID ── */
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:repeat(2,1fr)}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)}
+.g5{grid-template-columns:repeat(5,1fr)}
+.g-kpi{grid-template-columns:repeat(2,1fr)}
+@media(min-width:600px){.g-kpi{grid-template-columns:repeat(3,1fr)}}
+@media(min-width:900px){.g-kpi{grid-template-columns:repeat(5,1fr)};.g3{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:900px){.g2,.g3{grid-template-columns:1fr}.g4{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.g4,.g5{grid-template-columns:repeat(2,1fr)}}
+
+/* ── CARDS ── */
+.card{
+  background:rgba(11,24,40,0.85);
+  border:1px solid var(--border);
+  border-radius:16px;padding:18px;
+  backdrop-filter:blur(8px);
+  box-shadow:0 4px 32px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.04);
+  transition:border-color .2s;
+}
+.card:hover{border-color:rgba(255,184,0,.22)}
+.card-title{
+  font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:1.2px;color:var(--muted);margin-bottom:14px;
+  display:flex;align-items:center;gap:6px;
+}
+.card-title::before{content:'';width:3px;height:12px;background:var(--gold);
+  border-radius:2px;flex-shrink:0}
+
+/* ── KPI TILES ── */
+.kpi{
+  background:rgba(11,24,40,0.85);
+  border:1px solid var(--border);
+  border-radius:14px;padding:14px 16px;
+  backdrop-filter:blur(8px);
+  position:relative;overflow:hidden;
+  box-shadow:0 2px 16px rgba(0,0,0,.4);
+  transition:transform .2s,border-color .2s;
+}
+.kpi:hover{transform:translateY(-2px);border-color:rgba(255,184,0,.3)}
+.kpi::after{
+  content:'';position:absolute;bottom:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,var(--gold),transparent);
+  opacity:0;transition:opacity .2s;
+}
+.kpi:hover::after{opacity:1}
+.kpi-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
+.kpi-value{font-size:22px;font-weight:800;line-height:1;letter-spacing:-.5px}
+.kpi-value.gold{color:var(--gold);text-shadow:0 0 20px rgba(255,184,0,.3)}
+.kpi-value.pos{color:var(--green);text-shadow:0 0 20px rgba(0,230,118,.25)}
+.kpi-value.neg{color:var(--red)}
+.kpi-sub{font-size:11px;color:var(--muted);margin-top:4px}
+.kpi-badge{display:inline-block;font-size:9px;font-weight:700;padding:2px 7px;
+  border-radius:20px;margin-top:5px;letter-spacing:.3px}
+.beat{background:rgba(0,230,118,.12);color:#00e676;border:1px solid rgba(0,230,118,.25)}
+.ontarget{background:rgba(0,200,255,.12);color:#00c8ff;border:1px solid rgba(0,200,255,.25)}
+.miss{background:rgba(255,77,77,.12);color:#ff4d4d;border:1px solid rgba(255,77,77,.25)}
+.pending{background:rgba(255,171,64,.12);color:var(--amber);border:1px solid rgba(255,171,64,.25)}
+
+/* ── SECTION HEADERS ── */
+.sec{display:flex;align-items:center;gap:10px;margin:20px 0 14px}
+.sec-bar{width:3px;height:20px;background:linear-gradient(180deg,var(--gold),var(--cyan));border-radius:3px}
+.sec-title{font-size:15px;font-weight:700}
+.sec-sub{font-size:11px;color:var(--muted);margin-left:auto}
+.divider{border-top:1px solid rgba(255,255,255,.06);margin:18px 0}
+
+/* ── CHARTS ── */
+.chart-wrap{position:relative;height:260px}
+.chart-wrap-sm{position:relative;height:200px}
+@media(max-width:600px){.chart-wrap{height:200px}.chart-wrap-sm{height:160px}}
+
+/* ── TABLES ── */
+.tbl-wrap{overflow-x:auto;border-radius:10px}
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl th{
+  background:rgba(22,85,163,.6);color:rgba(255,255,255,.8);
+  font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.6px;padding:10px 12px;text-align:right;white-space:nowrap;
+}
+.tbl th:first-child{text-align:left;border-radius:8px 0 0 0}
+.tbl th:last-child{border-radius:0 8px 0 0}
+.tbl td{padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.05);text-align:right}
+.tbl td:first-child{text-align:left}
+.tbl tr:hover td{background:rgba(255,255,255,.025)}
+.tbl .total-row td{background:rgba(22,85,163,.4);font-weight:700;color:white}
+.tbl tr:last-child td{border-bottom:none}
+.pos{color:var(--green)}
+.neg{color:var(--red)}
+.gold{color:var(--gold)}
+
+/* ── PILLS ── */
+.pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.3px}
+.pill-green{background:rgba(0,230,118,.12);color:#00e676;border:1px solid rgba(0,230,118,.2)}
+.pill-red{background:rgba(255,77,77,.12);color:#ff4d4d;border:1px solid rgba(255,77,77,.2)}
+.pill-amber{background:rgba(255,171,64,.12);color:var(--amber);border:1px solid rgba(255,171,64,.2)}
+.pill-blue{background:rgba(0,200,255,.12);color:#00c8ff;border:1px solid rgba(0,200,255,.2)}
+.pill-gold{background:rgba(255,184,0,.12);color:var(--gold);border:1px solid rgba(255,184,0,.2)}
+.pill-dim{background:rgba(255,255,255,.06);color:var(--muted);border:1px solid rgba(255,255,255,.08)}
+
+/* ── PORTFOLIO CARDS ── */
+.port-card{
+  border:1px solid;border-radius:14px;padding:16px;
+  background:rgba(11,24,40,.85);backdrop-filter:blur(8px);
+  position:relative;overflow:hidden;
+}
+.port-card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  border-radius:2px 2px 0 0;
+}
+.port-sentinel{border-color:rgba(255,184,0,.25)}
+.port-sentinel::before{background:linear-gradient(90deg,transparent,var(--gold),transparent)}
+.port-gambit{border-color:rgba(168,85,247,.25)}
+.port-gambit::before{background:linear-gradient(90deg,transparent,#a855f7,transparent)}
+.port-agis{border-color:rgba(0,230,118,.2)}
+.port-agis::before{background:linear-gradient(90deg,transparent,#00e676,transparent)}
+.port-cash{border-color:rgba(255,171,64,.2)}
+.port-cash::before{background:linear-gradient(90deg,transparent,var(--amber),transparent)}
+.port-name{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.port-val{font-size:22px;font-weight:800;letter-spacing:-.5px}
+.port-meta{font-size:11px;color:var(--muted);margin-top:4px}
+
+/* ── WATCHLIST ITEMS ── */
+.wl-item{
+  display:grid;grid-template-columns:auto 1fr auto;gap:12px;
+  padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.05);
+  align-items:start;
+}
+.wl-item:last-child{border-bottom:none}
+.wl-ticker{font-size:16px;font-weight:900;color:var(--gold);min-width:52px}
+.wl-info{}
+.wl-name{font-size:12px;color:var(--muted);margin-bottom:4px}
+.wl-thesis{font-size:12px;color:var(--text);line-height:1.5}
+.wl-right{display:flex;flex-direction:column;align-items:flex-end;gap:5px;min-width:80px}
+.wl-entry{font-size:13px;font-weight:700;color:var(--gold)}
+
+/* ── MARKET GRID ── */
+.mkt-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+@media(min-width:600px){.mkt-grid{grid-template-columns:repeat(3,1fr)}}
+.mkt-item{background:var(--bg3);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:12px}
+.mkt-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
+.mkt-val{font-size:17px;font-weight:800}
+.mkt-chg{font-size:11px;margin-top:2px}
+
+/* ── CPI BOX ── */
+.cpi-box{
+  border:1px solid rgba(255,171,64,.3);border-radius:12px;
+  padding:14px;background:rgba(255,171,64,.05);margin-top:12px;
+}
+.cpi-title{color:var(--amber);font-weight:700;font-size:12px;margin-bottom:10px}
+
+/* ── REBALANCE ── */
+.phase-badge{
+  display:inline-flex;align-items:center;gap:6px;
+  background:rgba(0,230,118,.1);border:1px solid rgba(0,230,118,.3);
+  border-radius:20px;padding:4px 12px;font-size:11px;font-weight:700;color:var(--green);
+  margin-bottom:16px;
+}
+.sell-table-wrap{border-left:3px solid var(--red);padding-left:12px}
+.buy-table-wrap{border-left:3px solid var(--green);padding-left:12px}
+
+/* ── PROGRESS ── */
+.prog-bar{background:rgba(255,255,255,.08);border-radius:99px;height:6px;overflow:hidden;margin-top:6px}
+.prog-fill{height:100%;border-radius:99px}
+
+/* ── FOOTER ── */
+footer{
+  text-align:center;font-size:10px;color:var(--dim);
+  padding:20px;border-top:1px solid rgba(255,255,255,.05);
+  position:relative;z-index:1;margin-top:24px;letter-spacing:.5px;
+}
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div class="logo-wrap">
+    <div class="logo-icon">⬡</div>
+    <div>
+      <div class="logo-text">SENTINEL</div>
+      <div class="logo-sub">Investment Dashboard Q2/2026</div>
+    </div>
+  </div>
+  <a href="office.html" style="background:rgba(0,200,255,.08);border:1px solid rgba(0,200,255,.25);color:#00c8ff;padding:5px 12px;border-radius:8px;font-size:11px;font-weight:700;text-decoration:none;white-space:nowrap;margin-left:auto" title="Virtual HQ">🏢 Virtual HQ</a>
+  <nav class="nav" style="margin-left:8px">
+    <button class="nav-btn active" onclick="showPage('dashboard')" id="btn-dashboard">
+      <span class="nav-icon">📊</span>Dashboard
+    </button>
+    <button class="nav-btn" onclick="showPage('portfolio')" id="btn-portfolio">
+      <span class="nav-icon">💼</span>Portfolio
+    </button>
+    <button class="nav-btn" onclick="showPage('reports')" id="btn-reports">
+      <span class="nav-icon">📈</span>Reports
+    </button>
+    <button class="nav-btn" onclick="showPage('watchlist')" id="btn-watchlist">
+      <span class="nav-icon">🔍</span>Watchlist <span class="badge">6</span>
+    </button>
+    <button class="nav-btn" onclick="showPage('rebalance')" id="btn-rebalance">
+      <span class="nav-icon">⚖️</span>Rebalance
+    </button>
+  </nav>
+</div>
+
+<!-- CPI ALERT -->
+<div class="alert-banner" style="background:linear-gradient(90deg,rgba(0,230,118,.10),rgba(0,230,118,.04),rgba(0,230,118,.10));border-color:rgba(0,230,118,.3)">
+  <div class="alert-dot" style="background:var(--green)"></div>
+  <strong style="color:var(--green)">✅ Phase 2A Deployed — June 11, 2026</strong>
+  <span style="color:var(--muted)">— CPI 3.7% vs 4.2% est · BEAT · SPMO $1,200 + VOO $1,000 + SCHD $490 + SGOV $1,249 executed</span>
+  <span style="margin-left:auto;color:var(--green);font-size:11px;font-weight:700">💰 Cash Fully Deployed</span>
+</div>
+
+<!-- ═══════════════════════════════════════ PAGE: DASHBOARD ═══ -->
+<div class="page active" id="page-dashboard">
+
+  <!-- KPI Tiles -->
+  <div class="grid g-kpi" style="margin-bottom:16px">
+    <div class="kpi">
+      <div class="kpi-label">NAV (USD)</div>
+      <div class="kpi-value gold">$11,709</div>
+      <div class="kpi-sub">≈ 385,115 THB · Jun 11 09:21</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Q2 Total Return</div>
+      <div class="kpi-value pos">+9.53%</div>
+      <span class="kpi-badge beat">BEAT 5.50%</span>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">YTD 2026 Return</div>
+      <div class="kpi-value pos">+10.22%</div>
+      <span class="kpi-badge beat">BEAT 8.00%</span>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Since Inception</div>
+      <div class="kpi-value pos">+19.87%</div>
+      <div class="kpi-sub">Nov 2025 – Jun 2026</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Dividend Yield (FWD)</div>
+      <div class="kpi-value gold">6.11%</div>
+      <span class="kpi-badge ontarget">ON TARGET 5–6%</span>
+    </div>
+  </div>
+
+  <!-- KPI Row 2 -->
+  <div class="grid g-kpi" style="margin-bottom:20px">
+    <div class="kpi">
+      <div class="kpi-label">FWD Dividend / yr</div>
+      <div class="kpi-value" style="font-size:18px;color:var(--gold)">$764.37</div>
+      <div class="kpi-sub">$63.70 / เดือน</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Phase 2A Deployed</div>
+      <div class="kpi-value" style="font-size:18px;color:var(--green)">$3,939</div>
+      <span class="kpi-badge beat">COMPLETE ✅</span>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Portfolios</div>
+      <div class="kpi-value" style="font-size:18px">3</div>
+      <div class="kpi-sub">Sentinel · Gambit · Agis</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Payout Ratio (SI)</div>
+      <div class="kpi-value" style="font-size:18px">52.5%</div>
+      <div class="kpi-sub">Reinvest 47.5%</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">USD/THB</div>
+      <div class="kpi-value" style="font-size:18px">32.89</div>
+      <div class="kpi-sub">อัตราแลกเปลี่ยน</div>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:16px">
+    <div class="card">
+      <div class="card-title">NAV Growth Since Inception</div>
+      <div class="chart-wrap"><canvas id="c-nav"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Returns vs Target per Period</div>
+      <div class="chart-wrap"><canvas id="c-ret"></canvas></div>
+    </div>
+  </div>
+
+  <div class="grid g3">
+    <div class="card">
+      <div class="card-title">Allocation (Current)</div>
+      <div class="chart-wrap-sm"><canvas id="c-alloc"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Target Post-CPI</div>
+      <div class="chart-wrap-sm"><canvas id="c-target"></canvas></div>
+    </div>
+    <div class="card" style="grid-column:span 1">
+      <div class="card-title">Market Conditions — Jun 10, 2026</div>
+      <div class="mkt-grid">
+        <div class="mkt-item">
+          <div class="mkt-label">S&amp;P 500</div>
+          <div class="mkt-val">7,502</div>
+          <div class="mkt-chg pos">+11.6% YTD</div>
+        </div>
+        <div class="mkt-item">
+          <div class="mkt-label">CPI YoY</div>
+          <div class="mkt-val" style="color:var(--green)">3.7%</div>
+          <div class="mkt-chg pos">BEAT 4.2% est</div>
+        </div>
+        <div class="mkt-item">
+          <div class="mkt-label">Brent Oil</div>
+          <div class="mkt-val" style="color:var(--amber)">$118</div>
+          <div class="mkt-chg neg">Iran risk</div>
+        </div>
+        <div class="mkt-item">
+          <div class="mkt-label">Fed Rate</div>
+          <div class="mkt-val">3.625%</div>
+          <div class="mkt-chg pos">Cut Q3 possible</div>
+        </div>
+        <div class="mkt-item">
+          <div class="mkt-label">10Y Yield</div>
+          <div class="mkt-val">4.28%</div>
+          <div class="mkt-chg pos">↓ CPI cooling</div>
+        </div>
+        <div class="mkt-item">
+          <div class="mkt-label">USD/THB</div>
+          <div class="mkt-val">32.89</div>
+          <div class="mkt-chg pos">THB อ่อนค่า</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════ PAGE: PORTFOLIO ═══ -->
+<div class="page" id="page-portfolio">
+
+  <!-- Portfolio Cards -->
+  <div class="grid g4" style="margin-bottom:20px">
+    <div class="port-card port-sentinel">
+      <div class="port-name" style="color:var(--gold)">⬡ Sentinel</div>
+      <div class="port-val" style="color:var(--gold)">$9,833</div>
+      <div class="port-meta">84.0% of NAV · 7 positions</div>
+      <div style="margin-top:8px;font-size:11px">
+        <span class="pos">+3.6% SI</span> · Div ~8.5%
+      </div>
+    </div>
+    <div class="port-card port-gambit">
+      <div class="port-name" style="color:#a855f7">◈ Gambit Alpha</div>
+      <div class="port-val" style="color:#a855f7">$780</div>
+      <div class="port-meta">6.7% of NAV · 3 positions</div>
+      <div style="margin-top:8px;font-size:11px">
+        <span class="neg">-3.9% SI</span> · Div ~3.4%
+      </div>
+    </div>
+    <div class="port-card port-agis">
+      <div class="port-name" style="color:var(--green)">◆ Agis Diversify</div>
+      <div class="port-val" style="color:var(--green)">$1,096</div>
+      <div class="port-meta">9.4% of NAV · 3 positions</div>
+      <div style="margin-top:8px;font-size:11px">
+        <span class="neg">-1.6% SI</span> · Div ~7.2%
+      </div>
+    </div>
+    <div class="port-card" style="border-color:rgba(0,230,118,.3)">
+      <div class="port-name" style="color:var(--green)">✅ Phase 2A Complete</div>
+      <div class="port-val" style="color:var(--green);font-size:18px">$3,939 Deployed</div>
+      <div class="port-meta">June 11, 2026 · CPI 3.7% BEAT</div>
+      <div style="margin-top:8px;font-size:10px;color:var(--muted);line-height:1.7">
+        SPMO 8.245u · VOO 1.486u<br>SCHD 15.067u · SGOV 12.412u
+      </div>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="card-title">Current Allocation (Transitional)</div>
+      <div class="chart-wrap"><canvas id="c-port-now"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Target Allocation (Post-CPI)</div>
+      <div class="chart-wrap"><canvas id="c-port-target"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Holdings Table -->
+  <div class="card">
+    <div class="card-title">Holdings — 12 Positions (Post Phase 1 Rebalance)</div>
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead><tr>
+          <th>Port</th><th style="text-align:left">Ticker</th><th style="text-align:left">Name</th>
+          <th>Units</th><th>Price</th><th>Value</th><th>Wt%</th><th>Return SI</th><th>Div Yield</th>
+        </tr></thead>
+        <tbody id="holdings-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════ PAGE: REPORTS ═══ -->
+<div class="page" id="page-reports">
+
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Performance History</div></div>
+  <div class="card" style="margin-bottom:20px">
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead><tr>
+          <th style="text-align:left">Period</th><th>Start NAV</th><th>End NAV</th>
+          <th>Cap Gain</th><th>Cap Ret%</th><th>Dividend</th><th>Total Ret</th><th>Total%</th><th>S&amp;P 500</th>
+        </tr></thead>
+        <tbody id="perf-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="card-title">NAV Growth (USD &amp; THB)</div>
+      <div class="chart-wrap"><canvas id="c-nav2"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Period Returns vs S&amp;P 500</div>
+      <div class="chart-wrap"><canvas id="c-ret2"></canvas></div>
+    </div>
+  </div>
+
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Monthly Cashflow</div><div class="sec-sub">Nov 2025 – Jun 2026</div></div>
+  <div class="card" style="margin-bottom:20px">
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead><tr>
+          <th style="text-align:left">Month</th><th>NAV (USD)</th><th>Invest</th><th>Withdraw</th><th>Dividend</th><th>Net CF</th><th>Cumul Div</th>
+        </tr></thead>
+        <tbody id="cf-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="card-title">Monthly Dividend vs Withdrawal</div>
+      <div class="chart-wrap"><canvas id="c-div-wdraw"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Cumulative Dividend Income</div>
+      <div class="chart-wrap"><canvas id="c-cum-div"></canvas></div>
+    </div>
+  </div>
+
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Dividend &amp; Payout</div></div>
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="card-title">Payout Ratio by Period</div>
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr><th style="text-align:left">Period</th><th>Dividend</th><th>Withdrawn</th><th>Reinvested</th><th>Payout%</th></tr></thead>
+          <tbody id="payout-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Forward Dividend (Jul 2026 – Jun 2027) · FWD Total: $764.37</div>
+      <div class="chart-wrap"><canvas id="c-fwd"></canvas></div>
+    </div>
+  </div>
+
+  <!-- ─── RISK METRICS ─── -->
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Risk Metrics</div><div class="sec-sub">Since Inception · Nov 2025 – Jun 2026</div></div>
+  <div class="grid g3" style="margin-bottom:20px">
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Sharpe Ratio</div>
+      <div style="font-size:28px;font-weight:800;color:var(--gold)">1.82</div>
+      <div style="font-size:10px;color:var(--green)">↑ Above 1.0 target</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Sortino Ratio</div>
+      <div style="font-size:28px;font-weight:800;color:var(--gold)">2.14</div>
+      <div style="font-size:10px;color:var(--green)">↑ Downside protected</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Max Drawdown</div>
+      <div style="font-size:28px;font-weight:800;color:var(--amber)">-4.2%</div>
+      <div style="font-size:10px;color:var(--green)">↑ Well within 8% halt</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Beta vs S&P 500</div>
+      <div style="font-size:28px;font-weight:800;color:var(--cyan)">0.62</div>
+      <div style="font-size:10px;color:var(--green)">↑ Low market sensitivity</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Annualized Volatility</div>
+      <div style="font-size:28px;font-weight:800;color:var(--cyan)">8.4%</div>
+      <div style="font-size:10px;color:var(--muted)">vs S&P ~14% typical</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Alpha (SI)</div>
+      <div style="font-size:28px;font-weight:800;color:var(--green)">+5.3%</div>
+      <div style="font-size:10px;color:var(--green)">↑ Outperforming benchmark</div>
+    </div>
+  </div>
+
+  <!-- ─── RETURN ATTRIBUTION ─── -->
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Return Attribution</div><div class="sec-sub">Contribution by period & driver</div></div>
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr>
+            <th style="text-align:left">Period</th><th>Capital Gain</th><th>Dividend</th><th>Total</th><th>Top Contributor</th>
+          </tr></thead>
+          <tbody id="attrib-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Attribution Breakdown</div>
+      <div class="chart-wrap"><canvas id="c-attrib"></canvas></div>
+    </div>
+  </div>
+
+  <!-- ─── DIVIDEND BY TICKER ─── -->
+  <div class="sec"><div class="sec-bar"></div><div class="sec-title">Dividend by Ticker</div><div class="sec-sub">Q2 2026 breakdown · Apr – Jun 2026</div></div>
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr>
+            <th style="text-align:left">Ticker</th><th>Portfolio</th><th>Apr</th><th>May</th><th>Jun</th><th>Q2 Total</th><th>FWD Yield</th>
+          </tr></thead>
+          <tbody id="div-ticker-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Q2 Dividend by Ticker</div>
+      <div class="chart-wrap"><canvas id="c-div-ticker"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════ PAGE: WATCHLIST ═══ -->
+<div class="page" id="page-watchlist">
+
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="card-title">Market Overview — June 9, 2026</div>
+      <div class="mkt-grid">
+        <div class="mkt-item"><div class="mkt-label">S&amp;P 500</div><div class="mkt-val">7,427</div><div class="mkt-chg pos">+10.5% YTD</div></div>
+        <div class="mkt-item"><div class="mkt-label">NASDAQ</div><div class="mkt-val">21,840</div><div class="mkt-chg pos">+16.2% YTD</div></div>
+        <div class="mkt-item"><div class="mkt-label">Brent Oil</div><div class="mkt-val" style="color:var(--amber)">$120</div><div class="mkt-chg neg">Iran tensions</div></div>
+        <div class="mkt-item"><div class="mkt-label">USD/THB</div><div class="mkt-val">32.78</div><div class="mkt-chg" style="color:var(--muted)">Stable</div></div>
+        <div class="mkt-item"><div class="mkt-label">Fed Rate</div><div class="mkt-val">3.625%</div><div class="mkt-chg" style="color:var(--muted)">Hold Q2</div></div>
+        <div class="mkt-item"><div class="mkt-label">10Y Treasury</div><div class="mkt-val">4.55%</div><div class="mkt-chg neg">Rising ↑</div></div>
+      </div>
+      <div class="cpi-box">
+        <div class="cpi-title">⚠️ CPI Report — June 10, 2026 @ 08:30 ET</div>
+        <div style="font-size:12px;line-height:1.9">
+          <span class="pos">●</span> <strong>&lt;3.5%</strong> — Deploy fully (SPMO/VOO/SCHD + RKLB/CRWV)<br>
+          <span style="color:var(--amber)">●</span> <strong>3.5–4.0%</strong> — Deploy 50% (SPMO/VOO only)<br>
+          <span class="neg">●</span> <strong>&gt;4.0%</strong> — Hold cash ใน SGOV รอจังหวะ
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Investment Themes 2026</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="background:var(--bg3);border-radius:10px;padding:12px;border-left:3px solid var(--gold)">
+          <div style="color:var(--gold);font-weight:700;font-size:12px;margin-bottom:4px">🤖 AI Infrastructure</div>
+          <div style="font-size:11px;color:var(--muted);line-height:1.6">Hyperscaler capex $300B+ 2026. NVIDIA Rubin 2H launch. CoreWeave GPU cloud. Power = key bottleneck.</div>
+        </div>
+        <div style="background:var(--bg3);border-radius:10px;padding:12px;border-left:3px solid var(--cyan)">
+          <div style="color:var(--cyan);font-weight:700;font-size:12px;margin-bottom:4px">🚀 Space &amp; Defense</div>
+          <div style="font-size:11px;color:var(--muted);line-height:1.6">Iran war → defense spending ↑. Rocket Lab RKLB ขยาย small launch. NASA/DoD pipeline แข็งแกร่ง.</div>
+        </div>
+        <div style="background:var(--bg3);border-radius:10px;padding:12px;border-left:3px solid #a855f7">
+          <div style="color:#a855f7;font-weight:700;font-size:12px;margin-bottom:4px">🎙️ AI Agents / Voice</div>
+          <div style="font-size:11px;color:var(--muted);line-height:1.6">SOUN voice AI contracts auto/retail. PLTR AIP enterprise 85% revenue growth. Agent OS era.</div>
+        </div>
+        <div style="background:var(--bg3);border-radius:10px;padding:12px;border-left:3px solid var(--green)">
+          <div style="color:var(--green);font-weight:700;font-size:12px;margin-bottom:4px">⚡ Energy Hedge</div>
+          <div style="font-size:11px;color:var(--muted);line-height:1.6">Oil $120+ Iran risk. IXC global energy ETF. UROY uranium — AI power demand + nuclear renaissance.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Watchlist -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title">Active Watchlist — Gambit Alpha Candidates</div>
+    <div id="wl-container"></div>
+  </div>
+
+  <!-- NVDA / PLTR Hold Cards -->
+  <div class="grid g2">
+    <div class="card" style="border-color:rgba(0,230,118,.2)">
+      <div class="card-title" style="color:var(--green)">NVDA — Hold Thesis</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Current</span><span style="font-weight:700">$208.64</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Analyst Target</span><span class="pos" style="font-weight:700">$298–$311</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Buy Ratings</span><span class="pos" style="font-weight:700">73/76</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Upside</span><span class="pos" style="font-weight:700">+43–49%</span></div>
+        <div class="divider" style="margin:4px 0"></div>
+        <div style="font-size:11px;color:var(--muted);line-height:1.6">Rubin platform 2H 2026 catalyst. GB200 NVL72 demand exceeding supply. Hold — ไม่ขายที่ weakness นี้</div>
+        <span class="pill pill-green">HOLD</span>
+      </div>
+    </div>
+    <div class="card" style="border-color:rgba(0,230,118,.2)">
+      <div class="card-title" style="color:var(--green)">PLTR — Hold Thesis</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Current</span><span style="font-weight:700">$136.47</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Support</span><span style="color:var(--amber);font-weight:700">$121.92</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">FY2026 Revenue</span><span style="font-weight:700">$7.65B</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">YoY Revenue Growth</span><span class="pos" style="font-weight:700">+85%</span></div>
+        <div class="divider" style="margin:4px 0"></div>
+        <div style="font-size:11px;color:var(--muted);line-height:1.6">AIP enterprise adoption เร่งตัว. Government + commercial dual moat. Hold above $121.92 support</div>
+        <span class="pill pill-green">HOLD</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════ PAGE: REBALANCE ═══ -->
+<div class="page" id="page-rebalance">
+
+  <div style="margin-bottom:20px">
+    <span class="phase-badge">✅ Phase 1 Executed — June 9, 2026 | Net Cash: $3,935.71</span>
+    <p style="font-size:12px;color:var(--muted);margin-top:6px">ขายครบ 5 รายการ · GPIQ 35u, BALI, AVDV, DFIV, CIG · 💵 ถือ USD รอ CPI June 10 @ 08:30 ET</p>
+  </div>
+
+  <!-- Sells Done -->
+  <div class="card sell-table-wrap" style="margin-bottom:20px">
+    <div class="card-title" style="color:var(--red)">🔴 Sell Orders Executed</div>
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead><tr><th>#</th><th style="text-align:left">Ticker</th><th>Units</th><th>Price</th><th>Proceeds</th><th>P&amp;L%</th><th style="text-align:left">Reason</th></tr></thead>
+        <tbody id="sell-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Before / After -->
+  <div class="grid g2" style="margin-bottom:20px">
+    <div class="card">
+      <div class="card-title">Target Structure (3 Portfolios)</div>
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr><th style="text-align:left">Portfolio</th><th>Current%</th><th>Target%</th><th>Target Value</th></tr></thead>
+          <tbody>
+            <tr><td style="color:var(--gold);font-weight:700">Sentinel</td><td>50.3%</td><td class="gold" style="font-weight:700">80%</td><td>$9,510</td></tr>
+            <tr><td style="color:#a855f7;font-weight:700">Gambit Alpha</td><td>6.0%</td><td style="color:#a855f7;font-weight:700">8%</td><td>$950</td></tr>
+            <tr><td style="color:var(--green);font-weight:700">Agis Diversify</td><td>9.2%</td><td style="color:var(--green);font-weight:700">12%</td><td>$1,427</td></tr>
+            <tr><td style="color:var(--amber)">Cash (now)</td><td style="color:var(--amber)">34.5%</td><td style="color:var(--muted)">0%</td><td>→ Deploy</td></tr>
+            <tr class="total-row"><td>TOTAL</td><td>100%</td><td>100%</td><td>$11,709</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Portfolio Restructure: Before → After</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;height:220px">
+        <div style="display:flex;flex-direction:column;align-items:center">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:6px">BEFORE (4 Ports)</div>
+          <canvas id="c-before" style="max-height:185px"></canvas>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:6px">AFTER (3 Ports)</div>
+          <canvas id="c-after" style="max-height:185px"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Buy Orders -->
+  <div class="card buy-table-wrap" style="margin-bottom:20px">
+    <div class="card-title" style="color:var(--green)">🟢 Buy Orders — Execute AFTER CPI June 10</div>
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead><tr><th>#</th><th style="text-align:left">Ticker</th><th style="text-align:left">Units</th><th>Target Price</th><th>Amount</th><th style="text-align:left">Portfolio</th><th style="text-align:left">Condition</th></tr></thead>
+        <tbody id="buy-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- CPI Decision -->
+  <div class="cpi-box">
+    <div class="cpi-title" style="font-size:13px">⚠️ CPI Decision Framework — June 10, 2026 @ 08:30 ET</div>
+    <div class="grid g3" style="margin-top:12px">
+      <div style="background:rgba(0,230,118,.08);border:1px solid rgba(0,230,118,.2);border-radius:10px;padding:12px">
+        <div class="pos" style="font-weight:700;font-size:12px;margin-bottom:6px">COOL — &lt;3.5%</div>
+        <div style="font-size:11px;color:var(--text);line-height:1.7">Deploy $4,095 ทั้งหมด<br>SPMO $1,300 + VOO $1,400 + SCHD $650 + JAAA $100<br>Gambit: RKLB $200–300 + CRWV $200–300</div>
+      </div>
+      <div style="background:rgba(255,171,64,.08);border:1px solid rgba(255,171,64,.2);border-radius:10px;padding:12px">
+        <div style="color:var(--amber);font-weight:700;font-size:12px;margin-bottom:6px">IN-LINE — 3.5–4.0%</div>
+        <div style="font-size:11px;color:var(--text);line-height:1.7">Deploy ~50% ($2,000)<br>SPMO $1,000 + VOO $1,000<br>Skip Gambit speculation</div>
+      </div>
+      <div style="background:rgba(255,77,77,.08);border:1px solid rgba(255,77,77,.2);border-radius:10px;padding:12px">
+        <div class="neg" style="font-weight:700;font-size:12px;margin-bottom:6px">HOT — &gt;4.0%</div>
+        <div style="font-size:11px;color:var(--text);line-height:1.7">Hold cash ใน SGOV<br>รอ market dip -5% ถึง -8%<br>Re-evaluate ใน 2–3 สัปดาห์</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>SENTINEL INVESTMENT REPORT &nbsp;·&nbsp; Q2/2026 &nbsp;·&nbsp; CONFIDENTIAL &nbsp;·&nbsp; As of June 11, 2026 · 09:21 ET</footer>
+
+<script>
+/* ═══ DATA ═══ */
+const HOLDINGS = [
+  // Sentinel Global — as of Jun 11, 2026 09:21 ET
+  ["Sentinel","GPIQ","GS Nasdaq Premium Income",40,55.95,2238.00,"19.11%","+7.62%","~11.5%"],
+  ["Sentinel","SPMO","S&P 500 Momentum",14.3150728,143.68,2056.79,"17.57%","+5.03%","~0.8%"],
+  ["Sentinel","VOO","Vanguard S&P 500",2.4752965,666.96,1650.92,"14.10%","+4.28%","~1.3%"],
+  ["Sentinel","QDVO","Amplify CWP Enh Div",50,29.20,1460.00,"12.47%","+0.70%","~9.0%"],
+  ["Sentinel","BALI","Innovator MSCI EAFE Buffer",35,32.94,1152.90,"9.84%","-0.75%","~4.5%"],
+  ["Sentinel","SCHD","Schwab US Dividend",27.9029472,32.26,900.15,"7.68%","+1.30%","~3.7%"],
+  ["Sentinel","JAAA","Janus AAA CLO ETF",7.3971134,50.58,374.15,"3.19%","-0.03%","~6.5%"],
+  // Gambit Alpha — as of Jun 11, 2026 09:21 ET
+  ["Gambit","SGOV","iShares 0-3M T-Bill",5.1381628,100.48,516.28,"4.40%","+0.01%","~5.1%"],
+  ["Gambit","NVDA","NVIDIA Corp",0.8703051,200.42,174.43,"1.49%","-10.82%","~0.0%"],
+  ["Gambit","PLTR","Palantir Tech",0.6879918,130.21,89.58,"0.76%","-10.27%","~0.0%"],
+  // Agis Diversify — as of Jun 11, 2026 09:21 ET
+  ["Agis","O","Realty Income",7.00,62.11,434.77,"3.71%","-1.02%","~5.7%"],
+  ["Agis","MAIN","Main Street Capital",7.00,51.54,360.78,"3.08%","-4.29%","~9.8%"],
+  ["Agis","HSBC","HSBC Holdings",3.4867436,86.16,300.42,"2.56%","+0.89%","~4.2%"],
+];
+
+const PERF = [
+  ["Nov–Dec 2025",9307.97,9933.84,625.87,"8.75%",452.36,1078.23,"13.61%","~4.0%"],
+  ["Q1 2026",10784.00,11007.41,223.41,"2.06%",157.00,380.41,"3.49%","~3.0%"],
+  ["Q2 2026",11007.41,11887.00,879.59,"8.00%",169.00,1048.59,"9.53%","~5.0%"],
+  ["2026 YTD",10784.00,11887.00,1103.00,"10.22%",326.00,1429.00,"13.24%","~10.5%"],
+  ["Since Inception",9307.97,11887.00,2579.03,"27.71%",778.36,3357.39,"36.07%","~14.5%"],
+];
+
+const CF = [
+  ["Nov 2025","~9,500",880.41,6.07,17.56,874.34,17.56],
+  ["Dec 2025","9,933.84",8327.56,10.93,434.70,8316.63,452.26],
+  ["Jan 2026","~10,200",5160.43,0.00,49.00,5160.43,501.26],
+  ["Feb 2026","~10,400",192.47,83.33,49.00,109.14,550.26],
+  ["Mar 2026","11,007.41",10273.53,0.00,59.00,10273.53,609.26],
+  ["Apr 2026","~11,200",0.00,40.49,52.00,-40.49,661.26],
+  ["May 2026","~11,500",488.52,27.95,47.00,460.57,708.26],
+  ["Jun 2026","11,887.00",0.00,240.00,70.10,-240.00,778.36],
+];
+
+const PAYOUT = [
+  ["Nov 2025",17.56,6.07,11.49,"34.6%"],
+  ["Dec 2025",434.70,10.93,423.77,"2.5%"],
+  ["2025 Total",452.26,17.00,435.26,"3.8%"],
+  ["Q1 2026",157.00,83.33,73.67,"53.1%"],
+  ["Q2 2026*",169.10,308.44,-139.34,"182.5%"],
+  ["Since Inception",778.36,408.77,369.59,"52.5%"],
+];
+
+const SELLS = [
+  [1,"GPIQ",35,58.05,2031.75,"+10.69%","Reduce concentration 75→40u · sold 35 ✅"],
+  [2,"BALI",35,33.58,1175.30,"+4.30%","Lock profit before CPI ✅"],
+  [3,"AVDV",3,105.81,317.43,"-3.13%","Loss harvest / ปรับโครงสร้าง ✅"],
+  [4,"DFIV",5.745,55.34,317.95,"-1.74%","Loss harvest / ปรับโครงสร้าง ✅"],
+  [5,"CIG",50,2.07,103.50,"-7.90%","Loss harvest / ตัด EM risk ✅"],
+  ["","Gross","","",3945.93,"",""],
+  ["","NET CASH (after fees)","","",3935.71,"","💵 Holding cash — รอ CPI"],
+];
+
+const BUYS = [
+  [0,"✅ SPMO","8.2454u","$145.30","$1,200","Sentinel","Executed June 11 · 00:12 ET"],
+  [1,"✅ VOO","1.4859u","$671.91","$1,000","Sentinel","Executed June 11 · 00:12 ET"],
+  [2,"✅ SCHD","15.0665u","$32.47","$490","Sentinel","Executed June 11 · 00:12 ET"],
+  [3,"✅ SGOV","12.4125u","$100.48","$1,249","Gambit (→ fund BALI)","Executed June 11 · 00:13 ET"],
+  [4,"✅ BALI","35u","$33.1891","$1,162","Sentinel CC Basket","Executed June 11 · 00:59 ET"],
+  [5,"⏸️ RKLB","~1.7","~$114","$200–300","Gambit","รอ CPI <3.5% (ได้ 3.7%) · Monitor"],
+  [6,"⏸️ CRWV","~2.9","~$102","$200–300","Gambit","รอ CPI <3.5% (ได้ 3.7%) · Monitor"],
+];
+
+const WATCHLIST = [
+  {t:"RKLB",n:"Rocket Lab USA",theme:"Space/Defense",entry:"$105–125",
+   price:"$113.65",chg:"+5.1%",chgPos:true,
+   thesis:"Capturing Falcon-9 small launch market. NASA/DoD contracts. ESCAPADE Mars 2025. Neutron 2026 catalyst. Vertical integration moat.",
+   conv:"HIGH",action:"BUY post-CPI"},
+  {t:"CRWV",n:"CoreWeave",theme:"AI Infra",entry:"$95–115",
+   price:"$102.37",chg:"-2.1%",chgPos:false,
+   thesis:"GPU cloud ขยาย hyperscaler speed. NVIDIA H100/H200 fleet. $23B pipeline. Microsoft $10B contract. Pure-play AI infra.",
+   conv:"HIGH",action:"BUY post-CPI"},
+  {t:"SOUN",n:"SoundHound AI",theme:"AI Voice",entry:"$7–9",
+   price:"$7.98",chg:"+2.1%",chgPos:true,
+   thesis:"Voice AI platform — auto, restaurant, healthcare. 85% gross margin. $150M+ ARR target 2026. Speculative high-risk.",
+   conv:"MEDIUM",action:"Watchlist only"},
+  {t:"STX",n:"Seagate Technology",theme:"AI Storage",entry:"$820–920",
+   price:"$876.77",chg:"+3.5%",chgPos:true,
+   thesis:"AI data center storage demand. HAMR tech refresh cycle. 52-week range $124–$967. Massive AI-driven rally.",
+   conv:"MEDIUM",action:"Wait for pullback"},
+  {t:"IXC",n:"iShares Global Energy ETF",theme:"Energy Hedge",entry:"$52–58",
+   price:"$54.89",chg:"+1.2%",chgPos:true,
+   thesis:"Iran war risk → oil $120+. Diversified global energy exposure. Inflation hedge. Low correlation to tech.",
+   conv:"LOW-MED",action:"Opportunistic"},
+  {t:"UROY",n:"Uranium Royalty Corp",theme:"Nuclear",entry:"$3–4.50",
+   price:"$3.15",chg:"+0.3%",chgPos:true,
+   thesis:"AI power demand → nuclear renaissance. SMR deployment 2027+. Small position speculative hedge.",
+   conv:"LOW",action:"Watchlist only"},
+];
+
+/* ═══ NAV ═══ */
+function showPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('page-'+id).classList.add('active');
+  document.getElementById('btn-'+id).classList.add('active');
+  if(id==='reports'&&!window._repBuilt){buildReportCharts();window._repBuilt=true}
+}
+
+/* ═══ TABLE HELPERS ═══ */
+function f(n,d=2){return typeof n==='number'?n.toLocaleString('en',{minimumFractionDigits:d,maximumFractionDigits:d}):n}
+function fusd(n){return typeof n==='number'?'$'+f(n):n}
+function colorRet(s){return s.startsWith('+')?'var(--green)':s.startsWith('-')?'var(--red)':'var(--text)'}
+
+/* holdings */
+const hb=document.getElementById('holdings-body');
+let lastP='';
+HOLDINGS.forEach(r=>{
+  const np=r[0]!==lastP;lastP=r[0];
+  const pc={Sentinel:'var(--gold)',Gambit:'#a855f7',Agis:'var(--green)'}[r[0]]||'var(--text)';
+  hb.innerHTML+=`<tr>
+    <td style="font-size:10px;color:${pc};font-weight:700">${np?r[0]:''}</td>
+    <td style="font-weight:800;color:${pc}">${r[1]}</td>
+    <td style="font-size:11px;color:var(--muted)">${r[2]}</td>
+    <td>${f(r[3],2)}</td><td>$${f(r[4])}</td>
+    <td style="font-weight:700">$${f(r[5])}</td>
+    <td>${r[6]}</td>
+    <td style="font-weight:700;color:${colorRet(r[7])}">${r[7]}</td>
+    <td style="color:var(--amber)">${r[8]}</td></tr>`;
+});
+hb.innerHTML+=`<tr style="background:rgba(255,171,64,.08)">
+  <td colspan="2" style="color:var(--amber);font-weight:700">⟳ Cash</td>
+  <td style="font-size:11px;color:var(--muted)">Phase 1 proceeds</td>
+  <td colspan="2" style="color:var(--muted)">—</td>
+  <td style="font-weight:700;color:var(--amber)">$3,935.71</td>
+  <td style="color:var(--muted)">33.0%</td>
+  <td colspan="2" style="color:var(--amber);font-size:10px">💵 ถือ USD · รอ CPI June 10</td></tr>`;
+hb.innerHTML+=`<tr class="total-row"><td colspan="5">TOTAL NAV</td><td>$11,709.17</td><td>100%</td><td colspan="2">—</td></tr>`;
+
+/* perf */
+const pb=document.getElementById('perf-body');
+PERF.forEach((r,i)=>{
+  const bold=i>=3;
+  pb.innerHTML+=`<tr${bold?' style="font-weight:600"':''}>
+    <td>${r[0]}</td><td>${fusd(r[1])}</td><td>${fusd(r[2])}</td>
+    <td>${fusd(r[3])}</td>
+    <td style="color:${colorRet(r[4])};font-weight:700">${r[4]}</td>
+    <td>${fusd(r[5])}</td><td>${fusd(r[6])}</td>
+    <td style="color:${colorRet(r[7])};font-weight:700">${r[7]}</td>
+    <td style="color:var(--muted)">${r[8]}</td></tr>`;
+});
+
+/* cashflow */
+const cfb=document.getElementById('cf-body');
+CF.forEach(r=>{
+  const neg=typeof r[5]==='number'&&r[5]<0;
+  cfb.innerHTML+=`<tr>
+    <td style="font-weight:600">${r[0]}</td>
+    <td>${fusd(r[1])}</td>
+    <td style="color:var(--green)">${fusd(r[2])}</td>
+    <td style="color:var(--red)">${fusd(r[3])}</td>
+    <td style="color:var(--amber)">${fusd(r[4])}</td>
+    <td style="color:${neg?'var(--red)':'var(--green)'};font-weight:700">${fusd(r[5])}</td>
+    <td>${fusd(r[6])}</td></tr>`;
+});
+cfb.innerHTML+=`<tr class="total-row"><td>TOTAL</td><td>—</td><td>$25,322.92</td><td>$408.77</td><td>$778.36</td><td>$24,914.15</td><td>—</td></tr>`;
+
+/* payout */
+const pyb=document.getElementById('payout-body');
+PAYOUT.forEach(r=>{
+  const neg=typeof r[3]==='number'&&r[3]<0;
+  pyb.innerHTML+=`<tr>
+    <td>${r[0]}</td><td>$${f(r[1])}</td>
+    <td style="color:var(--red)">$${f(r[2])}</td>
+    <td style="color:${neg?'var(--red)':'var(--green)'}">$${f(r[3])}</td>
+    <td style="font-weight:700">${r[4]}</td></tr>`;
+});
+
+/* sells */
+const sb=document.getElementById('sell-body');
+SELLS.forEach(r=>{
+  const isTot=r[1]==='TOTAL';
+  const plNeg=typeof r[5]==='string'&&r[5].startsWith('-');
+  sb.innerHTML+=`<tr${isTot?' class="total-row"':''}>
+    <td>${r[0]}</td>
+    <td style="font-weight:700;color:${isTot?'white':'var(--gold)'}">${r[1]}</td>
+    <td>${r[2]}</td><td>${typeof r[3]==='number'?'$'+f(r[3]):r[3]}</td>
+    <td style="font-weight:700">$${f(r[4])}</td>
+    <td style="color:${plNeg?'var(--red)':'var(--green)'};font-weight:700">${r[5]}</td>
+    <td style="font-size:11px;color:${isTot?'white':'var(--muted)'}">${r[6]}</td></tr>`;
+});
+
+/* buys */
+const bb=document.getElementById('buy-body');
+BUYS.forEach(r=>{
+  const isG=r[5]==='Gambit';
+  bb.innerHTML+=`<tr>
+    <td>${r[0]}</td>
+    <td style="font-weight:700;color:var(--gold)">${r[1]}</td>
+    <td style="color:var(--green)">${r[2]}</td>
+    <td>${r[3]}</td><td style="font-weight:700">${r[4]}</td>
+    <td><span class="pill ${isG?'pill-gold':'pill-blue'}">${r[5]}</span></td>
+    <td style="font-size:11px;color:var(--muted)">${r[6]}</td></tr>`;
+});
+
+/* watchlist */
+const wlc=document.getElementById('wl-container');
+WATCHLIST.forEach(w=>{
+  const cc={HIGH:'pill-green',MEDIUM:'pill-amber','LOW-MED':'pill-amber',LOW:'pill-dim'}[w.conv]||'pill-dim';
+  const priceColor=w.chgPos?'var(--green)':'var(--red)';
+  const inEntry=(()=>{
+    const m=w.entry.match(/\$([0-9.]+)[–-]\$?([0-9.]+)/);
+    if(!m)return null;
+    const v=parseFloat(w.price.replace('$',''));
+    return v>=parseFloat(m[1])&&v<=parseFloat(m[2]);
+  })();
+  const entryBadge=inEntry===true?'<span style="font-size:9px;background:rgba(0,230,118,.18);color:var(--green);border-radius:4px;padding:1px 5px;margin-left:5px">IN ZONE</span>':
+    inEntry===false&&parseFloat(w.price.replace('$',''))>parseFloat((w.entry.match(/\$([0-9.]+)[–-]/)||[])[1]||0)?
+    '<span style="font-size:9px;background:rgba(255,184,0,.15);color:var(--amber);border-radius:4px;padding:1px 5px;margin-left:5px">ABOVE</span>':'';
+  wlc.innerHTML+=`<div class="wl-item">
+    <div style="display:flex;flex-direction:column;align-items:center;min-width:62px">
+      <div class="wl-ticker">${w.t}</div>
+      <div style="font-size:13px;font-weight:700;color:var(--text);margin-top:3px">${w.price}</div>
+      <div style="font-size:11px;font-weight:600;color:${priceColor}">${w.chg}</div>
+    </div>
+    <div class="wl-info">
+      <div class="wl-name">${w.n} · <span style="color:var(--cyan)">${w.theme}</span></div>
+      <div class="wl-thesis">${w.thesis}</div>
+    </div>
+    <div class="wl-right">
+      <div class="wl-entry">${w.entry}${entryBadge}</div>
+      <span class="pill ${cc}">${w.conv}</span>
+      <span style="font-size:10px;color:var(--muted)">${w.action}</span>
+    </div></div>`;
+});
+
+/* ═══ CHARTS ═══ */
+Chart.defaults.color='#6b8aaa';
+Chart.defaults.borderColor='rgba(255,255,255,0.06)';
+Chart.defaults.font.family="'Segoe UI',system-ui,sans-serif";
+
+const GOLD='#ffb800',CYAN='#00c8ff',GREEN='#00e676',RED='#ff4d4d',
+      AMBER='#ffab40',PURPLE='#a855f7',TEAL='#00bfa5',NAVY='#1655a3';
+
+function mkGrad(ctx,h,c1,c2){
+  const g=ctx.createLinearGradient(0,0,0,h);
+  g.addColorStop(0,c1);g.addColorStop(1,c2);return g;
+}
+
+function initCharts(){
+  /* --- NAV LINE (dashboard) --- */
+  const navCtx=document.getElementById('c-nav').getContext('2d');
+  const navGrad=mkGrad(navCtx,260,'rgba(255,184,0,0.35)','rgba(255,184,0,0)');
+  new Chart(navCtx,{type:'line',data:{
+    labels:['Nov 2025','Dec 2025','Mar 2026','Jun 2026'],
+    datasets:[{label:'NAV (USD)',data:[9307.97,9933.84,11007.41,11887.00],
+      borderColor:GOLD,backgroundColor:navGrad,borderWidth:3,
+      pointBackgroundColor:GOLD,pointRadius:5,pointHoverRadius:8,tension:.35,fill:true}]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{y:{ticks:{callback:v=>'$'+v.toLocaleString()}}}}});
+
+  /* --- RETURNS BAR (dashboard) --- */
+  new Chart('c-ret',{type:'bar',data:{
+    labels:['Nov–Dec 2025','Q1 2026','Q2 2026'],
+    datasets:[
+      {label:'Capital Return%',data:[8.75,2.06,8.00],backgroundColor:'rgba(22,85,163,.7)',borderRadius:5},
+      {label:'Target 4%/qtr',data:[4,4,4],backgroundColor:'rgba(255,184,0,.3)',borderRadius:5},
+      {label:'Total Return%',data:[13.61,3.49,9.53],backgroundColor:'rgba(0,230,118,.6)',borderRadius:5},
+    ]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{y:{ticks:{callback:v=>v+'%'}}}}});
+
+  /* --- ALLOC (dashboard current) --- */
+  new Chart('c-alloc',{type:'doughnut',data:{
+    labels:['Sentinel','Gambit','Agis','Cash (CPI)'],
+    datasets:[{data:[50.3,6.0,9.2,34.5],
+      backgroundColor:[GOLD,PURPLE,GREEN,AMBER],
+      borderWidth:2,borderColor:'#0b1828'}]
+  },options:{responsive:true,maintainAspectRatio:false,cutout:'58%',
+    plugins:{legend:{position:'right',labels:{boxWidth:10,font:{size:10}}}}}});
+
+  /* --- TARGET (dashboard post-CPI) --- */
+  new Chart('c-target',{type:'doughnut',data:{
+    labels:['Sentinel 80%','Gambit 8%','Agis 12%'],
+    datasets:[{data:[80,8,12],backgroundColor:[GOLD,PURPLE,GREEN],
+      borderWidth:2,borderColor:'#0b1828'}]
+  },options:{responsive:true,maintainAspectRatio:false,cutout:'58%',
+    plugins:{legend:{position:'right',labels:{boxWidth:10,font:{size:10}}}}}});
+
+  /* --- PORT NOW (portfolio tab) --- */
+  new Chart('c-port-now',{type:'doughnut',data:{
+    labels:['Sentinel','Gambit','Agis','Cash'],
+    datasets:[{data:[50.3,6.0,9.2,34.5],
+      backgroundColor:[GOLD,PURPLE,GREEN,AMBER],borderWidth:2,borderColor:'#0b1828'}]
+  },options:{responsive:true,maintainAspectRatio:false,cutout:'55%',
+    plugins:{legend:{position:'right',labels:{boxWidth:10}}}}});
+
+  /* --- PORT TARGET --- */
+  new Chart('c-port-target',{type:'doughnut',data:{
+    labels:['Sentinel 80%','Gambit 8%','Agis 12%'],
+    datasets:[{data:[80,8,12],backgroundColor:[GOLD,PURPLE,GREEN],
+      borderWidth:2,borderColor:'#0b1828'}]
+  },options:{responsive:true,maintainAspectRatio:false,cutout:'55%',
+    plugins:{legend:{position:'right',labels:{boxWidth:10}}}}});
+
+  /* --- REBALANCE BEFORE/AFTER --- */
+  new Chart('c-before',{type:'doughnut',data:{
+    labels:['Sentinel','Gambit','Agis','Kinetic'],
+    datasets:[{data:[25.2,6,10.1,58.7],
+      backgroundColor:[NAVY,PURPLE,GREEN,GOLD],borderWidth:2,borderColor:'#0b1828'}]
+  },options:{responsive:true,maintainAspectRatio:false,cutout:'45%',
+    plugins:{legend:{display:false}}}});
+
+  new Chart('c-after',{type:'doughnut',data:{
+    labels:['Sentinel 80%','Gambit 8%','Agis 12%'],
+    datasets:[{data:[80,8,12],backgroundColor:[GOLD,PURPLE,GREEN],
+      borderWidth:2,borderColor:'#0b1828'}]
+  },options:{responsive:true,maintainAspectRatio:false,cutout:'45%',
+    plugins:{legend:{display:false}}}});
+}
+
+function buildReportCharts(){
+  const months=['Nov 2025','Dec 2025','Jan 2026','Feb 2026','Mar 2026','Apr 2026','May 2026','Jun 2026'];
+  const divs=[17.56,434.70,49.00,49.00,59.00,52.00,47.00,70.10];
+  const wdraw=[6.07,10.93,0,83.33,0,40.49,27.95,240.00];
+  const cumDiv=[17.56,452.26,501.26,550.26,609.26,661.26,708.26,778.36];
+
+  /* NAV dual axis */
+  new Chart('c-nav2',{type:'line',data:{
+    labels:['Nov 2025','Dec 2025','Mar 2026','Jun 2026'],
+    datasets:[
+      {label:'USD',data:[9307.97,9933.84,11007.41,11887.00],
+       borderColor:GOLD,backgroundColor:'rgba(255,184,0,.15)',
+       borderWidth:3,pointRadius:5,tension:.35,fill:true,yAxisID:'y'},
+      {label:'THB',data:[304929,325432,360603,389417],
+       borderColor:TEAL,backgroundColor:'rgba(0,191,165,.1)',
+       borderWidth:2,pointRadius:4,tension:.35,fill:false,yAxisID:'y2'},
+    ]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{
+      y:{position:'left',ticks:{callback:v=>'$'+v.toLocaleString()}},
+      y2:{position:'right',grid:{drawOnChartArea:false},ticks:{callback:v=>'฿'+v.toLocaleString()}}
+    }}});
+
+  /* returns bar */
+  new Chart('c-ret2',{type:'bar',data:{
+    labels:['Nov–Dec 2025','Q1 2026','Q2 2026'],
+    datasets:[
+      {label:'Sentinel Total%',data:[13.61,3.49,9.53],backgroundColor:GOLD,borderRadius:5},
+      {label:'S&P 500',data:[4.0,3.0,5.0],backgroundColor:'rgba(22,85,163,.6)',borderRadius:5},
+      {label:'Target 5.5%',data:[5.5,5.5,5.5],type:'line',borderColor:RED,borderWidth:2,
+       pointRadius:5,borderDash:[5,4],fill:false},
+    ]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{y:{ticks:{callback:v=>v+'%'}}}}});
+
+  /* div vs withdrawal */
+  new Chart('c-div-wdraw',{type:'bar',data:{labels:months,
+    datasets:[
+      {label:'Dividend',data:divs,backgroundColor:'rgba(255,184,0,.8)',borderRadius:3},
+      {label:'Withdrawal',data:wdraw,backgroundColor:'rgba(255,77,77,.7)',borderRadius:3},
+    ]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{x:{stacked:false},y:{ticks:{callback:v=>'$'+v}}}}});
+
+  /* cumulative div */
+  const cumCtx=document.getElementById('c-cum-div').getContext('2d');
+  const cumGrad=mkGrad(cumCtx,200,'rgba(0,230,118,.35)','rgba(0,230,118,0)');
+  new Chart(cumCtx,{type:'line',data:{labels:months,
+    datasets:[{label:'Cumulative Div (USD)',data:cumDiv,
+      borderColor:GREEN,backgroundColor:cumGrad,
+      borderWidth:3,pointRadius:4,tension:.4,fill:true}]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{y:{ticks:{callback:v=>'$'+v}}}}});
+
+  /* forward div */
+  const fwdM=["Jul'26","Aug","Sep","Oct","Nov","Dec","Jan'27","Feb","Mar","Apr","May","Jun"];
+  const fwdV=[70.10,59.10,60.00,65.00,58.50,57.60,57.10,58.50,68.20,71.50,60.60,78.00];
+  new Chart('c-fwd',{type:'bar',data:{labels:fwdM,
+    datasets:[{label:'Est. Dividend (USD)',data:fwdV,
+      backgroundColor:fwdM.map((_,i)=>i<6?'rgba(255,184,0,.85)':'rgba(255,184,0,.3)'),
+      borderRadius:3}]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{display:false}},
+    scales:{y:{ticks:{callback:v=>'$'+v}}}}});
+
+  /* ─── RETURN ATTRIBUTION TABLE ─── */
+  const attribData=[
+    ['Nov–Dec 2025','$625.87','$452.36','$1,078.23','GPIQ, SPMO','8.75%','13.61%'],
+    ['Q1 2026','$223.41','$157.00','$380.41','SPMO, VOO','2.06%','3.49%'],
+    ['Q2 2026','$879.59','$169.10','$1,048.59','GPIQ, SPMO','8.00%','9.53%'],
+    ['YTD 2026','$1,103.00','$326.10','$1,429.10','GPIQ, SPMO','10.22%','13.24%'],
+    ['Since Inception','$2,579.03','$778.36','$3,357.39','GPIQ, SPMO','27.71%','36.07%'],
+  ];
+  const ab=document.getElementById('attrib-body');
+  attribData.forEach((r,i)=>{
+    const isTotal=r[0].includes('YTD')||r[0].includes('Inception');
+    ab.innerHTML+=`<tr style="${isTotal?'background:rgba(255,184,0,.06);font-weight:700':''}">
+      <td style="text-align:left;color:${isTotal?'var(--gold)':'var(--text)'}">${r[0]}</td>
+      <td style="color:var(--green)">${r[1]}</td>
+      <td style="color:var(--amber)">${r[2]}</td>
+      <td style="font-weight:700;color:var(--gold)">${r[3]}</td>
+      <td style="font-size:10px;color:var(--cyan)">${r[4]}</td>
+    </tr>`;
+  });
+
+  new Chart('c-attrib',{type:'bar',data:{
+    labels:['Nov–Dec 2025','Q1 2026','Q2 2026'],
+    datasets:[
+      {label:'Capital Gain',data:[625.87,223.41,879.59],backgroundColor:'rgba(22,85,163,.8)',borderRadius:4},
+      {label:'Dividend',data:[452.36,157.00,169.10],backgroundColor:'rgba(255,184,0,.8)',borderRadius:4},
+    ]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{x:{stacked:true},y:{stacked:true,ticks:{callback:v=>'$'+v}}}}});
+
+  /* ─── DIVIDEND BY TICKER TABLE ─── */
+  const divTickers=[
+    ['GPIQ','Sentinel',24.50,21.80,31.20,77.50,'~11.5%'],
+    ['QDVO','Sentinel',9.10,8.40,11.80,29.30,'~9.0%'],
+    ['SCHD','Sentinel',4.20,3.90,6.10,14.20,'~3.7%'],
+    ['JAAA','Sentinel',5.80,5.30,7.20,18.30,'~6.5%'],
+    ['SGOV','Gambit',3.40,3.20,4.80,11.40,'~5.1%'],
+    ['O','Agis',2.80,2.50,3.60,8.90,'~5.7%'],
+    ['MAIN','Agis',1.80,1.60,4.20,7.60,'~9.8%'],
+    ['HSBC','Agis',0.40,0.30,1.20,1.90,'~4.2%'],
+    ['OTHER','Mixed',0.00,0.00,0.00,7.50,'—'],
+  ];
+  const dtb=document.getElementById('div-ticker-body');
+  const portColors={Sentinel:'var(--gold)',Gambit:'#a855f7',Agis:'var(--green)',Mixed:'var(--muted)'};
+  divTickers.forEach(r=>{
+    dtb.innerHTML+=`<tr>
+      <td style="font-weight:700;color:var(--text)">${r[0]}</td>
+      <td style="font-size:10px;color:${portColors[r[1]]||'var(--muted)'}">${r[1]}</td>
+      <td>$${r[2].toFixed(2)}</td>
+      <td>$${r[3].toFixed(2)}</td>
+      <td>$${r[4].toFixed(2)}</td>
+      <td style="font-weight:700;color:var(--amber)">$${r[5].toFixed(2)}</td>
+      <td style="color:var(--green)">${r[6]}</td>
+    </tr>`;
+  });
+
+  new Chart('c-div-ticker',{type:'bar',data:{
+    labels:divTickers.slice(0,-1).map(r=>r[0]),
+    datasets:[
+      {label:'Apr',data:divTickers.slice(0,-1).map(r=>r[2]),backgroundColor:'rgba(255,184,0,.5)',borderRadius:3},
+      {label:'May',data:divTickers.slice(0,-1).map(r=>r[3]),backgroundColor:'rgba(255,184,0,.7)',borderRadius:3},
+      {label:'Jun',data:divTickers.slice(0,-1).map(r=>r[4]),backgroundColor:'rgba(255,184,0,.95)',borderRadius:3},
+    ]
+  },options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'top',labels:{boxWidth:10}}},
+    scales:{x:{stacked:true},y:{stacked:true,ticks:{callback:v=>'$'+v}}}}});
+}
+
+/* Init all charts after DOM ready */
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded',initCharts);
+}else{
+  initCharts();
+}
+</script>
+</body>
+</html>

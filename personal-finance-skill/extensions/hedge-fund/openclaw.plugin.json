@@ -1,0 +1,59 @@
+{
+  "id": "hedge-fund",
+  "name": "Quantum Capital Fund",
+  "description": "Multi-agent hedge fund — Research, Quant, Risk, and Execution teams trading equities, ETFs, and crypto via Alpaca",
+  "version": "1.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "alpacaApiKeyEnv": {
+        "type": "string",
+        "description": "Env var holding Alpaca API key",
+        "default": "ALPACA_API_KEY"
+      },
+      "alpacaApiSecretEnv": {
+        "type": "string",
+        "description": "Env var holding Alpaca API secret",
+        "default": "ALPACA_API_SECRET"
+      },
+      "alpacaEnv": {
+        "type": "string",
+        "enum": ["paper", "live"],
+        "description": "Trading environment — use 'paper' until ready for live",
+        "default": "paper"
+      },
+      "finnhubApiKeyEnv": {
+        "type": "string",
+        "description": "Env var holding Finnhub API key",
+        "default": "FINNHUB_API_KEY"
+      },
+      "maxPositionPct": {
+        "type": "number",
+        "description": "Max allocation to any single position as fraction of portfolio (0–1)",
+        "default": 0.12
+      },
+      "maxDrawdownPct": {
+        "type": "number",
+        "description": "Max portfolio drawdown before trading halt (0–1)",
+        "default": 0.08
+      },
+      "baseNotionalPerTrade": {
+        "type": "number",
+        "description": "Base dollar notional per trade signal (adjusted by confidence score)",
+        "default": 2000
+      },
+      "defaultUniverse": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Default trading universe (ticker symbols)",
+        "default": [
+          "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META",
+          "TSLA", "JPM", "V", "UNH",
+          "SPY", "QQQ", "GLD", "TLT", "IWM",
+          "BTCUSD", "ETHUSD"
+        ]
+      }
+    }
+  }
+}

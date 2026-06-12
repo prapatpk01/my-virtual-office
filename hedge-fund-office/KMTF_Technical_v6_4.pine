@@ -1,0 +1,822 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════
+// KMTF Technical v6.4  |  Predictive Dual Dashboard + Deep Analysis
+// TOP-RIGHT : Macro Engine — Deep Momentum/Trend/MTF/Stage/Prediction
+// BOT-LEFT  : Strategy Engine — Precision entry + trade plan + next pivot
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("KMTF Technical v6.4", overlay=true,
+     max_labels_count=300, max_boxes_count=100,
+     max_lines_count=200,  max_bars_back=5000)
+
+// ══════════════════════════════════════════════════════════════
+// §1 INPUTS
+// ══════════════════════════════════════════════════════════════
+G_MA = "📈 Moving Averages"
+i_ma1_on   = input.bool(true,  "MA1 On", group=G_MA, inline="1")
+i_ma1_len  = input.int(20,     "Len",    group=G_MA, inline="1", minval=1)
+i_ma1_type = input.string("EMA","Type",  group=G_MA, inline="1", options=["EMA","SMA","WMA","HMA"])
+i_ma1_col  = input.color(color.new(color.lime,20),   "Color", group=G_MA, inline="1")
+i_ma1_w    = input.int(1,"Width", group=G_MA, inline="1", minval=1, maxval=4)
+
+i_ma2_on   = input.bool(true,  "MA2 On", group=G_MA, inline="2")
+i_ma2_len  = input.int(50,     "Len",    group=G_MA, inline="2", minval=1)
+i_ma2_type = input.string("EMA","Type",  group=G_MA, inline="2", options=["EMA","SMA","WMA","HMA"])
+i_ma2_col  = input.color(color.new(color.yellow,20), "Color", group=G_MA, inline="2")
+i_ma2_w    = input.int(1,"Width", group=G_MA, inline="2", minval=1, maxval=4)
+
+i_ma3_on   = input.bool(true,  "MA3 On", group=G_MA, inline="3")
+i_ma3_len  = input.int(200,    "Len",    group=G_MA, inline="3", minval=1)
+i_ma3_type = input.string("SMA","Type",  group=G_MA, inline="3", options=["EMA","SMA","WMA","HMA"])
+i_ma3_col  = input.color(color.new(color.orange,20), "Color", group=G_MA, inline="3")
+i_ma3_w    = input.int(2,"Width", group=G_MA, inline="3", minval=1, maxval=4)
+
+i_ma4_on   = input.bool(false, "MA4 On", group=G_MA, inline="4")
+i_ma4_len  = input.int(100,    "Len",    group=G_MA, inline="4", minval=1)
+i_ma4_type = input.string("EMA","Type",  group=G_MA, inline="4", options=["EMA","SMA","WMA","HMA"])
+i_ma4_col  = input.color(color.new(color.purple,20), "Color", group=G_MA, inline="4")
+i_ma4_w    = input.int(1,"Width", group=G_MA, inline="4", minval=1, maxval=4)
+
+i_hma_on   = input.bool(true,  "HMA On", group=G_MA, inline="h")
+i_hma_fast = input.int(9,      "Fast",   group=G_MA, inline="h", minval=1)
+i_hma_slow = input.int(21,     "Slow",   group=G_MA, inline="h", minval=1)
+i_hma_bull = input.color(color.new(color.lime,0), "Bull", group=G_MA, inline="h")
+i_hma_bear = input.color(color.new(color.red,0),  "Bear", group=G_MA, inline="h")
+i_hma_w    = input.int(2,"Width", group=G_MA, inline="h", minval=1, maxval=4)
+
+i_bos_on   = input.bool(true, "BOS On",  group=G_MA, inline="b")
+i_bos_col  = input.color(color.new(color.fuchsia,20),"Color",group=G_MA,inline="b")
+i_bos_w    = input.int(1,"Width", group=G_MA, inline="b", minval=1, maxval=3)
+
+G_FIB = "📐 Auto Fibonacci"
+i_fib_on   = input.bool(true,  "Auto Fib Lines",    group=G_FIB)
+i_fib_col  = input.color(color.new(color.gray,55),  "Fib Color", group=G_FIB)
+i_fib_ext  = input.bool(true,  "Show Extensions",   group=G_FIB)
+
+G_CORE = "⚙️ Core"
+i_rsi_len = input.int(14,"RSI", group=G_CORE, minval=2)
+i_adx_len = input.int(14,"ADX", group=G_CORE, minval=2)
+i_adx_str = input.int(25,"ADX Strong", group=G_CORE, minval=10)
+i_adx_wk  = input.int(15,"ADX Weak",   group=G_CORE, minval=5)
+i_atr_len = input.int(14,"ATR", group=G_CORE, minval=2)
+i_vol_len = input.int(20,"VolMA", group=G_CORE, minval=5)
+i_swing   = input.int(10,"Swing", group=G_CORE, minval=3, maxval=50)
+
+G_ENTRY = "🎯 Entry Engine"
+i_tf_combo = input.string("15m+1H+4H","TF Combo",group=G_ENTRY,options=["15m+1H+4H","15m+1H+4H+D"])
+i_fib1     = input.float(1.272,"Fib T1",group=G_ENTRY,step=0.1)
+i_fib2     = input.float(1.618,"Fib T2",group=G_ENTRY,step=0.1)
+i_fib3     = input.float(2.000,"Fib T3",group=G_ENTRY,step=0.1)
+i_min_conf = input.float(60.,"Min Conf%",group=G_ENTRY,minval=40.,maxval=90.,step=5.)
+i_div_show = input.bool(true,"Divergence Labels",group=G_ENTRY)
+
+G_RISK = "💰 Risk"
+i_acc      = input.float(10000.,"Account",group=G_RISK,minval=100.)
+i_risk_pct = input.float(1.0,"Risk %",group=G_RISK,minval=0.1,maxval=5.,step=0.1)
+
+G_DSH = "📊 Dashboard"
+i_macro_pos = input.string("Top Right",  "Macro",group=G_DSH,options=["Top Right","Top Left","Bottom Right","Bottom Left"])
+i_entry_pos = input.string("Bottom Left","Strategy",group=G_DSH,options=["Bottom Left","Bottom Right","Top Left","Top Right"])
+
+// ══════════════════════════════════════════════════════════════
+// §2 HELPERS
+// ══════════════════════════════════════════════════════════════
+f_clamp(v,lo,hi)  => math.max(lo, math.min(hi, v))
+f_ma(src,len,t)   => t=="EMA"?ta.ema(src,len):t=="WMA"?ta.wma(src,len):t=="HMA"?ta.hma(src,len):ta.sma(src,len)
+f_pos(p)          => p=="Top Right"?position.top_right:p=="Bottom Right"?position.bottom_right:p=="Top Left"?position.top_left:position.bottom_left
+f_sign(v)         => v>=0?"+" + str.tostring(math.abs(math.round(v)),"#"):"-" + str.tostring(math.abs(math.round(v)),"#")
+f_rr(rr)          => str.tostring(rr,"#.#")+"x"
+f_macdh() =>
+    [_l, _s, _h] = ta.macd(close, 12, 26, 9)
+    _h
+
+// ══════════════════════════════════════════════════════════════
+// §3 MOVING AVERAGES
+// ══════════════════════════════════════════════════════════════
+ma1 = f_ma(close,i_ma1_len,i_ma1_type)
+ma2 = f_ma(close,i_ma2_len,i_ma2_type)
+ma3 = f_ma(close,i_ma3_len,i_ma3_type)
+ma4 = f_ma(close,i_ma4_len,i_ma4_type)
+hma = (ta.ema(close,i_hma_fast)+ta.ema(close,i_hma_slow))/2.
+color hma_col = i_hma_on ? (hma>hma[1]?i_hma_bull:i_hma_bear) : na
+
+plot(i_ma1_on?ma1:na,"MA1",color=i_ma1_col,linewidth=i_ma1_w)
+plot(i_ma2_on?ma2:na,"MA2",color=i_ma2_col,linewidth=i_ma2_w)
+plot(i_ma3_on?ma3:na,"MA3",color=i_ma3_col,linewidth=i_ma3_w)
+plot(i_ma4_on?ma4:na,"MA4",color=i_ma4_col,linewidth=i_ma4_w)
+plot(i_hma_on?hma:na,"HybridMA",color=hma_col,linewidth=i_hma_w)
+
+// ══════════════════════════════════════════════════════════════
+// §4 CORE INDICATORS
+// ══════════════════════════════════════════════════════════════
+atr_v  = ta.atr(i_atr_len)
+atr_ma = ta.sma(atr_v,30)
+vol_ma = ta.sma(volume,i_vol_len)
+rsi    = ta.rsi(close,i_rsi_len)
+[macd_l,macd_s,macd_h] = ta.macd(close,12,26,9)
+[adx_v,dip,dim]        = ta.dmi(i_adx_len,i_adx_len)
+stoch  = ta.stoch(close,high,low,14)
+vol_r  = vol_ma>0?volume/vol_ma:1.
+roc5   = close>0?(close-close[5])/close[5]*100.:0.
+roc10  = close>0?(close-close[10])/close[10]*100.:0.
+
+// CVD
+float cvd_d = (close-open)/math.max(high-low,syminfo.mintick)*volume
+var float cvd = 0.
+cvd := cvd + cvd_d
+float cvd_slope = cvd - cvd[3]
+bool cvd_flip_bull = cvd>0 and cvd[1]<=0 and cvd[2]<=0
+bool cvd_flip_bear = cvd<0 and cvd[1]>=0 and cvd[2]>=0
+bool cvd_bull_div = (low<low[3] and low[3]<low[6]) and (cvd>cvd[3] and cvd[3]>cvd[6])
+bool cvd_bear_div = (high>high[3] and high[3]>high[6]) and (cvd<cvd[3] and cvd[3]<cvd[6])
+
+// OFS
+float _cvd_norm = vol_ma>0?f_clamp(cvd/(vol_ma*20.)*50.,-50.,50.):0.
+float _slp_norm = f_clamp(cvd_slope/math.max(vol_ma,1.)*30.,-30.,30.)
+bool  _high_vol = vol_r>1.8
+bool  _small_bod= (high-low)>0 and math.abs(close-open)/(high-low)<0.35
+bool  _bull_abs = _high_vol and _small_bod and close>open[1]
+bool  _bear_abs = _high_vol and _small_bod and close<open[1]
+float of_score  = f_clamp(_cvd_norm+_slp_norm+(cvd_bull_div?15.:cvd_bear_div?-15.:0.)+(_bull_abs?10.:_bear_abs?-10.:0.),-100.,100.)
+bool  of_bull_strong = of_score>=50.
+bool  of_bear_strong = of_score<=-50.
+
+// Volume anomaly
+bool vol_anom_bull = vol_r>2.0 and close>open and (close-open)/(high-low+syminfo.mintick)>0.5
+bool vol_anom_bear = vol_r>2.0 and close<open and (open-close)/(high-low+syminfo.mintick)>0.5
+bool is_vol_spike  = vol_r>2.5
+
+// ══════════════════════════════════════════════════════════════
+// §5 BOS — No-lag real-time
+// ══════════════════════════════════════════════════════════════
+var float sw_hi = na
+var float sw_lo = na
+var int   sw_hi_bar = 0
+var int   sw_lo_bar = 0
+float _rhi = ta.highest(high,i_swing)
+float _rlo = ta.lowest(low,i_swing)
+if high>=_rhi
+    sw_hi:=high
+    sw_hi_bar:=bar_index
+if low<=_rlo
+    sw_lo:=low
+    sw_lo_bar:=bar_index
+
+var int   ms_trend  = 0
+var float bos_level = na
+float _body_r = (high-low)>0?math.abs(close-open)/(high-low):0.
+bool bos_bull = not na(sw_hi) and close>sw_hi and close>open and _body_r>=0.40 and ms_trend<=0
+bool bos_bear = not na(sw_lo) and close<sw_lo and close<open and _body_r>=0.40 and ms_trend>=0
+if bos_bull
+    ms_trend:=1
+    bos_level:=sw_lo
+if bos_bear
+    ms_trend:=-1
+    bos_level:=sw_hi
+
+plot(i_bos_on?bos_level:na,"BOS Level",color=i_bos_col,linewidth=i_bos_w,style=plot.style_stepline_diamond)
+var line _bos_ln = na
+if i_bos_on and (bos_bull or bos_bear) and barstate.isconfirmed
+    line.delete(_bos_ln)
+    _bos_ln:=line.new(bar_index,bos_level,bar_index+50,bos_level,color=i_bos_col,width=i_bos_w,style=line.style_dashed)
+if i_bos_on and barstate.islast and not na(_bos_ln)
+    line.set_x2(_bos_ln,bar_index+50)
+
+// Sweep
+var bool bull_sweep = false
+var bool bear_sweep = false
+var int _bsw_cd = 0
+var int _ssw_cd = 0
+_bsw_cd:=math.max(0,_bsw_cd-1)
+_ssw_cd:=math.max(0,_ssw_cd-1)
+if low<sw_lo and close>sw_lo+atr_v*0.3 and _bsw_cd==0
+    _bsw_cd:=3
+if high>sw_hi and close<sw_hi-atr_v*0.3 and _ssw_cd==0
+    _ssw_cd:=3
+bull_sweep:=_bsw_cd>0
+bear_sweep:=_ssw_cd>0
+
+// ══════════════════════════════════════════════════════════════
+// §6 AUTO FIBONACCI
+// ══════════════════════════════════════════════════════════════
+var float fib_hi = na
+var float fib_lo = na
+var int   fib_hi_bar = 0
+var int   fib_lo_bar = 0
+var bool  fib_upswing = true
+if bos_bull and not na(sw_lo)
+    fib_lo:=sw_lo
+    fib_lo_bar:=sw_lo_bar
+    fib_hi:=sw_hi
+    fib_hi_bar:=sw_hi_bar
+    fib_upswing:=true
+if bos_bear and not na(sw_hi)
+    fib_hi:=sw_hi
+    fib_hi_bar:=sw_hi_bar
+    fib_lo:=sw_lo
+    fib_lo_bar:=sw_lo_bar
+    fib_upswing:=false
+
+float fib_range = not na(fib_hi) and not na(fib_lo)?fib_hi-fib_lo:na
+var line[] _fib_lines = array.new_line()
+if i_fib_on and barstate.islast and not na(fib_range) and fib_range>0
+    for ln in _fib_lines
+        line.delete(ln)
+    array.clear(_fib_lines)
+    float[] fib_pcts = array.from(0.0,0.236,0.382,0.5,0.618,0.786,1.0)
+    if i_fib_ext
+        array.push(fib_pcts,1.272)
+        array.push(fib_pcts,1.618)
+        array.push(fib_pcts,2.000)
+    int _x1 = math.min(fib_lo_bar,fib_hi_bar)
+    int _x2 = bar_index+30
+    for pct in fib_pcts
+        float lvl = fib_upswing?fib_hi-fib_range*pct:fib_lo+fib_range*pct
+        color _lc = pct<=0.?color.new(color.gray,30):pct>=1.0?color.new(color.gray,30):pct==0.618?color.new(color.yellow,20):pct==0.382?color.new(color.aqua,30):i_fib_col
+        int   _lw = (pct==0.618 or pct==0.382)?2:1
+        bool  _dotted = pct>1.0
+        line _l = line.new(_x1,lvl,_x2,lvl,color=_lc,width=_lw,style=_dotted?line.style_dotted:line.style_dashed,xloc=xloc.bar_index)
+        label.new(_x2,lvl,str.tostring(pct*100.,"#.#")+"%  "+str.tostring(lvl,"#.##"),color=color.new(color.black,100),textcolor=_lc,style=label.style_label_left,size=size.tiny)
+        array.push(_fib_lines,_l)
+
+// ══════════════════════════════════════════════════════════════
+// §7 MTF MACRO HIERARCHY
+// ══════════════════════════════════════════════════════════════
+w_c    = request.security(syminfo.tickerid,"W",  close,             lookahead=barmerge.lookahead_off)
+w_e20  = request.security(syminfo.tickerid,"W",  ta.ema(close,20),  lookahead=barmerge.lookahead_off)
+w_e50  = request.security(syminfo.tickerid,"W",  ta.ema(close,50),  lookahead=barmerge.lookahead_off)
+w_rsi  = request.security(syminfo.tickerid,"W",  ta.rsi(close,14),  lookahead=barmerge.lookahead_off)
+d_c    = request.security(syminfo.tickerid,"D",  close,             lookahead=barmerge.lookahead_off)
+d_e20  = request.security(syminfo.tickerid,"D",  ta.ema(close,20),  lookahead=barmerge.lookahead_off)
+d_e50  = request.security(syminfo.tickerid,"D",  ta.ema(close,50),  lookahead=barmerge.lookahead_off)
+d_rsi  = request.security(syminfo.tickerid,"D",  ta.rsi(close,14),  lookahead=barmerge.lookahead_off)
+h4_c   = request.security(syminfo.tickerid,"240",close,             lookahead=barmerge.lookahead_off)
+h4_e20 = request.security(syminfo.tickerid,"240",ta.ema(close,20),  lookahead=barmerge.lookahead_off)
+h4_e50 = request.security(syminfo.tickerid,"240",ta.ema(close,50),  lookahead=barmerge.lookahead_off)
+h4_rsi = request.security(syminfo.tickerid,"240",ta.rsi(close,14),  lookahead=barmerge.lookahead_off)
+h4_atr = request.security(syminfo.tickerid,"240",ta.atr(14),         lookahead=barmerge.lookahead_off)
+h4_hi20= request.security(syminfo.tickerid,"240",ta.highest(high,20),lookahead=barmerge.lookahead_off)
+h4_lo20= request.security(syminfo.tickerid,"240",ta.lowest(low,20),  lookahead=barmerge.lookahead_off)
+
+float ws = (w_c>w_e20?1.:-1.)+(w_e20>w_e50?1.:-1.)+(w_rsi>50.?1.:-1.)
+float ds = (d_c>d_e20?1.:-1.)+(d_e20>d_e50?1.:-1.)+(d_rsi>50.?1.:-1.)
+float hs = (h4_c>h4_e20?1.:-1.)+(h4_e20>h4_e50?1.:-1.)+(h4_rsi>50.?1.:-1.)
+float mtf_raw = ws*3.+ds*2.+hs*1.
+float mtf_sc  = f_clamp(mtf_raw/9.*100.,-100.,100.)
+bool  mtf_flag= math.abs(ws)<2. and math.abs(mtf_sc)<30.
+bool  w_bull  = ws>=2.
+bool  w_bear  = ws<=-2.
+string mtf_str= mtf_sc>=60.?"BULL 3/3":mtf_sc>=30.?"BULL 2/3":mtf_sc<=-60.?"BEAR 3/3":mtf_sc<=-30.?"BEAR 2/3":"MIXED"
+
+// ══════════════════════════════════════════════════════════════
+// §8 DEEP MOMENTUM ENGINE
+// Enhanced: 6 components + phase analysis + momentum cycle detection
+// ══════════════════════════════════════════════════════════════
+// Component 1: RSI slope + acceleration (primary leading indicator)
+float rsi_slope  = rsi - rsi[3]
+float rsi_accel  = rsi_slope - (rsi[3]-rsi[6])
+float rsi_mom    = f_clamp(rsi_slope*2.5,-25.,25.)
+
+// Component 2: MACD histogram velocity + acceleration
+float macd_vel   = macd_h - macd_h[2]
+float macd_accel = macd_vel - (macd_h[2]-macd_h[4])
+float macd_mom   = f_clamp(macd_vel*3.,-20.,20.)
+
+// Component 3: Volume-weighted price momentum
+float vwp_mom    = f_clamp(close>0?(close-close[5])/close[5]*vol_r*100.*1.5:0.,-20.,20.)
+
+// Component 4: CVD (smart money flow proxy)
+float cvd_norm_m = vol_ma>0?cvd_slope/math.max(vol_ma,1.)*50.:0.
+float cvd_mom    = f_clamp(cvd_norm_m,-15.,15.)
+
+// Component 5: Stochastic momentum
+float stoch_mom  = f_clamp((stoch-50.)*0.4,-20.,20.)
+
+// Component 6: ROC acceleration (breakout detection)
+float roc_accel  = roc5 - roc5[3]
+float roc_mom    = f_clamp(roc_accel*1.5,-10.,10.)
+
+// Composite momentum score
+float mom_raw    = rsi_mom + macd_mom + vwp_mom + cvd_mom + stoch_mom + roc_mom
+float mom_score  = f_clamp(mom_raw/90.*100.,-100.,100.)
+float mom_accel_c= f_clamp(rsi_accel*0.3+macd_accel*2.+(roc5-roc5[3])*0.5,-10.,10.)
+
+// Momentum cycle states
+bool mom_building   = mom_accel_c>0.5 and math.abs(mom_score)>20.
+bool mom_peak       = math.abs(mom_score)>55. and mom_accel_c<-0.3
+bool mom_early_top  = mom_score>40. and mom_accel_c<0. and mom_score<mom_score[1] and macd_h<macd_h[1]
+bool mom_early_bot  = mom_score<-40. and mom_accel_c>0. and mom_score>mom_score[1] and macd_h>macd_h[1]
+bool mom_fading     = mom_early_top or mom_early_bot
+
+// Momentum character deep analysis
+float mom_strength  = math.abs(mom_score)
+float mom_quality   = f_clamp((math.abs(macd_accel)>0.5?25.:0.)+(of_bull_strong or of_bear_strong?25.:0.)+(vol_r>1.3?20.:vol_r<0.7?-15.:0.)+(math.abs(rsi_slope)>5.?15.:0.), 0., 100.)
+string mom_state    = mom_peak?"PEAK ⚠️":mom_fading?"FADING ↘":mom_building?"BUILDING ⚡":math.abs(mom_score)<15.?"NEUTRAL":mom_score>0.?"BULL":"BEAR"
+float mom_conf_v    = f_clamp(mom_strength*0.5+(math.abs(macd_accel)>0.5?15.:0.)+(of_bull_strong or of_bear_strong?15.:0.)+(vol_r>1.3?10.:vol_r<0.7?-10.:0.),10.,95.)
+
+// ══════════════════════════════════════════════════════════════
+// §9 DEEP TREND ENGINE
+// Enhanced: MA structure + ADX depth + momentum-trend alignment
+// ══════════════════════════════════════════════════════════════
+// MA alignment score (−5..+5)
+float ma_al = ((close>ma1?1.:0.)+(close>ma2?1.:0.)+(close>ma3?1.:0.)+(ma1>ma2?1.:0.)+(ma2>ma3?1.:0.)) - ((close<ma1?1.:0.)+(close<ma2?1.:0.)+(close<ma3?1.:0.)+(ma1<ma2?1.:0.)+(ma2<ma3?1.:0.))
+
+// ADX directional strength
+float adx_dir = adx_v>=i_adx_str?(dip>dim?30.:-10.):adx_v>=i_adx_wk?(dip>dim?10.:-5.):(dip>dim?3.:-3.)
+float di_spread = dip - dim
+float di_score  = f_clamp(di_spread*0.8,-20.,20.)
+
+// Price distance from anchor MA
+float dist_pct  = ma2>0?math.abs(close-ma2)/ma2*100.:0.
+float dist_score= ma2>0?f_clamp((close-ma2)/ma2*200.,-15.,15.):0.
+
+// Higher high / lower low structure
+bool hh = high>ta.highest(high,i_swing)[1]
+bool hl = low>ta.lowest(low,i_swing)[1]
+bool lh = high<ta.highest(high,i_swing)[1]
+bool ll = low<ta.lowest(low,i_swing)[1]
+float struct_score = (hh?10.:0.)+(hl?10.:0.)-(lh?10.:0.)-(ll?10.:0.)
+
+// Trend score composite
+float trend_score = f_clamp(ma_al/5.*40.+adx_dir+di_score+dist_score+struct_score,-100.,100.)
+bool  adx_rising  = adx_v>adx_v[3]
+bool  adx_falling = adx_v<adx_v[3]
+
+// Trend phase
+string trend_phase = dist_pct<2.5 and adx_v<i_adx_wk?"ACCUMULATION":adx_rising and (bos_bull or bos_bear)?"BREAKOUT":adx_v>=i_adx_str and math.abs(trend_score)>50.?"TREND":dist_pct>10. and mom_peak?"EXHAUSTION":"TRANSITION"
+float trend_conf_v = f_clamp(math.abs(trend_score)*0.4+(adx_v>=i_adx_str?20.:adx_v>=i_adx_wk?10.:0.)+(math.abs(ma_al)>=3.?20.:math.abs(ma_al)>=2.?10.:0.)+(ms_trend!=0?10.:0.)+mtf_sc*0.1,10.,95.)
+
+// Trend strength characterization
+string trend_strength = adx_v>=i_adx_str and math.abs(trend_score)>60.?"STRONG":adx_v>=i_adx_wk and math.abs(trend_score)>30.?"MODERATE":adx_v<i_adx_wk?"WEAK":"DEVELOPING"
+
+// Trend-Momentum divergence (highest quality reversal signal)
+bool tm_bear_setup = trend_score>30. and mom_score<mom_score[3] and mom_accel_c<-0.5 and rsi>60.
+bool tm_bull_setup = trend_score<-30. and mom_score>mom_score[3] and mom_accel_c>0.5 and rsi<40.
+bool tm_diverge    = tm_bear_setup or tm_bull_setup
+string tm_signal   = tm_bull_setup?"⚡TM:Bull(trend↓ mom↑)":tm_bear_setup?"⚠️TM:Bear(trend↑ mom↓)":""
+
+// ══════════════════════════════════════════════════════════════
+// §8b MOMENTUM CYCLE ENGINE
+// Maps momentum into a 6-phase cycle with position% and next phase prediction
+// Cycle: RECOVERY → BUILD → ACCELERATE → PEAK → DECEL → EXHAUST → RECOVERY
+// Position% = where we are within the current phase (0-100%)
+// ══════════════════════════════════════════════════════════════
+
+// Cycle phase detection based on score + acceleration + rate of change
+// Phase boundaries are defined by combinations of level + direction + accel
+bool _mc_recovery    = mom_score > -20. and mom_score < 15. and mom_accel_c > 0. and mom_score > mom_score[3]
+bool _mc_build       = mom_score >= 15. and mom_score < 40. and mom_accel_c >= 0. and mom_building
+bool _mc_accelerate  = mom_score >= 40. and mom_accel_c > 0. and not mom_early_top
+bool _mc_peak        = mom_peak or (mom_score > 50. and mom_accel_c < 0. and mom_score > mom_score[2])
+bool _mc_decel       = mom_fading or (mom_score > 20. and mom_accel_c < -0.3 and not mom_peak)
+bool _mc_exhaust     = math.abs(mom_score) < 20. and mom_accel_c < 0. and not _mc_recovery
+
+// Negative cycle mirror
+bool _mc_recovery_n  = mom_score < 20. and mom_score > -15. and mom_accel_c < 0. and mom_score < mom_score[3]
+bool _mc_build_n     = mom_score <= -15. and mom_score > -40. and mom_accel_c <= 0. and mom_building
+bool _mc_accelerate_n= mom_score <= -40. and mom_accel_c < 0. and not mom_early_bot
+bool _mc_peak_n      = mom_peak or (mom_score < -50. and mom_accel_c > 0. and mom_score < mom_score[2])
+bool _mc_decel_n     = mom_early_bot or (mom_score < -20. and mom_accel_c > 0.3 and not mom_peak)
+
+// Assign phase label + determine next expected phase
+string mom_cyc_phase = mom_score > 0 or mom_building ? (_mc_accelerate ? "ACCELERATE" : _mc_peak ? "PEAK" : _mc_decel ? "DECEL" : _mc_build ? "BUILD" : _mc_exhaust ? "EXHAUST" : "RECOVERY") : (_mc_accelerate_n ? "ACCEL↓" : _mc_peak_n ? "PEAK↓" : _mc_decel_n ? "DECEL↑" : _mc_build_n ? "BUILD↓" : "EXHAUST↓")
+string mom_cyc_next  = mom_cyc_phase == "RECOVERY" ? "→ BUILD" : mom_cyc_phase == "BUILD" ? "→ ACCELERATE" : mom_cyc_phase == "ACCELERATE" ? "→ PEAK ⚠️" : mom_cyc_phase == "PEAK" ? "→ DECEL ⚠️" : mom_cyc_phase == "DECEL" ? "→ EXHAUST" : mom_cyc_phase == "EXHAUST" ? "→ RECOVERY" : mom_cyc_phase == "BUILD↓" ? "→ ACCEL↓" : mom_cyc_phase == "ACCEL↓" ? "→ PEAK↓ ⚠️" : mom_cyc_phase == "PEAK↓" ? "→ DECEL↑" : mom_cyc_phase == "DECEL↑" ? "→ EXHAUST↓" : "→ RECOVERY"
+
+// Cycle position % (how far through current phase, 0-100%)
+// Estimated from score position relative to phase thresholds
+float mom_cyc_pos = mom_cyc_phase == "RECOVERY" ? f_clamp((mom_score + 20.) / 35. * 100., 0., 100.) : mom_cyc_phase == "BUILD" ? f_clamp((mom_score - 15.) / 25. * 100., 0., 100.) : mom_cyc_phase == "ACCELERATE" ? f_clamp((mom_score - 40.) / 60. * 100., 0., 100.) : mom_cyc_phase == "PEAK" ? f_clamp((100. - mom_score) / 50. * 100., 0., 100.) : mom_cyc_phase == "DECEL" ? f_clamp((mom_score - 20.) / 35. * 100., 0., 100.) : f_clamp((20. - math.abs(mom_score)) / 20. * 100., 0., 100.)
+
+// Time in current phase (bars since phase started)
+var string _prev_cyc_phase = ""
+var int    _cyc_bars = 0
+if mom_cyc_phase != _prev_cyc_phase
+    _cyc_bars := 0
+    _prev_cyc_phase := mom_cyc_phase
+else
+    _cyc_bars := _cyc_bars + 1
+
+// ══════════════════════════════════════════════════════════════
+// §9b TREND CYCLE ENGINE
+// Maps trend structure into 5 states with continuation probability
+// Cycle: RANGING → DEVELOPING → TRENDING → OVEREXTENDED → REVERTING
+// ══════════════════════════════════════════════════════════════
+
+// Trend cycle state based on ADX + distance + structure
+bool _tc_ranging      = adx_v < i_adx_wk and dist_pct < 3.
+bool _tc_developing   = adx_rising and adx_v >= i_adx_wk and adx_v < i_adx_str and dist_pct < 6.
+bool _tc_trending     = adx_v >= i_adx_str and dist_pct >= 3. and dist_pct < 10. and not mom_peak
+bool _tc_overextended = dist_pct >= 10. or (adx_v >= i_adx_str and mom_peak)
+bool _tc_reverting    = adx_falling and dist_pct > 5. and (mom_fading or tm_diverge)
+
+string tr_cyc_phase = _tc_reverting ? "REVERTING ⚠️" : _tc_overextended ? "OVEREXTENDED ⚠️" : _tc_trending ? "TRENDING" : _tc_developing ? "DEVELOPING" : "RANGING"
+
+// Trend cycle continuation probability (how likely this phase continues next N bars)
+float tr_cont_prob = _tc_trending ? f_clamp(70. + adx_v*0.3 - dist_pct*1.5, 40., 88.) : _tc_developing ? f_clamp(60. + adx_v*0.5, 40., 80.) : _tc_overextended ? f_clamp(30. - dist_pct*0.8, 10., 45.) : _tc_reverting ? f_clamp(20. + math.abs(trend_score)*0.2, 15., 45.) : 40.
+
+// Bars likely remaining in current trend phase (estimated from ADX slope + phase)
+float _tr_remaining = _tc_trending ? f_clamp((i_adx_str*1.5 - adx_v) / math.max(math.abs(adx_v-adx_v[5])*0.5, 0.1), 2., 20.) : _tc_developing ? f_clamp((i_adx_str - adx_v) / math.max(adx_v-adx_v[3], 0.5), 1., 12.) : _tc_overextended ? f_clamp(dist_pct / math.max(math.abs(roc5)*0.3, 0.2), 1., 8.) : 5.
+int tr_remain_bars = math.round(_tr_remaining)
+
+// Trend cycle color
+color tr_cyc_col = _tc_trending?color.lime:_tc_developing?color.aqua:_tc_overextended?color.orange:_tc_reverting?color.red:color.gray
+
+// ══════════════════════════════════════════════════════════════
+// §10 DIVERGENCE
+// ══════════════════════════════════════════════════════════════
+bool bull_div   = low<low[5] and low[5]<low[10] and rsi>rsi[5] and rsi[5]>rsi[10]
+bool bear_div   = high>high[5] and high[5]>high[10] and rsi<rsi[5] and rsi[5]<rsi[10]
+bool h_bull_div = low>low[5] and rsi<rsi[5] and ms_trend==1
+bool h_bear_div = high<high[5] and rsi>rsi[5] and ms_trend==-1
+var bool _pbdiv = false
+var bool _psdiv = false
+bool new_bull_div = bull_div and not _pbdiv
+bool new_bear_div = bear_div and not _psdiv
+_pbdiv:=bull_div
+_psdiv:=bear_div
+if i_div_show and new_bull_div and barstate.isconfirmed
+    label.new(bar_index,low-atr_v*0.8,"📐+",color=color.new(color.lime,20),textcolor=color.white,style=label.style_label_up,size=size.tiny)
+if i_div_show and new_bear_div and barstate.isconfirmed
+    label.new(bar_index,high+atr_v*0.8,"📐-",color=color.new(color.red,20),textcolor=color.white,style=label.style_label_down,size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// §11 STAGE + NARRATIVE
+// ══════════════════════════════════════════════════════════════
+int mkt_stage = dist_pct<2.5 and adx_v<i_adx_wk?1:dist_pct>8. and (rsi>70. or bear_div or of_bear_strong or vol_anom_bear or mom_early_top)?4:adx_v>=i_adx_wk and close>ma2 and hma>hma[1]?2:dist_pct>6. and rsi>62.?3:0
+string stage_s = mkt_stage==1?"S1:Accum":mkt_stage==2?"S2:Markup":mkt_stage==3?"S3:Extended":mkt_stage==4?"S4:Dist":"S0:Watch"
+
+bool _distrib = mkt_stage==4 or (of_bear_strong and vol_anom_bear and ms_trend==-1)
+bool _accum   = mkt_stage==1 and of_bull_strong
+bool _sm_long = bull_sweep and of_bull_strong and is_vol_spike
+bool _sm_short= bear_sweep and of_bear_strong and is_vol_spike
+bool _bull_ex = rsi>72. and mom_peak and close>ma2 and dist_pct>10.
+bool _bear_ex = rsi<28. and mom_peak and close<ma2 and dist_pct>10.
+string narrative = _distrib?"DISTRIBUTION — Offloading detected, reduce longs":_sm_long?"SMART MONEY LONG — Sweep+OFS confirm institutional buy":_sm_short?"SMART MONEY SHORT — Sweep+OFS confirm institutional sell":_bull_ex?"BULL EXHAUSTION — Overextended, trim longs":_bear_ex?"BEAR EXHAUSTION — Capitulation, reversal window":_accum?"ACCUMULATION — Smart money building quietly":trend_phase=="BREAKOUT"?"BREAKOUT — Enter on pullback, confirm with volume":trend_phase=="TREND"?"MID TREND — Healthy momentum, dips = opportunities":mtf_flag?"TF CONFLICT — Await W/D/H4 alignment":"NEUTRAL — Monitor for setup"
+
+// ══════════════════════════════════════════════════════════════
+// §12 MULTI-TF ENTRY ENGINE
+// ══════════════════════════════════════════════════════════════
+m15_c  = request.security(syminfo.tickerid,"15",close,           lookahead=barmerge.lookahead_off)
+m15_e9 = request.security(syminfo.tickerid,"15",ta.ema(close,9), lookahead=barmerge.lookahead_off)
+m15_e21= request.security(syminfo.tickerid,"15",ta.ema(close,21),lookahead=barmerge.lookahead_off)
+m15_rsi= request.security(syminfo.tickerid,"15",ta.rsi(close,14),lookahead=barmerge.lookahead_off)
+m15_mh = request.security(syminfo.tickerid,"15",f_macdh(),        lookahead=barmerge.lookahead_off)
+float m15_mh1 = m15_mh[1]
+m15_atr= request.security(syminfo.tickerid,"15",ta.atr(14),       lookahead=barmerge.lookahead_off)
+m15_vr = request.security(syminfo.tickerid,"15",ta.sma(volume,20)>0?volume/ta.sma(volume,20):1.,lookahead=barmerge.lookahead_off)
+
+h1_c   = request.security(syminfo.tickerid,"60",close,            lookahead=barmerge.lookahead_off)
+h1_e20 = request.security(syminfo.tickerid,"60",ta.ema(close,20), lookahead=barmerge.lookahead_off)
+h1_e50 = request.security(syminfo.tickerid,"60",ta.ema(close,50), lookahead=barmerge.lookahead_off)
+h1_rsi = request.security(syminfo.tickerid,"60",ta.rsi(close,14), lookahead=barmerge.lookahead_off)
+h1_mh  = request.security(syminfo.tickerid,"60",f_macdh(),         lookahead=barmerge.lookahead_off)
+h1_vr  = request.security(syminfo.tickerid,"60",ta.sma(volume,20)>0?volume/ta.sma(volume,20):1.,lookahead=barmerge.lookahead_off)
+
+h4_rsi2= request.security(syminfo.tickerid,"240",ta.rsi(close,14), lookahead=barmerge.lookahead_off)
+h4_mh  = request.security(syminfo.tickerid,"240",f_macdh(),          lookahead=barmerge.lookahead_off)
+h4_vr  = request.security(syminfo.tickerid,"240",ta.sma(volume,20)>0?volume/ta.sma(volume,20):1.,lookahead=barmerge.lookahead_off)
+
+bool use_daily = i_tf_combo=="15m+1H+4H+D"
+d_rsi2 = request.security(syminfo.tickerid,"D",ta.rsi(close,14),lookahead=barmerge.lookahead_off)
+bool d4_bull = d_c>d_e20 and d_e20>d_e50
+bool d4_bear = d_c<d_e20 and d_e20<d_e50
+
+float s15 = (m15_c>m15_e9 and m15_e9>m15_e21?2.:m15_c<m15_e9 and m15_e9<m15_e21?-2.:0.)+(m15_rsi>55.?1.5:m15_rsi<45.?-1.5:0.)+(m15_mh>m15_mh1?1.5:-1.5)+(m15_vr>1.3?(m15_c>m15_e9?1.:-1.):0.)
+float s1h = (h1_c>h1_e20 and h1_e20>h1_e50?2.5:h1_c<h1_e20 and h1_e20<h1_e50?-2.5:h1_c>h1_e20?1.:-1.)+(h1_rsi>55.?1.5:h1_rsi<45.?-1.5:0.)+(h1_mh>0.?1.:-1.)+(h1_vr>1.3?(h1_c>h1_e20?1.:-1.):0.)
+float s4h = (hs>=2.?3.:hs<=-2.?-3.:hs*1.)+(h4_rsi2>55.?1.5:h4_rsi2<45.?-1.5:0.)+(h4_mh>0.?1.:-1.)+(h4_vr>1.3?(hs>=0.?1.:-1.):0.)
+float sd  = use_daily?((d4_bull?2.:d4_bear?-2.:0.)+(d_rsi2>55.?1.:d_rsi2<45.?-1.:0.)):0.
+
+float w15=use_daily?0.20:0.25
+float w1h=use_daily?0.30:0.35
+float w4h=use_daily?0.35:0.40
+float wd =use_daily?0.15:0.00
+float _sc_max=use_daily?(6.*w15+6.*w1h+6.*w4h+3.*wd):(6.*w15+6.*w1h+6.*w4h)
+float entry_sc=_sc_max>0?f_clamp((s15*w15+s1h*w1h+s4h*w4h+sd*wd)/_sc_max*100.,-100.,100.):0.
+
+bool entry_long  = entry_sc>=30. and ms_trend>=0
+bool entry_short = entry_sc<=-30. and ms_trend<=0
+
+string lbl15=s15>1.?"15m▲":s15<-1.?"15m▼":"15m─"
+string lbl1h=s1h>1.?"1H▲":s1h<-1.?"1H▼":"1H─"
+string lbl4h=s4h>1.?"4H▲":s4h<-1.?"4H▼":"4H─"
+string lbld =use_daily?(sd>0.?" D▲":sd<0.?" D▼":" D─"):""
+
+// Entry confidence
+float ec=35.
+ec+=(math.abs(entry_sc)>70.?22.:math.abs(entry_sc)>50.?14.:math.abs(entry_sc)>30.?7.:0.)
+ec+=((entry_long and ms_trend==1) or (entry_short and ms_trend==-1)?10.:0.)
+ec+=((entry_long and mtf_sc>30.) or (entry_short and mtf_sc<-30.)?10.:0.)
+ec+=((entry_long and mtf_sc>60.) or (entry_short and mtf_sc<-60.)?5.:0.)
+ec+=((entry_long and bull_div) or (entry_short and bear_div)?8.:0.)
+ec+=((entry_long and h_bull_div) or (entry_short and h_bear_div)?5.:0.)
+ec+=(h4_vr>1.5 and ((entry_long and s4h>0.) or (entry_short and s4h<0.))?8.:0.)
+ec+=((entry_long and bos_bull) or (entry_short and bos_bear)?6.:0.)
+ec+=((entry_long and bull_sweep) or (entry_short and bear_sweep)?8.:0.)
+ec+=((entry_long and of_bull_strong) or (entry_short and of_bear_strong)?8.:0.)
+ec+=((entry_long and cvd_flip_bull) or (entry_short and cvd_flip_bear)?5.:0.)
+ec-=(mtf_flag?8.:0.)
+ec-=((entry_long and bear_div) or (entry_short and bull_div)?12.:0.)
+ec-=((entry_long and h4_rsi2>72.) or (entry_short and h4_rsi2<28.)?8.:0.)
+ec-=((entry_long and mom_peak) or (entry_short and mom_peak)?8.:0.)
+ec-=(mkt_stage==4?10.:0.)
+ec-=(use_daily and ((not d4_bull and entry_long) or (not d4_bear and entry_short))?10.:0.)
+ec+=((mkt_stage==2 and entry_long)?10.:0.)
+ec+=((mkt_stage==1 and entry_long and of_bull_strong)?6.:0.)
+ec-=((mkt_stage==3 and entry_long)?8.:0.)
+ec+=((tm_bull_setup and entry_long)?12.:0.)
+ec+=((tm_bear_setup and entry_short)?12.:0.)
+float entry_conf = f_clamp(ec,10.,96.)
+
+// Signal gate — 10 strict conditions
+float _sbody=(high-low)>0?math.abs(close-open)/(high-low):0.
+bool  _a3L  = s15>1. and s1h>1. and s4h>1.
+bool  _a3S  = s15<-1. and s1h<-1. and s4h<-1.
+var int _scd=0
+_scd:=math.max(0,_scd-1)
+
+bool _rev_long  = tm_bull_setup and bull_div and (bull_sweep or cvd_flip_bull) and of_score>-20.
+bool _rev_short = tm_bear_setup and bear_div and (bear_sweep or cvd_flip_bear) and of_score<20.
+
+float _sl_L  = h4_lo20-h4_atr*0.5
+float _sl_S  = h4_hi20+h4_atr*0.5
+float _rsk_L = math.max(math.abs(close-_sl_L),atr_v*0.1)
+float _rsk_S = math.max(math.abs(close-_sl_S),atr_v*0.1)
+float _swbL  = not na(sw_lo)?sw_lo:close-atr_v*3.
+float _swtS  = not na(sw_hi)?sw_hi:close+atr_v*3.
+float _mvL   = math.abs(close-_swbL)
+float _mvS   = math.abs(close-_swtS)
+float _tgL   = _mvL>=atr_v*0.5?_swbL+_mvL*i_fib1:close+atr_v*1.3
+float _tgS   = _mvS>=atr_v*0.5?_swtS-_mvS*i_fib1:close-atr_v*1.3
+float _rrL   = _rsk_L>0?math.abs(_tgL-close)/_rsk_L:0.
+float _rrS   = _rsk_S>0?math.abs(_tgS-close)/_rsk_S:0.
+
+bool _preL = _a3L and (ms_trend==1 or _rev_long) and not mom_peak and h4_rsi2<75. and _sbody>=0.30 and entry_conf>=i_min_conf and _scd==0 and not of_bear_strong and mkt_stage!=4
+bool _preS = _a3S and (ms_trend==-1 or _rev_short) and not mom_peak and h4_rsi2>25. and _sbody>=0.30 and entry_conf>=i_min_conf and _scd==0 and not of_bull_strong and mkt_stage!=4
+
+bool sig_long  = _preL and _rrL>=1.5
+bool sig_short = _preS and _rrS>=1.5
+if sig_long or sig_short
+    _scd:=3
+
+// Entry prices
+float en_now  = close
+float _fib_retr_L = not na(sw_hi) and not na(sw_lo) and sw_hi>sw_lo?sw_hi-(sw_hi-sw_lo)*0.382:m15_e9
+float _fib_retr_S = not na(sw_hi) and not na(sw_lo) and sw_hi>sw_lo?sw_lo+(sw_hi-sw_lo)*0.382:m15_e9
+float en_zone = entry_long?math.min(_fib_retr_L,close-m15_atr*0.3):entry_short?math.max(_fib_retr_S,close+m15_atr*0.3):close
+float sl      = entry_long?_sl_L:entry_short?_sl_S:na
+float rsk_now = math.max(math.abs(en_now-sl),atr_v*0.1)
+float rsk_zon = math.max(math.abs(en_zone-sl),atr_v*0.1)
+
+float sw_base = entry_long?(not na(sw_lo)?sw_lo:close-atr_v*3.):(not na(sw_hi)?sw_hi:close+atr_v*3.)
+float sw_move = math.abs(close-sw_base)
+bool  use_fib = sw_move>=atr_v*0.5 and not na(sw_base)
+
+float tgt1=use_fib?(entry_long?sw_base+sw_move*i_fib1:sw_base-sw_move*i_fib1):entry_long?close+atr_v*1.3:close-atr_v*1.3
+float tgt2=use_fib?(entry_long?sw_base+sw_move*i_fib2:sw_base-sw_move*i_fib2):entry_long?close+atr_v*2.0:close-atr_v*2.0
+float tgt3=use_fib?(entry_long?sw_base+sw_move*i_fib3:sw_base-sw_move*i_fib3):na
+
+float rr_n1=rsk_now>0?math.abs(tgt1-en_now)/rsk_now:0.
+float rr_n2=rsk_now>0?math.abs(tgt2-en_now)/rsk_now:0.
+float rr_z1=rsk_zon>0?math.abs(tgt1-en_zone)/rsk_zon:0.
+float rr_z2=rsk_zon>0?math.abs(tgt2-en_zone)/rsk_zon:0.
+
+float risk_usd   = i_acc*i_risk_pct/100.
+float entry_prob = f_clamp(entry_conf*0.9+(w_bull and entry_long or w_bear and entry_short?5.:0.),10.,96.)
+
+// ══════════════════════════════════════════════════════════════
+// §13 MACRO SYNTHESIS
+// ══════════════════════════════════════════════════════════════
+bool mb=mom_score>20.
+bool me=mom_score<-20.
+bool tb=trend_score>20.
+bool te=trend_score<-20.
+bool cb=mtf_sc>30.
+bool ce=mtf_sc<-30.
+int  ba=(mb?1:0)+(tb?1:0)+(cb?1:0)
+int  ea=(me?1:0)+(te?1:0)+(ce?1:0)
+bool dir_bull=ba>=2
+bool dir_bear=ea>=2
+string direction=dir_bull?"BULL":dir_bear?"BEAR":"NEUTRAL"
+
+float conv_score=f_clamp(math.abs(mom_score)*0.3+math.abs(trend_score)*0.3+math.abs(mtf_sc)*0.2+math.abs(of_score)*0.2,0.,100.)
+string mgr_verdict=conv_score>=85.?"A+":conv_score>=70.?"A":conv_score>=55.?"B":conv_score>=40.?"C":"D"
+string mgr_action=sig_long?"EXECUTE — 3/3 aligned. Long":sig_short?"EXECUTE — 3/3 aligned. Short":entry_long?"WATCH — Setup forming. Long":entry_short?"WATCH — Setup forming. Short":"WAIT — No signal"
+
+// Setup quality grade
+float _setup_pts=0.
+_setup_pts+=((mom_building or tm_diverge)?20.:mom_fading?-10.:0.)
+_setup_pts+=((trend_phase=="TREND" or trend_phase=="BREAKOUT")?20.:trend_phase=="EXHAUSTION"?-15.:0.)
+_setup_pts+=(mtf_sc>60. or mtf_sc<-60.?20.:math.abs(mtf_sc)>30.?10.:mtf_flag?-15.:0.)
+_setup_pts+=(mkt_stage==2?15.:mkt_stage==1?10.:mkt_stage==4?-20.:mkt_stage==3?-10.:0.)
+_setup_pts+=((of_bull_strong or of_bear_strong)?15.:0.)
+_setup_pts+=((bull_sweep or bear_sweep)?10.:0.)
+_setup_pts+=((sig_long or sig_short)?10.:0.)
+float setup_score=f_clamp(_setup_pts,0.,100.)
+string setup_grade=setup_score>=80.?"A+":setup_score>=65.?"A":setup_score>=50.?"B":setup_score>=35.?"C":"D"
+
+// Prediction targets
+float _ph_mult=trend_phase=="BREAKOUT"?2.2:trend_phase=="TREND"?1.6:trend_phase=="ACCUMULATION"?0.8:trend_phase=="EXHAUSTION"?0.5:1.2
+float _sw_up=not na(sw_hi) and sw_hi>close?(sw_hi-close)/close*100.:atr_v/close*100.*_ph_mult*1.2
+float _sw_dn=not na(sw_lo) and sw_lo<close?(close-sw_lo)/close*100.:atr_v/close*100.*_ph_mult*0.8
+float macro_prob=f_clamp(40.+math.abs(mom_score)*0.15+math.abs(trend_score)*0.15+math.abs(mtf_sc)*0.12+(mom_building?8.:mom_peak?-5.:0.)+(trend_phase=="TREND"?8.:trend_phase=="EXHAUSTION"?-10.:0.)-(mtf_flag?10.:0.)+(w_bull and dir_bull or w_bear and dir_bear?10.:0.)-(w_bull and dir_bear or w_bear and dir_bull?15.:0.)-(bull_div and dir_bear or bear_div and dir_bull?12.:0.),20.,96.)
+float overall_conf=f_clamp((mom_conf_v+trend_conf_v+math.abs(mtf_sc))/3.,15.,95.)
+bool  worth_risk=rr_n1>=1.5
+
+// ══════════════════════════════════════════════════════════════
+// §13b NEXT PIVOT PROJECTION (3-method blended model)
+// ══════════════════════════════════════════════════════════════
+int   proj_dir  = dir_bull?1:dir_bear?-1:ms_trend
+bool  proj_valid= proj_dir!=0 and not na(sw_hi) and not na(sw_lo) and sw_hi>sw_lo
+
+// Phase-adaptive method weights
+float _w1=trend_phase=="TREND"?0.55:trend_phase=="BREAKOUT"?0.50:trend_phase=="ACCUMULATION"?0.25:0.40
+float _w2=trend_phase=="TREND"?0.25:trend_phase=="BREAKOUT"?0.30:trend_phase=="ACCUMULATION"?0.50:0.35
+float _w3=1.-_w1-_w2
+
+// M1: Fib 161.8% measured move
+float _swing_sz = sw_hi-sw_lo
+float _m1_target= proj_dir==1?sw_lo+_swing_sz*1.618:sw_hi-_swing_sz*1.618
+
+// M2: ATR × phase multiplier
+float _m2_mult  = trend_phase=="BREAKOUT"?5.5:trend_phase=="TREND"?4.0:trend_phase=="ACCUMULATION"?2.5:trend_phase=="EXHAUSTION"?1.5:3.0
+float _m2_target= proj_dir==1?close+atr_v*_m2_mult:close-atr_v*_m2_mult
+
+// M3: Momentum velocity projection
+float _mom_vel_f= f_clamp(math.abs(mom_score)/100.*1.8+0.2,0.2,2.0)
+float _m3_target= proj_dir==1?close+atr_v*3.*_mom_vel_f:close-atr_v*3.*_mom_vel_f
+
+// Blended price target
+float proj_price= proj_valid?_m1_target*_w1+_m2_target*_w2+_m3_target*_w3:_m2_target
+float proj_dist = math.abs(proj_price-close)
+float proj_pct  = close>0?(proj_price-close)/close*100.:0.
+
+// ETA: phase-adjusted velocity
+float _bar_spd  = atr_v*_mom_vel_f*(trend_phase=="TREND"?1.3:trend_phase=="BREAKOUT"?1.5:trend_phase=="EXHAUSTION"?0.6:1.0)
+int   proj_bars = _bar_spd>0?math.max(2,math.round(proj_dist/_bar_spd)):8
+int   proj_bar_lo=math.max(2,math.round(proj_bars*0.65))
+int   proj_bar_hi=math.round(proj_bars*1.35)
+
+// 12-factor probability
+float _pp=42.
+_pp+=(math.abs(mom_score)>60.?14.:math.abs(mom_score)>40.?9.:math.abs(mom_score)>20.?4.:0.)
+_pp+=(mom_building?9.:mom_fading?-9.:mom_peak?-14.:0.)
+_pp+=(trend_phase=="TREND"?12.:trend_phase=="BREAKOUT"?9.:trend_phase=="EXHAUSTION"?-14.:trend_phase=="ACCUMULATION"?4.:0.)
+_pp+=((proj_dir==1 and mtf_sc>60.) or (proj_dir==-1 and mtf_sc<-60.)?12.:(proj_dir==1 and mtf_sc>30.) or (proj_dir==-1 and mtf_sc<-30.)?6.:0.)
+_pp+=((proj_dir==1 and w_bull) or (proj_dir==-1 and w_bear)?8.:0.)
+_pp+=((proj_dir==1 and of_bull_strong) or (proj_dir==-1 and of_bear_strong)?7.:0.)
+_pp+=((proj_dir==1 and bull_sweep) or (proj_dir==-1 and bear_sweep)?5.:0.)
+_pp-=((proj_dir==1 and bear_div) or (proj_dir==-1 and bull_div)?12.:0.)
+_pp+=((proj_dir==1 and bull_div) or (proj_dir==-1 and bear_div)?5.:0.)
+_pp-=(mtf_flag?10.:0.)
+_pp-=(mkt_stage==4?12.:mkt_stage==3?5.:0.)
+_pp+=(adx_v>=i_adx_str?7.:adx_v>=i_adx_wk?3.:-4.)
+float proj_prob = f_clamp(_pp,20.,88.)
+string proj_path= mom_building and not mom_fading?"▲ accel":mom_fading?"↘ decel":mom_peak?"⚠️ peak":math.abs(mom_score)>30.?"→ steady":"~ choppy"
+string proj_probq= proj_prob>=65.?"HIGH":proj_prob>=50.?"MED":"LOW"
+
+// Draw projection line + label
+var line  _proj_ln = na
+var label _proj_lbl= na
+var line  _proj_ln2= na
+if barstate.islast and proj_valid
+    line.delete(_proj_ln)
+    label.delete(_proj_lbl)
+    line.delete(_proj_ln2)
+    color _pc    = proj_dir==1?color.new(color.lime,0):color.new(color.red,0)
+    color _pc_dim= proj_dir==1?color.new(color.lime,55):color.new(color.red,55)
+    _proj_ln  := line.new(bar_index,proj_price,bar_index+proj_bar_hi+5,proj_price,color=_pc,width=2,style=line.style_dashed,xloc=xloc.bar_index)
+    _proj_ln2 := line.new(bar_index,close,bar_index+proj_bars,proj_price,color=_pc_dim,width=1,style=line.style_dotted,xloc=xloc.bar_index)
+    string _lbl="🎯 "+str.tostring(proj_price,format.mintick)+" ("+str.tostring(proj_pct,"+#.#")+"%)"+"\nETA "+str.tostring(proj_bar_lo)+"–"+str.tostring(proj_bar_hi)+" bars  "+str.tostring(math.round(proj_prob),"#")+"% ["+proj_probq+"]"+"\n"+proj_path
+    _proj_lbl := label.new(bar_index+proj_bar_hi+5,proj_price,_lbl,color=color.new(color.black,15),textcolor=_pc,style=label.style_label_left,size=size.small,xloc=xloc.bar_index)
+
+// ══════════════════════════════════════════════════════════════
+// §14 PLOTSHAPES
+// ══════════════════════════════════════════════════════════════
+plotshape(sig_long, title="Entry Long ▲", style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime,0), size=size.normal)
+plotshape(sig_short,title="Entry Short ▼",style=shape.triangledown, location=location.abovebar, color=color.new(color.red,0),  size=size.normal)
+bgcolor(sig_long?color.new(color.lime,97):sig_short?color.new(color.red,97):na)
+
+// ══════════════════════════════════════════════════════════════
+// §15 TOP-RIGHT DASHBOARD — Macro Analysis
+// ══════════════════════════════════════════════════════════════
+// Global strings needed across both dashboard blocks
+string _ws = w_bull?"W↑":w_bear?"W↓":"W─"
+string _ds = ds>1.?"D↑":ds<-1.?"D↓":"D─"
+string _hs = hs>0.?"H4↑":hs<0.?"H4↓":"H4─"
+color  _TR = color.new(color.black,100)
+color  _SV = color.new(color.gray,20)
+color  _ct = trend_score>20.?color.lime:trend_score<-20.?color.red:color.new(color.gray,20)
+
+var table mt = table.new(f_pos(i_macro_pos),2,9,bgcolor=color.new(color.black,100),border_width=0,border_color=color.new(color.black,100))
+
+if barstate.islast
+    color cd   = dir_bull?color.lime:dir_bear?color.red:_SV
+    color cm   = mom_score>20.?color.lime:mom_score<-20.?color.red:_SV
+    color ctpc = trend_phase=="ACCUMULATION"?color.yellow:trend_phase=="BREAKOUT"?color.aqua:trend_phase=="TREND"?color.lime:trend_phase=="EXHAUSTION"?color.red:_SV
+    color cmtf = mtf_sc>30.?color.lime:mtf_sc<-30.?color.red:color.orange
+    color cof  = of_bull_strong?color.lime:of_bear_strong?color.red:_SV
+    color cnarr= str.contains(narrative,"DISTRIBUTION") or str.contains(narrative,"EXHAUSTION")?color.red:str.contains(narrative,"SMART MONEY LONG") or str.contains(narrative,"ACCUMULATION")?color.lime:color.yellow
+    color _cyctc = _tc_trending?color.lime:_tc_overextended?color.orange:_tc_reverting?color.red:_tc_developing?color.aqua:_SV
+    string _mac  = mom_accel_c>1.?" ⚡":mom_accel_c<-1.?" ⚠️":""
+    string _cnxt = str.contains(mom_cyc_next,"PEAK") or str.contains(mom_cyc_next,"DECEL")?"⚠️":str.contains(mom_cyc_next,"ACCEL")?"⚡":""
+
+    // R0: Header — Action + Grade
+    table.cell(mt,0,0, mgr_action,                           bgcolor=_TR, text_color=cd,   text_size=size.tiny)
+    table.cell(mt,1,0, "["+setup_grade+"] "+str.tostring(ba)+"/3  Prob:"+str.tostring(math.round(macro_prob),"#")+"%", bgcolor=_TR, text_color=cd, text_size=size.tiny)
+    // R1: Momentum cycle
+    table.cell(mt,0,1, "MOM  "+mom_state+_mac+"  "+f_sign(mom_score), bgcolor=_TR, text_color=tm_diverge?color.fuchsia:cm, text_size=size.tiny)
+    table.cell(mt,1,1, "Cycle:"+mom_cyc_phase+"("+str.tostring(math.round(mom_cyc_pos),"#")+"%) "+mom_cyc_next+" "+_cnxt, bgcolor=_TR, text_color=cm, text_size=size.tiny)
+    // R2: Trend cycle
+    table.cell(mt,0,2, "TREND  "+trend_phase+"  "+trend_strength+"  "+f_sign(trend_score)+(tm_diverge?"  "+tm_signal:""), bgcolor=_TR, text_color=ctpc, text_size=size.tiny)
+    table.cell(mt,1,2, "Cycle:"+tr_cyc_phase+"  ~"+str.tostring(tr_remain_bars,"#")+"bar  "+str.tostring(math.round(tr_cont_prob),"#")+"%cont", bgcolor=_TR, text_color=_cyctc, text_size=size.tiny)
+    // R3: MTF
+    table.cell(mt,0,3, "MTF  "+mtf_str+(mtf_flag?" ⚠️":""), bgcolor=_TR, text_color=cmtf, text_size=size.tiny)
+    table.cell(mt,1,3, _ws+"  "+_ds+"  "+_hs+"  "+f_sign(mtf_sc), bgcolor=_TR, text_color=cmtf, text_size=size.tiny)
+    // R4: OFS + Flow
+    string _ofs_s = of_bull_strong?"OFS:StrongIn":of_bear_strong?"OFS:StrongOut":of_score>20.?"OFS:In":of_score<-20.?"OFS:Out":"OFS:Neut"
+    string _cvd_s = cvd_flip_bull?"CVD↑Flip":cvd_flip_bear?"CVD↓Flip":cvd_slope>0.?"CVD↑":"CVD↓"
+    string _sw_s  = bull_sweep?"Sweep↑":bear_sweep?"Sweep↓":"─"
+    table.cell(mt,0,4, "FF  "+_ofs_s+"  "+_cvd_s, bgcolor=_TR, text_color=cof, text_size=size.tiny)
+    table.cell(mt,1,4, _sw_s+(vol_anom_bull?"  VolSpike↑":vol_anom_bear?"  VolSpike↓":""), bgcolor=_TR, text_color=cof, text_size=size.tiny)
+    // R5: Narrative
+    table.cell(mt,0,5, narrative, bgcolor=_TR, text_color=cnarr, text_size=size.tiny)
+    table.cell(mt,1,5, stage_s+"  ADX:"+str.tostring(math.round(adx_v),"#")+"  Q:"+mgr_verdict, bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    // R6: DIV + BOS
+    string _div_s = bull_div?"📐Bull":bear_div?"📐Bear":h_bull_div?"h+Div":h_bear_div?"h-Div":"─"
+    color  _divc  = bull_div or h_bull_div?color.lime:bear_div or h_bear_div?color.red:_SV
+    string _bos_s = bos_bull?"BOS↑":bos_bear?"BOS↓":"─"
+    table.cell(mt,0,6, "DIV  "+_div_s+"  "+_bos_s, bgcolor=_TR, text_color=_divc, text_size=size.tiny)
+    table.cell(mt,1,6, "BOS Lvl:"+(not na(bos_level)?str.tostring(bos_level,"#.##"):"─"), bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    // R7: Target prediction
+    float _t1_pct = close>0?(tgt1-close)/close*100.:0.
+    string _wth   = worth_risk?"WORTH":"RISKY"
+    color  _cpred = dir_bull?(worth_risk?color.lime:color.orange):dir_bear?(worth_risk?color.red:color.orange):_SV
+    table.cell(mt,0,7, "TGT  "+str.tostring(tgt1,"#.##")+"  ("+str.tostring(_t1_pct,"+#.##")+"%)  "+_wth, bgcolor=_TR, text_color=_cpred, text_size=size.tiny)
+    table.cell(mt,1,7, "UP:+"+str.tostring(_sw_up,"#.##")+"%  DN:-"+str.tostring(_sw_dn,"#.##")+"%", bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    // R8: Confidence summary
+    table.cell(mt,0,8, "Conf:"+str.tostring(math.round(overall_conf),"#")+"%  MomQ:"+str.tostring(math.round(mom_quality),"#")+"%  TrendConf:"+str.tostring(math.round(trend_conf_v),"#")+"%", bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    table.cell(mt,1,8, "Setup:"+setup_grade+"("+str.tostring(math.round(setup_score),"#")+")  EV:"+str.tostring(rr_n1*(macro_prob/100.)-(1.-macro_prob/100.),"+#.##"), bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// §16 BOTTOM-LEFT — Strategy Engine
+// ══════════════════════════════════════════════════════════════
+var table et = table.new(f_pos(i_entry_pos),2,8,bgcolor=color.new(color.black,100),border_width=0,border_color=color.new(color.black,100))
+
+if barstate.islast
+    color dir_c = sig_long?color.lime:sig_short?color.red:entry_long?color.new(color.lime,40):entry_short?color.new(color.red,40):_SV
+    color rrc_n = rr_n1>=2.?color.lime:rr_n1>=1.?color.yellow:color.red
+    color rrc_z = rr_z1>=2.?color.lime:rr_z1>=1.?color.yellow:color.red
+    string _dir = sig_long?"▲ LONG":sig_short?"▼ SHORT":entry_long?"▲ WATCH":entry_short?"▼ WATCH":"─ WAIT"
+    string _wkq = math.abs(entry_sc)>60.?"A":math.abs(entry_sc)>40.?"B":math.abs(entry_sc)>20.?"C":"D"
+
+    // R0: Direction + Quality + Confidence (FIXED: use "#" not "%" format)
+    table.cell(et,0,0, _dir+"  Q:"+_wkq+"  Conf:"+str.tostring(math.round(entry_conf),"#")+"%", bgcolor=_TR, text_color=dir_c, text_size=size.tiny)
+    table.cell(et,1,0, "P:"+str.tostring(math.round(entry_prob),"#")+"%  Sc:"+str.tostring(math.round(entry_sc),"#"), bgcolor=_TR, text_color=dir_c, text_size=size.tiny)
+    // R1: SL + T1 + T2
+    table.cell(et,0,1, "SL:"+str.tostring(sl,"#.##")+"[4H]", bgcolor=_TR, text_color=color.red, text_size=size.tiny)
+    table.cell(et,1,1, "T1:"+str.tostring(tgt1,"#.##")+"  T2:"+str.tostring(tgt2,"#.##"), bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    // R2: Entry NOW
+    table.cell(et,0,2, "NOW:"+str.tostring(en_now,"#.##"), bgcolor=_TR, text_color=color.white, text_size=size.tiny)
+    table.cell(et,1,2, "R:R="+f_rr(rr_n1)+"(T1)  "+f_rr(rr_n2)+"(T2)", bgcolor=_TR, text_color=rrc_n, text_size=size.tiny)
+    // R3: Entry ZONE
+    table.cell(et,0,3, "ZONE:"+str.tostring(en_zone,"#.##")+"  pullback", bgcolor=_TR, text_color=color.aqua, text_size=size.tiny)
+    table.cell(et,1,3, "R:R="+f_rr(rr_z1)+"(T1)  "+f_rr(rr_z2)+"(T2)", bgcolor=_TR, text_color=rrc_z, text_size=size.tiny)
+    // R4: TF alignment + T3
+    string _t3d = not na(tgt3)?str.tostring(tgt3,"#.##"):"─"
+    table.cell(et,0,4, lbl15+"  "+lbl1h+"  "+lbl4h+lbld, bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    table.cell(et,1,4, "T3:"+_t3d+"  ["+i_tf_combo+"]", bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    // R5: Cycle analysis
+    color _cyc_c2 = mom_cyc_pos>60.?color.lime:mom_cyc_pos>40.?color.yellow:color.orange
+    table.cell(et,0,5, "MOM:"+mom_cyc_phase+"("+str.tostring(math.round(mom_cyc_pos),"#")+"%) "+mom_cyc_next, bgcolor=_TR, text_color=_cyc_c2, text_size=size.tiny)
+    table.cell(et,1,5, "TREND:"+tr_cyc_phase+"  "+str.tostring(math.round(tr_cont_prob),"#")+"%cont", bgcolor=_TR, text_color=tr_cyc_col, text_size=size.tiny)
+    // R6: OFS + Sweep + Vol
+    string _ctx = (of_bull_strong and entry_long?"✅OFS Long":of_bear_strong and entry_short?"✅OFS Short":of_bull_strong and entry_short?"⚠️OFS vs Short":of_bear_strong and entry_long?"⚠️OFS vs Long":"OFS:─")
+    string _swv = (bull_sweep?"Sweep↑":bear_sweep?"Sweep↓":"─")+(vol_anom_bull?"  Vol↑":vol_anom_bear?"  Vol↓":"")
+    table.cell(et,0,6, _ctx, bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    table.cell(et,1,6, _swv, bgcolor=_TR, text_color=_SV, text_size=size.tiny)
+    // R7: Situation / strategy note
+    string _sit = sig_long or sig_short ? (sig_long?"▲":"▼")+" SIGNAL  Entry:"+str.tostring(en_now,"#.##")+"  SL:"+str.tostring(sl,"#.##") : entry_long or entry_short ? "⏳ "+str.tostring(math.round(entry_conf),"#")+"% / need "+str.tostring(math.round(i_min_conf),"#")+"%" : mkt_stage==4 ? "🚨 S4 DIST — avoid longs" : mom_peak ? "⚠️ MOM PEAK — wait decel" : mtf_flag ? "⚠️ CONFLICT — wait "+_ws+" "+_ds+" "+_hs : tm_diverge ? tm_signal : bull_div and ms_trend==1 ? "📐 Bull Div — scale in dips" : bear_div and ms_trend==-1 ? "📐 Bear Div — reduce bounces" : "😴 No setup — monitor"
+    table.cell(et,0,7, _sit, bgcolor=_TR, text_color=sig_long or sig_short?color.lime:entry_long or entry_short?color.yellow:_SV, text_size=size.tiny)
+    table.cell(et,1,7, (sig_long or sig_short?"✅ Signal Active":entry_long or entry_short?"⏳ Forming":_dir), bgcolor=_TR, text_color=sig_long or sig_short?color.lime:_SV, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// §17 ALERTS
+// ══════════════════════════════════════════════════════════════
+alertcondition(sig_long,  title="KMTF: Long Signal ▲",          message="▲ LONG | Conf:{{plot.0}}% | Entry:{{plot.2}} | SL:{{plot.3}} | T1:{{plot.4}}")
+alertcondition(sig_short, title="KMTF: Short Signal ▼",         message="▼ SHORT | Conf:{{plot.0}}% | Entry:{{plot.2}} | SL:{{plot.3}} | T1:{{plot.4}}")
+alertcondition(new_bull_div, title="KMTF: Bull Divergence 📐",   message="📐 BULL DIV — Reversal setup forming")
+alertcondition(new_bear_div, title="KMTF: Bear Divergence 📐",   message="📐 BEAR DIV — Reversal setup forming")
+alertcondition(mom_peak,     title="KMTF: Momentum Peak ⚠️",    message="⚠️ MOM PEAK — Deceleration. Tighten stops.")
+alertcondition(mom_building and not mom_building[1], title="KMTF: Momentum Building ⚡", message="⚡ MOM BUILDING — Acceleration confirmed.")
+alertcondition(bos_bull, title="KMTF: BOS Bull 📈",             message="📈 BULL BOS — Structure break upward")
+alertcondition(bos_bear, title="KMTF: BOS Bear 📉",             message="📉 BEAR BOS — Structure break downward")
+alertcondition(_sm_long,     title="KMTF: Smart Money Long 💎",  message="💎 SMART MONEY LONG — Sweep+OFS+Volume")
+alertcondition(_sm_short,    title="KMTF: Smart Money Short 💎", message="💎 SMART MONEY SHORT — Sweep+OFS+Volume")
+alertcondition(mkt_stage==4 and mkt_stage[1]!=4, title="KMTF: Distribution S4 🔴", message="🔴 S4 DISTRIBUTION — Reduce longs.")
+alertcondition(tm_bull_setup and not tm_bull_setup[1], title="KMTF: Bull Reversal ⚡", message="⚡ BULL REVERSAL — Trend↓ Momentum↑")
+alertcondition(tm_bear_setup and not tm_bear_setup[1], title="KMTF: Bear Reversal ⚠️", message="⚠️ BEAR REVERSAL — Trend↑ Momentum↓")
+alertcondition(setup_score>=80. and setup_score[1]<80., title="KMTF: A+ Setup 💎", message="💎 A+ SETUP — All factors aligned.")
+
+plot(entry_conf, display=display.none, title="Entry Confidence")
+plot(entry_prob, display=display.none, title="Entry Probability")
+plot(en_now,     display=display.none, title="Entry Now")
+plot(sl,         display=display.none, title="Stop Loss")
+plot(tgt1,       display=display.none, title="Target 1")
