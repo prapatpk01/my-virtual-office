@@ -24,9 +24,9 @@ class MCDXStrategy(BaseStrategy):
         self.nr = self.params.get("length", 100)
         self.sma_pc_len = self.params.get("sma_pc_len", 10)
         self.sma_lc_len = self.params.get("sma_lc_len", 10)
-        self.dwcs_buy   = self.params.get("dwcs_buy", 60)
-        self.dwcs_sell  = self.params.get("dwcs_sell", 40)
-        self.min_conf   = self.params.get("min_conf", 55)
+        self.dwcs_buy   = self.params.get("dwcs_buy", 53)
+        self.dwcs_sell  = self.params.get("dwcs_sell", 47)
+        self.min_conf   = self.params.get("min_conf", 48)
         self.position_pct = self.params.get("position_pct", 0.08)
 
     # ------------------------------------------------------------------ #

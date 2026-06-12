@@ -75,6 +75,7 @@ def build_config() -> dict:
             "ai_signal":     _env_bool("STRATEGY_AI_SIGNAL",     False),
             "mcdx":          _env_bool("STRATEGY_MCDX",          True),
             "sentinel":      _env_bool("STRATEGY_SENTINEL",      True),
+            "rvol":          _env_bool("STRATEGY_RVOL",          True),
         },
 
         # Risk management
@@ -105,6 +106,7 @@ def build_bot(config: dict):
     from trading.strategies.ai_signal import AISignalStrategy
     from trading.strategies.mcdx_strategy import MCDXStrategy
     from trading.strategies.sentinel_strategy import SentinelStrategy
+    from trading.strategies.rvol_strategy import RVolStrategy
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
     from trading.telegram_notifier import TelegramNotifier
@@ -141,6 +143,7 @@ def build_bot(config: dict):
         if flags.get("ai_signal"):      strategies.append(AISignalStrategy(sym))
         if flags.get("mcdx"):           strategies.append(MCDXStrategy(sym))
         if flags.get("sentinel"):       strategies.append(SentinelStrategy(sym))
+        if flags.get("rvol"):           strategies.append(RVolStrategy(sym))
 
     if not strategies:
         strategies.append(MACrossoverStrategy(symbols[0]))

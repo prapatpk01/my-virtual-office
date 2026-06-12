@@ -46,6 +46,7 @@ def _build_bot(config: dict, broadcast_fn: Callable):
     from trading.strategies.ai_signal import AISignalStrategy
     from trading.strategies.mcdx_strategy import MCDXStrategy
     from trading.strategies.sentinel_strategy import SentinelStrategy
+    from trading.strategies.rvol_strategy import RVolStrategy
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
     from trading.telegram_notifier import TelegramNotifier
@@ -84,6 +85,8 @@ def _build_bot(config: dict, broadcast_fn: Callable):
             strategies.append(MCDXStrategy(symbol))
         if strategy_flags.get("sentinel", False):
             strategies.append(SentinelStrategy(symbol))
+        if strategy_flags.get("rvol", True):
+            strategies.append(RVolStrategy(symbol))
 
     if not strategies:
         strategies.append(MACrossoverStrategy(symbols[0]))
