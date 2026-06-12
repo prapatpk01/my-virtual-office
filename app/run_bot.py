@@ -73,7 +73,7 @@ def build_config() -> dict:
             "rsi_macd":      _env_bool("STRATEGY_RSI_MACD",      True),
             "grid_trading":  _env_bool("STRATEGY_GRID",          False),
             "ai_signal":     _env_bool("STRATEGY_AI_SIGNAL",     False),
-            "mcdx":          _env_bool("STRATEGY_MCDX",          True),
+            "mcdx":          _env_bool("STRATEGY_MCDX",          False),
             "sentinel":      _env_bool("STRATEGY_SENTINEL",      False),
             "rvol":          _env_bool("STRATEGY_RVOL",          True),
         },
