@@ -47,6 +47,64 @@ class BotState:
     error: str = ""
 
 
+class SignalStats:
+    """Tracks live trade outcomes (SL/TP hits) and computes running statistics."""
+
+    def __init__(self):
+        self._outcomes: list[dict] = []
+
+    def record(self, symbol: str, side: str, entry: float, exit_price: float,
+               sl: Optional[float], tp: Optional[float], reason: str):
+        risk = abs(entry - sl) if sl else abs(entry - exit_price) or 1.0
+        if reason == "take_profit":
+            pnl_r = abs(exit_price - entry) / risk
+        else:
+            pnl_r = -1.0
+        self._outcomes.append({
+            "symbol": symbol,
+            "side": side,
+            "entry": round(entry, 4),
+            "exit": round(exit_price, 4),
+            "sl": sl,
+            "tp": tp,
+            "pnl_r": round(pnl_r, 2),
+            "reason": reason,
+            "ts": int(time.time() * 1000),
+        })
+
+    def summary(self) -> dict:
+        out = self._outcomes
+        if not out:
+            return {"trades": 0}
+        wins   = [o for o in out if o["pnl_r"] > 0]
+        losses = [o for o in out if o["pnl_r"] <= 0]
+        total_r = sum(o["pnl_r"] for o in out)
+        gross_profit = sum(o["pnl_r"] for o in wins)
+        gross_loss   = abs(sum(o["pnl_r"] for o in losses))
+        pf = round(gross_profit / gross_loss, 2) if gross_loss else 999.0
+
+        # current streak (+N win / -N loss)
+        streak = 0
+        if out:
+            sign = 1 if out[-1]["pnl_r"] > 0 else -1
+            for o in reversed(out):
+                if (o["pnl_r"] > 0) == (sign == 1):
+                    streak += sign
+                else:
+                    break
+
+        return {
+            "trades": len(out),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(len(wins) / len(out) * 100, 1),
+            "profit_factor": pf,
+            "total_r": round(total_r, 2),
+            "streak": streak,
+            "recent": out[-10:],
+        }
+
+
 class TradingBot:
     """
     Orchestrates multiple strategies across multiple connectors.
@@ -73,6 +131,7 @@ class TradingBot:
         self._task: Optional[asyncio.Task] = None
         self._start_balance = 0.0
         self._trade_history: list[TradeRecord] = []
+        self._stats = SignalStats()
 
     # ------------------------------------------------------------------
     # Public control
@@ -174,10 +233,22 @@ class TradingBot:
                     paper=self.connector.paper,
                 )
                 self._record_trade(trade)
+                # Record outcome for live stats
+                self._stats.record(
+                    symbol=sym, side=pos_info["side"],
+                    entry=pos_info["entry"], exit_price=price,
+                    sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
+                    reason=trigger,
+                )
                 self.risk.close_position(sym)
                 logger.info("Position closed by %s: %s", trigger, sym)
                 if self.telegram:
-                    self.telegram.notify_stop_event(sym, trigger, price, pnl)
+                    stats = self._stats.summary()
+                    self.telegram.notify_trade_closed(sym, trigger, price,
+                                                      pos_info["entry"],
+                                                      pos_info.get("stop_loss"),
+                                                      pos_info.get("take_profit"),
+                                                      stats)
 
         # Run each strategy
         new_signals = []
@@ -306,8 +377,10 @@ class TradingBot:
         except Exception as e:
             logger.warning("Broadcast failed: %s", e)
 
+    def get_stats(self) -> dict:
+        return self._stats.summary()
+
     def get_state(self) -> dict:
-        self._broadcast_state.__func__  # just reference
         return {
             "running": self.state.running,
             "paper": self.state.paper,

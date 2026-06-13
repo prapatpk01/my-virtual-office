@@ -253,6 +253,7 @@ async def main():
 
     if telegram:
         telegram.get_state_fn = crypto_bot.get_state
+        telegram.get_stats_fn = crypto_bot.get_stats
         telegram.stop_bot_fn  = lambda: _stop_signal.set()
 
     # Auto-optimize SL/TP via backtest on first symbol

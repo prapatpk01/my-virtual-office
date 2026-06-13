@@ -36,6 +36,7 @@ class TelegramNotifier:
         token: str,
         chat_id: str,
         get_state_fn: Optional[Callable] = None,
+        get_stats_fn: Optional[Callable] = None,
         start_bot_fn: Optional[Callable] = None,
         stop_bot_fn: Optional[Callable] = None,
         min_confidence: float = 0.5,
@@ -43,6 +44,7 @@ class TelegramNotifier:
         self.token = token.strip()
         self.chat_id = str(chat_id).strip()
         self.get_state_fn = get_state_fn
+        self.get_stats_fn = get_stats_fn
         self.start_bot_fn = start_bot_fn
         self.stop_bot_fn = stop_bot_fn
         self.min_confidence = min_confidence
@@ -134,7 +136,34 @@ class TelegramNotifier:
         )
         self.notify(text)
 
+    def notify_trade_closed(self, symbol: str, reason: str, exit_price: float,
+                            entry: float, sl, tp, stats: dict):
+        """Called when a position closes via SL or TP. Includes running stats."""
+        won = reason == "take_profit"
+        emoji = "✅" if won else "❌"
+        label = "Take-Profit" if won else "Stop-Loss"
+        risk = abs(entry - sl) if sl else 1.0
+        pnl_r = abs(exit_price - entry) / risk if won else -1.0
+        sign = "+" if pnl_r >= 0 else ""
+
+        total    = stats.get("trades", 0)
+        wr       = stats.get("win_rate", 0)
+        total_r  = stats.get("total_r", 0)
+        streak   = stats.get("streak", 0)
+        streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
+
+        text = (
+            f"{emoji} *{label}* — `{symbol}`\n"
+            f"Entry: `{entry:,.4f}` → Exit: `{exit_price:,.4f}`\n"
+            f"Result: `{sign}{pnl_r:.1f}R`\n\n"
+            f"📊 *Running Stats* ({total} trades)\n"
+            f"WR: `{wr:.1f}%` | Total: `{sign if total_r>=0 else ''}{total_r:.1f}R`\n"
+            f"Streak: `{streak_str}`"
+        )
+        self.notify(text)
+
     def notify_stop_event(self, symbol: str, event: str, price: float, pnl: float):
+        """Legacy — kept for compatibility."""
         emoji = "🛑" if event == "stop_loss" else "💰"
         label = "Stop-Loss Hit" if event == "stop_loss" else "Take-Profit Reached"
         sign = "+" if pnl >= 0 else ""
@@ -237,6 +266,7 @@ class TelegramNotifier:
                 "/positions — open positions\n"
                 "/trades — last 5 trades\n"
                 "/balance — balance & P\\&L\n"
+                "/stats — win rate & signal statistics\n"
                 "/start\\_bot — start the bot\n"
                 "/stop\\_bot — stop the bot\n"
                 "/help — this message"
@@ -317,6 +347,39 @@ class TelegramNotifier:
                 await self._send(f"⏹ {msg}")
             else:
                 await self._send("⚠️ stop\\_bot not configured")
+
+        elif cmd == "stats":
+            s = self.get_stats_fn() if self.get_stats_fn else {}
+            total = s.get("trades", 0)
+            if total == 0:
+                await self._send("📭 No closed trades yet\nStats will appear after the first SL/TP hit.")
+                return
+            wins    = s.get("wins", 0)
+            losses  = s.get("losses", 0)
+            wr      = s.get("win_rate", 0)
+            pf      = s.get("profit_factor", 0)
+            total_r = s.get("total_r", 0)
+            streak  = s.get("streak", 0)
+            recent  = s.get("recent", [])
+
+            streak_str = (f"W{streak} streak" if streak > 0 else f"L{abs(streak)} streak") if streak else "—"
+            sign = "+" if total_r >= 0 else ""
+
+            lines = [
+                f"📊 *Signal Statistics*\n",
+                f"Total trades: `{total}` ({wins}W / {losses}L)",
+                f"Win Rate: `{wr:.1f}%`",
+                f"Profit Factor: `{pf:.2f}`",
+                f"Total R: `{sign}{total_r:.1f}R`",
+                f"Streak: `{streak_str}`\n",
+                "_Last 5 closed trades:_",
+            ]
+            for o in reversed(recent[-5:]):
+                e = "✅" if o["pnl_r"] > 0 else "❌"
+                sign_r = "+" if o["pnl_r"] >= 0 else ""
+                lines.append(f"{e} `{o['symbol']}` {o['side']} → `{sign_r}{o['pnl_r']:.1f}R` ({o['reason']})")
+
+            await self._send("\n".join(lines))
 
         else:
             await self._send(f"❓ Unknown command: `{text}`\nType /help for commands.")
