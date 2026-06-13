@@ -27,15 +27,16 @@ class MACDEMAStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.hma_period = self.params.get("hma_period",   15)
-        self.ema_fast   = self.params.get("ema_fast",      9)
-        self.sma_slow   = self.params.get("sma_slow",     21)
-        self.macd_fast  = self.params.get("macd_fast",    12)
-        self.macd_slow  = self.params.get("macd_slow",    26)
-        self.macd_sig   = self.params.get("macd_signal",   9)
+        self.hma_period  = self.params.get("hma_period",    15)
+        self.ema_fast    = self.params.get("ema_fast",       9)
+        self.sma_slow    = self.params.get("sma_slow",      21)
+        self.macd_fast   = self.params.get("macd_fast",     12)
+        self.macd_slow   = self.params.get("macd_slow",     26)
+        self.macd_sig    = self.params.get("macd_signal",    9)
+        self.adx_threshold = self.params.get("adx_threshold", 15)
         # SL/TP — updated by backtest at startup
-        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",    1.5)
+        self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
+        self.rr_ratio    = self.params.get("rr_ratio",     1.5)
 
     # ------------------------------------------------------------------
     # Live signal
@@ -56,7 +57,8 @@ class MACDEMAStrategy(BaseStrategy):
         macd_line, signal_line, _ = self.macd(
             closes, self.macd_fast, self.macd_slow, self.macd_sig
         )
-        atr_arr = self.atr(candles, _ATR_PERIOD)
+        atr_arr        = self.atr(candles, _ATR_PERIOD)
+        adx_arr, _, _  = self.adx(candles, 14)
 
         p     = current_price
         hma   = float(hma15[-1])
@@ -65,6 +67,7 @@ class MACDEMAStrategy(BaseStrategy):
         ml_c  = float(macd_line[-1]);   ml_p  = float(macd_line[-2])
         sl_c  = float(signal_line[-1]); sl_p  = float(signal_line[-2])
         current_atr = float(atr_arr[-1])
+        current_adx = float(adx_arr[-1]) if not np.isnan(adx_arr[-1]) else 0.0
 
         if any(np.isnan(v) for v in [hma, e9_c, s21_c, ml_c, sl_c, current_atr]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Indicator NaN")
@@ -82,6 +85,14 @@ class MACDEMAStrategy(BaseStrategy):
 
         buy_votes  = sum(1 for v in [vote_b, vote_c] if v ==  1)
         sell_votes = sum(1 for v in [vote_b, vote_c] if v == -1)
+
+        # ── ADX gate — filter sideways markets ────────────────────────
+        if current_adx < self.adx_threshold:
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                f"[ADX BLOCK] ADX={current_adx:.1f} < {self.adx_threshold}",
+                metadata={"hma15": hma, "open": open_price, "adx": round(current_adx, 1)},
+            )
 
         # ── MTF bias (D) — final gate, must agree with A ──────────────
         mtf_pass, mtf_label = _check_mtf(mtf_candles, vote_a, self.hma_period)
@@ -109,6 +120,7 @@ class MACDEMAStrategy(BaseStrategy):
                     "ema9": e9_c, "sma21": s21_c,
                     "macd": ml_c, "macd_signal": sl_c,
                     "atr": round(current_atr, 4),
+                    "adx": round(current_adx, 1),
                     "stop_loss": sl_price,
                     "take_profit": tp_price,
                     "rr": self.rr_ratio,
@@ -140,6 +152,7 @@ class MACDEMAStrategy(BaseStrategy):
                     "ema9": e9_c, "sma21": s21_c,
                     "macd": ml_c, "macd_signal": sl_c,
                     "atr": round(current_atr, 4),
+                    "adx": round(current_adx, 1),
                     "stop_loss": sl_price,
                     "take_profit": tp_price,
                     "rr": self.rr_ratio,
