@@ -74,7 +74,7 @@ def build_config() -> dict:
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
         "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
         "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.06")),
-        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "5")),
+        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "3")),
         "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID",   ""),
         "tg_min_confidence": float(os.environ.get("TG_MIN_CONFIDENCE", "0.5")),

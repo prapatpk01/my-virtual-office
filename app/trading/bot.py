@@ -201,9 +201,15 @@ class TradingBot:
                 new_signals.append(sig_dict)
 
                 if signal.type != SignalType.HOLD:
-                    if self.telegram:
-                        self.telegram.notify_signal(sig_dict)
-                    await self._execute_signal(signal, strategy.name)
+                    can_open, _ = self.risk.can_open(signal.symbol)
+                    # signal_only bots (forex, max_positions=0) always notify; trading bots only when slot is free
+                    signal_only_mode = self.risk.max_open_positions == 0
+                    if can_open or signal_only_mode:
+                        if self.telegram:
+                            self.telegram.notify_signal(sig_dict)
+                        await self._execute_signal(signal, strategy.name)
+                    else:
+                        logger.debug("Signal suppressed for %s — position already open or max reached", signal.symbol)
 
             except Exception as e:
                 logger.error("Strategy %s error: %s", strategy.name, e)
