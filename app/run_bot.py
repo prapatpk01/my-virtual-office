@@ -65,7 +65,7 @@ def build_config() -> dict:
         "api_key":      os.environ.get("EXCHANGE_API_KEY", ""),
         "api_secret":   os.environ.get("EXCHANGE_API_SECRET", ""),
         "paper":        _env_bool("PAPER_TRADING", True),
-        "symbols":      _env_list("SYMBOLS", "BTC/USDT,ETH/USDT"),
+        "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
             "wt_adx":   _env_bool("STRATEGY_WT_ADX",   False),
@@ -79,7 +79,7 @@ def build_config() -> dict:
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID",   ""),
         "tg_min_confidence": float(os.environ.get("TG_MIN_CONFIDENCE", "0.5")),
         # Forex / Gold signal-only symbols (Yahoo Finance, no order execution)
-        "forex_symbols": _env_list("FOREX_SYMBOLS", "XAUUSD,EURUSD,USDJPY"),
+        "forex_symbols": _env_list("FOREX_SYMBOLS", "XAUUSD"),
         "forex_enabled": _env_bool("FOREX_SIGNALS", True),
         "forex_interval": int(os.environ.get("FOREX_INTERVAL_SECONDS", "60")),
     }
