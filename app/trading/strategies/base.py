@@ -169,9 +169,10 @@ class BaseStrategy(ABC):
                 s_md[i] = s_md[i-1] - s_md[i-1]/period + mdm[i]
         plus_di  = np.where(s_tr > 0, 100 * s_pd / s_tr, 0.0)
         minus_di = np.where(s_tr > 0, 100 * s_md / s_tr, 0.0)
+        dsum = plus_di + minus_di
         dx = np.where(
-            (plus_di + minus_di) > 0,
-            100 * np.abs(plus_di - minus_di) / (plus_di + minus_di),
+            dsum > 0,
+            100 * np.abs(plus_di - minus_di) / np.where(dsum > 0, dsum, 1.0),
             0.0,
         )
         adx_arr = np.full(n, np.nan)
