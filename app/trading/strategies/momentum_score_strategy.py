@@ -3,7 +3,7 @@ Momentum Score Strategy — weighted scoring for 3-5 signals/day, target WR >72%
 
 Gates (all must pass before scoring):
   A)   Candle open vs HMA15       (core direction gate)
-  B)   Candle close vs open       (confirmation: bullish close for BUY, bearish for SELL)
+  B)   2/3 candles confirm        (≥2 of last 3 candles bullish for BUY, bearish for SELL)
   MTF) 1H + 4H HMA15 agree        (anti-chop gate)
 
 Score 0–8:
@@ -93,18 +93,18 @@ class MomentumScoreStrategy(BaseStrategy):
                           "[HOLD] open≈HMA15",
                           metadata={"hma15": round(hma, 2), "open": open_price})
 
-        # ── Gate B: candle direction confirmation ────────────────────
-        last_close = float(candles[-1].close)
-        last_open  = float(candles[-1].open)
-        candle_bullish = last_close > last_open
-        candle_bearish = last_close < last_open
-        if gate_a == 1 and not candle_bullish:
+        # ── Gate B: 2/3 candles momentum confirmation ────────────────
+        # At least 2 of the last 3 candles must close in signal direction
+        last3 = candles[-3:]
+        bull_count = sum(1 for c in last3 if c.close > c.open)
+        bear_count = sum(1 for c in last3 if c.close < c.open)
+        if gate_a == 1 and bull_count < 2:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                          "[HOLD] BUY gate A ok but candle bearish",
+                          f"[HOLD] BUY: only {bull_count}/3 bullish candles",
                           metadata={"hma15": round(hma, 2), "open": open_price})
-        if gate_a == -1 and not candle_bearish:
+        if gate_a == -1 and bear_count < 2:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                          "[HOLD] SELL gate A ok but candle bullish",
+                          f"[HOLD] SELL: only {bear_count}/3 bearish candles",
                           metadata={"hma15": round(hma, 2), "open": open_price})
 
         # ── Gate MTF ─────────────────────────────────────────────────
