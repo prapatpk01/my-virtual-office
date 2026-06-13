@@ -8,7 +8,7 @@ Gates (both must pass before scoring):
 Score 0–8:
   B  EMA9 > SMA21                 +1
   C  MACD > Signal                +2   (MACD+RSI combo = 73% WR)
-  D  RSI in momentum zone         +2   BUY: 40-70 / SELL: 30-60
+  D  RSI in momentum zone         +2   BUY: 42-68 / SELL: 32-58
   E  ADX > 20                     +2   (reduces false signals 30%)
   F  Price vs SMA200              +1   (+15-25% WR)
 
@@ -41,10 +41,10 @@ class MomentumScoreStrategy(BaseStrategy):
         self.macd_slow       = self.params.get("macd_slow",        26)
         self.macd_sig        = self.params.get("macd_signal",       9)
         self.adx_threshold   = self.params.get("adx_threshold",    20)
-        self.rsi_buy_lo      = self.params.get("rsi_buy_lo",       40)
-        self.rsi_buy_hi      = self.params.get("rsi_buy_hi",       70)
-        self.rsi_sell_lo     = self.params.get("rsi_sell_lo",      30)
-        self.rsi_sell_hi     = self.params.get("rsi_sell_hi",      60)
+        self.rsi_buy_lo      = self.params.get("rsi_buy_lo",       42)
+        self.rsi_buy_hi      = self.params.get("rsi_buy_hi",       68)
+        self.rsi_sell_lo     = self.params.get("rsi_sell_lo",      32)
+        self.rsi_sell_hi     = self.params.get("rsi_sell_hi",      58)
         self.score_threshold = self.params.get("score_threshold",   5)
         self.sl_atr_mult     = self.params.get("sl_atr_mult",     1.5)
         self.rr_ratio        = self.params.get("rr_ratio",        1.5)
