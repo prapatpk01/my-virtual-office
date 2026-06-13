@@ -129,6 +129,8 @@ class TradingBot:
         self.telegram = telegram
         self.state = BotState(paper=connector.paper)
         self._task: Optional[asyncio.Task] = None
+        # {symbol: (direction_str, timestamp_ms)} — suppress duplicate forex alerts
+        self._last_signal_dir: dict[str, tuple[str, int]] = {}
         self._start_balance = 0.0
         self._trade_history: list[TradeRecord] = []
         self._stats = SignalStats()
@@ -273,9 +275,22 @@ class TradingBot:
 
                 if signal.type != SignalType.HOLD:
                     can_open, _ = self.risk.can_open(signal.symbol)
-                    # signal_only bots (forex, max_positions=0) always notify; trading bots only when slot is free
                     signal_only_mode = self.risk.max_open_positions == 0
-                    if can_open or signal_only_mode:
+
+                    if signal_only_mode:
+                        # Forex/signal-only: only alert when direction CHANGES or after 4h
+                        last_dir, last_ts = self._last_signal_dir.get(signal.symbol, (None, 0))
+                        now_ms = int(time.time() * 1000)
+                        direction_changed = last_dir != signal.type.value
+                        four_hours_ms = 4 * 3600 * 1000
+                        should_notify = direction_changed or (now_ms - last_ts) > four_hours_ms
+                        if should_notify:
+                            self._last_signal_dir[signal.symbol] = (signal.type.value, now_ms)
+                            if self.telegram:
+                                self.telegram.notify_signal(sig_dict)
+                        else:
+                            logger.debug("Forex signal suppressed for %s — same direction as last alert", signal.symbol)
+                    elif can_open:
                         if self.telegram:
                             self.telegram.notify_signal(sig_dict)
                         await self._execute_signal(signal, strategy.name)

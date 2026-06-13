@@ -75,6 +75,10 @@ class YahooConnector(BaseConnector):
     async def fetch_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 250) -> List[OHLCV]:
         candles = await asyncio.to_thread(self._fetch_sync, symbol, timeframe, limit)
         if candles:
+            # Reject stale data: forex closes Fri night → Sun night (~48h gap max)
+            age_hours = (time.time() - candles[-1].timestamp) / 3600
+            if age_hours > 50:
+                return []   # strategy returns HOLD → no signal during market closure
             self._price_cache[symbol] = candles[-1].close
         return candles
 
