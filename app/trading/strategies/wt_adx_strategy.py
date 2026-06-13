@@ -46,7 +46,16 @@ class WTADXStrategy(BaseStrategy):
         h = np.array(highs); l = np.array(lows); c = np.array(closes)
         ap  = (h + l + c) / 3.0
         esa = np.array(self.ema(ap.tolist(), self.n1))
-        d   = np.array(self.ema(np.abs(ap - esa).tolist(), self.n1))
+        diff_abs = np.abs(ap - esa)
+        # esa has NaN for first n1-1 bars; backfill with first valid value
+        # so EMA seed can be computed (mirrors Pine Script NaN-skip behaviour)
+        first_ok = np.where(~np.isnan(diff_abs))[0]
+        if len(first_ok):
+            diff_filled = diff_abs.copy()
+            diff_filled[:first_ok[0]] = diff_abs[first_ok[0]]
+        else:
+            diff_filled = diff_abs
+        d   = np.array(self.ema(diff_filled.tolist(), self.n1))
         ci  = np.where(d > 1e-10, (ap - esa) / (0.015 * d), 0.0)
         tci = np.array(self.ema(ci.tolist(), self.n2))
         wt1 = tci
