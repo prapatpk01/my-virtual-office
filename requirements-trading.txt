@@ -13,5 +13,8 @@ numpy>=1.26.0
 # Anthropic SDK (only needed for AI Signal strategy)
 anthropic>=0.25.0
 
+# Forex / Gold data feed (free, no API key needed)
+yfinance>=0.2.40
+
 # Optional: for loading .env file automatically
 # python-dotenv>=1.0.0

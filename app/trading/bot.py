@@ -84,7 +84,8 @@ class TradingBot:
             return
         self.state.running = True
         loop = asyncio.get_event_loop()
-        if self.telegram:
+        skip_polling = getattr(self, "_skip_telegram_polling", False)
+        if self.telegram and not skip_polling:
             self.telegram.start_polling(loop)
             strategy_names = [s.name for s in self.strategies]
             symbols = list({s.symbol for s in self.strategies})
@@ -182,7 +183,7 @@ class TradingBot:
         new_signals = []
         for strategy in self.strategies:
             try:
-                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="1h", limit=100)
+                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="15m", limit=250)
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
                 signal = await strategy.analyze(candles, current_price)

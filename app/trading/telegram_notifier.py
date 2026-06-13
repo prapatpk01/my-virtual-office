@@ -58,7 +58,7 @@ class TelegramNotifier:
 
     def start_polling(self, loop: asyncio.AbstractEventLoop):
         """Start the Telegram command polling loop on the given event loop."""
-        if not self._enabled:
+        if not self._enabled or self._polling_task:   # prevent double-start
             return
         self._loop = loop
         self._polling_task = loop.create_task(self._poll_loop())
@@ -79,8 +79,14 @@ class TelegramNotifier:
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._send(text), self._loop)
         else:
-            # Fallback: create a temporary event loop
-            asyncio.run(self._send(text))
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._send(text))
+                else:
+                    loop.run_until_complete(self._send(text))
+            except Exception:
+                pass
 
     def notify_signal(self, signal_dict: dict):
         sig_type = signal_dict.get("type", "hold")
