@@ -98,7 +98,7 @@ class BinanceConnector(BaseConnector):
             filled=amount,
             status="closed",
         )
-        self._paper_orders.append(order)
+        self._paper_open_orders.append(order)
         return order
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:

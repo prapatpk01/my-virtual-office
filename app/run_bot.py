@@ -215,6 +215,13 @@ async def main():
     await crypto_bot.stop()
     if forex_bot:
         await forex_bot.stop()
+
+    # Close exchange sessions to prevent unclosed resource warnings
+    try:
+        await crypto_bot.connector.close()
+    except Exception:
+        pass
+
     logger.info("All bots stopped.")
 
 
