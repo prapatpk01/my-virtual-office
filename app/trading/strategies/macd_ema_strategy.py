@@ -62,6 +62,7 @@ class MACDEMAStrategy(BaseStrategy):
 
         p     = current_price
         hma   = float(hma15[-1])
+        hma_p = float(hma15[-2])   # previous HMA for slope check
         e9_c  = float(ema9[-1]);        e9_p  = float(ema9[-2])
         s21_c = float(sma21[-1]);       s21_p = float(sma21[-2])
         ml_c  = float(macd_line[-1]);   ml_p  = float(macd_line[-2])
@@ -85,6 +86,21 @@ class MACDEMAStrategy(BaseStrategy):
 
         buy_votes  = sum(1 for v in [vote_b, vote_c] if v ==  1)
         sell_votes = sum(1 for v in [vote_b, vote_c] if v == -1)
+
+        # ── HMA slope gate — confirm trend direction ──────────────────
+        hma_slope = hma - hma_p
+        if vote_a == 1 and hma_slope <= 0:
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                f"[HMA BLOCK] BUY but HMA falling ({hma_slope:+.2f})",
+                metadata={"hma15": hma, "open": open_price, "hma_slope": round(hma_slope, 4)},
+            )
+        if vote_a == -1 and hma_slope >= 0:
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                f"[HMA BLOCK] SELL but HMA rising ({hma_slope:+.2f})",
+                metadata={"hma15": hma, "open": open_price, "hma_slope": round(hma_slope, 4)},
+            )
 
         # ── ADX gate — filter sideways markets ────────────────────────
         if current_adx < self.adx_threshold:
