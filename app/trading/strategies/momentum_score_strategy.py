@@ -1,8 +1,9 @@
 """
 Momentum Score Strategy — weighted scoring for 3-5 signals/day, target WR >72%.
 
-Gates (both must pass before scoring):
+Gates (all must pass before scoring):
   A)   Candle open vs HMA15       (core direction gate)
+  B)   Candle close vs open       (confirmation: bullish close for BUY, bearish for SELL)
   MTF) 1H + 4H HMA15 agree        (anti-chop gate)
 
 Score 0–8:
@@ -90,6 +91,20 @@ class MomentumScoreStrategy(BaseStrategy):
         if gate_a == 0:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           "[HOLD] open≈HMA15",
+                          metadata={"hma15": round(hma, 2), "open": open_price})
+
+        # ── Gate B: candle direction confirmation ────────────────────
+        last_close = float(candles[-1].close)
+        last_open  = float(candles[-1].open)
+        candle_bullish = last_close > last_open
+        candle_bearish = last_close < last_open
+        if gate_a == 1 and not candle_bullish:
+            return Signal(SignalType.HOLD, self.symbol, current_price, 0,
+                          "[HOLD] BUY gate A ok but candle bearish",
+                          metadata={"hma15": round(hma, 2), "open": open_price})
+        if gate_a == -1 and not candle_bearish:
+            return Signal(SignalType.HOLD, self.symbol, current_price, 0,
+                          "[HOLD] SELL gate A ok but candle bullish",
                           metadata={"hma15": round(hma, 2), "open": open_price})
 
         # ── Gate MTF ─────────────────────────────────────────────────
