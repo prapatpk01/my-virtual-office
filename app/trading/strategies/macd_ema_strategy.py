@@ -18,7 +18,7 @@ logger = logging.getLogger("macd_ema_strategy")
 
 # Parameter search space for backtest
 _SL_MULTS  = [1.0, 1.5, 2.0, 2.5]
-_RR_RATIOS = [1.5, 2.0, 3.0]
+_RR_RATIOS = [1.5]
 _ATR_PERIOD = 14
 _LOOKFORWARD = 60  # max candles to look for SL/TP hit
 
@@ -35,7 +35,7 @@ class MACDEMAStrategy(BaseStrategy):
         self.macd_sig   = self.params.get("macd_signal",   9)
         # SL/TP — updated by backtest at startup
         self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",    2.0)
+        self.rr_ratio    = self.params.get("rr_ratio",    1.5)
 
     # ------------------------------------------------------------------
     # Live signal
