@@ -65,7 +65,7 @@ def build_config() -> dict:
         "api_key":      os.environ.get("EXCHANGE_API_KEY", ""),
         "api_secret":   os.environ.get("EXCHANGE_API_SECRET", ""),
         "paper":        _env_bool("PAPER_TRADING", True),
-        "symbols":      _env_list("SYMBOLS", "BTC/USDT,ETH/USDT"),
+        "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
             "wt_adx":   _env_bool("STRATEGY_WT_ADX",   False),
@@ -74,12 +74,12 @@ def build_config() -> dict:
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
         "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
         "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.06")),
-        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "5")),
+        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "3")),
         "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID",   ""),
         "tg_min_confidence": float(os.environ.get("TG_MIN_CONFIDENCE", "0.5")),
         # Forex / Gold signal-only symbols (Yahoo Finance, no order execution)
-        "forex_symbols": _env_list("FOREX_SYMBOLS", "XAUUSD,EURUSD,USDJPY"),
+        "forex_symbols": _env_list("FOREX_SYMBOLS", "XAUUSD"),
         "forex_enabled": _env_bool("FOREX_SIGNALS", True),
         "forex_interval": int(os.environ.get("FOREX_INTERVAL_SECONDS", "60")),
     }
@@ -177,6 +177,54 @@ def build_forex_bot(config: dict, telegram):
 _stop_signal = asyncio.Event()
 
 
+async def _run_backtest(crypto_bot, config: dict, telegram):
+    """Fetch 500 candles on first symbol, run backtest, apply best SL/TP to all strategies."""
+    from trading.strategies.macd_ema_strategy import MACDEMAStrategy
+    macd_strats = [s for s in crypto_bot.strategies if isinstance(s, MACDEMAStrategy)]
+    if not macd_strats:
+        return
+
+    symbol = macd_strats[0].symbol
+    logger.info("Running SL/TP backtest on %s (500 candles 15m)…", symbol)
+    try:
+        candles = await crypto_bot.connector.fetch_ohlcv(symbol, timeframe="15m", limit=500)
+        stats, best = await macd_strats[0].backtest(candles)
+
+        if not stats:
+            logger.warning("Backtest returned no results")
+            return
+
+        # Log full stats table
+        header = f"{'Config':<22} {'Trades':>6} {'WR%':>6} {'PF':>6} {'R total':>8}"
+        logger.info("Backtest results for %s:\n%s", symbol, header)
+        for key, v in sorted(stats.items(), key=lambda x: -x[1]["total_r"]):
+            logger.info("  %-22s  %6d  %5.1f%%  %5.2f  %+7.1fR",
+                        key, v["trades"], v["win_rate"], v["profit_factor"], v["total_r"])
+
+        if best:
+            sl_m, rr = best
+            logger.info("Best config: SL=%.1fxATR  RR=1:%.1f — applying to all strategies", sl_m, rr)
+            for s in macd_strats:
+                s.sl_atr_mult = sl_m
+                s.rr_ratio    = rr
+
+            if telegram:
+                best_stat = stats.get(f"SL={sl_m}xATR  RR=1:{rr}", {})
+                telegram.notify(
+                    f"📊 *Backtest complete* ({symbol} 500×15m)\n"
+                    f"Best: SL=`{sl_m}×ATR`  R:R=`1:{rr}`\n"
+                    f"WR: `{best_stat.get('win_rate',0):.1f}%` | "
+                    f"PF: `{best_stat.get('profit_factor',0):.2f}` | "
+                    f"Trades: `{best_stat.get('trades',0)}`\n"
+                    f"_Applied to live bot_"
+                )
+        else:
+            logger.warning("Backtest: not enough trades to pick best config, using defaults")
+
+    except Exception as e:
+        logger.warning("Backtest failed (non-fatal): %s", e)
+
+
 async def main():
     config = build_config()
     logger.info("=== Bot starting [%s] crypto=%s forex=%s ===",
@@ -205,7 +253,12 @@ async def main():
 
     if telegram:
         telegram.get_state_fn = crypto_bot.get_state
+        telegram.get_stats_fn = crypto_bot.get_stats
         telegram.stop_bot_fn  = lambda: _stop_signal.set()
+        telegram.start_bot_fn = lambda: {"message": "Bot is already running"}
+
+    # Auto-optimize SL/TP via backtest on first symbol
+    await _run_backtest(crypto_bot, config, telegram)
 
     # Start both bots concurrently
     tasks = [asyncio.create_task(crypto_bot.start())]
