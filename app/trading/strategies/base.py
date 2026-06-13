@@ -101,6 +101,23 @@ class BaseStrategy(ABC):
         return upper, sma, lower
 
     @staticmethod
+    def atr(candles: list, period: int = 14) -> np.ndarray:
+        """Average True Range using Wilder's smoothing (RMA)."""
+        n = len(candles)
+        tr = np.full(n, np.nan)
+        for i in range(1, n):
+            h  = candles[i].high
+            l  = candles[i].low
+            pc = candles[i - 1].close
+            tr[i] = max(h - l, abs(h - pc), abs(l - pc))
+        result = np.full(n, np.nan)
+        if n > period:
+            result[period] = float(np.nanmean(tr[1:period + 1]))
+            for i in range(period + 1, n):
+                result[i] = (result[i - 1] * (period - 1) + tr[i]) / period
+        return result
+
+    @staticmethod
     def wma(values: list[float], period: int) -> np.ndarray:
         """Weighted Moving Average — linearly weighted, newest bar has highest weight."""
         arr = np.array(values, dtype=float)

@@ -95,17 +95,30 @@ class TelegramNotifier:
         conf = signal_dict.get("confidence", 0)
         if conf < self.min_confidence:
             return
-        emoji = "🟢" if sig_type == "buy" else "🔴"
-        sym  = signal_dict.get("symbol", "")
-        strat = signal_dict.get("strategy", "")
-        price = signal_dict.get("price", 0)
+        emoji  = "🟢" if sig_type == "buy" else "🔴"
+        sym    = signal_dict.get("symbol", "")
+        strat  = signal_dict.get("strategy", "")
+        price  = signal_dict.get("price", 0)
         reason = signal_dict.get("reason", "")
+        meta   = signal_dict.get("metadata", {})
+
+        sl  = meta.get("stop_loss")
+        tp  = meta.get("take_profit")
+        rr  = meta.get("rr")
+
+        sl_tp_line = ""
+        if sl and tp and rr:
+            sl_tp_line = (
+                f"\n🛑 SL: `{sl:,.4f}`\n"
+                f"🎯 TP: `{tp:,.4f}`\n"
+                f"📐 R:R `1:{rr:.1f}`"
+            )
         text = (
             f"{emoji} *{sig_type.upper()} Signal*\n"
             f"`{sym}` @ `{price:,.4f}`\n"
-            f"Strategy: {strat}\n"
-            f"Confidence: {conf*100:.0f}%\n"
+            f"Strategy: {strat} | Conf: {conf*100:.0f}%\n"
             f"_{reason}_"
+            f"{sl_tp_line}"
         )
         self.notify(text)
 

@@ -1,30 +1,44 @@
 """
-MACD + EMA Voting Strategy — 2/3 confirmation system on 15m timeframe.
+MACD + EMA Voting Strategy — 2/3 confirmation + ATR-based SL/TP.
 
-Three independent voters:
-  A) HMA15 gate   — close > HMA15 → BUY vote;  close < HMA15 → SELL vote
-  B) EMA9/SMA21   — EMA9  > SMA21  → BUY vote;  EMA9  < SMA21  → SELL vote
-  C) MACD         — MACD  > Signal → BUY vote;  MACD  < Signal → SELL vote
+Three voters:
+  A) price vs HMA15
+  B) EMA9  vs SMA21  (cross detection)
+  C) MACD  vs Signal (cross detection)
 
-Signal fired when 2 or 3 voters agree:
-  2/3 → confidence 0.65
-  3/3 → confidence 0.85
-  +0.10 bonus if a crossover just happened (B or C)
+Signal when 2/3 agree. SL/TP computed from ATR.
+Backtest finds the optimal SL multiplier + R:R ratio automatically.
 """
+import logging
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
+
+logger = logging.getLogger("macd_ema_strategy")
+
+# Parameter search space for backtest
+_SL_MULTS  = [1.0, 1.5, 2.0, 2.5]
+_RR_RATIOS = [1.5, 2.0, 3.0]
+_ATR_PERIOD = 14
+_LOOKFORWARD = 60  # max candles to look for SL/TP hit
 
 
 class MACDEMAStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.hma_period = self.params.get("hma_period",  15)
-        self.ema_fast   = self.params.get("ema_fast",     9)
-        self.sma_slow   = self.params.get("sma_slow",    21)
-        self.macd_fast  = self.params.get("macd_fast",   12)
-        self.macd_slow  = self.params.get("macd_slow",   26)
-        self.macd_sig   = self.params.get("macd_signal",  9)
+        self.hma_period = self.params.get("hma_period",   15)
+        self.ema_fast   = self.params.get("ema_fast",      9)
+        self.sma_slow   = self.params.get("sma_slow",     21)
+        self.macd_fast  = self.params.get("macd_fast",    12)
+        self.macd_slow  = self.params.get("macd_slow",    26)
+        self.macd_sig   = self.params.get("macd_signal",   9)
+        # SL/TP — updated by backtest at startup
+        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
+        self.rr_ratio    = self.params.get("rr_ratio",    2.0)
+
+    # ------------------------------------------------------------------
+    # Live signal
+    # ------------------------------------------------------------------
 
     async def analyze(self, candles: list, current_price: float) -> Signal:
         min_len = self.macd_slow + self.macd_sig + self.hma_period + 5
@@ -39,72 +53,70 @@ class MACDEMAStrategy(BaseStrategy):
         macd_line, signal_line, _ = self.macd(
             closes, self.macd_fast, self.macd_slow, self.macd_sig
         )
+        atr_arr = self.atr(candles, _ATR_PERIOD)
 
         p     = current_price
         hma   = float(hma15[-1])
-        e9_c  = float(ema9[-1]);     e9_p  = float(ema9[-2])
-        s21_c = float(sma21[-1]);    s21_p = float(sma21[-2])
-        ml_c  = float(macd_line[-1]); ml_p = float(macd_line[-2])
+        e9_c  = float(ema9[-1]);      e9_p  = float(ema9[-2])
+        s21_c = float(sma21[-1]);     s21_p = float(sma21[-2])
+        ml_c  = float(macd_line[-1]); ml_p  = float(macd_line[-2])
         sl_c  = float(signal_line[-1]); sl_p = float(signal_line[-2])
+        current_atr = float(atr_arr[-1])
 
-        if any(np.isnan(v) for v in [hma, e9_c, s21_c, ml_c, sl_c]):
+        if any(np.isnan(v) for v in [hma, e9_c, s21_c, ml_c, sl_c, current_atr]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Indicator NaN")
 
-        # ── 3 voters (+1 = BUY, -1 = SELL, 0 = neutral) ─────────────
-        vote_a = 1 if p > hma   else (-1 if p < hma   else 0)  # HMA15
-        vote_b = 1 if e9_c > s21_c else (-1 if e9_c < s21_c else 0)  # EMA9/SMA21
-        vote_c = 1 if ml_c > sl_c  else (-1 if ml_c < sl_c  else 0)  # MACD
-
+        vote_a, vote_b, vote_c = _votes(p, hma, e9_c, s21_c, ml_c, sl_c)
         buy_votes  = sum(1 for v in [vote_a, vote_b, vote_c] if v ==  1)
         sell_votes = sum(1 for v in [vote_a, vote_b, vote_c] if v == -1)
 
-        # Crossover detection (confidence bonus + reason label)
         b_cross_up   = e9_p <= s21_p and e9_c > s21_c
         b_cross_down = e9_p >= s21_p and e9_c < s21_c
         c_cross_up   = ml_p <= sl_p  and ml_c > sl_c
         c_cross_down = ml_p >= sl_p  and ml_c < sl_c
 
-        def _build_reason(direction: str, votes: int) -> tuple[str, float]:
-            tags = []
-            if vote_a == (1 if direction == "buy" else -1):
-                tags.append(f"HMA15={'above' if direction=='buy' else 'below'}")
-            if vote_b == (1 if direction == "buy" else -1):
-                cross = " ✚cross" if (b_cross_up if direction == "buy" else b_cross_down) else ""
-                tags.append(f"EMA9{'>' if direction=='buy' else '<'}SMA21{cross}")
-            if vote_c == (1 if direction == "buy" else -1):
-                cross = " ✚cross" if (c_cross_up if direction == "buy" else c_cross_down) else ""
-                tags.append(f"MACD{'>' if direction=='buy' else '<'}Sig{cross}")
-
-            conf = 0.85 if votes == 3 else 0.65
-            if (direction == "buy"  and (b_cross_up  or c_cross_up)) or \
-               (direction == "sell" and (b_cross_down or c_cross_down)):
-                conf = min(conf + 0.10, 0.95)
-
-            return f"[{votes}/3] {' + '.join(tags)}", conf
-
         if buy_votes >= 2:
-            reason, conf = _build_reason("buy", buy_votes)
+            reason, conf = _build_reason(
+                "buy", buy_votes, vote_a, vote_b, vote_c,
+                b_cross_up, b_cross_down, c_cross_up, c_cross_down,
+            )
+            sl_price = round(p - self.sl_atr_mult * current_atr, 4)
+            tp_price = round(p + self.sl_atr_mult * self.rr_ratio * current_atr, 4)
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol,
-                price=p, amount=0.0, confidence=conf,
-                reason=reason,
-                metadata={"hma15": hma, "ema9": e9_c, "sma21": s21_c,
-                          "macd": ml_c, "signal": sl_c,
-                          "votes": buy_votes},
+                price=p, amount=0.0, confidence=conf, reason=reason,
+                metadata={
+                    "hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                    "macd": ml_c, "macd_signal": sl_c,
+                    "atr": round(current_atr, 4),
+                    "stop_loss": sl_price,
+                    "take_profit": tp_price,
+                    "rr": self.rr_ratio,
+                    "votes": buy_votes,
+                },
             )
 
         if sell_votes >= 2:
-            reason, conf = _build_reason("sell", sell_votes)
+            reason, conf = _build_reason(
+                "sell", sell_votes, vote_a, vote_b, vote_c,
+                b_cross_up, b_cross_down, c_cross_up, c_cross_down,
+            )
+            sl_price = round(p + self.sl_atr_mult * current_atr, 4)
+            tp_price = round(p - self.sl_atr_mult * self.rr_ratio * current_atr, 4)
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol,
-                price=p, amount=0.0, confidence=conf,
-                reason=reason,
-                metadata={"hma15": hma, "ema9": e9_c, "sma21": s21_c,
-                          "macd": ml_c, "signal": sl_c,
-                          "votes": sell_votes},
+                price=p, amount=0.0, confidence=conf, reason=reason,
+                metadata={
+                    "hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                    "macd": ml_c, "macd_signal": sl_c,
+                    "atr": round(current_atr, 4),
+                    "stop_loss": sl_price,
+                    "take_profit": tp_price,
+                    "rr": self.rr_ratio,
+                    "votes": sell_votes,
+                },
             )
 
-        # HOLD — show vote breakdown for transparency
         votes_str = (
             f"A={'B' if vote_a==1 else 'S' if vote_a==-1 else '-'} "
             f"B={'B' if vote_b==1 else 'S' if vote_b==-1 else '-'} "
@@ -113,7 +125,151 @@ class MACDEMAStrategy(BaseStrategy):
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
             f"[HOLD] {votes_str} | HMA15={hma:.2f}",
-            metadata={"hma15": hma, "ema9": e9_c, "sma21": s21_c,
-                      "macd": ml_c, "signal": sl_c,
-                      "buy_votes": buy_votes, "sell_votes": sell_votes},
+            metadata={
+                "hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                "macd": ml_c, "macd_signal": sl_c,
+                "buy_votes": buy_votes, "sell_votes": sell_votes,
+            },
         )
+
+    # ------------------------------------------------------------------
+    # Backtest — find optimal SL multiplier + R:R ratio
+    # ------------------------------------------------------------------
+
+    async def backtest(self, candles: list) -> dict:
+        """
+        Simulate 2/3 voting signals on historical candles.
+        Tests all combinations of SL multipliers and R:R ratios.
+        Returns stats dict and the best (sl_mult, rr) tuple.
+        """
+        min_len = self.macd_slow + self.macd_sig + self.hma_period + _ATR_PERIOD + 5
+        if len(candles) < min_len + 20:
+            return {}, None
+
+        closes = [c.close for c in candles]
+        highs  = [c.high  for c in candles]
+        lows   = [c.low   for c in candles]
+
+        hma_arr  = self.hma(closes, self.hma_period)
+        ema9_arr = self.ema(closes, self.ema_fast)
+        sma21_arr= self.sma(closes, self.sma_slow)
+        ml_arr, sl_arr, _ = self.macd(closes, self.macd_fast, self.macd_slow, self.macd_sig)
+        atr_arr  = self.atr(candles, _ATR_PERIOD)
+
+        # Collect all signal bars (direction + atr)
+        signal_bars: list[tuple[int, int, float]] = []  # (idx, direction +1/-1, atr)
+        prev_dir = 0  # avoid consecutive same-direction entries
+
+        for i in range(min_len, len(candles) - 1):
+            if any(np.isnan(v) for v in [
+                hma_arr[i], ema9_arr[i], sma21_arr[i], ml_arr[i], sl_arr[i], atr_arr[i]
+            ]):
+                continue
+            va, vb, vc = _votes(
+                closes[i], hma_arr[i],
+                ema9_arr[i], sma21_arr[i],
+                ml_arr[i], sl_arr[i],
+            )
+            bv = sum(1 for v in [va, vb, vc] if v ==  1)
+            sv = sum(1 for v in [va, vb, vc] if v == -1)
+
+            if bv >= 2 and prev_dir != 1:
+                signal_bars.append((i, 1, float(atr_arr[i])))
+                prev_dir = 1
+            elif sv >= 2 and prev_dir != -1:
+                signal_bars.append((i, -1, float(atr_arr[i])))
+                prev_dir = -1
+            else:
+                prev_dir = 0
+
+        if not signal_bars:
+            return {}, None
+
+        # Test each parameter combination
+        best_score = -999.0
+        best_config = None
+        stats: dict[str, dict] = {}
+
+        for sl_m in _SL_MULTS:
+            for rr in _RR_RATIOS:
+                wins = losses = 0
+                total_r = 0.0
+
+                for idx, direction, atr_val in signal_bars:
+                    if atr_val <= 0:
+                        continue
+                    entry = closes[idx]
+                    if direction == 1:
+                        sl_p = entry - sl_m * atr_val
+                        tp_p = entry + sl_m * rr * atr_val
+                    else:
+                        sl_p = entry + sl_m * atr_val
+                        tp_p = entry - sl_m * rr * atr_val
+
+                    outcome = 0
+                    for j in range(idx + 1, min(idx + _LOOKFORWARD, len(candles))):
+                        if direction == 1:
+                            if lows[j] <= sl_p:
+                                outcome = -1; break
+                            if highs[j] >= tp_p:
+                                outcome = 1; break
+                        else:
+                            if highs[j] >= sl_p:
+                                outcome = -1; break
+                            if lows[j] <= tp_p:
+                                outcome = 1; break
+
+                    if outcome == 1:
+                        wins += 1; total_r += rr
+                    elif outcome == -1:
+                        losses += 1; total_r -= 1.0
+
+                total = wins + losses
+                wr = wins / total if total else 0.0
+                pf = (wins * rr) / max(losses, 1)
+                key = f"SL={sl_m}xATR  RR=1:{rr}"
+                stats[key] = {
+                    "win_rate": round(wr * 100, 1),
+                    "profit_factor": round(pf, 2),
+                    "total_r": round(total_r, 1),
+                    "trades": total,
+                    "wins": wins,
+                    "losses": losses,
+                }
+
+                if total >= 5 and total_r > best_score:
+                    best_score = total_r
+                    best_config = (sl_m, rr)
+
+        return stats, best_config
+
+
+# ------------------------------------------------------------------
+# Module-level helpers (keep analyze() readable)
+# ------------------------------------------------------------------
+
+def _votes(price, hma, e9, s21, ml, sl):
+    va = 1 if price > hma  else (-1 if price < hma  else 0)
+    vb = 1 if e9    > s21  else (-1 if e9    < s21  else 0)
+    vc = 1 if ml    > sl   else (-1 if ml    < sl   else 0)
+    return va, vb, vc
+
+
+def _build_reason(direction, votes, va, vb, vc, b_up, b_dn, c_up, c_dn):
+    is_buy = direction == "buy"
+    target = 1 if is_buy else -1
+    tags = []
+    if va == target:
+        tags.append(f"HMA15={'above' if is_buy else 'below'}")
+    if vb == target:
+        cross = " ✚cross" if (b_up if is_buy else b_dn) else ""
+        tags.append(f"EMA9{'>' if is_buy else '<'}SMA21{cross}")
+    if vc == target:
+        cross = " ✚cross" if (c_up if is_buy else c_dn) else ""
+        tags.append(f"MACD{'>' if is_buy else '<'}Sig{cross}")
+
+    conf = 0.85 if votes == 3 else 0.65
+    has_cross = (is_buy and (b_up or c_up)) or (not is_buy and (b_dn or c_dn))
+    if has_cross:
+        conf = min(conf + 0.10, 0.95)
+    return f"[{votes}/3] {' + '.join(tags)}", conf
