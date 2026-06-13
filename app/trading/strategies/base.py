@@ -99,3 +99,25 @@ class BaseStrategy(ABC):
         upper = sma + std_dev * rolling_std
         lower = sma - std_dev * rolling_std
         return upper, sma, lower
+
+    @staticmethod
+    def wma(values: list[float], period: int) -> np.ndarray:
+        """Weighted Moving Average — linearly weighted, newest bar has highest weight."""
+        arr = np.array(values, dtype=float)
+        result = np.full_like(arr, np.nan)
+        weights = np.arange(1, period + 1, dtype=float)
+        denom = weights.sum()
+        for i in range(period - 1, len(arr)):
+            result[i] = np.dot(arr[i - period + 1:i + 1], weights) / denom
+        return result
+
+    @staticmethod
+    def hma(values: list[float], period: int) -> np.ndarray:
+        """Hull Moving Average: WMA(2*WMA(n/2) - WMA(n), sqrt(n))."""
+        import math
+        half  = max(2, period // 2)
+        sqrtn = max(2, int(round(math.sqrt(period))))
+        wma_half = BaseStrategy.wma(values, half)
+        wma_full = BaseStrategy.wma(values, period)
+        raw  = 2.0 * wma_half - wma_full
+        return BaseStrategy.wma(list(raw), sqrtn)
