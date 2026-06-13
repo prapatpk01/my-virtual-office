@@ -40,7 +40,8 @@ class GridTradingStrategy(BaseStrategy):
             levels.append(GridLevel(price=round(price, 6), side=side))
         return levels
 
-    async def analyze(self, candles: list, current_price: float) -> Signal:
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
         closes = [c.close for c in candles]
 
         # Auto-determine range if not set

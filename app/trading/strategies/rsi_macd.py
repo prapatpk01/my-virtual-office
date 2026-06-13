@@ -19,7 +19,8 @@ class RSIMACDStrategy(BaseStrategy):
         self.macd_signal   = self.params.get("macd_signal",   9)
         self.position_pct  = self.params.get("position_pct",  0.1)
 
-    async def analyze(self, candles: list, current_price: float) -> Signal:
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
         closes = [c.close for c in candles]
         volumes = [c.volume for c in candles]
         if len(closes) < self.macd_slow + self.macd_signal + 5:

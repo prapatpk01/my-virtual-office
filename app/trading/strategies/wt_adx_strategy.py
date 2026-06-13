@@ -81,7 +81,8 @@ class WTADXStrategy(BaseStrategy):
 
     # ------------------------------------------------------------------ #
 
-    async def analyze(self, candles: list, current_price: float) -> Signal:
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
         min_len = self.n1 + self.n2 + self.adx_period + 10
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")

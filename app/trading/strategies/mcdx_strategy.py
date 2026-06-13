@@ -161,7 +161,8 @@ class MCDXStrategy(BaseStrategy):
     # Main analysis
     # ------------------------------------------------------------------ #
 
-    async def analyze(self, candles: list, current_price: float) -> Signal:
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
         nr = min(self.nr, len(candles))
         if len(candles) < nr + self.sma_pc_len + 5:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
