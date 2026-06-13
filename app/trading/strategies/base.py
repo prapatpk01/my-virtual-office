@@ -32,8 +32,11 @@ class BaseStrategy(ABC):
         self.name = self.__class__.__name__
 
     @abstractmethod
-    async def analyze(self, candles: list, current_price: float) -> Signal:
-        """Return a Signal given OHLCV candles and current price."""
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
+        """Return a Signal given OHLCV candles and current price.
+        mtf_candles: optional dict of higher-TF candles, e.g. {"1h": [...], "4h": [...]}
+        """
 
     # ------------------------------------------------------------------
     # Shared indicator helpers (no external TA library needed)

@@ -186,7 +186,18 @@ class TradingBot:
                 candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="15m", limit=250)
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
-                signal = await strategy.analyze(candles, current_price)
+
+                # Fetch MTF candles for higher-timeframe bias (1H + 4H)
+                mtf_candles = {}
+                for tf in ("1h", "4h"):
+                    try:
+                        mtf_candles[tf] = await self.connector.fetch_ohlcv(
+                            strategy.symbol, timeframe=tf, limit=100
+                        )
+                    except Exception:
+                        pass
+
+                signal = await strategy.analyze(candles, current_price, mtf_candles=mtf_candles)
 
                 sig_dict = {
                     "strategy": strategy.name,

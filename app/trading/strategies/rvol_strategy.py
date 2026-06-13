@@ -22,7 +22,8 @@ class RVolStrategy(BaseStrategy):
         self.rsi_max        = self.params.get("rsi_max",        70)    # ignore extreme overbought
         self.position_pct   = self.params.get("position_pct",   0.08)
 
-    async def analyze(self, candles: list, current_price: float) -> Signal:
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
         if len(candles) < self.rvol_period + 30:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 

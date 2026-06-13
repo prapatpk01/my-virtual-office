@@ -293,7 +293,8 @@ class SentinelStrategy(BaseStrategy):
     # Main analysis
     # ------------------------------------------------------------------ #
 
-    async def analyze(self, candles: list, current_price: float) -> Signal:
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
         if len(candles) < 210:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Need ≥210 candles for Sentinel")
 

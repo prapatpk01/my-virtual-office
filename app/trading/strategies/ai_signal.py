@@ -23,7 +23,8 @@ class AISignalStrategy(BaseStrategy):
             self._client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
         return self._client
 
-    async def analyze(self, candles: list, current_price: float) -> Signal:
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
         recent = candles[-self.lookback:]
         if len(recent) < 5:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data for AI")

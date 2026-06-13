@@ -15,7 +15,8 @@ class MACrossoverStrategy(BaseStrategy):
         self.slow = self.params.get("slow_period", 21)
         self.position_pct = self.params.get("position_pct", 0.1)  # 10% of balance
 
-    async def analyze(self, candles: list, current_price: float) -> Signal:
+    async def analyze(self, candles: list, current_price: float,
+                      mtf_candles: dict = None) -> Signal:
         closes = [c.close for c in candles]
         if len(closes) < self.slow + 2:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
