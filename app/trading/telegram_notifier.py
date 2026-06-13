@@ -393,7 +393,7 @@ class TelegramNotifier:
             if not recent:
                 lines.append("_(no closed trades yet — waiting for SL/TP)_")
             else:
-                for o in reversed(recent[-5:]):
+                for o in reversed(recent[-10:]):
                     e      = "✅" if o["pnl_r"] > 0 else "❌"
                     sr     = "+" if o["pnl_r"] >= 0 else ""
                     label  = "TP" if o["reason"] == "take_profit" else "SL"

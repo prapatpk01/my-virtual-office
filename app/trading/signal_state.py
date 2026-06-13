@@ -161,5 +161,5 @@ class SignalState:
             "streak":          streak,
             "total_signals":   total_fired,
             "signals_per_day": self.signals_per_day(),
-            "recent":          out[-10:],
+            "recent":          out[-10:],   # last 10 for /stats display
         }

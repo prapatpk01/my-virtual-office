@@ -46,6 +46,7 @@ class MACDEMAStrategy(BaseStrategy):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
         closes = [c.close for c in candles]
+        open_price = float(candles[-1].open)   # use candle open as primary HMA15 gate
 
         hma15      = self.hma(closes, self.hma_period)
         ema9       = self.ema(closes, self.ema_fast)
@@ -57,27 +58,33 @@ class MACDEMAStrategy(BaseStrategy):
 
         p     = current_price
         hma   = float(hma15[-1])
-        e9_c  = float(ema9[-1]);      e9_p  = float(ema9[-2])
-        s21_c = float(sma21[-1]);     s21_p = float(sma21[-2])
-        ml_c  = float(macd_line[-1]); ml_p  = float(macd_line[-2])
-        sl_c  = float(signal_line[-1]); sl_p = float(signal_line[-2])
+        e9_c  = float(ema9[-1]);        e9_p  = float(ema9[-2])
+        s21_c = float(sma21[-1]);       s21_p = float(sma21[-2])
+        ml_c  = float(macd_line[-1]);   ml_p  = float(macd_line[-2])
+        sl_c  = float(signal_line[-1]); sl_p  = float(signal_line[-2])
         current_atr = float(atr_arr[-1])
 
         if any(np.isnan(v) for v in [hma, e9_c, s21_c, ml_c, sl_c, current_atr]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Indicator NaN")
 
-        vote_a, vote_b, vote_c = _votes(p, hma, e9_c, s21_c, ml_c, sl_c)
-        buy_votes  = sum(1 for v in [vote_a, vote_b, vote_c] if v ==  1)
-        sell_votes = sum(1 for v in [vote_a, vote_b, vote_c] if v == -1)
+        # Voter A uses candle OPEN price (core gate — must pass to get any signal)
+        vote_a = 1 if open_price > hma else (-1 if open_price < hma else 0)
+        vote_b = 1 if e9_c > s21_c else (-1 if e9_c < s21_c else 0)
+        vote_c = 1 if ml_c > sl_c  else (-1 if ml_c < sl_c  else 0)
 
+        # A is CORE: signal only when A passes + at least one of B/C agrees
         b_cross_up   = e9_p <= s21_p and e9_c > s21_c
         b_cross_down = e9_p >= s21_p and e9_c < s21_c
         c_cross_up   = ml_p <= sl_p  and ml_c > sl_c
         c_cross_down = ml_p >= sl_p  and ml_c < sl_c
 
-        if buy_votes >= 2:
+        buy_votes  = sum(1 for v in [vote_b, vote_c] if v ==  1)
+        sell_votes = sum(1 for v in [vote_b, vote_c] if v == -1)
+
+        if vote_a == 1 and buy_votes >= 1:
+            total_buy = 1 + buy_votes   # A + at least one of B/C
             reason, conf = _build_reason(
-                "buy", buy_votes, vote_a, vote_b, vote_c,
+                "buy", total_buy, vote_a, vote_b, vote_c,
                 b_cross_up, b_cross_down, c_cross_up, c_cross_down,
             )
             sl_price = round(p - self.sl_atr_mult * current_atr, 4)
@@ -86,19 +93,21 @@ class MACDEMAStrategy(BaseStrategy):
                 type=SignalType.BUY, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf, reason=reason,
                 metadata={
-                    "hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                    "hma15": hma, "open": open_price,
+                    "ema9": e9_c, "sma21": s21_c,
                     "macd": ml_c, "macd_signal": sl_c,
                     "atr": round(current_atr, 4),
                     "stop_loss": sl_price,
                     "take_profit": tp_price,
                     "rr": self.rr_ratio,
-                    "votes": buy_votes,
+                    "votes": total_buy,
                 },
             )
 
-        if sell_votes >= 2:
+        if vote_a == -1 and sell_votes >= 1:
+            total_sell = 1 + sell_votes
             reason, conf = _build_reason(
-                "sell", sell_votes, vote_a, vote_b, vote_c,
+                "sell", total_sell, vote_a, vote_b, vote_c,
                 b_cross_up, b_cross_down, c_cross_up, c_cross_down,
             )
             sl_price = round(p + self.sl_atr_mult * current_atr, 4)
@@ -107,16 +116,21 @@ class MACDEMAStrategy(BaseStrategy):
                 type=SignalType.SELL, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf, reason=reason,
                 metadata={
-                    "hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                    "hma15": hma, "open": open_price,
+                    "ema9": e9_c, "sma21": s21_c,
                     "macd": ml_c, "macd_signal": sl_c,
                     "atr": round(current_atr, 4),
                     "stop_loss": sl_price,
                     "take_profit": tp_price,
                     "rr": self.rr_ratio,
-                    "votes": sell_votes,
+                    "votes": total_sell,
                 },
             )
 
+        # HOLD — show why A blocked the signal
+        a_reason = (f"open({open_price:.2f})>HMA15({hma:.2f})" if vote_a == 1
+                    else f"open({open_price:.2f})<HMA15({hma:.2f})" if vote_a == -1
+                    else "open≈HMA15")
         votes_str = (
             f"A={'B' if vote_a==1 else 'S' if vote_a==-1 else '-'} "
             f"B={'B' if vote_b==1 else 'S' if vote_b==-1 else '-'} "
@@ -124,9 +138,9 @@ class MACDEMAStrategy(BaseStrategy):
         )
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[HOLD] {votes_str} | HMA15={hma:.2f}",
+            f"[HOLD] {votes_str} | {a_reason}",
             metadata={
-                "hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                "hma15": hma, "open": open_price, "ema9": e9_c, "sma21": s21_c,
                 "macd": ml_c, "macd_signal": sl_c,
                 "buy_votes": buy_votes, "sell_votes": sell_votes,
             },
