@@ -68,8 +68,9 @@ def build_config() -> dict:
         "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
-            "wt_adx":   _env_bool("STRATEGY_WT_ADX",   False),
-            "macd_ema": _env_bool("STRATEGY_MACD_EMA",  True),
+            "wt_adx":         _env_bool("STRATEGY_WT_ADX",          False),
+            "macd_ema":       _env_bool("STRATEGY_MACD_EMA",         False),
+            "momentum_score": _env_bool("STRATEGY_MOMENTUM_SCORE",    True),
         },
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
         "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
@@ -91,10 +92,12 @@ def build_config() -> dict:
 def _make_strategies(symbols: list, flags: dict):
     from trading.strategies.wt_adx_strategy import WTADXStrategy
     from trading.strategies.macd_ema_strategy import MACDEMAStrategy
+    from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
     strategies = []
     for sym in symbols:
-        if flags.get("wt_adx"):   strategies.append(WTADXStrategy(sym))
-        if flags.get("macd_ema"): strategies.append(MACDEMAStrategy(sym))
+        if flags.get("wt_adx"):          strategies.append(WTADXStrategy(sym))
+        if flags.get("macd_ema"):        strategies.append(MACDEMAStrategy(sym))
+        if flags.get("momentum_score"):  strategies.append(MomentumScoreStrategy(sym))
     return strategies
 
 
@@ -180,15 +183,17 @@ _stop_signal = asyncio.Event()
 async def _run_backtest(crypto_bot, config: dict, telegram):
     """Fetch 500 candles on first symbol, run backtest, apply best SL/TP to all strategies."""
     from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-    macd_strats = [s for s in crypto_bot.strategies if isinstance(s, MACDEMAStrategy)]
-    if not macd_strats:
+    from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
+    backtestable = [s for s in crypto_bot.strategies
+                    if isinstance(s, (MACDEMAStrategy, MomentumScoreStrategy))]
+    if not backtestable:
         return
-
-    symbol = macd_strats[0].symbol
+    strat = backtestable[0]
+    symbol = strat.symbol
     logger.info("Running SL/TP backtest on %s (500 candles 15m)…", symbol)
     try:
         candles = await crypto_bot.connector.fetch_ohlcv(symbol, timeframe="15m", limit=500)
-        stats, best = await macd_strats[0].backtest(candles)
+        stats, best = await strat.backtest(candles)
 
         if not stats:
             logger.warning("Backtest returned no results")
@@ -204,7 +209,7 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
         if best:
             sl_m, rr = best
             logger.info("Best config: SL=%.1fxATR  RR=1:%.1f — applying to all strategies", sl_m, rr)
-            for s in macd_strats:
+            for s in backtestable:
                 s.sl_atr_mult = sl_m
                 s.rr_ratio    = rr
 

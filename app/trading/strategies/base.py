@@ -141,3 +141,44 @@ class BaseStrategy(ABC):
         wma_full = BaseStrategy.wma(values, period)
         raw  = 2.0 * wma_half - wma_full
         return BaseStrategy.wma(list(raw), sqrtn)
+
+    @staticmethod
+    def adx(candles: list, period: int = 14) -> tuple:
+        """ADX, +DI, -DI using Wilder's smoothing. Returns (adx_arr, plus_di, minus_di)."""
+        n = len(candles)
+        pdm = np.zeros(n)
+        mdm = np.zeros(n)
+        tr  = np.zeros(n)
+        for i in range(1, n):
+            h, l   = candles[i].high, candles[i].low
+            ph, pl, pc = candles[i-1].high, candles[i-1].low, candles[i-1].close
+            up, dn = h - ph, pl - l
+            pdm[i] = up if up > dn and up > 0 else 0.0
+            mdm[i] = dn if dn > up and dn > 0 else 0.0
+            tr[i]  = max(h - l, abs(h - pc), abs(l - pc))
+        s_tr = np.full(n, np.nan)
+        s_pd = np.full(n, np.nan)
+        s_md = np.full(n, np.nan)
+        if n > period:
+            s_tr[period] = tr[1:period+1].sum()
+            s_pd[period] = pdm[1:period+1].sum()
+            s_md[period] = mdm[1:period+1].sum()
+            for i in range(period+1, n):
+                s_tr[i] = s_tr[i-1] - s_tr[i-1]/period + tr[i]
+                s_pd[i] = s_pd[i-1] - s_pd[i-1]/period + pdm[i]
+                s_md[i] = s_md[i-1] - s_md[i-1]/period + mdm[i]
+        plus_di  = np.where(s_tr > 0, 100 * s_pd / s_tr, 0.0)
+        minus_di = np.where(s_tr > 0, 100 * s_md / s_tr, 0.0)
+        dx = np.where(
+            (plus_di + minus_di) > 0,
+            100 * np.abs(plus_di - minus_di) / (plus_di + minus_di),
+            0.0,
+        )
+        adx_arr = np.full(n, np.nan)
+        start = 2 * period
+        if n > start:
+            adx_arr[start] = float(np.nanmean(dx[period:start+1]))
+            for i in range(start+1, n):
+                if not np.isnan(adx_arr[i-1]):
+                    adx_arr[i] = (adx_arr[i-1] * (period-1) + dx[i]) / period
+        return adx_arr, plus_di, minus_di
