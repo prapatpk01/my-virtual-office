@@ -248,6 +248,7 @@ class TradingBot:
             stale = (int(time.time() * 1000) - last_ts) > 4 * 3600 * 1000
             if direction_changed or stale:
                 self._sig.lock(sym, signal.type.value)
+                self._sig.record_signal(sym, signal.type.value, signal.price, signal.confidence)
                 if self.telegram:
                     self.telegram.notify_signal(sig_dict)
             else:
@@ -263,6 +264,7 @@ class TradingBot:
                 return
             # Lock before notifying to prevent race conditions
             self._sig.lock(sym, signal.type.value)
+            self._sig.record_signal(sym, signal.type.value, signal.price, signal.confidence)
             if self.telegram:
                 self.telegram.notify_signal(sig_dict)
             await self._execute_signal(signal, strategy_name)

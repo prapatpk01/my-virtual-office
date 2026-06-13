@@ -138,27 +138,38 @@ class TelegramNotifier:
 
     def notify_trade_closed(self, symbol: str, reason: str, exit_price: float,
                             entry: float, sl, tp, stats: dict):
-        """Called when a position closes via SL or TP. Includes running stats."""
-        won = reason == "take_profit"
+        """Called when a position closes via SL or TP. Full detail + running stats."""
+        won   = reason == "take_profit"
         emoji = "✅" if won else "❌"
-        label = "Take-Profit" if won else "Stop-Loss"
-        risk = abs(entry - sl) if sl else 1.0
+        label = "Take-Profit Hit" if won else "Stop-Loss Hit"
+        risk  = abs(entry - sl) if sl else 1.0
         pnl_r = abs(exit_price - entry) / risk if won else -1.0
-        sign = "+" if pnl_r >= 0 else ""
+        sign  = "+" if pnl_r >= 0 else ""
 
-        total    = stats.get("trades", 0)
-        wr       = stats.get("win_rate", 0)
-        total_r  = stats.get("total_r", 0)
-        streak   = stats.get("streak", 0)
+        sl_str = f"`{sl:,.4f}`" if sl else "—"
+        tp_str = f"`{tp:,.4f}`" if tp else "—"
+
+        total   = stats.get("trades",    0)
+        wins    = stats.get("wins",      0)
+        losses  = stats.get("losses",    0)
+        wr      = stats.get("win_rate",  0)
+        pf      = stats.get("profit_factor", 0)
+        total_r = stats.get("total_r",   0)
+        streak  = stats.get("streak",    0)
+        sig_day = stats.get("signals_per_day", 0)
         streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
+        sign_r = "+" if total_r >= 0 else ""
 
         text = (
-            f"{emoji} *{label}* — `{symbol}`\n"
+            f"{emoji} *{label}*\n"
+            f"`{symbol}`\n"
             f"Entry: `{entry:,.4f}` → Exit: `{exit_price:,.4f}`\n"
+            f"SL: {sl_str} | TP: {tp_str}\n"
             f"Result: `{sign}{pnl_r:.1f}R`\n\n"
-            f"📊 *Running Stats* ({total} trades)\n"
-            f"WR: `{wr:.1f}%` | Total: `{sign if total_r>=0 else ''}{total_r:.1f}R`\n"
-            f"Streak: `{streak_str}`"
+            f"📊 *Backtest Stats* ({total} trades)\n"
+            f"Win/Loss: `{wins}W / {losses}L` | WR: `{wr:.1f}%`\n"
+            f"Profit Factor: `{pf:.2f}` | Total: `{sign_r}{total_r:.1f}R`\n"
+            f"Streak: `{streak_str}` | Avg signals/day: `{sig_day}`"
         )
         self.notify(text)
 
@@ -349,35 +360,47 @@ class TelegramNotifier:
                 await self._send("⚠️ stop\\_bot not configured")
 
         elif cmd == "stats":
-            s = self.get_stats_fn() if self.get_stats_fn else {}
-            total = s.get("trades", 0)
-            if total == 0:
-                await self._send("📭 No closed trades yet\nStats will appear after the first SL/TP hit.")
-                return
-            wins    = s.get("wins", 0)
-            losses  = s.get("losses", 0)
-            wr      = s.get("win_rate", 0)
-            pf      = s.get("profit_factor", 0)
-            total_r = s.get("total_r", 0)
-            streak  = s.get("streak", 0)
-            recent  = s.get("recent", [])
+            s       = self.get_stats_fn() if self.get_stats_fn else {}
+            total   = s.get("trades",          0)
+            sig_all = s.get("total_signals",   0)
+            sig_day = s.get("signals_per_day", 0)
 
-            streak_str = (f"W{streak} streak" if streak > 0 else f"L{abs(streak)} streak") if streak else "—"
-            sign = "+" if total_r >= 0 else ""
+            if sig_all == 0:
+                await self._send("📭 No signals fired yet.")
+                return
+
+            wins    = s.get("wins",            0)
+            losses  = s.get("losses",          0)
+            wr      = s.get("win_rate",        0.0)
+            pf      = s.get("profit_factor",   0.0)
+            total_r = s.get("total_r",         0.0)
+            streak  = s.get("streak",          0)
+            recent  = s.get("recent",          [])
+
+            streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
+            sign_r = "+" if total_r >= 0 else ""
 
             lines = [
-                f"📊 *Signal Statistics*\n",
-                f"Total trades: `{total}` ({wins}W / {losses}L)",
+                f"📊 *Backtest / Live Stats*\n",
+                f"Signals sent: `{sig_all}` (avg `{sig_day}/day`)",
+                f"Closed trades: `{total}` (`{wins}W` / `{losses}L`)",
                 f"Win Rate: `{wr:.1f}%`",
                 f"Profit Factor: `{pf:.2f}`",
-                f"Total R: `{sign}{total_r:.1f}R`",
-                f"Streak: `{streak_str}`\n",
+                f"Total R: `{sign_r}{total_r:.1f}R`",
+                f"Current streak: `{streak_str}`\n",
                 "_Last 5 closed trades:_",
             ]
-            for o in reversed(recent[-5:]):
-                e = "✅" if o["pnl_r"] > 0 else "❌"
-                sign_r = "+" if o["pnl_r"] >= 0 else ""
-                lines.append(f"{e} `{o['symbol']}` {o['side']} → `{sign_r}{o['pnl_r']:.1f}R` ({o['reason']})")
+            if not recent:
+                lines.append("_(no closed trades yet — waiting for SL/TP)_")
+            else:
+                for o in reversed(recent[-5:]):
+                    e      = "✅" if o["pnl_r"] > 0 else "❌"
+                    sr     = "+" if o["pnl_r"] >= 0 else ""
+                    label  = "TP" if o["reason"] == "take_profit" else "SL"
+                    lines.append(
+                        f"{e} `{o['symbol']}` {o['side'].upper()} "
+                        f"`{sr}{o['pnl_r']:.1f}R` [{label}]"
+                    )
 
             await self._send("\n".join(lines))
 
