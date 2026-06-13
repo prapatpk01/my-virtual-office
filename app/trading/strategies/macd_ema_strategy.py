@@ -1,16 +1,15 @@
 """
-MACD + EMA + HMA15 Confluence Strategy — tuned for 15m timeframe.
+MACD + EMA Voting Strategy — 2/3 confirmation system on 15m timeframe.
 
-HMA15 filter (primary gate):
-  Price close > HMA15 → BUY side only
-  Price close < HMA15 → SELL side only
+Three independent voters:
+  A) HMA15 gate   — close > HMA15 → BUY vote;  close < HMA15 → SELL vote
+  B) EMA9/SMA21   — EMA9  > SMA21  → BUY vote;  EMA9  < SMA21  → SELL vote
+  C) MACD         — MACD  > Signal → BUY vote;  MACD  < Signal → SELL vote
 
-Signal tiers (most → least strict):
-  A) Full confluence: EMA9>21>50 + MACD cross up + price > EMA21
-  B) MACD crossover alone with price > EMA9
-  C) EMA9 > EMA21 + MACD histogram crosses zero upward
-
-Same logic inverted for SELL.
+Signal fired when 2 or 3 voters agree:
+  2/3 → confidence 0.65
+  3/3 → confidence 0.85
+  +0.10 bonus if a crossover just happened (B or C)
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -20,101 +19,101 @@ class MACDEMAStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.ema_fast     = self.params.get("ema_fast",     9)
-        self.ema_mid      = self.params.get("ema_mid",      21)
-        self.ema_slow     = self.params.get("ema_slow",     50)
-        self.hma_period   = self.params.get("hma_period",   15)
-        self.macd_fast    = self.params.get("macd_fast",    12)
-        self.macd_slow    = self.params.get("macd_slow",    26)
-        self.macd_sig     = self.params.get("macd_signal",  9)
-        self.position_pct = self.params.get("position_pct", 0.08)
+        self.hma_period = self.params.get("hma_period",  15)
+        self.ema_fast   = self.params.get("ema_fast",     9)
+        self.sma_slow   = self.params.get("sma_slow",    21)
+        self.macd_fast  = self.params.get("macd_fast",   12)
+        self.macd_slow  = self.params.get("macd_slow",   26)
+        self.macd_sig   = self.params.get("macd_signal",  9)
 
     async def analyze(self, candles: list, current_price: float) -> Signal:
-        min_len = self.ema_slow + self.macd_slow + self.macd_sig + 5
+        min_len = self.macd_slow + self.macd_sig + self.hma_period + 5
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
         closes = [c.close for c in candles]
 
-        ema9  = np.array(self.ema(closes, self.ema_fast))
-        ema21 = np.array(self.ema(closes, self.ema_mid))
-        ema50 = np.array(self.ema(closes, self.ema_slow))
-        hma15 = np.array(self.hma(closes, self.hma_period))
-        macd_line, signal_line, histogram = self.macd(
+        hma15      = self.hma(closes, self.hma_period)
+        ema9       = self.ema(closes, self.ema_fast)
+        sma21      = self.sma(closes, self.sma_slow)
+        macd_line, signal_line, _ = self.macd(
             closes, self.macd_fast, self.macd_slow, self.macd_sig
         )
 
-        e9    = float(ema9[-1])
-        e21   = float(ema21[-1])
-        e50   = float(ema50[-1])
-        hma   = float(hma15[-1])
-        ml_c  = float(macd_line[-1]);  ml_p = float(macd_line[-2])
-        sl_c  = float(signal_line[-1]); sl_p = float(signal_line[-2])
-        h_c   = float(histogram[-1]);   h_p  = float(histogram[-2])
         p     = current_price
+        hma   = float(hma15[-1])
+        e9_c  = float(ema9[-1]);     e9_p  = float(ema9[-2])
+        s21_c = float(sma21[-1]);    s21_p = float(sma21[-2])
+        ml_c  = float(macd_line[-1]); ml_p = float(macd_line[-2])
+        sl_c  = float(signal_line[-1]); sl_p = float(signal_line[-2])
 
-        if any(np.isnan(v) for v in [e9, e21, e50, hma, ml_c, sl_c, h_c]):
+        if any(np.isnan(v) for v in [hma, e9_c, s21_c, ml_c, sl_c]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Indicator NaN")
 
-        # HMA15 gate — primary filter
-        above_hma = p > hma
-        below_hma = p < hma
+        # ── 3 voters (+1 = BUY, -1 = SELL, 0 = neutral) ─────────────
+        vote_a = 1 if p > hma   else (-1 if p < hma   else 0)  # HMA15
+        vote_b = 1 if e9_c > s21_c else (-1 if e9_c < s21_c else 0)  # EMA9/SMA21
+        vote_c = 1 if ml_c > sl_c  else (-1 if ml_c < sl_c  else 0)  # MACD
 
-        # ── Helpers ───────────────────────────────────────────────────
-        macd_cross_up   = ml_p < sl_p and ml_c > sl_c
-        macd_cross_down = ml_p > sl_p and ml_c < sl_c
-        hist_up   = h_c > h_p   # histogram rising
-        hist_down = h_c < h_p   # histogram falling
+        buy_votes  = sum(1 for v in [vote_a, vote_b, vote_c] if v ==  1)
+        sell_votes = sum(1 for v in [vote_a, vote_b, vote_c] if v == -1)
 
-        # ── BUY tiers (only when price > HMA15) ──────────────────────
-        buy_A = above_hma and (e9 > e21 > e50) and macd_cross_up and p > e21
-        buy_B = above_hma and macd_cross_up and p > e9
-        buy_C = above_hma and (e9 > e21) and (h_c > 0 > h_p) and p > e21
+        # Crossover detection (confidence bonus + reason label)
+        b_cross_up   = e9_p <= s21_p and e9_c > s21_c
+        b_cross_down = e9_p >= s21_p and e9_c < s21_c
+        c_cross_up   = ml_p <= sl_p  and ml_c > sl_c
+        c_cross_down = ml_p >= sl_p  and ml_c < sl_c
 
-        if buy_A or buy_B or buy_C:
-            conf = 0.80 if buy_A else (0.65 if buy_B else 0.55)
-            tag  = ("Full stack+MACD cross" if buy_A
-                    else "MACD crossover" if buy_B
-                    else "EMA9>21 + hist cross 0")
+        def _build_reason(direction: str, votes: int) -> tuple[str, float]:
+            tags = []
+            if vote_a == (1 if direction == "buy" else -1):
+                tags.append(f"HMA15={'above' if direction=='buy' else 'below'}")
+            if vote_b == (1 if direction == "buy" else -1):
+                cross = " ✚cross" if (b_cross_up if direction == "buy" else b_cross_down) else ""
+                tags.append(f"EMA9{'>' if direction=='buy' else '<'}SMA21{cross}")
+            if vote_c == (1 if direction == "buy" else -1):
+                cross = " ✚cross" if (c_cross_up if direction == "buy" else c_cross_down) else ""
+                tags.append(f"MACD{'>' if direction=='buy' else '<'}Sig{cross}")
+
+            conf = 0.85 if votes == 3 else 0.65
+            if (direction == "buy"  and (b_cross_up  or c_cross_up)) or \
+               (direction == "sell" and (b_cross_down or c_cross_down)):
+                conf = min(conf + 0.10, 0.95)
+
+            return f"[{votes}/3] {' + '.join(tags)}", conf
+
+        if buy_votes >= 2:
+            reason, conf = _build_reason("buy", buy_votes)
             return Signal(
-                type=SignalType.BUY,
-                symbol=self.symbol,
-                price=p,
-                amount=self.position_pct,
-                reason=f"[MACD+EMA] {tag} | HMA15={hma:.0f} EMA9={e9:.0f} EMA21={e21:.0f}",
-                confidence=conf,
-                metadata={"hma15": hma, "ema9": e9, "ema21": e21, "ema50": e50,
-                          "macd": ml_c, "signal": sl_c, "hist": h_c},
+                type=SignalType.BUY, symbol=self.symbol,
+                price=p, amount=0.0, confidence=conf,
+                reason=reason,
+                metadata={"hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                          "macd": ml_c, "signal": sl_c,
+                          "votes": buy_votes},
             )
 
-        # ── SELL tiers (only when price < HMA15) ─────────────────────
-        sell_A = below_hma and (e9 < e21 < e50) and macd_cross_down and p < e21
-        sell_B = below_hma and macd_cross_down and p < e9
-        sell_C = below_hma and (e9 < e21) and (h_c < 0 < h_p) and p < e21
-
-        if sell_A or sell_B or sell_C:
-            conf = 0.80 if sell_A else (0.65 if sell_B else 0.55)
-            tag  = ("Full stack+MACD cross" if sell_A
-                    else "MACD crossover" if sell_B
-                    else "EMA9<21 + hist cross 0")
+        if sell_votes >= 2:
+            reason, conf = _build_reason("sell", sell_votes)
             return Signal(
-                type=SignalType.SELL,
-                symbol=self.symbol,
-                price=p,
-                amount=self.position_pct,
-                reason=f"[MACD+EMA] {tag} | HMA15={hma:.0f} EMA9={e9:.0f} EMA21={e21:.0f}",
-                confidence=conf,
-                metadata={"hma15": hma, "ema9": e9, "ema21": e21, "ema50": e50,
-                          "macd": ml_c, "signal": sl_c, "hist": h_c},
+                type=SignalType.SELL, symbol=self.symbol,
+                price=p, amount=0.0, confidence=conf,
+                reason=reason,
+                metadata={"hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                          "macd": ml_c, "signal": sl_c,
+                          "votes": sell_votes},
             )
 
-        # ── HOLD ──────────────────────────────────────────────────────
-        stack    = "bull" if e9 > e21 > e50 else ("bear" if e9 < e21 < e50 else "mixed")
-        hma_side = "above" if above_hma else "below"
+        # HOLD — show vote breakdown for transparency
+        votes_str = (
+            f"A={'B' if vote_a==1 else 'S' if vote_a==-1 else '-'} "
+            f"B={'B' if vote_b==1 else 'S' if vote_b==-1 else '-'} "
+            f"C={'B' if vote_c==1 else 'S' if vote_c==-1 else '-'}"
+        )
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[MACD+EMA] {stack} | price {hma_side} HMA15={hma:.0f} "
-            f"EMA9={e9:.0f} hist={'▲' if h_c > 0 else '▼'}{h_c:.4f}",
-            metadata={"hma15": hma, "ema9": e9, "ema21": e21, "ema50": e50,
-                      "macd": ml_c, "signal": sl_c, "hist": h_c},
+            f"[HOLD] {votes_str} | HMA15={hma:.2f}",
+            metadata={"hma15": hma, "ema9": e9_c, "sma21": s21_c,
+                      "macd": ml_c, "signal": sl_c,
+                      "buy_votes": buy_votes, "sell_votes": sell_votes},
         )
