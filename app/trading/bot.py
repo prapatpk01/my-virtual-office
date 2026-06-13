@@ -162,9 +162,10 @@ class TradingBot:
         # Check stop-loss / take-profit on open positions
         for pos_info in list(self.risk.get_positions()):
             sym = pos_info["symbol"]
+            strategy_name = pos_info.get("strategy", "")
             ticker = await self.connector.fetch_ticker(sym)
             price = ticker["last"]
-            trigger = self.risk.check_stops(sym, price)
+            trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
             if trigger:
                 side = "sell" if pos_info["side"] == "long" else "buy"
                 await self.connector.create_order(sym, side, pos_info["amount"])
@@ -173,7 +174,7 @@ class TradingBot:
                     timestamp=int(time.time() * 1000),
                     symbol=sym, side=side,
                     price=price, amount=pos_info["amount"],
-                    pnl=pnl, strategy="risk_manager", reason=trigger,
+                    pnl=pnl, strategy=strategy_name or "risk_manager", reason=trigger,
                     paper=self.connector.paper,
                 )
                 self._record_trade(trade)
@@ -184,9 +185,9 @@ class TradingBot:
                     sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
                     reason=trigger,
                 )
-                self._sig.unlock(sym)
-                self.risk.close_position(sym)
-                logger.info("Position closed by %s: %s → signal lock released", trigger, sym)
+                self._sig.unlock_strategy(sym, strategy_name)
+                self.risk.close_position(sym, strategy=strategy_name)
+                logger.info("Position closed by %s: %s [%s] → signal lock released", trigger, sym, strategy_name)
                 if self.telegram:
                     self.telegram.notify_trade_closed(
                         sym, trigger, price,
@@ -265,16 +266,16 @@ class TradingBot:
             else:
                 logger.debug("Forex %s suppressed — same direction already sent", sym)
         else:
-            # Crypto: locked = already in a trade for this symbol (persists across restarts)
-            if self._sig.is_locked(sym):
-                logger.debug("Crypto %s suppressed — signal lock active (position still open)", sym)
+            # Crypto: locked = already in a trade for this symbol+strategy (persists across restarts)
+            if self._sig.is_locked_for_strategy(sym, strategy_name):
+                logger.debug("Crypto %s suppressed — %s already in trade for this symbol", sym, strategy_name)
                 return
-            can, reason = self.risk.can_open(sym)
+            can, reason = self.risk.can_open(sym, strategy=strategy_name)
             if not can:
                 logger.debug("Crypto %s suppressed — %s", sym, reason)
                 return
             # Lock before notifying to prevent race conditions
-            self._sig.lock(sym, signal.type.value)
+            self._sig.lock_strategy(sym, strategy_name, signal.type.value)
             self._sig.record_signal(sym, signal.type.value, signal.price, signal.confidence)
             if self.telegram:
                 self.telegram.notify_signal(sig_dict)
@@ -282,10 +283,10 @@ class TradingBot:
 
     async def _execute_signal(self, signal: Signal, strategy_name: str):
         sym = signal.symbol
-        can, reason = self.risk.can_open(sym)
+        can, reason = self.risk.can_open(sym, strategy=strategy_name)
         if not can:
             logger.info("Skipping %s signal for %s: %s", signal.type, sym, reason)
-            self._sig.unlock(sym)  # release lock if execution fails
+            self._sig.unlock_strategy(sym, strategy_name)  # release lock if execution fails
             return
 
         balances = await self.connector.fetch_balance()
@@ -296,13 +297,13 @@ class TradingBot:
         amount = self.risk.size_position(quote_balance, price)
         if amount <= 0:
             logger.info("Position size 0, skipping %s", sym)
-            self._sig.unlock(sym)
+            self._sig.unlock_strategy(sym, strategy_name)
             return
 
         side = "buy" if signal.type == SignalType.BUY else "sell"
         try:
             order = await self.connector.create_order(sym, side, amount)
-            self.risk.open_position(sym, "long" if side == "buy" else "short", price, amount)
+            self.risk.open_position(sym, "long" if side == "buy" else "short", price, amount, strategy=strategy_name)
             trade = TradeRecord(
                 timestamp=int(time.time() * 1000),
                 symbol=sym, side=side,
@@ -317,7 +318,7 @@ class TradingBot:
                                            strategy_name, self.connector.paper)
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
-            self._sig.unlock(sym)  # release lock so bot can retry next tick
+            self._sig.unlock_strategy(sym, strategy_name)  # release lock so bot can retry next tick
 
     async def _refresh_balance(self):
         try:

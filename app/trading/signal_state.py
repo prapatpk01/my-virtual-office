@@ -75,6 +75,22 @@ class SignalState:
             del self._active[symbol]
             self._save()
 
+    def is_locked_for_strategy(self, symbol: str, strategy: str) -> bool:
+        return f"{symbol}||{strategy}" in self._active
+
+    def lock_strategy(self, symbol: str, strategy: str, direction: str):
+        self._active[f"{symbol}||{strategy}"] = {"direction": direction, "ts": int(time.time() * 1000)}
+        self._save()
+
+    def unlock_strategy(self, symbol: str, strategy: str):
+        key = f"{symbol}||{strategy}"
+        if key in self._active:
+            del self._active[key]
+            self._save()
+
+    def count_active(self, symbol: str) -> int:
+        return sum(1 for k in self._active if k.startswith(f"{symbol}||"))
+
     # ------------------------------------------------------------------
     # Signal firing log
     # ------------------------------------------------------------------
