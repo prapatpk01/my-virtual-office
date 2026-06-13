@@ -1,15 +1,12 @@
 """
-MACD + EMA Confluence Strategy.
+MACD + EMA Confluence Strategy — relaxed for 15m timeframe.
 
-BUY  — EMA bullish stack (EMA9 > EMA21 > EMA50)
-       + MACD line crosses above signal line
-       + MACD histogram turns positive
-       + price above EMA50
+Signal tiers (most → least strict):
+  A) Full confluence: EMA9>21>50 + MACD cross up + price > EMA21
+  B) MACD crossover alone with price > EMA9
+  C) EMA9 > EMA21 + MACD histogram turning positive (hist rising & > 0)
 
-SELL — EMA bearish stack (EMA9 < EMA21 < EMA50)
-       + MACD line crosses below signal line
-       + MACD histogram turns negative
-       + price below EMA50
+Same logic inverted for SELL.
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -33,91 +30,83 @@ class MACDEMAStrategy(BaseStrategy):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
         closes = [c.close for c in candles]
-        c_arr  = np.array(closes)
 
-        # EMA stack
         ema9  = np.array(self.ema(closes, self.ema_fast))
         ema21 = np.array(self.ema(closes, self.ema_mid))
         ema50 = np.array(self.ema(closes, self.ema_slow))
-
-        # MACD
         macd_line, signal_line, histogram = self.macd(
             closes, self.macd_fast, self.macd_slow, self.macd_sig
         )
 
-        # Current values
-        e9_c  = float(ema9[-1]);  e9_p  = float(ema9[-2])
-        e21_c = float(ema21[-1]); e21_p = float(ema21[-2])
-        e50_c = float(ema50[-1])
-        ml_c  = float(macd_line[-1]); ml_p = float(macd_line[-2])
-        sl_c  = float(signal_line[-1]); sl_p = float(signal_line[-2])
-        h_c   = float(histogram[-1]);  h_p  = float(histogram[-2])
-        price = current_price
+        e9   = float(ema9[-1])
+        e21  = float(ema21[-1])
+        e50  = float(ema50[-1])
+        ml_c = float(macd_line[-1]);  ml_p = float(macd_line[-2])
+        sl_c = float(signal_line[-1]); sl_p = float(signal_line[-2])
+        h_c  = float(histogram[-1]);   h_p  = float(histogram[-2])
+        p    = current_price
 
-        if any(np.isnan(v) for v in [e9_c, e21_c, e50_c, ml_c, sl_c, h_c]):
+        if any(np.isnan(v) for v in [e9, e21, e50, ml_c, sl_c, h_c]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Indicator NaN")
 
-        # ── Conditions ────────────────────────────────────────────────
-        ema_bull_stack  = e9_c > e21_c > e50_c
-        ema_bear_stack  = e9_c < e21_c < e50_c
-        price_above_50  = price > e50_c
-        price_below_50  = price < e50_c
-        macd_cross_up   = ml_p < sl_p and ml_c > sl_c   # MACD line crosses above signal
-        macd_cross_down = ml_p > sl_p and ml_c < sl_c   # MACD line crosses below signal
-        hist_positive   = h_c > 0
-        hist_negative   = h_c < 0
-        hist_turning_up  = h_c > h_p   # histogram rising
-        hist_turning_dn  = h_c < h_p   # histogram falling
+        # ── Helpers ───────────────────────────────────────────────────
+        macd_cross_up   = ml_p < sl_p and ml_c > sl_c
+        macd_cross_down = ml_p > sl_p and ml_c < sl_c
+        hist_up   = h_c > h_p   # histogram rising
+        hist_down = h_c < h_p   # histogram falling
 
-        # EMA slope strength (how aligned the stack is)
-        ema_bull_strength = ((e9_c - e21_c) / e21_c + (e21_c - e50_c) / e50_c) * 100
-        ema_bear_strength = ((e21_c - e9_c) / e21_c + (e50_c - e21_c) / e50_c) * 100
+        # ── BUY tiers ─────────────────────────────────────────────────
+        # A: full stack + MACD crossover + price above EMA21
+        buy_A = (e9 > e21 > e50) and macd_cross_up and p > e21
+        # B: MACD crossover alone, price above EMA9 (relaxed)
+        buy_B = macd_cross_up and p > e9
+        # C: EMA9 > EMA21 + histogram just crossed 0 upward
+        buy_C = (e9 > e21) and (h_c > 0 > h_p) and p > e21
 
-        # ── BUY ───────────────────────────────────────────────────────
-        # Full confluence: EMA stack + MACD cross up + above EMA50
-        buy_full = ema_bull_stack and macd_cross_up and price_above_50
-        # Partial: EMA stack + histogram just turned positive
-        buy_partial = ema_bull_stack and hist_positive and hist_turning_up and price_above_50
-
-        if buy_full or buy_partial:
-            conf = min(1.0, 0.5 + min(ema_bull_strength * 5, 0.3) + (0.2 if buy_full else 0.0))
-            tag  = "EMA stack + MACD crossover" if buy_full else "EMA stack + MACD hist rising"
+        if buy_A or buy_B or buy_C:
+            conf = 0.75 if buy_A else (0.60 if buy_B else 0.50)
+            tag  = ("Full EMA stack+MACD cross" if buy_A
+                    else "MACD crossover" if buy_B
+                    else "EMA9>21 + hist cross 0")
             return Signal(
                 type=SignalType.BUY,
                 symbol=self.symbol,
-                price=current_price,
+                price=p,
                 amount=self.position_pct,
-                reason=f"[MACD+EMA] {tag} | EMA9={e9_c:.0f} EMA21={e21_c:.0f} EMA50={e50_c:.0f}",
+                reason=f"[MACD+EMA] {tag} | EMA9={e9:.0f} EMA21={e21:.0f} hist={h_c:.4f}",
                 confidence=conf,
-                metadata={"ema9": e9_c, "ema21": e21_c, "ema50": e50_c,
+                metadata={"ema9": e9, "ema21": e21, "ema50": e50,
                           "macd": ml_c, "signal": sl_c, "hist": h_c},
             )
 
-        # ── SELL ──────────────────────────────────────────────────────
-        sell_full    = ema_bear_stack and macd_cross_down and price_below_50
-        sell_partial = ema_bear_stack and hist_negative and hist_turning_dn and price_below_50
+        # ── SELL tiers ────────────────────────────────────────────────
+        sell_A = (e9 < e21 < e50) and macd_cross_down and p < e21
+        sell_B = macd_cross_down and p < e9
+        sell_C = (e9 < e21) and (h_c < 0 < h_p) and p < e21
 
-        if sell_full or sell_partial:
-            conf = min(1.0, 0.5 + min(ema_bear_strength * 5, 0.3) + (0.2 if sell_full else 0.0))
-            tag  = "EMA stack + MACD crossover" if sell_full else "EMA stack + MACD hist falling"
+        if sell_A or sell_B or sell_C:
+            conf = 0.75 if sell_A else (0.60 if sell_B else 0.50)
+            tag  = ("Full EMA stack+MACD cross" if sell_A
+                    else "MACD crossover" if sell_B
+                    else "EMA9<21 + hist cross 0")
             return Signal(
                 type=SignalType.SELL,
                 symbol=self.symbol,
-                price=current_price,
+                price=p,
                 amount=self.position_pct,
-                reason=f"[MACD+EMA] {tag} | EMA9={e9_c:.0f} EMA21={e21_c:.0f} EMA50={e50_c:.0f}",
+                reason=f"[MACD+EMA] {tag} | EMA9={e9:.0f} EMA21={e21:.0f} hist={h_c:.4f}",
                 confidence=conf,
-                metadata={"ema9": e9_c, "ema21": e21_c, "ema50": e50_c,
+                metadata={"ema9": e9, "ema21": e21, "ema50": e50,
                           "macd": ml_c, "signal": sl_c, "hist": h_c},
             )
 
         # ── HOLD ──────────────────────────────────────────────────────
-        stack = "bull" if ema_bull_stack else ("bear" if ema_bear_stack else "mixed")
-        macd_pos = "▲" if h_c > 0 else "▼"
+        stack = ("bull" if e9 > e21 > e50 else
+                 "bear" if e9 < e21 < e50 else "mixed")
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[MACD+EMA] EMA {stack} | MACD {macd_pos}{h_c:.4f} | "
-            f"EMA9={e9_c:.0f} EMA21={e21_c:.0f} EMA50={e50_c:.0f}",
-            metadata={"ema9": e9_c, "ema21": e21_c, "ema50": e50_c,
+            f"[MACD+EMA] {stack} | EMA9={e9:.0f} EMA21={e21:.0f} EMA50={e50:.0f} "
+            f"hist={'▲' if h_c > 0 else '▼'}{h_c:.4f}",
+            metadata={"ema9": e9, "ema21": e21, "ema50": e50,
                       "macd": ml_c, "signal": sl_c, "hist": h_c},
         )

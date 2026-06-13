@@ -182,7 +182,7 @@ class TradingBot:
         new_signals = []
         for strategy in self.strategies:
             try:
-                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="1h", limit=250)
+                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="15m", limit=250)
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
                 signal = await strategy.analyze(candles, current_price)

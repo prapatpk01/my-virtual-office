@@ -69,7 +69,7 @@ def build_config() -> dict:
 
         # Strategies
         "strategies": {
-            "wt_adx":   _env_bool("STRATEGY_WT_ADX",   True),
+            "wt_adx":   _env_bool("STRATEGY_WT_ADX",   False),
             "macd_ema": _env_bool("STRATEGY_MACD_EMA",  True),
         },
 
