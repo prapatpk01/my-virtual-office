@@ -3,17 +3,16 @@ Trading Bot main engine.
 Runs strategy loops, manages orders, broadcasts state via WebSocket.
 """
 import asyncio
-import json
 import logging
-import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .connectors.base import BaseConnector
 from .strategies.base import BaseStrategy, Signal, SignalType
 from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
+from .signal_state import SignalState
 
 logger = logging.getLogger("trading_bot")
 
@@ -40,69 +39,11 @@ class BotState:
     pnl_today: float = 0.0
     pnl_total: float = 0.0
     open_positions: list = field(default_factory=list)
-    recent_trades: list = field(default_factory=list)  # last 50
-    signals: list = field(default_factory=list)        # last 20
+    recent_trades: list = field(default_factory=list)
+    signals: list = field(default_factory=list)
     strategy_states: dict = field(default_factory=dict)
     last_updated: int = 0
     error: str = ""
-
-
-class SignalStats:
-    """Tracks live trade outcomes (SL/TP hits) and computes running statistics."""
-
-    def __init__(self):
-        self._outcomes: list[dict] = []
-
-    def record(self, symbol: str, side: str, entry: float, exit_price: float,
-               sl: Optional[float], tp: Optional[float], reason: str):
-        risk = abs(entry - sl) if sl else abs(entry - exit_price) or 1.0
-        if reason == "take_profit":
-            pnl_r = abs(exit_price - entry) / risk
-        else:
-            pnl_r = -1.0
-        self._outcomes.append({
-            "symbol": symbol,
-            "side": side,
-            "entry": round(entry, 4),
-            "exit": round(exit_price, 4),
-            "sl": sl,
-            "tp": tp,
-            "pnl_r": round(pnl_r, 2),
-            "reason": reason,
-            "ts": int(time.time() * 1000),
-        })
-
-    def summary(self) -> dict:
-        out = self._outcomes
-        if not out:
-            return {"trades": 0}
-        wins   = [o for o in out if o["pnl_r"] > 0]
-        losses = [o for o in out if o["pnl_r"] <= 0]
-        total_r = sum(o["pnl_r"] for o in out)
-        gross_profit = sum(o["pnl_r"] for o in wins)
-        gross_loss   = abs(sum(o["pnl_r"] for o in losses))
-        pf = round(gross_profit / gross_loss, 2) if gross_loss else 999.0
-
-        # current streak (+N win / -N loss)
-        streak = 0
-        if out:
-            sign = 1 if out[-1]["pnl_r"] > 0 else -1
-            for o in reversed(out):
-                if (o["pnl_r"] > 0) == (sign == 1):
-                    streak += sign
-                else:
-                    break
-
-        return {
-            "trades": len(out),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": round(len(wins) / len(out) * 100, 1),
-            "profit_factor": pf,
-            "total_r": round(total_r, 2),
-            "streak": streak,
-            "recent": out[-10:],
-        }
 
 
 class TradingBot:
@@ -120,6 +61,7 @@ class TradingBot:
         interval_seconds: int = 60,
         broadcast_fn: Optional[Callable[[dict], Any]] = None,
         telegram: Optional[TelegramNotifier] = None,
+        state_file: Optional[str] = None,
     ):
         self.connector = connector
         self.strategies = strategies
@@ -129,11 +71,11 @@ class TradingBot:
         self.telegram = telegram
         self.state = BotState(paper=connector.paper)
         self._task: Optional[asyncio.Task] = None
-        # {symbol: (direction_str, timestamp_ms)} — suppress duplicate forex alerts
-        self._last_signal_dir: dict[str, tuple[str, int]] = {}
         self._start_balance = 0.0
         self._trade_history: list[TradeRecord] = []
-        self._stats = SignalStats()
+        # Persistent signal state — survives restarts
+        kwargs = {"path": state_file} if state_file else {}
+        self._sig = SignalState(**kwargs)
 
     # ------------------------------------------------------------------
     # Public control
@@ -225,7 +167,7 @@ class TradingBot:
             trigger = self.risk.check_stops(sym, price)
             if trigger:
                 side = "sell" if pos_info["side"] == "long" else "buy"
-                order = await self.connector.create_order(sym, side, pos_info["amount"])
+                await self.connector.create_order(sym, side, pos_info["amount"])
                 pnl = (price - pos_info["entry"]) * pos_info["amount"] if side == "sell" else 0
                 trade = TradeRecord(
                     timestamp=int(time.time() * 1000),
@@ -235,22 +177,24 @@ class TradingBot:
                     paper=self.connector.paper,
                 )
                 self._record_trade(trade)
-                # Record outcome for live stats
-                self._stats.record(
+                # Record outcome + unlock so next signal can fire
+                self._sig.record_outcome(
                     symbol=sym, side=pos_info["side"],
                     entry=pos_info["entry"], exit_price=price,
                     sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
                     reason=trigger,
                 )
+                self._sig.unlock(sym)
                 self.risk.close_position(sym)
-                logger.info("Position closed by %s: %s", trigger, sym)
+                logger.info("Position closed by %s: %s → signal lock released", trigger, sym)
                 if self.telegram:
-                    stats = self._stats.summary()
-                    self.telegram.notify_trade_closed(sym, trigger, price,
-                                                      pos_info["entry"],
-                                                      pos_info.get("stop_loss"),
-                                                      pos_info.get("take_profit"),
-                                                      stats)
+                    self.telegram.notify_trade_closed(
+                        sym, trigger, price,
+                        pos_info["entry"],
+                        pos_info.get("stop_loss"),
+                        pos_info.get("take_profit"),
+                        self._sig.summary(),
+                    )
 
         # Run each strategy
         new_signals = []
@@ -274,28 +218,7 @@ class TradingBot:
                 new_signals.append(sig_dict)
 
                 if signal.type != SignalType.HOLD:
-                    can_open, _ = self.risk.can_open(signal.symbol)
-                    signal_only_mode = self.risk.max_open_positions == 0
-
-                    if signal_only_mode:
-                        # Forex/signal-only: only alert when direction CHANGES or after 4h
-                        last_dir, last_ts = self._last_signal_dir.get(signal.symbol, (None, 0))
-                        now_ms = int(time.time() * 1000)
-                        direction_changed = last_dir != signal.type.value
-                        four_hours_ms = 4 * 3600 * 1000
-                        should_notify = direction_changed or (now_ms - last_ts) > four_hours_ms
-                        if should_notify:
-                            self._last_signal_dir[signal.symbol] = (signal.type.value, now_ms)
-                            if self.telegram:
-                                self.telegram.notify_signal(sig_dict)
-                        else:
-                            logger.debug("Forex signal suppressed for %s — same direction as last alert", signal.symbol)
-                    elif can_open:
-                        if self.telegram:
-                            self.telegram.notify_signal(sig_dict)
-                        await self._execute_signal(signal, strategy.name)
-                    else:
-                        logger.debug("Signal suppressed for %s — position already open or max reached", signal.symbol)
+                    await self._maybe_notify(signal, sig_dict, strategy.name)
 
             except Exception as e:
                 logger.error("Strategy %s error: %s", strategy.name, e)
@@ -307,17 +230,49 @@ class TradingBot:
                     "ts": int(time.time() * 1000),
                 })
 
-        # Keep last 20 signals
         self.state.signals = (new_signals + self.state.signals)[:20]
         self.state.open_positions = self.risk.get_positions()
         self.state.last_updated = int(time.time() * 1000)
         self._broadcast_state()
+
+    async def _maybe_notify(self, signal: Signal, sig_dict: dict, strategy_name: str):
+        """Decides whether to fire Telegram notification + execute, based on signal state."""
+        sym = signal.symbol
+        signal_only = self.risk.max_open_positions == 0
+
+        if signal_only:
+            # Forex / signal-only: alert only when direction CHANGES (persisted across restarts)
+            last_dir, last_ts = self._sig.last_direction(sym)
+            direction_changed = last_dir != signal.type.value
+            # Re-alert after 4h even if same direction (catches fresh session starts)
+            stale = (int(time.time() * 1000) - last_ts) > 4 * 3600 * 1000
+            if direction_changed or stale:
+                self._sig.lock(sym, signal.type.value)
+                if self.telegram:
+                    self.telegram.notify_signal(sig_dict)
+            else:
+                logger.debug("Forex %s suppressed — same direction already sent", sym)
+        else:
+            # Crypto: locked = already in a trade for this symbol (persists across restarts)
+            if self._sig.is_locked(sym):
+                logger.debug("Crypto %s suppressed — signal lock active (position still open)", sym)
+                return
+            can, reason = self.risk.can_open(sym)
+            if not can:
+                logger.debug("Crypto %s suppressed — %s", sym, reason)
+                return
+            # Lock before notifying to prevent race conditions
+            self._sig.lock(sym, signal.type.value)
+            if self.telegram:
+                self.telegram.notify_signal(sig_dict)
+            await self._execute_signal(signal, strategy_name)
 
     async def _execute_signal(self, signal: Signal, strategy_name: str):
         sym = signal.symbol
         can, reason = self.risk.can_open(sym)
         if not can:
             logger.info("Skipping %s signal for %s: %s", signal.type, sym, reason)
+            self._sig.unlock(sym)  # release lock if execution fails
             return
 
         balances = await self.connector.fetch_balance()
@@ -328,12 +283,13 @@ class TradingBot:
         amount = self.risk.size_position(quote_balance, price)
         if amount <= 0:
             logger.info("Position size 0, skipping %s", sym)
+            self._sig.unlock(sym)
             return
 
         side = "buy" if signal.type == SignalType.BUY else "sell"
         try:
             order = await self.connector.create_order(sym, side, amount)
-            pos = self.risk.open_position(sym, "long" if side == "buy" else "short", price, amount)
+            self.risk.open_position(sym, "long" if side == "buy" else "short", price, amount)
             trade = TradeRecord(
                 timestamp=int(time.time() * 1000),
                 symbol=sym, side=side,
@@ -348,11 +304,14 @@ class TradingBot:
                                            strategy_name, self.connector.paper)
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
+            self._sig.unlock(sym)  # release lock so bot can retry next tick
 
     async def _refresh_balance(self):
         try:
             balances = await self.connector.fetch_balance()
-            self.state.total_balance = sum(b.total for b in balances if b.asset in ("USDT", "USD", "BUSD", "BTC", "ETH"))
+            self.state.total_balance = sum(
+                b.total for b in balances if b.asset in ("USDT", "USD", "BUSD", "BTC", "ETH")
+            )
             self.state.equity = self.state.total_balance
             if self._start_balance:
                 self.state.pnl_total = self.state.total_balance - self._start_balance
@@ -393,7 +352,7 @@ class TradingBot:
             logger.warning("Broadcast failed: %s", e)
 
     def get_stats(self) -> dict:
-        return self._stats.summary()
+        return self._sig.summary()
 
     def get_state(self) -> dict:
         return {
