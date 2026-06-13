@@ -159,12 +159,16 @@ def build_forex_bot(config: dict, telegram):
         from trading.strategies.macd_ema_strategy import MACDEMAStrategy
         strategies = [MACDEMAStrategy(config["forex_symbols"][0])]
 
-    risk = RiskManager(max_open_positions=0)  # signal-only: never size real positions
-    return TradingBot(
+    # max_open_positions=0 → strategies run + Telegram alerts sent, but no real orders
+    risk = RiskManager(max_open_positions=0)
+    bot = TradingBot(
         connector=connector, strategies=strategies,
         risk_manager=risk, interval_seconds=config["forex_interval"],
         broadcast_fn=None, telegram=telegram,
     )
+    # Mark as signal-only so bot.start() skips Telegram polling (already started by crypto bot)
+    bot._skip_telegram_polling = True
+    return bot
 
 # ---------------------------------------------------------------------------
 # Main

@@ -84,7 +84,8 @@ class TradingBot:
             return
         self.state.running = True
         loop = asyncio.get_event_loop()
-        if self.telegram:
+        skip_polling = getattr(self, "_skip_telegram_polling", False)
+        if self.telegram and not skip_polling:
             self.telegram.start_polling(loop)
             strategy_names = [s.name for s in self.strategies]
             symbols = list({s.symbol for s in self.strategies})
