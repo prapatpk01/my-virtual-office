@@ -292,14 +292,16 @@ class TelegramNotifier:
         elif cmd in ("start_bot", "start"):
             if self.start_bot_fn:
                 result = self.start_bot_fn()
-                await self._send(f"▶️ {result.get('message', 'Starting...')}")
+                msg = result.get("message", "Starting...") if isinstance(result, dict) else "Starting..."
+                await self._send(f"▶️ {msg}")
             else:
                 await self._send("⚠️ start\\_bot not configured")
 
         elif cmd in ("stop_bot", "stop"):
             if self.stop_bot_fn:
                 result = self.stop_bot_fn()
-                await self._send(f"⏹ {result.get('message', 'Stopping...')}")
+                msg = result.get("message", "Stopping...") if isinstance(result, dict) else "Stopping..."
+                await self._send(f"⏹ {msg}")
             else:
                 await self._send("⚠️ stop\\_bot not configured")
 

@@ -97,5 +97,8 @@ class YahooConnector(BaseConnector):
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         return True
 
+    async def fetch_open_orders(self, symbol=None) -> list:
+        return []
+
     async def fetch_balance(self):
         return [Balance(asset="USD", free=0.0, used=0.0, total=0.0)]
