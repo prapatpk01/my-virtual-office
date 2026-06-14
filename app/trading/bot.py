@@ -4,12 +4,15 @@ Runs strategy loops, manages orders, broadcasts state via WebSocket.
 """
 import asyncio
 import logging
+import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .connectors.base import BaseConnector
 from .strategies.base import BaseStrategy, Signal, SignalType
+from .strategies.wt_adx_strategy import WTADXStrategy
 from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
 from .signal_state import SignalState
@@ -76,6 +79,10 @@ class TradingBot:
         # Persistent signal state — survives restarts
         kwargs = {"path": state_file} if state_file else {}
         self._sig = SignalState(**kwargs)
+        # WT_VERIFY=true → gate all signals through WaveTrend WT1 before notifying
+        self.wt_verify: bool = os.getenv("WT_VERIFY", "false").lower() == "true"
+        if self.wt_verify:
+            logger.info("[WT GATE] WaveTrend verify ENABLED (WT1 gate ±10 active)")
 
     # ------------------------------------------------------------------
     # Public control
@@ -229,7 +236,7 @@ class TradingBot:
                 new_signals.append(sig_dict)
 
                 if signal.type != SignalType.HOLD:
-                    await self._maybe_notify(signal, sig_dict, strategy.name)
+                    await self._maybe_notify(signal, sig_dict, strategy.name, candles)
 
             except Exception as e:
                 logger.error("Strategy %s error: %s", strategy.name, e)
@@ -246,9 +253,24 @@ class TradingBot:
         self.state.last_updated = int(time.time() * 1000)
         self._broadcast_state()
 
-    async def _maybe_notify(self, signal: Signal, sig_dict: dict, strategy_name: str):
+    async def _maybe_notify(self, signal: Signal, sig_dict: dict,
+                             strategy_name: str, candles: list = None):
         """Decides whether to fire Telegram notification + execute, based on signal state."""
         sym = signal.symbol
+
+        # ── WT1 Gate (env: WT_VERIFY=true) ─────────────────────────────
+        if self.wt_verify and candles:
+            wt1 = WTADXStrategy.compute_wt1(candles)
+            if not math.isnan(wt1):
+                if signal.type == SignalType.BUY and wt1 >= 10:
+                    logger.debug("[WT GATE] %s %s BUY blocked — WT1=%.1f ≥+10 (overbought)",
+                                 strategy_name, sym, wt1)
+                    return
+                if signal.type == SignalType.SELL and wt1 <= -10:
+                    logger.debug("[WT GATE] %s %s SELL blocked — WT1=%.1f ≤-10 (oversold)",
+                                 strategy_name, sym, wt1)
+                    return
+                logger.debug("[WT GATE] %s %s passed — WT1=%.1f", strategy_name, sym, wt1)
         signal_only = self.risk.max_open_positions == 0
 
         if signal_only:
