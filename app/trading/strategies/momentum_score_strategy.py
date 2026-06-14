@@ -109,7 +109,7 @@ class MomentumScoreStrategy(BaseStrategy):
 
         # ── Gate MTF — weighted composite 15m/1H/4H bias (EMA20/EMA50/RSI) ─
         comp_pct, mtf_label = BaseStrategy.compute_mtf_bias(candles, mtf_candles)
-        mtf_pass = (comp_pct > 0 if gate_a == 1 else comp_pct < 0)
+        mtf_pass = (comp_pct >= 33 if gate_a == 1 else comp_pct <= -33)
         if not mtf_pass:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[MTF BLOCK] {mtf_label}",

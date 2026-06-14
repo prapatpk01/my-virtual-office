@@ -114,7 +114,7 @@ class MACDEMAStrategy(BaseStrategy):
         comp_pct, mtf_label = BaseStrategy.compute_mtf_bias(candles, mtf_candles)
 
         if vote_a == 1 and buy_votes >= 1:
-            if comp_pct <= 0:
+            if comp_pct < 33:
                 return Signal(
                     SignalType.HOLD, self.symbol, current_price, 0,
                     f"[MTF BLOCK] {mtf_label}",
@@ -148,7 +148,7 @@ class MACDEMAStrategy(BaseStrategy):
             )
 
         if vote_a == -1 and sell_votes >= 1:
-            if comp_pct >= 0:
+            if comp_pct > -33:
                 return Signal(
                     SignalType.HOLD, self.symbol, current_price, 0,
                     f"[MTF BLOCK] {mtf_label}",
