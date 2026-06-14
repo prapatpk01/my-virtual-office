@@ -115,16 +115,14 @@ class YahooConnector(BaseConnector):
     async def create_order(self, symbol: str, side: str, amount: float,
                            order_type: str = "market", price: float = None) -> OrderResult:
         exec_price = self._price_cache.get(symbol, price or 0.0)
-        base = symbol.split("/")[0] if "/" in symbol else symbol[:3]
         quote = symbol.split("/")[1] if "/" in symbol else "USDT"
         import uuid as _uuid
+        cost = amount * exec_price
+        # Track only in quote currency (USDT) — avoids raw base-asset summing bug in balance refresh
         if side == "buy":
-            cost = amount * exec_price
             self._paper_balance[quote] = max(0.0, self._paper_balance.get(quote, 0) - cost)
-            self._paper_balance[base]  = self._paper_balance.get(base, 0) + amount
         else:
-            self._paper_balance[base]  = max(0.0, self._paper_balance.get(base, 0) - amount)
-            self._paper_balance[quote] = self._paper_balance.get(quote, 0) + amount * exec_price
+            self._paper_balance[quote] = self._paper_balance.get(quote, 0) + cost
         order = OrderResult(
             order_id=str(_uuid.uuid4())[:8],
             symbol=symbol, side=side,
