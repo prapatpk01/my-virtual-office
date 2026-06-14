@@ -4,8 +4,8 @@ SJ WaveTrend + UT Bot Dual-Confirm Strategy.
 Signal requires BOTH components to fire within 3 bars:
 
   WaveTrend side:
-    wtBuy  = wt1 crossover wt2  AND  wt1 < -25
-    wtSell = wt1 crossunder wt2 AND  wt1 > +30
+    wtBuy  = wt1 crossover wt2  AND  wt1 < -35
+    wtSell = wt1 crossunder wt2 AND  wt1 > +45
     Bar-2 candle confirm (use_candle=True by default):
       BUY:  wtBuy[1] AND prev-bar is green AND open > open[1]
       SELL: wtSell[1] AND prev-bar is red  AND open < close[1]
@@ -34,8 +34,8 @@ class WTADXStrategy(BaseStrategy):
         super().__init__(symbol, params)
         self.n1          = self.params.get("wt_channel_len", 10)
         self.n2          = self.params.get("wt_avg_len",     21)
-        self.ob_level    = self.params.get("ob_level",       30.0)
-        self.os_level    = self.params.get("os_level",      -25.0)
+        self.ob_level    = self.params.get("ob_level",       45.0)
+        self.os_level    = self.params.get("os_level",      -35.0)
         self.use_candle  = self.params.get("use_candle",     True)
         self.ut_mult     = self.params.get("ut_mult",         1.0)
         self.ut_atr_len  = self.params.get("ut_atr_len",      10)
