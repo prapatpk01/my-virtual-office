@@ -25,8 +25,8 @@ class UTBotStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.ut_mult     = self.params.get("ut_mult",     1.0)
-        self.ut_atr_len  = self.params.get("ut_atr_len",  10)
+        self.ut_mult     = self.params.get("ut_mult",     2.0)
+        self.ut_atr_len  = self.params.get("ut_atr_len",  14)
         self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
         self.rr_ratio    = self.params.get("rr_ratio",    1.5)
         self._last_signal = 0
@@ -127,9 +127,6 @@ class UTBotStrategy(BaseStrategy):
                     "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio,
                 },
             )
-
-        if not buy_sig[n] and not sell_sig[n]:
-            self._last_signal = 0
 
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
