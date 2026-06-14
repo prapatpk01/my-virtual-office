@@ -1,24 +1,11 @@
 """
-SJ WaveTrend + UT Bot Dual-Confirm Strategy.
+SJ WaveTrend Strategy.
 
-Signal requires BOTH components to fire within 3 bars:
+BUY:  wt1 crossover wt2  AND  wt1 < osLevel  (-45)
+SELL: wt1 crossunder wt2 AND  wt1 > obLevel  (+53)
 
-  WaveTrend side:
-    wtBuy  = wt1 crossover wt2  AND  wt1 < -35
-    wtSell = wt1 crossunder wt2 AND  wt1 > +45
-    Bar-2 candle confirm (use_candle=True by default):
-      BUY:  wtBuy[1] AND prev-bar is green AND open > open[1]
-      SELL: wtSell[1] AND prev-bar is red  AND open < close[1]
-
-  UT Bot side (mult=1.0, atr_period=10):
-    Trailing stop line trails price by mult×ATR, flipping on crossover
-    utBuy  = close crosses above trailing stop
-    utSell = close crosses below trailing stop
-
-  Final: (wtFinal AND utRecent) OR (utSignal AND wtRecent)
-    where Recent = fired within last 3 bars
-
-SL = 1.5×ATR(14), R:R = 1:1.5
+SL = slMult × ATR(14)  →  2.0 × ATR
+TP = SL × rrRatio       →  3.0 × ATR  (R:R 1:1.5)
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -34,16 +21,13 @@ class WTADXStrategy(BaseStrategy):
         super().__init__(symbol, params)
         self.n1          = self.params.get("wt_channel_len", 10)
         self.n2          = self.params.get("wt_avg_len",     21)
-        self.ob_level    = self.params.get("ob_level",       45.0)
-        self.os_level    = self.params.get("os_level",      -35.0)
-        self.use_candle  = self.params.get("use_candle",     True)
-        self.ut_mult     = self.params.get("ut_mult",         1.0)
-        self.ut_atr_len  = self.params.get("ut_atr_len",      10)
-        self.sl_atr_mult = self.params.get("sl_atr_mult",     1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",        1.5)
+        self.ob_level    = self.params.get("ob_level",       53.0)
+        self.os_level    = self.params.get("os_level",      -45.0)
+        self.sl_atr_mult = self.params.get("sl_atr_mult",    2.0)
+        self.rr_ratio    = self.params.get("rr_ratio",       1.5)
         self._last_signal = 0
 
-    # ── WaveTrend ──────────────────────────────────────────────────
+    # ── WaveTrend Core ─────────────────────────────────────────────
 
     def _wavetrend(self, highs, lows, closes):
         h = np.array(highs); l = np.array(lows); c = np.array(closes)
@@ -62,110 +46,32 @@ class WTADXStrategy(BaseStrategy):
         wt2 = np.array(self.sma(wt1.tolist(), 4))
         return wt1, wt2
 
-    # ── UT Bot trailing stop ───────────────────────────────────────
-
-    def _ut_trailing_stop(self, closes: np.ndarray, atr_a: np.ndarray) -> np.ndarray:
-        """
-        Trails price by mult×ATR, flipping direction on price crossover.
-        Matches Pine Script UT Bot logic exactly.
-        """
-        n   = len(closes)
-        tsl = np.full(n, np.nan)
-        for i in range(n):
-            slval = float(atr_a[i]) * self.ut_mult if not np.isnan(atr_a[i]) else 0.0
-            src   = float(closes[i])
-            if i == 0 or np.isnan(tsl[i - 1]):
-                tsl[i] = src + slval
-                continue
-            tsl_p = float(tsl[i - 1])
-            src_p = float(closes[i - 1])
-            if src > tsl_p and src_p > tsl_p:
-                tsl[i] = max(tsl_p, src - slval)
-            elif src < tsl_p and src_p < tsl_p:
-                tsl[i] = min(tsl_p, src + slval)
-            elif src > tsl_p:
-                tsl[i] = src - slval
-            else:
-                tsl[i] = src + slval
-        return tsl
-
-    # ── Pre-compute all signal arrays ─────────────────────────────
+    # ── Signal arrays ──────────────────────────────────────────────
 
     def _build_signals(self, candles: list):
-        """
-        Pre-compute all signal arrays for the full candle list.
-
-        Returns tuple:
-          (wt1, wt2, tsl,
-           wt_buy_final, wt_sell_final,
-           ut_buy, ut_sell,
-           buy_sig, sell_sig,
-           atr14, ut_atr)
-        """
+        """Returns (wt1, wt2, buy_sig, sell_sig, atr14)."""
         n   = len(candles)
-        cls = np.array([c.close  for c in candles], dtype=float)
-        ops = np.array([c.open   for c in candles], dtype=float)
-        hig = np.array([c.high   for c in candles], dtype=float)
-        low = np.array([c.low    for c in candles], dtype=float)
+        hig = np.array([c.high  for c in candles], dtype=float)
+        low = np.array([c.low   for c in candles], dtype=float)
+        cls = np.array([c.close for c in candles], dtype=float)
 
         wt1, wt2 = self._wavetrend(hig.tolist(), low.tolist(), cls.tolist())
-        atr14  = np.array(self.atr(candles, _ATR_PERIOD),       dtype=float)
-        ut_atr = np.array(self.atr(candles, self.ut_atr_len),   dtype=float)
-        tsl    = self._ut_trailing_stop(cls, ut_atr)
+        atr14    = np.array(self.atr(candles, _ATR_PERIOD), dtype=float)
 
-        # ─ WT base cross signals ─
-        wt_buy_base  = np.zeros(n, dtype=bool)
-        wt_sell_base = np.zeros(n, dtype=bool)
+        buy_sig  = np.zeros(n, dtype=bool)
+        sell_sig = np.zeros(n, dtype=bool)
+
         for i in range(1, n):
             if np.isnan(wt1[i]) or np.isnan(wt2[i]):
                 continue
-            cu = float(wt1[i-1]) <= float(wt2[i-1]) and float(wt1[i]) > float(wt2[i])
-            cd = float(wt1[i-1]) >= float(wt2[i-1]) and float(wt1[i]) < float(wt2[i])
-            wt_buy_base[i]  = cu and float(wt1[i]) < self.os_level
-            wt_sell_base[i] = cd and float(wt1[i]) > self.ob_level
+            # crossover(wt1, wt2): wt1[i-1] <= wt2[i-1] AND wt1[i] > wt2[i]
+            cross_up   = float(wt1[i-1]) <= float(wt2[i-1]) and float(wt1[i]) > float(wt2[i])
+            # crossunder(wt1, wt2): wt1[i-1] >= wt2[i-1] AND wt1[i] < wt2[i]
+            cross_down = float(wt1[i-1]) >= float(wt2[i-1]) and float(wt1[i]) < float(wt2[i])
+            buy_sig[i]  = cross_up   and float(wt1[i]) < self.os_level
+            sell_sig[i] = cross_down and float(wt1[i]) > self.ob_level
 
-        # ─ Bar-2 candle confirm ─
-        # BUY:  wtBuy[1] AND prev-bar green AND cur_open > prev_open
-        # SELL: wtSell[1] AND prev-bar red  AND cur_open < prev_close
-        wt_buy_f  = np.zeros(n, dtype=bool)
-        wt_sell_f = np.zeros(n, dtype=bool)
-        if self.use_candle:
-            for i in range(2, n):
-                wt_buy_f[i]  = (wt_buy_base[i-1]
-                                and cls[i-1] > ops[i-1]    # prev green
-                                and ops[i]   > ops[i-1])   # cur open > prev open
-                wt_sell_f[i] = (wt_sell_base[i-1]
-                                and cls[i-1] < ops[i-1]    # prev red
-                                and ops[i]   < cls[i-1])   # cur open < prev close
-        else:
-            wt_buy_f[:]  = wt_buy_base
-            wt_sell_f[:] = wt_sell_base
-
-        # ─ UT Bot crossover signals ─
-        ut_buy  = np.zeros(n, dtype=bool)
-        ut_sell = np.zeros(n, dtype=bool)
-        for i in range(1, n):
-            if np.isnan(tsl[i]) or np.isnan(tsl[i-1]):
-                continue
-            ut_buy[i]  = cls[i-1] < tsl[i-1] and cls[i] > tsl[i]
-            ut_sell[i] = cls[i-1] > tsl[i-1] and cls[i] < tsl[i]
-
-        # ─ Dual confirm — WT + UT must both fire within 3 bars ─
-        buy_sig  = np.zeros(n, dtype=bool)
-        sell_sig = np.zeros(n, dtype=bool)
-        for i in range(2, n):
-            wt_b_rec = bool(wt_buy_f[i]  or wt_buy_f[i-1]  or wt_buy_f[i-2])
-            wt_s_rec = bool(wt_sell_f[i] or wt_sell_f[i-1] or wt_sell_f[i-2])
-            ut_b_rec = bool(ut_buy[i]    or ut_buy[i-1]    or ut_buy[i-2])
-            ut_s_rec = bool(ut_sell[i]   or ut_sell[i-1]   or ut_sell[i-2])
-            buy_sig[i]  = (wt_buy_f[i]  and ut_b_rec) or (ut_buy[i]  and wt_b_rec)
-            sell_sig[i] = (wt_sell_f[i] and ut_s_rec) or (ut_sell[i] and wt_s_rec)
-
-        return (wt1, wt2, tsl,
-                wt_buy_f, wt_sell_f,
-                ut_buy, ut_sell,
-                buy_sig, sell_sig,
-                atr14, ut_atr)
+        return wt1, wt2, buy_sig, sell_sig, atr14
 
     # ── Kept for external gate usage ──────────────────────────────
 
@@ -194,15 +100,11 @@ class WTADXStrategy(BaseStrategy):
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
-        min_len = self.n1 + self.n2 + max(_ATR_PERIOD, self.ut_atr_len) + 10
+        min_len = self.n1 + self.n2 + _ATR_PERIOD + 10
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
-        (wt1, wt2, tsl,
-         wt_buy_f, wt_sell_f,
-         ut_buy, ut_sell,
-         buy_sig, sell_sig,
-         atr14, _) = self._build_signals(candles)
+        wt1, wt2, buy_sig, sell_sig, atr14 = self._build_signals(candles)
 
         n = len(candles) - 1
         if np.isnan(wt1[n]) or np.isnan(atr14[n]):
@@ -211,7 +113,6 @@ class WTADXStrategy(BaseStrategy):
         curr_wt1    = float(wt1[n])
         curr_wt2    = float(wt2[n]) if not np.isnan(wt2[n]) else 0.0
         current_atr = float(atr14[n])
-        tsl_v       = float(tsl[n]) if not np.isnan(tsl[n]) else None
         p           = current_price
         conf        = round(min(0.90, 0.55 + abs(curr_wt1) / 200), 2)
 
@@ -222,10 +123,9 @@ class WTADXStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf,
-                reason=f"[SJ+UT] BUY | WT1={curr_wt1:.1f} + UT confirm",
+                reason=f"[SJ-WT] BUY cross↑ | WT1={curr_wt1:.1f} < {self.os_level}",
                 metadata={
                     "wt1": round(curr_wt1, 2), "wt2": round(curr_wt2, 2),
-                    "ut_tsl": round(tsl_v, 4) if tsl_v else None,
                     "atr": round(current_atr, 4),
                     "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio,
                 },
@@ -238,10 +138,9 @@ class WTADXStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf,
-                reason=f"[SJ+UT] SELL | WT1={curr_wt1:.1f} + UT confirm",
+                reason=f"[SJ-WT] SELL cross↓ | WT1={curr_wt1:.1f} > {self.ob_level}",
                 metadata={
                     "wt1": round(curr_wt1, 2), "wt2": round(curr_wt2, 2),
-                    "ut_tsl": round(tsl_v, 4) if tsl_v else None,
                     "atr": round(current_atr, 4),
                     "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio,
                 },
@@ -255,14 +154,14 @@ class WTADXStrategy(BaseStrategy):
                 f"neutral({curr_wt1:.1f})")
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[SJ+UT] {zone} | waiting dual confirm",
+            f"[SJ-WT] {zone}",
             metadata={"wt1": round(curr_wt1, 2), "wt2": round(curr_wt2, 2)},
         )
 
     # ── Backtest ───────────────────────────────────────────────────
 
     async def backtest(self, candles: list) -> tuple[dict, tuple]:
-        min_len = self.n1 + self.n2 + max(_ATR_PERIOD, self.ut_atr_len) + 20
+        min_len = self.n1 + self.n2 + _ATR_PERIOD + 20
         if len(candles) < min_len:
             return {}, None
 
@@ -270,10 +169,7 @@ class WTADXStrategy(BaseStrategy):
         hig  = np.array([c.high  for c in candles], dtype=float)
         low  = np.array([c.low   for c in candles], dtype=float)
 
-        (_, _, _, _, _,
-         _, _,
-         buy_sig, sell_sig,
-         atr14, _) = self._build_signals(candles)
+        _, _, buy_sig, sell_sig, atr14 = self._build_signals(candles)
 
         signal_bars = []
         prev_dir = 0

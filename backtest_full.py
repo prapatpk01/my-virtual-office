@@ -101,11 +101,8 @@ def run_backtest():
         mo_s = MomentumScoreStrategy(sym)
         ma_s = MACDEMAStrategy(sym)
 
-        # ── WaveTrend + ATR (dual-confirm: SJ+UT) ───────────────────────────
-        (wt1_a, wt2_a, wt_tsl,
-         wt_buy_f, wt_sell_f, wt_ut_buy, wt_ut_sell,
-         wt_buy_sig, wt_sell_sig,
-         atr_a, _) = wt_s._build_signals(candles)
+        # ── WaveTrend (SJ-WT: crossover + OS/OB zones) ──────────────────────
+        wt1_a, wt2_a, wt_buy_sig, wt_sell_sig, atr_a = wt_s._build_signals(candles)
 
         # ── MACD/EMA indicators ──────────────────────────────────────────
         (ma_closes, ma_highs, ma_lows, ma_vols,
@@ -116,7 +113,7 @@ def run_backtest():
         mo_buy_sig, mo_sell_sig, mo_phase, mo_rsi, mo_atr = mo_s._build_signals(candles)
 
         # Min start bars
-        wt_min = max(wt_s.n1 + wt_s.n2 + max(ATR_P, wt_s.ut_atr_len) + 10, WARMUP)
+        wt_min = max(wt_s.n1 + wt_s.n2 + 14 + 10, WARMUP)
         ma_min = max(ma_s.macd_slow + ma_s.macd_sig + ma_s.vol_len + ma_s.hma_period + 5, WARMUP)
         mo_min = max(mo_s.rsi_len + mo_s.rsi_smooth + 2 * mo_s.pivot_len + mo_s.ema_len + 5, WARMUP)
 
@@ -141,15 +138,15 @@ def run_backtest():
 
             # ══ Check strategies in priority order ════════════════════
 
-            # 1. WaveTrend (SJ+UT dual-confirm) ───────────────────────────
+            # 1. WaveTrend (SJ-WT: crossover + OS/OB zones) ─────────────────
             if not fired and i >= wt_min:
                 buy  = bool(wt_buy_sig[i])
                 sell = bool(wt_sell_sig[i])
 
                 if buy and prev["WaveTrend"] != 1:
                     rr   = STRAT_RR["WaveTrend"]
-                    sl_p = entry - 1.5 * atr_v
-                    tp_p = entry + 1.5 * rr * atr_v
+                    sl_p = entry - 2.0 * atr_v
+                    tp_p = entry + 2.0 * rr * atr_v
                     eb, out = find_exit(highs, lows, i, 1, sl_p, tp_p)
                     all_signals.append((day, "WaveTrend", sym, 1, entry, sl_p, tp_p, rr, out))
                     sym_locked_until = eb
@@ -157,8 +154,8 @@ def run_backtest():
                     fired = True
                 elif sell and prev["WaveTrend"] != -1:
                     rr   = STRAT_RR["WaveTrend"]
-                    sl_p = entry + 1.5 * atr_v
-                    tp_p = entry - 1.5 * rr * atr_v
+                    sl_p = entry + 2.0 * atr_v
+                    tp_p = entry - 2.0 * rr * atr_v
                     eb, out = find_exit(highs, lows, i, -1, sl_p, tp_p)
                     all_signals.append((day, "WaveTrend", sym, -1, entry, sl_p, tp_p, rr, out))
                     sym_locked_until = eb
