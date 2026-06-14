@@ -1,405 +1,248 @@
 """
-Momentum Score Strategy — MC·DSA (8-indicator confluence).
+Momentum Score Strategy — RSI Divergence + 4-Phase Market Cycle.
 
-8 Indicators scored -1 / 0 / +1:
-  1. EMA 12/26       — price vs EMAs
-  2. S/R             — pivot highs/lows (lookback=15)
-  3. MACD 12/26/9    — line > signal AND hist rising
-  4. RSI 7/14        — fast & slow both directional
-  5. StochRSI 14/14/3/3
-  6. ROC 12 vs MA6
-  7. MFI 14
-  8. ADX/DMI 14      (strong ≥ 25)
+Phase engine:
+  Phase 1: RSI < 40 OR Bullish Divergence  (accumulation)
+  Phase 2: was Phase 1 AND RSI crosses above EMA9  (uptrend start)
+  Phase 3: RSI > 60 OR Bearish Divergence  (distribution)
+  Phase 4: was Phase 3 AND RSI crosses below EMA9  (downtrend start)
 
-BUY:  bull_score ≥ 4  AND  ADX+DI+>DI-  AND  MACD bull
-      TRIGGER: StochRSI K×D below 50 / MACD cross up / EMA cross up
-SELL: bear_score ≥ 4  AND  ADX+DI->DI+  AND  MACD bear
-      TRIGGER: StochRSI K×D above 50 / MACD cross down / EMA cross down
+Signals:
+  BUY:  Phase 1 → 2 transition
+  SELL: Phase 3 → 4 transition
 
-SL = 1.5×ATR,  TP = 1.5×1.5×ATR  (R:R 1:1.5)
-MTF Bias gate controlled by env MTFV (default: true).
+Divergence (pivot of WMA(RSI,3), lookback=5):
+  Bull: price low < pivot-bar price low  AND  RSI > pivot-bar RSI
+  Bear: price high > pivot-bar price high AND  RSI < pivot-bar RSI
+
+SL = 1.5×ATR(14), R:R = 1:1.5
 """
-import os
-import logging
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
 
-logger = logging.getLogger("momentum_score_strategy")
-
-_ATR_P    = 14
-_LOOKFWD  = 60
-_SL_MULTS = [1.0, 1.5, 2.0, 2.5]
+_ATR_PERIOD  = 14
+_SL_MULTS    = [1.0, 1.5, 2.0, 2.5]
+_LOOKFORWARD = 60
 
 
 class MomentumScoreStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        # EMA
-        self.ema_fast_len   = self.params.get("ema_fast_len",   12)
-        self.ema_slow_len   = self.params.get("ema_slow_len",   26)
-        # S/R pivot lookback
-        self.sr_len         = self.params.get("sr_len",         15)
-        # MACD
-        self.macd_fast      = self.params.get("macd_fast",      12)
-        self.macd_slow_p    = self.params.get("macd_slow",      26)
-        self.macd_sig       = self.params.get("macd_signal",     9)
-        # RSI
-        self.rsi_fast_len   = self.params.get("rsi_fast_len",    7)
-        self.rsi_slow_len   = self.params.get("rsi_slow_len",   14)
-        # StochRSI
-        self.stoch_len      = self.params.get("stoch_len",      14)
-        self.stochrsi_len   = self.params.get("stochrsi_len",   14)
-        self.stoch_k        = self.params.get("stoch_k",         3)
-        self.stoch_d        = self.params.get("stoch_d",         3)
-        self.stoch_ob       = self.params.get("stoch_ob",       80)
-        self.stoch_os       = self.params.get("stoch_os",       20)
-        # ROC
-        self.roc_len        = self.params.get("roc_len",        12)
-        self.roc_ma_len     = self.params.get("roc_ma_len",      6)
-        # MFI
-        self.mfi_len        = self.params.get("mfi_len",        14)
-        self.mfi_ob         = self.params.get("mfi_ob",         80)
-        self.mfi_os         = self.params.get("mfi_os",         20)
-        # ADX
-        self.adx_len        = self.params.get("adx_len",        14)
-        self.adx_strong     = self.params.get("adx_strong",     25)
-        # Signal threshold
-        self.min_bull_score = self.params.get("min_bull_score",  4)
-        self.min_bear_score = self.params.get("min_bear_score",  4)
-        # SL/TP
-        self.sl_atr_mult    = self.params.get("sl_atr_mult",   1.5)
-        self.rr_ratio       = self.params.get("rr_ratio",      1.5)
+        self.rsi_len     = self.params.get("rsi_len",      14)
+        self.pivot_len   = self.params.get("pivot_len",     5)
+        self.rsi_smooth  = self.params.get("rsi_smooth",    3)
+        self.ema_len     = self.params.get("ema_len",        9)
+        self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
+        self.rr_ratio    = self.params.get("rr_ratio",     1.5)
 
-    # ── Indicator helpers ──────────────────────────────────────────────
-
-    def _stoch_rsi(self, closes: list) -> tuple[np.ndarray, np.ndarray]:
-        """Stochastic applied to RSI (Pine: ta.stoch of rsi)."""
-        rsi_arr = np.array(self.rsi(closes, self.stochrsi_len), dtype=float)
-        n   = len(rsi_arr)
-        raw = np.full(n, np.nan)
-        for i in range(self.stoch_len - 1, n):
-            w  = rsi_arr[max(0, i - self.stoch_len + 1): i + 1]
-            lo = np.nanmin(w)
-            hi = np.nanmax(w)
-            raw[i] = (rsi_arr[i] - lo) / (hi - lo) * 100.0 if hi > lo else 50.0
-        k = np.array(self.sma(raw.tolist(), self.stoch_k), dtype=float)
-        d = np.array(self.sma(k.tolist(),   self.stoch_d), dtype=float)
-        return k, d
+    # ── Indicators ─────────────────────────────────────────────────
 
     @staticmethod
-    def _calc_roc(closes: np.ndarray, length: int) -> np.ndarray:
-        """Rate of Change (%)."""
-        out = np.full(len(closes), np.nan)
-        for i in range(length, len(closes)):
-            prev = closes[i - length]
-            if prev != 0:
-                out[i] = (closes[i] - prev) / prev * 100.0
-        return out
+    def _rsi(closes: np.ndarray, period: int) -> np.ndarray:
+        """Wilder's RSI."""
+        n = len(closes)
+        result = np.full(n, np.nan)
+        if n < period + 1:
+            return result
+        deltas = np.diff(closes)
+        gains  = np.where(deltas > 0,  deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+        avg_g  = float(np.mean(gains[:period]))
+        avg_l  = float(np.mean(losses[:period]))
+        result[period] = 100.0 if avg_l < 1e-10 else 100 - 100 / (1 + avg_g / avg_l)
+        for i in range(period + 1, n):
+            avg_g = (avg_g * (period - 1) + gains[i - 1]) / period
+            avg_l = (avg_l * (period - 1) + losses[i - 1]) / period
+            result[i] = 100.0 if avg_l < 1e-10 else 100 - 100 / (1 + avg_g / avg_l)
+        return result
 
     @staticmethod
-    def _calc_mfi(candles: list, length: int) -> np.ndarray:
-        """Money Flow Index."""
-        n    = len(candles)
-        hlc3 = np.array([(c.high + c.low + c.close) / 3.0 for c in candles])
-        vol  = np.array([c.volume for c in candles], dtype=float)
-        mf   = hlc3 * vol
-        out  = np.full(n, np.nan)
-        for i in range(length, n):
-            pos = neg = 0.0
-            for j in range(i - length + 1, i + 1):
-                if hlc3[j] > hlc3[j - 1]:
-                    pos += mf[j]
-                elif hlc3[j] < hlc3[j - 1]:
-                    neg += mf[j]
-            out[i] = 100.0 if neg == 0 else 100.0 - 100.0 / (1.0 + pos / neg)
-        return out
+    def _wma(arr: np.ndarray, period: int) -> np.ndarray:
+        """Weighted Moving Average (linear weights 1..period)."""
+        n       = len(arr)
+        result  = np.full(n, np.nan)
+        weights = np.arange(1, period + 1, dtype=float)
+        wsum    = weights.sum()
+        for i in range(period - 1, n):
+            w = arr[i - period + 1 : i + 1]
+            if not np.any(np.isnan(w)):
+                result[i] = float(np.dot(w, weights) / wsum)
+        return result
 
-    def _pivot_sr(self, highs: np.ndarray, lows: np.ndarray
-                  ) -> tuple[np.ndarray, np.ndarray]:
+    # ── Core signal engine ─────────────────────────────────────────
+
+    def _build_signals(self, candles: list):
         """
-        Causal pivot-based S/R.
-        Pivot high confirmed at bar j = i - sr_len, using window [j-sr_len, j+sr_len].
-        Levels persist forward until next pivot.
+        Compute all signal arrays over the full candle list.
+        Returns (buy_sig, sell_sig, phase, rsi_src, atr_a).
         """
-        n, L     = len(highs), self.sr_len
-        res      = np.full(n, np.nan)
-        sup      = np.full(n, np.nan)
-        last_res = last_sup = np.nan
-        for i in range(2 * L, n):
-            j   = i - L
-            w_h = highs[j - L: j + L + 1]
-            w_l = lows[j - L:  j + L + 1]
-            if len(w_h) == 2 * L + 1 and highs[j] == np.max(w_h):
-                last_res = highs[j]
-            if len(w_l) == 2 * L + 1 and lows[j]  == np.min(w_l):
-                last_sup = lows[j]
-            res[i] = last_res
-            sup[i] = last_sup
-        return res, sup
+        n      = len(candles)
+        closes = np.array([c.close for c in candles], dtype=float)
+        highs  = np.array([c.high  for c in candles], dtype=float)
+        lows   = np.array([c.low   for c in candles], dtype=float)
 
-    # ── Score helpers ──────────────────────────────────────────────────
+        rsi_raw = self._rsi(closes, self.rsi_len)
+        rsi_src = self._wma(rsi_raw, self.rsi_smooth)
+        rsi_ema = np.array(self.ema(rsi_src.tolist(), self.ema_len), dtype=float)
+        atr_a   = np.array(self.atr(candles, _ATR_PERIOD), dtype=float)
 
-    @staticmethod
-    def _sr_score(price: float, res: float, sup: float) -> int:
-        res_nan = np.isnan(res)
-        sup_nan = np.isnan(sup)
-        if res_nan and sup_nan:
-            return 0
-        near_res  = (not res_nan) and abs(price - res) / price < 0.005
-        near_sup  = (not sup_nan) and abs(price - sup) / price < 0.005
-        above_res = (not res_nan) and price > res
-        below_sup = (not sup_nan) and price < sup
-        if above_res or near_sup:  return  1
-        if below_sup or near_res:  return -1
-        return 0
+        pl = self.pivot_len
 
-    def _all_indicators(self, candles: list):
-        """Compute and return all indicator arrays. Shared by analyze + backtest."""
-        closes = [c.close for c in candles]
-        cn     = np.array(closes, dtype=float)
-        hn     = np.array([c.high for c in candles], dtype=float)
-        ln     = np.array([c.low  for c in candles], dtype=float)
+        # Pivot detection on rsiSrc (Pine: pivothigh/pivotlow of rsiSrc, len=5)
+        # At bar i, pivot bar = i-pl (confirmed by pl right bars)
+        # Matches Pine order: update last values THEN check divergence
+        last_price_hi = np.nan
+        last_rsi_hi   = np.nan
+        last_price_lo = np.nan
+        last_rsi_lo   = np.nan
 
-        ef  = np.array(self.ema(closes, self.ema_fast_len),  dtype=float)
-        es  = np.array(self.ema(closes, self.ema_slow_len),  dtype=float)
-        _ml, _sl, _hi = self.macd(closes, self.macd_fast, self.macd_slow_p, self.macd_sig)
-        ml  = np.array(_ml, dtype=float)
-        sl  = np.array(_sl, dtype=float)
-        hi  = np.array(_hi, dtype=float)
-        rf  = np.array(self.rsi(closes, self.rsi_fast_len),  dtype=float)
-        rs  = np.array(self.rsi(closes, self.rsi_slow_len),  dtype=float)
-        k_a, d_a = self._stoch_rsi(closes)
-        roc = self._calc_roc(cn, self.roc_len)
-        rocm= np.array(self.sma(roc.tolist(), self.roc_ma_len), dtype=float)
-        mfi = self._calc_mfi(candles, self.mfi_len)
-        _adx, _dip, _dim = self.adx(candles, self.adx_len)
-        adx = np.array(_adx, dtype=float)
-        dip = np.array(_dip, dtype=float)
-        dim = np.array(_dim, dtype=float)
-        atr = np.array(self.atr(candles, _ATR_P), dtype=float)
-        res, sup = self._pivot_sr(hn, ln)
+        bull_div = np.zeros(n, dtype=bool)
+        bear_div = np.zeros(n, dtype=bool)
 
-        return ef, es, ml, sl, hi, rf, rs, k_a, d_a, roc, rocm, mfi, adx, dip, dim, atr, res, sup, cn, hn, ln
+        for i in range(2 * pl, n):
+            j = i - pl
+            if j < pl:
+                continue
+            w = rsi_src[j - pl : j + pl + 1]
+            if np.any(np.isnan(w)):
+                continue
 
-    def _bar_scores(self, i, ef, es, ml, sl, hi, rf, rs, k_a, d_a,
-                    roc, rocm, mfi, adx, dip, dim, closes):
-        """Compute 8 scores and momentum/trigger flags at bar i."""
-        p = float(closes[i])
+            # Pivot low of rsiSrc → potential bull divergence
+            if float(rsi_src[j]) == float(np.min(w)):
+                last_price_lo = float(lows[j])
+                last_rsi_lo   = float(rsi_src[j])
+                if (not np.isnan(rsi_src[i]) and
+                        float(lows[i])    < last_price_lo and
+                        float(rsi_src[i]) > last_rsi_lo):
+                    bull_div[i] = True
 
-        ema_bull = ef[i] > es[i] and p > ef[i]
-        ema_bear = ef[i] < es[i] and p < ef[i]
-        ema_sc   = 1 if ema_bull else (-1 if ema_bear else 0)
+            # Pivot high of rsiSrc → potential bear divergence
+            if float(rsi_src[j]) == float(np.max(w)):
+                last_price_hi = float(highs[j])
+                last_rsi_hi   = float(rsi_src[j])
+                if (not np.isnan(rsi_src[i]) and
+                        float(highs[i])   > last_price_hi and
+                        float(rsi_src[i]) < last_rsi_hi):
+                    bear_div[i] = True
 
-        macd_bull = ml[i] > sl[i] and hi[i] > 0 and hi[i] > hi[i-1]
-        macd_bear = ml[i] < sl[i] and hi[i] < 0 and hi[i] < hi[i-1]
-        macd_sc   = 1 if macd_bull else (-1 if macd_bear else 0)
+        # 4-Phase state machine — exact Pine Script if/else-if cascade
+        phase    = np.ones(n, dtype=int)
+        buy_sig  = np.zeros(n, dtype=bool)
+        sell_sig = np.zeros(n, dtype=bool)
 
-        rsi_bull  = rf[i] > 50 and rs[i] > 50 and rf[i] > rf[i-1]
-        rsi_bear  = rf[i] < 50 and rs[i] < 50 and rf[i] < rf[i-1]
-        rsi_sc    = 1 if rsi_bull else (-1 if rsi_bear else 0)
+        for i in range(1, n):
+            if np.isnan(rsi_src[i]) or np.isnan(rsi_ema[i]):
+                phase[i] = phase[i - 1]
+                continue
 
-        stoch_bull = k_a[i] > d_a[i] and k_a[i] < self.stoch_ob and k_a[i] > k_a[i-1]
-        stoch_bear = k_a[i] < d_a[i] and k_a[i] > self.stoch_os and k_a[i] < k_a[i-1]
-        stoch_sc   = 1 if stoch_bull else (-1 if stoch_bear else 0)
+            prev   = int(phase[i - 1])
+            rsi_v  = float(rsi_src[i])
+            rsi_e  = float(rsi_ema[i])
+            rsi_vp = float(rsi_src[i - 1]) if not np.isnan(rsi_src[i - 1]) else rsi_v
+            rsi_ep = float(rsi_ema[i - 1]) if not np.isnan(rsi_ema[i - 1]) else rsi_e
 
-        roc_bull = roc[i] > 0 and roc[i] > rocm[i]
-        roc_bear = roc[i] < 0 and roc[i] < rocm[i]
-        roc_sc   = 1 if roc_bull else (-1 if roc_bear else 0)
+            cross_up   = rsi_vp <= rsi_ep and rsi_v > rsi_e
+            cross_down = rsi_vp >= rsi_ep and rsi_v < rsi_e
 
-        mfi_bull = mfi[i] > 50 and mfi[i] > mfi[i-1] and mfi[i] < self.mfi_ob
-        mfi_bear = mfi[i] < 50 and mfi[i] < mfi[i-1] and mfi[i] > self.mfi_os
-        mfi_sc   = 1 if mfi_bull else (-1 if mfi_bear else 0)
+            if rsi_v < 40 or bull_div[i]:
+                phase[i] = 1
+            elif prev == 1 and cross_up:
+                phase[i] = 2
+            elif rsi_v > 60 or bear_div[i]:
+                phase[i] = 3
+            elif prev == 3 and cross_down:
+                phase[i] = 4
+            else:
+                phase[i] = prev
 
-        adx_v = float(adx[i]) if not np.isnan(adx[i]) else 0.0
-        dip_v = float(dip[i]) if not np.isnan(dip[i]) else 0.0
-        dim_v = float(dim[i]) if not np.isnan(dim[i]) else 0.0
-        adx_bull = adx_v >= self.adx_strong and dip_v > dim_v
-        adx_bear = adx_v >= self.adx_strong and dim_v > dip_v
-        adx_sc   = 1 if adx_bull else (-1 if adx_bear else 0)
+            buy_sig[i]  = phase[i] == 2 and phase[i - 1] == 1
+            sell_sig[i] = phase[i] == 4 and phase[i - 1] == 3
 
-        return (ema_sc, macd_sc, macd_bull, macd_bear,
-                rsi_sc, stoch_sc, roc_sc, mfi_sc, adx_sc,
-                adx_bull, adx_bear, adx_v, dip_v, dim_v)
+        return buy_sig, sell_sig, phase, rsi_src, atr_a
 
-    # ── Live analysis ──────────────────────────────────────────────────
+    # ── Live analysis ──────────────────────────────────────────────
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
-        min_len = (max(2 * self.sr_len + 2,
-                       self.macd_slow_p + self.macd_sig + self.rsi_slow_len,
-                       self.stochrsi_len + self.stoch_len + self.stoch_k + self.stoch_d,
-                       self.mfi_len, self.adx_len * 2) + 10)
+        min_len = self.rsi_len + self.rsi_smooth + 2 * self.pivot_len + self.ema_len + 5
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
-        (ef, es, ml, sl_a, hi, rf, rs, k_a, d_a,
-         roc, rocm, mfi, adx, dip, dim, atr, res, sup, cn, hn, ln) = self._all_indicators(candles)
+        buy_sig, sell_sig, phase, rsi_src, atr_a = self._build_signals(candles)
 
-        n = len(candles) - 1  # current bar
+        n   = len(candles) - 1
+        p   = current_price
+        atr = float(atr_a[n])   if not np.isnan(atr_a[n])   else 0.0
+        rsi = float(rsi_src[n]) if not np.isnan(rsi_src[n]) else 50.0
+        ph  = int(phase[n])
+        conf = round(min(0.85, 0.60 + abs(rsi - 50) / 100), 2)
 
-        check = [ef[n], es[n], ml[n], sl_a[n], hi[n], rf[n], rs[n],
-                 k_a[n], d_a[n], roc[n], rocm[n], mfi[n], atr[n]]
-        if any(np.isnan(v) for v in check):
-            return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Indicator NaN")
-
-        closes = cn
-
-        # S/R score uses current price
-        sr_sc = self._sr_score(current_price, float(res[n]), float(sup[n]))
-
-        # Other 7 scores
-        (ema_sc, macd_sc, macd_bull, macd_bear,
-         rsi_sc, stoch_sc, roc_sc, mfi_sc, adx_sc,
-         adx_bull, adx_bear, adx_v, dip_v, dim_v) = self._bar_scores(
-            n, ef, es, ml, sl_a, hi, rf, rs, k_a, d_a, roc, rocm, mfi, adx, dip, dim, closes)
-
-        all_scores = [ema_sc, sr_sc, macd_sc, rsi_sc, stoch_sc, roc_sc, mfi_sc, adx_sc]
-        bull_score = sum(1 for s in all_scores if s ==  1)
-        bear_score = sum(1 for s in all_scores if s == -1)
-        net_score  = bull_score - bear_score
-
-        momentum_bull = bull_score >= self.min_bull_score and adx_bull and macd_bull
-        momentum_bear = bear_score >= self.min_bear_score and adx_bear and macd_bear
-
-        # Cross triggers
-        stoch_x_bull = k_a[n-1] <= d_a[n-1] and k_a[n] > d_a[n] and k_a[n-1] < 50
-        stoch_x_bear = k_a[n-1] >= d_a[n-1] and k_a[n] < d_a[n] and k_a[n-1] > 50
-        macd_x_bull  = ml[n-1] <= sl_a[n-1]  and ml[n] > sl_a[n]
-        macd_x_bear  = ml[n-1] >= sl_a[n-1]  and ml[n] < sl_a[n]
-        ema_x_bull   = ef[n-1] <= es[n-1]     and ef[n] > es[n]
-        ema_x_bear   = ef[n-1] >= es[n-1]     and ef[n] < es[n]
-        trig_bull = stoch_x_bull or macd_x_bull or ema_x_bull
-        trig_bear = stoch_x_bear or macd_x_bear or ema_x_bear
-
-        signal_buy  = momentum_bull and trig_bull
-        signal_sell = momentum_bear and trig_bear
-
-        # ── MTFV gate ────────────────────────────────────────────────
-        comp_pct, mtf_label = BaseStrategy.compute_mtf_bias(candles, mtf_candles)
-        if os.getenv("MTFV", "true").lower() == "true":
-            if signal_buy and comp_pct < 33:
-                return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                              f"[MTF BLOCK] {mtf_label}",
-                              metadata={"bull_score": bull_score,
-                                        "mtf_comp_pct": round(comp_pct, 1)})
-            if signal_sell and comp_pct > -33:
-                return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                              f"[MTF BLOCK] {mtf_label}",
-                              metadata={"bear_score": bear_score,
-                                        "mtf_comp_pct": round(comp_pct, 1)})
-
-        atr_c = float(atr[n])
-        conf  = round(0.55 + max(bull_score, bear_score) / 8.0 * 0.40, 2)
-        meta  = {
-            "bull_score": bull_score, "bear_score": bear_score, "net": net_score,
-            "ema":  f"{ef[n]:.4f}/{es[n]:.4f}",
-            "macd_hist": round(float(hi[n]), 5),
-            "rsi":  f"{rf[n]:.1f}/{rs[n]:.1f}",
-            "stoch_k": round(float(k_a[n]), 1),
-            "adx":  round(adx_v, 1), "dip": round(dip_v, 1), "dim": round(dim_v, 1),
-            "mfi":  round(float(mfi[n]), 1),
-            "roc":  round(float(roc[n]), 2),
-            "atr":  round(atr_c, 4),
-            "mtf":  mtf_label, "mtf_comp_pct": round(comp_pct, 1),
-        }
-
-        p = current_price
-        if signal_buy:
-            trig = "StochX" if stoch_x_bull else ("MACDX" if macd_x_bull else "EMAX")
-            sl_p = round(p - self.sl_atr_mult * atr_c, 4)
-            tp_p = round(p + self.sl_atr_mult * self.rr_ratio * atr_c, 4)
+        if buy_sig[n]:
+            sl_p = round(p - self.sl_atr_mult * atr, 4)
+            tp_p = round(p + self.sl_atr_mult * self.rr_ratio * atr, 4)
             return Signal(
-                type=SignalType.BUY, symbol=self.symbol, price=p, amount=0.0,
-                confidence=conf,
-                reason=f"[MC {bull_score}/8] {trig} | MTF✓ {mtf_label}",
-                metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p,
-                          "rr": self.rr_ratio, "trigger": trig},
+                type=SignalType.BUY, symbol=self.symbol,
+                price=p, amount=0.0, confidence=conf,
+                reason=f"[Momentum] Phase 1→2 | RSI={rsi:.1f}",
+                metadata={
+                    "phase": ph, "rsi": round(rsi, 1),
+                    "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio,
+                },
             )
 
-        if signal_sell:
-            trig = "StochX" if stoch_x_bear else ("MACDX" if macd_x_bear else "EMAX")
-            sl_p = round(p + self.sl_atr_mult * atr_c, 4)
-            tp_p = round(p - self.sl_atr_mult * self.rr_ratio * atr_c, 4)
+        if sell_sig[n]:
+            sl_p = round(p + self.sl_atr_mult * atr, 4)
+            tp_p = round(p - self.sl_atr_mult * self.rr_ratio * atr, 4)
             return Signal(
-                type=SignalType.SELL, symbol=self.symbol, price=p, amount=0.0,
-                confidence=conf,
-                reason=f"[MC {bear_score}/8] {trig} | MTF✓ {mtf_label}",
-                metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p,
-                          "rr": self.rr_ratio, "trigger": trig},
+                type=SignalType.SELL, symbol=self.symbol,
+                price=p, amount=0.0, confidence=conf,
+                reason=f"[Momentum] Phase 3→4 | RSI={rsi:.1f}",
+                metadata={
+                    "phase": ph, "rsi": round(rsi, 1),
+                    "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio,
+                },
             )
 
-        # HOLD
-        bias    = f"BULL {bull_score}/8" if bull_score >= bear_score else f"BEAR {bear_score}/8"
-        mom_str = "mom✓" if (momentum_bull or momentum_bear) else "no-mom"
+        _NAMES = {1: "Accumulation", 2: "Uptrend", 3: "Distribution", 4: "Downtrend"}
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[MC] {bias} | {mom_str} | no trigger",
-            metadata={"bull_score": bull_score, "bear_score": bear_score,
-                      "adx": round(adx_v, 1), "mfi": round(float(mfi[n]), 1)},
+            f"[Momentum] Phase {ph} ({_NAMES.get(ph,'?')}) | RSI={rsi:.1f}",
+            metadata={"phase": ph, "rsi": round(rsi, 1)},
         )
 
-    # ── Backtest ───────────────────────────────────────────────────────
+    # ── Backtest ───────────────────────────────────────────────────
 
     async def backtest(self, candles: list) -> tuple[dict, tuple]:
-        min_len = (max(2 * self.sr_len + 2,
-                       self.macd_slow_p + self.macd_sig + self.rsi_slow_len,
-                       self.stochrsi_len + self.stoch_len + self.stoch_k + self.stoch_d,
-                       self.mfi_len, self.adx_len * 2) + 10)
-        if len(candles) < min_len + 20:
+        min_len = self.rsi_len + self.rsi_smooth + 2 * self.pivot_len + self.ema_len + 20
+        if len(candles) < min_len:
             return {}, None
 
-        (ef, es, ml, sl_a, hi, rf, rs, k_a, d_a,
-         roc, rocm, mfi, adx, dip, dim, atr, res, sup, cn, hn, ln) = self._all_indicators(candles)
+        cls = np.array([c.close for c in candles], dtype=float)
+        hig = np.array([c.high  for c in candles], dtype=float)
+        low = np.array([c.low   for c in candles], dtype=float)
 
-        closes = cn
-        signal_bars: list[tuple[int, int, float]] = []
+        buy_sig, sell_sig, _, _, atr_a = self._build_signals(candles)
+
+        signal_bars = []
         prev_dir = 0
-
         for i in range(min_len, len(candles) - 1):
-            check = [ef[i], es[i], ml[i], sl_a[i], hi[i], rf[i], rs[i],
-                     k_a[i], d_a[i], roc[i], rocm[i], mfi[i], atr[i]]
-            if any(np.isnan(v) for v in check):
+            if np.isnan(atr_a[i]):
                 continue
-
-            sr_sc = self._sr_score(float(closes[i]), float(res[i]), float(sup[i]))
-
-            (ema_sc, macd_sc, macd_bull, macd_bear,
-             rsi_sc, stoch_sc, roc_sc, mfi_sc, adx_sc,
-             adx_bull, adx_bear, *_) = self._bar_scores(
-                i, ef, es, ml, sl_a, hi, rf, rs, k_a, d_a, roc, rocm, mfi, adx, dip, dim, closes)
-
-            scores     = [ema_sc, sr_sc, macd_sc, rsi_sc, stoch_sc, roc_sc, mfi_sc, adx_sc]
-            bull_score = sum(1 for s in scores if s ==  1)
-            bear_score = sum(1 for s in scores if s == -1)
-
-            mom_bull = bull_score >= self.min_bull_score and adx_bull and macd_bull
-            mom_bear = bear_score >= self.min_bear_score and adx_bear and macd_bear
-
-            trig_bull = ((k_a[i-1] <= d_a[i-1] and k_a[i] > d_a[i] and k_a[i-1] < 50) or
-                         (ml[i-1]  <= sl_a[i-1] and ml[i]  > sl_a[i]) or
-                         (ef[i-1]  <= es[i-1]   and ef[i]  > es[i]))
-            trig_bear = ((k_a[i-1] >= d_a[i-1] and k_a[i] < d_a[i] and k_a[i-1] > 50) or
-                         (ml[i-1]  >= sl_a[i-1] and ml[i]  < sl_a[i]) or
-                         (ef[i-1]  >= es[i-1]   and ef[i]  < es[i]))
-
-            buy  = mom_bull and trig_bull
-            sell = mom_bear and trig_bear
-
-            if buy and prev_dir != 1:
-                signal_bars.append((i, 1, float(atr[i])))
+            if buy_sig[i] and prev_dir != 1:
+                signal_bars.append((i, 1, float(atr_a[i])))
                 prev_dir = 1
-            elif sell and prev_dir != -1:
-                signal_bars.append((i, -1, float(atr[i])))
+            elif sell_sig[i] and prev_dir != -1:
+                signal_bars.append((i, -1, float(atr_a[i])))
                 prev_dir = -1
-            elif not buy and not sell:
+            elif not buy_sig[i] and not sell_sig[i]:
                 prev_dir = 0
 
         if not signal_bars:
             return {}, None
 
         best_score, best_config = -999.0, None
-        stats: dict[str, dict] = {}
+        stats: dict = {}
 
         for sl_m in _SL_MULTS:
             rr = self.rr_ratio
@@ -408,31 +251,31 @@ class MomentumScoreStrategy(BaseStrategy):
             for idx, direction, atr_val in signal_bars:
                 if atr_val <= 0:
                     continue
-                entry = float(closes[idx])
-                sl_p  = entry - sl_m * atr_val if direction == 1 else entry + sl_m * atr_val
+                entry = float(cls[idx])
+                sl_p  = entry - sl_m * atr_val if direction ==  1 else entry + sl_m * atr_val
                 tp_p  = entry + sl_m * rr * atr_val if direction == 1 else entry - sl_m * rr * atr_val
                 outcome = 0
-                for j in range(idx + 1, min(idx + _LOOKFWD, len(candles))):
+                for j in range(idx + 1, min(idx + _LOOKFORWARD, len(cls))):
                     if direction == 1:
-                        if ln[j] <= sl_p: outcome = -1; break
-                        if hn[j] >= tp_p: outcome =  1; break
+                        if low[j] <= sl_p: outcome = -1; break
+                        if hig[j] >= tp_p: outcome =  1; break
                     else:
-                        if hn[j] >= sl_p: outcome = -1; break
-                        if ln[j] <= tp_p: outcome =  1; break
+                        if hig[j] >= sl_p: outcome = -1; break
+                        if low[j] <= tp_p: outcome =  1; break
                 if outcome ==  1: wins   += 1; total_r += rr
                 elif outcome == -1: losses += 1; total_r -= 1.0
 
             total = wins + losses
-            wr    = wins / total if total else 0.0
-            pf    = (wins * rr) / max(losses, 1)
-            key   = f"SL={sl_m}xATR  RR=1:{rr}"
+            wr  = wins / total if total else 0.0
+            pf  = (wins * rr) / max(losses, 1)
+            key = f"SL={sl_m}xATR  RR=1:{rr}"
             stats[key] = {
                 "win_rate": round(wr * 100, 1), "profit_factor": round(pf, 2),
                 "total_r":  round(total_r, 1),  "trades": total,
-                "wins":     wins,                "losses": losses,
+                "wins": wins,                    "losses": losses,
             }
             if total >= 5 and total_r > best_score:
-                best_score = total_r
+                best_score  = total_r
                 best_config = (sl_m, rr)
 
         return stats, best_config
