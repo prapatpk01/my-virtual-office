@@ -1,347 +1,263 @@
 """
-MACD + EMA Voting Strategy — 2/3 confirmation + ATR-based SL/TP.
+MACD + EMA Strategy — Institutional Momentum (SJ rewrite).
 
-Three voters:
-  A) price vs HMA15
-  B) EMA9  vs SMA21  (cross detection)
-  C) MACD  vs Signal (cross detection)
+All conditions must pass (AND logic):
+  1. 1H EMA50 trend  — close > EMA50_1h for BUY  (skip if 1H data unavailable)
+  2. HMA15 slope     — rising for BUY, falling for SELL
+  3. EMA9 vs SMA21   — EMA9 > SMA21 for BUY
+  4. MACD direction  — line > signal AND hist rising for BUY
+  5. ADX > 20        — confirms trending market
+  6. Volume > MA20   — confirms participation
+  7. Breakout        — close > highest(high, 10)[1] for BUY
 
-Signal when 2/3 agree. SL/TP computed from ATR.
-MTF Bias gate (D): weighted composite of 15m/1H/4H (EMA20/EMA50/RSI scores).
-  BUY  → comp_pct > 0,  SELL → comp_pct < 0.
+SL = 1.5×ATR,  TP = 1.5×1.2×ATR  (R:R 1:1.2)
 """
 import logging
-import os
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
 
 logger = logging.getLogger("macd_ema_strategy")
 
-# Parameter search space for backtest
-_SL_MULTS  = [1.0, 1.5, 2.0, 2.5]
-_RR_RATIOS = [1.2]
-_ATR_PERIOD = 14
-_LOOKFORWARD = 60  # max candles to look for SL/TP hit
+_ATR_PERIOD  = 14
+_SL_MULTS    = [1.0, 1.5, 2.0, 2.5]
+_LOOKFORWARD = 60
 
 
 class MACDEMAStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.hma_period  = self.params.get("hma_period",    15)
-        self.ema_fast    = self.params.get("ema_fast",       9)
-        self.sma_slow    = self.params.get("sma_slow",      21)
-        self.macd_fast   = self.params.get("macd_fast",     12)
-        self.macd_slow   = self.params.get("macd_slow",     26)
-        self.macd_sig    = self.params.get("macd_signal",    9)
-        self.adx_threshold = self.params.get("adx_threshold", 15)
-        # SL/TP — updated by backtest at startup
-        self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",     1.2)
+        self.hma_period    = self.params.get("hma_period",    15)
+        self.ema_fast      = self.params.get("ema_fast",       9)
+        self.sma_slow      = self.params.get("sma_slow",      21)
+        self.macd_fast     = self.params.get("macd_fast",     12)
+        self.macd_slow     = self.params.get("macd_slow",     26)
+        self.macd_sig      = self.params.get("macd_signal",    9)
+        self.adx_len       = self.params.get("adx_len",       14)
+        self.adx_threshold = self.params.get("adx_threshold", 20)
+        self.breakout_len  = self.params.get("breakout_len",  10)
+        self.vol_len       = self.params.get("vol_len",       20)
+        self.ema50_len     = self.params.get("ema50_len",     50)
+        self.sl_atr_mult   = self.params.get("sl_atr_mult",  1.5)
+        self.rr_ratio      = self.params.get("rr_ratio",     1.2)
 
-    # ------------------------------------------------------------------
-    # Live signal
-    # ------------------------------------------------------------------
+    # ── Signal helper (called by analyze + backtest + backtest_full) ──
+
+    def _signal_at(self, i: int,
+                   closes, highs, lows, volumes,
+                   hma15, ema9, sma21, ml, sl_line, hist,
+                   adx_a, atr_a, vol_ma,
+                   ema50_1h: float = float("nan")) -> int:
+        """
+        Returns +1 (BUY), -1 (SELL), 0 (HOLD) at bar i.
+        ema50_1h=nan → skip 1H trend filter.
+        """
+        if i < max(2, self.breakout_len + 2):
+            return 0
+
+        check = [hma15[i], ema9[i], sma21[i], ml[i], sl_line[i],
+                 hist[i], hist[i-1], vol_ma[i]]
+        if any(np.isnan(v) for v in check):
+            return 0
+
+        p         = float(closes[i])
+        hma_slope = float(hma15[i]) - float(hma15[i-1])
+        e9_c      = float(ema9[i]);     s21_c = float(sma21[i])
+        ml_c      = float(ml[i]);       sl_c  = float(sl_line[i])
+        h_c       = float(hist[i]);     h_p   = float(hist[i-1])
+        adx_v     = float(adx_a[i]) if not np.isnan(adx_a[i]) else 0.0
+        vol_v     = float(volumes[i]);  vol_ma_v = float(vol_ma[i])
+
+        macd_bull = ml_c > sl_c and h_c > h_p
+        macd_bear = ml_c < sl_c and h_c < h_p
+        adx_ok    = adx_v > self.adx_threshold
+        vol_ok    = vol_v > vol_ma_v
+
+        # ta.highest(high, N)[1] = max(high[i-N ... i-1])
+        bo_lo  = max(0, i - self.breakout_len)
+        hs     = highs[bo_lo:i]
+        ls     = lows[bo_lo:i]
+        if len(hs) == 0:
+            return 0
+        bo_buy  = p > float(np.max(hs))
+        bo_sell = p < float(np.min(ls))
+
+        if np.isnan(ema50_1h):
+            trend_bull = trend_bear = True
+        else:
+            trend_bull = p > ema50_1h
+            trend_bear = p < ema50_1h
+
+        if (trend_bull and hma_slope > 0 and e9_c > s21_c
+                and macd_bull and adx_ok and vol_ok and bo_buy):
+            return 1
+        if (trend_bear and hma_slope < 0 and e9_c < s21_c
+                and macd_bear and adx_ok and vol_ok and bo_sell):
+            return -1
+        return 0
+
+    # ── Build indicator arrays once ────────────────────────────────
+
+    def _build_arrays(self, candles: list):
+        closes  = [c.close  for c in candles]
+        highs   = np.array([c.high   for c in candles], dtype=float)
+        lows    = np.array([c.low    for c in candles], dtype=float)
+        volumes = np.array([c.volume for c in candles], dtype=float)
+
+        hma15   = np.array(self.hma(closes, self.hma_period),  dtype=float)
+        ema9    = np.array(self.ema(closes, self.ema_fast),     dtype=float)
+        sma21   = np.array(self.sma(closes, self.sma_slow),     dtype=float)
+        _ml, _sl, _hi = self.macd(closes, self.macd_fast, self.macd_slow, self.macd_sig)
+        ml      = np.array(_ml,  dtype=float)
+        sl_line = np.array(_sl,  dtype=float)
+        hist    = np.array(_hi,  dtype=float)
+        adx_a, _, _ = self.adx(candles, self.adx_len)
+        adx_a   = np.array(adx_a, dtype=float)
+        atr_a   = np.array(self.atr(candles, _ATR_PERIOD), dtype=float)
+        vol_ma  = np.array(self.sma(volumes.tolist(), self.vol_len), dtype=float)
+        closes_n = np.array(closes, dtype=float)
+
+        return closes_n, highs, lows, volumes, hma15, ema9, sma21, ml, sl_line, hist, adx_a, atr_a, vol_ma
+
+    # ── Live analysis ──────────────────────────────────────────────
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
-        min_len = self.macd_slow + self.macd_sig + self.hma_period + 5
+        min_len = self.macd_slow + self.macd_sig + self.vol_len + self.hma_period + 5
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
-        closes = [c.close for c in candles]
-        open_price = float(candles[-1].open)   # use candle open as primary HMA15 gate
+        (closes_n, highs, lows, volumes,
+         hma15, ema9, sma21, ml, sl_line, hist,
+         adx_a, atr_a, vol_ma) = self._build_arrays(candles)
 
-        hma15      = self.hma(closes, self.hma_period)
-        ema9       = self.ema(closes, self.ema_fast)
-        sma21      = self.sma(closes, self.sma_slow)
-        macd_line, signal_line, _ = self.macd(
-            closes, self.macd_fast, self.macd_slow, self.macd_sig
+        # 1H EMA50
+        ema50_1h = float("nan")
+        if mtf_candles and "1h" in mtf_candles:
+            h1c = [c.close for c in mtf_candles["1h"]]
+            if len(h1c) >= self.ema50_len:
+                ema50_1h = float(self.ema(h1c, self.ema50_len)[-1])
+
+        n = len(candles) - 1
+        direction = self._signal_at(
+            n, closes_n, highs, lows, volumes,
+            hma15, ema9, sma21, ml, sl_line, hist,
+            adx_a, atr_a, vol_ma, ema50_1h=ema50_1h,
         )
-        atr_arr        = self.atr(candles, _ATR_PERIOD)
-        adx_arr, _, _  = self.adx(candles, 14)
 
         p     = current_price
-        hma   = float(hma15[-1])
-        hma_p = float(hma15[-2])   # previous HMA for slope check
-        e9_c  = float(ema9[-1]);        e9_p  = float(ema9[-2])
-        s21_c = float(sma21[-1]);       s21_p = float(sma21[-2])
-        ml_c  = float(macd_line[-1]);   ml_p  = float(macd_line[-2])
-        sl_c  = float(signal_line[-1]); sl_p  = float(signal_line[-2])
-        current_atr = float(atr_arr[-1])
-        current_adx = float(adx_arr[-1]) if not np.isnan(adx_arr[-1]) else 0.0
+        atr_c = float(atr_a[n]) if not np.isnan(atr_a[n]) else 0.0
+        adx_v = float(adx_a[n]) if not np.isnan(adx_a[n]) else 0.0
+        vol_ratio = (float(volumes[n]) / float(vol_ma[n])
+                     if not np.isnan(vol_ma[n]) and vol_ma[n] > 0 else 0.0)
 
-        if any(np.isnan(v) for v in [hma, e9_c, s21_c, ml_c, sl_c, current_atr]):
-            return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Indicator NaN")
+        meta = {
+            "hma15":     round(float(hma15[n]), 4),
+            "ema9":      round(float(ema9[n]),  4),
+            "sma21":     round(float(sma21[n]), 4),
+            "macd":      round(float(ml[n]),    5),
+            "hist":      round(float(hist[n]),  5),
+            "adx":       round(adx_v,            1),
+            "vol_ratio": round(vol_ratio,         2),
+            "ema50_1h":  round(ema50_1h, 4) if not np.isnan(ema50_1h) else None,
+            "atr":       round(atr_c,             4),
+        }
 
-        # Voter A uses candle OPEN price (core gate — must pass to get any signal)
-        vote_a = 1 if open_price > hma else (-1 if open_price < hma else 0)
-        vote_b = 1 if e9_c > s21_c else (-1 if e9_c < s21_c else 0)
-        vote_c = 1 if ml_c > sl_c  else (-1 if ml_c < sl_c  else 0)
-
-        # A is CORE: signal only when A passes + at least one of B/C agrees
-        b_cross_up   = e9_p <= s21_p and e9_c > s21_c
-        b_cross_down = e9_p >= s21_p and e9_c < s21_c
-        c_cross_up   = ml_p <= sl_p  and ml_c > sl_c
-        c_cross_down = ml_p >= sl_p  and ml_c < sl_c
-
-        buy_votes  = sum(1 for v in [vote_b, vote_c] if v ==  1)
-        sell_votes = sum(1 for v in [vote_b, vote_c] if v == -1)
-
-        # ── HMA slope gate — confirm trend direction ──────────────────
-        hma_slope = hma - hma_p
-        if vote_a == 1 and hma_slope <= 0:
+        if direction == 1:
+            sl_p = round(p - self.sl_atr_mult * atr_c, 4)
+            tp_p = round(p + self.sl_atr_mult * self.rr_ratio * atr_c, 4)
+            conf = round(min(0.90, 0.60 + max(0, adx_v - self.adx_threshold) / 80), 2)
             return Signal(
-                SignalType.HOLD, self.symbol, current_price, 0,
-                f"[HMA BLOCK] BUY but HMA falling ({hma_slope:+.2f})",
-                metadata={"hma15": hma, "open": open_price, "hma_slope": round(hma_slope, 4)},
+                type=SignalType.BUY, symbol=self.symbol, price=p, amount=0.0,
+                confidence=conf,
+                reason=(f"[MACD/EMA] BUY | ADX={adx_v:.0f} Vol×{vol_ratio:.1f}"
+                        + (f" 1H>{ema50_1h:.4f}" if not np.isnan(ema50_1h) else "")),
+                metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio},
             )
-        if vote_a == -1 and hma_slope >= 0:
+
+        if direction == -1:
+            sl_p = round(p + self.sl_atr_mult * atr_c, 4)
+            tp_p = round(p - self.sl_atr_mult * self.rr_ratio * atr_c, 4)
+            conf = round(min(0.90, 0.60 + max(0, adx_v - self.adx_threshold) / 80), 2)
             return Signal(
-                SignalType.HOLD, self.symbol, current_price, 0,
-                f"[HMA BLOCK] SELL but HMA rising ({hma_slope:+.2f})",
-                metadata={"hma15": hma, "open": open_price, "hma_slope": round(hma_slope, 4)},
+                type=SignalType.SELL, symbol=self.symbol, price=p, amount=0.0,
+                confidence=conf,
+                reason=(f"[MACD/EMA] SELL | ADX={adx_v:.0f} Vol×{vol_ratio:.1f}"
+                        + (f" 1H<{ema50_1h:.4f}" if not np.isnan(ema50_1h) else "")),
+                metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio},
             )
 
-        # ── ADX gate — filter sideways markets ────────────────────────
-        if current_adx < self.adx_threshold:
-            return Signal(
-                SignalType.HOLD, self.symbol, current_price, 0,
-                f"[ADX BLOCK] ADX={current_adx:.1f} < {self.adx_threshold}",
-                metadata={"hma15": hma, "open": open_price, "adx": round(current_adx, 1)},
-            )
-
-        # ── MTFV gate (D) — weighted composite 15m/1H/4H (env MTFV=true) ──
-        comp_pct, mtf_label = BaseStrategy.compute_mtf_bias(candles, mtf_candles)
-        mtfv_on = os.getenv("MTFV", "true").lower() == "true"
-
-        if vote_a == 1 and buy_votes >= 1:
-            if mtfv_on and comp_pct < 33:
-                return Signal(
-                    SignalType.HOLD, self.symbol, current_price, 0,
-                    f"[MTF BLOCK] {mtf_label}",
-                    metadata={"hma15": hma, "open": open_price, "mtf": mtf_label,
-                              "mtf_comp_pct": round(comp_pct, 1)},
-                )
-            total_buy = 1 + buy_votes
-            reason, conf = _build_reason(
-                "buy", total_buy, vote_a, vote_b, vote_c,
-                b_cross_up, b_cross_down, c_cross_up, c_cross_down,
-            )
-            sl_price = round(p - self.sl_atr_mult * current_atr, 4)
-            tp_price = round(p + self.sl_atr_mult * self.rr_ratio * current_atr, 4)
-            return Signal(
-                type=SignalType.BUY, symbol=self.symbol,
-                price=p, amount=0.0, confidence=conf,
-                reason=f"{reason} | MTF✓ {mtf_label}",
-                metadata={
-                    "hma15": hma, "open": open_price,
-                    "ema9": e9_c, "sma21": s21_c,
-                    "macd": ml_c, "macd_signal": sl_c,
-                    "atr": round(current_atr, 4),
-                    "adx": round(current_adx, 1),
-                    "stop_loss": sl_price,
-                    "take_profit": tp_price,
-                    "rr": self.rr_ratio,
-                    "votes": total_buy,
-                    "mtf": mtf_label,
-                    "mtf_comp_pct": round(comp_pct, 1),
-                },
-            )
-
-        if vote_a == -1 and sell_votes >= 1:
-            if mtfv_on and comp_pct > -33:
-                return Signal(
-                    SignalType.HOLD, self.symbol, current_price, 0,
-                    f"[MTF BLOCK] {mtf_label}",
-                    metadata={"hma15": hma, "open": open_price, "mtf": mtf_label,
-                              "mtf_comp_pct": round(comp_pct, 1)},
-                )
-            total_sell = 1 + sell_votes
-            reason, conf = _build_reason(
-                "sell", total_sell, vote_a, vote_b, vote_c,
-                b_cross_up, b_cross_down, c_cross_up, c_cross_down,
-            )
-            sl_price = round(p + self.sl_atr_mult * current_atr, 4)
-            tp_price = round(p - self.sl_atr_mult * self.rr_ratio * current_atr, 4)
-            return Signal(
-                type=SignalType.SELL, symbol=self.symbol,
-                price=p, amount=0.0, confidence=conf,
-                reason=f"{reason} | MTF✓ {mtf_label}",
-                metadata={
-                    "hma15": hma, "open": open_price,
-                    "ema9": e9_c, "sma21": s21_c,
-                    "macd": ml_c, "macd_signal": sl_c,
-                    "atr": round(current_atr, 4),
-                    "adx": round(current_adx, 1),
-                    "stop_loss": sl_price,
-                    "take_profit": tp_price,
-                    "rr": self.rr_ratio,
-                    "votes": total_sell,
-                    "mtf": mtf_label,
-                    "mtf_comp_pct": round(comp_pct, 1),
-                },
-            )
-
-        # HOLD
-        a_reason = (f"open>HMA15" if vote_a == 1
-                    else f"open<HMA15" if vote_a == -1
-                    else "open≈HMA15")
-        votes_str = (
-            f"A={'B' if vote_a==1 else 'S' if vote_a==-1 else '-'} "
-            f"B={'B' if vote_b==1 else 'S' if vote_b==-1 else '-'} "
-            f"C={'B' if vote_c==1 else 'S' if vote_c==-1 else '-'}"
-        )
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[HOLD] {votes_str} | {a_reason}",
-            metadata={
-                "hma15": hma, "open": open_price, "ema9": e9_c, "sma21": s21_c,
-                "macd": ml_c, "macd_signal": sl_c,
-                "buy_votes": buy_votes, "sell_votes": sell_votes,
-            },
+            f"[MACD/EMA] HOLD | ADX={adx_v:.1f} Vol×{vol_ratio:.1f}",
+            metadata=meta,
         )
 
-    # ------------------------------------------------------------------
-    # Backtest — find optimal SL multiplier + R:R ratio
-    # ------------------------------------------------------------------
+    # ── Backtest ───────────────────────────────────────────────────
 
-    async def backtest(self, candles: list) -> dict:
-        """
-        Simulate 2/3 voting signals on historical candles.
-        Tests all combinations of SL multipliers and R:R ratios.
-        Returns stats dict and the best (sl_mult, rr) tuple.
-        """
-        min_len = self.macd_slow + self.macd_sig + self.hma_period + _ATR_PERIOD + 5
-        if len(candles) < min_len + 20:
+    async def backtest(self, candles: list) -> tuple[dict, tuple]:
+        min_len = self.macd_slow + self.macd_sig + self.vol_len + self.hma_period + 20
+        if len(candles) < min_len:
             return {}, None
 
-        closes = [c.close for c in candles]
-        highs  = [c.high  for c in candles]
-        lows   = [c.low   for c in candles]
+        (closes_n, highs, lows, volumes,
+         hma15, ema9, sma21, ml, sl_line, hist,
+         adx_a, atr_a, vol_ma) = self._build_arrays(candles)
 
-        hma_arr  = self.hma(closes, self.hma_period)
-        ema9_arr = self.ema(closes, self.ema_fast)
-        sma21_arr= self.sma(closes, self.sma_slow)
-        ml_arr, sl_arr, _ = self.macd(closes, self.macd_fast, self.macd_slow, self.macd_sig)
-        atr_arr  = self.atr(candles, _ATR_PERIOD)
-
-        # Collect all signal bars (direction + atr)
-        signal_bars: list[tuple[int, int, float]] = []  # (idx, direction +1/-1, atr)
-        prev_dir = 0  # avoid consecutive same-direction entries
+        signal_bars: list[tuple[int, int, float]] = []
+        prev_dir = 0
 
         for i in range(min_len, len(candles) - 1):
-            if any(np.isnan(v) for v in [
-                hma_arr[i], ema9_arr[i], sma21_arr[i], ml_arr[i], sl_arr[i], atr_arr[i]
-            ]):
-                continue
-            va, vb, vc = _votes(
-                closes[i], hma_arr[i],
-                ema9_arr[i], sma21_arr[i],
-                ml_arr[i], sl_arr[i],
-            )
-            bv = sum(1 for v in [va, vb, vc] if v ==  1)
-            sv = sum(1 for v in [va, vb, vc] if v == -1)
-
-            if bv >= 2 and prev_dir != 1:
-                signal_bars.append((i, 1, float(atr_arr[i])))
+            d = self._signal_at(i, closes_n, highs, lows, volumes,
+                                hma15, ema9, sma21, ml, sl_line, hist,
+                                adx_a, atr_a, vol_ma)
+            if d == 1 and prev_dir != 1:
+                signal_bars.append((i, 1, float(atr_a[i])))
                 prev_dir = 1
-            elif sv >= 2 and prev_dir != -1:
-                signal_bars.append((i, -1, float(atr_arr[i])))
+            elif d == -1 and prev_dir != -1:
+                signal_bars.append((i, -1, float(atr_a[i])))
                 prev_dir = -1
-            else:
+            elif d == 0:
                 prev_dir = 0
 
         if not signal_bars:
             return {}, None
 
-        # Test each parameter combination
-        best_score = -999.0
-        best_config = None
-        stats: dict[str, dict] = {}
+        best_score, best_config = -999.0, None
+        stats: dict = {}
 
         for sl_m in _SL_MULTS:
-            for rr in _RR_RATIOS:
-                wins = losses = 0
-                total_r = 0.0
-
-                for idx, direction, atr_val in signal_bars:
-                    if atr_val <= 0:
-                        continue
-                    entry = closes[idx]
+            rr      = self.rr_ratio
+            wins    = losses = 0
+            total_r = 0.0
+            for idx, direction, atr_val in signal_bars:
+                if atr_val <= 0:
+                    continue
+                entry = float(closes_n[idx])
+                sl_p  = entry - sl_m * atr_val if direction == 1 else entry + sl_m * atr_val
+                tp_p  = entry + sl_m * rr * atr_val if direction == 1 else entry - sl_m * rr * atr_val
+                outcome = 0
+                for j in range(idx + 1, min(idx + _LOOKFORWARD, len(candles))):
                     if direction == 1:
-                        sl_p = entry - sl_m * atr_val
-                        tp_p = entry + sl_m * rr * atr_val
+                        if lows[j]  <= sl_p: outcome = -1; break
+                        if highs[j] >= tp_p: outcome =  1; break
                     else:
-                        sl_p = entry + sl_m * atr_val
-                        tp_p = entry - sl_m * rr * atr_val
+                        if highs[j] >= sl_p: outcome = -1; break
+                        if lows[j]  <= tp_p: outcome =  1; break
+                if outcome ==  1: wins   += 1; total_r += rr
+                elif outcome == -1: losses += 1; total_r -= 1.0
 
-                    outcome = 0
-                    for j in range(idx + 1, min(idx + _LOOKFORWARD, len(candles))):
-                        if direction == 1:
-                            if lows[j] <= sl_p:
-                                outcome = -1; break
-                            if highs[j] >= tp_p:
-                                outcome = 1; break
-                        else:
-                            if highs[j] >= sl_p:
-                                outcome = -1; break
-                            if lows[j] <= tp_p:
-                                outcome = 1; break
-
-                    if outcome == 1:
-                        wins += 1; total_r += rr
-                    elif outcome == -1:
-                        losses += 1; total_r -= 1.0
-
-                total = wins + losses
-                wr = wins / total if total else 0.0
-                pf = (wins * rr) / max(losses, 1)
-                key = f"SL={sl_m}xATR  RR=1:{rr}"
-                stats[key] = {
-                    "win_rate": round(wr * 100, 1),
-                    "profit_factor": round(pf, 2),
-                    "total_r": round(total_r, 1),
-                    "trades": total,
-                    "wins": wins,
-                    "losses": losses,
-                }
-
-                if total >= 5 and total_r > best_score:
-                    best_score = total_r
-                    best_config = (sl_m, rr)
+            total = wins + losses
+            wr    = wins / total if total else 0.0
+            pf    = (wins * rr) / max(losses, 1)
+            key   = f"SL={sl_m}xATR  RR=1:{rr}"
+            stats[key] = {
+                "win_rate": round(wr * 100, 1), "profit_factor": round(pf, 2),
+                "total_r":  round(total_r, 1),  "trades": total,
+                "wins":     wins,                "losses": losses,
+            }
+            if total >= 5 and total_r > best_score:
+                best_score  = total_r
+                best_config = (sl_m, rr)
 
         return stats, best_config
-
-
-# ------------------------------------------------------------------
-# Module-level helpers (keep analyze() readable)
-# ------------------------------------------------------------------
-
-def _votes(price, hma, e9, s21, ml, sl):
-    va = 1 if price > hma  else (-1 if price < hma  else 0)
-    vb = 1 if e9    > s21  else (-1 if e9    < s21  else 0)
-    vc = 1 if ml    > sl   else (-1 if ml    < sl   else 0)
-    return va, vb, vc
-
-
-def _build_reason(direction, votes, va, vb, vc, b_up, b_dn, c_up, c_dn):
-    is_buy = direction == "buy"
-    target = 1 if is_buy else -1
-    tags = []
-    if va == target:
-        tags.append(f"HMA15={'above' if is_buy else 'below'}")
-    if vb == target:
-        cross = " ✚cross" if (b_up if is_buy else b_dn) else ""
-        tags.append(f"EMA9{'>' if is_buy else '<'}SMA21{cross}")
-    if vc == target:
-        cross = " ✚cross" if (c_up if is_buy else c_dn) else ""
-        tags.append(f"MACD{'>' if is_buy else '<'}Sig{cross}")
-
-    conf = 0.85 if votes == 3 else 0.65
-    has_cross = (is_buy and (b_up or c_up)) or (not is_buy and (b_dn or c_dn))
-    if has_cross:
-        conf = min(conf + 0.10, 0.95)
-    return f"[{votes}/3] {' + '.join(tags)}", conf
-
-

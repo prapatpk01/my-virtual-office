@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from app.trading.connectors.base import OHLCV
 from app.trading.strategies.wt_adx_strategy import WTADXStrategy
 from app.trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-from app.trading.strategies.macd_ema_strategy import MACDEMAStrategy, _votes
+from app.trading.strategies.macd_ema_strategy import MACDEMAStrategy
 
 # ─── Constants ─────────────────────────────────────────────────────────────
 WARMUP   = 285
@@ -108,12 +108,9 @@ def run_backtest():
         atr_a = np.array(wt_s.atr(candles, ATR_P), dtype=float)
 
         # ── MACD/EMA indicators ──────────────────────────────────────────
-        hma_a   = np.array(ma_s.hma(closes.tolist(), ma_s.hma_period), dtype=float)
-        ema9_a  = np.array(ma_s.ema(closes.tolist(), 9),               dtype=float)
-        sma21_a = np.array(ma_s.sma(closes.tolist(), 21),              dtype=float)
-        _ml, _sl, _ = ma_s.macd(closes.tolist(), ma_s.macd_fast, ma_s.macd_slow, ma_s.macd_sig)
-        ml_a    = np.array(_ml, dtype=float)
-        sl_a    = np.array(_sl, dtype=float)
+        (ma_closes, ma_highs, ma_lows, ma_vols,
+         ma_hma, ma_ema9, ma_sma21, ma_ml, ma_sl, ma_hist,
+         ma_adx_a, ma_atr2, ma_volma) = ma_s._build_arrays(candles)
 
         # ── Momentum (MC·DSA) indicators ─────────────────────────────────
         (mo_ef, mo_es, mo_ml, mo_sl, mo_hi,
@@ -122,10 +119,10 @@ def run_backtest():
          mo_adx, mo_dip, mo_dim, mo_atr,
          mo_res, mo_sup, mo_cn, mo_hn, mo_ln) = mo_s._all_indicators(candles)
 
-        # Min start bars (all use WARMUP which is already generous)
+        # Min start bars
         wt_min = max(wt_s.n1 + wt_s.n2 + ATR_P + 10, WARMUP)
-        ma_min = max(ma_s.macd_slow + ma_s.macd_sig + ma_s.hma_period + ATR_P + 5, WARMUP)
-        mo_min = WARMUP  # new strategy needs ~59 bars; WARMUP=285 is sufficient
+        ma_min = max(ma_s.macd_slow + ma_s.macd_sig + ma_s.vol_len + ma_s.hma_period + 5, WARMUP)
+        mo_min = WARMUP
 
         def day_of(i): return (i - WARMUP) // BPD + 1
 
@@ -181,35 +178,33 @@ def run_backtest():
 
             # 2. MACD/EMA ──────────────────────────────────────────────
             if not fired and i >= ma_min:
-                nan_check = [hma_a[i], ema9_a[i], sma21_a[i], ml_a[i], sl_a[i]]
-                if not any(np.isnan(v) for v in nan_check):
-                    va, vb, vc = _votes(closes[i], hma_a[i], ema9_a[i], sma21_a[i],
-                                        ml_a[i], sl_a[i])
-                    bv = sum(1 for v in [va, vb, vc] if v ==  1)
-                    sv = sum(1 for v in [va, vb, vc] if v == -1)
-
-                    if bv >= 2 and prev["MACD/EMA"] != 1:
-                        if wt1_gate(wt1_a, i, 1):
-                            rr = STRAT_RR["MACD/EMA"]
-                            sl_p = entry - 1.5 * atr_v
-                            tp_p = entry + 1.5 * rr * atr_v
-                            eb, out = find_exit(highs, lows, i, 1, sl_p, tp_p)
-                            all_signals.append((day, "MACD/EMA", sym, 1, entry, sl_p, tp_p, rr, out))
-                            sym_locked_until = eb
-                            fired = True
-                        prev["MACD/EMA"] = 1
-                    elif sv >= 2 and prev["MACD/EMA"] != -1:
-                        if wt1_gate(wt1_a, i, -1):
-                            rr = STRAT_RR["MACD/EMA"]
-                            sl_p = entry + 1.5 * atr_v
-                            tp_p = entry - 1.5 * rr * atr_v
-                            eb, out = find_exit(highs, lows, i, -1, sl_p, tp_p)
-                            all_signals.append((day, "MACD/EMA", sym, -1, entry, sl_p, tp_p, rr, out))
-                            sym_locked_until = eb
-                            fired = True
-                        prev["MACD/EMA"] = -1
-                    else:
-                        prev["MACD/EMA"] = 0
+                d = ma_s._signal_at(i, ma_closes, ma_highs, ma_lows, ma_vols,
+                                    ma_hma, ma_ema9, ma_sma21, ma_ml, ma_sl, ma_hist,
+                                    ma_adx_a, ma_atr2, ma_volma)
+                if d == 1 and prev["MACD/EMA"] != 1:
+                    if wt1_gate(wt1_a, i, 1):
+                        rr   = STRAT_RR["MACD/EMA"]
+                        atr_i = float(ma_atr2[i]) if not np.isnan(ma_atr2[i]) else atr_v
+                        sl_p = entry - ma_s.sl_atr_mult * atr_i
+                        tp_p = entry + ma_s.sl_atr_mult * rr * atr_i
+                        eb, out = find_exit(highs, lows, i, 1, sl_p, tp_p)
+                        all_signals.append((day, "MACD/EMA", sym, 1, entry, sl_p, tp_p, rr, out))
+                        sym_locked_until = eb
+                        fired = True
+                    prev["MACD/EMA"] = 1
+                elif d == -1 and prev["MACD/EMA"] != -1:
+                    if wt1_gate(wt1_a, i, -1):
+                        rr   = STRAT_RR["MACD/EMA"]
+                        atr_i = float(ma_atr2[i]) if not np.isnan(ma_atr2[i]) else atr_v
+                        sl_p = entry + ma_s.sl_atr_mult * atr_i
+                        tp_p = entry - ma_s.sl_atr_mult * rr * atr_i
+                        eb, out = find_exit(highs, lows, i, -1, sl_p, tp_p)
+                        all_signals.append((day, "MACD/EMA", sym, -1, entry, sl_p, tp_p, rr, out))
+                        sym_locked_until = eb
+                        fired = True
+                    prev["MACD/EMA"] = -1
+                elif d == 0:
+                    prev["MACD/EMA"] = 0
 
             # 3. MomentumScore (MC·DSA) ─────────────────────────────────
             if not fired and i >= mo_min:
