@@ -61,10 +61,14 @@ def _env_bool(key: str, default: bool) -> bool:
 
 def build_config() -> dict:
     return {
-        "exchange":     os.environ.get("EXCHANGE", "binance"),
-        "api_key":      os.environ.get("EXCHANGE_API_KEY", ""),
-        "api_secret":   os.environ.get("EXCHANGE_API_SECRET", ""),
-        "paper":        _env_bool("PAPER_TRADING", True),
+        "exchange":        os.environ.get("EXCHANGE", "binance"),
+        "api_key":         os.environ.get("EXCHANGE_API_KEY", ""),
+        "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
+        "paper":           _env_bool("PAPER_TRADING", True),
+        # OANDA-specific
+        "oanda_api_key":   os.environ.get("OANDA_API_KEY", ""),
+        "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
+        "oanda_env":       os.environ.get("OANDA_ENV", "practice"),
         "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
@@ -117,11 +121,22 @@ def _make_telegram(config: dict):
 def build_crypto_bot(config: dict, telegram):
     from trading.connectors.binance_conn import BinanceConnector
     from trading.connectors.alpaca_conn import AlpacaConnector
+    from trading.connectors.oanda_conn import OANDAConnector
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
 
     exchange = config["exchange"]
-    if exchange in ("binance", "bybit", "okx"):
+    if exchange == "oanda":
+        connector = OANDAConnector(
+            api_key=config["oanda_api_key"],
+            account_id=config["oanda_account_id"],
+            paper=config["paper"],
+            env=config["oanda_env"],
+        )
+        logger.info("OANDA connector: env=%s paper=%s account=%s",
+                    config["oanda_env"], config["paper"],
+                    config["oanda_account_id"][:8] + "..." if config["oanda_account_id"] else "—")
+    elif exchange in ("binance", "bybit", "okx"):
         connector = BinanceConnector(
             api_key=config["api_key"], api_secret=config["api_secret"],
             paper=config["paper"], exchange_id=exchange,
