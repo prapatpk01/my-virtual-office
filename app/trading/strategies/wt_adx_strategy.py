@@ -1,8 +1,8 @@
 """
 WaveTrend Strategy — WT1/WT2 cross in OB/OS zones + ATR SL/TP.
 
-BUY:  WT1 crosses above WT2  AND  WT1 < -25  (oversold zone)
-SELL: WT1 crosses below WT2  AND  WT1 > +25  (overbought zone)
+BUY:  WT1 crosses above WT2  AND  WT1 < -25  (deep oversold zone)
+SELL: WT1 crosses below WT2  AND  WT1 > +30  (deep overbought zone)
 
 SL/TP: ATR-based, R:R = 1:1.5
 State machine prevents duplicate consecutive signals.
@@ -19,8 +19,8 @@ class WTADXStrategy(BaseStrategy):
         super().__init__(symbol, params)
         self.n1          = self.params.get("wt_channel_len", 10)
         self.n2          = self.params.get("wt_avg_len",     21)
-        self.ob_level    = self.params.get("ob_level",       10.0)   # overbought threshold
-        self.os_level    = self.params.get("os_level",      -10.0)   # oversold threshold
+        self.ob_level    = self.params.get("ob_level",       30.0)   # overbought threshold (SELL if WT1 > +30)
+        self.os_level    = self.params.get("os_level",      -25.0)   # oversold threshold (BUY if WT1 < -25)
         self.sl_atr_mult = self.params.get("sl_atr_mult",    1.5)
         self.rr_ratio    = self.params.get("rr_ratio",       1.5)
         self._last_signal = 0   # state machine: 1=buy, -1=sell

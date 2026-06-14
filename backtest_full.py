@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from app.trading.connectors.base import OHLCV
 from app.trading.strategies.wt_adx_strategy import WTADXStrategy
-from app.trading.strategies.momentum_score_strategy import MomentumScoreStrategy, _calc_score
+from app.trading.strategies.momentum_score_strategy import MomentumScoreStrategy
 from app.trading.strategies.macd_ema_strategy import MACDEMAStrategy, _votes
 
 # ─── Constants ─────────────────────────────────────────────────────────────
@@ -29,9 +29,9 @@ CAP_0    = 500.0
 ATR_P    = 14
 
 SYMBOLS = [
-    ("BTCUSD", 65_000.0, 0.0015, 0.0008, 0.00030, 42),
-    ("XAUUSD",  2_050.0, 0.0008, 0.0004, 0.00020, 43),
-    ("EURUSD",     1.085, 0.0004, 0.0002, 0.00010, 44),
+    ("BTC/USDT", 65_000.0, 0.0015, 0.0008, 0.00030, 42),
+    ("XAUUSD",   2_050.0,  0.0008, 0.0004, 0.00020, 43),
+    ("EURUSD",      1.085, 0.0004, 0.0002, 0.00010, 44),
 ]
 
 STRAT_RR = {"WaveTrend": 1.5, "MACD/EMA": 1.2, "Momentum": 1.5}
@@ -96,48 +96,47 @@ def run_backtest():
         highs   = np.array([c.high  for c in candles])
         lows    = np.array([c.low   for c in candles])
 
-        # Strategy instances for indicator methods
+        # Strategy instances
         wt_s = WTADXStrategy(sym)
         mo_s = MomentumScoreStrategy(sym)
         ma_s = MACDEMAStrategy(sym)
 
-        # Compute all indicator arrays once
-        wt1_a, wt2_a = wt_s._wavetrend(highs.tolist(), lows.tolist(), closes.tolist())
-        atr_a        = np.array(wt_s.atr(candles, ATR_P), dtype=float)
-        wt1_a        = np.array(wt1_a, dtype=float)
-        wt2_a        = np.array(wt2_a, dtype=float)
+        # ── WaveTrend + ATR ──────────────────────────────────────────────
+        wt1_raw, wt2_raw = wt_s._wavetrend(highs.tolist(), lows.tolist(), closes.tolist())
+        wt1_a = np.array(wt1_raw, dtype=float)
+        wt2_a = np.array(wt2_raw, dtype=float)
+        atr_a = np.array(wt_s.atr(candles, ATR_P), dtype=float)
 
-        hma_a    = np.array(mo_s.hma(closes.tolist(), 15),  dtype=float)
-        ema9_a   = np.array(mo_s.ema(closes.tolist(),  9),  dtype=float)
-        sma21_a  = np.array(mo_s.sma(closes.tolist(), 21),  dtype=float)
-        sma200_a = np.array(mo_s.sma(closes.tolist(), 200), dtype=float)
-        _ml, _sl, _ = mo_s.macd(closes.tolist(), 12, 26, 9)
-        ml_a     = np.array(_ml, dtype=float)
-        sl_a     = np.array(_sl, dtype=float)
-        rsi_a    = np.array(mo_s.rsi(closes.tolist(), 14), dtype=float)
-        adx_a, _, _ = mo_s.adx(candles, 14)
-        adx_a    = np.array(adx_a, dtype=float)
+        # ── MACD/EMA indicators ──────────────────────────────────────────
+        hma_a   = np.array(ma_s.hma(closes.tolist(), ma_s.hma_period), dtype=float)
+        ema9_a  = np.array(ma_s.ema(closes.tolist(), 9),               dtype=float)
+        sma21_a = np.array(ma_s.sma(closes.tolist(), 21),              dtype=float)
+        _ml, _sl, _ = ma_s.macd(closes.tolist(), ma_s.macd_fast, ma_s.macd_slow, ma_s.macd_sig)
+        ml_a    = np.array(_ml, dtype=float)
+        sl_a    = np.array(_sl, dtype=float)
 
-        # Min start bars for each strategy
+        # ── Momentum (MC·DSA) indicators ─────────────────────────────────
+        (mo_ef, mo_es, mo_ml, mo_sl, mo_hi,
+         mo_rf, mo_rs, mo_ka, mo_da,
+         mo_roc, mo_rocm, mo_mfi,
+         mo_adx, mo_dip, mo_dim, mo_atr,
+         mo_res, mo_sup, mo_cn, mo_hn, mo_ln) = mo_s._all_indicators(candles)
+
+        # Min start bars (all use WARMUP which is already generous)
         wt_min = max(wt_s.n1 + wt_s.n2 + ATR_P + 10, WARMUP)
         ma_min = max(ma_s.macd_slow + ma_s.macd_sig + ma_s.hma_period + ATR_P + 5, WARMUP)
-        mo_min = max(200 + mo_s.macd_slow + ATR_P * 2 + 10, WARMUP)
+        mo_min = WARMUP  # new strategy needs ~59 bars; WARMUP=285 is sufficient
 
         def day_of(i): return (i - WARMUP) // BPD + 1
 
-        # Position lock: symbol locked until this bar (inclusive)
         sym_locked_until = -1
-
-        # Per-strategy dedup (prev direction)
         prev = {"WaveTrend": 0, "MACD/EMA": 0, "Momentum": 0}
 
         for i in range(WARMUP, N_BARS - 1):
             day = day_of(i)
             if day < 1 or day > DAYS: break
 
-            # ── Skip if symbol is in an active trade ─────────────────
             if i <= sym_locked_until:
-                # Still update strategy dedup state so we don't carry stale state
                 continue
 
             atr_v = float(atr_a[i]) if not np.isnan(atr_a[i]) else 0.0
@@ -145,7 +144,7 @@ def run_backtest():
             if atr_v <= 0:
                 continue
 
-            fired = False  # only one signal per bar per symbol
+            fired = False
 
             # ══ Check strategies in priority order ════════════════════
 
@@ -156,8 +155,8 @@ def run_backtest():
                     w2c, w2p = float(wt2_a[i]), float(wt2_a[i-1])
                     cu  = w1p <= w2p and w1c > w2c
                     cd  = w1p >= w2p and w1c < w2c
-                    buy  = cu and w1c < -10.0
-                    sell = cd and w1c > +10.0
+                    buy  = cu and w1c < -25.0
+                    sell = cd and w1c > +30.0
 
                     if buy and prev["WaveTrend"] != 1:
                         rr = STRAT_RR["WaveTrend"]
@@ -212,38 +211,67 @@ def run_backtest():
                     else:
                         prev["MACD/EMA"] = 0
 
-            # 3. MomentumScore ─────────────────────────────────────────
+            # 3. MomentumScore (MC·DSA) ─────────────────────────────────
             if not fired and i >= mo_min:
-                vals = [hma_a[i], ema9_a[i], sma21_a[i], sma200_a[i],
-                        ml_a[i], sl_a[i], rsi_a[i]]
-                if not any(np.isnan(v) for v in vals):
-                    adx_v = float(adx_a[i]) if not np.isnan(adx_a[i]) else 0.0
-                    gate  = 1 if closes[i] > hma_a[i] else (-1 if closes[i] < hma_a[i] else 0)
-                    if gate != 0:
-                        score, _ = _calc_score(
-                            gate == 1, ema9_a[i], sma21_a[i], ml_a[i], sl_a[i],
-                            rsi_a[i], adx_v, closes[i], sma200_a[i],
-                            mo_s.adx_threshold,
-                            mo_s.rsi_buy_lo, mo_s.rsi_buy_hi,
-                            mo_s.rsi_sell_lo, mo_s.rsi_sell_hi,
-                        )
-                        if score >= mo_s.score_threshold and gate != prev["Momentum"]:
-                            if wt1_gate(wt1_a, i, gate):
-                                rr = STRAT_RR["Momentum"]
-                                if gate == 1:
-                                    sl_p = entry - 1.5 * atr_v
-                                    tp_p = entry + 1.5 * rr * atr_v
-                                else:
-                                    sl_p = entry + 1.5 * atr_v
-                                    tp_p = entry - 1.5 * rr * atr_v
-                                eb, out = find_exit(highs, lows, i, gate, sl_p, tp_p)
-                                all_signals.append((day, "Momentum", sym, gate,
-                                                   entry, sl_p, tp_p, rr, out))
-                                sym_locked_until = eb
-                                fired = True
-                            prev["Momentum"] = gate
-                        elif score < mo_s.score_threshold:
-                            prev["Momentum"] = 0
+                check = [mo_ef[i], mo_es[i], mo_ml[i], mo_sl[i], mo_hi[i],
+                         mo_rf[i], mo_rs[i], mo_ka[i], mo_da[i],
+                         mo_roc[i], mo_rocm[i], mo_mfi[i], mo_atr[i]]
+                if not any(np.isnan(v) for v in check):
+                    sr_sc = mo_s._sr_score(
+                        float(mo_cn[i]), float(mo_res[i]), float(mo_sup[i]))
+
+                    (ema_sc, macd_sc, macd_bull, macd_bear,
+                     rsi_sc, stoch_sc, roc_sc, mfi_sc, adx_sc,
+                     adx_bull, adx_bear, adx_v, dip_v, dim_v) = mo_s._bar_scores(
+                        i, mo_ef, mo_es, mo_ml, mo_sl, mo_hi,
+                        mo_rf, mo_rs, mo_ka, mo_da,
+                        mo_roc, mo_rocm, mo_mfi,
+                        mo_adx, mo_dip, mo_dim, mo_cn)
+
+                    scores     = [ema_sc, sr_sc, macd_sc, rsi_sc, stoch_sc,
+                                  roc_sc, mfi_sc, adx_sc]
+                    bull_score = sum(1 for s in scores if s ==  1)
+                    bear_score = sum(1 for s in scores if s == -1)
+
+                    mom_bull = bull_score >= mo_s.min_bull_score and adx_bull and macd_bull
+                    mom_bear = bear_score >= mo_s.min_bear_score and adx_bear and macd_bear
+
+                    trig_bull = (
+                        (mo_ka[i-1] <= mo_da[i-1] and mo_ka[i] > mo_da[i] and mo_ka[i-1] < 50) or
+                        (mo_ml[i-1] <= mo_sl[i-1] and mo_ml[i] > mo_sl[i]) or
+                        (mo_ef[i-1] <= mo_es[i-1] and mo_ef[i] > mo_es[i]))
+                    trig_bear = (
+                        (mo_ka[i-1] >= mo_da[i-1] and mo_ka[i] < mo_da[i] and mo_ka[i-1] > 50) or
+                        (mo_ml[i-1] >= mo_sl[i-1] and mo_ml[i] < mo_sl[i]) or
+                        (mo_ef[i-1] >= mo_es[i-1] and mo_ef[i] < mo_es[i]))
+
+                    buy  = mom_bull and trig_bull
+                    sell = mom_bear and trig_bear
+
+                    if buy and prev["Momentum"] != 1:
+                        if wt1_gate(wt1_a, i, 1):
+                            rr   = STRAT_RR["Momentum"]
+                            sl_p = entry - mo_s.sl_atr_mult * float(mo_atr[i])
+                            tp_p = entry + mo_s.sl_atr_mult * mo_s.rr_ratio * float(mo_atr[i])
+                            eb, out = find_exit(highs, lows, i, 1, sl_p, tp_p)
+                            all_signals.append((day, "Momentum", sym, 1,
+                                                entry, sl_p, tp_p, rr, out))
+                            sym_locked_until = eb
+                            fired = True
+                        prev["Momentum"] = 1
+                    elif sell and prev["Momentum"] != -1:
+                        if wt1_gate(wt1_a, i, -1):
+                            rr   = STRAT_RR["Momentum"]
+                            sl_p = entry + mo_s.sl_atr_mult * float(mo_atr[i])
+                            tp_p = entry - mo_s.sl_atr_mult * mo_s.rr_ratio * float(mo_atr[i])
+                            eb, out = find_exit(highs, lows, i, -1, sl_p, tp_p)
+                            all_signals.append((day, "Momentum", sym, -1,
+                                                entry, sl_p, tp_p, rr, out))
+                            sym_locked_until = eb
+                            fired = True
+                        prev["Momentum"] = -1
+                    elif not buy and not sell:
+                        prev["Momentum"] = 0
 
     return all_signals
 
@@ -311,16 +339,16 @@ def print_report(all_signals):
         print(f"  {sn:<13}{len(sg):>8}{w:>5}{l:>5}{wr:>7}{tr:>+8.1f}R{dpt:>+8.2f}")
 
     # ── Per-symbol ───────────────────────────────────────────────────
-    print(f"\n  {'Symbol':<9}{'Signals':>8}{'W':>5}{'L':>5}{'WR':>7}{'P/L ($)':>10}")
+    print(f"\n  {'Symbol':<10}{'Signals':>8}{'W':>5}{'L':>5}{'WR':>7}{'P/L ($)':>10}")
     print("  " + "─" * (W - 2))
-    for sy in ["BTCUSD", "XAUUSD", "EURUSD"]:
+    for sy in [s[0] for s in SYMBOLS]:
         sg = [s for s in all_signals if s[2] == sy]
         cl = [s for s in sg if s[8] != 0]
         w  = sum(1 for s in cl if s[8] ==  1)
         l  = sum(1 for s in cl if s[8] == -1)
         pnl = sum(RISK * s[7] for s in cl if s[8] == 1) - RISK * l
         wr  = f"{w/len(cl)*100:.1f}%" if cl else "—"
-        print(f"  {sy:<9}{len(sg):>8}{w:>5}{l:>5}{wr:>7}{pnl:>+9.2f}")
+        print(f"  {sy:<10}{len(sg):>8}{w:>5}{l:>5}{wr:>7}{pnl:>+9.2f}")
 
     # ── Capital ──────────────────────────────────────────────────────
     final_cap, max_dd, day_pnl_map = simulate_capital(all_signals)
