@@ -56,13 +56,11 @@ class RiskManager:
         return True
 
     def size_position(self, balance: float, price: float) -> float:
-        """Calculate safe position size in base asset units."""
-        risk_amount = balance * self.max_risk_per_trade_pct
-        stop_distance = price * self.stop_loss_pct
-        if stop_distance == 0:
+        """Calculate position size: spend risk_pct% of balance per trade."""
+        if price <= 0:
             return 0
-        units = risk_amount / stop_distance
-        return round(units, 6)
+        risk_amount = balance * self.max_risk_per_trade_pct
+        return round(risk_amount / price, 6)
 
     def compute_stops(self, side: str, entry_price: float) -> tuple[float, float]:
         """Returns (stop_loss_price, take_profit_price). Accepts 'buy'/'long' or 'sell'/'short'."""
