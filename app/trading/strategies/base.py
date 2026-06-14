@@ -104,6 +104,23 @@ class BaseStrategy(ABC):
         return upper, sma, lower
 
     @staticmethod
+    def atr(candles: list, period: int = 14) -> np.ndarray:
+        """Average True Range using Wilder's smoothing (RMA)."""
+        n = len(candles)
+        tr = np.full(n, np.nan)
+        for i in range(1, n):
+            h  = candles[i].high
+            l  = candles[i].low
+            pc = candles[i - 1].close
+            tr[i] = max(h - l, abs(h - pc), abs(l - pc))
+        result = np.full(n, np.nan)
+        if n > period:
+            result[period] = float(np.nanmean(tr[1:period + 1]))
+            for i in range(period + 1, n):
+                result[i] = (result[i - 1] * (period - 1) + tr[i]) / period
+        return result
+
+    @staticmethod
     def wma(values: list[float], period: int) -> np.ndarray:
         """Weighted Moving Average — linearly weighted, newest bar has highest weight."""
         arr = np.array(values, dtype=float)
@@ -124,3 +141,109 @@ class BaseStrategy(ABC):
         wma_full = BaseStrategy.wma(values, period)
         raw  = 2.0 * wma_half - wma_full
         return BaseStrategy.wma(list(raw), sqrtn)
+
+    @staticmethod
+    def adx(candles: list, period: int = 14) -> tuple:
+        """ADX, +DI, -DI using Wilder's smoothing. Returns (adx_arr, plus_di, minus_di)."""
+        n = len(candles)
+        pdm = np.zeros(n)
+        mdm = np.zeros(n)
+        tr  = np.zeros(n)
+        for i in range(1, n):
+            h, l   = candles[i].high, candles[i].low
+            ph, pl, pc = candles[i-1].high, candles[i-1].low, candles[i-1].close
+            up, dn = h - ph, pl - l
+            pdm[i] = up if up > dn and up > 0 else 0.0
+            mdm[i] = dn if dn > up and dn > 0 else 0.0
+            tr[i]  = max(h - l, abs(h - pc), abs(l - pc))
+        s_tr = np.full(n, np.nan)
+        s_pd = np.full(n, np.nan)
+        s_md = np.full(n, np.nan)
+        if n > period:
+            s_tr[period] = tr[1:period+1].sum()
+            s_pd[period] = pdm[1:period+1].sum()
+            s_md[period] = mdm[1:period+1].sum()
+            for i in range(period+1, n):
+                s_tr[i] = s_tr[i-1] - s_tr[i-1]/period + tr[i]
+                s_pd[i] = s_pd[i-1] - s_pd[i-1]/period + pdm[i]
+                s_md[i] = s_md[i-1] - s_md[i-1]/period + mdm[i]
+        plus_di  = np.where(s_tr > 0, 100 * s_pd / s_tr, 0.0)
+        minus_di = np.where(s_tr > 0, 100 * s_md / s_tr, 0.0)
+        dsum = plus_di + minus_di
+        dx = np.where(
+            dsum > 0,
+            100 * np.abs(plus_di - minus_di) / np.where(dsum > 0, dsum, 1.0),
+            0.0,
+        )
+        adx_arr = np.full(n, np.nan)
+        start = 2 * period
+        if n > start:
+            adx_arr[start] = float(np.nanmean(dx[period:start+1]))
+            for i in range(start+1, n):
+                if not np.isnan(adx_arr[i-1]):
+                    adx_arr[i] = (adx_arr[i-1] * (period-1) + dx[i]) / period
+        return adx_arr, plus_di, minus_di
+
+    @staticmethod
+    def compute_mtf_bias(
+        candles_15m: list,
+        mtf_candles: dict,
+        ema_fast: int = 20,
+        ema_slow: int = 50,
+        rsi_period: int = 14,
+        rsi_bull: float = 55.0,
+        rsi_bear: float = 45.0,
+        w1: float = 1.0,
+        w2: float = 2.0,
+        w3: float = 3.0,
+    ) -> tuple[float, str]:
+        """
+        Port of Pine Script MTF Bias Monitor (15m / 1H / 4H).
+
+        Per-TF score  -3..+3:
+          close > EMA20   → +1  else -1
+          EMA20 > EMA50   → +1  else -1
+          RSI > rsi_bull  → +1, RSI < rsi_bear → -1, else 0
+
+        Weighted composite (weights default 1/2/3):
+          comp_pct = (s15m*w1 + s1h*w2 + s4h*w3) / (3*(w1+w2+w3)) * 100
+          range -100..+100 %
+
+        Gate:  BUY  → comp_pct > 0
+               SELL → comp_pct < 0
+        """
+        def _tf_score(closes: list) -> float:
+            if len(closes) < ema_slow + rsi_period + 2:
+                return 0.0
+            e20 = float(BaseStrategy.ema(closes, ema_fast)[-1])
+            e50 = float(BaseStrategy.ema(closes, ema_slow)[-1])
+            r   = float(BaseStrategy.rsi(closes, rsi_period)[-1])
+            if any(np.isnan(v) for v in [e20, e50, r]):
+                return 0.0
+            c = closes[-1]
+            return (
+                (1.0 if c > e20 else -1.0) +
+                (1.0 if e20 > e50 else -1.0) +
+                (1.0 if r > rsi_bull else (-1.0 if r < rsi_bear else 0.0))
+            )
+
+        def _arrow(s: float) -> str:
+            return "↑↑" if s >= 2 else "↑" if s > 0 else "↓↓" if s <= -2 else "↓" if s < 0 else "→"
+
+        mtf = mtf_candles or {}
+        c15 = [c.close for c in (candles_15m or [])]
+        c1h = [c.close for c in mtf.get("1h", [])]
+        c4h = [c.close for c in mtf.get("4h", [])]
+
+        s1 = _tf_score(c15)
+        s2 = _tf_score(c1h)
+        s3 = _tf_score(c4h)
+
+        wt_max   = 3.0 * (w1 + w2 + w3)
+        comp_pct = (s1 * w1 + s2 * w2 + s3 * w3) / wt_max * 100.0
+
+        label = (
+            f"15m{_arrow(s1)} 1H{_arrow(s2)} 4H{_arrow(s3)} | "
+            f"{comp_pct:+.0f}%"
+        )
+        return comp_pct, label

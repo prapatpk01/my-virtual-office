@@ -79,10 +79,10 @@ class TradingBot:
         # Persistent signal state — survives restarts
         kwargs = {"path": state_file} if state_file else {}
         self._sig = SignalState(**kwargs)
-        # WT_VERIFY=true → gate all signals through WaveTrend WT1 before notifying
-        self.wt_verify: bool = os.getenv("WT_VERIFY", "false").lower() == "true"
+        # WTV=true → gate all signals through WaveTrend WT1 before notifying
+        self.wt_verify: bool = os.getenv("WTV", "false").lower() == "true"
         if self.wt_verify:
-            logger.info("[WT GATE] WaveTrend verify ENABLED (WT1 gate ±10 active)")
+            logger.info("[WTV] WaveTrend verify ENABLED (WT1 gate ±10 active)")
 
     # ------------------------------------------------------------------
     # Public control
@@ -169,9 +169,10 @@ class TradingBot:
         # Check stop-loss / take-profit on open positions
         for pos_info in list(self.risk.get_positions()):
             sym = pos_info["symbol"]
+            strategy_name = pos_info.get("strategy", "")
             ticker = await self.connector.fetch_ticker(sym)
             price = ticker["last"]
-            trigger = self.risk.check_stops(sym, price)
+            trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
             if trigger:
                 side = "sell" if pos_info["side"] == "long" else "buy"
                 await self.connector.create_order(sym, side, pos_info["amount"])
@@ -180,7 +181,7 @@ class TradingBot:
                     timestamp=int(time.time() * 1000),
                     symbol=sym, side=side,
                     price=price, amount=pos_info["amount"],
-                    pnl=pnl, strategy="risk_manager", reason=trigger,
+                    pnl=pnl, strategy=strategy_name or "risk_manager", reason=trigger,
                     paper=self.connector.paper,
                 )
                 self._record_trade(trade)
@@ -191,9 +192,9 @@ class TradingBot:
                     sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
                     reason=trigger,
                 )
-                self._sig.unlock(sym)
-                self.risk.close_position(sym)
-                logger.info("Position closed by %s: %s → signal lock released", trigger, sym)
+                self._sig.unlock_strategy(sym, strategy_name)
+                self.risk.close_position(sym, strategy=strategy_name)
+                logger.info("Position closed by %s: %s [%s] → signal lock released", trigger, sym, strategy_name)
                 if self.telegram:
                     self.telegram.notify_trade_closed(
                         sym, trigger, price,
@@ -205,12 +206,25 @@ class TradingBot:
 
         # Run each strategy
         new_signals = []
+        _resolved_symbols: set[str] = set()  # check virtual SL/TP once per symbol per tick
         for strategy in self.strategies:
             try:
-                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="15m", limit=250)
+                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="15m", limit=300)
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
 
+                # Check virtual SL/TP + update WT1 cache (once per symbol per tick)
+                if strategy.symbol not in _resolved_symbols and candles:
+                    _resolved_symbols.add(strategy.symbol)
+                    last_c = candles[-1]
+                    v_high = max(float(last_c.high), current_price)
+                    v_low  = min(float(last_c.low),  current_price)
+                    resolved = self._sig.check_and_resolve_pending(strategy.symbol, v_high, v_low)
+                    for v_reason, v_price in resolved:
+                        if self.telegram:
+                            self.telegram.notify_virtual_closed(
+                                strategy.symbol, v_reason, v_price, self._sig.summary()
+                            )
                 # Fetch MTF candles for 1H + 4H bias gate
                 mtf_candles = {}
                 for tf in ("1h", "4h"):
@@ -258,19 +272,20 @@ class TradingBot:
         """Decides whether to fire Telegram notification + execute, based on signal state."""
         sym = signal.symbol
 
-        # ── WT1 Gate (env: WT_VERIFY=true) ─────────────────────────────
+        # ── WTV gate (env WTV=true) ──────────────────────────────────────
         if self.wt_verify and candles:
             wt1 = WTADXStrategy.compute_wt1(candles)
             if not math.isnan(wt1):
                 if signal.type == SignalType.BUY and wt1 >= 10:
-                    logger.debug("[WT GATE] %s %s BUY blocked — WT1=%.1f ≥+10 (overbought)",
+                    logger.debug("[WTV] %s %s BUY blocked — WT1=%.1f ≥+10 (overbought)",
                                  strategy_name, sym, wt1)
                     return
                 if signal.type == SignalType.SELL and wt1 <= -10:
-                    logger.debug("[WT GATE] %s %s SELL blocked — WT1=%.1f ≤-10 (oversold)",
+                    logger.debug("[WTV] %s %s SELL blocked — WT1=%.1f ≤-10 (oversold)",
                                  strategy_name, sym, wt1)
                     return
-                logger.debug("[WT GATE] %s %s passed — WT1=%.1f", strategy_name, sym, wt1)
+                logger.debug("[WTV] %s %s passed — WT1=%.1f", strategy_name, sym, wt1)
+
         signal_only = self.risk.max_open_positions == 0
 
         if signal_only:
@@ -282,21 +297,27 @@ class TradingBot:
             if direction_changed or stale:
                 self._sig.lock(sym, signal.type.value)
                 self._sig.record_signal(sym, signal.type.value, signal.price, signal.confidence)
+                # Register virtual trade so /stats tracks SL/TP outcome
+                meta = signal.metadata or {}
+                sl_p = meta.get("stop_loss"); tp_p = meta.get("take_profit")
+                if sl_p and tp_p:
+                    vkey = f"forex||{sym}||{int(time.time() * 1000)}"
+                    self._sig.add_pending(vkey, sym, signal.type.value, signal.price, sl_p, tp_p)
                 if self.telegram:
                     self.telegram.notify_signal(sig_dict)
             else:
                 logger.debug("Forex %s suppressed — same direction already sent", sym)
         else:
-            # Crypto: locked = already in a trade for this symbol (persists across restarts)
-            if self._sig.is_locked(sym):
-                logger.debug("Crypto %s suppressed — signal lock active (position still open)", sym)
+            # Crypto: locked = already in a trade for this symbol+strategy (persists across restarts)
+            if self._sig.is_locked_for_strategy(sym, strategy_name):
+                logger.debug("Crypto %s suppressed — %s already in trade for this symbol", sym, strategy_name)
                 return
-            can, reason = self.risk.can_open(sym)
+            can, reason = self.risk.can_open(sym, strategy=strategy_name)
             if not can:
                 logger.debug("Crypto %s suppressed — %s", sym, reason)
                 return
             # Lock before notifying to prevent race conditions
-            self._sig.lock(sym, signal.type.value)
+            self._sig.lock_strategy(sym, strategy_name, signal.type.value)
             self._sig.record_signal(sym, signal.type.value, signal.price, signal.confidence)
             if self.telegram:
                 self.telegram.notify_signal(sig_dict)
@@ -304,10 +325,10 @@ class TradingBot:
 
     async def _execute_signal(self, signal: Signal, strategy_name: str):
         sym = signal.symbol
-        can, reason = self.risk.can_open(sym)
+        can, reason = self.risk.can_open(sym, strategy=strategy_name)
         if not can:
             logger.info("Skipping %s signal for %s: %s", signal.type, sym, reason)
-            self._sig.unlock(sym)  # release lock if execution fails
+            self._sig.unlock_strategy(sym, strategy_name)  # release lock if execution fails
             return
 
         balances = await self.connector.fetch_balance()
@@ -317,14 +338,20 @@ class TradingBot:
 
         amount = self.risk.size_position(quote_balance, price)
         if amount <= 0:
-            logger.info("Position size 0, skipping %s", sym)
-            self._sig.unlock(sym)
+            logger.info("Position size 0, skipping %s — tracking virtually", sym)
+            # No real order; track SL/TP virtually so /stats shows outcome
+            meta = signal.metadata or {}
+            sl_p = meta.get("stop_loss"); tp_p = meta.get("take_profit")
+            if sl_p and tp_p:
+                vkey = f"virtual||{sym}||{strategy_name}||{int(time.time() * 1000)}"
+                self._sig.add_pending(vkey, sym, signal.type.value, signal.price, sl_p, tp_p)
+            self._sig.unlock_strategy(sym, strategy_name)
             return
 
         side = "buy" if signal.type == SignalType.BUY else "sell"
         try:
             order = await self.connector.create_order(sym, side, amount)
-            self.risk.open_position(sym, "long" if side == "buy" else "short", price, amount)
+            self.risk.open_position(sym, "long" if side == "buy" else "short", price, amount, strategy=strategy_name)
             trade = TradeRecord(
                 timestamp=int(time.time() * 1000),
                 symbol=sym, side=side,
@@ -339,7 +366,7 @@ class TradingBot:
                                            strategy_name, self.connector.paper)
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
-            self._sig.unlock(sym)  # release lock so bot can retry next tick
+            self._sig.unlock_strategy(sym, strategy_name)  # release lock so bot can retry next tick
 
     async def _refresh_balance(self):
         try:

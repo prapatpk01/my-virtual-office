@@ -74,54 +74,66 @@ class RiskManager:
             tp = entry_price * (1 - self.take_profit_pct)
         return round(sl, 6), round(tp, 6)
 
-    def can_open(self, symbol: str) -> tuple[bool, str]:
+    def can_open(self, symbol: str, strategy: str = "") -> tuple[bool, str]:
         if self._halted:
             return False, "Trading halted: max drawdown reached"
-        if symbol in self._positions:
-            return False, f"Already have open position for {symbol}"
+        key = f"{symbol}||{strategy}"
+        if key in self._positions:
+            return False, f"{strategy} already has open position for {symbol}"
+        sym_count = sum(1 for k in self._positions if k.startswith(f"{symbol}||"))
+        if sym_count >= 2:
+            return False, f"Max 2 positions per symbol for {symbol}"
         if len(self._positions) >= self.max_open_positions:
             return False, f"Max open positions ({self.max_open_positions}) reached"
         return True, "ok"
 
-    def open_position(self, symbol: str, side: str, entry_price: float, amount: float) -> Position:
+    def open_position(self, symbol: str, side: str, entry_price: float, amount: float, strategy: str = "") -> Position:
         sl, tp = self.compute_stops(side, entry_price)
-        pos = Position(symbol=symbol, side=side, entry_price=entry_price,
-                       amount=amount, stop_loss=sl, take_profit=tp)
-        self._positions[symbol] = pos
+        pos = Position(symbol=symbol, side=side, entry_price=entry_price, amount=amount, stop_loss=sl, take_profit=tp)
+        self._positions[f"{symbol}||{strategy}"] = pos
         return pos
 
-    def close_position(self, symbol: str) -> Optional[Position]:
-        return self._positions.pop(symbol, None)
+    def close_position(self, symbol: str, strategy: str = "") -> Optional[Position]:
+        key = f"{symbol}||{strategy}"
+        if key in self._positions:
+            return self._positions.pop(key)
+        # Fallback: close any position for symbol if no strategy given
+        for k in list(self._positions):
+            if k.startswith(f"{symbol}||"):
+                return self._positions.pop(k)
+        return None
 
-    def check_stops(self, symbol: str, current_price: float) -> Optional[str]:
+    def check_stops(self, symbol: str, price: float, strategy: str = "") -> Optional[str]:
         """Returns 'stop_loss', 'take_profit', or None."""
-        pos = self._positions.get(symbol)
+        pos = self._positions.get(f"{symbol}||{strategy}")
         if not pos:
             return None
         if pos.side == "long":
-            if pos.stop_loss and current_price <= pos.stop_loss:
+            if pos.stop_loss and price <= pos.stop_loss:
                 return "stop_loss"
-            if pos.take_profit and current_price >= pos.take_profit:
+            if pos.take_profit and price >= pos.take_profit:
                 return "take_profit"
         else:
-            if pos.stop_loss and current_price >= pos.stop_loss:
+            if pos.stop_loss and price >= pos.stop_loss:
                 return "stop_loss"
-            if pos.take_profit and current_price <= pos.take_profit:
+            if pos.take_profit and price <= pos.take_profit:
                 return "take_profit"
         return None
 
     def get_positions(self) -> list[dict]:
-        return [
-            {
+        result = []
+        for key, p in self._positions.items():
+            strategy = key.split("||")[1] if "||" in key else ""
+            result.append({
                 "symbol": p.symbol,
+                "strategy": strategy,
                 "side": p.side,
                 "entry": p.entry_price,
                 "amount": p.amount,
                 "stop_loss": p.stop_loss,
                 "take_profit": p.take_profit,
-            }
-            for p in self._positions.values()
-        ]
+            })
+        return result
 
     @property
     def is_halted(self) -> bool:

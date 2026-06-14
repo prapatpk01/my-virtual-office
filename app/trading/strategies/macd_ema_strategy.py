@@ -7,10 +7,11 @@ Three voters:
   C) MACD  vs Signal (cross detection)
 
 Signal when 2/3 agree. SL/TP computed from ATR.
-Backtest finds the optimal SL multiplier + R:R ratio automatically.
-MTF gate (D): 1H + 4H HMA15 must agree with A's direction.
+MTF Bias gate (D): weighted composite of 15m/1H/4H (EMA20/EMA50/RSI scores).
+  BUY  → comp_pct > 0,  SELL → comp_pct < 0.
 """
 import logging
+import os
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
 
@@ -18,7 +19,7 @@ logger = logging.getLogger("macd_ema_strategy")
 
 # Parameter search space for backtest
 _SL_MULTS  = [1.0, 1.5, 2.0, 2.5]
-_RR_RATIOS = [1.5, 2.0, 3.0]
+_RR_RATIOS = [1.2]
 _ATR_PERIOD = 14
 _LOOKFORWARD = 60  # max candles to look for SL/TP hit
 
@@ -27,15 +28,16 @@ class MACDEMAStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.hma_period = self.params.get("hma_period",   15)
-        self.ema_fast   = self.params.get("ema_fast",      9)
-        self.sma_slow   = self.params.get("sma_slow",     21)
-        self.macd_fast  = self.params.get("macd_fast",    12)
-        self.macd_slow  = self.params.get("macd_slow",    26)
-        self.macd_sig   = self.params.get("macd_signal",   9)
+        self.hma_period  = self.params.get("hma_period",    15)
+        self.ema_fast    = self.params.get("ema_fast",       9)
+        self.sma_slow    = self.params.get("sma_slow",      21)
+        self.macd_fast   = self.params.get("macd_fast",     12)
+        self.macd_slow   = self.params.get("macd_slow",     26)
+        self.macd_sig    = self.params.get("macd_signal",    9)
+        self.adx_threshold = self.params.get("adx_threshold", 15)
         # SL/TP — updated by backtest at startup
-        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",    2.0)
+        self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
+        self.rr_ratio    = self.params.get("rr_ratio",     1.2)
 
     # ------------------------------------------------------------------
     # Live signal
@@ -56,15 +58,18 @@ class MACDEMAStrategy(BaseStrategy):
         macd_line, signal_line, _ = self.macd(
             closes, self.macd_fast, self.macd_slow, self.macd_sig
         )
-        atr_arr = self.atr(candles, _ATR_PERIOD)
+        atr_arr        = self.atr(candles, _ATR_PERIOD)
+        adx_arr, _, _  = self.adx(candles, 14)
 
         p     = current_price
         hma   = float(hma15[-1])
+        hma_p = float(hma15[-2])   # previous HMA for slope check
         e9_c  = float(ema9[-1]);        e9_p  = float(ema9[-2])
         s21_c = float(sma21[-1]);       s21_p = float(sma21[-2])
         ml_c  = float(macd_line[-1]);   ml_p  = float(macd_line[-2])
         sl_c  = float(signal_line[-1]); sl_p  = float(signal_line[-2])
         current_atr = float(atr_arr[-1])
+        current_adx = float(adx_arr[-1]) if not np.isnan(adx_arr[-1]) else 0.0
 
         if any(np.isnan(v) for v in [hma, e9_c, s21_c, ml_c, sl_c, current_atr]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Indicator NaN")
@@ -83,15 +88,40 @@ class MACDEMAStrategy(BaseStrategy):
         buy_votes  = sum(1 for v in [vote_b, vote_c] if v ==  1)
         sell_votes = sum(1 for v in [vote_b, vote_c] if v == -1)
 
-        # ── MTF bias (D) — final gate, must agree with A ──────────────
-        mtf_pass, mtf_label = _check_mtf(mtf_candles, vote_a, self.hma_period)
+        # ── HMA slope gate — confirm trend direction ──────────────────
+        hma_slope = hma - hma_p
+        if vote_a == 1 and hma_slope <= 0:
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                f"[HMA BLOCK] BUY but HMA falling ({hma_slope:+.2f})",
+                metadata={"hma15": hma, "open": open_price, "hma_slope": round(hma_slope, 4)},
+            )
+        if vote_a == -1 and hma_slope >= 0:
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                f"[HMA BLOCK] SELL but HMA rising ({hma_slope:+.2f})",
+                metadata={"hma15": hma, "open": open_price, "hma_slope": round(hma_slope, 4)},
+            )
+
+        # ── ADX gate — filter sideways markets ────────────────────────
+        if current_adx < self.adx_threshold:
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                f"[ADX BLOCK] ADX={current_adx:.1f} < {self.adx_threshold}",
+                metadata={"hma15": hma, "open": open_price, "adx": round(current_adx, 1)},
+            )
+
+        # ── MTFV gate (D) — weighted composite 15m/1H/4H (env MTFV=true) ──
+        comp_pct, mtf_label = BaseStrategy.compute_mtf_bias(candles, mtf_candles)
+        mtfv_on = os.getenv("MTFV", "true").lower() == "true"
 
         if vote_a == 1 and buy_votes >= 1:
-            if not mtf_pass:
+            if mtfv_on and comp_pct < 33:
                 return Signal(
                     SignalType.HOLD, self.symbol, current_price, 0,
-                    f"[MTF BLOCK] A=BUY B/C ok | {mtf_label}",
-                    metadata={"hma15": hma, "open": open_price, "mtf": mtf_label},
+                    f"[MTF BLOCK] {mtf_label}",
+                    metadata={"hma15": hma, "open": open_price, "mtf": mtf_label,
+                              "mtf_comp_pct": round(comp_pct, 1)},
                 )
             total_buy = 1 + buy_votes
             reason, conf = _build_reason(
@@ -109,20 +139,23 @@ class MACDEMAStrategy(BaseStrategy):
                     "ema9": e9_c, "sma21": s21_c,
                     "macd": ml_c, "macd_signal": sl_c,
                     "atr": round(current_atr, 4),
+                    "adx": round(current_adx, 1),
                     "stop_loss": sl_price,
                     "take_profit": tp_price,
                     "rr": self.rr_ratio,
                     "votes": total_buy,
                     "mtf": mtf_label,
+                    "mtf_comp_pct": round(comp_pct, 1),
                 },
             )
 
         if vote_a == -1 and sell_votes >= 1:
-            if not mtf_pass:
+            if mtfv_on and comp_pct > -33:
                 return Signal(
                     SignalType.HOLD, self.symbol, current_price, 0,
-                    f"[MTF BLOCK] A=SELL B/C ok | {mtf_label}",
-                    metadata={"hma15": hma, "open": open_price, "mtf": mtf_label},
+                    f"[MTF BLOCK] {mtf_label}",
+                    metadata={"hma15": hma, "open": open_price, "mtf": mtf_label,
+                              "mtf_comp_pct": round(comp_pct, 1)},
                 )
             total_sell = 1 + sell_votes
             reason, conf = _build_reason(
@@ -140,11 +173,13 @@ class MACDEMAStrategy(BaseStrategy):
                     "ema9": e9_c, "sma21": s21_c,
                     "macd": ml_c, "macd_signal": sl_c,
                     "atr": round(current_atr, 4),
+                    "adx": round(current_adx, 1),
                     "stop_loss": sl_price,
                     "take_profit": tp_price,
                     "rr": self.rr_ratio,
                     "votes": total_sell,
                     "mtf": mtf_label,
+                    "mtf_comp_pct": round(comp_pct, 1),
                 },
             )
 
@@ -310,30 +345,3 @@ def _build_reason(direction, votes, va, vb, vc, b_up, b_dn, c_up, c_dn):
     return f"[{votes}/3] {' + '.join(tags)}", conf
 
 
-def _check_mtf(mtf_candles: dict, direction: int, hma_period: int) -> tuple:
-    """Check that 1H and 4H both agree with direction (+1=bull, -1=bear).
-    Returns (passed: bool, label: str).
-    Passes through (True) when no MTF data is available.
-    """
-    if not mtf_candles:
-        return True, "no MTF"
-
-    results = {}
-    for tf, candles in mtf_candles.items():
-        if not candles or len(candles) < hma_period + 5:
-            continue
-        closes = [c.close for c in candles]
-        hma_arr = BaseStrategy.hma(closes, hma_period)
-        last_hma = float(hma_arr[-1])
-        if np.isnan(last_hma):
-            continue
-        results[tf] = 1 if closes[-1] > last_hma else -1
-
-    if not results:
-        return True, "MTF unavailable"
-
-    agree = sum(1 for v in results.values() if v == direction)
-    label = " ".join(
-        f"{tf}={'↑' if v == 1 else '↓'}" for tf, v in sorted(results.items())
-    )
-    return agree == len(results), label
