@@ -63,6 +63,8 @@ class YahooConnector(BaseConnector):
     def __init__(self, **kwargs):
         super().__init__(api_key="", api_secret="", paper=True)
         self._price_cache: dict = {}
+        self._paper_balance = {"USDT": 10000.0}
+        self._paper_open_orders: list[OrderResult] = []
 
     def _yf_symbol(self, symbol: str) -> str:
         return SYMBOL_MAP.get(symbol.upper(), symbol)
@@ -110,20 +112,39 @@ class YahooConnector(BaseConnector):
         price = candles[-1].close if candles else 0.0
         return {"last": price, "symbol": symbol}
 
-    async def create_order(self, symbol: str, side: str, amount: float, price: float = None) -> OrderResult:
-        last = self._price_cache.get(symbol, price or 0.0)
-        return OrderResult(
-            id=f"signal-{int(time.time())}",
+    async def create_order(self, symbol: str, side: str, amount: float,
+                           order_type: str = "market", price: float = None) -> OrderResult:
+        exec_price = self._price_cache.get(symbol, price or 0.0)
+        base = symbol.split("/")[0] if "/" in symbol else symbol[:3]
+        quote = symbol.split("/")[1] if "/" in symbol else "USDT"
+        import uuid as _uuid
+        if side == "buy":
+            cost = amount * exec_price
+            self._paper_balance[quote] = max(0.0, self._paper_balance.get(quote, 0) - cost)
+            self._paper_balance[base]  = self._paper_balance.get(base, 0) + amount
+        else:
+            self._paper_balance[base]  = max(0.0, self._paper_balance.get(base, 0) - amount)
+            self._paper_balance[quote] = self._paper_balance.get(quote, 0) + amount * exec_price
+        order = OrderResult(
+            order_id=str(_uuid.uuid4())[:8],
             symbol=symbol, side=side,
-            price=last, amount=amount,
-            filled=amount, status="signal_only",
+            price=exec_price, amount=amount,
+            filled=amount, status="closed",
         )
+        self._paper_open_orders.append(order)
+        return order
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
+        self._paper_open_orders = [o for o in self._paper_open_orders if o.order_id != order_id]
         return True
 
     async def fetch_open_orders(self, symbol=None) -> list:
-        return []
+        return [o for o in self._paper_open_orders
+                if symbol is None or o.symbol == symbol]
 
     async def fetch_balance(self):
-        return [Balance(asset="USD", free=0.0, used=0.0, total=0.0)]
+        return [Balance(asset=k, free=v, used=0.0, total=v)
+                for k, v in self._paper_balance.items() if v > 0]
+
+    async def close(self):
+        pass
