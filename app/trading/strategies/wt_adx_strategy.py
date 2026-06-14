@@ -134,3 +134,87 @@ class WTADXStrategy(BaseStrategy):
             f"[WT] {zone} | no cross",
             metadata={"wt1": round(curr_wt1, 2), "wt2": round(curr_wt2, 2)},
         )
+
+    # ------------------------------------------------------------------ #
+
+    async def backtest(self, candles: list) -> tuple[dict, tuple]:
+        _SL_MULTS   = [1.0, 1.5, 2.0, 2.5]
+        _LOOKFORWARD = 60
+        min_len = self.n1 + self.n2 + _ATR_PERIOD + 10
+        if len(candles) < min_len + 20:
+            return {}, None
+
+        closes = [c.close for c in candles]
+        highs  = [c.high  for c in candles]
+        lows   = [c.low   for c in candles]
+
+        wt1, wt2 = self._wavetrend(highs, lows, closes)
+        atr_arr  = self.atr(candles, _ATR_PERIOD)
+
+        signal_bars: list[tuple[int, int, float]] = []
+        prev_dir = 0
+
+        for i in range(1, len(candles) - 1):
+            if i < min_len:
+                continue
+            if np.isnan(wt1[i]) or np.isnan(wt2[i]) or np.isnan(atr_arr[i]):
+                continue
+            w1c = float(wt1[i]); w1p = float(wt1[i - 1])
+            w2c = float(wt2[i]); w2p = float(wt2[i - 1])
+
+            cross_up   = w1p <= w2p and w1c > w2c
+            cross_down = w1p >= w2p and w1c < w2c
+            buy  = cross_up   and w1c < self.os_level
+            sell = cross_down and w1c > self.ob_level
+
+            if buy and prev_dir != 1:
+                signal_bars.append((i, 1, float(atr_arr[i])))
+                prev_dir = 1
+            elif sell and prev_dir != -1:
+                signal_bars.append((i, -1, float(atr_arr[i])))
+                prev_dir = -1
+            elif not buy and not sell:
+                prev_dir = 0
+
+        if not signal_bars:
+            return {}, None
+
+        best_score = -999.0
+        best_config = None
+        stats: dict[str, dict] = {}
+
+        for sl_m in _SL_MULTS:
+            rr = self.rr_ratio
+            wins = losses = 0
+            total_r = 0.0
+            for idx, direction, atr_val in signal_bars:
+                if atr_val <= 0:
+                    continue
+                entry = closes[idx]
+                sl_p = (entry - sl_m * atr_val) if direction == 1 else (entry + sl_m * atr_val)
+                tp_p = (entry + sl_m * rr * atr_val) if direction == 1 else (entry - sl_m * rr * atr_val)
+                outcome = 0
+                for j in range(idx + 1, min(idx + _LOOKFORWARD, len(candles))):
+                    if direction == 1:
+                        if lows[j]  <= sl_p: outcome = -1; break
+                        if highs[j] >= tp_p: outcome =  1; break
+                    else:
+                        if highs[j] >= sl_p: outcome = -1; break
+                        if lows[j]  <= tp_p: outcome =  1; break
+                if outcome ==  1: wins   += 1; total_r += rr
+                elif outcome == -1: losses += 1; total_r -= 1.0
+            total = wins + losses
+            wr = wins / total if total else 0.0
+            pf = (wins * rr) / max(losses, 1)
+            key = f"SL={sl_m}xATR  RR=1:{rr}"
+            stats[key] = {
+                "win_rate": round(wr * 100, 1),
+                "profit_factor": round(pf, 2),
+                "total_r": round(total_r, 1),
+                "trades": total, "wins": wins, "losses": losses,
+            }
+            if total >= 5 and total_r > best_score:
+                best_score = total_r
+                best_config = (sl_m, rr)
+
+        return stats, best_config
