@@ -19,8 +19,8 @@ class WTADXStrategy(BaseStrategy):
         super().__init__(symbol, params)
         self.n1          = self.params.get("wt_channel_len", 10)
         self.n2          = self.params.get("wt_avg_len",     21)
-        self.ob_level    = self.params.get("ob_level",       25.0)   # overbought threshold
-        self.os_level    = self.params.get("os_level",      -25.0)   # oversold threshold
+        self.ob_level    = self.params.get("ob_level",       10.0)   # overbought threshold
+        self.os_level    = self.params.get("os_level",      -10.0)   # oversold threshold
         self.sl_atr_mult = self.params.get("sl_atr_mult",    1.5)
         self.rr_ratio    = self.params.get("rr_ratio",       1.5)
         self._last_signal = 0   # state machine: 1=buy, -1=sell
