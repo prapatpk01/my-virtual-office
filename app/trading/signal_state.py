@@ -100,19 +100,21 @@ class SignalState:
     # Virtual outcome tracking (forex signal-only + paper/0-balance crypto)
     # ------------------------------------------------------------------
 
-    def add_pending(self, key: str, symbol: str, side: str, entry: float, sl: float, tp: float):
+    def add_pending(self, key: str, symbol: str, side: str, entry: float,
+                    sl: float, tp: float, strategy: str = ""):
         """Register a virtual open trade to monitor SL/TP virtually."""
         if not sl or not tp:
             return
         if key in self._pending:
             return
         self._pending[key] = {
-            "symbol": symbol,
-            "side":   side,
-            "entry":  round(entry, 8),
-            "sl":     sl,
-            "tp":     tp,
-            "ts":     int(time.time() * 1000),
+            "symbol":   symbol,
+            "side":     side,
+            "entry":    round(entry, 8),
+            "sl":       sl,
+            "tp":       tp,
+            "strategy": strategy,
+            "ts":       int(time.time() * 1000),
         }
         self._save()
         logger.info("Virtual trade registered: %s %s @ %.4f  SL=%.4f TP=%.4f", side, symbol, entry, sl, tp)
@@ -157,6 +159,7 @@ class SignalState:
                     symbol=symbol, side=side,
                     entry=entry, exit_price=exit_price,
                     sl=sl, tp=tp, reason=hit,
+                    strategy=item.get("strategy", ""),
                 )
                 resolved.append((hit, exit_price))
                 logger.info("Virtual %s %s → %s @ %.4f (entry %.4f)", side, symbol, hit, exit_price, entry)
@@ -168,13 +171,15 @@ class SignalState:
     # Signal firing log
     # ------------------------------------------------------------------
 
-    def record_signal(self, symbol: str, direction: str, price: float, confidence: float):
+    def record_signal(self, symbol: str, direction: str, price: float,
+                      confidence: float, strategy: str = ""):
         """Called every time a signal alert is actually sent to Telegram."""
         self._fired.append({
             "symbol":     symbol,
             "direction":  direction,
             "price":      round(price, 4),
             "confidence": round(confidence, 2),
+            "strategy":   strategy,
             "ts":         int(time.time() * 1000),
         })
         self._save()
@@ -184,25 +189,59 @@ class SignalState:
     # ------------------------------------------------------------------
 
     def record_outcome(self, symbol: str, side: str, entry: float,
-                       exit_price: float, sl, tp, reason: str):
+                       exit_price: float, sl, tp, reason: str, strategy: str = ""):
         risk  = abs(entry - sl) if sl else abs(entry - exit_price) or 1.0
         pnl_r = abs(exit_price - entry) / risk if reason == "take_profit" else -1.0
         self._outcomes.append({
-            "symbol": symbol,
-            "side":   side,
-            "entry":  round(entry, 4),
-            "exit":   round(exit_price, 4),
-            "sl":     sl,
-            "tp":     tp,
-            "pnl_r":  round(pnl_r, 2),
-            "reason": reason,
-            "ts":     int(time.time() * 1000),
+            "symbol":   symbol,
+            "side":     side,
+            "entry":    round(entry, 4),
+            "exit":     round(exit_price, 4),
+            "sl":       sl,
+            "tp":       tp,
+            "pnl_r":    round(pnl_r, 2),
+            "reason":   reason,
+            "strategy": strategy,
+            "ts":       int(time.time() * 1000),
         })
         self._save()
 
     # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
+
+    def strategy_stats(self, days: int = 7) -> dict:
+        """Per-strategy signal count and WR for the past N days."""
+        cutoff = int(time.time() * 1000) - days * 86_400_000
+        fired_r    = [f for f in self._fired    if f["ts"] >= cutoff]
+        outcomes_r = [o for o in self._outcomes if o["ts"] >= cutoff]
+
+        data: dict[str, dict] = {}
+        for f in fired_r:
+            s = f.get("strategy") or "unknown"
+            if s not in data:
+                data[s] = {"signals": 0, "wins": 0, "losses": 0}
+            data[s]["signals"] += 1
+        for o in outcomes_r:
+            s = o.get("strategy") or "unknown"
+            if s not in data:
+                data[s] = {"signals": 0, "wins": 0, "losses": 0}
+            if o["pnl_r"] > 0:
+                data[s]["wins"]   += 1
+            else:
+                data[s]["losses"] += 1
+
+        result = {}
+        for s, d in sorted(data.items()):
+            closed = d["wins"] + d["losses"]
+            wr = round(d["wins"] / closed * 100, 1) if closed else None
+            result[s] = {
+                "signals": d["signals"],
+                "wins":    d["wins"],
+                "losses":  d["losses"],
+                "win_rate": wr,
+            }
+        return result
 
     def signals_per_day(self) -> float:
         if not self._fired:
@@ -242,15 +281,16 @@ class SignalState:
                     break
 
         return {
-            "trades":          len(out),
-            "wins":            len(wins),
-            "losses":          len(losses),
-            "win_rate":        round(len(wins) / len(out) * 100, 1),
-            "profit_factor":   pf,
-            "total_r":         round(total_r, 2),
-            "streak":          streak,
-            "pending":         len(self._pending),
-            "total_signals":   total_fired,
-            "signals_per_day": self.signals_per_day(),
-            "recent":          out[-10:],   # last 10 for /stats display
+            "trades":             len(out),
+            "wins":               len(wins),
+            "losses":             len(losses),
+            "win_rate":           round(len(wins) / len(out) * 100, 1),
+            "profit_factor":      pf,
+            "total_r":            round(total_r, 2),
+            "streak":             streak,
+            "pending":            len(self._pending),
+            "total_signals":      total_fired,
+            "signals_per_day":    self.signals_per_day(),
+            "strategy_breakdown": self.strategy_stats(days=7),
+            "recent":             out[-10:],
         }

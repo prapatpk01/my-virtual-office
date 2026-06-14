@@ -190,7 +190,7 @@ class TradingBot:
                     symbol=sym, side=pos_info["side"],
                     entry=pos_info["entry"], exit_price=price,
                     sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
-                    reason=trigger,
+                    reason=trigger, strategy=strategy_name,
                 )
                 self._sig.unlock_strategy(sym, strategy_name)
                 self.risk.close_position(sym, strategy=strategy_name)
@@ -296,13 +296,15 @@ class TradingBot:
             stale = (int(time.time() * 1000) - last_ts) > 4 * 3600 * 1000
             if direction_changed or stale:
                 self._sig.lock(sym, signal.type.value)
-                self._sig.record_signal(sym, signal.type.value, signal.price, signal.confidence)
+                self._sig.record_signal(sym, signal.type.value, signal.price,
+                                        signal.confidence, strategy=strategy_name)
                 # Register virtual trade so /stats tracks SL/TP outcome
                 meta = signal.metadata or {}
                 sl_p = meta.get("stop_loss"); tp_p = meta.get("take_profit")
                 if sl_p and tp_p:
                     vkey = f"forex||{sym}||{int(time.time() * 1000)}"
-                    self._sig.add_pending(vkey, sym, signal.type.value, signal.price, sl_p, tp_p)
+                    self._sig.add_pending(vkey, sym, signal.type.value, signal.price,
+                                          sl_p, tp_p, strategy=strategy_name)
                 if self.telegram:
                     self.telegram.notify_signal(sig_dict)
             else:
@@ -318,7 +320,8 @@ class TradingBot:
                 return
             # Lock before notifying to prevent race conditions
             self._sig.lock_strategy(sym, strategy_name, signal.type.value)
-            self._sig.record_signal(sym, signal.type.value, signal.price, signal.confidence)
+            self._sig.record_signal(sym, signal.type.value, signal.price,
+                                    signal.confidence, strategy=strategy_name)
             if self.telegram:
                 self.telegram.notify_signal(sig_dict)
             await self._execute_signal(signal, strategy_name)
@@ -344,7 +347,8 @@ class TradingBot:
             sl_p = meta.get("stop_loss"); tp_p = meta.get("take_profit")
             if sl_p and tp_p:
                 vkey = f"virtual||{sym}||{strategy_name}||{int(time.time() * 1000)}"
-                self._sig.add_pending(vkey, sym, signal.type.value, signal.price, sl_p, tp_p)
+                self._sig.add_pending(vkey, sym, signal.type.value, signal.price,
+                                      sl_p, tp_p, strategy=strategy_name)
             self._sig.unlock_strategy(sym, strategy_name)
             return
 

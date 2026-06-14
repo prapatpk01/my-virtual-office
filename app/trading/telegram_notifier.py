@@ -404,36 +404,52 @@ class TelegramNotifier:
             total_r = s.get("total_r",         0.0)
             streak  = s.get("streak",          0)
             recent  = s.get("recent",          [])
+            breakdown = s.get("strategy_breakdown", {})
 
             streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
             sign_r = "+" if total_r >= 0 else ""
 
-            pending_line = f"\nTracking open: `{pending}` virtual trades" if pending else ""
+            lines = [f"📊 *Signal Stats — ย้อนหลัง 7 วัน*\n"]
 
-            lines = [
-                f"📊 *Signal Stats*\n",
-                f"Signals sent: `{sig_all}` (avg `{sig_day}/day`)",
-                f"Closed trades: `{total}` (`{wins}W` / `{losses}L`)",
+            # ── Per-strategy table ───────────────────────────────────
+            if breakdown:
+                lines.append("*Strategy        Signals    WR*")
+                for strat, d in breakdown.items():
+                    sigs = d["signals"]
+                    wr_s = f"{d['win_rate']:.1f}%" if d["win_rate"] is not None else "—"
+                    cl   = d["wins"] + d["losses"]
+                    cl_s = f"({d['wins']}W/{d['losses']}L)" if cl else ""
+                    lines.append(f"`{strat:<16}` `{sigs:>3}` signals  `{wr_s:>6}` {cl_s}")
+                lines.append("")
+
+            # ── Overall ──────────────────────────────────────────────
+            lines += [
+                f"รวม signals: `{sig_all}` (avg `{sig_day}/day`)",
+                f"ปิด trades: `{total}` (`{wins}W` / `{losses}L`)",
             ]
             if total > 0:
                 lines += [
                     f"Win Rate: `{wr:.1f}%`",
                     f"Profit Factor: `{pf:.2f}`",
                     f"Total R: `{sign_r}{total_r:.1f}R`",
-                    f"Current streak: `{streak_str}`",
+                    f"Streak: `{streak_str}`",
                 ]
-            lines.append(pending_line if pending_line else "")
+            if pending:
+                lines.append(f"Tracking open: `{pending}` virtual trades")
+
             lines.append("\n_Last closed trades:_")
             if not recent:
                 lines.append("_(waiting for SL/TP to be hit)_")
             else:
                 for o in reversed(recent[-10:]):
-                    e      = "✅" if o["pnl_r"] > 0 else "❌"
-                    sr     = "+" if o["pnl_r"] >= 0 else ""
-                    label  = "TP" if o["reason"] == "take_profit" else "SL"
+                    e     = "✅" if o["pnl_r"] > 0 else "❌"
+                    sr    = "+" if o["pnl_r"] >= 0 else ""
+                    label = "TP" if o["reason"] == "take_profit" else "SL"
+                    strat = o.get("strategy", "")
+                    strat_tag = f" [{strat}]" if strat else ""
                     lines.append(
                         f"{e} `{o['symbol']}` {o['side'].upper()} "
-                        f"`{sr}{o['pnl_r']:.1f}R` [{label}]"
+                        f"`{sr}{o['pnl_r']:.1f}R` [{label}]{strat_tag}"
                     )
 
             await self._send("\n".join(lines))
