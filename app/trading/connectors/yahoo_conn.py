@@ -13,6 +13,7 @@ import numpy as np
 from .base import BaseConnector, OHLCV, OrderResult, Balance
 
 SYMBOL_MAP = {
+    # Forex / Commodities
     "XAUUSD": "GC=F",
     "EURUSD": "EURUSD=X",
     "USDJPY": "USDJPY=X",
@@ -21,8 +22,28 @@ SYMBOL_MAP = {
     "AUDUSD": "AUDUSD=X",
     "USDCAD": "USDCAD=X",
     "NZDUSD": "NZDUSD=X",
+    # Crypto — bare format
     "BTCUSD": "BTC-USD",
     "ETHUSD": "ETH-USD",
+    "BNBUSD": "BNB-USD",
+    "SOLUSD": "SOL-USD",
+    "XRPUSD": "XRP-USD",
+    "TRXUSD": "TRX-USD",
+    "DOTUSD": "DOT-USD",
+    "ADAUSD": "ADA-USD",
+    # Crypto — CCXT USDT format (BTC/USDT → BTC-USD)
+    "BTC/USDT": "BTC-USD",
+    "ETH/USDT": "ETH-USD",
+    "BNB/USDT": "BNB-USD",
+    "SOL/USDT": "SOL-USD",
+    "XRP/USDT": "XRP-USD",
+    "TRX/USDT": "TRX-USD",
+    "DOT/USDT": "DOT-USD",
+    "ADA/USDT": "ADA-USD",
+    "DOGE/USDT": "DOGE-USD",
+    "MATIC/USDT": "MATIC-USD",
+    "AVAX/USDT": "AVAX-USD",
+    "LINK/USDT": "LINK-USD",
 }
 
 TF_MAP = {

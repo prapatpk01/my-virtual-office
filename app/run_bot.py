@@ -125,11 +125,18 @@ def build_crypto_bot(config: dict, telegram):
     from trading.connectors.binance_conn import BinanceConnector
     from trading.connectors.alpaca_conn import AlpacaConnector
     from trading.connectors.oanda_conn import OANDAConnector
+    from trading.connectors.yahoo_conn import YahooConnector
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
 
     exchange = config["exchange"]
-    if exchange == "oanda":
+
+    # Paper trading → use Yahoo Finance for market data (no exchange API key needed,
+    # avoids geo-blocking issues with Binance/Bybit on cloud servers)
+    if config["paper"] and exchange in ("binance", "bybit", "okx"):
+        connector = YahooConnector()
+        logger.info("Paper trading: using Yahoo Finance for market data (exchange=%s)", exchange)
+    elif exchange == "oanda":
         connector = OANDAConnector(
             api_key=config["oanda_api_key"],
             account_id=config["oanda_account_id"],
