@@ -110,7 +110,7 @@ def run_backtest():
         # ── MACD/EMA indicators ──────────────────────────────────────────
         (ma_closes, ma_highs, ma_lows, ma_vols,
          ma_hma, ma_ema9, ma_sma21, ma_ml, ma_sl, ma_hist,
-         ma_adx_a, ma_atr2, ma_volma) = ma_s._build_arrays(candles)
+         ma_adx_a, ma_atr2, ma_volma, ma_ha_o, ma_ha_c) = ma_s._build_arrays(candles)
 
         # ── Momentum (MC·DSA) indicators ─────────────────────────────────
         (mo_ef, mo_es, mo_ml, mo_sl, mo_hi,
@@ -180,7 +180,7 @@ def run_backtest():
             if not fired and i >= ma_min:
                 d = ma_s._signal_at(i, ma_closes, ma_highs, ma_lows, ma_vols,
                                     ma_hma, ma_ema9, ma_sma21, ma_ml, ma_sl, ma_hist,
-                                    ma_adx_a, ma_atr2, ma_volma)
+                                    ma_adx_a, ma_atr2, ma_volma, ma_ha_o, ma_ha_c)
                 if d == 1 and prev["MACD/EMA"] != 1:
                     if wt1_gate(wt1_a, i, 1):
                         rr   = STRAT_RR["MACD/EMA"]
