@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional
 
 from .connectors.base import BaseConnector
 from .strategies.base import BaseStrategy, Signal, SignalType
+from .strategies.wt_adx_strategy import WTADXStrategy
 from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
 from .signal_state import SignalState
@@ -76,6 +77,8 @@ class TradingBot:
         # Persistent signal state — survives restarts
         kwargs = {"path": state_file} if state_file else {}
         self._sig = SignalState(**kwargs)
+        # WT1 cache per symbol — updated each tick, used to gate other strategies
+        self._wt1_cache: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public control
@@ -206,7 +209,7 @@ class TradingBot:
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
 
-                # Check virtual SL/TP for pending trades (once per symbol per tick)
+                # Check virtual SL/TP + update WT1 cache (once per symbol per tick)
                 if strategy.symbol not in _resolved_symbols and candles:
                     _resolved_symbols.add(strategy.symbol)
                     last_c = candles[-1]
@@ -218,6 +221,8 @@ class TradingBot:
                             self.telegram.notify_virtual_closed(
                                 strategy.symbol, v_reason, v_price, self._sig.summary()
                             )
+                    # Cache WT1 for this symbol — used as entry-timing gate
+                    self._wt1_cache[strategy.symbol] = WTADXStrategy.compute_wt1(candles)
 
                 # Fetch MTF candles for 1H + 4H bias gate
                 mtf_candles = {}
@@ -261,10 +266,32 @@ class TradingBot:
         self.state.last_updated = int(time.time() * 1000)
         self._broadcast_state()
 
+    def _wt1_gate(self, sym: str, signal_type: SignalType) -> tuple[bool, str]:
+        """
+        WaveTrend WT1 entry-timing gate.
+        BUY  blocked when WT1 >= +10 (overbought — bad time to buy).
+        SELL blocked when WT1 <= -10 (oversold  — bad time to sell).
+        Passes through when WT1 not yet available.
+        """
+        wt1 = self._wt1_cache.get(sym)
+        if wt1 is None or (wt1 != wt1):  # None or NaN
+            return True, "WT N/A"
+        if signal_type == SignalType.BUY and wt1 >= 10:
+            return False, f"WT1={wt1:.1f} OB (≥+10)"
+        if signal_type == SignalType.SELL and wt1 <= -10:
+            return False, f"WT1={wt1:.1f} OS (≤-10)"
+        return True, f"WT1={wt1:.1f} ✓"
+
     async def _maybe_notify(self, signal: Signal, sig_dict: dict, strategy_name: str):
         """Decides whether to fire Telegram notification + execute, based on signal state."""
         sym = signal.symbol
         signal_only = self.risk.max_open_positions == 0
+
+        # ── WaveTrend entry-timing gate (applies to all modes) ───────────
+        wt_ok, wt_label = self._wt1_gate(sym, signal.type)
+        if not wt_ok:
+            logger.debug("[WT GATE] %s %s blocked: %s", strategy_name, sym, wt_label)
+            return
 
         if signal_only:
             # Forex / signal-only: alert only when direction CHANGES (persisted across restarts)

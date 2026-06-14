@@ -59,6 +59,31 @@ class WTADXStrategy(BaseStrategy):
         wt2 = np.array(self.sma(wt1.tolist(), 4))
         return wt1, wt2
 
+    @staticmethod
+    def compute_wt1(candles: list, n1: int = 10, n2: int = 21) -> float:
+        """
+        Compute current WT1 value from candles.
+        Used externally as a gate by other strategies.
+        Returns NaN when not enough data.
+        """
+        if len(candles) < n1 + n2 + 5:
+            return float("nan")
+        h = np.array([c.high  for c in candles])
+        l = np.array([c.low   for c in candles])
+        c = np.array([c.close for c in candles])
+        ap  = (h + l + c) / 3.0
+        esa = np.array(BaseStrategy.ema(ap.tolist(), n1))
+        diff_abs = np.abs(ap - esa)
+        first_ok = np.where(~np.isnan(diff_abs))[0]
+        if len(first_ok):
+            diff_filled = diff_abs.copy()
+            diff_filled[:first_ok[0]] = diff_abs[first_ok[0]]
+        else:
+            diff_filled = diff_abs
+        d  = np.array(BaseStrategy.ema(diff_filled.tolist(), n1))
+        ci = np.where(d > 1e-10, (ap - esa) / (0.015 * d), 0.0)
+        return float(BaseStrategy.ema(ci.tolist(), n2)[-1])
+
     # ------------------------------------------------------------------ #
 
     async def analyze(self, candles: list, current_price: float,
