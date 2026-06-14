@@ -107,13 +107,14 @@ class MomentumScoreStrategy(BaseStrategy):
                           f"[HOLD] SELL: only {bear_count}/3 bearish candles",
                           metadata={"hma15": round(hma, 2), "open": open_price})
 
-        # ── Gate MTF ─────────────────────────────────────────────────
-        mtf_pass, mtf_label = _check_mtf(mtf_candles, gate_a, self.hma_period)
+        # ── Gate MTF — weighted composite 15m/1H/4H bias (EMA20/EMA50/RSI) ─
+        comp_pct, mtf_label = BaseStrategy.compute_mtf_bias(candles, mtf_candles)
+        mtf_pass = (comp_pct > 0 if gate_a == 1 else comp_pct < 0)
         if not mtf_pass:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[MTF BLOCK] {mtf_label}",
                           metadata={"hma15": round(hma, 2), "open": open_price,
-                                    "mtf": mtf_label})
+                                    "mtf": mtf_label, "mtf_comp_pct": round(comp_pct, 1)})
 
         # ── Score ────────────────────────────────────────────────────
         is_buy = (gate_a == 1)
@@ -154,6 +155,7 @@ class MomentumScoreStrategy(BaseStrategy):
                 "atr": round(atr_v, 4),
                 "stop_loss": sl_price, "take_profit": tp_price,
                 "rr": self.rr_ratio, "mtf": mtf_label,
+                "mtf_comp_pct": round(comp_pct, 1),
             },
         )
 
@@ -279,21 +281,3 @@ def _calc_score(is_buy, e9, s21, ml_c, sl_c, rsi, adx_v, price, s200,
     return score, tags
 
 
-def _check_mtf(mtf_candles: dict, direction: int, hma_period: int) -> tuple:
-    if not mtf_candles:
-        return True, "no MTF"
-    results = {}
-    for tf, candles in mtf_candles.items():
-        if not candles or len(candles) < hma_period + 5:
-            continue
-        closes = [c.close for c in candles]
-        hma_arr = BaseStrategy.hma(closes, hma_period)
-        last_hma = float(hma_arr[-1])
-        if np.isnan(last_hma):
-            continue
-        results[tf] = 1 if closes[-1] > last_hma else -1
-    if not results:
-        return True, "MTF unavailable"
-    agree = sum(1 for v in results.values() if v == direction)
-    label = " ".join(f"{tf}={'↑' if v==1 else '↓'}" for tf, v in sorted(results.items()))
-    return agree == len(results), label

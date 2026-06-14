@@ -183,3 +183,67 @@ class BaseStrategy(ABC):
                 if not np.isnan(adx_arr[i-1]):
                     adx_arr[i] = (adx_arr[i-1] * (period-1) + dx[i]) / period
         return adx_arr, plus_di, minus_di
+
+    @staticmethod
+    def compute_mtf_bias(
+        candles_15m: list,
+        mtf_candles: dict,
+        ema_fast: int = 20,
+        ema_slow: int = 50,
+        rsi_period: int = 14,
+        rsi_bull: float = 55.0,
+        rsi_bear: float = 45.0,
+        w1: float = 1.0,
+        w2: float = 2.0,
+        w3: float = 3.0,
+    ) -> tuple[float, str]:
+        """
+        Port of Pine Script MTF Bias Monitor (15m / 1H / 4H).
+
+        Per-TF score  -3..+3:
+          close > EMA20   → +1  else -1
+          EMA20 > EMA50   → +1  else -1
+          RSI > rsi_bull  → +1, RSI < rsi_bear → -1, else 0
+
+        Weighted composite (weights default 1/2/3):
+          comp_pct = (s15m*w1 + s1h*w2 + s4h*w3) / (3*(w1+w2+w3)) * 100
+          range -100..+100 %
+
+        Gate:  BUY  → comp_pct > 0
+               SELL → comp_pct < 0
+        """
+        def _tf_score(closes: list) -> float:
+            if len(closes) < ema_slow + rsi_period + 2:
+                return 0.0
+            e20 = float(BaseStrategy.ema(closes, ema_fast)[-1])
+            e50 = float(BaseStrategy.ema(closes, ema_slow)[-1])
+            r   = float(BaseStrategy.rsi(closes, rsi_period)[-1])
+            if any(np.isnan(v) for v in [e20, e50, r]):
+                return 0.0
+            c = closes[-1]
+            return (
+                (1.0 if c > e20 else -1.0) +
+                (1.0 if e20 > e50 else -1.0) +
+                (1.0 if r > rsi_bull else (-1.0 if r < rsi_bear else 0.0))
+            )
+
+        def _arrow(s: float) -> str:
+            return "↑↑" if s >= 2 else "↑" if s > 0 else "↓↓" if s <= -2 else "↓" if s < 0 else "→"
+
+        mtf = mtf_candles or {}
+        c15 = [c.close for c in (candles_15m or [])]
+        c1h = [c.close for c in mtf.get("1h", [])]
+        c4h = [c.close for c in mtf.get("4h", [])]
+
+        s1 = _tf_score(c15)
+        s2 = _tf_score(c1h)
+        s3 = _tf_score(c4h)
+
+        wt_max   = 3.0 * (w1 + w2 + w3)
+        comp_pct = (s1 * w1 + s2 * w2 + s3 * w3) / wt_max * 100.0
+
+        label = (
+            f"15m{_arrow(s1)} 1H{_arrow(s2)} 4H{_arrow(s3)} | "
+            f"{comp_pct:+.0f}%"
+        )
+        return comp_pct, label
