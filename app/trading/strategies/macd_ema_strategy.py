@@ -8,13 +8,13 @@ All conditions must pass (AND logic):
   2. HMA15 slope     — rising for BUY, falling for SELL
   3. EMA9 vs SMA21   — EMA9 > SMA21 for BUY
   4. MACD direction  — line > signal AND hist rising for BUY
-  5. ADX > 20
-  6. Volume > MA20
-  7. Breakout        — HA_close > highest(HA_high, 10)[1] for BUY
-  8. HA open filter  — HA_open > HA_open[1] for BUY
+  5. ADX > 14        — trend strength (relaxed from 20)
+  6. Volume > 0.8×MA20  — above-average volume
+  7. HA open filter  — HA_open > HA_open[1] for BUY
                        HA_open < HA_close[1] for SELL
 
 SL = 1.5×ATR,  TP = 1.5×1.2×ATR  (R:R 1:1.2)
+Target: ~2-3 signals/day on 15m BTC
 """
 import logging
 import numpy as np
@@ -46,8 +46,8 @@ class MACDEMAStrategy(BaseStrategy):
         self.macd_slow     = self.params.get("macd_slow",     26)
         self.macd_sig      = self.params.get("macd_signal",    9)
         self.adx_len       = self.params.get("adx_len",       14)
-        self.adx_threshold = self.params.get("adx_threshold", 20)
-        self.breakout_len  = self.params.get("breakout_len",  10)
+        self.adx_threshold = self.params.get("adx_threshold", 14)
+        self.vol_factor    = self.params.get("vol_factor",   0.8)
         self.vol_len       = self.params.get("vol_len",       20)
         self.ema50_len     = self.params.get("ema50_len",     50)
         self.sl_atr_mult   = self.params.get("sl_atr_mult",  1.5)
@@ -91,7 +91,7 @@ class MACDEMAStrategy(BaseStrategy):
         All arrays computed on Heikin Ashi candles.
         ema50_1h=nan → skip 1H trend filter.
         """
-        if i < max(2, self.breakout_len + 2):
+        if i < 2:
             return 0
 
         check = [hma15[i], ema9[i], sma21[i], ml[i], sl_line[i],
@@ -112,16 +112,7 @@ class MACDEMAStrategy(BaseStrategy):
         macd_bull = ml_c > sl_c and h_c > h_p
         macd_bear = ml_c < sl_c and h_c < h_p
         adx_ok    = adx_v > self.adx_threshold
-        vol_ok    = vol_v > vol_ma_v
-
-        # Breakout on HA highs/lows: close > highest(ha_high, N)[1]
-        bo_lo  = max(0, i - self.breakout_len)
-        ha_hs  = ha_highs[bo_lo:i]
-        ha_ls  = ha_lows[bo_lo:i]
-        if len(ha_hs) == 0:
-            return 0
-        bo_buy  = p > float(np.max(ha_hs))
-        bo_sell = p < float(np.min(ha_ls))
+        vol_ok    = vol_v > vol_ma_v * self.vol_factor
 
         # HA open filters
         ha_buy_filter  = ha_o_c > ha_o_p     # HA_open > HA_open[1]
@@ -134,10 +125,10 @@ class MACDEMAStrategy(BaseStrategy):
             trend_bear = p < ema50_1h
 
         if (trend_bull and hma_slope > 0 and e9_c > s21_c
-                and macd_bull and adx_ok and vol_ok and bo_buy and ha_buy_filter):
+                and macd_bull and adx_ok and vol_ok and ha_buy_filter):
             return 1
         if (trend_bear and hma_slope < 0 and e9_c < s21_c
-                and macd_bear and adx_ok and vol_ok and bo_sell and ha_sell_filter):
+                and macd_bear and adx_ok and vol_ok and ha_sell_filter):
             return -1
         return 0
 
