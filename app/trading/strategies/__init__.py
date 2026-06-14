@@ -1,6 +1,7 @@
 from .base import BaseStrategy, Signal, SignalType
 from .wt_adx_strategy import WTADXStrategy
 from .macd_ema_strategy import MACDEMAStrategy
+from .ut_bot_strategy import UTBotStrategy
 
 # Legacy strategies (kept, disabled by default)
 from .momentum_strategy import MomentumStrategy
