@@ -283,9 +283,6 @@ async def main():
     # Auto-optimize SL/TP via backtest on first symbol
     await _run_backtest(crypto_bot, config, telegram)
 
-    # Auto-optimize SL/TP via backtest on first symbol
-    await _run_backtest(crypto_bot, config, telegram)
-
     # Start both bots concurrently
     tasks = [asyncio.create_task(crypto_bot.start())]
     if forex_bot:
