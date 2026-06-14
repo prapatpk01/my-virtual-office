@@ -199,11 +199,25 @@ class TradingBot:
 
         # Run each strategy
         new_signals = []
+        _resolved_symbols: set[str] = set()  # check virtual SL/TP once per symbol per tick
         for strategy in self.strategies:
             try:
                 candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="15m", limit=300)
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
+
+                # Check virtual SL/TP for pending trades (once per symbol per tick)
+                if strategy.symbol not in _resolved_symbols and candles:
+                    _resolved_symbols.add(strategy.symbol)
+                    last_c = candles[-1]
+                    v_high = max(float(last_c.high), current_price)
+                    v_low  = min(float(last_c.low),  current_price)
+                    resolved = self._sig.check_and_resolve_pending(strategy.symbol, v_high, v_low)
+                    for v_reason, v_price in resolved:
+                        if self.telegram:
+                            self.telegram.notify_virtual_closed(
+                                strategy.symbol, v_reason, v_price, self._sig.summary()
+                            )
 
                 # Fetch MTF candles for 1H + 4H bias gate
                 mtf_candles = {}
@@ -261,6 +275,12 @@ class TradingBot:
             if direction_changed or stale:
                 self._sig.lock(sym, signal.type.value)
                 self._sig.record_signal(sym, signal.type.value, signal.price, signal.confidence)
+                # Register virtual trade so /stats tracks SL/TP outcome
+                meta = signal.metadata or {}
+                sl_p = meta.get("stop_loss"); tp_p = meta.get("take_profit")
+                if sl_p and tp_p:
+                    vkey = f"forex||{sym}||{int(time.time() * 1000)}"
+                    self._sig.add_pending(vkey, sym, signal.type.value, signal.price, sl_p, tp_p)
                 if self.telegram:
                     self.telegram.notify_signal(sig_dict)
             else:
@@ -296,7 +316,13 @@ class TradingBot:
 
         amount = self.risk.size_position(quote_balance, price)
         if amount <= 0:
-            logger.info("Position size 0, skipping %s", sym)
+            logger.info("Position size 0, skipping %s — tracking virtually", sym)
+            # No real order; track SL/TP virtually so /stats shows outcome
+            meta = signal.metadata or {}
+            sl_p = meta.get("stop_loss"); tp_p = meta.get("take_profit")
+            if sl_p and tp_p:
+                vkey = f"virtual||{sym}||{strategy_name}||{int(time.time() * 1000)}"
+                self._sig.add_pending(vkey, sym, signal.type.value, signal.price, sl_p, tp_p)
             self._sig.unlock_strategy(sym, strategy_name)
             return
 

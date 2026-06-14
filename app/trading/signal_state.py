@@ -5,6 +5,7 @@ Tracks:
   - Which symbols have an unresolved active signal (prevents re-entry)
   - Every signal fired (for signals/day stats)
   - Closed trade outcomes (win/loss history for /stats)
+  - Pending virtual trades (for SL/TP outcome tracking on forex / paper-0-balance signals)
 """
 import json
 import logging
@@ -15,6 +16,7 @@ from collections import defaultdict
 logger = logging.getLogger("signal_state")
 
 _DEFAULT_PATH = os.environ.get("SIGNAL_STATE_FILE", "/app/signal_state.json")
+_PENDING_TTL_MS = 7 * 24 * 3600 * 1000  # 7 days
 
 
 class SignalState:
@@ -24,6 +26,7 @@ class SignalState:
         self._active: dict[str, dict] = {}
         self._fired: list[dict] = []       # every signal alert sent
         self._outcomes: list[dict] = []    # closed trade results
+        self._pending: dict[str, dict] = {}  # virtual open trades awaiting SL/TP
         self._load()
 
     # ------------------------------------------------------------------
@@ -37,8 +40,9 @@ class SignalState:
             self._active   = data.get("active",   {})
             self._fired    = data.get("fired",     [])
             self._outcomes = data.get("outcomes",  [])
-            logger.info("Signal state loaded: %d locks, %d fired, %d outcomes",
-                        len(self._active), len(self._fired), len(self._outcomes))
+            self._pending  = data.get("pending",   {})
+            logger.info("Signal state loaded: %d locks, %d fired, %d outcomes, %d pending",
+                        len(self._active), len(self._fired), len(self._outcomes), len(self._pending))
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -51,6 +55,7 @@ class SignalState:
                     "active":   self._active,
                     "fired":    self._fired[-1000:],
                     "outcomes": self._outcomes[-500:],
+                    "pending":  self._pending,
                 }, f, indent=2)
         except Exception as e:
             logger.warning("Could not save signal state: %s", e)
@@ -90,6 +95,74 @@ class SignalState:
 
     def count_active(self, symbol: str) -> int:
         return sum(1 for k in self._active if k.startswith(f"{symbol}||"))
+
+    # ------------------------------------------------------------------
+    # Virtual outcome tracking (forex signal-only + paper/0-balance crypto)
+    # ------------------------------------------------------------------
+
+    def add_pending(self, key: str, symbol: str, side: str, entry: float, sl: float, tp: float):
+        """Register a virtual open trade to monitor SL/TP virtually."""
+        if not sl or not tp:
+            return
+        if key in self._pending:
+            return
+        self._pending[key] = {
+            "symbol": symbol,
+            "side":   side,
+            "entry":  round(entry, 8),
+            "sl":     sl,
+            "tp":     tp,
+            "ts":     int(time.time() * 1000),
+        }
+        self._save()
+        logger.info("Virtual trade registered: %s %s @ %.4f  SL=%.4f TP=%.4f", side, symbol, entry, sl, tp)
+
+    def check_and_resolve_pending(self, symbol: str, high: float, low: float) -> list[tuple[str, float]]:
+        """
+        Check all pending virtual trades for symbol against high/low prices.
+        Resolves any that hit SL or TP: records the outcome and removes the entry.
+        Returns list of (reason, exit_price) for each resolved trade.
+        """
+        resolved = []
+        now = int(time.time() * 1000)
+        changed = False
+        for key in list(self._pending):
+            item = self._pending[key]
+            if item["symbol"] != symbol:
+                continue
+            # Prune expired entries
+            if now - item["ts"] > _PENDING_TTL_MS:
+                del self._pending[key]
+                changed = True
+                logger.info("Virtual trade expired (7d): %s", key)
+                continue
+            sl = item["sl"]; tp = item["tp"]
+            side = item["side"]
+            entry = item["entry"]
+            hit = None; exit_price = None
+            if side in ("buy", "long"):
+                if low <= sl:
+                    hit = "stop_loss";   exit_price = sl
+                elif high >= tp:
+                    hit = "take_profit"; exit_price = tp
+            else:
+                if high >= sl:
+                    hit = "stop_loss";   exit_price = sl
+                elif low <= tp:
+                    hit = "take_profit"; exit_price = tp
+            if hit:
+                del self._pending[key]
+                changed = True
+                self.record_outcome(
+                    symbol=symbol, side=side,
+                    entry=entry, exit_price=exit_price,
+                    sl=sl, tp=tp, reason=hit,
+                )
+                resolved.append((hit, exit_price))
+                logger.info("Virtual %s %s → %s @ %.4f (entry %.4f)", side, symbol, hit, exit_price, entry)
+        if changed and not resolved:  # record_outcome already saves when resolved
+            self._save()
+        return resolved
 
     # ------------------------------------------------------------------
     # Signal firing log
@@ -147,6 +220,7 @@ class SignalState:
         if not out:
             return {
                 "trades": 0,
+                "pending": len(self._pending),
                 "total_signals": total_fired,
                 "signals_per_day": self.signals_per_day(),
             }
@@ -175,6 +249,7 @@ class SignalState:
             "profit_factor":   pf,
             "total_r":         round(total_r, 2),
             "streak":          streak,
+            "pending":         len(self._pending),
             "total_signals":   total_fired,
             "signals_per_day": self.signals_per_day(),
             "recent":          out[-10:],   # last 10 for /stats display

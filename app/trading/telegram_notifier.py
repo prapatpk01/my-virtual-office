@@ -173,6 +173,33 @@ class TelegramNotifier:
         )
         self.notify(text)
 
+    def notify_virtual_closed(self, symbol: str, reason: str, exit_price: float, stats: dict):
+        """Called when a virtual (signal-only / paper-0-balance) trade hits SL or TP."""
+        won   = reason == "take_profit"
+        emoji = "✅" if won else "❌"
+        label = "Take-Profit Hit" if won else "Stop-Loss Hit"
+
+        total   = stats.get("trades",           0)
+        wins    = stats.get("wins",             0)
+        losses  = stats.get("losses",           0)
+        wr      = stats.get("win_rate",         0)
+        pf      = stats.get("profit_factor",    0)
+        total_r = stats.get("total_r",          0)
+        streak  = stats.get("streak",           0)
+        sig_day = stats.get("signals_per_day",  0)
+        streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
+        sign_r = "+" if total_r >= 0 else ""
+
+        text = (
+            f"{emoji} *{label}* _(virtual)_\n"
+            f"`{symbol}` @ `{exit_price:,.4f}`\n\n"
+            f"📊 *Signal Stats* ({total} tracked)\n"
+            f"Win/Loss: `{wins}W / {losses}L` | WR: `{wr:.1f}%`\n"
+            f"Profit Factor: `{pf:.2f}` | Total: `{sign_r}{total_r:.1f}R`\n"
+            f"Streak: `{streak_str}` | Avg signals/day: `{sig_day}`"
+        )
+        self.notify(text)
+
     def notify_stop_event(self, symbol: str, event: str, price: float, pnl: float):
         """Legacy — kept for compatibility."""
         emoji = "🛑" if event == "stop_loss" else "💰"
@@ -364,6 +391,7 @@ class TelegramNotifier:
             total   = s.get("trades",          0)
             sig_all = s.get("total_signals",   0)
             sig_day = s.get("signals_per_day", 0)
+            pending = s.get("pending",         0)
 
             if sig_all == 0:
                 await self._send("📭 No signals fired yet.")
@@ -380,18 +408,24 @@ class TelegramNotifier:
             streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
             sign_r = "+" if total_r >= 0 else ""
 
+            pending_line = f"\nTracking open: `{pending}` virtual trades" if pending else ""
+
             lines = [
-                f"📊 *Backtest / Live Stats*\n",
+                f"📊 *Signal Stats*\n",
                 f"Signals sent: `{sig_all}` (avg `{sig_day}/day`)",
                 f"Closed trades: `{total}` (`{wins}W` / `{losses}L`)",
-                f"Win Rate: `{wr:.1f}%`",
-                f"Profit Factor: `{pf:.2f}`",
-                f"Total R: `{sign_r}{total_r:.1f}R`",
-                f"Current streak: `{streak_str}`\n",
-                "_Last 5 closed trades:_",
             ]
+            if total > 0:
+                lines += [
+                    f"Win Rate: `{wr:.1f}%`",
+                    f"Profit Factor: `{pf:.2f}`",
+                    f"Total R: `{sign_r}{total_r:.1f}R`",
+                    f"Current streak: `{streak_str}`",
+                ]
+            lines.append(pending_line if pending_line else "")
+            lines.append("\n_Last closed trades:_")
             if not recent:
-                lines.append("_(no closed trades yet — waiting for SL/TP)_")
+                lines.append("_(waiting for SL/TP to be hit)_")
             else:
                 for o in reversed(recent[-10:]):
                     e      = "✅" if o["pnl_r"] > 0 else "❌"
