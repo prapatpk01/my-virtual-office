@@ -64,6 +64,7 @@ def build_config() -> dict:
         "exchange":        os.environ.get("EXCHANGE", "binance"),
         "api_key":         os.environ.get("EXCHANGE_API_KEY", ""),
         "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
+        "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),  # OKX only
         "paper":           _env_bool("PAPER_TRADING", True),
         # OANDA-specific
         "oanda_api_key":   os.environ.get("OANDA_API_KEY", ""),
@@ -150,6 +151,7 @@ def build_crypto_bot(config: dict, telegram):
         connector = BinanceConnector(
             api_key=config["api_key"], api_secret=config["api_secret"],
             paper=config["paper"], exchange_id=exchange,
+            passphrase=config.get("api_passphrase", ""),
         )
     else:
         connector = AlpacaConnector(

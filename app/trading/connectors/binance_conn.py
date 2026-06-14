@@ -21,19 +21,22 @@ class BinanceConnector(BaseConnector):
     }
 
     def __init__(self, api_key: str = "", api_secret: str = "",
-                 paper: bool = True, exchange_id: str = "binance"):
+                 paper: bool = True, exchange_id: str = "binance",
+                 passphrase: str = ""):
         super().__init__(api_key, api_secret, paper)
         exchange_class = getattr(ccxt, exchange_id)
         options: dict = {"defaultType": "spot"}
-        # Bybit blocks /v5/asset/coin/query-info from cloud IPs — disable currency loading
-        if exchange_id in ("bybit",):
+        if exchange_id == "bybit":
             options["fetchCurrencies"] = False
-        self._exchange = exchange_class({
+        cfg: dict = {
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
             "options": options,
-        })
+        }
+        if passphrase:  # OKX requires password (passphrase)
+            cfg["password"] = passphrase
+        self._exchange = exchange_class(cfg)
         self._exchange_id = exchange_id
         self._paper_balance = {"USDT": 10000.0, "BTC": 0.0, "ETH": 0.0}
         self._paper_open_orders: list[OrderResult] = []
