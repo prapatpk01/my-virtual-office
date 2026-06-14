@@ -13,7 +13,7 @@ All conditions must pass (AND logic):
   7. HA open filter  — HA_open > HA_open[1] for BUY
                        HA_open < HA_close[1] for SELL
 
-SL = 1.5×ATR,  TP = 1.5×1.2×ATR  (R:R 1:1.2)
+SL = 1.5×ATR,  TP = 1.5×1.5×ATR  (R:R 1:1.5)
 Target: ~2-3 signals/day on 15m BTC
 """
 import logging
@@ -51,7 +51,7 @@ class MACDEMAStrategy(BaseStrategy):
         self.vol_len       = self.params.get("vol_len",       20)
         self.ema50_len     = self.params.get("ema50_len",     50)
         self.sl_atr_mult   = self.params.get("sl_atr_mult",  1.5)
-        self.rr_ratio      = self.params.get("rr_ratio",     1.2)
+        self.rr_ratio      = self.params.get("rr_ratio",     1.5)
 
     # ── Heikin Ashi conversion ─────────────────────────────────────
 

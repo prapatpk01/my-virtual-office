@@ -34,7 +34,7 @@ SYMBOLS = [
     ("EURUSD",      1.085, 0.0004, 0.0002, 0.00010, 44),
 ]
 
-STRAT_RR = {"WaveTrend": 1.5, "MACD/EMA": 1.2, "Momentum": 1.5}
+STRAT_RR = {"WaveTrend": 1.5, "MACD/EMA": 1.5, "Momentum": 1.5}
 
 
 # ─── Candle Generator ──────────────────────────────────────────────────────
