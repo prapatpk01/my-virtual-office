@@ -6,6 +6,14 @@ from typing import Optional
 import numpy as np
 
 
+class _HACandle:
+    """Lightweight Heikin Ashi candle object compatible with all indicator helpers."""
+    __slots__ = ("timestamp", "open", "high", "low", "close", "volume")
+    def __init__(self, ts, o, h, l, c, v):
+        self.timestamp = ts
+        self.open = o; self.high = h; self.low = l; self.close = c; self.volume = v
+
+
 class SignalType(str, Enum):
     BUY = "buy"
     SELL = "sell"
@@ -183,6 +191,23 @@ class BaseStrategy(ABC):
                 if not np.isnan(adx_arr[i-1]):
                     adx_arr[i] = (adx_arr[i-1] * (period-1) + dx[i]) / period
         return adx_arr, plus_di, minus_di
+
+    @staticmethod
+    def _heikin_ashi(candles: list):
+        """Convert OHLCV candles to Heikin Ashi. Returns (ha_candles, ha_open_arr, ha_close_arr)."""
+        n = len(candles)
+        ha_o = np.zeros(n); ha_c = np.zeros(n)
+        ha_h = np.zeros(n); ha_l = np.zeros(n)
+        for i, c in enumerate(candles):
+            ha_c[i] = (c.open + c.high + c.low + c.close) / 4.0
+            ha_o[i] = ((c.open + c.close) / 2.0 if i == 0 else (ha_o[i-1] + ha_c[i-1]) / 2.0)
+            ha_h[i] = max(c.high, ha_o[i], ha_c[i])
+            ha_l[i] = min(c.low,  ha_o[i], ha_c[i])
+        ha_candles = [
+            _HACandle(candles[i].timestamp, ha_o[i], ha_h[i], ha_l[i], ha_c[i], candles[i].volume)
+            for i in range(n)
+        ]
+        return ha_candles, ha_o, ha_c
 
     @staticmethod
     def compute_mtf_bias(

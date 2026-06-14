@@ -77,15 +77,17 @@ class MomentumScoreStrategy(BaseStrategy):
         Compute all signal arrays over the full candle list.
         Returns (buy_sig, sell_sig, phase, rsi_src, atr_a).
         """
+        ha_candles, _, ha_c = self._heikin_ashi(candles)
+
         n      = len(candles)
-        closes = np.array([c.close for c in candles], dtype=float)
-        highs  = np.array([c.high  for c in candles], dtype=float)
-        lows   = np.array([c.low   for c in candles], dtype=float)
+        closes = ha_c
+        highs  = np.array([c.high for c in ha_candles], dtype=float)
+        lows   = np.array([c.low  for c in ha_candles], dtype=float)
 
         rsi_raw = self._rsi(closes, self.rsi_len)
         rsi_src = self._wma(rsi_raw, self.rsi_smooth)
         rsi_ema = np.array(self.ema(rsi_src.tolist(), self.ema_len), dtype=float)
-        atr_a   = np.array(self.atr(candles, _ATR_PERIOD), dtype=float)
+        atr_a   = np.array(self.atr(ha_candles, _ATR_PERIOD), dtype=float)
 
         pl = self.pivot_len
 

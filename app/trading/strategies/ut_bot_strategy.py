@@ -59,13 +59,15 @@ class UTBotStrategy(BaseStrategy):
 
     def _build_signals(self, candles: list):
         """Returns (buy_sig, sell_sig, tsl, atr14)."""
-        n      = len(candles)
-        closes = np.array([c.close for c in candles], dtype=float)
-        highs  = np.array([c.high  for c in candles], dtype=float)
-        lows   = np.array([c.low   for c in candles], dtype=float)
+        ha_candles, _, ha_c = self._heikin_ashi(candles)
 
-        ut_atr = np.array(self.atr(candles, self.ut_atr_len), dtype=float)
-        atr14  = np.array(self.atr(candles, _ATR_PERIOD),     dtype=float)
+        n      = len(candles)
+        closes = ha_c
+        highs  = np.array([c.high for c in ha_candles], dtype=float)
+        lows   = np.array([c.low  for c in ha_candles], dtype=float)
+
+        ut_atr = np.array(self.atr(ha_candles, self.ut_atr_len), dtype=float)
+        atr14  = np.array(self.atr(ha_candles, _ATR_PERIOD),     dtype=float)
         tsl    = self._trailing_stop(closes, ut_atr)
 
         buy_sig  = np.zeros(n, dtype=bool)

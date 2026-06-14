@@ -50,13 +50,15 @@ class WTADXStrategy(BaseStrategy):
 
     def _build_signals(self, candles: list):
         """Returns (wt1, wt2, buy_sig, sell_sig, atr14)."""
+        ha_candles, _, ha_c = self._heikin_ashi(candles)
+
         n   = len(candles)
-        hig = np.array([c.high  for c in candles], dtype=float)
-        low = np.array([c.low   for c in candles], dtype=float)
-        cls = np.array([c.close for c in candles], dtype=float)
+        hig = np.array([c.high for c in ha_candles], dtype=float)
+        low = np.array([c.low  for c in ha_candles], dtype=float)
+        cls = ha_c
 
         wt1, wt2 = self._wavetrend(hig.tolist(), low.tolist(), cls.tolist())
-        atr14    = np.array(self.atr(candles, _ATR_PERIOD), dtype=float)
+        atr14    = np.array(self.atr(ha_candles, _ATR_PERIOD), dtype=float)
 
         buy_sig  = np.zeros(n, dtype=bool)
         sell_sig = np.zeros(n, dtype=bool)
@@ -77,12 +79,13 @@ class WTADXStrategy(BaseStrategy):
 
     @staticmethod
     def compute_wt1(candles: list, n1: int = 10, n2: int = 21) -> float:
-        """Return current WT1 value — used as gate by other strategies."""
+        """Return current WT1 value (on HA candles) — used as gate by other strategies."""
         if len(candles) < n1 + n2 + 5:
             return float("nan")
-        h = np.array([c.high  for c in candles])
-        l = np.array([c.low   for c in candles])
-        c = np.array([c.close for c in candles])
+        ha_candles, _, ha_c = BaseStrategy._heikin_ashi(candles)
+        h = np.array([c.high for c in ha_candles])
+        l = np.array([c.low  for c in ha_candles])
+        c = ha_c
         ap  = (h + l + c) / 3.0
         esa = np.array(BaseStrategy.ema(ap.tolist(), n1))
         diff_abs = np.abs(ap - esa)
