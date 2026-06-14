@@ -24,11 +24,15 @@ class BinanceConnector(BaseConnector):
                  paper: bool = True, exchange_id: str = "binance"):
         super().__init__(api_key, api_secret, paper)
         exchange_class = getattr(ccxt, exchange_id)
+        options: dict = {"defaultType": "spot"}
+        # Bybit blocks /v5/asset/coin/query-info from cloud IPs — disable currency loading
+        if exchange_id in ("bybit",):
+            options["fetchCurrencies"] = False
         self._exchange = exchange_class({
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
+            "options": options,
         })
         self._exchange_id = exchange_id
         self._paper_balance = {"USDT": 10000.0, "BTC": 0.0, "ETH": 0.0}
