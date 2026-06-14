@@ -1,0 +1,359 @@
+"""
+Full 7-Day Backtest  |  3 Strategies × 3 Symbols  |  WT1 Gate + Position Lock
+Capital simulation: $500 start, $10 risk/trade.
+
+Models real bot behaviour:
+  - One open trade per symbol at a time (all strategies locked until exit)
+  - Strategies checked in priority order: WaveTrend → MACD/EMA → Momentum
+  - WT1 gate applied to MACD and Momentum signals
+  - Exit bar determined by first SL/TP hit or timeout (60 bars)
+"""
+import sys, os
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+from app.trading.connectors.base import OHLCV
+from app.trading.strategies.wt_adx_strategy import WTADXStrategy
+from app.trading.strategies.momentum_score_strategy import MomentumScoreStrategy, _calc_score
+from app.trading.strategies.macd_ema_strategy import MACDEMAStrategy, _votes
+
+# ─── Constants ─────────────────────────────────────────────────────────────
+WARMUP   = 285
+DAYS     = 7
+BPD      = 96           # 15m bars per day
+N_BARS   = WARMUP + DAYS * BPD
+LOOKFWD  = 60           # max bars to scan for SL/TP exit
+RISK     = 10.0
+CAP_0    = 500.0
+ATR_P    = 14
+
+SYMBOLS = [
+    ("BTCUSD", 65_000.0, 0.0015, 0.0008, 0.00030, 42),
+    ("XAUUSD",  2_050.0, 0.0008, 0.0004, 0.00020, 43),
+    ("EURUSD",     1.085, 0.0004, 0.0002, 0.00010, 44),
+]
+
+STRAT_RR = {"WaveTrend": 1.5, "MACD/EMA": 1.2, "Momentum": 1.5}
+
+
+# ─── Candle Generator ──────────────────────────────────────────────────────
+def gen_candles(n, start, vt, vr, drift, seed):
+    rng = np.random.default_rng(seed)
+    closes = [float(start)]
+    regime = 96
+    for i in range(1, n):
+        ph = (i // regime) % 6
+        mu, sd = (+drift, vt) if ph < 2 else ((-drift, vt) if ph < 4 else (0.0, vr))
+        closes.append(closes[-1] * (1 + rng.normal(mu, sd)))
+    candles = []
+    for i, c in enumerate(closes):
+        o  = closes[i-1] if i > 0 else c
+        sp = abs(rng.normal(0, c * 0.0005))
+        candles.append(OHLCV(
+            timestamp=i * 15 * 60 * 1000,
+            open=round(o, 6), high=round(max(o, c) + sp, 6),
+            low=round(min(o, c) - sp, 6), close=round(c, 6),
+            volume=float(rng.uniform(5, 50)),
+        ))
+    return candles
+
+
+# ─── Find trade exit ───────────────────────────────────────────────────────
+def find_exit(highs, lows, idx, direction, sl_p, tp_p):
+    """Returns (exit_bar_idx, outcome). outcome: +1=win, -1=loss, 0=timeout."""
+    n = len(highs)
+    for j in range(idx + 1, min(idx + LOOKFWD, n)):
+        if direction == 1:
+            if lows[j]  <= sl_p: return j, -1
+            if highs[j] >= tp_p: return j,  1
+        else:
+            if highs[j] >= sl_p: return j, -1
+            if lows[j]  <= tp_p: return j,  1
+    return min(idx + LOOKFWD, n - 1), 0
+
+
+# ─── WT1 Gate ──────────────────────────────────────────────────────────────
+def wt1_gate(wt1_a, idx, direction):
+    w = float(wt1_a[idx])
+    if np.isnan(w):                return True
+    if direction ==  1 and w >= 10: return False
+    if direction == -1 and w <= -10: return False
+    return True
+
+
+# ─── Main Backtest ─────────────────────────────────────────────────────────
+def run_backtest():
+    """
+    Returns list of signal tuples:
+      (day, strategy, symbol, direction, entry, sl, tp, rr, outcome)
+    """
+    all_signals = []
+
+    for sym, start, vt, vr, drift, seed in SYMBOLS:
+        candles = gen_candles(N_BARS, start, vt, vr, drift, seed)
+        closes  = np.array([c.close for c in candles])
+        highs   = np.array([c.high  for c in candles])
+        lows    = np.array([c.low   for c in candles])
+
+        # Strategy instances for indicator methods
+        wt_s = WTADXStrategy(sym)
+        mo_s = MomentumScoreStrategy(sym)
+        ma_s = MACDEMAStrategy(sym)
+
+        # Compute all indicator arrays once
+        wt1_a, wt2_a = wt_s._wavetrend(highs.tolist(), lows.tolist(), closes.tolist())
+        atr_a        = np.array(wt_s.atr(candles, ATR_P), dtype=float)
+        wt1_a        = np.array(wt1_a, dtype=float)
+        wt2_a        = np.array(wt2_a, dtype=float)
+
+        hma_a    = np.array(mo_s.hma(closes.tolist(), 15),  dtype=float)
+        ema9_a   = np.array(mo_s.ema(closes.tolist(),  9),  dtype=float)
+        sma21_a  = np.array(mo_s.sma(closes.tolist(), 21),  dtype=float)
+        sma200_a = np.array(mo_s.sma(closes.tolist(), 200), dtype=float)
+        _ml, _sl, _ = mo_s.macd(closes.tolist(), 12, 26, 9)
+        ml_a     = np.array(_ml, dtype=float)
+        sl_a     = np.array(_sl, dtype=float)
+        rsi_a    = np.array(mo_s.rsi(closes.tolist(), 14), dtype=float)
+        adx_a, _, _ = mo_s.adx(candles, 14)
+        adx_a    = np.array(adx_a, dtype=float)
+
+        # Min start bars for each strategy
+        wt_min = max(wt_s.n1 + wt_s.n2 + ATR_P + 10, WARMUP)
+        ma_min = max(ma_s.macd_slow + ma_s.macd_sig + ma_s.hma_period + ATR_P + 5, WARMUP)
+        mo_min = max(200 + mo_s.macd_slow + ATR_P * 2 + 10, WARMUP)
+
+        def day_of(i): return (i - WARMUP) // BPD + 1
+
+        # Position lock: symbol locked until this bar (inclusive)
+        sym_locked_until = -1
+
+        # Per-strategy dedup (prev direction)
+        prev = {"WaveTrend": 0, "MACD/EMA": 0, "Momentum": 0}
+
+        for i in range(WARMUP, N_BARS - 1):
+            day = day_of(i)
+            if day < 1 or day > DAYS: break
+
+            # ── Skip if symbol is in an active trade ─────────────────
+            if i <= sym_locked_until:
+                # Still update strategy dedup state so we don't carry stale state
+                continue
+
+            atr_v = float(atr_a[i]) if not np.isnan(atr_a[i]) else 0.0
+            entry = float(closes[i])
+            if atr_v <= 0:
+                continue
+
+            fired = False  # only one signal per bar per symbol
+
+            # ══ Check strategies in priority order ════════════════════
+
+            # 1. WaveTrend ─────────────────────────────────────────────
+            if not fired and i >= wt_min:
+                if not any(np.isnan(v) for v in [wt1_a[i], wt2_a[i]]):
+                    w1c, w1p = float(wt1_a[i]), float(wt1_a[i-1])
+                    w2c, w2p = float(wt2_a[i]), float(wt2_a[i-1])
+                    cu  = w1p <= w2p and w1c > w2c
+                    cd  = w1p >= w2p and w1c < w2c
+                    buy  = cu and w1c < -10.0
+                    sell = cd and w1c > +10.0
+
+                    if buy and prev["WaveTrend"] != 1:
+                        rr = STRAT_RR["WaveTrend"]
+                        sl_p = entry - 1.5 * atr_v
+                        tp_p = entry + 1.5 * rr * atr_v
+                        eb, out = find_exit(highs, lows, i, 1, sl_p, tp_p)
+                        all_signals.append((day, "WaveTrend", sym, 1, entry, sl_p, tp_p, rr, out))
+                        sym_locked_until = eb
+                        prev["WaveTrend"] = 1
+                        fired = True
+                    elif sell and prev["WaveTrend"] != -1:
+                        rr = STRAT_RR["WaveTrend"]
+                        sl_p = entry + 1.5 * atr_v
+                        tp_p = entry - 1.5 * rr * atr_v
+                        eb, out = find_exit(highs, lows, i, -1, sl_p, tp_p)
+                        all_signals.append((day, "WaveTrend", sym, -1, entry, sl_p, tp_p, rr, out))
+                        sym_locked_until = eb
+                        prev["WaveTrend"] = -1
+                        fired = True
+                    elif not buy and not sell:
+                        prev["WaveTrend"] = 0
+
+            # 2. MACD/EMA ──────────────────────────────────────────────
+            if not fired and i >= ma_min:
+                nan_check = [hma_a[i], ema9_a[i], sma21_a[i], ml_a[i], sl_a[i]]
+                if not any(np.isnan(v) for v in nan_check):
+                    va, vb, vc = _votes(closes[i], hma_a[i], ema9_a[i], sma21_a[i],
+                                        ml_a[i], sl_a[i])
+                    bv = sum(1 for v in [va, vb, vc] if v ==  1)
+                    sv = sum(1 for v in [va, vb, vc] if v == -1)
+
+                    if bv >= 2 and prev["MACD/EMA"] != 1:
+                        if wt1_gate(wt1_a, i, 1):
+                            rr = STRAT_RR["MACD/EMA"]
+                            sl_p = entry - 1.5 * atr_v
+                            tp_p = entry + 1.5 * rr * atr_v
+                            eb, out = find_exit(highs, lows, i, 1, sl_p, tp_p)
+                            all_signals.append((day, "MACD/EMA", sym, 1, entry, sl_p, tp_p, rr, out))
+                            sym_locked_until = eb
+                            fired = True
+                        prev["MACD/EMA"] = 1
+                    elif sv >= 2 and prev["MACD/EMA"] != -1:
+                        if wt1_gate(wt1_a, i, -1):
+                            rr = STRAT_RR["MACD/EMA"]
+                            sl_p = entry + 1.5 * atr_v
+                            tp_p = entry - 1.5 * rr * atr_v
+                            eb, out = find_exit(highs, lows, i, -1, sl_p, tp_p)
+                            all_signals.append((day, "MACD/EMA", sym, -1, entry, sl_p, tp_p, rr, out))
+                            sym_locked_until = eb
+                            fired = True
+                        prev["MACD/EMA"] = -1
+                    else:
+                        prev["MACD/EMA"] = 0
+
+            # 3. MomentumScore ─────────────────────────────────────────
+            if not fired and i >= mo_min:
+                vals = [hma_a[i], ema9_a[i], sma21_a[i], sma200_a[i],
+                        ml_a[i], sl_a[i], rsi_a[i]]
+                if not any(np.isnan(v) for v in vals):
+                    adx_v = float(adx_a[i]) if not np.isnan(adx_a[i]) else 0.0
+                    gate  = 1 if closes[i] > hma_a[i] else (-1 if closes[i] < hma_a[i] else 0)
+                    if gate != 0:
+                        score, _ = _calc_score(
+                            gate == 1, ema9_a[i], sma21_a[i], ml_a[i], sl_a[i],
+                            rsi_a[i], adx_v, closes[i], sma200_a[i],
+                            mo_s.adx_threshold,
+                            mo_s.rsi_buy_lo, mo_s.rsi_buy_hi,
+                            mo_s.rsi_sell_lo, mo_s.rsi_sell_hi,
+                        )
+                        if score >= mo_s.score_threshold and gate != prev["Momentum"]:
+                            if wt1_gate(wt1_a, i, gate):
+                                rr = STRAT_RR["Momentum"]
+                                if gate == 1:
+                                    sl_p = entry - 1.5 * atr_v
+                                    tp_p = entry + 1.5 * rr * atr_v
+                                else:
+                                    sl_p = entry + 1.5 * atr_v
+                                    tp_p = entry - 1.5 * rr * atr_v
+                                eb, out = find_exit(highs, lows, i, gate, sl_p, tp_p)
+                                all_signals.append((day, "Momentum", sym, gate,
+                                                   entry, sl_p, tp_p, rr, out))
+                                sym_locked_until = eb
+                                fired = True
+                            prev["Momentum"] = gate
+                        elif score < mo_s.score_threshold:
+                            prev["Momentum"] = 0
+
+    return all_signals
+
+
+# ─── Capital Simulation (chronological) ───────────────────────────────────
+def simulate_capital(signals):
+    cap    = CAP_0
+    peak   = CAP_0
+    max_dd = 0.0
+    day_cap = {d: 0.0 for d in range(1, DAYS + 1)}
+
+    for day, strat, sym, direction, entry, sl, tp, rr, outcome in signals:
+        if outcome == 1:
+            cap += RISK * rr
+        elif outcome == -1:
+            cap -= RISK
+        peak   = max(peak, cap)
+        max_dd = max(max_dd, peak - cap)
+        day_cap[day] += (RISK * rr if outcome == 1 else (-RISK if outcome == -1 else 0.0))
+
+    return cap, max_dd, day_cap
+
+
+# ─── Report ────────────────────────────────────────────────────────────────
+def print_report(all_signals):
+    W = 68
+    print("\n" + "═" * W)
+    print("  FULL 7-DAY BACKTEST  |  3 Strategies × 3 Symbols  |  WT1 Gate")
+    print("  Position lock per symbol  |  SL=1.5×ATR  |  15m synthetic data")
+    print("═" * W)
+
+    # ── Day-by-day ──────────────────────────────────────────────────
+    print(f"\n  {'Day':<5}{'Signals':>8}{'Closed':>8}{'W':>5}{'L':>5}{'WR':>7}{'P/L ($)':>10}")
+    print("  " + "─" * (W - 2))
+    tot_sig = tot_cl = tot_w = tot_l = 0
+    tot_pnl = 0.0
+
+    for d in range(1, DAYS + 1):
+        ds = [s for s in all_signals if s[0] == d]
+        cl = [s for s in ds if s[8] != 0]
+        w  = sum(1 for s in cl if s[8] ==  1)
+        l  = sum(1 for s in cl if s[8] == -1)
+        pnl = sum(RISK * s[7] for s in cl if s[8] == 1) - RISK * l
+        wr  = f"{w/len(cl)*100:.0f}%" if cl else "—"
+        print(f"  Day{d:<3}{len(ds):>8}{len(cl):>8}{w:>5}{l:>5}{wr:>7}{pnl:>+9.2f}")
+        tot_sig += len(ds); tot_cl += len(cl); tot_w += w; tot_l += l; tot_pnl += pnl
+
+    tot_wr = f"{tot_w/tot_cl*100:.1f}%" if tot_cl else "—"
+    print("  " + "─" * (W - 2))
+    print(f"  {'TOTAL':<5}{tot_sig:>8}{tot_cl:>8}{tot_w:>5}{tot_l:>5}{tot_wr:>7}{tot_pnl:>+9.2f}")
+    print(f"\n  ✦ สัญญาณเฉลี่ย : {tot_sig/DAYS:.1f} signal/day (รวม 3 symbols)")
+
+    # ── Per-strategy ─────────────────────────────────────────────────
+    print(f"\n  {'Strategy':<13}{'Signals':>8}{'W':>5}{'L':>5}{'WR':>7}{'Total R':>9}{'$/trade':>9}")
+    print("  " + "─" * (W - 2))
+    for sn in ["WaveTrend", "MACD/EMA", "Momentum"]:
+        sg = [s for s in all_signals if s[1] == sn]
+        cl = [s for s in sg if s[8] != 0]
+        w  = sum(1 for s in cl if s[8] ==  1)
+        l  = sum(1 for s in cl if s[8] == -1)
+        tr = sum(s[7] for s in cl if s[8] == 1) - float(l)
+        pnl = sum(RISK * s[7] for s in cl if s[8] == 1) - RISK * l
+        wr  = f"{w/len(cl)*100:.1f}%" if cl else "—"
+        dpt = pnl / len(cl) if cl else 0.0
+        print(f"  {sn:<13}{len(sg):>8}{w:>5}{l:>5}{wr:>7}{tr:>+8.1f}R{dpt:>+8.2f}")
+
+    # ── Per-symbol ───────────────────────────────────────────────────
+    print(f"\n  {'Symbol':<9}{'Signals':>8}{'W':>5}{'L':>5}{'WR':>7}{'P/L ($)':>10}")
+    print("  " + "─" * (W - 2))
+    for sy in ["BTCUSD", "XAUUSD", "EURUSD"]:
+        sg = [s for s in all_signals if s[2] == sy]
+        cl = [s for s in sg if s[8] != 0]
+        w  = sum(1 for s in cl if s[8] ==  1)
+        l  = sum(1 for s in cl if s[8] == -1)
+        pnl = sum(RISK * s[7] for s in cl if s[8] == 1) - RISK * l
+        wr  = f"{w/len(cl)*100:.1f}%" if cl else "—"
+        print(f"  {sy:<9}{len(sg):>8}{w:>5}{l:>5}{wr:>7}{pnl:>+9.2f}")
+
+    # ── Capital ──────────────────────────────────────────────────────
+    final_cap, max_dd, day_pnl_map = simulate_capital(all_signals)
+    pnl_total = final_cap - CAP_0
+    roi = pnl_total / CAP_0 * 100
+    closed_all = [s for s in all_signals if s[8] != 0]
+    wr_all = tot_w / tot_cl * 100 if tot_cl else 0
+
+    print(f"\n{'═'*W}")
+    print(f"  CAPITAL SIMULATION  |  เริ่ม ${CAP_0:.0f}  |  เสี่ยง ${RISK:.0f}/trade")
+    print(f"{'─'*W}")
+    running = CAP_0
+    print(f"  {'Day':<5}{'Balance':>12}{'Daily P/L':>11}{'Cumulative':>12}")
+    print("  " + "─" * 42)
+    for d in range(1, DAYS + 1):
+        dp = day_pnl_map[d]
+        running += dp
+        print(f"  Day{d:<3}${running:>11,.2f}{dp:>+10.2f}   {running-CAP_0:>+9.2f}")
+
+    print(f"\n  ทุนสุดท้าย  : ${final_cap:,.2f}  ({pnl_total:+.2f} USD / {roi:+.2f}%)")
+    print(f"  Win Rate    : {wr_all:.1f}%  ({tot_w}W / {tot_l}L)")
+    print(f"  Max Drawdown: ${max_dd:.2f}")
+
+    monthly_roi = roi / DAYS * 30
+    open_count = len(all_signals) - len(closed_all)
+    print(f"\n  ─── Estimate ──────────────────────────────────────────")
+    print(f"  Projected 30d ROI : {monthly_roi:+.2f}%")
+    print(f"  สัญญาณ 30 วัน    : ~{tot_sig/DAYS*30:.0f} trades")
+    print(f"  รอผล (timeout)   : {open_count} trades ยังไม่ถึง SL/TP")
+    print("═" * W + "\n")
+
+
+if __name__ == "__main__":
+    print("กำลังรัน 7-day backtest พร้อม position lock...")
+    signals = run_backtest()
+    print_report(signals)
