@@ -32,15 +32,15 @@ class MomentumScoreStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.rsi_len     = self.params.get("rsi_len",      14)
+        self.rsi_len     = self.params.get("rsi_len",      21)   # smoother RSI
         self.rsi_ema_len = self.params.get("rsi_ema_len",   9)
-        self.ema_len     = self.params.get("ema_len",       20)
+        self.ema_len     = self.params.get("ema_len",       50)   # stronger trend filter
         self.macd_fast   = self.params.get("macd_fast",    12)
         self.macd_slow   = self.params.get("macd_slow",    26)
         self.macd_sig    = self.params.get("macd_signal",   9)
-        self.threshold   = self.params.get("threshold",     4)   # min score to signal
+        self.threshold   = self.params.get("threshold",     4)   # 4 of 5 conditions
         self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",     1.5)
+        self.rr_ratio    = self.params.get("rr_ratio",     1.2)   # tighter TP → higher WR
 
     # ── RSI (Wilder's) ─────────────────────────────────────────────
 
