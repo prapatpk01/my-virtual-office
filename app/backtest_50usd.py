@@ -1,10 +1,22 @@
 """
 Full backtest — fixed $50 position size, OKX fees 0.20% round trip.
-BTC/USDT synthetic 15m data (GBM).  Bars: 250 / 500 / 1000.
+BTC/USDT synthetic data (GBM).  Bars: 250 / 500 / 1000.
+Usage: python backtest_50usd.py [15m|1h]
 """
 import asyncio, sys, math, random
 import numpy as np
 sys.path.insert(0, "")
+
+TF = sys.argv[1] if len(sys.argv) > 1 else "15m"
+assert TF in ("15m", "1h"), "TF must be 15m or 1h"
+
+# 15m: sigma=0.002, bar_sec=900, bars/day=96
+# 1h:  sigma=0.005, bar_sec=3600, bars/day=24
+TF_CFG = {
+    "15m": dict(sigma=0.002, bar_sec=900,  bars_per_day=96,  lookfwd=60),
+    "1h":  dict(sigma=0.005, bar_sec=3600, bars_per_day=24,  lookfwd=30),
+}
+cfg = TF_CFG[TF]
 
 from dataclasses import dataclass
 from trading.strategies.ut_bot_strategy      import UTBotStrategy
@@ -20,7 +32,9 @@ class C:
     open: float; high: float; low: float; close: float; volume: float
 
 def gbm_candles(n: int, seed: int = 42, start: float = 100_000.0,
-                mu: float = 0.0001, sigma: float = 0.002) -> list:
+                mu: float = 0.0001, sigma: float = None) -> list:
+    if sigma is None:
+        sigma = cfg["sigma"]
     rng = random.Random(seed)
     candles = []
     price = start
@@ -38,7 +52,7 @@ def gbm_candles(n: int, seed: int = 42, start: float = 100_000.0,
 
 FEE_RT    = 0.0020   # 0.10% entry + 0.10% exit
 POSITION  = 50.0     # USD per trade
-LOOKFWD   = 60       # bars max hold
+LOOKFWD   = cfg["lookfwd"]
 
 async def run_strategy_backtest(strategy, candles: list, bars: int) -> dict:
     subset = candles[-bars:]
@@ -196,7 +210,7 @@ async def run_strategy_backtest(strategy, candles: list, bars: int) -> dict:
     pf   = gross_win/gross_loss if gross_loss > 0 else float("inf")
     total_usd  = sum(p for _,p in results)
     avg_usd    = total_usd/total if total else 0
-    bars_per_day = 96  # 15m → 96 bars/day
+    bars_per_day = cfg["bars_per_day"]
     trades_per_day = total / (bars / bars_per_day)
 
     return {
@@ -223,7 +237,7 @@ async def main():
     ]
 
     print(f"\n{'='*80}")
-    print(f"  Full Backtest — $50/trade fixed, OKX fee 0.20% RT, BTC/USDT 15m (synthetic)")
+    print(f"  Full Backtest — $50/trade fixed, OKX fee 0.20% RT, BTC/USDT {TF} (synthetic)")
     print(f"{'='*80}")
 
     all_rows = []
