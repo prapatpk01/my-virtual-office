@@ -310,21 +310,84 @@ class TradingBot:
             else:
                 logger.debug("Forex %s suppressed — same direction already sent", sym)
         else:
-            # Crypto: locked = already in a trade for this symbol+strategy
-            if self._sig.is_locked_for_strategy(sym, strategy_name):
-                # Check if this is a reversal (opposite direction) — close existing first
+            # ── WaveTrend: allow up to 2 stacked positions, close ALL on reversal ──
+            _WT = "WTADXStrategy"
+            _WT_MAX = 2
+            if strategy_name == _WT:
+                new_side  = "long" if signal.type == SignalType.BUY else "short"
                 positions = self.risk.get_positions()
-                existing = next((p for p in positions
-                                 if p["symbol"] == sym and p["strategy"] == strategy_name), None)
+                wt_pos    = [p for p in positions
+                             if p["symbol"] == sym and p["strategy"].startswith(_WT)]
+                opposite  = [p for p in wt_pos if p["side"] != new_side]
+                same_dir  = [p for p in wt_pos if p["side"] == new_side]
+
+                if opposite:
+                    # Reversal → close ALL WT positions on this symbol
+                    logger.info("[WT] Reversal on %s — closing %d position(s)", sym, len(wt_pos))
+                    ticker = await self.connector.fetch_ticker(sym)
+                    exit_price = ticker["last"]
+                    for pos in list(wt_pos):
+                        slot_name = pos["strategy"]
+                        c_side = "sell" if pos["side"] == "long" else "buy"
+                        try:
+                            await self.connector.create_order(sym, c_side, pos["amount"])
+                            self._sig.record_outcome(
+                                symbol=sym, side=pos["side"],
+                                entry=pos["entry"], exit_price=exit_price,
+                                sl=pos.get("stop_loss"), tp=pos.get("take_profit"),
+                                reason="reversal", strategy=slot_name,
+                            )
+                            self._sig.unlock_strategy(sym, slot_name)
+                            self.risk.close_position(sym, strategy=slot_name)
+                            if self.telegram:
+                                self.telegram.notify_trade_closed(
+                                    sym, "reversal", exit_price,
+                                    pos["entry"], pos.get("stop_loss"),
+                                    pos.get("take_profit"), self._sig.summary(),
+                                )
+                        except Exception as e:
+                            logger.error("WT reversal close failed [%s]: %s", slot_name, e)
+                    # Fall through to open new position
+
+                elif len(same_dir) >= _WT_MAX:
+                    logger.debug("[WT] %s max stack (%d) reached, suppressing", sym, _WT_MAX)
+                    return
+
+                # Find next free slot
+                slot_key = None
+                for s in range(_WT_MAX):
+                    candidate = f"{_WT}#{s}"
+                    if not self._sig.is_locked_for_strategy(sym, candidate):
+                        slot_key = candidate
+                        break
+                if slot_key is None:
+                    return
+
+                can, reason = self.risk.can_open(sym, strategy=slot_key)
+                if not can:
+                    logger.debug("[WT] %s can_open blocked: %s", sym, reason)
+                    return
+                self._sig.lock_strategy(sym, slot_key, signal.type.value)
+                self._sig.record_signal(sym, signal.type.value, signal.price,
+                                        signal.confidence, strategy=slot_key)
+                if self.telegram:
+                    self.telegram.notify_signal(sig_dict)
+                await self._execute_signal(signal, slot_key)
+                return
+
+            # ── Normal strategies: reversal close then re-enter ──────────────
+            if self._sig.is_locked_for_strategy(sym, strategy_name):
+                positions = self.risk.get_positions()
+                existing  = next((p for p in positions
+                                  if p["symbol"] == sym and p["strategy"] == strategy_name), None)
                 if existing:
                     new_side = "long" if signal.type == SignalType.BUY else "short"
                     if existing["side"] != new_side:
-                        # Opposite signal → close existing position then open new one
                         close_side = "sell" if existing["side"] == "long" else "buy"
-                        logger.info("[%s] Reversal %s → %s on %s", strategy_name,
-                                    existing["side"], new_side, sym)
+                        logger.info("[%s] Reversal %s→%s on %s",
+                                    strategy_name, existing["side"], new_side, sym)
                         try:
-                            ticker = await self.connector.fetch_ticker(sym)
+                            ticker     = await self.connector.fetch_ticker(sym)
                             exit_price = ticker["last"]
                             await self.connector.create_order(sym, close_side, existing["amount"])
                             self._sig.record_outcome(
@@ -338,17 +401,14 @@ class TradingBot:
                             if self.telegram:
                                 self.telegram.notify_trade_closed(
                                     sym, "reversal", exit_price,
-                                    existing["entry"],
-                                    existing.get("stop_loss"),
-                                    existing.get("take_profit"),
-                                    self._sig.summary(),
+                                    existing["entry"], existing.get("stop_loss"),
+                                    existing.get("take_profit"), self._sig.summary(),
                                 )
                         except Exception as e:
-                            logger.error("Reversal close failed for %s [%s]: %s", sym, strategy_name, e)
+                            logger.error("Reversal close failed [%s]: %s", strategy_name, e)
                             return
-                        # Fall through to open new position below
                     else:
-                        logger.debug("Crypto %s suppressed — %s same direction in trade", sym, strategy_name)
+                        logger.debug("Crypto %s suppressed — %s same direction", sym, strategy_name)
                         return
                 else:
                     logger.debug("Crypto %s suppressed — %s locked (no position)", sym, strategy_name)
@@ -357,7 +417,6 @@ class TradingBot:
             if not can:
                 logger.debug("Crypto %s suppressed — %s", sym, reason)
                 return
-            # Lock before notifying to prevent race conditions
             self._sig.lock_strategy(sym, strategy_name, signal.type.value)
             self._sig.record_signal(sym, signal.type.value, signal.price,
                                     signal.confidence, strategy=strategy_name)
