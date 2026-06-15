@@ -37,7 +37,7 @@ class MACDEMAStrategy(BaseStrategy):
         self.macd_slow     = self.params.get("macd_slow",     26)
         self.macd_sig      = self.params.get("macd_signal",    9)
         self.adx_len       = self.params.get("adx_len",       14)
-        self.adx_threshold = self.params.get("adx_threshold", 20)
+        self.adx_threshold = self.params.get("adx_threshold", 15)
         self.atr_period    = self.params.get("atr_period",    14)
         self.sl_atr_mult   = self.params.get("sl_atr_mult",  1.5)
         self.rr_ratio      = self.params.get("rr_ratio",     1.2)
