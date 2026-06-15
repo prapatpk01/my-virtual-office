@@ -1,11 +1,23 @@
 """
-Momentum Score Strategy — RSI × Heikin Ashi.
+Momentum Score Strategy — 5-indicator scoring system.
 
-Signal fires when ALL 3 conditions are true:
-  BUY:  HA bullish (HA_close > HA_open)  AND  RSI < 50  AND  RSI crosses above EMA9(RSI)
-  SELL: HA bearish (HA_close < HA_open)  AND  RSI > 50  AND  RSI crosses below EMA9(RSI)
+Scores 5 momentum conditions per bar (each true = 1 point):
+  BUY  (bullish score ≥ threshold):
+    1. RSI > 50              (momentum bullish zone)
+    2. RSI > EMA9(RSI)       (RSI trending up)
+    3. HA_close > HA_open    (bullish Heikin Ashi candle)
+    4. HA_close > EMA20(HA)  (price above trend line)
+    5. MACD line > Signal    (macro momentum positive)
 
-RSI cross is the trigger; HA direction + RSI zone confirm the trend.
+  SELL (bearish score ≥ threshold):
+    1. RSI < 50
+    2. RSI < EMA9(RSI)
+    3. HA_close < HA_open
+    4. HA_close < EMA20(HA)
+    5. MACD line < Signal
+
+Signal fires on the bar where score first reaches threshold (transition).
+Default threshold = 4 (4 out of 5 must pass).
 SL = 1.5×ATR(14), R:R = 1:1.5
 """
 import numpy as np
@@ -20,27 +32,17 @@ class MomentumScoreStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.rsi_len     = self.params.get("rsi_len",     14)
-        self.ema_len     = self.params.get("ema_len",      9)
-        self.rsi_mid     = self.params.get("rsi_mid",     50)   # zone threshold
-        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",    1.5)
+        self.rsi_len     = self.params.get("rsi_len",      14)
+        self.rsi_ema_len = self.params.get("rsi_ema_len",   9)
+        self.ema_len     = self.params.get("ema_len",       20)
+        self.macd_fast   = self.params.get("macd_fast",    12)
+        self.macd_slow   = self.params.get("macd_slow",    26)
+        self.macd_sig    = self.params.get("macd_signal",   9)
+        self.threshold   = self.params.get("threshold",     4)   # min score to signal
+        self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
+        self.rr_ratio    = self.params.get("rr_ratio",     1.5)
 
-    # ── Indicators ─────────────────────────────────────────────────
-
-    @staticmethod
-    def _ema_skipnan(arr: np.ndarray, period: int) -> np.ndarray:
-        """EMA that skips leading NaN — needed when input (e.g. RSI) starts with NaN."""
-        result = np.full(len(arr), np.nan)
-        valid  = np.where(~np.isnan(arr))[0]
-        if len(valid) == 0 or len(arr) - valid[0] < period:
-            return result
-        s = int(valid[0])
-        k = 2.0 / (period + 1)
-        result[s + period - 1] = float(np.mean(arr[s : s + period]))
-        for i in range(s + period, len(arr)):
-            result[i] = float(arr[i]) * k + result[i - 1] * (1 - k)
-        return result
+    # ── RSI (Wilder's) ─────────────────────────────────────────────
 
     @staticmethod
     def _rsi(closes: np.ndarray, period: int) -> np.ndarray:
@@ -60,60 +62,114 @@ class MomentumScoreStrategy(BaseStrategy):
             result[i] = 100.0 if avg_l < 1e-10 else 100 - 100 / (1 + avg_g / avg_l)
         return result
 
+    @staticmethod
+    def _ema_skipnan(arr: np.ndarray, period: int) -> np.ndarray:
+        """EMA that skips leading NaN (needed for EMA of RSI)."""
+        result = np.full(len(arr), np.nan)
+        valid  = np.where(~np.isnan(arr))[0]
+        if len(valid) == 0 or len(arr) - valid[0] < period:
+            return result
+        s = int(valid[0])
+        k = 2.0 / (period + 1)
+        result[s + period - 1] = float(np.mean(arr[s : s + period]))
+        for i in range(s + period, len(arr)):
+            result[i] = float(arr[i]) * k + result[i - 1] * (1 - k)
+        return result
+
+    # ── Build all indicator arrays ─────────────────────────────────
+
+    def _build_arrays(self, candles: list):
+        ha_candles, ha_o, ha_c = self._heikin_ashi(candles)
+
+        cl      = ha_c.tolist()
+        rsi_a   = self._rsi(ha_c, self.rsi_len)
+        rsi_ema = self._ema_skipnan(rsi_a, self.rsi_ema_len)
+        ema20   = np.array(self.ema(cl, self.ema_len),  dtype=float)
+        _ml, _sl, _ = self.macd(cl, self.macd_fast, self.macd_slow, self.macd_sig)
+        ml      = np.array(_ml, dtype=float)
+        sl_line = np.array(_sl, dtype=float)
+        atr_a   = np.array(self.atr(ha_candles, _ATR_PERIOD), dtype=float)
+
+        return ha_o, ha_c, rsi_a, rsi_ema, ema20, ml, sl_line, atr_a
+
+    # ── Score at bar i ─────────────────────────────────────────────
+
+    def _score(self, i: int, ha_o, ha_c, rsi_a, rsi_ema, ema20, ml, sl_line):
+        """Return (bull_score, bear_score) at bar i (0–5 each)."""
+        if any(np.isnan(v) for v in [rsi_a[i], rsi_ema[i], ema20[i], ml[i], sl_line[i]]):
+            return 0, 0
+
+        rsi_v  = float(rsi_a[i])
+        rsi_e  = float(rsi_ema[i])
+        ha_o_v = float(ha_o[i])
+        ha_c_v = float(ha_c[i])
+        ema_v  = float(ema20[i])
+        ml_v   = float(ml[i])
+        sig_v  = float(sl_line[i])
+
+        bull = int(rsi_v > 50) + int(rsi_v > rsi_e) + \
+               int(ha_c_v > ha_o_v) + int(ha_c_v > ema_v) + int(ml_v > sig_v)
+        bear = int(rsi_v < 50) + int(rsi_v < rsi_e) + \
+               int(ha_c_v < ha_o_v) + int(ha_c_v < ema_v) + int(ml_v < sig_v)
+        return bull, bear
+
     # ── Signal arrays ──────────────────────────────────────────────
 
     def _build_signals(self, candles: list):
-        """Returns (buy_sig, sell_sig, rsi_a, rsi_ema_a, atr_a)."""
-        ha_candles, ha_o, ha_c = self._heikin_ashi(candles)
+        """Returns (buy_sig, sell_sig, bull_score, bear_score, atr_a)."""
+        ha_o, ha_c, rsi_a, rsi_ema, ema20, ml, sl_line, atr_a = \
+            self._build_arrays(candles)
 
-        n = len(candles)
-        atr_a   = np.array(self.atr(ha_candles, _ATR_PERIOD), dtype=float)
-        rsi_a   = self._rsi(ha_c, self.rsi_len)
-        rsi_ema = self._ema_skipnan(rsi_a, self.ema_len)
-
+        n        = len(candles)
+        bull_arr = np.zeros(n, dtype=int)
+        bear_arr = np.zeros(n, dtype=int)
         buy_sig  = np.zeros(n, dtype=bool)
         sell_sig = np.zeros(n, dtype=bool)
 
+        prev_bull = 0
+        prev_bear = 0
+
         for i in range(1, n):
-            if np.isnan(rsi_a[i]) or np.isnan(rsi_a[i-1]):
-                continue
-            if np.isnan(rsi_ema[i]) or np.isnan(rsi_ema[i-1]):
-                continue
+            b, s = self._score(i, ha_o, ha_c, rsi_a, rsi_ema, ema20, ml, sl_line)
+            bull_arr[i] = b
+            bear_arr[i] = s
 
-            rsi_c  = float(rsi_a[i]);    rsi_p  = float(rsi_a[i-1])
-            ema_c  = float(rsi_ema[i]);  ema_p  = float(rsi_ema[i-1])
-            ha_o_v = float(ha_o[i]);     ha_c_v = float(ha_c[i])
+            # Signal fires when score first reaches threshold (transition ≥ threshold)
+            if b >= self.threshold and prev_bull < self.threshold:
+                buy_sig[i] = True
+            if s >= self.threshold and prev_bear < self.threshold:
+                sell_sig[i] = True
 
-            rsi_cross_up   = rsi_c > ema_c and rsi_p <= ema_p
-            rsi_cross_down = rsi_c < ema_c and rsi_p >= ema_p
-            ha_bull = ha_c_v > ha_o_v
-            ha_bear = ha_c_v < ha_o_v
+            prev_bull = b
+            prev_bear = s
 
-            buy_sig[i]  = ha_bull and rsi_c < self.rsi_mid and rsi_cross_up
-            sell_sig[i] = ha_bear and rsi_c > self.rsi_mid and rsi_cross_down
-
-        return buy_sig, sell_sig, rsi_a, rsi_ema, atr_a
+        return buy_sig, sell_sig, bull_arr, bear_arr, atr_a
 
     # ── Live analysis ──────────────────────────────────────────────
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
-        min_len = self.rsi_len + self.ema_len + 5
+        min_len = self.macd_slow + self.macd_sig + self.ema_len + 5
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
-        buy_sig, sell_sig, rsi_a, rsi_ema, atr_a = self._build_signals(candles)
+        ha_o, ha_c, rsi_a, rsi_ema, ema20, ml, sl_line, atr_a = \
+            self._build_arrays(candles)
+
+        buy_sig, sell_sig, bull_arr, bear_arr, _ = self._build_signals(candles)
 
         n   = len(candles) - 1
         p   = current_price
         atr = float(atr_a[n]) if not np.isnan(atr_a[n]) else 0.0
         rsi = float(rsi_a[n]) if not np.isnan(rsi_a[n]) else 50.0
-        conf = round(min(0.85, 0.60 + abs(rsi - 50) / 100), 2)
+        b_s = int(bull_arr[n]); s_s = int(bear_arr[n])
+        conf = round(min(0.85, 0.50 + max(b_s, s_s) * 0.07), 2)
 
         meta = {
-            "rsi":     round(rsi, 1),
-            "rsi_ema": round(float(rsi_ema[n]), 1) if not np.isnan(rsi_ema[n]) else None,
-            "atr":     round(atr, 4),
+            "rsi":        round(rsi, 1),
+            "bull_score": b_s,
+            "bear_score": s_s,
+            "atr":        round(atr, 4),
         }
 
         if buy_sig[n]:
@@ -122,7 +178,7 @@ class MomentumScoreStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf,
-                reason=f"[Momentum] BUY | HA↑ RSI={rsi:.1f}×↑EMA",
+                reason=f"[Momentum] BUY score {b_s}/5 | RSI={rsi:.1f}",
                 metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio},
             )
 
@@ -132,21 +188,20 @@ class MomentumScoreStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf,
-                reason=f"[Momentum] SELL | HA↓ RSI={rsi:.1f}×↓EMA",
+                reason=f"[Momentum] SELL score {s_s}/5 | RSI={rsi:.1f}",
                 metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio},
             )
 
-        zone = "Bull" if rsi > 50 else "Bear"
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[Momentum] HOLD | RSI={rsi:.1f} ({zone})",
+            f"[Momentum] HOLD | bull={b_s} bear={s_s} RSI={rsi:.1f}",
             metadata=meta,
         )
 
     # ── Backtest ───────────────────────────────────────────────────
 
     async def backtest(self, candles: list) -> tuple[dict, tuple]:
-        min_len = self.rsi_len + self.ema_len + 20
+        min_len = self.macd_slow + self.macd_sig + self.ema_len + 20
         if len(candles) < min_len:
             return {}, None
 
