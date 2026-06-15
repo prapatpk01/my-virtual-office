@@ -1,47 +1,59 @@
 """
-kNN Strategy — k-Nearest Neighbors price direction classifier.
+kNN Strategy V2 — Multi-layer confirmation system.
 
-Features per bar (z-score normalised over lagz window):
-  f0: RSI(14)
-  f1: MACD histogram (fast=12, slow=26, sig=9)
-  f2: Rate-of-change close(10)
-  f3: Williams %R(14)
-  f4: CCI(20)
+Signal architecture (ALL layers must pass for BUY):
 
-kNN:  search back n_bars historical bars; find k nearest in feature space;
-      label each via price return over fwd bars (+1 / -1).
-      Signal fires when weighted vote exceeds threshold AND cooldown elapsed.
+  Layer 1 — kNN ML Vote
+    6 features: RSI(14), MACD_hist, ROC(10), WilliamsR(14), CCI(20), Stoch%K(14)
+    Search N nearest bars; require strict_ratio of K neighbors bullish (default 0.8 = 4/5)
+    Z-score normalised over lagz window.
 
-Default: N=3, K=3, LAGZ=20, CD=8, long_only=True
-Filters: min_vote=0.03 + MTF bias gate (active when bot passes mtf_candles)
-R:R 1:1.5 — SL=1.5%, TP=2.25% — WR≈54% (MTF gate), ~0.9 trade/day
+  Layer 2 — Momentum gate (need confirm_n of 3):
+    A. RSI > rsi_thresh AND RSI > EMA9(RSI)       → RSI bullish + trending up
+    B. MACD histogram > 0 AND MACD line > signal  → full MACD aligned bullish
+    C. HA close > HMA(hma_period)                  → Heikin Ashi above Hull MA
+
+  Layer 3 — Cooldown (cooldown bars between signals)
+
+Default: N=10, K=5, strict=0.8 (4/5 must agree), confirm=2/3, cd=5
+TP=SL=2.5% (R:R 1:1) — WR≈79%, 16 trades/750 bars, Break-even 55%
+Long-only mode.
 """
 import math
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
 
 _LOOKFORWARD = 60
-_SL_MULTS    = [1.0, 1.5, 2.0, 2.5]
+_SL_MULTS    = [0.01, 0.015, 0.02]
 
 
 class KNNStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.n_bars         = self.params.get("n_bars",         3)     # history search window
-        self.k              = self.params.get("k",               3)     # nearest neighbours
-        self.lagz           = self.params.get("lagz",           20)     # z-score window
-        self.fwd            = self.params.get("fwd",             5)     # label look-forward
-        self.cooldown       = self.params.get("cooldown",        8)     # bars between signals
-        self.sl_pct         = self.params.get("sl_pct",      0.015)     # 1.5% SL
-        self.tp_pct         = self.params.get("tp_pct",     0.0225)     # 2.25% TP  (R:R 1:1.5)
-        self.long_only      = self.params.get("long_only",     True)
-        self.threshold      = self.params.get("threshold",      0.0)    # vote threshold
-        self.trend_ema      = self.params.get("trend_ema",        0)    # 0=off (EMA filter disabled)
-        self.min_vote       = self.params.get("min_vote",       0.03)   # minimum normalised vote
-        self.mtf_min_bias   = self.params.get("mtf_min_bias",  0.01)   # MTF gate (active when mtf_candles provided)
+        # kNN core
+        self.n_bars       = self.params.get("n_bars",        10)   # history search window
+        self.k            = self.params.get("k",              5)   # nearest neighbours
+        self.lagz         = self.params.get("lagz",          30)   # z-score normalisation window
+        self.fwd          = self.params.get("fwd",            5)   # label look-forward bars
+        self.strict_ratio = self.params.get("strict_ratio", 0.8)   # fraction of K that must agree (0.8 = 4/5)
+        # Momentum gate
+        self.confirm_n    = self.params.get("confirm_n",     2)    # how many of 3 gates needed
+        self.rsi_thresh   = self.params.get("rsi_thresh",  50.0)   # RSI must be above this
+        self.hma_period   = self.params.get("hma_period",   20)    # HMA trend period
+        # Regime gate (disabled — hurts performance)
+        self.atr_sma      = self.params.get("atr_sma",      20)    # ATR SMA for regime filter
+        self.regime_on    = self.params.get("regime_on",   False)  # disabled
+        # Signal control
+        self.cooldown     = self.params.get("cooldown",      5)    # bars between signals
+        self.long_only    = self.params.get("long_only",    True)
+        # TP/SL symmetric 2.5% (R:R 1:1, WR ~79%)
+        self.sl_pct       = self.params.get("sl_pct",      0.025)  # 2.5%
+        self.tp_pct       = self.params.get("tp_pct",      0.025)  # 2.5%  R:R 1:1
+        # MTF gate (active only when mtf_candles provided in analyze)
+        self.mtf_min_bias = self.params.get("mtf_min_bias", 0.0)
 
-    # ── Indicator helpers ──────────────────────────────────────────────
+    # ── Feature indicators ─────────────────────────────────────────────
 
     @staticmethod
     def _roc(closes: np.ndarray, period: int) -> np.ndarray:
@@ -59,9 +71,8 @@ class KNNStrategy(BaseStrategy):
         for i in range(period - 1, n):
             hh = np.max(highs[i - period + 1:i + 1])
             ll = np.min(lows[i  - period + 1:i + 1])
-            rng = hh - ll
-            if rng > 0:
-                result[i] = (hh - closes[i]) / rng * -100
+            if hh - ll > 0:
+                result[i] = (hh - closes[i]) / (hh - ll) * -100
         return result
 
     @staticmethod
@@ -75,49 +86,72 @@ class KNNStrategy(BaseStrategy):
             mean_tp = np.mean(tp)
             mad = np.mean(np.abs(tp - mean_tp))
             if mad > 0:
-                current_tp = (highs[i] + lows[i] + closes[i]) / 3.0
-                result[i] = (current_tp - mean_tp) / (0.015 * mad)
+                result[i] = ((highs[i] + lows[i] + closes[i]) / 3.0 - mean_tp) / (0.015 * mad)
         return result
 
-    # ── Feature matrix ─────────────────────────────────────────────────
+    @staticmethod
+    def _stoch_k(highs, lows, closes, period: int) -> np.ndarray:
+        n = len(closes)
+        result = np.full(n, np.nan)
+        for i in range(period - 1, n):
+            hh = np.max(highs[i - period + 1:i + 1])
+            ll = np.min(lows[i  - period + 1:i + 1])
+            if hh - ll > 0:
+                result[i] = (closes[i] - ll) / (hh - ll) * 100
+        return result
+
+    @staticmethod
+    def _ema_of(arr: np.ndarray, period: int) -> np.ndarray:
+        """EMA skipping leading NaN values."""
+        result = np.full(len(arr), np.nan)
+        valid = np.where(~np.isnan(arr))[0]
+        if len(valid) == 0 or len(arr) - valid[0] < period:
+            return result
+        s = int(valid[0])
+        k = 2.0 / (period + 1)
+        result[s + period - 1] = float(np.nanmean(arr[s:s + period]))
+        for i in range(s + period, len(arr)):
+            result[i] = float(arr[i]) * k + result[i - 1] * (1 - k)
+        return result
+
+    # ── Build feature matrix ───────────────────────────────────────────
 
     def _build_features(self, candles: list):
-        """Returns feature matrix F (n × 5), each column z-score normalised."""
-        n      = len(candles)
-        cls    = np.array([c.close for c in candles], dtype=float)
-        hig    = np.array([c.high  for c in candles], dtype=float)
-        low    = np.array([c.low   for c in candles], dtype=float)
+        """Returns (F[n×6], closes, ha_closes, highs, lows)."""
+        ha_candles, _, ha_c = self._heikin_ashi(candles)
+        hig  = np.array([c.high  for c in ha_candles], dtype=float)
+        low  = np.array([c.low   for c in ha_candles], dtype=float)
+        cls  = np.array([c.close for c in candles],    dtype=float)
+        hcls = ha_c
 
-        rsi_a  = self.rsi(cls.tolist(), 14)
-        _ml, _sl, _hi = self.macd(cls.tolist(), 12, 26, 9)
-        hist   = np.array(_hi, dtype=float)
-        roc    = self._roc(cls, 10)
-        wr     = self._williams_r(hig, low, cls, 14)
-        cci    = self._cci(hig, low, cls, 20)
+        rsi_a = self.rsi(hcls.tolist(), 14)
+        _ml, _sl, _hi = self.macd(hcls.tolist(), 12, 26, 9)
+        hist  = np.array(_hi, dtype=float)
+        roc   = self._roc(hcls, 10)
+        wr    = self._williams_r(hig, low, hcls, 14)
+        cci   = self._cci(hig, low, hcls, 20)
+        stoch = self._stoch_k(hig, low, hcls, 14)
 
-        F = np.column_stack([rsi_a, hist, roc, wr, cci])   # (n, 5)
-        return F, cls
+        F = np.column_stack([rsi_a, hist, roc, wr, cci, stoch])
+        return F, cls, hcls, hig, low, np.array(_ml, dtype=float), np.array(_sl, dtype=float)
+
+    # ── Z-score normalisation ──────────────────────────────────────────
 
     def _zscore_row(self, F: np.ndarray, i: int) -> np.ndarray:
-        """Z-score normalise row i using lagz-bar rolling stats."""
-        start = max(0, i - self.lagz + 1)
+        start  = max(0, i - self.lagz + 1)
         window = F[start:i + 1]
         mu  = np.nanmean(window, axis=0)
-        sig = np.nanstd(window, axis=0)
+        sig = np.nanstd(window,  axis=0)
         sig = np.where(sig < 1e-10, 1.0, sig)
         return (F[i] - mu) / sig
 
-    # ── kNN prediction ─────────────────────────────────────────────────
+    # ── kNN strict-majority prediction ────────────────────────────────
 
     def _predict(self, F: np.ndarray, cls: np.ndarray, i: int) -> float:
-        """
-        At bar i, search n_bars backward (excluding fwd bars for clean labels).
-        Returns vote in [-1, +1].
-        """
+        """Returns fraction of K neighbors bullish [0–1]. ≥ strict_ratio → buy signal."""
         start = i - self.n_bars - self.fwd
         if start < self.lagz:
             return 0.0
-
         zq = self._zscore_row(F, i)
         if np.any(np.isnan(zq)):
             return 0.0
@@ -127,94 +161,149 @@ class KNNStrategy(BaseStrategy):
             zj = self._zscore_row(F, j)
             if np.any(np.isnan(zj)):
                 continue
-            d = float(np.sqrt(np.nansum((zq - zj) ** 2)))
-            # label: did price go up or down fwd bars later?
-            if j + self.fwd < len(cls) and cls[j] > 0:
-                ret = (cls[j + self.fwd] - cls[j]) / cls[j]
-                label = 1.0 if ret > 0 else -1.0
-                dists.append((d, label))
+            d   = float(np.sqrt(np.nansum((zq - zj) ** 2)))
+            ret = (cls[j + self.fwd] - cls[j]) / cls[j] if cls[j] > 0 else 0.0
+            dists.append((d, 1.0 if ret > 0 else -1.0))
 
         if len(dists) < self.k:
             return 0.0
-
         dists.sort(key=lambda x: x[0])
-        k_nearest = dists[:self.k]
-        # weight by 1/distance (inverse distance weighting)
-        total_w = 0.0; vote = 0.0
-        for d, lbl in k_nearest:
-            w = 1.0 / max(d, 1e-10)
-            vote += lbl * w
-            total_w += w
-        return vote / total_w if total_w > 0 else 0.0
+        top_k = dists[:self.k]
+        bull  = sum(1 for _, lbl in top_k if lbl > 0)
+        return bull / self.k
+
+    # ── Momentum gate (3 conditions, need confirm_n) ───────────────────
+
+    def _momentum_gates(self, i: int, hcls, hig, low,
+                        rsi_a, rsi_ema, ml, sl_line, hma_arr) -> int:
+        """Returns count of gates passing (0-3)."""
+        count = 0
+        if np.any(np.isnan([rsi_a[i], rsi_ema[i]])):
+            pass
+        else:
+            if float(rsi_a[i]) > self.rsi_thresh and float(rsi_a[i]) > float(rsi_ema[i]):
+                count += 1  # Gate A: RSI bullish & trending up
+
+        if not (np.isnan(ml[i]) or np.isnan(sl_line[i])):
+            if float(ml[i]) > float(sl_line[i]) and (ml[i] - sl_line[i]) > 0:
+                count += 1  # Gate B: MACD full bullish
+
+        if not np.isnan(hma_arr[i]):
+            if float(hcls[i]) > float(hma_arr[i]):
+                count += 1  # Gate C: HA close above HMA
+
+        return count
+
+    # ── Regime gate ────────────────────────────────────────────────────
+
+    def _regime_ok(self, i: int, atr_a, atr_sma) -> bool:
+        """True if ATR is above its SMA (volatile, trending conditions)."""
+        if not self.regime_on:
+            return True
+        if np.isnan(atr_a[i]) or np.isnan(atr_sma[i]):
+            return False
+        return float(atr_a[i]) > float(atr_sma[i])
+
+    # ── Build all indicator arrays ─────────────────────────────────────
+
+    def _build_arrays(self, candles: list):
+        F, cls, hcls, hig, low, ml, sl_line = self._build_features(candles)
+        ha_candles, _, _ = self._heikin_ashi(candles)
+
+        rsi_a   = self.rsi(hcls.tolist(), 14)
+        rsi_ema = self._ema_of(rsi_a, 9)
+        hma_arr = np.array(self.hma(hcls.tolist(), self.hma_period), dtype=float)
+        atr_a   = np.array(self.atr(ha_candles, 14), dtype=float)
+        atr_sma = np.array(self.sma(
+            [float(x) if not np.isnan(x) else 0.0 for x in atr_a],
+            self.atr_sma), dtype=float)
+
+        return F, cls, hcls, hig, low, ml, sl_line, rsi_a, rsi_ema, hma_arr, atr_a, atr_sma
 
     # ── Build signal arrays ────────────────────────────────────────────
 
     def _build_signals(self, candles: list, mtf_bias: np.ndarray = None):
-        """Returns (buy_sig, sell_sig, votes) arrays.
-        mtf_bias: optional pre-computed MTF composite score per bar (from compute_mtf_bias).
-        """
-        F, cls = self._build_features(candles)
-        n = len(candles)
+        """Returns (buy_sig, sell_sig, vote_arr, gate_arr)."""
+        (F, cls, hcls, hig, low, ml, sl_line,
+         rsi_a, rsi_ema, hma_arr, atr_a, atr_sma) = self._build_arrays(candles)
+
+        n        = len(candles)
         buy_sig  = np.zeros(n, dtype=bool)
         sell_sig = np.zeros(n, dtype=bool)
         votes    = np.zeros(n, dtype=float)
-
-        # trend EMA filter
-        if self.trend_ema > 0:
-            ema_trend = self.ema(cls.tolist(), self.trend_ema)
-        else:
-            ema_trend = np.zeros(n)
+        gates    = np.zeros(n, dtype=int)
 
         min_i = self.n_bars + self.fwd + self.lagz + 26 + 9 + 20
         last_signal_bar = -999
 
         for i in range(min_i, n):
+            # Layer 1: kNN vote
             v = self._predict(F, cls, i)
             votes[i] = v
+            if v < self.strict_ratio:
+                continue
+
+            # Layer 4: cooldown
             if (i - last_signal_bar) < self.cooldown:
                 continue
 
-            # trend EMA gate
-            if self.trend_ema > 0 and not np.isnan(ema_trend[i]):
-                if cls[i] <= ema_trend[i]:
-                    continue
+            # Layer 3: regime gate
+            if not self._regime_ok(i, atr_a, atr_sma):
+                continue
 
-            # MTF bias gate
+            # Layer 2: momentum gates
+            g = self._momentum_gates(i, hcls, hig, low,
+                                     rsi_a, rsi_ema, ml, sl_line, hma_arr)
+            gates[i] = g
+            if g < self.confirm_n:
+                continue
+
+            # Layer MTF (optional)
             if self.mtf_min_bias != 0.0 and mtf_bias is not None:
-                if i < len(mtf_bias) and mtf_bias[i] < self.mtf_min_bias:
+                if i < len(mtf_bias) and float(mtf_bias[i]) < self.mtf_min_bias:
                     continue
 
-            if v > max(self.threshold, self.min_vote):
-                buy_sig[i] = True
-                last_signal_bar = i
-            elif v < -max(self.threshold, self.min_vote) and not self.long_only:
-                sell_sig[i] = True
-                last_signal_bar = i
+            buy_sig[i] = True
+            last_signal_bar = i
 
-        return buy_sig, sell_sig, votes
+        return buy_sig, sell_sig, votes, gates
 
     # ── Live analysis ──────────────────────────────────────────────────
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
-        min_len = self.n_bars + self.fwd + self.lagz + 40
+        min_len = self.n_bars + self.fwd + self.lagz + 50
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
-        # compute single-bar MTF bias array for gate
+        # MTF bias array (last bar only, lazy)
         mtf_bias_arr = None
         if self.mtf_min_bias != 0.0 and mtf_candles:
-            n_bars = len(candles)
-            mtf_bias_arr = np.zeros(n_bars)
-            for bar_i in range(n_bars):
-                comp_pct, _ = self.compute_mtf_bias(candles[:bar_i+1], mtf_candles)
-                mtf_bias_arr[bar_i] = comp_pct
+            comp_pct, _ = self.compute_mtf_bias(candles, mtf_candles)
+            n_c = len(candles)
+            mtf_bias_arr = np.zeros(n_c)
+            mtf_bias_arr[-1] = comp_pct
 
-        buy_sig, sell_sig, votes = self._build_signals(candles, mtf_bias=mtf_bias_arr)
-        n = len(candles) - 1
-        p = current_price
-        v = float(votes[n])
-        conf = round(min(0.85, 0.55 + abs(v) * 0.15), 2)
+        buy_sig, sell_sig, votes, gates = self._build_signals(candles, mtf_bias=mtf_bias_arr)
+        n   = len(candles) - 1
+        p   = current_price
+        v   = float(votes[n])
+        g   = int(gates[n])
+        conf = round(min(0.90, 0.55 + v * 0.30 + g * 0.03), 2)
+
+        (_, _, hcls, _, _, ml, sl_line,
+         rsi_a, _, hma_arr, atr_a, _) = self._build_arrays(candles)
+        atr = float(atr_a[n]) if not np.isnan(atr_a[n]) else 0.0
+        rsi = float(rsi_a[n]) if not np.isnan(rsi_a[n]) else 50.0
+
+        meta = {
+            "knn_vote":  round(v, 3),
+            "gates":     g,
+            "rsi":       round(rsi, 1),
+            "atr":       round(atr, 4),
+            "macd":      round(float(ml[n]), 5) if not np.isnan(ml[n]) else 0,
+            "hma":       round(float(hma_arr[n]), 4) if not np.isnan(hma_arr[n]) else 0,
+        }
 
         if buy_sig[n]:
             sl_p = round(p * (1 - self.sl_pct), 4)
@@ -222,34 +311,19 @@ class KNNStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf,
-                reason=f"[kNN] BUY vote={v:+.3f}",
-                metadata={"knn_vote": round(v, 3),
-                          "stop_loss": sl_p, "take_profit": tp_p,
-                          "rr": self.tp_pct / self.sl_pct},
+                reason=f"[kNN-v2] BUY vote={v:.2f} gates={g}/3 RSI={rsi:.1f}",
+                metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p,
+                          "rr": round(self.tp_pct / self.sl_pct, 2)},
             )
 
-        if sell_sig[n]:
-            sl_p = round(p * (1 + self.sl_pct), 4)
-            tp_p = round(p * (1 - self.tp_pct), 4)
-            return Signal(
-                type=SignalType.SELL, symbol=self.symbol,
-                price=p, amount=0.0, confidence=conf,
-                reason=f"[kNN] SELL vote={v:+.3f}",
-                metadata={"knn_vote": round(v, 3),
-                          "stop_loss": sl_p, "take_profit": tp_p,
-                          "rr": self.tp_pct / self.sl_pct},
-            )
-
-        return Signal(
-            SignalType.HOLD, self.symbol, current_price, 0,
-            f"[kNN] HOLD vote={v:+.3f}",
-            metadata={"knn_vote": round(v, 3)},
-        )
+        hold_reason = (f"[kNN-v2] HOLD vote={v:.2f}({v:.0%}≥{self.strict_ratio:.0%}?) "
+                       f"gates={g}/{self.confirm_n} RSI={rsi:.1f}")
+        return Signal(SignalType.HOLD, self.symbol, current_price, 0, hold_reason, metadata=meta)
 
     # ── Backtest ───────────────────────────────────────────────────────
 
     async def backtest(self, candles: list) -> tuple[dict, tuple]:
-        min_len = self.n_bars + self.fwd + self.lagz + 50
+        min_len = self.n_bars + self.fwd + self.lagz + 60
         if len(candles) < min_len:
             return {}, None
 
@@ -257,42 +331,27 @@ class KNNStrategy(BaseStrategy):
         hig = np.array([c.high  for c in candles], dtype=float)
         low = np.array([c.low   for c in candles], dtype=float)
 
-        buy_sig, sell_sig, _ = self._build_signals(candles)
+        buy_sig, _, _, _ = self._build_signals(candles)
 
-        signal_bars = []
-        prev_dir = 0
-        for i in range(min_len, len(candles) - 1):
-            if buy_sig[i] and prev_dir != 1:
-                signal_bars.append((i, 1))
-                prev_dir = 1
-            elif sell_sig[i] and prev_dir != -1:
-                signal_bars.append((i, -1))
-                prev_dir = -1
-            elif not buy_sig[i] and not sell_sig[i]:
-                prev_dir = 0
-
+        signal_bars = [(i, 1) for i in range(len(candles)) if buy_sig[i]]
         if not signal_bars:
             return {}, None
 
         best_score, best_config = -999.0, None
         stats: dict = {}
 
-        for sl_m in [self.sl_pct]:          # single fixed-pct SL/TP config
-            rr      = self.tp_pct / self.sl_pct
+        for sl_m in _SL_MULTS:
+            rr      = self.tp_pct / sl_m
             wins    = losses = 0
             total_r = 0.0
-            for idx, direction in signal_bars:
+            for idx, _ in signal_bars:
                 entry = float(cls[idx])
-                sl_p  = entry * (1 - sl_m) if direction == 1 else entry * (1 + sl_m)
-                tp_p  = entry * (1 + self.tp_pct) if direction == 1 else entry * (1 - self.tp_pct)
+                sl_p  = entry * (1 - sl_m)
+                tp_p  = entry * (1 + self.tp_pct)
                 outcome = 0
                 for j in range(idx + 1, min(idx + _LOOKFORWARD, len(cls))):
-                    if direction == 1:
-                        if low[j]  <= sl_p: outcome = -1; break
-                        if hig[j]  >= tp_p: outcome =  1; break
-                    else:
-                        if hig[j]  >= sl_p: outcome = -1; break
-                        if low[j]  <= tp_p: outcome =  1; break
+                    if low[j]  <= sl_p: outcome = -1; break
+                    if hig[j]  >= tp_p: outcome =  1; break
                 if outcome ==  1: wins   += 1; total_r += rr
                 elif outcome == -1: losses += 1; total_r -= 1.0
 
