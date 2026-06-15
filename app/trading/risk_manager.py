@@ -85,9 +85,14 @@ class RiskManager:
             return False, f"Max open positions ({self.max_open_positions}) reached"
         return True, "ok"
 
-    def open_position(self, symbol: str, side: str, entry_price: float, amount: float, strategy: str = "") -> Position:
-        sl, tp = self.compute_stops(side, entry_price)
-        pos = Position(symbol=symbol, side=side, entry_price=entry_price, amount=amount, stop_loss=sl, take_profit=tp)
+    def open_position(self, symbol: str, side: str, entry_price: float, amount: float,
+                      strategy: str = "", stop_loss: float = None, take_profit: float = None) -> Position:
+        if stop_loss is None or take_profit is None:
+            sl_default, tp_default = self.compute_stops(side, entry_price)
+            stop_loss  = stop_loss  or sl_default
+            take_profit = take_profit or tp_default
+        pos = Position(symbol=symbol, side=side, entry_price=entry_price, amount=amount,
+                       stop_loss=stop_loss, take_profit=take_profit)
         self._positions[f"{symbol}||{strategy}"] = pos
         return pos
 

@@ -269,7 +269,12 @@ class TradingBot:
 
     async def _maybe_notify(self, signal: Signal, sig_dict: dict,
                              strategy_name: str, candles: list = None):
-        """Decides whether to fire Telegram notification + execute, based on signal state."""
+        """BUY-only execution engine.
+
+        BUY  → open long (if no position open for this strategy).
+        SELL → close existing long from THIS strategy only; never opens a short.
+        Strategy isolation: a SELL from strategy A cannot close strategy B's position.
+        """
         sym = signal.symbol
 
         # ── WTV gate (env WTV=true) ──────────────────────────────────────
@@ -277,11 +282,11 @@ class TradingBot:
             wt1 = WTADXStrategy.compute_wt1(candles)
             if not math.isnan(wt1):
                 if signal.type == SignalType.BUY and wt1 >= 10:
-                    logger.debug("[WTV] %s %s BUY blocked — WT1=%.1f ≥+10 (overbought)",
+                    logger.debug("[WTV] %s %s BUY blocked — WT1=%.1f ≥+10",
                                  strategy_name, sym, wt1)
                     return
                 if signal.type == SignalType.SELL and wt1 <= -10:
-                    logger.debug("[WTV] %s %s SELL blocked — WT1=%.1f ≤-10 (oversold)",
+                    logger.debug("[WTV] %s %s SELL blocked — WT1=%.1f ≤-10",
                                  strategy_name, sym, wt1)
                     return
                 logger.debug("[WTV] %s %s passed — WT1=%.1f", strategy_name, sym, wt1)
@@ -289,16 +294,14 @@ class TradingBot:
         signal_only = self.risk.max_open_positions == 0
 
         if signal_only:
-            # Forex / signal-only: alert only when direction CHANGES (persisted across restarts)
+            # Forex / signal-only mode: alert on direction change or after 4h stale
             last_dir, last_ts = self._sig.last_direction(sym)
             direction_changed = last_dir != signal.type.value
-            # Re-alert after 4h even if same direction (catches fresh session starts)
             stale = (int(time.time() * 1000) - last_ts) > 4 * 3600 * 1000
             if direction_changed or stale:
                 self._sig.lock(sym, signal.type.value)
                 self._sig.record_signal(sym, signal.type.value, signal.price,
                                         signal.confidence, strategy=strategy_name)
-                # Register virtual trade so /stats tracks SL/TP outcome
                 meta = signal.metadata or {}
                 sl_p = meta.get("stop_loss"); tp_p = meta.get("take_profit")
                 if sl_p and tp_p:
@@ -308,141 +311,141 @@ class TradingBot:
                 if self.telegram:
                     self.telegram.notify_signal(sig_dict)
             else:
-                logger.debug("Forex %s suppressed — same direction already sent", sym)
-        else:
-            # ── WaveTrend: allow up to 2 stacked positions, close ALL on reversal ──
-            _WT = "WTADXStrategy"
-            _WT_MAX = 2
-            if strategy_name == _WT:
-                new_side  = "long" if signal.type == SignalType.BUY else "short"
-                positions = self.risk.get_positions()
-                wt_pos    = [p for p in positions
-                             if p["symbol"] == sym and p["strategy"].startswith(_WT)]
-                opposite  = [p for p in wt_pos if p["side"] != new_side]
-                same_dir  = [p for p in wt_pos if p["side"] == new_side]
+                logger.debug("Forex %s suppressed — same direction", sym)
+            return
 
-                if opposite:
-                    # Reversal → close ALL WT positions on this symbol
-                    logger.info("[WT] Reversal on %s — closing %d position(s)", sym, len(wt_pos))
-                    ticker = await self.connector.fetch_ticker(sym)
-                    exit_price = ticker["last"]
-                    for pos in list(wt_pos):
-                        slot_name = pos["strategy"]
-                        c_side = "sell" if pos["side"] == "long" else "buy"
-                        try:
-                            await self.connector.create_order(sym, c_side, pos["amount"])
-                            self._sig.record_outcome(
-                                symbol=sym, side=pos["side"],
-                                entry=pos["entry"], exit_price=exit_price,
-                                sl=pos.get("stop_loss"), tp=pos.get("take_profit"),
-                                reason="reversal", strategy=slot_name,
+        # ── WaveTrend: 2-slot long stacking; SELL exits all WT longs ────
+        _WT = "WTADXStrategy"
+        _WT_MAX = 2
+        if strategy_name == _WT:
+            positions = self.risk.get_positions()
+            wt_pos    = [p for p in positions
+                         if p["symbol"] == sym and p["strategy"].startswith(_WT)]
+            wt_longs  = [p for p in wt_pos if p["side"] == "long"]
+
+            if signal.type == SignalType.SELL:
+                if not wt_longs:
+                    return
+                logger.info("[WT] SELL signal on %s — exiting %d long(s)", sym, len(wt_longs))
+                ticker = await self.connector.fetch_ticker(sym)
+                exit_price = ticker["last"]
+                for pos in list(wt_longs):
+                    slot_name = pos["strategy"]
+                    try:
+                        await self.connector.create_order(sym, "sell", pos["amount"])
+                        self._sig.record_outcome(
+                            symbol=sym, side="long",
+                            entry=pos["entry"], exit_price=exit_price,
+                            sl=pos.get("stop_loss"), tp=pos.get("take_profit"),
+                            reason="sell_signal", strategy=slot_name,
+                        )
+                        self._sig.unlock_strategy(sym, slot_name)
+                        self.risk.close_position(sym, strategy=slot_name)
+                        if self.telegram:
+                            self.telegram.notify_trade_closed(
+                                sym, "sell_signal", exit_price,
+                                pos["entry"], pos.get("stop_loss"),
+                                pos.get("take_profit"), self._sig.summary(),
                             )
-                            self._sig.unlock_strategy(sym, slot_name)
-                            self.risk.close_position(sym, strategy=slot_name)
-                            if self.telegram:
-                                self.telegram.notify_trade_closed(
-                                    sym, "reversal", exit_price,
-                                    pos["entry"], pos.get("stop_loss"),
-                                    pos.get("take_profit"), self._sig.summary(),
-                                )
-                        except Exception as e:
-                            logger.error("WT reversal close failed [%s]: %s", slot_name, e)
-                    # Fall through to open new position
+                    except Exception as e:
+                        logger.error("WT exit on SELL failed [%s]: %s", slot_name, e)
+                return  # Never open short
 
-                elif len(same_dir) >= _WT_MAX:
-                    logger.debug("[WT] %s max stack (%d) reached, suppressing", sym, _WT_MAX)
-                    return
-
-                # Find next free slot
-                slot_key = None
-                for s in range(_WT_MAX):
-                    candidate = f"{_WT}#{s}"
-                    if not self._sig.is_locked_for_strategy(sym, candidate):
-                        slot_key = candidate
-                        break
-                if slot_key is None:
-                    return
-
-                can, reason = self.risk.can_open(sym, strategy=slot_key)
-                if not can:
-                    logger.debug("[WT] %s can_open blocked: %s", sym, reason)
-                    return
-                self._sig.lock_strategy(sym, slot_key, signal.type.value)
-                self._sig.record_signal(sym, signal.type.value, signal.price,
-                                        signal.confidence, strategy=slot_key)
-                if self.telegram:
-                    self.telegram.notify_signal(sig_dict)
-                await self._execute_signal(signal, slot_key)
+            # BUY: stack longs up to _WT_MAX
+            if len(wt_longs) >= _WT_MAX:
+                logger.debug("[WT] %s max stack (%d) reached, suppressing", sym, _WT_MAX)
                 return
+            slot_key = None
+            for s in range(_WT_MAX):
+                candidate = f"{_WT}#{s}"
+                if not self._sig.is_locked_for_strategy(sym, candidate):
+                    slot_key = candidate
+                    break
+            if slot_key is None:
+                return
+            can, reason = self.risk.can_open(sym, strategy=slot_key)
+            if not can:
+                logger.debug("[WT] %s can_open blocked: %s", sym, reason)
+                return
+            self._sig.lock_strategy(sym, slot_key, signal.type.value)
+            self._sig.record_signal(sym, signal.type.value, signal.price,
+                                    signal.confidence, strategy=slot_key)
+            if self.telegram:
+                self.telegram.notify_signal(sig_dict)
+            await self._execute_signal(signal, slot_key)
+            return
 
-            # ── Normal strategies: reversal close then re-enter ──────────────
+        # ── Normal strategies: BUY-only ──────────────────────────────────
+        if signal.type == SignalType.SELL:
+            # Close long belonging to THIS strategy; ignore if no position
             if self._sig.is_locked_for_strategy(sym, strategy_name):
                 positions = self.risk.get_positions()
                 existing  = next((p for p in positions
                                   if p["symbol"] == sym and p["strategy"] == strategy_name), None)
-                if existing:
-                    new_side = "long" if signal.type == SignalType.BUY else "short"
-                    if existing["side"] != new_side:
-                        close_side = "sell" if existing["side"] == "long" else "buy"
-                        logger.info("[%s] Reversal %s→%s on %s",
-                                    strategy_name, existing["side"], new_side, sym)
-                        try:
-                            ticker     = await self.connector.fetch_ticker(sym)
-                            exit_price = ticker["last"]
-                            await self.connector.create_order(sym, close_side, existing["amount"])
-                            self._sig.record_outcome(
-                                symbol=sym, side=existing["side"],
-                                entry=existing["entry"], exit_price=exit_price,
-                                sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
-                                reason="reversal", strategy=strategy_name,
+                if existing and existing["side"] == "long":
+                    logger.info("[%s] SELL signal — exiting long on %s", strategy_name, sym)
+                    try:
+                        ticker     = await self.connector.fetch_ticker(sym)
+                        exit_price = ticker["last"]
+                        await self.connector.create_order(sym, "sell", existing["amount"])
+                        self._sig.record_outcome(
+                            symbol=sym, side="long",
+                            entry=existing["entry"], exit_price=exit_price,
+                            sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
+                            reason="sell_signal", strategy=strategy_name,
+                        )
+                        self._sig.unlock_strategy(sym, strategy_name)
+                        self.risk.close_position(sym, strategy=strategy_name)
+                        if self.telegram:
+                            self.telegram.notify_trade_closed(
+                                sym, "sell_signal", exit_price,
+                                existing["entry"], existing.get("stop_loss"),
+                                existing.get("take_profit"), self._sig.summary(),
                             )
-                            self._sig.unlock_strategy(sym, strategy_name)
-                            self.risk.close_position(sym, strategy=strategy_name)
-                            if self.telegram:
-                                self.telegram.notify_trade_closed(
-                                    sym, "reversal", exit_price,
-                                    existing["entry"], existing.get("stop_loss"),
-                                    existing.get("take_profit"), self._sig.summary(),
-                                )
-                        except Exception as e:
-                            logger.error("Reversal close failed [%s]: %s", strategy_name, e)
-                            return
-                    else:
-                        logger.debug("Crypto %s suppressed — %s same direction", sym, strategy_name)
-                        return
-                else:
-                    logger.debug("Crypto %s suppressed — %s locked (no position)", sym, strategy_name)
-                    return
-            can, reason = self.risk.can_open(sym, strategy=strategy_name)
-            if not can:
-                logger.debug("Crypto %s suppressed — %s", sym, reason)
-                return
-            self._sig.lock_strategy(sym, strategy_name, signal.type.value)
-            self._sig.record_signal(sym, signal.type.value, signal.price,
-                                    signal.confidence, strategy=strategy_name)
-            if self.telegram:
-                self.telegram.notify_signal(sig_dict)
-            await self._execute_signal(signal, strategy_name)
+                    except Exception as e:
+                        logger.error("Exit on SELL signal failed [%s]: %s", strategy_name, e)
+            return  # Never open short
+
+        # BUY signal — open long if not already holding one for this strategy
+        if self._sig.is_locked_for_strategy(sym, strategy_name):
+            logger.debug("%s [%s] already long — suppressing BUY", sym, strategy_name)
+            return
+        can, reason = self.risk.can_open(sym, strategy=strategy_name)
+        if not can:
+            logger.debug("Crypto %s suppressed — %s", sym, reason)
+            return
+        self._sig.lock_strategy(sym, strategy_name, signal.type.value)
+        self._sig.record_signal(sym, signal.type.value, signal.price,
+                                signal.confidence, strategy=strategy_name)
+        if self.telegram:
+            self.telegram.notify_signal(sig_dict)
+        await self._execute_signal(signal, strategy_name)
 
     async def _execute_signal(self, signal: Signal, strategy_name: str):
+        """Open a LONG position. Only called for BUY signals."""
+        if signal.type != SignalType.BUY:
+            logger.warning("[%s] _execute_signal called with non-BUY — ignored", strategy_name)
+            self._sig.unlock_strategy(signal.symbol, strategy_name)
+            return
+
         sym = signal.symbol
         can, reason = self.risk.can_open(sym, strategy=strategy_name)
         if not can:
-            logger.info("Skipping %s signal for %s: %s", signal.type, sym, reason)
-            self._sig.unlock_strategy(sym, strategy_name)  # release lock if execution fails
+            logger.info("Skipping BUY for %s: %s", sym, reason)
+            self._sig.unlock_strategy(sym, strategy_name)
             return
 
         balances = await self.connector.fetch_balance()
         quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
         ticker = await self.connector.fetch_ticker(sym)
         price = ticker["last"]
+        meta  = signal.metadata or {}
+        sl_p  = meta.get("stop_loss")
+        tp_p  = meta.get("take_profit")
 
         amount = self.risk.size_position(quote_balance, price)
         if amount <= 0:
-            logger.info("Position size 0, skipping %s — tracking virtually", sym)
-            # No real order; track SL/TP virtually so /stats shows outcome
-            meta = signal.metadata or {}
-            sl_p = meta.get("stop_loss"); tp_p = meta.get("take_profit")
+            logger.info("Position size 0 for %s — tracking virtually", sym)
             if sl_p and tp_p:
                 vkey = f"virtual||{sym}||{strategy_name}||{int(time.time() * 1000)}"
                 self._sig.add_pending(vkey, sym, signal.type.value, signal.price,
@@ -450,25 +453,27 @@ class TradingBot:
             self._sig.unlock_strategy(sym, strategy_name)
             return
 
-        side = "buy" if signal.type == SignalType.BUY else "sell"
         try:
-            order = await self.connector.create_order(sym, side, amount)
-            self.risk.open_position(sym, "long" if side == "buy" else "short", price, amount, strategy=strategy_name)
+            order = await self.connector.create_order(sym, "buy", amount)
+            # Use ATR-based SL/TP from signal; fall back to % if not provided
+            self.risk.open_position(sym, "long", price, amount, strategy=strategy_name,
+                                    stop_loss=sl_p, take_profit=tp_p)
             trade = TradeRecord(
                 timestamp=int(time.time() * 1000),
-                symbol=sym, side=side,
+                symbol=sym, side="buy",
                 price=order.price, amount=amount,
                 pnl=0.0, strategy=strategy_name, reason=signal.reason,
                 paper=self.connector.paper,
             )
             self._record_trade(trade)
-            logger.info("[%s] %s %s @ %.4f (paper=%s)", strategy_name, side.upper(), sym, price, self.connector.paper)
+            logger.info("[%s] BUY %s @ %.4f  SL=%.4f  TP=%.4f (paper=%s)",
+                        strategy_name, sym, price, sl_p or 0, tp_p or 0, self.connector.paper)
             if self.telegram:
-                self.telegram.notify_order(sym, side, amount, order.price,
+                self.telegram.notify_order(sym, "buy", amount, order.price,
                                            strategy_name, self.connector.paper)
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
-            self._sig.unlock_strategy(sym, strategy_name)  # release lock so bot can retry next tick
+            self._sig.unlock_strategy(sym, strategy_name)
 
     async def _refresh_balance(self):
         try:
