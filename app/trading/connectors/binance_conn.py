@@ -135,9 +135,11 @@ class BinanceConnector(BaseConnector):
             return [Balance(asset=k, free=v, used=0.0, total=v)
                     for k, v in self._paper_balance.items() if v > 0]
         raw = await self._exchange.fetch_balance()
-        return [Balance(asset=k, free=v["free"], used=v["used"], total=v["total"])
-                for k, v in raw["total"].items()
-                if isinstance(raw.get(k), dict) and raw[k].get("total", 0) > 0]
+        # raw["total"] = {asset: float}; per-asset dict is raw[asset]
+        return [Balance(asset=k, free=float(v.get("free") or 0),
+                        used=float(v.get("used") or 0), total=float(v.get("total") or 0))
+                for k, v in raw.items()
+                if isinstance(v, dict) and (v.get("total") or 0) > 0]
 
     async def close(self):
         await self._exchange.close()
