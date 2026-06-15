@@ -66,6 +66,8 @@ def build_config() -> dict:
         "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
         "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),  # OKX only
         "paper":           _env_bool("PAPER_TRADING", True),
+        "leverage":        int(os.environ.get("LEVERAGE", "1")),       # 1=spot, 10=margin×10
+        "margin_mode":     os.environ.get("MARGIN_MODE", "cross"),     # cross | isolated
         # OANDA-specific
         "oanda_api_key":   os.environ.get("OANDA_API_KEY", ""),
         "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
@@ -155,6 +157,8 @@ def build_crypto_bot(config: dict, telegram):
             api_key=config["api_key"], api_secret=config["api_secret"],
             paper=config["paper"], exchange_id=exchange,
             passphrase=config.get("api_passphrase", ""),
+            leverage=config.get("leverage", 1),
+            margin_mode=config.get("margin_mode", "cross"),
         )
     else:
         connector = AlpacaConnector(

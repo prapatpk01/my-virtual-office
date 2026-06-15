@@ -22,10 +22,15 @@ class BinanceConnector(BaseConnector):
 
     def __init__(self, api_key: str = "", api_secret: str = "",
                  paper: bool = True, exchange_id: str = "binance",
-                 passphrase: str = ""):
+                 passphrase: str = "", leverage: int = 1,
+                 margin_mode: str = "cross"):
         super().__init__(api_key, api_secret, paper)
+        self.leverage     = max(1, int(leverage))
+        self.margin_mode  = margin_mode  # "cross" | "isolated"
         exchange_class = getattr(ccxt, exchange_id)
-        options: dict = {"defaultType": "spot"}
+        # OKX spot-margin uses defaultType="margin"; others stay "spot"
+        default_type = "margin" if (exchange_id == "okx" and self.leverage > 1) else "spot"
+        options: dict = {"defaultType": default_type}
         if exchange_id == "bybit":
             options["fetchCurrencies"] = False
         cfg: dict = {
@@ -57,14 +62,31 @@ class BinanceConnector(BaseConnector):
     # Orders
     # ------------------------------------------------------------------
 
+    async def set_leverage_for(self, symbol: str) -> None:
+        """Set OKX cross/isolated margin leverage. No-op for spot or paper."""
+        if self.paper or self._exchange_id != "okx" or self.leverage <= 1:
+            return
+        try:
+            await self._exchange.set_leverage(
+                self.leverage, symbol,
+                params={"mgnMode": self.margin_mode},
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger("binance_conn").warning(
+                "set_leverage %sx %s failed: %s", self.leverage, symbol, e)
+
     async def create_order(self, symbol: str, side: str, amount: float,
                            order_type: str = "market", price: Optional[float] = None) -> OrderResult:
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price)
 
-        kwargs = {}
+        kwargs: dict = {}
         if order_type == "limit" and price:
             kwargs["price"] = price
+        # OKX margin requires tdMode param
+        if self._exchange_id == "okx" and self.leverage > 1:
+            kwargs["params"] = {"tdMode": self.margin_mode}
 
         raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
         return OrderResult(

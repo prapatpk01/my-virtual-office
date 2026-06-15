@@ -420,7 +420,8 @@ class TradingBot:
         sl_p  = meta.get("stop_loss")
         tp_p  = meta.get("take_profit")
 
-        amount = self.risk.size_position(quote_balance, price)
+        leverage = getattr(self.connector, "leverage", 1)
+        amount = self.risk.size_position(quote_balance, price) * leverage
         if amount <= 0:
             logger.info("Position size 0 for %s — tracking virtually", sym)
             if sl_p and tp_p:
@@ -429,6 +430,10 @@ class TradingBot:
                                       sl_p, tp_p, strategy=strategy_name)
             self._sig.unlock_strategy(sym, strategy_name)
             return
+
+        # Ensure leverage is set on exchange before first order
+        if hasattr(self.connector, "set_leverage_for"):
+            await self.connector.set_leverage_for(sym)
 
         try:
             order = await self.connector.create_order(sym, "buy", amount)
