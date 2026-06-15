@@ -12,8 +12,9 @@ kNN:  search back n_bars historical bars; find k nearest in feature space;
       label each via price return over fwd bars (+1 / -1).
       Signal fires when weighted vote exceeds threshold AND cooldown elapsed.
 
-Default: N=3, K=3, LAGZ=20, CD=3, long_only=True
-R:R 1:1.5 — SL=1.5%, TP=2.25% — WR≈58%, ~1 trade/day
+Default: N=3, K=3, LAGZ=20, CD=8, long_only=True
+Filters: min_vote=0.03 + MTF bias gate (active when bot passes mtf_candles)
+R:R 1:1.5 — SL=1.5%, TP=2.25% — WR≈54% (MTF gate), ~0.9 trade/day
 """
 import math
 import numpy as np
@@ -27,15 +28,18 @@ class KNNStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.n_bars    = self.params.get("n_bars",     3)    # history search window
-        self.k         = self.params.get("k",          3)    # nearest neighbours
-        self.lagz      = self.params.get("lagz",      20)    # z-score window
-        self.fwd       = self.params.get("fwd",        5)    # label look-forward
-        self.cooldown  = self.params.get("cooldown",   3)    # bars between signals
-        self.sl_pct    = self.params.get("sl_pct",  0.015)   # 1.5% SL
-        self.tp_pct    = self.params.get("tp_pct",  0.0225)  # 2.25% TP  (R:R 1:1.5)
-        self.long_only = self.params.get("long_only", True)
-        self.threshold = self.params.get("threshold", 0.0)   # vote threshold (0 = any positive vote)
+        self.n_bars         = self.params.get("n_bars",         3)     # history search window
+        self.k              = self.params.get("k",               3)     # nearest neighbours
+        self.lagz           = self.params.get("lagz",           20)     # z-score window
+        self.fwd            = self.params.get("fwd",             5)     # label look-forward
+        self.cooldown       = self.params.get("cooldown",        8)     # bars between signals
+        self.sl_pct         = self.params.get("sl_pct",      0.015)     # 1.5% SL
+        self.tp_pct         = self.params.get("tp_pct",     0.0225)     # 2.25% TP  (R:R 1:1.5)
+        self.long_only      = self.params.get("long_only",     True)
+        self.threshold      = self.params.get("threshold",      0.0)    # vote threshold
+        self.trend_ema      = self.params.get("trend_ema",        0)    # 0=off (EMA filter disabled)
+        self.min_vote       = self.params.get("min_vote",       0.03)   # minimum normalised vote
+        self.mtf_min_bias   = self.params.get("mtf_min_bias",  0.01)   # MTF gate (active when mtf_candles provided)
 
     # ── Indicator helpers ──────────────────────────────────────────────
 
@@ -145,13 +149,21 @@ class KNNStrategy(BaseStrategy):
 
     # ── Build signal arrays ────────────────────────────────────────────
 
-    def _build_signals(self, candles: list):
-        """Returns (buy_sig, sell_sig, votes) arrays."""
+    def _build_signals(self, candles: list, mtf_bias: np.ndarray = None):
+        """Returns (buy_sig, sell_sig, votes) arrays.
+        mtf_bias: optional pre-computed MTF composite score per bar (from compute_mtf_bias).
+        """
         F, cls = self._build_features(candles)
         n = len(candles)
         buy_sig  = np.zeros(n, dtype=bool)
         sell_sig = np.zeros(n, dtype=bool)
         votes    = np.zeros(n, dtype=float)
+
+        # trend EMA filter
+        if self.trend_ema > 0:
+            ema_trend = self.ema(cls.tolist(), self.trend_ema)
+        else:
+            ema_trend = np.zeros(n)
 
         min_i = self.n_bars + self.fwd + self.lagz + 26 + 9 + 20
         last_signal_bar = -999
@@ -161,10 +173,21 @@ class KNNStrategy(BaseStrategy):
             votes[i] = v
             if (i - last_signal_bar) < self.cooldown:
                 continue
-            if v > self.threshold:
+
+            # trend EMA gate
+            if self.trend_ema > 0 and not np.isnan(ema_trend[i]):
+                if cls[i] <= ema_trend[i]:
+                    continue
+
+            # MTF bias gate
+            if self.mtf_min_bias != 0.0 and mtf_bias is not None:
+                if i < len(mtf_bias) and mtf_bias[i] < self.mtf_min_bias:
+                    continue
+
+            if v > max(self.threshold, self.min_vote):
                 buy_sig[i] = True
                 last_signal_bar = i
-            elif v < -self.threshold and not self.long_only:
+            elif v < -max(self.threshold, self.min_vote) and not self.long_only:
                 sell_sig[i] = True
                 last_signal_bar = i
 
@@ -178,7 +201,16 @@ class KNNStrategy(BaseStrategy):
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
-        buy_sig, sell_sig, votes = self._build_signals(candles)
+        # compute single-bar MTF bias array for gate
+        mtf_bias_arr = None
+        if self.mtf_min_bias != 0.0 and mtf_candles:
+            n_bars = len(candles)
+            mtf_bias_arr = np.zeros(n_bars)
+            for bar_i in range(n_bars):
+                comp_pct, _ = self.compute_mtf_bias(candles[:bar_i+1], mtf_candles)
+                mtf_bias_arr[bar_i] = comp_pct
+
+        buy_sig, sell_sig, votes = self._build_signals(candles, mtf_bias=mtf_bias_arr)
         n = len(candles) - 1
         p = current_price
         v = float(votes[n])
