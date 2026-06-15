@@ -33,15 +33,15 @@ class MACDEMAStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.hma_period  = self.params.get("hma_period",  20)
-        self.ema_fast    = self.params.get("ema_fast",    10)
-        self.sma_slow    = self.params.get("sma_slow",    20)
+        self.hma_period  = self.params.get("hma_period",  50)
+        self.ema_fast    = self.params.get("ema_fast",    21)
+        self.sma_slow    = self.params.get("sma_slow",    50)
         self.macd_fast   = self.params.get("macd_fast",   12)
         self.macd_slow   = self.params.get("macd_slow",   26)
         self.macd_sig    = self.params.get("macd_signal",  9)
         self.atr_period  = self.params.get("atr_period",  14)
         self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",    1.2)
+        self.rr_ratio    = self.params.get("rr_ratio",    1.4)
 
     # ── Heikin Ashi ────────────────────────────────────────────────
 

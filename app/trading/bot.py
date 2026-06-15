@@ -209,7 +209,9 @@ class TradingBot:
         _resolved_symbols: set[str] = set()  # check virtual SL/TP once per symbol per tick
         for strategy in self.strategies:
             try:
-                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe="15m", limit=300)
+                _tf    = os.getenv("CANDLE_TF", "15m")
+                _limit = int(os.getenv("CANDLE_LIMIT", "300"))
+                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe=_tf, limit=_limit)
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
 
@@ -225,9 +227,11 @@ class TradingBot:
                             self.telegram.notify_virtual_closed(
                                 strategy.symbol, v_reason, v_price, self._sig.summary()
                             )
-                # Fetch MTF candles for 1H + 4H bias gate
+                # Fetch MTF candles for higher-TF bias (skip if already on 1h/4h)
                 mtf_candles = {}
-                for tf in ("1h", "4h"):
+                _base_tf = os.getenv("CANDLE_TF", "15m")
+                _mtf_tfs = [t for t in ("1h", "4h") if t != _base_tf]
+                for tf in _mtf_tfs:
                     try:
                         mtf_candles[tf] = await self.connector.fetch_ohlcv(
                             strategy.symbol, timeframe=tf, limit=100

@@ -71,6 +71,8 @@ def build_config() -> dict:
         "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
         "oanda_env":       os.environ.get("OANDA_ENV", "practice"),
         "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
+        "candle_tf":    os.environ.get("CANDLE_TF", "15m"),     # 15m | 1h | 4h
+        "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
             "wt_adx":         _env_bool("STRATEGY_WT_ADX",          True),
@@ -222,9 +224,11 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
         return
     strat = backtestable[0]
     symbol = strat.symbol
-    logger.info("Running SL/TP backtest on %s (1500 candles 15m)…", symbol)
+    tf = config.get("candle_tf", "15m")
+    bt_limit = 1500 if tf == "15m" else 500
+    logger.info("Running SL/TP backtest on %s (%d candles %s)…", symbol, bt_limit, tf)
     try:
-        candles = await crypto_bot.connector.fetch_ohlcv(symbol, timeframe="15m", limit=1500)
+        candles = await crypto_bot.connector.fetch_ohlcv(symbol, timeframe=tf, limit=bt_limit)
         stats, best = await strat.backtest(candles)
 
         if not stats:
@@ -249,7 +253,7 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
             if telegram:
                 best_stat = stats.get(f"SL={sl_m}xATR  RR=1:{rr}", {})
                 telegram.notify(
-                    f"📊 *Backtest complete* ({symbol} {n_candles}×15m)\n"
+                    f"📊 *Backtest complete* ({symbol} {n_candles}×{tf})\n"
                     f"Best: SL=`{sl_m}×ATR`  R:R=`1:{rr}`\n"
                     f"WR: `{best_stat.get('win_rate',0):.1f}%` | "
                     f"PF: `{best_stat.get('profit_factor',0):.2f}` | "
@@ -265,7 +269,7 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
                     for k, v in top
                 ) if top else "_no signals found_"
                 telegram.notify(
-                    f"📊 *Backtest complete* ({symbol} {n_candles}×15m)\n"
+                    f"📊 *Backtest complete* ({symbol} {n_candles}×{tf})\n"
                     f"Not enough trades — using default SL/TP\n{lines}"
                 )
 
