@@ -1,12 +1,12 @@
 """
 SJ-MACD/EMA Strategy.
 
-Signal conditions (ALL must pass — AND logic):
-  BUY:  HA_open > HMA20  AND  EMA10 crosses above SMA20  AND  MACD line > Signal  AND  ADX > 20
-  SELL: HA_open < HMA20  AND  EMA10 crosses below SMA20  AND  MACD line < Signal  AND  ADX > 20
+Signal conditions (ALL 3 must pass — AND logic):
+  BUY:  HA_open > HMA20  AND  EMA10 crosses above SMA20  AND  MACD crosses above Signal
+  SELL: HA_open < HMA20  AND  EMA10 crosses below SMA20  AND  MACD crosses below Signal
 
 Default parameters match TradingView SJ-MACD/EMA:
-  HMA 20, EMA 10, SMA 20, MACD 12/26/9, ADX 14/thr 20
+  HMA 20, EMA 10, SMA 20, MACD 12/26/9
   ATR 14, Stop 1.5×ATR, R:R 1:1.2
 """
 import logging
@@ -30,17 +30,15 @@ class MACDEMAStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.hma_period    = self.params.get("hma_period",    20)
-        self.ema_fast      = self.params.get("ema_fast",      10)
-        self.sma_slow      = self.params.get("sma_slow",      20)
-        self.macd_fast     = self.params.get("macd_fast",     12)
-        self.macd_slow     = self.params.get("macd_slow",     26)
-        self.macd_sig      = self.params.get("macd_signal",    9)
-        self.adx_len       = self.params.get("adx_len",       14)
-        self.adx_threshold = self.params.get("adx_threshold", 15)
-        self.atr_period    = self.params.get("atr_period",    14)
-        self.sl_atr_mult   = self.params.get("sl_atr_mult",  1.5)
-        self.rr_ratio      = self.params.get("rr_ratio",     1.2)
+        self.hma_period  = self.params.get("hma_period",  20)
+        self.ema_fast    = self.params.get("ema_fast",    10)
+        self.sma_slow    = self.params.get("sma_slow",    20)
+        self.macd_fast   = self.params.get("macd_fast",   12)
+        self.macd_slow   = self.params.get("macd_slow",   26)
+        self.macd_sig    = self.params.get("macd_signal",  9)
+        self.atr_period  = self.params.get("atr_period",  14)
+        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
+        self.rr_ratio    = self.params.get("rr_ratio",    1.2)
 
     # ── Heikin Ashi ────────────────────────────────────────────────
 
@@ -65,34 +63,34 @@ class MACDEMAStrategy(BaseStrategy):
 
     def _signal_at(self, i: int,
                    ha_o, ha_c, ha_highs, ha_lows,
-                   hma, ema, sma,
-                   ml, sl_line,
-                   adx_a) -> int:
+                   hma, ema, sma, ml, sl_line) -> int:
         """Returns +1 BUY, -1 SELL, 0 HOLD."""
         if i < 2:
             return 0
 
         needed = [hma[i], ema[i], ema[i-1], sma[i], sma[i-1],
-                  ml[i], sl_line[i], ha_o[i]]
+                  ml[i], ml[i-1], sl_line[i], sl_line[i-1], ha_o[i]]
         if any(np.isnan(v) for v in needed):
             return 0
 
         ha_open_v = float(ha_o[i])
         hma_v     = float(hma[i])
-        ema_c     = float(ema[i]);   ema_p = float(ema[i-1])
-        sma_c     = float(sma[i]);   sma_p = float(sma[i-1])
-        macd_v    = float(ml[i]);    sig_v = float(sl_line[i])
-        adx_v     = float(adx_a[i]) if not np.isnan(adx_a[i]) else 0.0
+        ema_c = float(ema[i]);     ema_p  = float(ema[i-1])
+        sma_c = float(sma[i]);     sma_p  = float(sma[i-1])
+        ml_c  = float(ml[i]);      ml_p   = float(ml[i-1])
+        sig_c = float(sl_line[i]); sig_p  = float(sl_line[i-1])
 
-        # EMA/SMA crossover (Pine Script: crossover / crossunder)
+        # Condition 2: EMA/SMA crossover
         ema_cross_up   = ema_c > sma_c and ema_p <= sma_p
         ema_cross_down = ema_c < sma_c and ema_p >= sma_p
 
-        adx_ok = adx_v > self.adx_threshold
+        # Condition 3: MACD crosses Signal line
+        macd_cross_up   = ml_c > sig_c and ml_p <= sig_p
+        macd_cross_down = ml_c < sig_c and ml_p >= sig_p
 
-        if ha_open_v > hma_v and ema_cross_up   and macd_v > sig_v and adx_ok:
+        if ha_open_v > hma_v and ema_cross_up   and macd_cross_up:
             return 1
-        if ha_open_v < hma_v and ema_cross_down and macd_v < sig_v and adx_ok:
+        if ha_open_v < hma_v and ema_cross_down and macd_cross_down:
             return -1
         return 0
 
@@ -112,12 +110,10 @@ class MACDEMAStrategy(BaseStrategy):
         ml      = np.array(_ml, dtype=float)
         sl_line = np.array(_sl, dtype=float)
         hist    = np.array(_hi, dtype=float)
-        adx_a, _, _ = self.adx(ha_candles, self.adx_len)
-        adx_a   = np.array(adx_a, dtype=float)
         atr_a   = np.array(self.atr(ha_candles, self.atr_period), dtype=float)
 
         return (ha_o, ha_c, ha_highs, ha_lows,
-                hma, ema, sma, ml, sl_line, hist, adx_a, atr_a)
+                hma, ema, sma, ml, sl_line, hist, atr_a)
 
     # ── Live analysis ──────────────────────────────────────────────
 
@@ -128,17 +124,16 @@ class MACDEMAStrategy(BaseStrategy):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
         (ha_o, ha_c, ha_highs, ha_lows,
-         hma, ema, sma, ml, sl_line, hist, adx_a, atr_a) = self._build_arrays(candles)
+         hma, ema, sma, ml, sl_line, hist, atr_a) = self._build_arrays(candles)
 
         n = len(candles) - 1
         direction = self._signal_at(
             n, ha_o, ha_c, ha_highs, ha_lows,
-            hma, ema, sma, ml, sl_line, adx_a,
+            hma, ema, sma, ml, sl_line,
         )
 
         p     = current_price
         atr_c = float(atr_a[n]) if not np.isnan(atr_a[n]) else 0.0
-        adx_v = float(adx_a[n]) if not np.isnan(adx_a[n]) else 0.0
 
         meta = {
             "ha_open":  round(float(ha_o[n]), 4),
@@ -149,35 +144,34 @@ class MACDEMAStrategy(BaseStrategy):
             "macd":     round(float(ml[n]),   5),
             "signal":   round(float(sl_line[n]), 5),
             "hist":     round(float(hist[n]), 5),
-            "adx":      round(adx_v, 1),
             "atr":      round(atr_c, 4),
         }
 
         if direction == 1:
             sl_p = round(p - self.sl_atr_mult * atr_c, 4)
             tp_p = round(p + self.sl_atr_mult * self.rr_ratio * atr_c, 4)
-            conf = round(min(0.90, 0.60 + max(0, adx_v - self.adx_threshold) / 80), 2)
+            conf = round(min(0.85, 0.65 + abs(float(ml[n]) - float(sl_line[n])) / max(atr_c, 1) * 5), 2)
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol, price=p, amount=0.0,
                 confidence=conf,
-                reason=f"[MACD/EMA] BUY | open>{float(hma[n]):.4f} EMA×↑ MACD↑ ADX={adx_v:.0f}",
+                reason=f"[MACD/EMA] BUY | open>{float(hma[n]):.4f} EMA×↑ MACD×↑",
                 metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio},
             )
 
         if direction == -1:
             sl_p = round(p + self.sl_atr_mult * atr_c, 4)
             tp_p = round(p - self.sl_atr_mult * self.rr_ratio * atr_c, 4)
-            conf = round(min(0.90, 0.60 + max(0, adx_v - self.adx_threshold) / 80), 2)
+            conf = round(min(0.85, 0.65 + abs(float(ml[n]) - float(sl_line[n])) / max(atr_c, 1) * 5), 2)
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=p, amount=0.0,
                 confidence=conf,
-                reason=f"[MACD/EMA] SELL | open<{float(hma[n]):.4f} EMA×↓ MACD↓ ADX={adx_v:.0f}",
+                reason=f"[MACD/EMA] SELL | open<{float(hma[n]):.4f} EMA×↓ MACD×↓",
                 metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio},
             )
 
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[MACD/EMA] HOLD | ADX={adx_v:.1f}",
+            f"[MACD/EMA] HOLD | EMA={float(ema[n]):.4f} SMA={float(sma[n]):.4f}",
             metadata=meta,
         )
 
@@ -189,14 +183,14 @@ class MACDEMAStrategy(BaseStrategy):
             return {}, None
 
         (ha_o, ha_c, ha_highs, ha_lows,
-         hma, ema, sma, ml, sl_line, hist, adx_a, atr_a) = self._build_arrays(candles)
+         hma, ema, sma, ml, sl_line, hist, atr_a) = self._build_arrays(candles)
 
         signal_bars: list[tuple[int, int, float]] = []
         prev_dir = 0
 
         for i in range(min_len, len(candles) - 1):
             d = self._signal_at(i, ha_o, ha_c, ha_highs, ha_lows,
-                                hma, ema, sma, ml, sl_line, adx_a)
+                                hma, ema, sma, ml, sl_line)
             if d == 1 and prev_dir != 1:
                 signal_bars.append((i, 1, float(atr_a[i])))
                 prev_dir = 1
