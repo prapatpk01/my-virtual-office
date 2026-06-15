@@ -4,10 +4,10 @@ SJ WaveTrend Strategy.
 BUY:  wt1 crossover wt2  (crossover-only mode, ob=os=100 disables OB/OS filter)
 SELL: wt1 crossunder wt2 (crossover-only mode, ob=os=100 disables OB/OS filter)
 
-SL = slMult × ATR(14)  →  2.0 × ATR
-TP = SL × rrRatio       →  3.0 × ATR  (R:R 1:1.5)
+SL = slMult × ATR(14)  →  2.5 × ATR
+TP = SL × rrRatio       →  3.0 × ATR  (R:R 1:1.2)
 
-Default: n1=2, n2=4, crossover-only mode (ob=os=100) — fires ~33 signals/250 bars 1H, WR≈76%
+Default: n1=2, n2=4, crossover-only mode (ob=os=100) — fires ~33 signals/250 bars 1H, WR≈61%
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -25,8 +25,8 @@ class WTADXStrategy(BaseStrategy):
         self.n2          = self.params.get("wt_avg_len",      4)
         self.ob_level    = self.params.get("ob_level",       100.0)
         self.os_level    = self.params.get("os_level",       100.0)
-        self.sl_atr_mult = self.params.get("sl_atr_mult",    2.0)
-        self.rr_ratio    = self.params.get("rr_ratio",       1.5)
+        self.sl_atr_mult = self.params.get("sl_atr_mult",    2.5)
+        self.rr_ratio    = self.params.get("rr_ratio",       1.2)
         self._last_signal = 0
 
     # ── WaveTrend Core ─────────────────────────────────────────────

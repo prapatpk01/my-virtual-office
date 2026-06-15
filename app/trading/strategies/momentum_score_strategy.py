@@ -17,8 +17,7 @@ Scores 5 momentum conditions per bar (each true = 1 point):
     5. MACD line < Signal
 
 Signal fires on first transition AND re-fires every reentry_bars while score stays sustained.
-Default: threshold=2, reentry_bars=5 — fires ~20+ signals/250 bars 1H, WR≈75% pure TP/SL
-SL = 1.5×ATR(14), R:R = 1:1.4
+Default: threshold=2, reentry_bars=10, sl=2.0×ATR, R:R 1:1.2 — WR≈60% on 1H
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -39,9 +38,9 @@ class MomentumScoreStrategy(BaseStrategy):
         self.macd_slow   = self.params.get("macd_slow",    26)
         self.macd_sig    = self.params.get("macd_signal",   9)
         self.threshold   = self.params.get("threshold",     2)   # 2 of 5 — more frequent signals
-        self.reentry_bars = self.params.get("reentry_bars", 5)   # re-fire every N bars while sustained
-        self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",     1.4)   # R:R 1.4 → need WR > 42%
+        self.reentry_bars = self.params.get("reentry_bars", 10)   # re-fire every N bars while sustained
+        self.sl_atr_mult = self.params.get("sl_atr_mult",  2.0)
+        self.rr_ratio    = self.params.get("rr_ratio",     1.2)
 
     # ── RSI (Wilder's) ─────────────────────────────────────────────
 

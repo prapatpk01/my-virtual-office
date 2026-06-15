@@ -6,7 +6,7 @@ Signal fires on MACD histogram crossover with price above HMA:
   SELL: MACD histogram crosses from ≥0 to <0
 
 Default: MACD 5/13/4, HMA9 — fires ~15-25 signals/250 bars 1H on MACD hist crossover
-  ATR 14, Stop 1.5×ATR, R:R 1:1.4
+  ATR 14, Stop 2.0×ATR, R:R 1:1.2
 """
 import logging
 import numpy as np
@@ -36,8 +36,8 @@ class MACDEMAStrategy(BaseStrategy):
         self.macd_slow   = self.params.get("macd_slow",   13)
         self.macd_sig    = self.params.get("macd_signal",  4)
         self.atr_period  = self.params.get("atr_period",  14)
-        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",    1.4)
+        self.sl_atr_mult = self.params.get("sl_atr_mult", 2.0)
+        self.rr_ratio    = self.params.get("rr_ratio",    1.2)
 
     # ── Heikin Ashi ────────────────────────────────────────────────
 
