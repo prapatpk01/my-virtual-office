@@ -10,8 +10,8 @@ Trailing stop logic (exact Pine Script UT Bot v2):
   price > tsl[1]                         → flip bull:   price - sl
   else                                   → flip bear:   price + sl
 
-Default: mult=1.0, atr_period=10
-SL = 1.5×ATR(14), R:R = 1:1.5
+Default: mult=1.25, atr_period=14
+SL = 1.0×ATR(14), R:R = 1:1.2  (backtest 500×15m: WR=64.7% PF=2.20 ~3.3/day)
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -25,10 +25,10 @@ class UTBotStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.ut_mult     = self.params.get("ut_mult",     1.2)
+        self.ut_mult     = self.params.get("ut_mult",     1.25)
         self.ut_atr_len  = self.params.get("ut_atr_len",  14)
-        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",    1.5)
+        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.0)
+        self.rr_ratio    = self.params.get("rr_ratio",    1.2)
         self._last_signal = 0
 
     # ── ATR Trailing Stop ──────────────────────────────────────────

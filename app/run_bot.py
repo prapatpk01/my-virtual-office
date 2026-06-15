@@ -210,11 +210,14 @@ _stop_signal = asyncio.Event()
 
 
 async def _run_backtest(crypto_bot, config: dict, telegram):
-    """Fetch 500 candles on first symbol, run backtest, apply best SL/TP to all strategies."""
+    """Fetch candles on first symbol, run backtest, apply best SL/TP to each strategy."""
     from trading.strategies.macd_ema_strategy import MACDEMAStrategy
     from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
+    from trading.strategies.ut_bot_strategy import UTBotStrategy
+    from trading.strategies.wt_adx_strategy import WTADXStrategy
     backtestable = [s for s in crypto_bot.strategies
-                    if isinstance(s, (MACDEMAStrategy, MomentumScoreStrategy))]
+                    if isinstance(s, (MACDEMAStrategy, MomentumScoreStrategy,
+                                      UTBotStrategy, WTADXStrategy))]
     if not backtestable:
         return
     strat = backtestable[0]
