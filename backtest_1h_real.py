@@ -1,13 +1,11 @@
 """
-Full 1H Backtest — 250 bars × 3 windows (750 bars total)
+Full 1H Backtest — 250 bars × 3 windows (750 bars total)  [5 strategies]
 Real BTC/USDT candles from Binance (falls back to GBM if unavailable).
 
 Rules:
   - $50/trade, $500 starting capital
-  - TP = +4.8% of entry  →  +$2.40 gross, +$2.30 net (after 0.20% RT fee)
-  - SL = -4.6% of entry  →  -$2.30 gross, -$2.40 net
-  - Pure TP/SL exits only (no early sell-signal exit)
-  - After sell signal: block new BUY for 10 bars
+  - TP/SL per strategy (TP/SL are strategy-specific, see STRAT_PARAMS)
+  - Pure TP/SL exits only
   - 1 active trade per strategy at a time
   - Lookforward: 120 bars max before timeout
 """
@@ -15,21 +13,35 @@ import asyncio, sys, math, random
 import numpy as np
 sys.path.insert(0, "app")
 
-from trading.strategies.ut_bot_strategy        import UTBotStrategy
-from trading.strategies.wt_adx_strategy        import WTADXStrategy
-from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-from trading.strategies.macd_ema_strategy       import MACDEMAStrategy
+from trading.strategies.ut_bot_strategy         import UTBotStrategy
+from trading.strategies.wt_adx_strategy         import WTADXStrategy
+from trading.strategies.momentum_score_strategy  import MomentumScoreStrategy
+from trading.strategies.macd_ema_strategy        import MACDEMAStrategy
+from trading.strategies.knn_strategy             import KNNStrategy
 
 # ── constants ───────────────────────────────────────────────────────────────
 POSITION   = 50.0     # USD per trade
-TP_PCT     = 0.048    # 4.8% price move
-SL_PCT     = 0.046    # 4.6% price move
 FEE_RT     = 0.0020   # 0.10% entry + 0.10% exit
 START_BAL  = 500.0
 LOOKFWD    = 120      # max bars to wait for TP/SL on 1H
 
-TP_NET = round(POSITION * TP_PCT - POSITION * FEE_RT, 4)   # +$2.30
-SL_NET = round(POSITION * SL_PCT + POSITION * FEE_RT, 4)   # -$2.40
+# per-strategy TP/SL (tuned for 1H)
+STRAT_PARAMS = {
+    "WaveTrend":  {"tp": 0.048, "sl": 0.046},   # TP=4.8% SL=4.6%
+    "UT Bot":     {"tp": 0.048, "sl": 0.046},
+    "Momentum":   {"tp": 0.048, "sl": 0.046},
+    "MACD/EMA":   {"tp": 0.048, "sl": 0.046},
+    "kNN":        {"tp": 0.0225, "sl": 0.015},  # TP=2.25% SL=1.5%  R:R 1:1.5
+}
+
+def _net(tp_pct, sl_pct):
+    return (round(POSITION * tp_pct - POSITION * FEE_RT, 4),
+            round(POSITION * sl_pct + POSITION * FEE_RT, 4))
+
+# legacy aliases kept for existing simulate_window
+TP_PCT = 0.048; SL_PCT = 0.046
+TP_NET = round(POSITION * TP_PCT - POSITION * FEE_RT, 4)
+SL_NET = round(POSITION * SL_PCT + POSITION * FEE_RT, 4)
 
 # ── candle dataclass ─────────────────────────────────────────────────────────
 class C:
@@ -109,33 +121,40 @@ def get_signals(strategy, candles: list):
         buys  = [i for i in range(min_i, n - 1) if buy_arr[i]]
         sells = [i for i in range(min_i, n - 1) if sell_arr[i]]
 
+    elif name == "KNNStrategy":
+        buy_arr, sell_arr, _ = strategy._build_signals(candles)
+        buys  = [i for i in range(n) if buy_arr[i]]
+        sells = [i for i in range(n) if sell_arr[i]]
+
     else:
         buys, sells = [], []
 
     return buys, sells
 
 # ── simulate one 250-bar window ───────────────────────────────────────────────
-def simulate_window(strategy, candles: list, balance: float):
+def simulate_window(strategy, sname: str, candles: list, balance: float):
     """
     Returns (trades_list, ending_balance).
-    trades_list = [{"outcome": "win"|"loss"|"timeout", "pnl": float, ...}, ...]
+    Uses per-strategy TP/SL from STRAT_PARAMS.
     """
     highs  = np.array([c.high  for c in candles], dtype=float)
     lows   = np.array([c.low   for c in candles], dtype=float)
     closes = np.array([c.close for c in candles], dtype=float)
     n = len(candles)
 
+    sp  = STRAT_PARAMS.get(sname, {"tp": TP_PCT, "sl": SL_PCT})
+    tp_pct = sp["tp"]; sl_pct = sp["sl"]
+    tp_net, sl_net = _net(tp_pct, sl_pct)
+
     buys, sells = get_signals(strategy, candles)
     sell_set = set(sells)
 
     trades = []
-    in_trade    = False
     trade_entry_bar = -1
     trade_exit_bar  = -1
-    blocked_until = -1   # sell-signal block: no new BUY until this bar
+    blocked_until   = -1
 
     for bi in buys:
-        # respect blocking and previous trade not yet exited
         if bi <= trade_exit_bar:
             continue
         if bi < blocked_until:
@@ -144,41 +163,28 @@ def simulate_window(strategy, candles: list, balance: float):
             continue
 
         entry = float(closes[bi])
-        tp_p  = entry * (1 + TP_PCT)
-        sl_p  = entry * (1 - SL_PCT)
+        tp_p  = entry * (1 + tp_pct)
+        sl_p  = entry * (1 - sl_pct)
 
-        outcome    = "timeout"
-        exit_bar   = min(bi + LOOKFWD, n - 1)
-        pnl        = 0.0
+        outcome  = "timeout"
+        exit_bar = min(bi + LOOKFWD, n - 1)
+        pnl      = 0.0
 
         for j in range(bi + 1, min(bi + LOOKFWD, n)):
-            # check if a sell signal fired in between — block future buys
             if j in sell_set:
                 blocked_until = j + 10
-
             if lows[j] <= sl_p:
-                outcome  = "loss"
-                pnl      = -SL_NET
-                exit_bar = j
-                break
+                outcome  = "loss";  pnl = -sl_net; exit_bar = j; break
             if highs[j] >= tp_p:
-                outcome  = "win"
-                pnl      = TP_NET
-                exit_bar = j
-                break
+                outcome  = "win";   pnl = tp_net;  exit_bar = j; break
         else:
-            # timeout: close at last bar
             exit_p = float(closes[min(bi + LOOKFWD, n) - 1])
-            pnl    = (exit_p - entry) / entry * POSITION - POSITION * FEE_RT
-            pnl    = round(pnl, 4)
+            pnl    = round((exit_p - entry) / entry * POSITION - POSITION * FEE_RT, 4)
 
         balance += pnl
         trades.append({
-            "entry_bar": bi,
-            "exit_bar":  exit_bar,
-            "outcome":   outcome,
-            "pnl":       round(pnl, 4),
-            "balance":   round(balance, 2),
+            "entry_bar": bi, "exit_bar": exit_bar,
+            "outcome": outcome, "pnl": round(pnl, 4), "balance": round(balance, 2),
         })
         trade_entry_bar = bi
         trade_exit_bar  = exit_bar
@@ -188,9 +194,9 @@ def simulate_window(strategy, candles: list, balance: float):
 # ── run all strategies on 3 windows ──────────────────────────────────────────
 async def main():
     print("\n" + "="*74)
-    print("  BTC/USDT 1H — Full Backtest  250 bars × 3 windows")
-    print(f"  $50/trade | $500 capital | TP=+4.8% (+${TP_NET}) | SL=-4.6% (-${SL_NET})")
-    print(f"  Fee 0.20% RT ($0.10/trade) | Pure TP/SL exits | Lookfwd {LOOKFWD} bars")
+    print("  BTC/USDT 1H — Full Backtest  250 bars × 3 windows  [5 strategies]")
+    print(f"  $50/trade | $500 capital | Fee 0.20% RT | Pure TP/SL exits | Lookfwd {LOOKFWD} bars")
+    print(f"  WT/UTBot/Momentum/MACD: TP=4.8% SL=4.6%  |  kNN: TP=2.25% SL=1.5%")
     print("="*74)
 
     # ── data ──────────────────────────────────────────────────────────────────
@@ -211,6 +217,7 @@ async def main():
         ("UT Bot",    UTBotStrategy("BTC/USDT")),
         ("Momentum",  MomentumScoreStrategy("BTC/USDT")),
         ("MACD/EMA",  MACDEMAStrategy("BTC/USDT")),
+        ("kNN",       KNNStrategy("BTC/USDT")),
     ]
 
     print(f"\n  Data: {data_source}")
@@ -230,7 +237,7 @@ async def main():
         all_trades = []
 
         for wi, win_candles in enumerate(windows):
-            trades, balance = simulate_window(strat, win_candles, balance)
+            trades, balance = simulate_window(strat, sname, win_candles, balance)
             wins   = [t for t in trades if t["outcome"] == "win"]
             losses = [t for t in trades if t["outcome"] in ("loss", "timeout") and t["pnl"] < 0]
             total  = len(trades)
@@ -270,7 +277,7 @@ async def main():
 
     # ── grand summary table ────────────────────────────────────────────────────
     print(f"\n{'='*74}")
-    print("  GRAND SUMMARY — all 4 strategies, 750 bars, $500 starting capital")
+    print("  GRAND SUMMARY — all 5 strategies, 750 bars, $500 starting capital")
     print(f"  {'Strategy':<12} │ {'Trades':>6} │ {'W/L':>7} │ {'WR%':>6} │ "
           f"{'Net $':>8} │ {'Final Bal':>10} │ {'T/day':>6}")
     print(f"  {'─'*12}─┼─{'─'*6}─┼─{'─'*7}─┼─{'─'*6}─┼─"
