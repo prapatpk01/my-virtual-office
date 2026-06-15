@@ -1,20 +1,11 @@
 """
-Momentum Score Strategy — RSI Divergence + 4-Phase Market Cycle.
+Momentum Score Strategy — RSI × Heikin Ashi.
 
-Phase engine:
-  Phase 1: RSI < 40 OR Bullish Divergence  (accumulation)
-  Phase 2: was Phase 1 AND RSI crosses above EMA9  (uptrend start)
-  Phase 3: RSI > 60 OR Bearish Divergence  (distribution)
-  Phase 4: was Phase 3 AND RSI crosses below EMA9  (downtrend start)
+Signal fires when ALL 3 conditions are true:
+  BUY:  HA bullish (HA_close > HA_open)  AND  RSI < 50  AND  RSI crosses above EMA9(RSI)
+  SELL: HA bearish (HA_close < HA_open)  AND  RSI > 50  AND  RSI crosses below EMA9(RSI)
 
-Signals:
-  BUY:  Phase 1 → 2 transition
-  SELL: Phase 3 → 4 transition
-
-Divergence (pivot of WMA(RSI,3), lookback=5):
-  Bull: price low < pivot-bar price low  AND  RSI > pivot-bar RSI
-  Bear: price high > pivot-bar price high AND  RSI < pivot-bar RSI
-
+RSI cross is the trigger; HA direction + RSI zone confirm the trend.
 SL = 1.5×ATR(14), R:R = 1:1.5
 """
 import numpy as np
@@ -29,18 +20,30 @@ class MomentumScoreStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.rsi_len     = self.params.get("rsi_len",      14)
-        self.pivot_len   = self.params.get("pivot_len",     5)
-        self.rsi_smooth  = self.params.get("rsi_smooth",    3)
-        self.ema_len     = self.params.get("ema_len",        9)
-        self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
-        self.rr_ratio    = self.params.get("rr_ratio",     1.5)
+        self.rsi_len     = self.params.get("rsi_len",     14)
+        self.ema_len     = self.params.get("ema_len",      9)
+        self.rsi_mid     = self.params.get("rsi_mid",     50)   # zone threshold
+        self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
+        self.rr_ratio    = self.params.get("rr_ratio",    1.5)
 
     # ── Indicators ─────────────────────────────────────────────────
 
     @staticmethod
+    def _ema_skipnan(arr: np.ndarray, period: int) -> np.ndarray:
+        """EMA that skips leading NaN — needed when input (e.g. RSI) starts with NaN."""
+        result = np.full(len(arr), np.nan)
+        valid  = np.where(~np.isnan(arr))[0]
+        if len(valid) == 0 or len(arr) - valid[0] < period:
+            return result
+        s = int(valid[0])
+        k = 2.0 / (period + 1)
+        result[s + period - 1] = float(np.mean(arr[s : s + period]))
+        for i in range(s + period, len(arr)):
+            result[i] = float(arr[i]) * k + result[i - 1] * (1 - k)
+        return result
+
+    @staticmethod
     def _rsi(closes: np.ndarray, period: int) -> np.ndarray:
-        """Wilder's RSI."""
         n = len(closes)
         result = np.full(n, np.nan)
         if n < period + 1:
@@ -57,128 +60,61 @@ class MomentumScoreStrategy(BaseStrategy):
             result[i] = 100.0 if avg_l < 1e-10 else 100 - 100 / (1 + avg_g / avg_l)
         return result
 
-    @staticmethod
-    def _wma(arr: np.ndarray, period: int) -> np.ndarray:
-        """Weighted Moving Average (linear weights 1..period)."""
-        n       = len(arr)
-        result  = np.full(n, np.nan)
-        weights = np.arange(1, period + 1, dtype=float)
-        wsum    = weights.sum()
-        for i in range(period - 1, n):
-            w = arr[i - period + 1 : i + 1]
-            if not np.any(np.isnan(w)):
-                result[i] = float(np.dot(w, weights) / wsum)
-        return result
-
-    # ── Core signal engine ─────────────────────────────────────────
+    # ── Signal arrays ──────────────────────────────────────────────
 
     def _build_signals(self, candles: list):
-        """
-        Compute all signal arrays over the full candle list.
-        Returns (buy_sig, sell_sig, phase, rsi_src, atr_a).
-        """
-        ha_candles, _, ha_c = self._heikin_ashi(candles)
+        """Returns (buy_sig, sell_sig, rsi_a, rsi_ema_a, atr_a)."""
+        ha_candles, ha_o, ha_c = self._heikin_ashi(candles)
 
-        n      = len(candles)
-        closes = ha_c
-        highs  = np.array([c.high for c in ha_candles], dtype=float)
-        lows   = np.array([c.low  for c in ha_candles], dtype=float)
-
-        rsi_raw = self._rsi(closes, self.rsi_len)
-        rsi_src = self._wma(rsi_raw, self.rsi_smooth)
-        rsi_ema = np.array(self.ema(rsi_src.tolist(), self.ema_len), dtype=float)
+        n = len(candles)
         atr_a   = np.array(self.atr(ha_candles, _ATR_PERIOD), dtype=float)
+        rsi_a   = self._rsi(ha_c, self.rsi_len)
+        rsi_ema = self._ema_skipnan(rsi_a, self.ema_len)
 
-        pl = self.pivot_len
-
-        # Pivot detection on rsiSrc (Pine: pivothigh/pivotlow of rsiSrc, len=5)
-        # At bar i, pivot bar = i-pl (confirmed by pl right bars)
-        # Matches Pine order: update last values THEN check divergence
-        last_price_hi = np.nan
-        last_rsi_hi   = np.nan
-        last_price_lo = np.nan
-        last_rsi_lo   = np.nan
-
-        bull_div = np.zeros(n, dtype=bool)
-        bear_div = np.zeros(n, dtype=bool)
-
-        for i in range(2 * pl, n):
-            j = i - pl
-            if j < pl:
-                continue
-            w = rsi_src[j - pl : j + pl + 1]
-            if np.any(np.isnan(w)):
-                continue
-
-            # Pivot low of rsiSrc → potential bull divergence
-            if float(rsi_src[j]) == float(np.min(w)):
-                last_price_lo = float(lows[j])
-                last_rsi_lo   = float(rsi_src[j])
-                if (not np.isnan(rsi_src[i]) and
-                        float(lows[i])    < last_price_lo and
-                        float(rsi_src[i]) > last_rsi_lo):
-                    bull_div[i] = True
-
-            # Pivot high of rsiSrc → potential bear divergence
-            if float(rsi_src[j]) == float(np.max(w)):
-                last_price_hi = float(highs[j])
-                last_rsi_hi   = float(rsi_src[j])
-                if (not np.isnan(rsi_src[i]) and
-                        float(highs[i])   > last_price_hi and
-                        float(rsi_src[i]) < last_rsi_hi):
-                    bear_div[i] = True
-
-        # 4-Phase state machine — exact Pine Script if/else-if cascade
-        phase    = np.ones(n, dtype=int)
         buy_sig  = np.zeros(n, dtype=bool)
         sell_sig = np.zeros(n, dtype=bool)
 
         for i in range(1, n):
-            if np.isnan(rsi_src[i]) or np.isnan(rsi_ema[i]):
-                phase[i] = phase[i - 1]
+            if np.isnan(rsi_a[i]) or np.isnan(rsi_a[i-1]):
+                continue
+            if np.isnan(rsi_ema[i]) or np.isnan(rsi_ema[i-1]):
                 continue
 
-            prev   = int(phase[i - 1])
-            rsi_v  = float(rsi_src[i])
-            rsi_e  = float(rsi_ema[i])
-            rsi_vp = float(rsi_src[i - 1]) if not np.isnan(rsi_src[i - 1]) else rsi_v
-            rsi_ep = float(rsi_ema[i - 1]) if not np.isnan(rsi_ema[i - 1]) else rsi_e
+            rsi_c  = float(rsi_a[i]);    rsi_p  = float(rsi_a[i-1])
+            ema_c  = float(rsi_ema[i]);  ema_p  = float(rsi_ema[i-1])
+            ha_o_v = float(ha_o[i]);     ha_c_v = float(ha_c[i])
 
-            cross_up   = rsi_vp <= rsi_ep and rsi_v > rsi_e
-            cross_down = rsi_vp >= rsi_ep and rsi_v < rsi_e
+            rsi_cross_up   = rsi_c > ema_c and rsi_p <= ema_p
+            rsi_cross_down = rsi_c < ema_c and rsi_p >= ema_p
+            ha_bull = ha_c_v > ha_o_v
+            ha_bear = ha_c_v < ha_o_v
 
-            if rsi_v < 40 or bull_div[i]:
-                phase[i] = 1
-            elif prev == 1 and cross_up:
-                phase[i] = 2
-            elif rsi_v > 60 or bear_div[i]:
-                phase[i] = 3
-            elif prev == 3 and cross_down:
-                phase[i] = 4
-            else:
-                phase[i] = prev
+            buy_sig[i]  = ha_bull and rsi_c < self.rsi_mid and rsi_cross_up
+            sell_sig[i] = ha_bear and rsi_c > self.rsi_mid and rsi_cross_down
 
-            buy_sig[i]  = phase[i] == 2 and phase[i - 1] == 1
-            sell_sig[i] = phase[i] == 4 and phase[i - 1] == 3
-
-        return buy_sig, sell_sig, phase, rsi_src, atr_a
+        return buy_sig, sell_sig, rsi_a, rsi_ema, atr_a
 
     # ── Live analysis ──────────────────────────────────────────────
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
-        min_len = self.rsi_len + self.rsi_smooth + 2 * self.pivot_len + self.ema_len + 5
+        min_len = self.rsi_len + self.ema_len + 5
         if len(candles) < min_len:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0, "Not enough data")
 
-        buy_sig, sell_sig, phase, rsi_src, atr_a = self._build_signals(candles)
+        buy_sig, sell_sig, rsi_a, rsi_ema, atr_a = self._build_signals(candles)
 
         n   = len(candles) - 1
         p   = current_price
-        atr = float(atr_a[n])   if not np.isnan(atr_a[n])   else 0.0
-        rsi = float(rsi_src[n]) if not np.isnan(rsi_src[n]) else 50.0
-        ph  = int(phase[n])
+        atr = float(atr_a[n]) if not np.isnan(atr_a[n]) else 0.0
+        rsi = float(rsi_a[n]) if not np.isnan(rsi_a[n]) else 50.0
         conf = round(min(0.85, 0.60 + abs(rsi - 50) / 100), 2)
+
+        meta = {
+            "rsi":     round(rsi, 1),
+            "rsi_ema": round(float(rsi_ema[n]), 1) if not np.isnan(rsi_ema[n]) else None,
+            "atr":     round(atr, 4),
+        }
 
         if buy_sig[n]:
             sl_p = round(p - self.sl_atr_mult * atr, 4)
@@ -186,11 +122,8 @@ class MomentumScoreStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf,
-                reason=f"[Momentum] Phase 1→2 | RSI={rsi:.1f}",
-                metadata={
-                    "phase": ph, "rsi": round(rsi, 1),
-                    "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio,
-                },
+                reason=f"[Momentum] BUY | HA↑ RSI={rsi:.1f}×↑EMA",
+                metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio},
             )
 
         if sell_sig[n]:
@@ -199,30 +132,27 @@ class MomentumScoreStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol,
                 price=p, amount=0.0, confidence=conf,
-                reason=f"[Momentum] Phase 3→4 | RSI={rsi:.1f}",
-                metadata={
-                    "phase": ph, "rsi": round(rsi, 1),
-                    "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio,
-                },
+                reason=f"[Momentum] SELL | HA↓ RSI={rsi:.1f}×↓EMA",
+                metadata={**meta, "stop_loss": sl_p, "take_profit": tp_p, "rr": self.rr_ratio},
             )
 
-        _NAMES = {1: "Accumulation", 2: "Uptrend", 3: "Distribution", 4: "Downtrend"}
+        zone = "Bull" if rsi > 50 else "Bear"
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[Momentum] Phase {ph} ({_NAMES.get(ph,'?')}) | RSI={rsi:.1f}",
-            metadata={"phase": ph, "rsi": round(rsi, 1)},
+            f"[Momentum] HOLD | RSI={rsi:.1f} ({zone})",
+            metadata=meta,
         )
 
     # ── Backtest ───────────────────────────────────────────────────
 
     async def backtest(self, candles: list) -> tuple[dict, tuple]:
-        min_len = self.rsi_len + self.rsi_smooth + 2 * self.pivot_len + self.ema_len + 20
+        min_len = self.rsi_len + self.ema_len + 20
         if len(candles) < min_len:
             return {}, None
 
-        cls = np.array([c.close for c in candles], dtype=float)
-        hig = np.array([c.high  for c in candles], dtype=float)
-        low = np.array([c.low   for c in candles], dtype=float)
+        ha_candles, ha_o, ha_c = self._heikin_ashi(candles)
+        ha_highs = np.array([c.high for c in ha_candles], dtype=float)
+        ha_lows  = np.array([c.low  for c in ha_candles], dtype=float)
 
         buy_sig, sell_sig, _, _, atr_a = self._build_signals(candles)
 
@@ -247,34 +177,34 @@ class MomentumScoreStrategy(BaseStrategy):
         stats: dict = {}
 
         for sl_m in _SL_MULTS:
-            rr = self.rr_ratio
-            wins = losses = 0
+            rr      = self.rr_ratio
+            wins    = losses = 0
             total_r = 0.0
             for idx, direction, atr_val in signal_bars:
                 if atr_val <= 0:
                     continue
-                entry = float(cls[idx])
-                sl_p  = entry - sl_m * atr_val if direction ==  1 else entry + sl_m * atr_val
+                entry = float(ha_c[idx])
+                sl_p  = entry - sl_m * atr_val if direction == 1 else entry + sl_m * atr_val
                 tp_p  = entry + sl_m * rr * atr_val if direction == 1 else entry - sl_m * rr * atr_val
                 outcome = 0
-                for j in range(idx + 1, min(idx + _LOOKFORWARD, len(cls))):
+                for j in range(idx + 1, min(idx + _LOOKFORWARD, len(ha_c))):
                     if direction == 1:
-                        if low[j] <= sl_p: outcome = -1; break
-                        if hig[j] >= tp_p: outcome =  1; break
+                        if ha_lows[j]  <= sl_p: outcome = -1; break
+                        if ha_highs[j] >= tp_p: outcome =  1; break
                     else:
-                        if hig[j] >= sl_p: outcome = -1; break
-                        if low[j] <= tp_p: outcome =  1; break
+                        if ha_highs[j] >= sl_p: outcome = -1; break
+                        if ha_lows[j]  <= tp_p: outcome =  1; break
                 if outcome ==  1: wins   += 1; total_r += rr
                 elif outcome == -1: losses += 1; total_r -= 1.0
 
             total = wins + losses
-            wr  = wins / total if total else 0.0
-            pf  = (wins * rr) / max(losses, 1)
-            key = f"SL={sl_m}xATR  RR=1:{rr}"
+            wr    = wins / total if total else 0.0
+            pf    = (wins * rr) / max(losses, 1)
+            key   = f"SL={sl_m}xATR  RR=1:{rr}"
             stats[key] = {
                 "win_rate": round(wr * 100, 1), "profit_factor": round(pf, 2),
                 "total_r":  round(total_r, 1),  "trades": total,
-                "wins": wins,                    "losses": losses,
+                "wins":     wins,                "losses": losses,
             }
             if total >= 5 and total_r > best_score:
                 best_score  = total_r
