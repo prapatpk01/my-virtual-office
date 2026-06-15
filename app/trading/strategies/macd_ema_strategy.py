@@ -7,7 +7,7 @@ Signal conditions (ALL must pass — AND logic):
 
 Default parameters match TradingView SJ-MACD/EMA:
   HMA 20, EMA 10, SMA 20, MACD 12/26/9, ADX 14/thr 20
-  ATR 10, Stop 1.5×ATR, R:R 1:1.2
+  ATR 14, Stop 1.5×ATR, R:R 1:1.2
 """
 import logging
 import numpy as np
@@ -38,7 +38,7 @@ class MACDEMAStrategy(BaseStrategy):
         self.macd_sig      = self.params.get("macd_signal",    9)
         self.adx_len       = self.params.get("adx_len",       14)
         self.adx_threshold = self.params.get("adx_threshold", 20)
-        self.atr_period    = self.params.get("atr_period",    10)
+        self.atr_period    = self.params.get("atr_period",    14)
         self.sl_atr_mult   = self.params.get("sl_atr_mult",  1.5)
         self.rr_ratio      = self.params.get("rr_ratio",     1.2)
 
