@@ -12,8 +12,8 @@ kNN:  search back n_bars historical bars; find k nearest in feature space;
       label each via price return over fwd bars (+1 / -1).
       Signal fires when weighted vote exceeds threshold AND cooldown elapsed.
 
-Default: N=15, K=3, LAGZ=20, CD=8, long_only=True
-R:R 1:1.5 — SL=1.5%, TP=2.25% — WR≈56%
+Default: N=3, K=3, LAGZ=20, CD=3, long_only=True
+R:R 1:1.5 — SL=1.5%, TP=2.25% — WR≈58%, ~1 trade/day
 """
 import math
 import numpy as np
@@ -27,11 +27,11 @@ class KNNStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.n_bars    = self.params.get("n_bars",    15)    # history search window
+        self.n_bars    = self.params.get("n_bars",     3)    # history search window
         self.k         = self.params.get("k",          3)    # nearest neighbours
         self.lagz      = self.params.get("lagz",      20)    # z-score window
         self.fwd       = self.params.get("fwd",        5)    # label look-forward
-        self.cooldown  = self.params.get("cooldown",   8)    # bars between signals
+        self.cooldown  = self.params.get("cooldown",   3)    # bars between signals
         self.sl_pct    = self.params.get("sl_pct",  0.015)   # 1.5% SL
         self.tp_pct    = self.params.get("tp_pct",  0.0225)  # 2.25% TP  (R:R 1:1.5)
         self.long_only = self.params.get("long_only", True)
