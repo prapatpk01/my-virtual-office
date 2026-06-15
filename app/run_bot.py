@@ -83,11 +83,12 @@ def build_config() -> dict:
             "ut_bot":         _env_bool("STRATEGY_UT_BOT",           True),
             "knn":            _env_bool("STRATEGY_KNN",              True),
         },
-        "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
-        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
-        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.06")),
-        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "3")),
-        "max_drawdown":    float(os.environ.get("MAX_DRAWDOWN_PCT", "0.30")),
+        "trade_amount_usdt": float(os.environ.get("TRADE_AMOUNT_USDT", "0")),   # fixed $ per trade
+        "risk_per_trade":    float(os.environ.get("RISK_PER_TRADE",  "0.02")),
+        "stop_loss_pct":     float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
+        "take_profit_pct":   float(os.environ.get("TAKE_PROFIT_PCT", "0.06")),
+        "max_positions":     int(os.environ.get("MAX_POSITIONS",     "3")),
+        "max_drawdown":      float(os.environ.get("MAX_DRAWDOWN_PCT", "0.30")),
         "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID",   ""),
         "tg_min_confidence": float(os.environ.get("TG_MIN_CONFIDENCE", "0.5")),
@@ -185,6 +186,7 @@ def build_crypto_bot(config: dict, telegram):
         connector=connector, strategies=strategies,
         risk_manager=risk, interval_seconds=config["interval"],
         broadcast_fn=None, telegram=telegram,
+        trade_amount_usdt=config.get("trade_amount_usdt", 0.0),
     )
 
 

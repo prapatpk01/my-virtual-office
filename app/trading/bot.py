@@ -65,6 +65,7 @@ class TradingBot:
         broadcast_fn: Optional[Callable[[dict], Any]] = None,
         telegram: Optional[TelegramNotifier] = None,
         state_file: Optional[str] = None,
+        trade_amount_usdt: float = 0.0,
     ):
         self.connector = connector
         self.strategies = strategies
@@ -72,6 +73,10 @@ class TradingBot:
         self.interval = interval_seconds
         self._broadcast = broadcast_fn or (lambda x: None)
         self.telegram = telegram
+        # Fixed USDT per trade (overrides risk_per_trade when > 0)
+        self.trade_amount_usdt = float(trade_amount_usdt)
+        if self.trade_amount_usdt > 0:
+            logger.info("Fixed trade size: $%.2f USDT per trade", self.trade_amount_usdt)
         self.state = BotState(paper=connector.paper)
         self._task: Optional[asyncio.Task] = None
         self._start_balance = 0.0
@@ -421,7 +426,11 @@ class TradingBot:
         tp_p  = meta.get("take_profit")
 
         leverage = getattr(self.connector, "leverage", 1)
-        amount = self.risk.size_position(quote_balance, price) * leverage
+        if self.trade_amount_usdt > 0:
+            # Fixed dollar amount per trade (ignores risk_per_trade %)
+            amount = round((self.trade_amount_usdt / price) * leverage, 6)
+        else:
+            amount = self.risk.size_position(quote_balance, price) * leverage
         if amount <= 0:
             logger.info("Position size 0 for %s — tracking virtually", sym)
             if sl_p and tp_p:
