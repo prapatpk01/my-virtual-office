@@ -219,9 +219,9 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
         return
     strat = backtestable[0]
     symbol = strat.symbol
-    logger.info("Running SL/TP backtest on %s (500 candles 15m)…", symbol)
+    logger.info("Running SL/TP backtest on %s (1500 candles 15m)…", symbol)
     try:
-        candles = await crypto_bot.connector.fetch_ohlcv(symbol, timeframe="15m", limit=500)
+        candles = await crypto_bot.connector.fetch_ohlcv(symbol, timeframe="15m", limit=1500)
         stats, best = await strat.backtest(candles)
 
         if not stats:
@@ -235,6 +235,7 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
             logger.info("  %-22s  %6d  %5.1f%%  %5.2f  %+7.1fR",
                         key, v["trades"], v["win_rate"], v["profit_factor"], v["total_r"])
 
+        n_candles = len(candles)
         if best:
             sl_m, rr = best
             logger.info("Best config: SL=%.1fxATR  RR=1:%.1f — applying to all strategies", sl_m, rr)
@@ -245,7 +246,7 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
             if telegram:
                 best_stat = stats.get(f"SL={sl_m}xATR  RR=1:{rr}", {})
                 telegram.notify(
-                    f"📊 *Backtest complete* ({symbol} 500×15m)\n"
+                    f"📊 *Backtest complete* ({symbol} {n_candles}×15m)\n"
                     f"Best: SL=`{sl_m}×ATR`  R:R=`1:{rr}`\n"
                     f"WR: `{best_stat.get('win_rate',0):.1f}%` | "
                     f"PF: `{best_stat.get('profit_factor',0):.2f}` | "
@@ -254,6 +255,16 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
                 )
         else:
             logger.warning("Backtest: not enough trades to pick best config, using defaults")
+            if telegram:
+                top = sorted(stats.items(), key=lambda x: -x[1]["total_r"])[:2]
+                lines = "\n".join(
+                    f"`{k}` WR:{v['win_rate']:.0f}% T:{v['trades']}"
+                    for k, v in top
+                ) if top else "_no signals found_"
+                telegram.notify(
+                    f"📊 *Backtest complete* ({symbol} {n_candles}×15m)\n"
+                    f"Not enough trades — using default SL/TP\n{lines}"
+                )
 
     except Exception as e:
         logger.warning("Backtest failed (non-fatal): %s", e)
