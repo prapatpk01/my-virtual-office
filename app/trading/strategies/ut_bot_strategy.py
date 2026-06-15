@@ -25,7 +25,7 @@ class UTBotStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.ut_mult     = self.params.get("ut_mult",     2.0)
+        self.ut_mult     = self.params.get("ut_mult",     1.2)
         self.ut_atr_len  = self.params.get("ut_atr_len",  14)
         self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
         self.rr_ratio    = self.params.get("rr_ratio",    1.5)
