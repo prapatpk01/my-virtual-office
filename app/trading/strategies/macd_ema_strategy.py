@@ -2,8 +2,8 @@
 SJ-MACD/EMA Strategy.
 
 Signal conditions (ALL 3 must pass — AND logic):
-  BUY:  HA_open > HMA20  AND  EMA10 crosses above SMA20  AND  MACD crosses above Signal
-  SELL: HA_open < HMA20  AND  EMA10 crosses below SMA20  AND  MACD crosses below Signal
+  BUY:  HA_open > HMA20 (state)  AND  MACD > Signal (state)  AND  EMA10 crosses above SMA20 (trigger)
+  SELL: HA_open < HMA20 (state)  AND  MACD < Signal (state)  AND  EMA10 crosses below SMA20 (trigger)
 
 Default parameters match TradingView SJ-MACD/EMA:
   HMA 20, EMA 10, SMA 20, MACD 12/26/9
@@ -69,28 +69,27 @@ class MACDEMAStrategy(BaseStrategy):
             return 0
 
         needed = [hma[i], ema[i], ema[i-1], sma[i], sma[i-1],
-                  ml[i], ml[i-1], sl_line[i], sl_line[i-1], ha_o[i]]
+                  ml[i], sl_line[i], ha_o[i]]
         if any(np.isnan(v) for v in needed):
             return 0
 
         ha_open_v = float(ha_o[i])
         hma_v     = float(hma[i])
-        ema_c = float(ema[i]);     ema_p  = float(ema[i-1])
-        sma_c = float(sma[i]);     sma_p  = float(sma[i-1])
-        ml_c  = float(ml[i]);      ml_p   = float(ml[i-1])
-        sig_c = float(sl_line[i]); sig_p  = float(sl_line[i-1])
+        ema_c = float(ema[i]);  ema_p = float(ema[i-1])
+        sma_c = float(sma[i]);  sma_p = float(sma[i-1])
+        ml_c  = float(ml[i]);   sig_c = float(sl_line[i])
 
-        # Condition 2: EMA/SMA crossover
+        # Trigger: EMA crosses SMA (entry event)
         ema_cross_up   = ema_c > sma_c and ema_p <= sma_p
         ema_cross_down = ema_c < sma_c and ema_p >= sma_p
 
-        # Condition 3: MACD crosses Signal line
-        macd_cross_up   = ml_c > sig_c and ml_p <= sig_p
-        macd_cross_down = ml_c < sig_c and ml_p >= sig_p
+        # Confirmation (state): MACD already above/below Signal
+        macd_bull = ml_c > sig_c
+        macd_bear = ml_c < sig_c
 
-        if ha_open_v > hma_v and ema_cross_up   and macd_cross_up:
+        if ha_open_v > hma_v and macd_bull and ema_cross_up:
             return 1
-        if ha_open_v < hma_v and ema_cross_down and macd_cross_down:
+        if ha_open_v < hma_v and macd_bear and ema_cross_down:
             return -1
         return 0
 
