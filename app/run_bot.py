@@ -71,7 +71,7 @@ def build_config() -> dict:
         "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
         "oanda_env":       os.environ.get("OANDA_ENV", "practice"),
         "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
-        "candle_tf":    os.environ.get("CANDLE_TF", "15m"),     # 15m | 1h | 4h
+        "candle_tf":    os.environ.get("CANDLE_TF", "1h"),      # 1h | 15m | 4h
         "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
