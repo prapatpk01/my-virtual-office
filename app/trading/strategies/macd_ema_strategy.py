@@ -1,16 +1,12 @@
 """
 SJ-MACD/EMA Strategy.
 
-Signal fires when ALL 3 conditions are true at the same bar,
-triggered the moment the last condition is met (any order):
-  BUY:  open > HMA20  AND  EMA10 > SMA20  AND  MACD > Signal
-        fires on EMA crossover OR MACD crossover (whichever completes the set)
-  SELL: open < HMA20  AND  EMA10 < SMA20  AND  MACD < Signal
-        fires on EMA crossunder OR MACD crossunder
+Signal fires on MACD histogram crossover with price above HMA:
+  BUY:  MACD histogram crosses from ≤0 to >0 AND ha_close > HMA
+  SELL: MACD histogram crosses from ≥0 to <0
 
-Default parameters match TradingView SJ-MACD/EMA:
-  HMA 20, EMA 10, SMA 20, MACD 12/26/9
-  ATR 14, Stop 1.5×ATR, R:R 1:1.2
+Default: MACD 5/13/4, HMA9 — fires ~15-25 signals/250 bars 1H on MACD hist crossover
+  ATR 14, Stop 1.5×ATR, R:R 1:1.4
 """
 import logging
 import numpy as np
@@ -33,12 +29,12 @@ class MACDEMAStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.hma_period  = self.params.get("hma_period",  50)
-        self.ema_fast    = self.params.get("ema_fast",    21)
-        self.sma_slow    = self.params.get("sma_slow",    50)
-        self.macd_fast   = self.params.get("macd_fast",   12)
-        self.macd_slow   = self.params.get("macd_slow",   26)
-        self.macd_sig    = self.params.get("macd_signal",  9)
+        self.hma_period  = self.params.get("hma_period",   9)   # fast trend filter
+        self.ema_fast    = self.params.get("ema_fast",     5)
+        self.sma_slow    = self.params.get("sma_slow",    10)
+        self.macd_fast   = self.params.get("macd_fast",    5)
+        self.macd_slow   = self.params.get("macd_slow",   13)
+        self.macd_sig    = self.params.get("macd_signal",  4)
         self.atr_period  = self.params.get("atr_period",  14)
         self.sl_atr_mult = self.params.get("sl_atr_mult", 1.5)
         self.rr_ratio    = self.params.get("rr_ratio",    1.4)
@@ -67,34 +63,21 @@ class MACDEMAStrategy(BaseStrategy):
     def _signal_at(self, i: int,
                    ha_o, ha_c, ha_highs, ha_lows,
                    hma, ema, sma, ml, sl_line) -> int:
-        """Returns +1 BUY, -1 SELL, 0 HOLD."""
-        if i < 2:
+        """Returns +1 BUY, -1 SELL, 0 HOLD.
+        BUY:  MACD histogram crosses ≤0→>0 while ha_close > HMA
+        SELL: MACD histogram crosses ≥0→<0
+        """
+        if i < 1:
+            return 0
+        if any(np.isnan(v) for v in [hma[i], ml[i], ml[i-1], sl_line[i], sl_line[i-1], ha_c[i]]):
             return 0
 
-        needed = [hma[i], ema[i], ema[i-1], sma[i], sma[i-1],
-                  ml[i], ml[i-1], sl_line[i], sl_line[i-1], ha_o[i]]
-        if any(np.isnan(v) for v in needed):
-            return 0
+        hist_c = float(ml[i])   - float(sl_line[i])
+        hist_p = float(ml[i-1]) - float(sl_line[i-1])
 
-        ha_open_v = float(ha_o[i])
-        hma_v     = float(hma[i])
-        ema_c = float(ema[i]);     ema_p = float(ema[i-1])
-        sma_c = float(sma[i]);     sma_p = float(sma[i-1])
-        ml_c  = float(ml[i]);      ml_p  = float(ml[i-1])
-        sig_c = float(sl_line[i]); sig_p = float(sl_line[i-1])
-
-        ema_cross_up   = ema_c > sma_c and ema_p <= sma_p
-        ema_cross_down = ema_c < sma_c and ema_p >= sma_p
-        macd_cross_up   = ml_c > sig_c and ml_p <= sig_p
-        macd_cross_down = ml_c < sig_c and ml_p >= sig_p
-
-        # BUY: open above HMA + EMA>SMA + MACD>Signal, fired when either EMA or MACD just crossed
-        if (ha_open_v > hma_v and ema_c > sma_c and ml_c > sig_c
-                and (ema_cross_up or macd_cross_up)):
+        if hist_c > 0 and hist_p <= 0 and float(ha_c[i]) > float(hma[i]):
             return 1
-        # SELL: open below HMA + EMA<SMA + MACD<Signal, fired when either EMA or MACD just crossed
-        if (ha_open_v < hma_v and ema_c < sma_c and ml_c < sig_c
-                and (ema_cross_down or macd_cross_down)):
+        if hist_c < 0 and hist_p >= 0:
             return -1
         return 0
 

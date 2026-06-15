@@ -83,6 +83,9 @@ class TradingBot:
         self.wt_verify: bool = os.getenv("WTV", "false").lower() == "true"
         if self.wt_verify:
             logger.info("[WTV] WaveTrend verify ENABLED (WT1 gate ±10 active)")
+        # Bar-level blocking: SELL signal blocks new BUYs for 10 bars per sym+strategy
+        self._blocked_until: dict = {}  # key="sym||strategy" → bar_index to unblock
+        self._bar_counter: int = 0  # incremented each tick
 
     # ------------------------------------------------------------------
     # Public control
@@ -154,6 +157,7 @@ class TradingBot:
 
     async def _tick(self):
         self.state.error = ""
+        self._bar_counter += 1
         await self._refresh_balance()
 
         if not self.risk.check_drawdown(self.state.total_balance):
@@ -328,31 +332,12 @@ class TradingBot:
             wt_longs  = [p for p in wt_pos if p["side"] == "long"]
 
             if signal.type == SignalType.SELL:
-                if not wt_longs:
-                    return
-                logger.info("[WT] SELL signal on %s — exiting %d long(s)", sym, len(wt_longs))
-                ticker = await self.connector.fetch_ticker(sym)
-                exit_price = ticker["last"]
-                for pos in list(wt_longs):
-                    slot_name = pos["strategy"]
-                    try:
-                        await self.connector.create_order(sym, "sell", pos["amount"])
-                        self._sig.record_outcome(
-                            symbol=sym, side="long",
-                            entry=pos["entry"], exit_price=exit_price,
-                            sl=pos.get("stop_loss"), tp=pos.get("take_profit"),
-                            reason="sell_signal", strategy=slot_name,
-                        )
-                        self._sig.unlock_strategy(sym, slot_name)
-                        self.risk.close_position(sym, strategy=slot_name)
-                        if self.telegram:
-                            self.telegram.notify_trade_closed(
-                                sym, "sell_signal", exit_price,
-                                pos["entry"], pos.get("stop_loss"),
-                                pos.get("take_profit"), self._sig.summary(),
-                            )
-                    except Exception as e:
-                        logger.error("WT exit on SELL failed [%s]: %s", slot_name, e)
+                # Do NOT close WT positions on SELL signal — let TP/SL handle exits.
+                # Block new BUY slots for 10 bars.
+                for s in range(_WT_MAX):
+                    block_key = f"{sym}||{_WT}#{s}"
+                    self._blocked_until[block_key] = self._bar_counter + 10
+                logger.debug("[WT] SELL on %s — blocking all WT slots for 10 bars", sym)
                 return  # Never open short
 
             # BUY: stack longs up to _WT_MAX
@@ -362,7 +347,9 @@ class TradingBot:
             slot_key = None
             for s in range(_WT_MAX):
                 candidate = f"{_WT}#{s}"
-                if not self._sig.is_locked_for_strategy(sym, candidate):
+                block_key = f"{sym}||{candidate}"
+                if (not self._sig.is_locked_for_strategy(sym, candidate)
+                        and self._bar_counter >= self._blocked_until.get(block_key, 0)):
                     slot_key = candidate
                     break
             if slot_key is None:
@@ -379,38 +366,24 @@ class TradingBot:
             await self._execute_signal(signal, slot_key)
             return
 
-        # ── Normal strategies: BUY-only ──────────────────────────────────
+        # ── Normal strategies: BUY-only, pure TP/SL exits ───────────────
         if signal.type == SignalType.SELL:
-            # Close long belonging to THIS strategy; ignore if no position
-            if self._sig.is_locked_for_strategy(sym, strategy_name):
-                positions = self.risk.get_positions()
-                existing  = next((p for p in positions
-                                  if p["symbol"] == sym and p["strategy"] == strategy_name), None)
-                if existing and existing["side"] == "long":
-                    logger.info("[%s] SELL signal — exiting long on %s", strategy_name, sym)
-                    try:
-                        ticker     = await self.connector.fetch_ticker(sym)
-                        exit_price = ticker["last"]
-                        await self.connector.create_order(sym, "sell", existing["amount"])
-                        self._sig.record_outcome(
-                            symbol=sym, side="long",
-                            entry=existing["entry"], exit_price=exit_price,
-                            sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
-                            reason="sell_signal", strategy=strategy_name,
-                        )
-                        self._sig.unlock_strategy(sym, strategy_name)
-                        self.risk.close_position(sym, strategy=strategy_name)
-                        if self.telegram:
-                            self.telegram.notify_trade_closed(
-                                sym, "sell_signal", exit_price,
-                                existing["entry"], existing.get("stop_loss"),
-                                existing.get("take_profit"), self._sig.summary(),
-                            )
-                    except Exception as e:
-                        logger.error("Exit on SELL signal failed [%s]: %s", strategy_name, e)
-            return  # Never open short
+            # Do NOT close position on SELL signal — let TP/SL handle exits.
+            # Instead, block new BUY signals for this sym+strategy for 10 bars.
+            block_key = f"{sym}||{strategy_name}"
+            self._blocked_until[block_key] = self._bar_counter + 10
+            logger.debug("[%s] SELL signal on %s — blocking new BUYs for 10 bars (bar %d→%d)",
+                         strategy_name, sym, self._bar_counter, self._bar_counter + 10)
+            return  # Never open short, never close on SELL
 
         # BUY signal — open long if not already holding one for this strategy
+        # and not blocked from a recent SELL signal
+        block_key = f"{sym}||{strategy_name}"
+        if self._bar_counter < self._blocked_until.get(block_key, 0):
+            logger.debug("[%s] BUY on %s blocked until bar %d (current %d)",
+                         strategy_name, sym, self._blocked_until[block_key], self._bar_counter)
+            return
+
         if self._sig.is_locked_for_strategy(sym, strategy_name):
             logger.debug("%s [%s] already long — suppressing BUY", sym, strategy_name)
             return
