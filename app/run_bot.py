@@ -81,6 +81,7 @@ def build_config() -> dict:
             "macd_ema":       _env_bool("STRATEGY_MACD_EMA",         True),
             "momentum_score": _env_bool("STRATEGY_MOMENTUM_SCORE",   True),
             "ut_bot":         _env_bool("STRATEGY_UT_BOT",           True),
+            "knn":            _env_bool("STRATEGY_KNN",              True),
         },
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
         "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
@@ -105,12 +106,14 @@ def _make_strategies(symbols: list, flags: dict):
     from trading.strategies.macd_ema_strategy import MACDEMAStrategy
     from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
     from trading.strategies.ut_bot_strategy import UTBotStrategy
+    from trading.strategies.knn_strategy import KNNStrategy
     strategies = []
     for sym in symbols:
         if flags.get("wt_adx"):          strategies.append(WTADXStrategy(sym))
         if flags.get("macd_ema"):        strategies.append(MACDEMAStrategy(sym))
         if flags.get("momentum_score"):  strategies.append(MomentumScoreStrategy(sym))
         if flags.get("ut_bot"):          strategies.append(UTBotStrategy(sym))
+        if flags.get("knn"):             strategies.append(KNNStrategy(sym))
     return strategies
 
 
@@ -221,9 +224,10 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
     from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
     from trading.strategies.ut_bot_strategy import UTBotStrategy
     from trading.strategies.wt_adx_strategy import WTADXStrategy
+    from trading.strategies.knn_strategy import KNNStrategy
     backtestable = [s for s in crypto_bot.strategies
                     if isinstance(s, (MACDEMAStrategy, MomentumScoreStrategy,
-                                      UTBotStrategy, WTADXStrategy))]
+                                      UTBotStrategy, WTADXStrategy, KNNStrategy))]
     if not backtestable:
         return
     strat = backtestable[0]
