@@ -17,8 +17,8 @@ Scores 5 momentum conditions per bar (each true = 1 point):
     5. MACD line < Signal
 
 Signal fires on the bar where score first reaches threshold (transition).
-Default threshold = 4 (4 out of 5 must pass).
-SL = 1.5×ATR(14), R:R = 1:1.5
+Default threshold = 5 (all 5 must pass — strictest filter for 1H profitable trades).
+SL = 1.5×ATR(14), R:R = 1:1.4
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -34,11 +34,11 @@ class MomentumScoreStrategy(BaseStrategy):
         super().__init__(symbol, params)
         self.rsi_len     = self.params.get("rsi_len",      14)   # 1H standard RSI
         self.rsi_ema_len = self.params.get("rsi_ema_len",   9)
-        self.ema_len     = self.params.get("ema_len",      100)   # ~4-day trend filter on 1H
+        self.ema_len     = self.params.get("ema_len",      150)   # ~6-day trend filter on 1H
         self.macd_fast   = self.params.get("macd_fast",    12)
         self.macd_slow   = self.params.get("macd_slow",    26)
         self.macd_sig    = self.params.get("macd_signal",   9)
-        self.threshold   = self.params.get("threshold",     4)   # 4 of 5 conditions
+        self.threshold   = self.params.get("threshold",     5)   # 5 of 5 — strictest filter for 1H
         self.sl_atr_mult = self.params.get("sl_atr_mult",  1.5)
         self.rr_ratio    = self.params.get("rr_ratio",     1.4)   # R:R 1.4 → need WR > 42%
 
