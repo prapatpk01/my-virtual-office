@@ -111,6 +111,66 @@ class TradingBot:
         self._task = asyncio.create_task(self._run_loop())
         logger.info("TradingBot started (paper=%s, interval=%ds)", self.connector.paper, self.interval)
 
+    async def close_all_positions(self, reason: str = "shutdown") -> int:
+        """Sell every open position immediately. Returns number of positions closed."""
+        positions = self.risk.get_positions()
+        if not positions:
+            logger.info("No open positions to close on shutdown")
+            return 0
+
+        n = len(positions)
+        logger.info("Graceful shutdown: closing %d open position(s)...", n)
+        if self.telegram:
+            self.telegram.notify(
+                f"🔄 *Bot restarting* — closing {n} open position(s) before shutdown..."
+            )
+
+        closed = 0
+        for pos in list(positions):
+            sym            = pos["symbol"]
+            strategy_name  = pos.get("strategy", "")
+            amount         = pos.get("amount", 0.0)
+            entry          = pos.get("entry", 0.0)
+            if amount <= 0:
+                continue
+            try:
+                ticker = await self.connector.fetch_ticker(sym)
+                price  = ticker["last"]
+                side   = "sell" if pos["side"] == "long" else "buy"
+                await self.connector.create_order(sym, side, amount)
+                pnl = round((price - entry) * amount, 4) if side == "sell" else 0.0
+                self._record_trade(TradeRecord(
+                    timestamp=int(time.time() * 1000),
+                    symbol=sym, side=side,
+                    price=price, amount=amount,
+                    pnl=pnl, strategy=strategy_name,
+                    reason=f"shutdown:{reason}",
+                    paper=self.connector.paper,
+                ))
+                self.risk.close_position(sym, strategy=strategy_name)
+                self._sig.unlock_strategy(sym, strategy_name)
+                closed += 1
+                pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"−${abs(pnl):.2f}"
+                logger.info("Closed %s [%s] @ %.4f  entry=%.4f  pnl=%s",
+                            sym, strategy_name, price, entry, pnl_str)
+                if self.telegram:
+                    self.telegram.notify(
+                        f"✅ *Position closed* (shutdown)\n"
+                        f"`{sym}` [{strategy_name}]\n"
+                        f"SELL @ ${price:,.2f}  Entry ${entry:,.2f}  PnL {pnl_str}"
+                    )
+            except Exception as e:
+                logger.error("Failed to close %s [%s] on shutdown: %s", sym, strategy_name, e)
+                if self.telegram:
+                    self.telegram.notify(
+                        f"⚠️ *Could not close position*\n"
+                        f"`{sym}` [{strategy_name}]: `{str(e)[:120]}`\n"
+                        f"_Please close manually on OKX_"
+                    )
+
+        logger.info("Graceful shutdown: %d/%d positions closed", closed, n)
+        return closed
+
     async def stop(self):
         self.state.running = False
         if self._task:
