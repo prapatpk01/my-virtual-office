@@ -427,13 +427,13 @@ class TradingBot:
 
         leverage = getattr(self.connector, "leverage", 1)
         if self.trade_amount_usdt > 0:
-            # Fixed notional: TRADE_AMOUNT_USDT is the total position size in USDT
-            # (leverage is handled by OKX automatically via set_leverage_for)
-            amount = round(self.trade_amount_usdt / price, 6)
+            # For OKX margin: order the full leveraged BTC amount;
+            # OKX deducts (amount × price / leverage) as collateral automatically.
+            amount = round((self.trade_amount_usdt * leverage) / price, 6)
         else:
-            amount = self.risk.size_position(quote_balance, price)
-        logger.info("[%s] Order attempt: %s BUY %.6f BTC @ %.2f  (trade_usdt=%.1f lev=%dx bal=%.2f)",
-                    strategy_name, sym, amount, price, self.trade_amount_usdt, leverage, quote_balance)
+            amount = self.risk.size_position(quote_balance, price) * leverage
+        logger.info("[%s] Order attempt: %s BUY %.6f BTC @ %.2f  notional=$%.1f (usdt=%.1f × %dx)",
+                    strategy_name, sym, amount, price, amount * price, self.trade_amount_usdt, leverage)
         if amount <= 0:
             logger.info("Position size 0 for %s — tracking virtually", sym)
             if sl_p and tp_p:
