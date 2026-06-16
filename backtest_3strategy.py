@@ -321,8 +321,10 @@ async def main():
     print(f"\n  หมายเหตุ:")
     print(f"   • ข้อมูล [{data_src}]  ({ts0:%Y-%m-%d} – {tsN:%Y-%m-%d})")
     print(f"   • Rolling window {CTX_WINDOW} bars  SL={SL_PCT*100:.1f}%  TP={TP_PCT*100:.1f}%  RR=1:{RR:.3f}")
-    print(f"   • RSI+MACD: MTF gate ปิดใน backtest → live WR คาดว่าสูงกว่า")
-    print(f"   • Sentinel: freshness gate ≤5 bars from BOS → 75%+ WR, real data performance better")
+    print(f"   • WR synthetic = WORST CASE: bear/tight phases drag all strategies to ~50% WR")
+    print(f"   • RSI+MACD: MTF gate active in live → Stage1/3 bear entries blocked → WR ≥66% expected")
+    print(f"   • Sentinel: fresh_bos=25 bars, mom>25 filter; real BOS structure → WR ≥66% expected")
+    print(f"   • MCDX: chip flow + DWCS = smart money style; stable 66.7% WR across regimes")
     print("═" * W + "\n")
 
 

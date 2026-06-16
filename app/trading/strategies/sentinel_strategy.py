@@ -23,13 +23,14 @@ class SentinelStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.min_conf        = self.params.get("min_conf", 62.0)   # BOS + MTF + DWCS alignment
+        self.min_conf        = self.params.get("min_conf", 55.0)    # BOS + MTF + DWCS alignment
         self.min_rr          = self.params.get("min_rr", 1.5)
         self.swing_len       = self.params.get("swing_len", 10)
         self.position_pct    = self.params.get("position_pct", 0.08)
-        self.dwcs_bull_min   = self.params.get("dwcs_bull_min", 57.0)   # DWCS floor for LONG
-        self.dwcs_bear_max   = self.params.get("dwcs_bear_max", 43.0)   # DWCS ceiling for SHORT
-        self.fresh_bos_bars  = self.params.get("fresh_bos_bars", 5)     # max bars since last BOS
+        self.dwcs_bull_min   = self.params.get("dwcs_bull_min", 50.0)   # neutral floor; BOS is primary signal
+        self.dwcs_bear_max   = self.params.get("dwcs_bear_max", 50.0)   # symmetric
+        self.fresh_bos_bars  = self.params.get("fresh_bos_bars", 25)    # bars since last BOS (fresh entry)
+        self.retest_zone     = self.params.get("retest_zone", 0.008)    # HMA retest tolerance (0.8%)
 
     # ------------------------------------------------------------------ #
     # HMA (Hull Moving Average) — [F1] correct formula
@@ -315,6 +316,7 @@ class SentinelStrategy(BaseStrategy):
         hma  = self._hma(closes, 21)
         e9   = self.ema(closes, 9)
         e21  = self.ema(closes, 21)
+        e50  = self.ema(closes, 50)
 
         # RSI, MACD, ADX
         rsi_arr = self.rsi(closes, 14)
@@ -378,6 +380,9 @@ class SentinelStrategy(BaseStrategy):
         curr_dwcs = float(dwcs[i])
         curr_hma  = float(hma[i]) if not np.isnan(hma[i]) else current_price
         curr_atr  = float(atr14[i])
+        curr_e50  = float(np.nan_to_num(e50[i], nan=current_price))
+        # Momentum gate: strong positive momentum confirms active uptrend (filters idle oscillation)
+        mom_positive = curr_mom > 25
 
         # Phases
         mom_str    = abs(curr_mom)
@@ -391,9 +396,9 @@ class SentinelStrategy(BaseStrategy):
         sc_s = float(np.nan_to_num(e9[i]) - np.nan_to_num(e21[i]))
         sc_m = float(np.nan_to_num(e21[i]))  # already captured in mtf_sc
 
-        # BOS state + net-positive MTF required for entry eligibility
-        elong  = curr_mtf >= 0 and ms_trend >= 0
-        eshort = curr_mtf <= 0 and ms_trend <= 0
+        # BOS state drives eligibility; MTF alignment captured in confidence scoring
+        elong  = ms_trend >= 0
+        eshort = ms_trend <= 0
 
         # Entry score
         esc = curr_mtf  # -100..100
@@ -437,9 +442,9 @@ class SentinelStrategy(BaseStrategy):
             econf >= self.min_conf and
             rr_L >= self.min_rr and
             not mom_peak and not mom_fade and
-            current_price > curr_hma and
             curr_rsi < 68 and
-            curr_dwcs >= self.dwcs_bull_min
+            curr_dwcs >= self.dwcs_bull_min and
+            mom_positive                   # positive momentum: confirms active trend, not oscillation
         )
 
         sig_short = (

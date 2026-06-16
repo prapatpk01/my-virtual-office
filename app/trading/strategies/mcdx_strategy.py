@@ -205,7 +205,6 @@ class MCDXStrategy(BaseStrategy):
         conf_pct = abs(curr_dwcs - 50) / 50
 
         # BUY: Golden Cross (strongest) OR DWCS Bull zone cross + volume confirm
-        # Removed: "OS + DWCS neutral" — too noisy, low WR
         dwcs_buy_confirmed = dwcs_buy_signal and rvol >= self.rvol_min
         if golden_cross or dwcs_buy_confirmed:
             reason = "Golden Cross" if golden_cross else f"DWCS Bull zone + RVOL={rvol:.1f}x"
@@ -219,7 +218,6 @@ class MCDXStrategy(BaseStrategy):
             )
 
         # SELL: Death Cross OR DWCS Bear zone cross + volume confirm
-        # Removed: "OB + DWCS weakening" — too noisy
         dwcs_sell_confirmed = dwcs_sell_signal and rvol >= self.rvol_min
         if death_cross or dwcs_sell_confirmed:
             reason = "Death Cross" if death_cross else f"DWCS Bear zone + RVOL={rvol:.1f}x"
