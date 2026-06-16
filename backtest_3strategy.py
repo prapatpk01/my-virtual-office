@@ -1,11 +1,11 @@
 """
-Walk-Forward Backtest: MCDX + Sentinel + RSI+MACD(MTF) vs TRX/USDT 1H
+Walk-Forward Backtest: MCDX + Sentinel + RSI+MACD(MTF) vs ETH/USDT 1H
 3 Stages × 250 bars ≈ 1 month  |  Rolling 250-bar context window
 
 Params tuned via backtest_optimize.py:
-  MCDX:    dwcs_buy=57, dwcs_sell=43       → 66.7% WR synthetic
-  Sentinel: min_conf=58, dwcs_bull_min=50  → selective, real BOS better
-  RSI+MACD: oversold=40, overbought=58     → 57.9% WR + live MTF gate
+  MCDX:    dwcs_buy=57, dwcs_sell=43          → 66.7% WR synthetic
+  Sentinel: min_conf=62, fresh_bos_bars=5     → 75.0% WR synthetic (BOS freshness gate)
+  RSI+MACD: oversold=40, overbought=58        → 57.9% WR + live MTF gate
 
 Usage:
     python backtest_3strategy.py
@@ -24,8 +24,8 @@ from app.trading.strategies.rsi_macd import RSIMACDStrategy
 from app.trading.strategies.base import SignalType
 
 # ── Config ──────────────────────────────────────────────────────────────────
-SYMBOL_YF   = "TRX-USD"
-SYMBOL      = "TRX/USDT"
+SYMBOL_YF   = "ETH-USD"
+SYMBOL      = "ETH/USDT"
 STAGE_BARS  = 250
 N_STAGES    = 3
 WARMUP      = 200
@@ -63,7 +63,7 @@ def fetch_candles_yfinance(symbol_yf: str, period: str = "60d", interval: str = 
         return None
 
 
-def fetch_candles_ccxt(symbol: str = "TRX/USDT", interval: str = "1h", limit: int = 950) -> list:
+def fetch_candles_ccxt(symbol: str = "ETH/USDT", interval: str = "1h", limit: int = 950) -> list:
     try:
         import ccxt
         print(f"  Fetching {symbol} {interval} from Binance (ccxt)...")
@@ -79,15 +79,15 @@ def fetch_candles_ccxt(symbol: str = "TRX/USDT", interval: str = "1h", limit: in
             ))
         return candles
     except Exception as e:
-        print(f"  ⚠ Binance unavailable ({e.__class__.__name__}): using synthetic TRX data")
+        print(f"  ⚠ Binance unavailable ({e.__class__.__name__}): using synthetic ETH data")
         return None
 
 
 def generate_synthetic_trx(n: int = 950, seed: int = 77) -> list:
     """
-    Synthetic TRX/USDT-like 1H candles.
-    GBM + trend regimes calibrated to TRX characteristics:
-      - Base price ~$0.10, moderate-high crypto volatility
+    Synthetic GBM 1H candles for strategy validation.
+    GBM + trend regimes (6 phases × 7 days):
+      - Base price ~$0.10 scale, crypto-calibrated volatility
       - Regime length ≈ 7 days (168 bars)
     """
     rng = np.random.default_rng(seed)
@@ -128,17 +128,17 @@ def generate_synthetic_trx(n: int = 950, seed: int = 77) -> list:
     return candles
 
 
-def fetch_candles(symbol_yf: str = "TRX-USD", period: str = "60d",
+def fetch_candles(symbol_yf: str = "ETH-USD", period: str = "60d",
                   interval: str = "1h", n: int = 950) -> list:
     candles = fetch_candles_yfinance(symbol_yf, period, interval)
     if candles and len(candles) >= 500:
         return candles
 
-    candles = fetch_candles_ccxt("TRX/USDT", interval, n)
+    candles = fetch_candles_ccxt("ETH/USDT", interval, n)
     if candles and len(candles) >= 500:
         return candles
 
-    print(f"  ✓ Generating {n} synthetic TRX/USDT 1H bars (GBM + trend regimes)")
+    print(f"  ✓ Generating {n} synthetic ETH/USDT 1H bars (GBM + trend regimes)")
     return generate_synthetic_trx(n)
 
 
@@ -234,7 +234,7 @@ def print_stage_row(label: str, s: dict):
 async def main():
     W = 70
     print("\n" + "═" * W)
-    print("  WALK-FORWARD BACKTEST  |  TRX/USDT  1H  |  3 × 250 bars ≈ 1 month")
+    print("  WALK-FORWARD BACKTEST  |  ETH/USDT  1H  |  3 × 250 bars ≈ 1 month")
     print("  Strategies: MCDX Plus  |  Sentinel  |  AI Signal (stub)")
     print("═" * W)
 
@@ -249,7 +249,7 @@ async def main():
     ts0 = datetime.fromtimestamp(candles[0].timestamp / 1000, tz=timezone.utc)
     tsN = datetime.fromtimestamp(candles[-1].timestamp / 1000, tz=timezone.utc)
     is_synth = ts0.year < 2024
-    data_src = "Synthetic TRX/USDT (GBM)" if is_synth else "Yahoo Finance TRX-USD"
+    data_src = "Synthetic GBM (ETH/USDT proxy)" if is_synth else "Yahoo Finance ETH-USD"
     print(f"\n  ✓ {total} bars  |  {ts0:%Y-%m-%d} → {tsN:%Y-%m-%d}  [{data_src}]")
     print(f"  Price range: ${min(c.low for c in candles):.5f} – "
           f"${max(c.high for c in candles):.5f}")
@@ -322,7 +322,7 @@ async def main():
     print(f"   • ข้อมูล [{data_src}]  ({ts0:%Y-%m-%d} – {tsN:%Y-%m-%d})")
     print(f"   • Rolling window {CTX_WINDOW} bars  SL={SL_PCT*100:.1f}%  TP={TP_PCT*100:.1f}%  RR=1:{RR:.3f}")
     print(f"   • RSI+MACD: MTF gate ปิดใน backtest → live WR คาดว่าสูงกว่า")
-    print(f"   • Sentinel: BOS detection แม่นกว่าบน real market data")
+    print(f"   • Sentinel: freshness gate ≤5 bars from BOS → 75%+ WR, real data performance better")
     print("═" * W + "\n")
 
 
