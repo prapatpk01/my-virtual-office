@@ -212,6 +212,14 @@ class TelegramNotifier:
         )
         self.notify(text)
 
+    def notify_order_error(self, symbol: str, strategy: str, error: str):
+        text = (
+            f"⚠️ *Order Failed* 💰 LIVE\n"
+            f"`{symbol}` [{strategy}]\n"
+            f"Error: `{error[:200]}`"
+        )
+        self.notify(text)
+
     def notify_drawdown_halt(self, balance: float, peak: float):
         dd = (peak - balance) / peak * 100
         text = (

@@ -464,6 +464,8 @@ class TradingBot:
                                            strategy_name, self.connector.paper)
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
+            if self.telegram:
+                self.telegram.notify_order_error(sym, strategy_name, str(e))
             self._sig.unlock_strategy(sym, strategy_name)
 
     async def _refresh_balance(self):
