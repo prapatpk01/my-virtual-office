@@ -330,7 +330,8 @@ async def main():
 
     await _stop_signal.wait()
 
-    logger.info("Stopping all bots — open positions saved, will restore after restart")
+    logger.info("Stopping all bots — closing open positions before shutdown...")
+    await crypto_bot.close_all_positions(reason="restart")
     await crypto_bot.stop()
     if forex_bot:
         await forex_bot.stop()
