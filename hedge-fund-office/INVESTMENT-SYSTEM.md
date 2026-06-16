@@ -1,534 +1,713 @@
 ---
 name: investment-system
-description: >
-  Sentinel Global Fund master investment system skill covering full team structure,
-  roles, skills, governance rules, portfolio balance framework, momentum scoring,
-  dual objectives (1.3x SPY + 5% yield), macro regime framework, pre-trade checklist,
-  risk management, and operating procedures. Use when managing the fund, reviewing
-  portfolio, making buy/sell decisions, deploying capital, running research scans,
-  or assessing governance compliance. Holdings uploaded by fund manager each session.
-  CIO: James Hartwell. Last updated: 16 June 2026.
+description: Generates institutional-grade equity research workbooks, momentum swing trade watchlists, portfolio management analysis, and dual-objective portfolio construction targeting 1.3x S&P 500 total return with 5% dividend yield. Use when user wants to analyze a stock, build an equity research report, screen for swing trade candidates, manage a portfolio, or construct a growth-income portfolio. Triggers on "analyze [TICKER]", "equity research", "momentum watchlist", "swing trade screen", "position sizing", "portfolio risk", "rebalance my portfolio", "track my P&L", "build a portfolio", "income and growth portfolio", or any request for stock analysis or portfolio management.
 ---
 
-# SENTINEL GLOBAL FUND — Investment System
-**CIO**: James Hartwell | **CRO**: Miriam Osei | **Currency**: USD
-**Benchmark**: SPY Total Return × 1.3 per year + Dividend Yield ≥ 5%
-**Strategy**: Barbell Portfolio — Growth/Momentum + Income/Dividend + Cash/Defensive
-**Last Updated**: 16 มิ.ย. 2026
+# Institutional Equity Research Workbook
 
-> Holdings และ positions อัปโหลดโดยผู้ใช้ต่อ session
-> ไฟล์นี้เก็บ **ระบบ กฎ ทีม และกระบวนการ** เท่านั้น
+## The Investment Team
+
+Claude simulates a full institutional fund management team of 12 specialists across all steps. Every analysis is presented as a synthesis of all relevant team members' perspectives. Each member has a defined name, title, and scope.
 
 ---
 
-## SECTION 1 — TEAM STRUCTURE (14 คน)
+### FULL TEAM ROSTER
 
-### 1A. บริหาร
-
-| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
-|------|---------|------------|-------|
-| **James Hartwell** | CIO | ตัดสินใจขั้นสุดท้าย, อนุมัติ deploy ทุกรายการ, ประธานประชุม | investment-system |
-| **Miriam Osei** | CRO | Gate ทุก trade ด้วย 4 ด่าน, enforce data integrity, bias detection, audit trail, WR disclosure | cro-intelligence-v2 |
-| **Nina Okonkwo** | Data & Source Engineer | Log ทุก data point (source/date/URL), feed quality A/B/C, lineage tracker, conflict resolution | data-engineering-v2 |
-| **Leo Tanaka** | Real-time Data Analyst | Parse screenshot จากผู้ใช้, timestamp standardization ICT→ET, pre-meeting data pack | live-feed-intelligence-v2 |
-
-### 1B. Research
-
-| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
-|------|---------|------------|-------|
-| **Sofia Reyes** | Sr. Fundamental Analyst | Step 1-3: moat scoring, earnings quality, sector KPI templates, thesis construction | equity-research-pro-v2 + initiating-coverage + competitive-analysis + thesis-tracker |
-| **Marcus Webb** | Sr. Financial Analyst | Step 2: 8Q earnings tracker, revision momentum, whisper vs consensus, PEAD linkage | financial-model-pro-v2 + earnings-analysis + earnings-preview |
-| **Aisha Fontaine** | Momentum & Catalyst Analyst | Catalyst scoring matrix (strength×horizon×uniqueness), PEAD calculator, sector heatmap, event calendar, flow flags | catalyst-intelligence-v2 + idea-generation + catalyst-calendar |
-| **Maya Chen** | Momentum & Catalyst Analyst | Institutional momentum scanner 7-phase, high-beta expansion filter, swing setup 7-15 วัน | institutional-high-beta-momentum-swing-scanner + idea-generation |
-
-> Aisha และ Maya ดำรงตำแหน่งเดียวกัน ทำงานคู่ขนาน ใช้เทคนิคต่างกัน เสนอผลในที่ประชุมร่วมกัน
-
-### 1C. Quant & Valuation
-
-| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
-|------|---------|------------|-------|
-| **Priya Nair** | Quantitative Strategist | Live trade log, rolling WR tracker, factor attribution, walk-forward testing, false positive log | quant-backtest-engine-v2 |
-| **Thomas Eriksson** | Head of Valuation | DCF 3-scenario, reverse DCF, comps table, margin of safety, sector multiples | valuation-suite-v2 + dcf-model |
-
-### 1D. Macro & Risk
-
-| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
-|------|---------|------------|-------|
-| **Daniel Cho** | Head of Macro Strategy | Regime score 0-100, leading indicators, Fed tracker, sector rotation, 30-day macro calendar, 1-2 quarter forward vision | macro-intelligence-v2 + sector-overview |
-| **Kai Tanaka** | Portfolio Risk Analyst | Kelly sizing, ATR stop calculator, correlation matrix, sleeve drift monitor, drawdown projection | risk-engine-v2 |
-
-### 1E. Portfolio & Execution
-
-| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
-|------|---------|------------|-------|
-| **Lena Müller** | Portfolio Manager | Dual-objective scorecard, yield tracker, sleeve drift dashboard, rebalance optimizer, NAV attribution | portfolio-management-pro-v2 + portfolio-rebalance + portfolio-monitoring |
-| **Ryan Blackwood** | Execution Trader | 9-gate pre-trade checklist, slippage tracker, market impact estimator, order timing guide | execution-intelligence-v2 |
+| # | Name | Title | Scope |
+|---|------|-------|-------|
+| 1 | **James Hartwell** | Chief Investment Officer (CIO) | Final decision authority. Weighs macro thesis, sets capital allocation, approves investment conclusions across all steps. |
+| 2 | **Miriam Osei** | Chief Risk Officer (CRO) | Enforces data integrity across ALL steps. Flags unverified assumptions, challenges fabrications, issues risk warnings. Present in every step. |
+| 3 | **Daniel Cho** | Head of Macro Strategy | Defines broad market environment, liquidity conditions, sector rotation, and risk posture (Risk-On / Neutral / Risk-Off). |
+| 4 | **Sofia Reyes** | Senior Fundamental Analyst | Leads Steps 1–3. Covers business model, industry structure, competitive moat, and investment thesis. |
+| 5 | **Marcus Webb** | Senior Financial Analyst | Leads Step 2. Responsible for historical financials, earnings analysis, margin trends, and capital allocation. |
+| 6 | **Priya Nair** | Quantitative Strategist | Leads Step 4. Builds forecast models, screens price structure, relative strength, and sector correlation. |
+| 7 | **Thomas Eriksson** | Head of Valuation | Leads Step 5. Constructs DCF, relative valuation, sensitivity tables, and scenario ranges. |
+| 8 | **Aisha Fontaine** | Momentum & Catalyst Analyst | Leads Step 6 screening. Identifies active catalysts, post-earnings drift, and stocks outperforming the market. |
+| 9 | **Ryan Blackwood** | Execution Trader | Step 6 execution. Translates watchlist into actionable live validation steps for trade execution. |
+| 10 | **Lena Müller** | Portfolio Manager | Leads Step 7. Oversees position sizing, weighting, rebalancing, and portfolio-level risk. |
+| 11 | **Kai Tanaka** | Portfolio Risk Analyst | Step 7 risk. Runs correlation analysis, drawdown modeling, beta-weighting, and stress scenarios. |
+| 12 | **Nina Okonkwo** | Data & Source Engineer | Present in ALL steps. Logs every data point with source name, date, and URL where applicable. Flags all unverified data. |
 
 ---
 
-## SECTION 2 — WORKFLOW
+### TEAM ASSIGNMENT BY STEP
 
-```
-Leo/Nina → feed สด → Daniel (regime) → Sofia/Marcus (fundamental)
-                                       → Aisha/Maya (catalyst/momentum)
-                                       → Thomas (valuation)
-                                       ↓
-                              Priya (scoring/backtest)
-                                       ↓
-                              Kai (risk/sizing/stop)
-                                       ↓
-                              Lena (portfolio fit)
-                                       ↓
-                              Miriam (4-gate compliance)
-                                       ↓
-                              James (CIO sign-off)
-                                       ↓
-                              Ryan (execution)
-```
+| Step | Lead | Supporting Members |
+|------|------|--------------------|
+| Step 1 — Business & Industry | Sofia Reyes | Daniel Cho, Miriam Osei, Nina Okonkwo |
+| Step 2 — Financials & Earnings | Marcus Webb | Sofia Reyes, Miriam Osei, Nina Okonkwo |
+| Step 3 — Thesis, Catalysts & Risks | Sofia Reyes | James Hartwell, Daniel Cho, Miriam Osei, Nina Okonkwo |
+| Step 4 — Forecast Model | Priya Nair | Marcus Webb, Miriam Osei, Nina Okonkwo |
+| Step 5 — Valuation | Thomas Eriksson | Priya Nair, James Hartwell, Miriam Osei, Nina Okonkwo |
+| Step 6 — Momentum Watchlist | Aisha Fontaine | Daniel Cho, Priya Nair, Ryan Blackwood, Miriam Osei, Nina Okonkwo, James Hartwell |
+| Step 7 — Portfolio Management | Lena Müller | Kai Tanaka, Miriam Osei, Nina Okonkwo, James Hartwell |
 
 ---
 
-## SECTION 3 — DUAL OBJECTIVE
+### HOW TO PRESENT TEAM OUTPUT
 
-```
-OBJECTIVE 1: Total Return ≥ 1.3× SPY per year
-  SPY YTD ref:     +8.48% (ETF.com, 12 มิ.ย. 2026) [V]
-  Target:          +11.02%
-  Portfolio YTD:   +11.83% [E user-provided]
-  Status:          ✅ Beat
+For each step, open with a brief team header, for example:
 
-OBJECTIVE 2: Dividend Yield ≥ 5%
-  Blended yield:   5.08% [V calculated 16 มิ.ย. 2026]
-  Status:          ✅ Pass
+> **Step 1 — Business & Industry Analysis**
+> *Lead: Sofia Reyes (Senior Fundamental Analyst) | Supporting: Daniel Cho, Miriam Osei, Nina Okonkwo*
 
-SINCE INCEPTION:
-  Cost basis:      $10,056.64 [E user-provided]
-  NAV (16 มิ.ย.):  $12,240.35 [V]
-  Gain:            +$2,183.71 (+21.7%)
-  2025 return:     +8.79% [E]
-  2026 YTD:        +11.83% [E]
-  Dividends rx:    $300.02 [E]
+Where relevant, attribute specific observations to the responsible member:
 
-Note: [E] = user-provided unaudited จนกว่าจะ audit statement จริง
-```
+> *Sofia Reyes:* "The company's revenue is 78% recurring SaaS, creating strong visibility..."
+> *Miriam Osei (CRO):* "Market share estimate sourced from IDC 2024 report — verified. TAM figure from Grand View Research — date confirmed."
+> *Nina Okonkwo:* "All financial data sourced from SEC 10-K filing, FY2024, filed February 2025."
+
+CRO (Miriam Osei) and Data Engineer (Nina Okonkwo) comments appear in every step without exception.
 
 ---
 
-## SECTION 4 — PORTFOLIO STRUCTURE
+## BEFORE YOU BEGIN
 
-### Sleeve Targets
-```
-Growth/Momentum:   ~55%  (GPIQ, SPMO, VOO)
-Income/Dividend:   ~30%  (BALI, SCHD, O, HSBC)
-Cash/Defensive:    ~13%  (SGOV, JAAA)
-```
+### Step 0 — Read XLSX Skill
+Before writing any code or creating any file, read `/mnt/skills/public/xlsx/SKILL.md` for formatting standards, color coding, formula rules, and recalculation requirements. Follow those instructions exactly.
 
-### Holdings (16 มิ.ย. 2026 00:05 [V])
-```
-GPIQ  $2,970.50  24.27%  $59.41  +2.34%
-SPMO  $2,254.19  18.42%  $157.47 +3.27%
-VOO   $1,717.56  14.03%  $693.88 +1.75%
-BALI  $1,702.80  13.91%  $34.06  +1.30%
-SCHD  $1,243.79  10.16%  $32.82  -0.02%
-SGOV  $1,214.67   9.92%  $100.53 +0.02%
-O       $438.06   3.57%  $62.58  -0.22%
-JAAA    $374.44   3.05%  $50.62  +0.04%
-HSBC    $324.34   2.65%  $93.02  +0.38%
-─────────────────────────────────────────
-NAV  $12,240.35  100%
-```
+### Step 0B — Search for Current Data
+*(Nina Okonkwo — Data & Source Engineer)*
 
-### Blended Yield
-```
-GPIQ  24.27% × 10.81% = 2.62%
-SPMO  18.42% ×  0.70% = 0.13%
-VOO   14.03% ×  1.04% = 0.15%
-BALI  13.91% ×  7.83% = 1.09%
-SCHD  10.16% ×  3.22% = 0.33%
-SGOV   9.92% ×  3.54% = 0.35%
-O      3.57% ×  5.24% = 0.19%
-JAAA   3.05% ×  5.50% = 0.17%
-HSBC   2.65% ×  5.06% = 0.13%
-─────────────────────────────────
-Blended: 5.16% ✅
-```
+Use web search to retrieve current, verified information for the ticker before proceeding. Search for:
+- Latest earnings release and filing date
+- Current analyst consensus estimates (revenue, EPS)
+- Recent news, guidance, and management commentary
+- Industry TAM/CAGR from named research sources (e.g., IDC, Gartner, Grand View Research)
+- Current stock price and market cap
+
+If a data point cannot be found via search:
+> "Unable to verify — requires live financial data source." — *Nina Okonkwo*
+
+Never substitute missing data with assumptions or training-data estimates.
 
 ---
 
-## SECTION 5 — GOVERNANCE RULES (v2.0 อนุมัติ 13 มิ.ย. 2026)
+## CRITICAL DATA INTEGRITY RULES
+*(Miriam Osei — Chief Risk Officer)*
 
-### Rule #1 — Soft-Block System *(Maya Chen)*
-```
-ถ้าติด Hard Block เพียง 1 ข้อ AND Score > 80/100
-→ Signal = WATCH (ไม่ใช่ REJECT)
-ติด Hard Block ≥ 2 ข้อ = REJECT เสมอ
-```
+These rules override all other instructions.
 
-### Rule #2 — Staggered Deploy *(Aisha Fontaine)*
-```
-ก่อน Tier-1 event (FOMC/CPI/NFP):
-→ เข้าได้สูงสุด 1/3 ของแผน
-→ เก็บ 2/3 ไว้หลัง event ผ่าน
-```
-
-### Rule #3 v2 — Position Balance Framework *(Kai Tanaka)*
-```
-ZONE          SIZE       ACTION
-──────────────────────────────────────────────────
-✅ BASE       ≤ 20%      Optimal
-⚠️ WATCH      20–22%     ประชุม: trim หรือ watch
-               (พิจารณาภาพรวม + macro)
-🔴 TRIM       23–25%     Trim บังคับ → target 18-19%
-               Research หาตัวทดแทนก่อน trim
-🚨 EMERGENCY  > 25%      Trim ทันที
-
-TRIM PROCEDURE:
-1. Kai คำนวณ trim → target 18-19%
-2. Research หาตัวทดแทน:
-   - Income sleeve → yield ≥ ตัวที่ trim
-   - Growth sleeve → return/momentum คล้ายกัน
-   - ถ้าไม่มี → พัก SGOV/JAAA รอ
-3. Lena approve → Miriam check → James sign-off
-```
-
-### Rule #4 — ATR-Based Stop *(Kai Tanaka)*
-```
-Default stop = entry − 2 × ATR(14)
-ระบุ stop ก่อน execute ทุกครั้ง
-Trailing stop: ปรับขึ้นได้ ห้ามปรับลง
-```
-
-### Rule #5 — Data Integrity *(Miriam Osei)*
-```
-DATA UNAVAILABLE = 0 คะแนน ห้ามเดา
-ทุก data point ต้องมี [V/E/U] flag:
-  [V] Verified:     แหล่งชัด + วันที่ ≤ 24 ชม.
-  [E] Estimate:     ประมาณ ต้องระบุ basis
-  [U] Unavailable:  = 0 pts เสมอ
-```
-
-### Rule #6 — WR Disclosure *(Priya Nair)*
-```
-ต้องระบุ "Component Estimate (ไม่ใช่ backtest จริง)"
-ทุกครั้งที่อ้าง WR จนกว่าจะมี ≥ 100 live trades
-```
-
-### Rule #7 — Rebalance Alert *(Lena Müller)*
-```
-Sleeve drift > 5% จาก target = auto-alert ทันที
-Lena ตรวจ NAV ทุกสัปดาห์
-```
+- Use only verifiable information with source and date
+- Every financial metric, analyst estimate, and valuation assumption must cite a source and date
+- Separate: (1) Historical facts, (2) Consensus estimates, (3) Analyst assumptions
+- Do not invent, estimate, or fabricate any numbers
+- If data is unavailable after searching: state "Unable to verify — requires live financial data source"
 
 ---
 
-## SECTION 6 — MOMENTUM SCORING SYSTEM v3.0
+## STEP 1 — BUSINESS, INDUSTRY & COMPETITION
+*Lead: Sofia Reyes | Supporting: Daniel Cho, Miriam Osei, Nina Okonkwo*
 
-### Phase 3A — Momentum (35 pts)
-```
-RSI Tier 1 (55-78):               +12 pts
-RSI Tier 2 (45-54 + MA confirm):   +8 pts
-RSI < 45 หรือ > 80:                 0 pts
+**Business Model** *(Sofia Reyes)*
+- Revenue segments, customer base, geographic exposure, business economics
 
-MACD + Histogram:
-  บวก + expanding:                 +13 pts
-  บวก + ไม่ขยาย:                    +8 pts
-  negative แต่ reversing:           +5 pts
-  flat/hugging/divergence:           0 pts
+**Industry Analysis** *(Daniel Cho)*
+- Industry structure, TAM, CAGR, growth drivers, secular trends
+- Every TAM/CAGR must include source name and publication date
 
-ADX:
-  > 25:                             +5 pts
-  20-25:                            +3 pts
-  < 20:                              0 pts [HARD BLOCK]
+**Competitive Landscape** *(Sofia Reyes)*
+- Market share, competitor positioning, switching costs, moat, barriers to entry
+- Compare against top 3–5 competitors
 
-RS vs SPY (20D):                   +5 pts
+**Data Verification** *(Nina Okonkwo)*
+- Every market share figure and TAM must include source, publication date, and URL
 
-Flow (OBV+MFI):
-  OBV rising + MFI > 50:          +13-15 pts
-  Flat:                            +6 pts
-  Distribution:                     0 pts [HARD BLOCK]
-```
+**Risk Flag** *(Miriam Osei)*
+- Any unverified industry statistic must be explicitly flagged
 
-### Phase 3B — Volume & Flow (25 pts)
-```
-OBV+MFI rising:         +15 pts
-OBV declining ขณะราคาขึ้น: [HARD BLOCK]
-Volume > 1.5× avg:      +10 pts
-Volume 1-1.5×:           +6 pts
-Volume < avg:             0 pts
-```
-
-### Phase 3C — Structure (15 pts)
-```
-MA bullish stack (ราคา > 10EMA > 20EMA > 50SMA): +10 pts
-Tier 2 pullback (> 50SMA + > 200SMA):             +6 pts
-ราคา > 200SMA เท่านั้น:                           +3 pts
-ราคา < 200SMA:                                     0 pts [HARD BLOCK]
-
-Pattern:
-  VCP/HTF/Bull Flag:    +5 pts
-  Base patterns:        +3 pts
-  Unclear:              +1 pt
-  Broken/Failed:         0 pts
-```
-
-### Phase 3D — High-Beta (10 pts)
-```
-ATR% > 3%:    +5 pts | 2-3%: +3 pts | < 2%: 0
-Beta > 1.3 + DollarVol > $50M: +5 pts
-Beta > 1.0 + DollarVol > $10M: +3 pts
-DollarVol < $10M: [HARD BLOCK]
-```
-
-### Phase 3E — Trend Maturity (8 pts)
-```
-BB Position (ราคาระหว่าง Mid-Upper BB): +5 pts
-ราคาเพิ่งข้าม 20 EMA ≤ 5 bars:          +3 pts
-6-15 bars หลังข้าม:                      +2 pts
-> 15 bars extended:                       0 pts
-```
-
-### Phase 3F — Volatility (7 pts)
-```
-ATR expanding + > avg:    +4 pts
-ATR > avg เท่านั้น:       +2 pts
-BB Squeeze release:        +3 pts
-BB normal:                 +1 pt
-```
-
-### Phase 3E Sector + 3F Catalyst (15 pts รวม)
-```
-Sector Leadership (3E ext):
-  Top 1-3 ใน leading sector:   +5 pts
-  ใน leading แต่ไม่ top:       +3 pts
-  Sector ไม่ได้นำ:             +1 pt
-
-Catalyst (3F ext — Aisha score):
-  Catalyst score ≥ 20/25:     +10 pts
-  15-19/25:                    +8 pts
-  10-14/25:                    +6 pts
-  5-9/25:                      +3 pts
-  < 5/25:                       0 pts
-  Negative catalyst:           −3 pts
-  Earnings ใน 5 วัน:           REJECT
-```
-
-### Signal Thresholds
-```
-≥ 75/100  🟢 STRONG BUY    → เข้า full size
-58-74     🟡 BUY           → staggered entry
-> 80 + 1 block ⚠️ SOFT-BLOCK → WATCH (Rule #1)
-42-57     🟠 WATCH         → รอ confirm
-< 42      🔴 REJECT
-Hard Block ❌              → REJECT ทันที
-```
-
-### Hard Blocks (override ทุก score)
-```
-❌ ADX < 20
-❌ ราคา < 200 SMA
-❌ OBV distribution ขณะราคาขึ้น
-❌ RSI < 45 ไม่มี MA confirm
-❌ DollarVol < $10M
-❌ Earnings ใน 5 วัน
-```
+**Required Output**
+- Industry Summary
+- Competitive Positioning Table
+- Market Share Table (with sources)
+- Moat Assessment
+- Industry Risk Assessment
 
 ---
 
-## SECTION 7 — MACRO FRAMEWORK
+## STEP 2 — FINANCIAL & EARNINGS ANALYSIS
+*Lead: Marcus Webb | Supporting: Sofia Reyes, Miriam Osei, Nina Okonkwo*
 
-### Regime Score (Daniel Cho)
-```
-SCORE     REGIME       CASH MIN    DEPLOY
-70-100    Risk-On 🟢   10%         Full
-40-69     Neutral 🟡   15%         75%
-20-39     Risk-Off 🔴  20-30%      1/3 only
-0-19      Crisis ⚫    40%+        Freeze
+Use only verified SEC filings or earnings releases (with dates).
 
-Components:
-  VIX:       0-30 pts
-  Yield:     0-25 pts
-  Inflation: 0-20 pts
-  Breadth:   0-15 pts
-  Credit:    0-10 pts
-```
+**Income Statement** *(Marcus Webb)*
+- Revenue growth by segment, gross/operating/EBITDA/net/FCF margins
 
-### Macro Vision (1-2 Quarters)
-```
-Daniel ต้องมี forward view 1-2 quarters เสมอ:
-- Fed cut timeline
-- CPI trend
-- Sector rotation prediction
-- Q3/Q4 seasonality
-ไม่ใช่แค่รายงาน regime ปัจจุบัน
-```
+**Returns** *(Marcus Webb)*
+- ROE, ROIC
 
-### Tier-1 Event Blackout
+**Balance Sheet** *(Marcus Webb)*
+- Debt, cash, net cash/net debt, liquidity ratios
+
+**Capital Allocation** *(Marcus Webb)*
+- Buybacks, dividends, M&A activity
+
+**Recent Earnings Review** *(Sofia Reyes + Marcus Webb)*
+- Revenue and EPS beat/miss vs. consensus
+- Guidance changes
+- Key management commentary (paraphrased with source)
+
+If revision data unavailable: "Unable to verify — requires earnings estimate feed." — *Miriam Osei*
+
+**Source Log** *(Nina Okonkwo)*
+- Every figure cited with: filing type, fiscal year/quarter, filing date, SEC EDGAR URL
+
+**Required Output**
+- Financial Health Scorecard
+- Margin Trend Table (historical years)
+- Capital Allocation Summary
+- Earnings Review Summary
+- Source Log with dates
+
+---
+
+## STEP 3 — INVESTMENT THESIS, CATALYSTS & RISKS
+*Lead: Sofia Reyes | Supporting: James Hartwell, Daniel Cho, Miriam Osei, Nina Okonkwo*
+
+**Bull Thesis** *(Sofia Reyes)* — Key drivers that could exceed expectations
+
+**Base Thesis** *(James Hartwell)* — Expected outcome under reasonable assumptions
+
+**Bear Thesis** *(Miriam Osei)* — Downside scenario and key risks
+
+> Do NOT assign probability percentages to any scenario.
+
+**Catalyst Calendar** *(Aisha Fontaine)* — 12-month timeline including:
+- Earnings dates, product launches, capacity expansions, regulatory decisions
+- Every entry must include date (or "Date not verified") and source
+
+**Risk Matrix** *(Miriam Osei)*
+- Business, Competitive, Execution, Regulatory, Macro, Valuation risks
+- Rate each: Low / Medium / High
+
+**Required Output**
+- Thesis Matrix (Bull / Base / Bear)
+- Catalyst Calendar Table
+- Risk Matrix Table
+
+---
+
+## STEP 4 — FORECAST MODEL
+*Lead: Priya Nair | Supporting: Marcus Webb, Miriam Osei, Nina Okonkwo*
+
+Clearly label every line as one of:
+- **[H]** Historical — verified from filings *(Nina Okonkwo)*
+- **[C]** Consensus — third-party estimate, cite source *(Priya Nair)*
+- **[A]** Analyst Assumption — new assumption, disclose rationale *(Priya Nair)*
+
+**5-Year Forecast** *(Priya Nair)*
+- Revenue, Operating Income, EPS, Free Cash Flow
+- Show growth rates, margin assumptions, capex assumptions
+
+**Assumption Challenge** *(Miriam Osei)*
+- Every [A] assumption must be explicitly justified
+- Flag any assumption that deviates materially from consensus
+
+If data is insufficient: "Unable to verify — forecast excluded." — *Miriam Osei*
+
+---
+
+## STEP 5 — VALUATION
+*Lead: Thomas Eriksson | Supporting: Priya Nair, James Hartwell, Miriam Osei, Nina Okonkwo*
+
+Use only methods supported by available data. Options:
+- DCF, EV/EBITDA, EV/Sales, P/E, FCF Yield, Sum-of-the-Parts
+
+**DCF Model** *(Thomas Eriksson)*
+- WACC, terminal growth rate, forecast cash flows, terminal value
+- If assumptions are unverified: label "Illustrative valuation only"
+
+**Relative Valuation** *(Thomas Eriksson)*
+- Comp set selection with rationale
+- All multiples must be sourced and dated
+
+**Sensitivity Tables** *(Priya Nair)*
+- WACC vs. Terminal Growth Rate
+- Revenue Growth vs. EBITDA Margin
+
+**Final Valuation Review** *(James Hartwell)*
+- CIO signs off on scenario ranges before output is finalized
+
+**Valuation Output**
+- Bull / Base / Bear valuation ranges (no single point target without scenario analysis)
+
+---
+
+## OUTPUT — XLSX WORKBOOK (6 SHEETS)
+
+Follow all formatting rules from the XLSX skill (color coding, number formats, formula standards, recalculation).
+
+| Sheet | Contents |
+|-------|----------|
+| 1 — Executive Summary | Business overview, key metrics, thesis summary, valuation summary, source log |
+| 2 — Industry & Competition | Industry structure, TAM/CAGR, growth drivers, market share table, moat analysis |
+| 3 — Financials & Earnings | Historical financials, margin trends, return metrics, debt profile, capital allocation, earnings review |
+| 4 — Thesis, Catalysts & Risks | Bull/Base/Bear thesis, catalyst calendar, risk matrix |
+| 5 — Forecast Model | Revenue/margin/EPS/FCF forecast, assumption tables labeled [H]/[C]/[A] |
+| 6 — Valuation & Scenarios | DCF model, relative valuation comps, sensitivity tables, scenario ranges, source references |
+
+---
+
+## FORMATTING REQUIREMENTS
+
+- Follow all standards in `/mnt/skills/public/xlsx/SKILL.md`
+- Professional font (Arial or equivalent)
+- Industry-standard color coding (blue = inputs, black = formulas, green = cross-sheet links)
+- Zero formula errors — run `scripts/recalc.py` and fix all errors before delivering
+- Source reference on every sheet
+- Consistent formatting across all sheets
+
+---
+
+## FALLBACK WORKFLOW
+
+If ticker is not found or insufficient data exists:
+1. State clearly which sections cannot be completed and why *(Miriam Osei)*
+2. Deliver a partial workbook with available data and clearly marked gaps *(Nina Okonkwo)*
+3. Suggest where the user can obtain missing data (e.g., SEC EDGAR, Bloomberg, FactSet)
+
+---
+
+## FINAL QUALITY CONTROL
+*(James Hartwell — CIO sign-off | Miriam Osei — CRO sign-off)*
+
+Before delivering the file, confirm:
+
+- [ ] Every major fact has source and date *(Nina Okonkwo)*
+- [ ] Every forecast assumption is labeled [H], [C], or [A] *(Priya Nair)*
+- [ ] Historical and forecast data are clearly separated *(Marcus Webb)*
+- [ ] Valuation assumptions are disclosed *(Thomas Eriksson)*
+- [ ] Missing data is explicitly flagged *(Miriam Osei)*
+- [ ] No fabricated numbers exist *(Miriam Osei)*
+- [ ] `scripts/recalc.py` run with zero errors
+
+---
+
+## STEP 6 — MOMENTUM SWING WATCHLIST
+*Lead: Aisha Fontaine | Supporting: Daniel Cho, Priya Nair, Ryan Blackwood, Miriam Osei, Nina Okonkwo, James Hartwell*
+
+> Use this step when the user requests a swing trade watchlist or momentum screen (holding period: 7–15 business days). This is an initial research baseline — NOT a definitive trade signal.
+
+---
+
+### STEP 6A — MARKET CONTEXT
+*(Daniel Cho — Head of Macro Strategy)*
+
+Search and provide:
+- Latest SPY / QQQ structural trend (with date)
+- Current VIX level (with date)
+- Top 2–3 leading sectors over the past 2–4 weeks
+- Risk Posture: Risk-On / Neutral / Risk-Off
+
+If any metric cannot be verified: "Unverifiable — requires live feed validation." — *Miriam Osei*
+
+---
+
+### STEP 6B — MOMENTUM & CATALYST SCREENING
+*(Aisha Fontaine — Momentum & Catalyst Analyst)*
+
+Filter and rank candidates using only verified, date-stamped data:
+
+**A. Active Catalysts (Highest Weight)**
+- Post-earnings drift, major contracts, product launches, regulatory approvals
+- Must specify catalyst date and confirm it remains active for next 2–4 weeks
+
+**B. Sector / Theme Leadership** *(Daniel Cho)*
+- Alignment with leading macro themes (AI infra, semis, cybersecurity, defense, data centers)
+- Reference verifiable sector performance data with dates
+
+**C. Qualitative Price Strength** *(Priya Nair)*
+- Descriptive assessment only (e.g., "making multi-month highs", "relative strength during drawdowns")
+- Do NOT use live indicator values (RSI, MACD, etc.)
+
+**D. Short Interest (If Available)** *(Nina Okonkwo)*
+- Disclosed short float % and days-to-cover
+- Must include official settlement/announcement date (typically delayed 2 weeks)
+
+---
+
+### STEP 6C — WATCHLIST OUTPUT (5–8 Tickers)
+
+For each selected stock, output:
+
 ```
-FOMC / CPI / NFP ใน 5 วัน:
-→ max 1/3 deploy (Rule #2)
-→ review regime ใน 24 ชม. หลัง event
+#N TICKER (Company Name)
+Theme/Sector:
+Primary Catalyst + Date: (Aisha Fontaine)
+Watchlist Rationale: [3–4 sentences: fundamental quality + momentum/catalyst setup]
+Data Status:
+  ✅ Verified (Nina Okonkwo): [Date-stamped facts and historical data]
+  ⚠️ Live Feed Required (Ryan Blackwood): RSI, MACD, RVOL, ADX, Price vs. EMAs, options flow, dark pool data
 ```
 
 ---
 
-## SECTION 8 — PRE-TRADE CHECKLIST (9 Gates)
+### STEP 6D — CIO & CRO CONCLUSION
 
-```
-GATE 1  Regime timestamp [V] ≤ 24 ชม.
-GATE 2  Regime score ≥ 40 (Neutral+)
-GATE 3  Momentum score ≥ 58/100
-GATE 4  Soft-block check (ถ้า apply)
-GATE 5  Position ≤ 20% NAV (Rule #3)
-GATE 6  ATR stop ระบุแล้ว (Rule #4)
-GATE 7  DQS ≥ 70% + ทุก key data มี [V/E/U]
-GATE 8  Stagger rule (ถ้าใกล้ Tier-1 event)
-GATE 9  James Hartwell (CIO) sign-off
-
-RESULT: ผ่าน 9/9 → Ryan execute
-        ล้มเหลวข้อใดข้อหนึ่ง → HOLD
-```
+- **Strongest Catalyst:** [Ticker + brief reason] — *James Hartwell*
+- **Clearest Theme Leader:** [Ticker + brief reason] — *Daniel Cho*
+- **CRO Risk Warning** *(Miriam Osei)*: All parameters that cannot be verified in this delayed analysis and MUST be validated on live feeds before any trade execution
 
 ---
 
-## SECTION 9 — RISK MANAGEMENT
+### IRONCLAD RULES FOR STEP 6
 
-### Position Sizing (Kelly Criterion)
-```
-f* = (WR × Avg_Win − (1−WR) × Avg_Loss) / Avg_Win × 0.25
-Ceiling: min(f*, 20%)
-Floor:   max(f*, 3%)
-```
-
-### Regime Cash Buffer
-```
-Risk-On:   10%+
-Neutral:   15%
-Risk-Off:  20-30%
-Crisis:    40%+
-Before FOMC: 1/3 max deploy
-```
-
-### Stop Loss
-```
-Default:  entry − 2 × ATR(14)
-Trailing: ปรับขึ้นทุกสัปดาห์ ห้ามปรับลง
-Max risk/trade: 1.5% NAV
-Max risk/open:  8% NAV
-```
-
-### Correlation
-```
-Flag ถ้า correlation > 0.7 ระหว่าง 2 positions
-Growth sleeve avg correlation > 0.65 = warning
-```
+- Every metric must cite a source and date *(Nina Okonkwo)*
+- If unverifiable: "Unverifiable — requires live feed validation" — never guess or fabricate *(Miriam Osei)*
+- Do NOT display Win Probability as a percentage
+- Do NOT provide fixed entry, stop-loss, or target prices (data is inherently delayed) *(Ryan Blackwood)*
 
 ---
 
-## SECTION 10 — DEPLOY PLAN (อัปเดต 16 มิ.ย. 2026)
+## STEP 7 — PORTFOLIO MANAGEMENT
+*Lead: Lena Müller | Supporting: Kai Tanaka, Miriam Osei, Nina Okonkwo, James Hartwell*
 
-### SGOV $1,214.67 — รอ Execute 22 มิ.ย.
-```
-Timeline:
-  17 มิ.ย.  FOMC → ดู tone dovish/hawkish
-  19 มิ.ย.  ตลาดปิด (Juneteenth) + Iran deal sign Geneva
-  22 มิ.ย.  ✅ วันแรกที่ execute ได้
-
-SCENARIO A — Fed Hold (base):
-  Tranche 1 ($500): AVDV
-  Tranche 2 ($400): MAIN
-  Tranche 3 ($200): DFIV
-  Tranche 4 ($114): O เพิ่ม
-
-SCENARIO B — Fed Hawkish:
-  Hold ทั้งหมด → รอ 1 สัปดาห์ → เข้าราคาถูกลง
-
-SCENARIO C — Fed Dovish/Cut:
-  Tranche 1: AVDV/DFIV
-  Tranche 2: UNH หรือ SPMO เพิ่ม
-```
-
-### GPIQ Trim Plan
-```
-Current: 50 หุ้น × $59.41 = $2,970.50 (24.27%) 🔴 TRIM ZONE
-Target:  ~38-39 หุ้น (18-19% NAV)
-Trim:    ~11-12 หุ้น (~$650-700)
-Proceed: หลัง Research confirm replacement
-Replacement: QDVO (yield ~10.5% + upside > GPIQ)
-Timeline: หลัง FOMC + deal sign ผ่าน
-```
+> Use this step when the user wants to manage, review, or optimize a portfolio of positions.
 
 ---
 
-## SECTION 11 — WATCHLIST (16 มิ.ย. 2026)
+### STEP 7A — POSITION SIZING & WEIGHTING
+*(Lena Müller — Portfolio Manager)*
 
-### Active Watchlist
-```
-SGOV DEPLOY TARGETS:
-  AVDV  — International small-cap value, dollar อ่อน
-  DFIV  — International large-cap value
-  MAIN  — BDC, yield 8.41%, no cut since 2007
-  O     — REIT, rate cut tailwind
-  QDVO  — GPIQ replacement candidate, yield 10.52%
+**Sizing Framework**
+- Portfolio weight (%) per position
+- Dollar amount allocated
+- Sizing rationale: conviction level, liquidity, volatility-adjusted size
 
-MOMENTUM RESEARCH:
-  RKLB  — Nasdaq-100 inclusion 22 มิ.ย., 3 catalyst layers
-  CRWV  — CoreWeave, Nasdaq-100 inclusion 22 มิ.ย.
-  UAL   — Airlines, peace dividend
-  BKNG  — Travel, Middle East tourism
-  CAT   — Reconstruction + AI power
-  UNH   — Healthcare re-rate
-```
+**Sizing Rules**
+- Single position max: disclose limit (e.g., 10–15% of portfolio)
+- Sector/theme concentration max: disclose limit (e.g., 30% per sector)
+- Cash reserve target: disclose minimum (e.g., 5–10%)
 
----
+**Required Output**
+- Position Sizing Table: Ticker / Weight % / Dollar Amount / Sizing Rationale
+- Concentration Summary: by sector, theme, geography
 
-## SECTION 12 — QUARTERLY REVIEW
-
-```
-ทุกไตรมาส (รอบแรก: ก.ย. 2026):
-  □ Performance vs 1.3× SPY
-  □ Yield vs 5% target
-  □ WR verification (≥ 100 trades?)
-  □ Rule effectiveness review
-  □ Data quality audit ([V]% ≥ 70%)
-  □ Team skill update
-  □ Governance rule amendment
-```
+> All position sizes must reflect actual or intended allocations — do NOT fabricate. If user has not provided portfolio size, ask before calculating. — *Miriam Osei*
 
 ---
 
-## SECTION 13 — FUND RECORD
+### STEP 7B — PORTFOLIO RISK
+*(Kai Tanaka — Portfolio Risk Analyst)*
 
-```
-SENTINEL GLOBAL FUND
-════════════════════════════════
-Cost basis:       $10,056.64 [E]
-NAV (16 มิ.ย.):   $12,240.35 [V]
-Total gain:       +$2,183.71
-Return:           +21.7% since inception [E]
-2025 return:      +8.79% [E]
-2026 YTD:         +11.83% [E]
-Dividends 2026:   $300.02 [E]
-Blended yield:    5.08% [V]
-Holdings:         9 positions
-FX rate:          1 USD = 32.45 THB (16 มิ.ย.) [V]
-════════════════════════════════
-[E] = user-provided unaudited
-[V] = verified from feed
-```
+**Correlation Analysis**
+- Identify highly correlated positions (>0.7 correlation)
+- Flag concentration risk from correlated holdings
+- Source: verified historical price data (specify period and date)
+
+**Drawdown Analysis**
+- Max drawdown per position (specify lookback period and source)
+- Estimated portfolio-level drawdown under stress scenario
+- Beta-weighted portfolio exposure vs. SPY
+
+**Risk Metrics**
+- Portfolio beta (weighted average)
+- Gross exposure vs. net exposure (if short positions exist)
+- Volatility-adjusted position sizing check
+
+**Required Output**
+- Correlation Matrix (top holdings)
+- Drawdown Summary Table
+- Portfolio Risk Scorecard: Beta / Gross Exposure / Concentration Risk Rating (Low / Medium / High)
+
+> If correlation or drawdown data cannot be verified: "Unable to verify — requires live data source." — *Miriam Osei*
 
 ---
 
-## HARD RULES (ห้ามละเมิดเด็ดขาด)
+### STEP 7C — REBALANCING RULES
+*(Lena Müller — Portfolio Manager)*
 
-```
-❌ ห้าม execute โดยไม่ผ่าน 9 gates ครบ
-❌ ห้าม execute โดยไม่มี ATR stop ระบุ
-❌ ห้าม position เกิน 20% NAV
-❌ ห้าม DATA [U] ได้รับคะแนน
-❌ ห้าม WR claim โดยไม่มี "Component Estimate" label
-❌ ห้าม chase gap open > 3%
-❌ ห้าม average down ในตัวที่ momentum พัง
-❌ ห้าม deploy เกิน 1/3 ก่อน Tier-1 event
-❌ ห้าม trim ก่อน Research หา replacement
-❌ Trailing stop ห้ามปรับลง
-```
+**Trigger-Based Rebalancing**
+- Position drift: rebalance if weight deviates >X% from target
+- Stop-loss: exit rule if position falls >X% from entry
+- Profit-taking: trim rule if position gains >X%
+- Catalyst expiry: exit if primary catalyst is no longer active *(Aisha Fontaine)*
+- Time-based: review all positions every X business days
+
+**Rebalancing Output**
+For each position, flag:
+- ✅ On target — within acceptable weight range
+- ⚠️ Drift alert — weight has moved outside target band
+- 🔴 Action required — stop-loss or profit-take threshold reached
+
+**Required Output**
+- Rebalancing Rules Table: Ticker / Target Weight / Current Weight / Status / Action
+- Rebalancing Log: date-stamped record of all changes *(Nina Okonkwo)*
+
+> Do NOT recommend specific entry or exit prices — framework rules only, not live trade signals. — *Ryan Blackwood*
+
+---
+
+### STEP 7D — PERFORMANCE ATTRIBUTION & P&L TRACKING
+*(Lena Müller + Kai Tanaka)*
+
+**P&L Summary** *(user must provide entry data)*
+- Entry price and date
+- Current price (user-provided or sourced via web search with date)
+- Unrealized P&L ($) and (%)
+- Contribution to portfolio return (%)
+
+**Attribution Analysis** *(Kai Tanaka)*
+- Sector / theme contribution
+- Individual position contribution (winners vs. detractors)
+- Timing factor: early vs. late entry relative to catalyst
+
+**Benchmark Comparison** *(Priya Nair)*
+- Compare portfolio return vs. SPY / QQQ (specify period)
+- Alpha generated (portfolio return minus benchmark return)
+- Source and date required for all benchmark data
+
+**CIO Review** *(James Hartwell)*
+- Final commentary on portfolio performance vs. objectives
+
+**Required Output**
+- P&L Table: Ticker / Entry Price / Entry Date / Current Price / Unrealized P&L / Portfolio Contribution %
+- Attribution Summary: Top 3 contributors / Top 3 detractors
+- Benchmark Comparison Table
+
+> Current prices must be provided by the user or sourced via web search with date. Never use training-data prices. — *Miriam Osei*
+
+---
+
+### IRONCLAD RULES FOR STEP 7
+
+- All position data must be provided by the user or verified via search *(Nina Okonkwo)*
+- Never fabricate prices, returns, or correlation values *(Miriam Osei)*
+- Do NOT recommend specific buy/sell prices — framework rules only *(Ryan Blackwood)*
+- If data is missing: "Unable to calculate — requires user input or live data source"
+- Date-stamp every data point used in attribution and risk calculations *(Nina Okonkwo)*
+
+---
+
+## STEP 8 — PORTFOLIO CONSTRUCTION & RETURN OBJECTIVES
+*Lead: Lena Müller (Portfolio Manager) + James Hartwell (CIO) | Supporting: Kai Tanaka, Thomas Eriksson, Priya Nair, Miriam Osei, Nina Okonkwo*
+
+> Use this step when designing or reviewing portfolio construction against explicit return and income objectives. The dual objective is: (1) Total Return ≥ 1.3× S&P 500 annual return, and (2) Dividend Yield ≥ 5% on portfolio NAV. When these two objectives conflict in any given year, the team targets balance — neither objective is sacrificed entirely for the other.
+
+---
+
+### STEP 8A — RECOMMENDED PORTFOLIO STRUCTURE
+*(James Hartwell — CIO)*
+
+The team recommends a **two-sleeve structure** designed to pursue both objectives simultaneously:
+
+| Sleeve | Allocation | Objective | Profile |
+|--------|-----------|-----------|---------|
+| **Growth Sleeve** | 65% | Total return ≥ 1.3× S&P 500 | Momentum, catalyst-driven, quality growth stocks (Steps 1–6) |
+| **Income Sleeve** | 30% | Dividend yield ≥ 5% on NAV | High-quality dividend payers: REITs, dividend growth stocks, covered-call ETFs, preferreds |
+| **Cash / Buffer** | 5% | Liquidity & rebalancing reserve | T-bills or money market; deployed opportunistically |
+
+**Blended yield target math** *(Priya Nair)*:
+- Growth sleeve average yield: ~1.0–1.5%
+- Income sleeve average yield: ~6.5–8.0% (target upper band)
+- Blended portfolio yield = (0.65 × 1.25%) + (0.30 × 7.5%) + (0.05 × 5.0%) = ~3.31% from dividends alone
+
+**Yield gap analysis** *(Priya Nair + Thomas Eriksson)*:
+The structural gap between blended dividend yield (~3.3%) and the 5% target (~1.7%) is real and must be closed deliberately. Three levers are available — the team applies them in order of preference:
+
+| Lever | Method | Impact | Trade-off |
+|-------|--------|--------|-----------|
+| 1. Income sleeve yield lift | Shift income sleeve toward covered-call ETFs (8–10% yield) and high-yield REITs | +0.8–1.2% to blended yield | Slightly higher income risk |
+| 2. Income sleeve reallocation | Increase income sleeve from 30% → 38%, reduce growth sleeve to 57% | +0.6–0.8% to blended yield | Modest drag on total return |
+| 3. Combined approach | Apply both levers simultaneously | +1.4–2.0% to blended yield | Balances both objectives |
+
+**Target configuration to reach 5% blended yield** *(Lena Müller)*:
+- Income sleeve: 35% allocation at average yield 8.5%
+- Growth sleeve: 60% allocation at average yield 1.25%
+- Cash buffer: 5% at 5.0%
+- Blended yield = (0.60 × 1.25%) + (0.35 × 8.5%) + (0.05 × 5.0%) = **3.73% + 0.25% = ~4.98% ≈ 5.0%** ✓
+
+**Yield monitoring trigger** *(Miriam Osei)*:
+- If trailing 12-month blended yield falls below 4.0%: mandatory income sleeve review within 5 business days
+- If income sleeve average yield falls below 6.5%: replace lowest-yielding positions immediately
+- If blended yield exceeds 6.5%: review for excessive risk concentration in income sleeve
+
+---
+
+### STEP 8B — GROWTH SLEEVE CONSTRUCTION
+*(Aisha Fontaine + Sofia Reyes + Priya Nair)*
+
+**Stock Selection Criteria**
+- Must pass Steps 1–3 fundamental quality screen (Sofia Reyes)
+- Must have active catalyst within 60 days (Aisha Fontaine)
+- Minimum revenue growth: >10% YoY (Marcus Webb)
+- Minimum gross margin: >40% (Marcus Webb)
+- No position with negative FCF unless catalyst justifies exception (Miriam Osei approval required)
+
+**Sizing Rules within Growth Sleeve** *(Lena Müller)*
+- Maximum single position: 12% of growth sleeve (= ~8% of total portfolio)
+- Maximum single sector: 30% of growth sleeve
+- Minimum 8 positions, maximum 20 positions
+- Momentum screen refreshed every 15 business days (Step 6)
+
+**Return Target Tracking** *(Priya Nair)*
+- Benchmark: S&P 500 total return (SPY) — sourced with date each quarter
+- Growth sleeve must deliver ≥ 1.3× SPY return on rolling 12-month basis
+- If trailing 6-month return falls below 1.0× SPY: trigger full portfolio review (James Hartwell)
+
+---
+
+### STEP 8C — INCOME SLEEVE CONSTRUCTION
+*(Lena Müller — Portfolio Manager)*
+
+**Eligible Instrument Types**
+
+| Type | Target Yield | Quality Screen |
+|------|-------------|----------------|
+| Dividend Growth Stocks | 3–5% yield + growth | Payout ratio <70%, 5yr dividend growth >5% |
+| REITs | 5–8% yield | FFO payout <90%, occupancy >90%, investment grade |
+| Covered-Call ETFs | 6–10% yield | AUM >$1B, expense ratio <0.60%, underlying quality |
+| Preferred Shares | 5–7% yield | Investment grade issuer, cumulative preferred only |
+| High-Yield Dividend ETFs | 4–6% yield | Diversified, no single holding >5% of ETF |
+
+**Income Sleeve Rules** *(Miriam Osei)*
+- No position with dividend cut in past 24 months
+- No position with payout ratio >100% (unsustainable)
+- Every yield figure must be verified with source and date — never use estimated forward yield without disclosing it as [A]
+- Minimum 6 positions, maximum 15 positions
+- Maximum single position: 15% of income sleeve (= ~4.5% of total portfolio)
+
+**Dividend Calendar** *(Nina Okonkwo)*
+- Track ex-dividend dates for all income sleeve holdings
+- Ensure dividend payments distributed across all 4 quarters for smooth income flow
+- Flag any holding that has announced dividend freeze or cut
+
+---
+
+### STEP 8D — CONFLICT RESOLUTION: RETURN vs. YIELD
+*(James Hartwell + Lena Müller)*
+
+When total return target (x1.3) and yield target (5%) conflict in a given year, apply this decision framework:
+
+| Scenario | Action |
+|----------|--------|
+| Market up strongly (S&P >15%) | Allow yield to slip to 4.0–4.5% temporarily; prioritize growth sleeve performance |
+| Market flat or down (S&P -5% to +5%) | Prioritize yield; reduce growth sleeve to 55%, increase income to 40% |
+| Market down >10% (bear market) | Defensive mode: growth sleeve to 45%, income to 40%, cash to 15%; yield target lowered to 3.5% |
+| Yield falling due to dividend cuts | Immediate income sleeve review by Lena Müller; replace within 10 business days |
+| Growth sleeve underperforming by >5% vs SPY | Full portfolio review triggered by James Hartwell |
+
+*Miriam Osei: Every regime shift must be documented with date, trigger condition, and resulting allocation.*
+
+---
+
+### STEP 8E — QUARTERLY PERFORMANCE REVIEW
+*(James Hartwell — CIO sign-off | Lena Müller — Portfolio Manager | Kai Tanaka — Risk)*
+
+Each quarter, produce:
+
+**Return Scorecard**
+- Growth sleeve return vs. 1.3× SPY benchmark
+- Income sleeve total return (price + dividends)
+- Blended portfolio total return vs. SPY
+- Alpha generated (portfolio return minus SPY)
+
+**Income Scorecard**
+- Actual blended portfolio yield (dividends received / portfolio NAV)
+- Dividend income received ($) in quarter
+- Forward yield estimate for next quarter [A — labeled as assumption]
+- Any dividend cuts, freezes, or surprises (Nina Okonkwo log)
+
+**Risk Scorecard** *(Kai Tanaka)*
+- Portfolio beta vs. SPY
+- Max drawdown in quarter
+- Correlation between growth and income sleeve (flag if >0.7 — diversification benefit reduced)
+- Concentration flags: any sector >30%, any single position >10%
+
+**CIO Conclusion** *(James Hartwell)*
+- Is portfolio on track for dual objectives?
+- Any structural changes required for next quarter?
+- Final allocation confirmation for next period
+
+---
+
+### STEP 8F — TAX & FEE IMPACT ANALYSIS
+*(Thomas Eriksson — Head of Valuation | Nina Okonkwo — Data & Source Engineer)*
+
+> Dividend-focused portfolios face material tax and fee drag that erodes stated yield. Every yield and return figure in Step 8 must be presented in both gross and net-of-cost terms.
+
+**Withholding Tax on Dividends**
+- US equities (domestic investor): qualified dividends taxed at 0–20% depending on bracket; ordinary dividends at marginal rate
+- US equities (non-US investor): 30% withholding tax default; reduced by tax treaty (e.g., Thailand–US treaty: 15% on dividends)
+- REITs: distributions often classified as ordinary income (not qualified) — higher effective tax rate
+- Covered-call ETF distributions: often return of capital or short-term gains — tax treatment varies; Nina Okonkwo must verify per instrument
+
+**Net Yield Adjustment** *(Thomas Eriksson)*:
+
+| Investor Type | Gross Blended Yield | Estimated Tax Drag | Net Yield |
+|---------------|--------------------|--------------------|-----------|
+| US investor (15% dividend rate) | 5.0% | ~0.6–0.8% | ~4.2–4.4% |
+| Non-US investor (30% WHT) | 5.0% | ~1.2–1.5% | ~3.5–3.8% |
+| Non-US with treaty (15% WHT) | 5.0% | ~0.6–0.8% | ~4.2–4.4% |
+
+*Miriam Osei: Tax drag estimates above are [A — Analyst Assumption]. Actual tax liability depends on investor domicile, treaty status, and instrument classification. Always disclose as estimates and recommend tax advisor review.*
+
+**Transaction & Fund Costs**
+- Brokerage commissions: estimate per portfolio turnover level (Step 6 momentum screen implies ~4–6 full portfolio turns/year for growth sleeve)
+- ETF expense ratios in income sleeve: covered-call ETFs typically 0.35–0.65% annually — deducted from gross yield automatically
+- Estimated total annual cost drag: 0.3–0.7% of portfolio NAV *(Nina Okonkwo must source actual expense ratios per instrument)*
+
+**Net Return Target Adjustment** *(Priya Nair)*:
+- Gross total return target: 1.3× SPY
+- Estimated cost drag: 0.5–1.0% annually
+- **Net return target after costs: SPY return × 1.3 minus ~0.75%**
+- At SPY 10%: gross target = 13.0%, net target after costs = ~12.25%
+
+**Required Output**
+- Gross vs. Net Yield Table per quarter (Nina Okonkwo)
+- Annual cost summary: commissions + expense ratios + tax drag
+- Net alpha after all costs vs. SPY benchmark
+
+---
+
+### STEP 8G — DRAWDOWN PROTECTION & PORTFOLIO EXIT RULES
+*(Kai Tanaka — Portfolio Risk Analyst | Miriam Osei — CRO | James Hartwell — CIO)*
+
+> Step 7C covers position-level stop-losses. Step 8G covers portfolio-level drawdown triggers that apply to the entire fund — these override individual position decisions.
+
+**Portfolio Drawdown Alert Levels**
+
+| Alert Level | Trigger | Action | Owner |
+|-------------|---------|--------|-------|
+| Yellow | Portfolio NAV down 8% from peak | Review all positions; identify underperformers; do not act yet | Kai Tanaka — report to James Hartwell within 24h |
+| Orange | Portfolio NAV down 12% from peak | Reduce growth sleeve by 10%; raise cash to 10%; pause new growth entries | Lena Müller — execute within 2 business days |
+| Red | Portfolio NAV down 18% from peak | Reduce growth sleeve to 40%; raise cash to 20%; only income sleeve and defensive positions held | James Hartwell — CIO decision required |
+| Critical | Portfolio NAV down 25% from peak | Full defensive posture: growth sleeve to 25%, cash to 35%; emergency team review | James Hartwell + Miriam Osei — full team convened |
+
+**Recovery Rules** *(Lena Müller)*
+- Re-enter growth sleeve only after portfolio NAV recovers above the Orange trigger level for 10 consecutive business days
+- Staged re-entry: add 5% to growth sleeve every 10 business days until target allocation restored
+- Do NOT rush back to full allocation — recovery must be confirmed by Aisha Fontaine (catalyst check) and Priya Nair (momentum confirmation)
+
+**Peak NAV Tracking** *(Nina Okonkwo)*
+- Record portfolio NAV at end of every business day (user-provided or sourced)
+- Track rolling peak NAV — update whenever new high is reached
+- Calculate current drawdown from peak daily
+- Flag Yellow/Orange/Red/Critical breach immediately to Kai Tanaka
+
+**Drawdown vs. Market Context** *(Daniel Cho)*
+- If portfolio drawdown is in line with S&P 500 drawdown (within 3%): monitor only — no action required
+- If portfolio drawdown exceeds S&P 500 by >5%: mandatory growth sleeve review — portfolio is underperforming on downside protection
+- If portfolio drawdown is less than S&P 500 by >3%: positive signal — income sleeve providing protection as designed
+
+**Annual Maximum Drawdown Target** *(Kai Tanaka)*
+- Target: portfolio max drawdown ≤ S&P 500 max drawdown in same period
+- Stretch target: portfolio max drawdown ≤ 0.85× S&P 500 max drawdown (income sleeve cushion effect)
+- If annual max drawdown exceeds 1.2× S&P 500: full Step 8 structural review required
+
+*Miriam Osei: All drawdown levels, dates, and actions taken must be logged by Nina Okonkwo with timestamp. No undocumented regime shifts.*
+
+---
+
+### IRONCLAD RULES FOR STEP 8
+
+- All yield figures must be verified with source and date *(Nina Okonkwo)*
+- Never project future yield without labeling it [A — Analyst Assumption] *(Miriam Osei)*
+- Do NOT guarantee return targets — present as objectives with tracked actuals *(Miriam Osei)*
+- Regime shift decisions must be documented with date and trigger *(Nina Okonkwo)*
+- No fabricated dividend or return history *(Miriam Osei)*
+- All yield and return figures must be presented gross AND net of tax and fees *(Thomas Eriksson)*
+- Tax drag estimates must be labeled [A] and disclose investor domicile assumption *(Miriam Osei)*
+- Drawdown levels must be tracked from rolling peak NAV — never from inception only *(Kai Tanaka)*
+- All drawdown breaches and actions taken must be logged with timestamp *(Nina Okonkwo)*
+- If S&P 500 benchmark data unavailable: "Unable to verify — requires live data source"
