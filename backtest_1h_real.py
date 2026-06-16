@@ -31,7 +31,7 @@ STRAT_PARAMS = {
     "UT Bot":     {"tp": 0.048, "sl": 0.046},
     "Momentum":   {"tp": 0.048, "sl": 0.046},
     "MACD/EMA":   {"tp": 0.048, "sl": 0.046},
-    "kNN":        {"tp": 0.0225, "sl": 0.015},  # TP=2.25% SL=1.5%  R:R 1:1.5
+    "kNN":        {"tp": 0.048,  "sl": 0.046},
 }
 
 def _net(tp_pct, sl_pct):

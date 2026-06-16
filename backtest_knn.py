@@ -21,8 +21,8 @@ from trading.strategies.knn_strategy import KNNStrategy
 
 # ── constants ────────────────────────────────────────────────────────────────
 POSITION   = 50.0     # USD per trade
-TP_PCT     = 0.0225   # 2.25%
-SL_PCT     = 0.015    # 1.50%
+TP_PCT     = 0.048    # 4.8%
+SL_PCT     = 0.046    # 4.6%
 FEE_RT     = 0.0020   # 0.10%×2
 START_BAL  = 500.0
 LOOKFWD    = 60       # max bars to wait for TP/SL

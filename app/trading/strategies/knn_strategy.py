@@ -47,9 +47,9 @@ class KNNStrategy(BaseStrategy):
         # Signal control
         self.cooldown     = self.params.get("cooldown",      5)    # bars between signals
         self.long_only    = self.params.get("long_only",    True)
-        # TP/SL symmetric 2.5% (R:R 1:1, WR ~79%)
-        self.sl_pct       = self.params.get("sl_pct",      0.025)  # 2.5%
-        self.tp_pct       = self.params.get("tp_pct",      0.025)  # 2.5%  R:R 1:1
+        # TP/SL matching other strategies (WR ~83%, backtest +$36 vs +$28 at 2.5%)
+        self.sl_pct       = self.params.get("sl_pct",      0.046)  # 4.6%
+        self.tp_pct       = self.params.get("tp_pct",      0.048)  # 4.8%
         # MTF gate (active only when mtf_candles provided in analyze)
         self.mtf_min_bias = self.params.get("mtf_min_bias", 0.0)
 
