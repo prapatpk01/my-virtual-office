@@ -23,10 +23,12 @@ class SentinelStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.min_conf      = self.params.get("min_conf", 60.0)
+        self.min_conf      = self.params.get("min_conf", 58.0)   # slightly relaxed: was 60
         self.min_rr        = self.params.get("min_rr", 1.5)
         self.swing_len     = self.params.get("swing_len", 10)
         self.position_pct  = self.params.get("position_pct", 0.08)
+        self.dwcs_bull_min = self.params.get("dwcs_bull_min", 50.0)  # DWCS floor for LONG
+        self.dwcs_bear_max = self.params.get("dwcs_bear_max", 50.0)  # DWCS ceiling for SHORT
 
     # ------------------------------------------------------------------ #
     # HMA (Hull Moving Average) — [F1] correct formula
@@ -421,18 +423,20 @@ class SentinelStrategy(BaseStrategy):
 
         conf_norm = econf / 100.0
 
-        # Signal Gate
+        # Signal Gate — added DWCS floor/ceiling for macro trend alignment
         sig_long  = (elong and econf >= self.min_conf and rr_L >= self.min_rr
                      and not mom_peak and not mom_fade
                      and current_price > curr_hma
                      and curr_mtf > -50
-                     and curr_rsi < 75)
+                     and curr_rsi < 75
+                     and curr_dwcs >= self.dwcs_bull_min)  # macro trend confirm
 
         sig_short = (eshort and econf >= self.min_conf and rr_S >= self.min_rr
                      and not mom_peak and not mom_fade_S
                      and current_price < curr_hma
                      and curr_mtf < 50
-                     and curr_rsi > 25)
+                     and curr_rsi > 25
+                     and curr_dwcs <= self.dwcs_bear_max)  # macro trend confirm
 
         if sig_long:
             phase = ("ACCEL" if (mom_str >= 55 and mom_rising) else

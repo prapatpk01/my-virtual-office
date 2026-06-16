@@ -19,13 +19,14 @@ class RSIMACDStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.rsi_period     = self.params.get("rsi_period",    14)
-        self.rsi_oversold   = self.params.get("rsi_oversold",  42)
-        self.rsi_overbought = self.params.get("rsi_overbought", 58)
+        self.rsi_period     = self.params.get("rsi_period",     14)
+        self.rsi_oversold   = self.params.get("rsi_oversold",  40)   # optimized: 57.9% WR
+        self.rsi_overbought = self.params.get("rsi_overbought", 58)  # optimized: best R
         self.macd_fast      = self.params.get("macd_fast",     12)
         self.macd_slow      = self.params.get("macd_slow",     26)
         self.macd_signal    = self.params.get("macd_signal",    9)
         self.position_pct   = self.params.get("position_pct",  0.1)
+        self.rvol_min       = self.params.get("rvol_min",      1.5)  # tighter: was 1.3
         # MTF gate threshold: absolute comp_pct must exceed this to confirm direction
         self.mtf_threshold  = self.params.get("mtf_threshold", 0.0)
 
@@ -70,13 +71,14 @@ class RSIMACDStrategy(BaseStrategy):
             mtf_bull = mtf_bear = True  # gate open when no MTF data
 
         # ── BUY conditions ───────────────────────────────────────────────
+        # buy1: RSI deeply oversold + MACD zero-cross (strongest)
+        # buy2: RSI oversold + histogram turning + volume spike
+        # Removed buy3 (MACD cross alone, no RSI filter) — too many false entries
         buy1 = curr_rsi < self.rsi_oversold and macd_cross_up
-        buy2 = curr_rsi < self.rsi_oversold and hist_rising and rvol >= 1.3
-        buy3 = macd_cross_up and curr_rsi < 55 and rvol >= 1.5
+        buy2 = curr_rsi < self.rsi_oversold and hist_rising and rvol >= self.rvol_min
 
-        if buy1 or buy2 or buy3:
+        if buy1 or buy2:
             if not mtf_bull:
-                # Signal exists but MTF rejects it
                 return Signal(
                     SignalType.HOLD, self.symbol, current_price, 0,
                     f"[RSI+MACD] BUY blocked by MTF [{mtf_label}] RSI={curr_rsi:.1f}",
@@ -84,8 +86,7 @@ class RSIMACDStrategy(BaseStrategy):
                               "rvol": rvol, "mtf_comp": round(mtf_comp, 1)},
                 )
             reason_tag = ("RSI+MACD crossover" if buy1
-                          else f"RSI oversold+RVOL={rvol:.1f}x" if buy2
-                          else f"MACD crossover+RVOL={rvol:.1f}x")
+                          else f"RSI oversold+RVOL={rvol:.1f}x")
             conf = min(1.0, (self.rsi_oversold - curr_rsi) / self.rsi_oversold + 0.3)
             return Signal(
                 type=SignalType.BUY,
@@ -99,11 +100,11 @@ class RSIMACDStrategy(BaseStrategy):
             )
 
         # ── SELL conditions ──────────────────────────────────────────────
+        # Removed sell3 (MACD cross alone) — mirrors buy3 removal
         sell1 = curr_rsi > self.rsi_overbought and macd_cross_down
-        sell2 = curr_rsi > self.rsi_overbought and hist_falling and rvol >= 1.3
-        sell3 = macd_cross_down and curr_rsi > 45 and rvol >= 1.5
+        sell2 = curr_rsi > self.rsi_overbought and hist_falling and rvol >= self.rvol_min
 
-        if sell1 or sell2 or sell3:
+        if sell1 or sell2:
             if not mtf_bear:
                 return Signal(
                     SignalType.HOLD, self.symbol, current_price, 0,
@@ -112,8 +113,7 @@ class RSIMACDStrategy(BaseStrategy):
                               "rvol": rvol, "mtf_comp": round(mtf_comp, 1)},
                 )
             reason_tag = ("RSI+MACD crossover" if sell1
-                          else f"RSI overbought+RVOL={rvol:.1f}x" if sell2
-                          else f"MACD crossover+RVOL={rvol:.1f}x")
+                          else f"RSI overbought+RVOL={rvol:.1f}x")
             conf = min(1.0, (curr_rsi - self.rsi_overbought) / (100 - self.rsi_overbought) + 0.3)
             return Signal(
                 type=SignalType.SELL,
