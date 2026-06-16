@@ -75,9 +75,9 @@ def build_config() -> dict:
         "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
-            "mcdx":      _env_bool("STRATEGY_MCDX",       True),
-            "sentinel":  _env_bool("STRATEGY_SENTINEL",    True),
-            "ai_signal": _env_bool("STRATEGY_AI_SIGNAL",   False),  # requires ANTHROPIC_API_KEY
+            "mcdx":     _env_bool("STRATEGY_MCDX",     True),
+            "sentinel": _env_bool("STRATEGY_SENTINEL",  True),
+            "rsi_macd": _env_bool("STRATEGY_RSI_MACD",  True),
         },
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
         # Fixed SL/TP applied to every trade (overrides ATR-based from strategies)
@@ -101,16 +101,12 @@ def build_config() -> dict:
 def _make_strategies(symbols: list, flags: dict):
     from trading.strategies.mcdx_strategy import MCDXStrategy
     from trading.strategies.sentinel_strategy import SentinelStrategy
+    from trading.strategies.rsi_macd import RSIMACDStrategy
     strategies = []
     for sym in symbols:
         if flags.get("mcdx"):     strategies.append(MCDXStrategy(sym))
         if flags.get("sentinel"): strategies.append(SentinelStrategy(sym))
-        if flags.get("ai_signal"):
-            if os.environ.get("ANTHROPIC_API_KEY"):
-                from trading.strategies.ai_signal import AISignalStrategy
-                strategies.append(AISignalStrategy(sym))
-            else:
-                logger.warning("STRATEGY_AI_SIGNAL=true but ANTHROPIC_API_KEY not set — skipping")
+        if flags.get("rsi_macd"): strategies.append(RSIMACDStrategy(sym))
     if not strategies:
         logger.warning("No strategies enabled — defaulting to MCDXStrategy")
         from trading.strategies.mcdx_strategy import MCDXStrategy
