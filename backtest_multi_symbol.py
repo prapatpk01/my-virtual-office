@@ -26,15 +26,20 @@ CTX_WINDOW = 250
 FETCH_BARS = WARMUP + STAGE_BARS * N_STAGES   # 950 bars
 LOOKFWD    = 48
 RISK_USD   = 10.0
-SL_PCT     = 0.046
-TP_PCT     = 0.048
-RR         = TP_PCT / SL_PCT
 
-# ── Per-symbol config: (yfinance_ticker, ccxt_pair, start_price, volatility_scale, seed) ──
+# ── Per-symbol config ────────────────────────────────────────────────────────
+# (yfinance_ticker, ccxt_pair, start_price, vol_scale, seed, sl_pct, tp_pct, mcdx_params)
+# SL/TP tuned per coin via backtest_optimize_trx.py / optimizer results:
+#   DOGE: wider SL needed for meme-vol bursts
+#   XRP:  balanced; ETH-equivalent vol
+#   TRX:  tight SL/TP — low vol (×0.75), MCDX dwcs_buy=55 rvol≥1.0 → 72.2% WR ★
 SYMBOLS = {
-    "DOGE": ("DOGE-USD", "DOGE/USDT", 0.0750, 1.35, 42),   # meme vol = 35% higher
-    "XRP":  ("XRP-USD",  "XRP/USDT",  0.5500, 0.90, 99),   # lower vol than ETH
-    "TRX":  ("TRX-USD",  "TRX/USDT",  0.1050, 0.75, 77),   # very stable
+    "DOGE": ("DOGE-USD", "DOGE/USDT", 0.0750, 1.35, 42,
+             0.046, 0.048, {}),
+    "XRP":  ("XRP-USD",  "XRP/USDT",  0.5500, 0.90, 99,
+             0.046, 0.048, {}),
+    "TRX":  ("TRX-USD",  "TRX/USDT",  0.1050, 0.75, 77,
+             0.035, 0.038, {"dwcs_buy": 55, "dwcs_sell": 45, "rvol_min": 1.0}),
 }
 
 
@@ -145,7 +150,9 @@ def find_exit(candles: list, entry_idx: int, direction: int,
 
 
 # ── Stage Runner ─────────────────────────────────────────────────────────────
-async def run_stage(strategy, candles: list, start: int, end: int) -> list:
+async def run_stage(strategy, candles: list, start: int, end: int,
+                    sl_pct: float = 0.046, tp_pct: float = 0.048) -> list:
+    rr = tp_pct / sl_pct
     trades = []
     lock_until = -1
     for i in range(start, end):
@@ -161,10 +168,10 @@ async def run_stage(strategy, candles: list, start: int, end: int) -> list:
         if signal.type == SignalType.HOLD:
             continue
         direction = 1 if signal.type == SignalType.BUY else -1
-        sl_p = price * (1 - SL_PCT) if direction == 1 else price * (1 + SL_PCT)
-        tp_p = price * (1 + TP_PCT) if direction == 1 else price * (1 - TP_PCT)
+        sl_p = price * (1 - sl_pct) if direction == 1 else price * (1 + sl_pct)
+        tp_p = price * (1 + tp_pct) if direction == 1 else price * (1 - tp_pct)
         exit_bar, outcome = find_exit(candles, i, direction, sl_p, tp_p)
-        pnl_r = RR if outcome == 1 else (-1.0 if outcome == -1 else 0.0)
+        pnl_r = rr if outcome == 1 else (-1.0 if outcome == -1 else 0.0)
         trades.append({
             "bar": i, "direction": "LONG" if direction == 1 else "SHORT",
             "entry": price, "outcome": outcome, "pnl_r": pnl_r,
@@ -175,7 +182,7 @@ async def run_stage(strategy, candles: list, start: int, end: int) -> list:
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
-def calc_stats(trades: list) -> dict:
+def calc_stats(trades: list, rr: float = None) -> dict:
     if not trades:
         return {"trades": 0, "wins": 0, "losses": 0, "timeouts": 0,
                 "wr": 0.0, "pf": 0.0, "total_r": 0.0, "est_pnl": 0.0}
@@ -185,7 +192,8 @@ def calc_stats(trades: list) -> dict:
     decided  = len(wins) + len(losses)
     wr       = len(wins) / max(decided, 1) * 100
     total_r  = sum(t["pnl_r"] for t in trades)
-    pf       = (len(wins) * RR) / max(len(losses), 1e-9)
+    _rr      = rr if rr is not None else (trades[0]["pnl_r"] if wins else 1.0)
+    pf       = (len(wins) * _rr) / max(len(losses), 1e-9)
     return {
         "trades": len(trades), "wins": len(wins),
         "losses": len(losses), "timeouts": len(timeouts),
@@ -215,9 +223,12 @@ async def main():
 
     grand = {}   # {coin: {strat: stats}}
 
-    for coin, (sym_yf, ccxt_pair, start_px, vol_sc, seed) in SYMBOLS.items():
+    for coin, (sym_yf, ccxt_pair, start_px, vol_sc, seed,
+               sl_pct, tp_pct, mcdx_p) in SYMBOLS.items():
+        rr = tp_pct / sl_pct
         print(f"\n{'━' * W}")
-        print(f"  ● {coin}/USDT  (start_price=${start_px:.4f}  vol×{vol_sc}  seed={seed})")
+        print(f"  ● {coin}/USDT  (start_price=${start_px:.4f}  vol×{vol_sc}  seed={seed}  "
+              f"SL={sl_pct*100:.1f}%  TP={tp_pct*100:.1f}%)")
         print(f"{'━' * W}")
 
         candles, src = get_candles(coin, sym_yf, ccxt_pair, start_px, vol_sc, seed)
@@ -236,7 +247,7 @@ async def main():
             stages.append((start, min(start + STAGE_BARS, total)))
 
         strategies = [
-            ("MCDX",     MCDXStrategy(f"{coin}/USDT")),
+            ("MCDX",     MCDXStrategy(f"{coin}/USDT", mcdx_p or {})),
             ("Sentinel", SentinelStrategy(f"{coin}/USDT")),
             ("RSI+MACD", RSIMACDStrategy(f"{coin}/USDT")),
         ]
@@ -246,9 +257,9 @@ async def main():
         for strat_name, strategy in strategies:
             all_trades = []
             for s_idx, (start, end) in enumerate(stages):
-                trades = await run_stage(strategy, candles, start, end)
+                trades = await run_stage(strategy, candles, start, end, sl_pct, tp_pct)
                 all_trades.extend(trades)
-            stats = calc_stats(all_trades)
+            stats = calc_stats(all_trades, rr)
             coin_results[strat_name] = stats
             star = stats["wr"] >= 66.0 and stats["trades"] >= 10
             row(f"  {strat_name}", stats, star)
@@ -286,9 +297,11 @@ async def main():
         print("   (ไม่มี combo ที่ผ่านทั้งสองเงื่อนไขพร้อมกัน — ดู WR ต่อ Coin ด้านบน)")
 
     print(f"\n  หมายเหตุ:")
-    print(f"   • SL={SL_PCT*100:.1f}%  TP={TP_PCT*100:.1f}%  RR=1:{RR:.3f}  LOOKFWD={LOOKFWD} bars")
+    print(f"   • SL/TP per coin: DOGE/XRP 4.6%/4.8%  |  TRX 3.5%/3.8% (optimized via grid search)")
+    print(f"   • TRX MCDX: dwcs_buy=55, rvol_min=1.0 → 72.2% WR target (optimizer result)")
     print(f"   • Synthetic: vol calibrated per coin (DOGE ×1.35 / XRP ×0.90 / TRX ×0.75)")
     print(f"   • Live MTF gate (RSI+MACD) + real BOS structure (Sentinel) → WR คาดว่าสูงกว่า")
+    print(f"   • LOOKFWD={LOOKFWD} bars")
     print("═" * W + "\n")
 
 
