@@ -1,813 +1,534 @@
 ---
 name: investment-system
 description: >
-  Investment system skill for Quantum Capital Fund managed by Victoria Chen.
-  Covers the full Barbell Portfolio strategy (Core 80% / Satellite Alpha 20%),
-  Sentinel Signal v1.0, momentum scan + research watchlist scanner, contrarian
-  VIX/Fear&Greed framework, dynamic cash buffer, rotation rules, macro signals
-  (bond truth, smart money, sentiment), rate-hike playbook, benchmark + income
-  mandate, rebalance policy, position sizing, risk management, and emergency
-  protocols. Target: beat VOO Total Return x1.3 per year with >=5% dividend
-  yield. Use when managing or reviewing the fund portfolio, finding new satellite
-  positions, running scans, or making buy/sell decisions. Portfolio holdings are
-  uploaded separately by the fund manager each session.
+  Sentinel Global Fund master investment system skill covering full team structure,
+  roles, skills, governance rules, portfolio balance framework, momentum scoring,
+  dual objectives (1.3x SPY + 5% yield), macro regime framework, pre-trade checklist,
+  risk management, and operating procedures. Use when managing the fund, reviewing
+  portfolio, making buy/sell decisions, deploying capital, running research scans,
+  or assessing governance compliance. Holdings uploaded by fund manager each session.
+  CIO: James Hartwell. Last updated: 16 June 2026.
 ---
 
-# Quantum Capital Fund — Investment System Skill
+# SENTINEL GLOBAL FUND — Investment System
+**CIO**: James Hartwell | **CRO**: Miriam Osei | **Currency**: USD
+**Benchmark**: SPY Total Return × 1.3 per year + Dividend Yield ≥ 5%
+**Strategy**: Barbell Portfolio — Growth/Momentum + Income/Dividend + Cash/Defensive
+**Last Updated**: 16 มิ.ย. 2026
 
-**Fund Manager**: Victoria Chen | **Currency**: USD
-**Target Return**: เอาชนะ VOO (Total Return) × 1.3 ต่อปี
-**Benchmark**: VOO Total Return (รวมปันผล reinvested)
-**Strategy**: Barbell Portfolio — Core 80% + Satellite Alpha 20%
-**Last Updated**: June 12, 2026
-
-> **เป้าหมายแบบ relative**: ถ้า VOO TR = +10% → กองทุนต้องทำ ≥ +13%
-> ปรับตามสภาพตลาดอัตโนมัติ — ปีตลาดดีตั้งเป้าสูง / ปีตลาดแย่แค่ขาดทุนน้อยกว่าก็ถือว่าชนะ
-> วัดความสำเร็จที่ "alpha เหนือ benchmark" ไม่ใช่ตัวเลขตายตัวที่บังคับให้ไล่ราคา
-
-> **หมายเหตุ**: ข้อมูล holdings และ positions จะถูก upload โดย fund manager ในแต่ละ session
-> ไฟล์นี้เก็บเฉพาะ **ระบบ กฎ และกระบวนการทำงาน** ของกองทุน
+> Holdings และ positions อัปโหลดโดยผู้ใช้ต่อ session
+> ไฟล์นี้เก็บ **ระบบ กฎ ทีม และกระบวนการ** เท่านั้น
 
 ---
 
-## 0. ปรัชญาการลงทุน (Core Philosophy)
+## SECTION 1 — TEAM STRUCTURE (14 คน)
 
-```
-1. ชนะ benchmark ด้วย "วินัย" ไม่ใช่ "การไล่ราคา"
-   - เป้าคือ alpha เหนือ VOO TR × 1.3 — ปีที่รักษาทุนในวิกฤตได้ก็คือปีที่ดี
-   - ไม่แพ้หนักในวันแย่ สำคัญกว่าชนะใหญ่ทุกวัน
+### 1A. บริหาร
 
-2. Contrarian: "กล้าในวันที่คนกลัว กลัวในวันที่คนกล้า"
-   - ซื้อตอนคนเทขาย (panic) / ขายตอนคนแย่งซื้อ (euphoria)
-   - แต่ต้องมีวินัย ไม่ใช่ดื้อ — รอสัญญาณทรงตัวเสมอ ไม่รับมีดร่วง
+| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
+|------|---------|------------|-------|
+| **James Hartwell** | CIO | ตัดสินใจขั้นสุดท้าย, อนุมัติ deploy ทุกรายการ, ประธานประชุม | investment-system |
+| **Miriam Osei** | CRO | Gate ทุก trade ด้วย 4 ด่าน, enforce data integrity, bias detection, audit trail, WR disclosure | cro-intelligence-v2 |
+| **Nina Okonkwo** | Data & Source Engineer | Log ทุก data point (source/date/URL), feed quality A/B/C, lineage tracker, conflict resolution | data-engineering-v2 |
+| **Leo Tanaka** | Real-time Data Analyst | Parse screenshot จากผู้ใช้, timestamp standardization ICT→ET, pre-meeting data pack | live-feed-intelligence-v2 |
 
-3. กระแสเงินสด (Income) เป็นหัวใจ — ปันผล ≥ 5% ของ total asset
+### 1B. Research
 
-4. Total Return > ตัวเลขเดี่ยว ๆ — yield สูงแต่ราคาร่วงหนัก = แพ้
+| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
+|------|---------|------------|-------|
+| **Sofia Reyes** | Sr. Fundamental Analyst | Step 1-3: moat scoring, earnings quality, sector KPI templates, thesis construction | equity-research-pro-v2 + initiating-coverage + competitive-analysis + thesis-tracker |
+| **Marcus Webb** | Sr. Financial Analyst | Step 2: 8Q earnings tracker, revision momentum, whisper vs consensus, PEAD linkage | financial-model-pro-v2 + earnings-analysis + earnings-preview |
+| **Aisha Fontaine** | Momentum & Catalyst Analyst | Catalyst scoring matrix (strength×horizon×uniqueness), PEAD calculator, sector heatmap, event calendar, flow flags | catalyst-intelligence-v2 + idea-generation + catalyst-calendar |
+| **Maya Chen** | Momentum & Catalyst Analyst | Institutional momentum scanner 7-phase, high-beta expansion filter, swing setup 7-15 วัน | institutional-high-beta-momentum-swing-scanner + idea-generation |
 
-5. กฎเหล็กห้ามละเมิดเพื่อไล่เป้า:
-   ❌ ห้าม average down ในตัวที่ momentum พัง / ราคาร่วง
-   ⚠️ ถึง -12% → ทบทวน thesis + catalyst ก่อน — ตัดเพราะ "พื้นฐานเสีย" ไม่ใช่แค่ราคาลงถึงเลข
-   ❌ ห้าม market order สำหรับ satellite (เข้า) — limit เท่านั้น
-   ❌ ห้ามล้างพอร์ต/ตัดสินใจใหญ่ตอนตลาด panic หรือด้วยอารมณ์
-   ✅ stagger entry เสมอ (เข้าทีละชั้น)
-```
+> Aisha และ Maya ดำรงตำแหน่งเดียวกัน ทำงานคู่ขนาน ใช้เทคนิคต่างกัน เสนอผลในที่ประชุมร่วมกัน
+
+### 1C. Quant & Valuation
+
+| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
+|------|---------|------------|-------|
+| **Priya Nair** | Quantitative Strategist | Live trade log, rolling WR tracker, factor attribution, walk-forward testing, false positive log | quant-backtest-engine-v2 |
+| **Thomas Eriksson** | Head of Valuation | DCF 3-scenario, reverse DCF, comps table, margin of safety, sector multiples | valuation-suite-v2 + dcf-model |
+
+### 1D. Macro & Risk
+
+| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
+|------|---------|------------|-------|
+| **Daniel Cho** | Head of Macro Strategy | Regime score 0-100, leading indicators, Fed tracker, sector rotation, 30-day macro calendar, 1-2 quarter forward vision | macro-intelligence-v2 + sector-overview |
+| **Kai Tanaka** | Portfolio Risk Analyst | Kelly sizing, ATR stop calculator, correlation matrix, sleeve drift monitor, drawdown projection | risk-engine-v2 |
+
+### 1E. Portfolio & Execution
+
+| ชื่อ | ตำแหน่ง | หน้าที่หลัก | Skill |
+|------|---------|------------|-------|
+| **Lena Müller** | Portfolio Manager | Dual-objective scorecard, yield tracker, sleeve drift dashboard, rebalance optimizer, NAV attribution | portfolio-management-pro-v2 + portfolio-rebalance + portfolio-monitoring |
+| **Ryan Blackwood** | Execution Trader | 9-gate pre-trade checklist, slippage tracker, market impact estimator, order timing guide | execution-intelligence-v2 |
 
 ---
 
-## 1. ทีมงาน (Team Structure)
-
-| Agent | ชื่อ | ตำแหน่ง | หน้าที่ |
-|-------|------|---------|--------|
-| `hf-manager` | Victoria Chen | Fund Manager | ตัดสินใจขั้นสุดท้าย, อนุมัติการเทรด |
-| `hf-research-1` | Dr. Emily Zhao | Research Analyst | Deep research, scan, web research |
-| `hf-research-2` | Marcus Webb | Research Analyst | Equity workbook, financial model |
-| `hf-research-3` | Nina Patel | Senior Analyst | Sector/theme, fund flows |
-| `hf-quant-1` | Kenji Tanaka | Quant Analyst | Sentinel Signal, RSI/MACD |
-| `hf-quant-2` | Aisha Okonkwo | Quant Analyst | Chart technicals, entry/exit levels |
-| `hf-macro` | Sam Rivera | Macro Analyst | Fed/yields/CPI/FOMC + sentiment, smart money, bond market truth |
-| `hf-risk` | Chris Morgan | Risk Manager | Stop loss, position sizing, drawdown |
-
-### การเรียกทีมทำงาน
+## SECTION 2 — WORKFLOW
 
 ```
-ลำดับทำงานทุกครั้ง:
-  1. ทีม Macro    → อ่านภาพตลาด, regime, yield curve, sentiment
-  2. ทีม Research → รับ macro context จาก Macro ก่อน แล้วค่อย scan/research
-                    → ส่งรายชื่อหุ้น + thesis ให้ทีม Quant
-  3. ทีม Quant    → รับหุ้นจาก Research → รัน Sentinel Signal, เช็ค technicals
-  4. ทีม Risk     → sizing, stop loss, concentration check
-  5. Victoria     → final decision, execution approval
-
-สรุปการส่งต่อ: Macro → Research → Quant → Risk → Victoria
-```
-
-### 1.1 Mandate เชิงลึก
-
-**ทีม Macro (Sam) — "อ่านใจตลาดให้ออก":**
-
-```
-1. SENTIMENT — VIX, Fear & Greed, put/call ratio, AAII survey
-   หา divergence: ราคาขึ้นแต่ sentiment/breadth อ่อน = เตือนภัย
-
-2. SMART MONEY FUND FLOW — ETF flows, institutional positioning, sector rotation
-   defensive (utilities/staples) นำ = risk-off กำลังมา
-   เงินเข้า safe haven (gold/SGOV/long bond) = ตลาดกลัวจริง
-
-3. BOND MARKET = ความจริง ⭐ (สำคัญสุด — ตลาด bond ฉลาดกว่า รู้ก่อน)
-   yield curve, credit spread (HY-IG), 2Y/10Y, MOVE index
-   ถ้าหุ้นขึ้นแต่ bond/credit เตือน → เชื่อ bond
-```
-
-**ทีม Investment (Research + Quant) — "จับ momentum & trend":**
-
-```
-• Momentum: relative strength นำตลาด (RS line ทำ new high)
-• Trend: ราคาเหนือ MA20/50/200, higher highs/lows
-• เข้าตามเทรนด์ยืนยันแล้ว ไม่สวนเทรนด์ (ยกเว้น contrarian setup §7 อนุมัติ)
-• Phase: เข้าช่วงต้น (IGNITE/BUILD) ออกช่วง PEAK
-• ผสาน macro: เทรนด์ + fund flow หนุน + sentiment ไม่สุดโต่ง = setup คุณภาพ
+Leo/Nina → feed สด → Daniel (regime) → Sofia/Marcus (fundamental)
+                                       → Aisha/Maya (catalyst/momentum)
+                                       → Thomas (valuation)
+                                       ↓
+                              Priya (scoring/backtest)
+                                       ↓
+                              Kai (risk/sizing/stop)
+                                       ↓
+                              Lena (portfolio fit)
+                                       ↓
+                              Miriam (4-gate compliance)
+                                       ↓
+                              James (CIO sign-off)
+                                       ↓
+                              Ryan (execution)
 ```
 
 ---
 
-## 2. Barbell Portfolio Structure
+## SECTION 3 — DUAL OBJECTIVE
 
 ```
-CORE (80%) — ฐานที่มั่นคง, income + compounding
-  • Broad index (VOO, SPMO)
-  • Dividend/income ETF (SCHD, GPIQ, QDVO covered-call)
-  • Buffer ETF (BALI), REIT (O), cash-like (SGOV, JAAA)
-  • ถือยาว ขายเมื่อ thesis เปลี่ยน/rebalance เท่านั้น
+OBJECTIVE 1: Total Return ≥ 1.3× SPY per year
+  SPY YTD ref:     +8.48% (ETF.com, 12 มิ.ย. 2026) [V]
+  Target:          +11.02%
+  Portfolio YTD:   +11.83% [E user-provided]
+  Status:          ✅ Beat
 
-SATELLITE ALPHA (20%) — เครื่องสร้าง alpha เหนือ benchmark
-  • High-conviction momentum/theme plays
-  • ถือ 7-15 วันทำการ (swing) ถึงระยะกลาง
-  • มี exit rule ตามกำไร % (ดู §5)
-  • นี่คือส่วนที่ทำให้ชนะ VOO ได้
+OBJECTIVE 2: Dividend Yield ≥ 5%
+  Blended yield:   5.08% [V calculated 16 มิ.ย. 2026]
+  Status:          ✅ Pass
 
-⚠️ Core ต้องไม่ซ้ำ benchmark มากเกินไป
-   ถ้า Core = VOO ล้วน จะไม่มี alpha
-```
+SINCE INCEPTION:
+  Cost basis:      $10,056.64 [E user-provided]
+  NAV (16 มิ.ย.):  $12,240.35 [V]
+  Gain:            +$2,183.71 (+21.7%)
+  2025 return:     +8.79% [E]
+  2026 YTD:        +11.83% [E]
+  Dividends rx:    $300.02 [E]
 
----
-
-## 3. Sentinel Signal v1.0 (ทีม Quant)
-
-```
-Voting system: RSI + MACD + Sentiment → BUY / HOLD / SELL + confidence
-
-1. RSI(14):
-   - Power Zone 60-75 (momentum แข็ง ไม่ overbought สุด) = bullish vote
-   - > 75 = overbought, ระวัง / < 30 = oversold, contrarian watch
-   - bearish divergence = veto
-
-2. MACD(12,26,9):
-   - zero-line separation + expansion = bullish vote
-   - bearish cross / below zero = bearish vote
-
-3. Sentiment:
-   - VIX/F&G regime + fund flow + catalyst = vote
-   - ดู §7 contrarian framework
-
-Output: STRONG BUY / BUY / HOLD / SELL / STRONG SELL + confidence %
-REJECT filter: ราคา < 50MA AND MACD ลง พร้อมกัน = ตัดออกอัตโนมัติ
+Note: [E] = user-provided unaudited จนกว่าจะ audit statement จริง
 ```
 
 ---
 
-## 4. Momentum Scan Framework — Research Team Prompt
+## SECTION 4 — PORTFOLIO STRUCTURE
 
-ใช้ทุกครั้งที่หา Satellite candidates ใหม่ (รัน deep-research skill):
-
+### Sleeve Targets
 ```
-Act as an institutional Quantitative Analyst and High-Beta Swing Trader.
-Scan, select, and analyze exactly 5 high-momentum equity setups
-for a 7 to 15-day swing trading timeframe.
-
-Momentum-Centric Alpha Score (Total 100%):
-1. MOMENTUM & RELATIVE STRENGTH (40% — DOMINANT)
-   Extreme RS vs SPY/QQQ over last 30 days.
-   RSI(14) in 60-75 "Power Zone" without bearish divergence.
-   MACD sustained zero-line separation + expansion.
-
-2. VOLUME ACCUMULATION (25%)
-   5-day avg volume > 1.5x of 20-day avg.
-   Up/Down Volume Ratio > 1.5 over 2 weeks.
-
-3. STRUCTURAL BASE & TREND (20%)
-   Emerging from multi-week consolidation (VCP, Flat Base, High-Tight Flag).
-   Price above 10 EMA & 20 EMA, MAs fanning upward.
-
-4. CATALYST DRIFT (15%)
-   PEAD / persistent sector rotation / major contract wins.
-
-CRITICAL FILTERS:
-- MARKET REGIME: VIX > 18 → defensive momentum or extreme RS outliers only
-- ENTRY RANGE: tight to 10-day EMA or within 3% above breakout pivot. Reject extended.
-- SWING TARGETS: 10-25% upside, Fibonacci 1.618 ext or measured moves
-- R:R minimum 1:3 | Stop: below 20-day EMA or base bottom
+Growth/Momentum:   ~55%  (GPIQ, SPMO, VOO)
+Income/Dividend:   ~30%  (BALI, SCHD, O, HSBC)
+Cash/Defensive:    ~13%  (SGOV, JAAA)
 ```
 
-> ⚠️ prompt ด้านบนเป็นเวอร์ชัน "execution-oriented" (ฟันธงราคา/score)
-> ใช้เฉพาะเมื่อมี **feed สด** ยืนยัน indicator ได้ — ห้ามใช้ค่าจากข้อมูลดีเลย์
-
-### 4.1 Research Watchlist Scanner — Verify-First Model (DEFAULT)
-
-> ใช้เมื่อทำงานจาก web search (ข้อมูลดีเลย์) — เน้นวินัยข้อมูล
-> บทบาท: Momentum Strategist + Catalyst Analyst
-> เป้าหมาย: watchlist 5-8 ตัว momentum swing (ถือ 7-15 วันทำการ)
-
+### Holdings (16 มิ.ย. 2026 00:05 [V])
 ```
-กฎเหล็ก:
-• ใช้เฉพาะข้อมูลที่ค้นหาได้และมีวันที่กำกับ
-• ทุกตัวเลข/ข้อเท็จจริง ต้องระบุแหล่ง + วันที่
-• verify ไม่ได้ → เขียน "ยืนยันไม่ได้ — ต้องเช็คใน feed สด"
-  ❌ ห้ามเดา ❌ ห้ามใส่ตัวเลขลอย ๆ
-• ❌ ห้ามแสดง "Win Probability %" (ไม่มีโมเดลรองรับ)
-• ❌ ห้ามฟันธง entry/stop/target ตายตัว (ราคาดีเลย์)
-
-STEP 1: ภาพตลาด (มีวันที่กำกับ)
-  • ทิศทาง SPY/QQQ ล่าสุด | VIX ล่าสุด
-  • Sector นำตลาด 2-4 สัปดาห์ | โทน: Risk-On/Neutral/Risk-Off
-
-STEP 2: คัดกรองด้วยปัจจัยที่ verify ได้
-  A. CATALYST (น้ำหนักสูงสุด) — earnings drift/revision, สัญญา, launch
-     ระบุวันที่ + ต้อง active 2-4 สัปดาห์
-  B. SECTOR/THEME LEADERSHIP — กลุ่มนำตลาด + อ้างผลงานกลุ่ม
-  C. PRICE STRENGTH (เชิงพรรณนา) — new high/ฟื้นแรงกว่าตลาด
-  D. SHORT INTEREST (ถ้ามี) — short float/days-to-cover + วันที่ประกาศ
-
-STEP 3: ผลลัพธ์ต่อตัว
-  #N TICKER (ชื่อ) | ธีม/Sector | Catalyst + วันที่
-  เหตุผลใน watchlist (3-4 ประโยค)
-  สถานะข้อมูล: ✅ ยืนยันแล้ว [+วันที่] /
-               ⚠️ ต้องเช็ค feed สด: RSI, MACD, RVOL, ADX, EMA, options flow
+GPIQ  $2,970.50  24.27%  $59.41  +2.34%
+SPMO  $2,254.19  18.42%  $157.47 +3.27%
+VOO   $1,717.56  14.03%  $693.88 +1.75%
+BALI  $1,702.80  13.91%  $34.06  +1.30%
+SCHD  $1,243.79  10.16%  $32.82  -0.02%
+SGOV  $1,214.67   9.92%  $100.53 +0.02%
+O       $438.06   3.57%  $62.58  -0.22%
+JAAA    $374.44   3.05%  $50.62  +0.04%
+HSBC    $324.34   2.65%  $93.02  +0.38%
+─────────────────────────────────────────
+NAV  $12,240.35  100%
 ```
 
-**เมื่อไหร่ใช้ตัวไหน:** §4.1 = DEFAULT (web search) | §4 = เมื่อมี feed สดยืนยัน
-
----
-
-## 5. Rotation Rules — Entry & Exit
-
-### Entry — มีหลายจังหวะ (ไม่ใช่แค่รอ panic)
-
+### Blended Yield
 ```
-🟢 จังหวะปกติ (เข้าได้ตาม regime — ไม่ต้องรอวิกฤต):
-   1. Pullback ในเทรนด์ขาขึ้น — ย่อมาทดสอบ EMA/support แล้วเด้ง
-   2. Breakout ยืนยัน — ทะลุ resistance + volume + momentum บวก
-   3. Post-earnings drift — งบดี guidance ขึ้น drift ต่อ (catalyst active)
-   4. Sector rotation — ธีมที่เงินสถาบันเพิ่งเริ่มไหลเข้า
-   5. DCA/เงินเพิ่มทุน — ลงตามรอบ ไม่ต้องจับ timing เป๊ะ
-
-🌟 จังหวะพิเศษ (SPECIAL OPPORTUNITY — โบนัส นาน ๆ มาที):
-   VIX > 30 + F&G < 15 + มีดหยุดร่วง = "เข้าซื้ออย่างบ้าคลั่ง"
-   → นี่คือโอกาสพิเศษที่ให้ผลตอบแทนสูงสุด
-   → อย่ารอแค่อันนี้อย่างเดียว จะพลาดจังหวะปกติ
-
-❌ ห้ามซื้อทุกตัวพร้อมกันวันเดียว (stagger)
-❌ ห้าม market order สำหรับ satellite — limit เท่านั้น
-❌ ห้ามไล่ราคาที่ปลายเทรนด์/extended
-```
-
-### Exit — Satellite
-
-```
-+20%  → TRIM 50% (lock profit, ถือที่เหลือ)
-+30%  → ออกทั้งหมด → หา IGNITE ตัวใหม่ทันที
-Phase = PEAK ⚠️ → ออก 50% (แม้กำไรยังไม่ถึง 30%)
--12%  → ทบทวน thesis + catalyst ก่อนตัดสินใจ:
-         • thesis พัง / catalyst หาย      → ตัดทันที ไม่มีข้อยกเว้น
-         • thesis ยังแข็ง + catalyst active → ทบทวนได้ ไม่ตัดมั่ว
-         ❌ ห้ามถัวเฉลี่ยทุกกรณี | ❌ ห้ามรอ "เดี๋ยวก็กลับ" โดยไม่มีเหตุผล
-Contrarian sell: F&G > 85 → trim แม้ยังไม่ถึง +20% (ดู §7)
-```
-
-### Exit — Core (ETF/ถือยาว)
-
-```
-ไม่มีเกณฑ์ "ขายที่กำไร X%" — ถือยาวเพื่อ compounding + ปันผล
-ขายเมื่อ: thesis เปลี่ยน / ต้อง rebalance (drift > ±5%) / หาที่ใช้เงินดีกว่า
+GPIQ  24.27% × 10.81% = 2.62%
+SPMO  18.42% ×  0.70% = 0.13%
+VOO   14.03% ×  1.04% = 0.15%
+BALI  13.91% ×  7.83% = 1.09%
+SCHD  10.16% ×  3.22% = 0.33%
+SGOV   9.92% ×  3.54% = 0.35%
+O      3.57% ×  5.24% = 0.19%
+JAAA   3.05% ×  5.50% = 0.17%
+HSBC   2.65% ×  5.06% = 0.13%
+─────────────────────────────────
+Blended: 5.16% ✅
 ```
 
 ---
 
-## 6. Position Sizing Rules
+## SECTION 5 — GOVERNANCE RULES (v2.0 อนุมัติ 13 มิ.ย. 2026)
 
-| ประเภท | ขนาด (% ของ Satellite Pool) | เงื่อนไข |
-|--------|---------------------------|---------|
-| Tier 1 — High Conviction | 18-20% | Sentinel STRONG + catalyst ชัด |
-| Tier 2 — Medium Conviction | 13-15% | Sentinel MODERATE + setup ดี |
-| High Beta (β > 3) | **50% ของ Tier ปกติ** | ATR สูง ลด size |
-| Cash Buffer | ดู §6.1 Dynamic Cash | ปรับตาม regime |
-
-**กฎ concentration:** Single position ไม่เกิน 18% NAV
-
-### 6.1 Dynamic Cash Buffer Policy (ปรับตาม Regime)
-
-> เงินสดคือ "ตำแหน่ง" ไม่ใช่เงินตาย — ถือมากตอนเสี่ยง ถือน้อยตอนปกติ
-
-| Regime | สัญญาณ | Cash Buffer | เหตุผล |
-|--------|--------|------------|--------|
-| 🟢 ปกติ | VIX < 18, F&G 25-75 | **5-10%** | ให้เงินทำงานเต็มที่ |
-| 🟡 เสี่ยง | VIX 18-25↑, F&G < 25 | **20-30%** | ลด exposure, สะสมกระสุน |
-| 🔴 Panic/Opportunity | VIX > 30, F&G < 15 | **Deploy → 5-10%** | ปล่อยกระสุน ซื้อตอนถูก |
-
+### Rule #1 — Soft-Block System *(Maya Chen)*
 ```
-เพิ่ม cash "ก่อน" panic (ตอนเห็นสัญญาณ) ไม่ใช่ตอน panic แล้ว
-deploy "ตอน" panic ไม่ใช่หนีตอน panic
-buffer เก็บใน SGOV/JAAA (ได้ yield 4-5% ระหว่างรอ)
+ถ้าติด Hard Block เพียง 1 ข้อ AND Score > 80/100
+→ Signal = WATCH (ไม่ใช่ REJECT)
+ติด Hard Block ≥ 2 ข้อ = REJECT เสมอ
 ```
 
-### Stagger Entry Rule
-
+### Rule #2 — Staggered Deploy *(Aisha Fontaine)*
 ```
-Day 1:   ซื้อ 60-70% ของ position ที่วางแผน (หรือ 1/3 ถ้าตลาดผันผวน)
-Day 2-3: ซื้อที่เหลือเมื่อ price confirm (ไม่ใช่ average down)
-ห้ามซื้อครั้งเดียว 100% ยกเว้น catalyst overnight
-```
-
----
-
-## 7. Macro Framework — ทีม Macro
-
-### VIX Contrarian Scale — "กล้าเมื่อคนกลัว กล้าเมื่อคนกล้า"
-
-> ⚠️ กฎเหล็ก: ไม่รับมีดร่วง — รอ "สัญญาณทรงตัว" ก่อนเข้าเสมอ
-
-**ขา Fear → หาจังหวะซื้อ:**
-
-| VIX | Regime | Action |
-|-----|--------|--------|
-| 20-25 | ⚠️ ดีดแรง — ดูทิศทางก่อน | รอดู price action ทรงตัว/ไหลต่อ ห้าม FOMO |
-| 25-30 | 🟠 เริ่มมองหาการลงทุน | watchlist, เลือกตัวคุณภาพ, เตรียม limit |
-| > 30 | 🟢 SPECIAL: เข้าซื้อเชิงรุก | ความกลัวสุดขีด = ราคาดีสุด (stagger) |
-
-**ขา Greed → ระวัง + เตรียมขาย:**
-
-| VIX | Regime | Action |
-|-----|--------|--------|
-| 15-20 | 🟡 Neutral | ถือ, deploy เฉพาะ high RS |
-| < 15 | 🔴 Complacent | อันตราย — trim satellite กำไร, ยก stop |
-
-### Stabilization Guardrail — ห้ามรับมีดร่วง
-
-```
-VIX > 30 ไม่ได้แปลว่าซื้อทันที — ต้องเห็น 1 ใน 3 สัญญาณ:
-  1. VIX ทำ lower high 2 วันติด
-  2. ดัชนีหลัก (SPX) ปิดเหนือ low วันก่อนหน้า (ไม่ทำ new low)
-  3. ไม่มี catalyst ลบใหม่ค้าง (สงครามบานปลาย, Fed hawkish รอ)
-
-→ ยัง free-fall + catalyst ลบค้าง = รอ ห้ามเข้า แม้ VIX 35+
-→ เข้าแบบ stagger เสมอ (ทีละ 1/3)
+ก่อน Tier-1 event (FOMC/CPI/NFP):
+→ เข้าได้สูงสุด 1/3 ของแผน
+→ เก็บ 2/3 ไว้หลัง event ผ่าน
 ```
 
-### Fear & Greed Index — Contrarian Scale
-
-**ขา Fear (สัญญาณซื้อ):**
-
-| Score | สภาวะ | Action |
-|-------|-------|--------|
-| 25-35 | Mild Fear | WATCH — เตรียม watchlist |
-| 15-25 | Fear | เริ่ม scale in 25-30% |
-| < 15 | Extreme Fear | ซื้อจริงจัง (รอ stabilize) |
-| < 10 | Maximum Fear | ALL IN — เกิดน้อยมาก |
-
-**ขา Greed (สัญญาณขาย):**
-
-| Score | สภาวะ | Action |
-|-------|-------|--------|
-| 65-75 | Greed | เริ่ม TRIM ตัวที่กำไรแล้ว |
-| 75-85 | Extreme Greed | TRIM 30-50% satellite |
-| > 85 | Euphoria | DANGER — TRIM 50-70% ทันที |
-| > 90 | Maximum Greed | เตรียม cash รอรอบหน้า |
-
-### Dual-Signal Confirmation Matrix
-
+### Rule #3 v2 — Position Balance Framework *(Kai Tanaka)*
 ```
-ซื้อแข็งสุด  : VIX > 30 AND F&G < 15 (+ผ่าน guardrail)
-ขาย/ระวังสุด : VIX < 15 AND F&G > 85 (euphoria = top zone)
-ขัดกัน       : ใช้ VIX guardrail นำ, เข้าช้าลง size เล็กลง
+ZONE          SIZE       ACTION
+──────────────────────────────────────────────────
+✅ BASE       ≤ 20%      Optimal
+⚠️ WATCH      20–22%     ประชุม: trim หรือ watch
+               (พิจารณาภาพรวม + macro)
+🔴 TRIM       23–25%     Trim บังคับ → target 18-19%
+               Research หาตัวทดแทนก่อน trim
+🚨 EMERGENCY  > 25%      Trim ทันที
+
+TRIM PROCEDURE:
+1. Kai คำนวณ trim → target 18-19%
+2. Research หาตัวทดแทน:
+   - Income sleeve → yield ≥ ตัวที่ trim
+   - Growth sleeve → return/momentum คล้ายกัน
+   - ถ้าไม่มี → พัก SGOV/JAAA รอ
+3. Lena approve → Miriam check → James sign-off
 ```
 
-### Proactive Profit-Taking — "นำหน้าฝูงชนเสมอ"
-
+### Rule #4 — ATR-Based Stop *(Kai Tanaka)*
 ```
-สัญญาณ aggressive ที่ต้องเริ่มขาย (ไม่รอครบทุกข้อ):
-  □ F&G > 75 หรือพุ่งเร็วผิดปกติ
-  □ ดัชนี new high + volume ลด (rally ไร้แรง)
-  □ junk/meme วิ่งแรงกว่าคุณภาพ (ปลายรอบ)
-  □ social media euphoria, รายย่อยแห่เข้า
-  □ satellite กำไรเกินเป้าเร็วผิดปกติ
-  □ RSI > 75 ทั้งกระดาน
-
-Action:
-  2-3 สัญญาณ → trim แม้ยังไม่ถึง +20%
-  4+ สัญญาณ  → trim 30-50%, ยก stop, เพิ่ม cash 20-30%
-  F&G > 85    → take profit สูงสุด
-
-✅ scale out เป็นชั้น (เหมือน stagger ขาเข้า)
-✅ ขายเร็วไปนิด > ติดดอยตอนทุกคนหนีพร้อมกัน
-❌ ห้ามโลภรอบสุดท้าย "เดี๋ยวขึ้นอีกนิด" = ติดดอย
+Default stop = entry − 2 × ATR(14)
+ระบุ stop ก่อน execute ทุกครั้ง
+Trailing stop: ปรับขึ้นได้ ห้ามปรับลง
 ```
 
-### Yield Curve Signals
-
-| สัญญาณ | ความหมาย | Action |
-|--------|---------|--------|
-| 2Y > Fed Funds | ตลาด price in rate hike | ลด satellite exposure |
-| 2Y > Fed Funds +50 bps | Rate hike ใกล้มา | เตรียม cash ก่อน FOMC |
-| Yield curve steepening | Growth re-acceleration | เพิ่ม cyclicals |
-| Yield curve inverting | Recession risk | เพิ่ม defensive core |
-
-### Bond Market Truth — "ตลาดพันธบัตรไม่โกหก" ⭐
-
-| สัญญาณ Bond | อ่านความจริง | Action |
-|------------|------------|--------|
-| Credit spread (HY-IG) กว้างขึ้น | ความเสี่ยง default เพิ่ม แม้หุ้นขึ้น | ลด risk, เพิ่ม cash |
-| Credit spread แคบ/นิ่ง | เครดิตสบายใจ หนุน risk-on | ถือ/เพิ่ม satellite ได้ |
-| MOVE index > 100 | ความไม่แน่นอนเชิงระบบ | ระวัง, ลด leverage |
-| 10Y พุ่งเร็ว | กดดัน valuation หุ้น growth | Trim growth/long duration |
-| เงินเข้า long bond (TLT) | safe haven — เงินใหญ่กลัว | Defensive, เตรียม cash |
-| หุ้น↑ แต่ credit spread↑ | 🚨 Divergence — หุ้นหลอก | เชื่อ bond, take profit |
-
-### Smart Money Fund Flow
-
+### Rule #5 — Data Integrity *(Miriam Osei)*
 ```
-RISK-ON มา  → เงินเข้า: tech, discretionary, small-cap, cyclicals
-RISK-OFF มา → เงินเข้า: utilities, staples, healthcare, gold, bonds
-กฎ: ตามเงินใหญ่ ไม่ใช่ตามข่าว
-เครื่องมือ: ETF flows, relative strength, safe haven (gold/SGOV/TLT/USD), breadth
+DATA UNAVAILABLE = 0 คะแนน ห้ามเดา
+ทุก data point ต้องมี [V/E/U] flag:
+  [V] Verified:     แหล่งชัด + วันที่ ≤ 24 ชม.
+  [E] Estimate:     ประมาณ ต้องระบุ basis
+  [U] Unavailable:  = 0 pts เสมอ
 ```
 
-### Market Read Synthesis (3 คำถาม)
-
+### Rule #6 — WR Disclosure *(Priya Nair)*
 ```
-1. SENTIMENT บอกอะไร? (คนกลัว/โลภ?)
-2. SMART MONEY ไปไหน? (risk-on/off?)
-3. BOND พูดความจริงอะไร? (เศรษฐกิจจริง?)
-
-→ ทั้ง 3 ทางเดียวกัน = แข็งแรง เชื่อได้
-→ ขัดกัน = ให้น้ำหนัก BOND > SMART MONEY > SENTIMENT
+ต้องระบุ "Component Estimate (ไม่ใช่ backtest จริง)"
+ทุกครั้งที่อ้าง WR จนกว่าจะมี ≥ 100 live trades
 ```
 
-### Rate Hike Playbook
-
+### Rule #7 — Rebalance Alert *(Lena Müller)*
 ```
-Sensitivity (เจ็บสุด → ได้ประโยชน์สุด):
-🔴🔴 REIT         → เจ็บสุด: พึ่งกู้, แข่ง bond yield
-🟡   Income ETF   → ปานกลาง: dividend แข่ง bond
-🟡   Dividend     → เบา-กลาง
-🟢   Floating-rate → ได้ประโยชน์: yield ลอยตามดอกเบี้ย
-🟢🟢 Cash-like    → ได้ประโยชน์: yield ขึ้นทันที
-🟢🟢 Banks        → ได้ประโยชน์: NIM กว้าง
-
-FedWatch Trigger:
-  < 50%         → ถือปกติ
-  50-70%        → trim REIT 1/3, ห้ามเพิ่ม REIT/long-duration
-  > 70%         → trim REIT ครึ่ง-หมด, เพิ่ม cash/banks
-  10Y > 4.8%    → เตือน REIT, เตรียม exit
-  Fed ขึ้นจริง + VIX > 30 → special opportunity deploy
-```
-
-### FOMC Blackout Rule
-
-```
-T-2 ก่อน FOMC → ไม่เพิ่ม position ใหม่
-T-0 วัน FOMC  → ถือสถานะเดิม ไม่ซื้อขาย
-หลัง Dovish   → ซื้อ satellite เพิ่มทันที
-หลัง Hawkish  → รอ 2-3 วัน ดู price action
-```
-
-### Inflation Signals
-
-```
-Core CPI > 3.5% YoY → trim growth, เพิ่ม dividend/value
-Core CPI > 4.0% YoY → ลด satellite 30%, เข้า short-duration
-Energy-driven CPI   → ดู defense/nuclear theme (ไม่ใช่ structural inflation)
+Sleeve drift > 5% จาก target = auto-alert ทันที
+Lena ตรวจ NAV ทุกสัปดาห์
 ```
 
 ---
 
-## 8. "Buy Rumor — Sell News" Calendar System
+## SECTION 6 — MOMENTUM SCORING SYSTEM v3.0
 
+### Phase 3A — Momentum (35 pts)
 ```
-ก่อน catalyst (earnings/launch/Fed):
-  สะสมช่วง rumor หากเข้าเกณฑ์ momentum
+RSI Tier 1 (55-78):               +12 pts
+RSI Tier 2 (45-54 + MA confirm):   +8 pts
+RSI < 45 หรือ > 80:                 0 pts
 
-วัน catalyst:
-  ประเมิน — ถ้า price in แล้ว มัก sell-the-news → take profit
+MACD + Histogram:
+  บวก + expanding:                 +13 pts
+  บวก + ไม่ขยาย:                    +8 pts
+  negative แต่ reversing:           +5 pts
+  flat/hugging/divergence:           0 pts
 
-หลัง catalyst:
-  ดู post-earnings drift (PEAD) ถ้า guidance ดี
+ADX:
+  > 25:                             +5 pts
+  20-25:                            +3 pts
+  < 20:                              0 pts [HARD BLOCK]
 
-⚠️ Satellite: ห้ามถือข้าม earnings ที่ไม่มั่นใจ (binary risk)
+RS vs SPY (20D):                   +5 pts
 
-Events ที่ต้อง Track:
-  📊 Earnings      — ซื้อ 3-4 สัปดาห์ก่อน, ขายก่อน/หลัง 1 วัน
-  🏦 FOMC Meeting  — ดู macro signal, ไม่ซื้อ 2 วันก่อน
-  📈 CPI Release   — รอผลก่อนตัดสินใจ
-  🚀 IPO/SpinOff   — ซื้อ sector peers ก่อน (halo effect)
-  🛡️ DoD Contract  — ซื้อ defense names ก่อนประกาศ
-  💊 FDA Approval  — ซื้อ biotech ก่อน PDUFA date
-```
-
----
-
-## 9. Fundamental Analysis Framework (Marcus Webb)
-
-### Scorecard (100 pts)
-
-| Factor | Metric | เกณฑ์ | คะแนน |
-|--------|--------|-------|-------|
-| **Growth (40)** | Revenue Growth YoY | > 20% = 10 / 10-20% = 5 | /10 |
-| | EPS Growth YoY | > 25% = 10 / 10-25% = 5 | /10 |
-| | Revenue Guidance | ขึ้น = 10 / คงที่ = 5 | /10 |
-| | Estimate Revision | ปรับขึ้น = 10 / คงที่ = 0 | /10 |
-| **Quality (30)** | Gross Margin Trend | ขยาย = 10 / คงที่ = 5 / หด = 0 | /10 |
-| | Free Cash Flow | FCF > 0 + yield > 2% = 10 | /10 |
-| | ROIC / ROE | > 15% = 10 / 10-15% = 5 | /10 |
-| **Valuation (20)** | Forward P/E vs Sector | < avg = 10 | /10 |
-| | PEG Ratio | < 1.5 = 10 / 1.5-2.5 = 5 / > 2.5 = 0 | /10 |
-| **Catalyst (10)** | Event proximity + quality | ดู §8 | /10 |
-
-```
-Total Score:
-  ≥ 75 → GREEN  ✅ เข้าได้ (ร่วมกับ Sentinel Signal)
-  50-74 → YELLOW 🟡 เข้าได้ถ้า technical แข็งมาก
-  < 50  → RED   ❌ ข้าม
+Flow (OBV+MFI):
+  OBV rising + MFI > 50:          +13-15 pts
+  Flat:                            +6 pts
+  Distribution:                     0 pts [HARD BLOCK]
 ```
 
-### Red Flags — REJECT ทันที
-
+### Phase 3B — Volume & Flow (25 pts)
 ```
-🚩 Revenue growth ลดลงติดต่อกัน 2 ไตรมาส
-🚩 Gross margin หดลงมากกว่า 300 bps YoY
-🚩 Free Cash Flow ติดลบ และ burn rate > 6 เดือน
-🚩 Debt/Equity > 3x โดยไม่มี asset backing
-🚩 Guidance ถูกปรับลง 2 ไตรมาสล่าสุด
-🚩 Insider selling > 5% ของหุ้นใน 30 วัน
-🚩 Short interest > 20% ของ float
-🚩 Customer concentration > 50% จาก 1 ราย
+OBV+MFI rising:         +15 pts
+OBV declining ขณะราคาขึ้น: [HARD BLOCK]
+Volume > 1.5× avg:      +10 pts
+Volume 1-1.5×:           +6 pts
+Volume < avg:             0 pts
 ```
 
-### Key Metrics per Sector
-
-| Sector | Metric หลัก | Metric รอง |
-|--------|------------|-----------|
-| AI / Semiconductor | AI revenue growth %, custom chip backlog | Gross margin, R&D/Revenue |
-| Cloud / SaaS | ARR growth, NRR | Rule of 40, CAC payback |
-| Defense | Backlog ($), backlog-to-revenue ratio | EBITDA margin, contract type |
-| Energy / Nuclear | Capacity additions (GW), PPA pricing | FCF, debt maturity |
-| Biotech | Pipeline stage, FDA timeline | Cash runway, partnership deals |
-| Space / Satellite | Launch cadence, backlog, gross margin | R&D burn, gov vs commercial mix |
-
-### Earnings Analysis
-
+### Phase 3C — Structure (15 pts)
 ```
-1. BEAT OR MISS?
-   Revenue + EPS vs consensus
-   → Beat both + Guidance up   = STRONG BUY (PEAD setup)
-   → Beat revenue, miss EPS    = NEUTRAL
-   → Miss revenue              = EXIT depending on guidance
+MA bullish stack (ราคา > 10EMA > 20EMA > 50SMA): +10 pts
+Tier 2 pullback (> 50SMA + > 200SMA):             +6 pts
+ราคา > 200SMA เท่านั้น:                           +3 pts
+ราคา < 200SMA:                                     0 pts [HARD BLOCK]
 
-2. GUIDANCE CHECK
-   Q+1 guidance vs consensus? Full-year raised/maintained/lowered?
-   → Raised = PEAD setup ✅
-   → Lowered = EXIT หรือ ลด position ทันที
-
-3. PRICE ACTION POST-EARNINGS
-   Gap up > 5% on volume    = momentum entry
-   Gap down > 8% on beat    = potential flush-reversal
-   Flat on beat             = แผ่ว รอ next catalyst
+Pattern:
+  VCP/HTF/Bull Flag:    +5 pts
+  Base patterns:        +3 pts
+  Unclear:              +1 pt
+  Broken/Failed:         0 pts
 ```
 
----
-
-## 10. Investment Themes Framework
-
-### หลักการเลือกธีม
-
+### Phase 3D — High-Beta (10 pts)
 ```
-เข้าธีม: fund flow เริ่มเข้า + RSI Power Zone
-ออกธีม: fund flow ชะลอ + RSI > 75 + Volume ลด
-ไม่ Overweight ธีมเดียวเกิน 40% ของ Satellite
+ATR% > 3%:    +5 pts | 2-3%: +3 pts | < 2%: 0
+Beta > 1.3 + DollarVol > $50M: +5 pts
+Beta > 1.0 + DollarVol > $10M: +3 pts
+DollarVol < $10M: [HARD BLOCK]
 ```
 
-### ธีม Structural (2-5 ปี)
-
+### Phase 3E — Trend Maturity (8 pts)
 ```
-AI Infrastructure  — Hyperscaler capex, custom chips, data center
-Defense/Drones     — Global rearmament, drone warfare, budget surge
-Nuclear/Uranium    — AI power demand, SMR commercialization
-Critical Minerals  — US-China decoupling, EV + defense supply chain
-```
-
-### ธีม Cyclical (6-18 เดือน)
-
-```
-Space Economy    — Launch cadence, satellite internet, sector IPOs
-AI Cloud         — GPU rental, inference scaling
-Biotech M&A      — Patent cliff, acquisition premium
-AI Power Infra   — Cooling, power distribution, grid
-Cybersecurity    — Zero-trust, AI-driven threats
+BB Position (ราคาระหว่าง Mid-Upper BB): +5 pts
+ราคาเพิ่งข้าม 20 EMA ≤ 5 bars:          +3 pts
+6-15 bars หลังข้าม:                      +2 pts
+> 15 bars extended:                       0 pts
 ```
 
-### Active Themes + Watchlist
-
-> *[Fund manager จะ upload watchlist และ active positions ในแต่ละ session]*
-
----
-
-## 11. Research Workflow — ลำดับการทำงาน
-
+### Phase 3F — Volatility (7 pts)
 ```
-┌─────────────────────────────────────────────────────┐
-│  Step 1: MACRO (Sam Rivera)                         │
-│    → VIX level, 2Y vs Fed Funds, CPI trend          │
-│    → Market Regime: Risk-On / Caution / Risk-Off    │
-│    → FOMC calendar + blackout dates                 │
-│    → Bond/credit/smart money read                   │
-│    ⬇ ส่ง Macro Brief → Research ก่อนเริ่ม scan     │
-├─────────────────────────────────────────────────────┤
-│  Step 2: RESEARCH (Emily / Marcus / Nina)           │
-│    [รับ Macro Brief จาก Step 1 ก่อนเสมอ]            │
-│    → Run Momentum Scan §4 หรือ Watchlist §4.1       │
-│      (กรองเฉพาะ sector/theme ที่ Macro อนุมัติ)      │
-│    → Deep research per candidate                    │
-│    → Fundamental Scorecard §9                       │
-│    → Fund flow verification per theme               │
-│    ⬇ ส่ง Research List (ticker + thesis) → Quant   │
-├─────────────────────────────────────────────────────┤
-│  Step 3: QUANT (Kenji / Aisha)                     │
-│    [รับ Research List จาก Step 2]                   │
-│    → Sentinel Signal v1.0 per candidate             │
-│    → Entry range: 10-day EMA ± 3%                  │
-│    → R:R calculation (reject if < 1:3)             │
-│    → Fibonacci targets (1.618 extension)            │
-│    ⬇ ส่ง Signal Report → Risk                      │
-├─────────────────────────────────────────────────────┤
-│  Step 4: RISK (Chris Morgan)                        │
-│    → Position size per Beta tier                    │
-│    → Portfolio concentration check                  │
-│    → Stop loss placement (below 20-day EMA)         │
-│    → Cash buffer verification                       │
-│    ⬇ ส่ง Approved List → Victoria                  │
-├─────────────────────────────────────────────────────┤
-│  Step 5: VICTORIA CHEN — Final Decision             │
-│    → Review all team inputs                         │
-│    → Approve / reject / modify                      │
-│    → Set limit orders + execution timing            │
-└─────────────────────────────────────────────────────┘
+ATR expanding + > avg:    +4 pts
+ATR > avg เท่านั้น:       +2 pts
+BB Squeeze release:        +3 pts
+BB normal:                 +1 pt
+```
 
-กฎ: Research ห้าม scan โดยไม่มี macro context ก่อน
-    Quant ห้ามรัน signal โดยไม่มี research list ก่อน
+### Phase 3E Sector + 3F Catalyst (15 pts รวม)
+```
+Sector Leadership (3E ext):
+  Top 1-3 ใน leading sector:   +5 pts
+  ใน leading แต่ไม่ top:       +3 pts
+  Sector ไม่ได้นำ:             +1 pt
+
+Catalyst (3F ext — Aisha score):
+  Catalyst score ≥ 20/25:     +10 pts
+  15-19/25:                    +8 pts
+  10-14/25:                    +6 pts
+  5-9/25:                      +3 pts
+  < 5/25:                       0 pts
+  Negative catalyst:           −3 pts
+  Earnings ใน 5 วัน:           REJECT
+```
+
+### Signal Thresholds
+```
+≥ 75/100  🟢 STRONG BUY    → เข้า full size
+58-74     🟡 BUY           → staggered entry
+> 80 + 1 block ⚠️ SOFT-BLOCK → WATCH (Rule #1)
+42-57     🟠 WATCH         → รอ confirm
+< 42      🔴 REJECT
+Hard Block ❌              → REJECT ทันที
+```
+
+### Hard Blocks (override ทุก score)
+```
+❌ ADX < 20
+❌ ราคา < 200 SMA
+❌ OBV distribution ขณะราคาขึ้น
+❌ RSI < 45 ไม่มี MA confirm
+❌ DollarVol < $10M
+❌ Earnings ใน 5 วัน
 ```
 
 ---
 
-## 12. Portfolio Health Metrics (ตรวจทุกสัปดาห์)
+## SECTION 7 — MACRO FRAMEWORK
 
-| Metric | เป้า | Alert | Action |
-|--------|------|-------|--------|
-| Quarterly return vs benchmark | ≥ VOO TR × 1.3 | Alpha < 0 | Strategy review |
-| Cash buffer | §6.1 dynamic | ดู regime | Adjust ตาม VIX/F&G |
-| Single position | ≤ 18% NAV | > 20% | Trim immediately |
-| Core/Satellite ratio | 80/20 | drift ±5% | Rebalance |
-| Blended dividend yield | ≥ 5% | < 5% | เพิ่ม income tilt |
-| Theme correlation | < 0.7 | > 0.8 | Diversify |
-
----
-
-## 13. Benchmark & Income Mandate
-
-### เป้าหมาย
-
+### Regime Score (Daniel Cho)
 ```
-Fund Return ≥ VOO Total Return × 1.3 ต่อปี
-Alpha = Fund − (VOO TR × 1.3) | >0 = ชนะ / <0 = review
+SCORE     REGIME       CASH MIN    DEPLOY
+70-100    Risk-On 🟢   10%         Full
+40-69     Neutral 🟡   15%         75%
+20-39     Risk-Off 🔴  20-30%      1/3 only
+0-19      Crisis ⚫    40%+        Freeze
+
+Components:
+  VIX:       0-30 pts
+  Yield:     0-25 pts
+  Inflation: 0-20 pts
+  Breadth:   0-15 pts
+  Credit:    0-10 pts
 ```
 
-### Income Mandate
-
+### Macro Vision (1-2 Quarters)
 ```
-Dividend Yield ≥ 5% ของ Total Asset/ปี
-Total Return = Dividend Yield + Capital Growth
-  เช่น VOO TR +10% → เป้า +13% = 5% ปันผล + 8% growth
-
-• Core: income-generating (dividend ETF, covered-call, REIT)
-• Satellite: growth (ปันผลน้อย) เติม growth layer
-• Blended yield ≥ 5% — เช็คทุก rebalance
-• ⚠️ ระวัง yield trap — Total return สำคัญกว่า yield เดี่ยว ๆ
+Daniel ต้องมี forward view 1-2 quarters เสมอ:
+- Fed cut timeline
+- CPI trend
+- Sector rotation prediction
+- Q3/Q4 seasonality
+ไม่ใช่แค่รายงาน regime ปัจจุบัน
 ```
 
-### Rebalance Policy
-
+### Tier-1 Event Blackout
 ```
-TRIGGER (บังคับ):
-  Core/Satellite drift > ±5%
-  Single position > 18%
-  Theme correlation > 0.8
-
-CADENCE:
-  ทุก 1 เดือน: review (rebalance ถ้า drift)
-  ทุก 3 เดือน: full review + benchmark check
-
-กฎเหล็ก:
-  ❌ ห้าม rebalance ตอน VIX > 25 (รอตลาดนิ่ง)
-  ❌ ห้ามขาย Core thesis ดี เพื่อ "ปรับตัวเลข"
-  ✅ เติมส่วนขาดด้วย cash/ปันผล/ตัวที่ trim ก่อน
-  ✅ Tax/cost aware
-
-Sequence: วัด VOO TR → หา alpha → เช็ค drift →
-          ตัดตัวผิดกฎ → เติมส่วนขาด → บันทึก
+FOMC / CPI / NFP ใน 5 วัน:
+→ max 1/3 deploy (Rule #2)
+→ review regime ใน 24 ชม. หลัง event
 ```
 
 ---
 
-## 14. Performance Review Template
+## SECTION 8 — PRE-TRADE CHECKLIST (9 Gates)
 
 ```
-═══════════════════════════════════════
-  QUANTUM CAPITAL — PERFORMANCE REVIEW
-  Period: ______  Date: ______
-═══════════════════════════════════════
-NAV: Opening $____ → Closing $____ (Return ___%)
+GATE 1  Regime timestamp [V] ≤ 24 ชม.
+GATE 2  Regime score ≥ 40 (Neutral+)
+GATE 3  Momentum score ≥ 58/100
+GATE 4  Soft-block check (ถ้า apply)
+GATE 5  Position ≤ 20% NAV (Rule #3)
+GATE 6  ATR stop ระบุแล้ว (Rule #4)
+GATE 7  DQS ≥ 70% + ทุก key data มี [V/E/U]
+GATE 8  Stagger rule (ถ้าใกล้ Tier-1 event)
+GATE 9  James Hartwell (CIO) sign-off
 
-Benchmark:
-  VOO Total Return: ___% | Target (×1.3): ___%
-  Fund Return: ___% | ALPHA: ___% → ✅/⚠️
-
-Income Mandate:
-  Dividend received: $____ | Annualized yield: ___%
-  Blended yield: ___% → ✅/⚠️
-
-Layer: Core +___% | Satellite +___%
-
-Rebalance Check:
-  Core/Satellite: ___/___ (drift ___%)
-  Largest position: ____ (___% NAV)
-  Action: _______________
-
-Trade Log:
-  Best: ____ +__% | Worst: ____ -__% | Win rate: __/__
-  
-Themes: 1.____ +___% | 2.____ +___% | 3.____ +___%
-
-Lessons: 1.__________ 2.__________
-
-Next Period: Theme focus:____ Key risk:____ FOMC:____
-═══════════════════════════════════════
+RESULT: ผ่าน 9/9 → Ryan execute
+        ล้มเหลวข้อใดข้อหนึ่ง → HOLD
 ```
 
 ---
 
-## 15. Emergency Protocols
+## SECTION 9 — RISK MANAGEMENT
 
+### Position Sizing (Kelly Criterion)
 ```
-🚨 VIX spikes > 30 (แยก 2 กรณี):
-  A. Free-fall + catalyst ลบค้าง
-     → ปกป้องทุน: ถือ core, ไม่เพิ่ม, ตัดตัวชน -12%
-     → เตรียม watchlist + cash รอ guardrail stabilize
-  B. VIX สูงแต่เริ่มทรงตัว (ผ่าน stabilization §7)
-     → SPECIAL opportunity: deploy เชิงรุก stagger 1/3
-  ⚠️ ซื้อตอนมีดหยุด — ไม่ panic-out ที่ราคาต่ำสุด
-
-🚨 Fed surprise rate hike:
-  → ลด satellite 50% ใน 24 ชม.
-  → เพิ่ม defensive core
-  → Review ทุก position
-
-🚨 Position ถึง -12%:
-  → ทบทวน thesis + catalyst ก่อนตัดสินใจ (ห้ามตัดมั่ว / ห้ามรอมั่ว)
-     thesis พัง หรือ catalyst หาย → ตัดทันที ไม่มีข้อยกเว้น
-     thesis ยังแข็ง + catalyst active → ถือได้ แต่ห้ามถัวเฉลี่ยทุกกรณี
-  → บันทึก lesson เสมอ (ไม่ว่าจะตัดหรือถือ)
-  → รอ 48 ชม. ก่อนเข้าธีมเดิม (ถ้าตัดออก)
-
-🚨 Portfolio drawdown > 8%:
-  → หยุดซื้อทุกอย่าง
-  → ประชุมทบทวน strategy
-  → ไม่ re-enter จนกว่า macro ชัด
+f* = (WR × Avg_Win − (1−WR) × Avg_Loss) / Avg_Win × 0.25
+Ceiling: min(f*, 20%)
+Floor:   max(f*, 3%)
 ```
 
----
-
-## 16. คำเตือนพฤติกรรม (Behavioral Guardrails)
-
+### Regime Cash Buffer
 ```
-ทีมต้องเตือน fund manager เมื่อเห็นสัญญาณเหล่านี้:
+Risk-On:   10%+
+Neutral:   15%
+Risk-Off:  20-30%
+Crisis:    40%+
+Before FOMC: 1/3 max deploy
+```
 
-🚩 อยากล้างพอร์ต/reset เพราะอึดอัด (ไม่ใช่เพราะ thesis เปลี่ยน)
-🚩 อยากถัว/สะสมตัวที่เพิ่งขายขาดทุน (revenge trading)
-🚩 อยากไล่ของที่วิ่งไปแล้ว เพราะกลัวตกรถ (FOMO)
-🚩 อยากถัวเฉลี่ย หรือรอ "เดี๋ยวก็กลับ" โดยไม่ตรวจ thesis + catalyst ที่ -12%
-🚩 อยากเข้า high-beta ตอนตลาด panic ก่อนมีดหยุดร่วง
+### Stop Loss
+```
+Default:  entry − 2 × ATR(14)
+Trailing: ปรับขึ้นทุกสัปดาห์ ห้ามปรับลง
+Max risk/trade: 1.5% NAV
+Max risk/open:  8% NAV
+```
 
-→ "ไม่ทำอะไรโง่ ๆ" ในวันตลาดแย่ = วินัย ไม่ใช่ความขี้กลัว
-→ ทีมที่ดีต้องท้วง ไม่ใช่ yes-man ที่พากองทุนเจ๊ง
-→ สมดุล: ลงทุนตาม setup ปกติ + เก็บกระสุนรอ special opportunity
+### Correlation
+```
+Flag ถ้า correlation > 0.7 ระหว่าง 2 positions
+Growth sleeve avg correlation > 0.65 = warning
 ```
 
 ---
 
-## 17. Data Sources & Tools
+## SECTION 10 — DEPLOY PLAN (อัปเดต 16 มิ.ย. 2026)
 
-| Tool | ทีม | วัตถุประสงค์ |
-|------|-----|------------|
-| `deep-research` skill | Research | Multi-source research + scan |
-| `equity-research` skill | Research | Screening + thesis |
-| Sentinel Signal v1.0 | Quant | RSI + MACD + Sentiment |
-| TradingView | Quant | Chart, EMA, MACD (feed สด) |
-| CME FedWatch | Macro | Fed rate probability |
-| FRED (St. Louis Fed) | Macro | 2Y/10Y, Fed Funds, CPI |
-| CBOE / Yahoo (^VIX) | Macro | VIX — contrarian regime |
-| CNN Fear & Greed | Macro | Sentiment contrarian |
-| Morningstar / iShares | Research | ETF fund flows |
+### SGOV $1,214.67 — รอ Execute 22 มิ.ย.
+```
+Timeline:
+  17 มิ.ย.  FOMC → ดู tone dovish/hawkish
+  19 มิ.ย.  ตลาดปิด (Juneteenth) + Iran deal sign Geneva
+  22 มิ.ย.  ✅ วันแรกที่ execute ได้
+
+SCENARIO A — Fed Hold (base):
+  Tranche 1 ($500): AVDV
+  Tranche 2 ($400): MAIN
+  Tranche 3 ($200): DFIV
+  Tranche 4 ($114): O เพิ่ม
+
+SCENARIO B — Fed Hawkish:
+  Hold ทั้งหมด → รอ 1 สัปดาห์ → เข้าราคาถูกลง
+
+SCENARIO C — Fed Dovish/Cut:
+  Tranche 1: AVDV/DFIV
+  Tranche 2: UNH หรือ SPMO เพิ่ม
+```
+
+### GPIQ Trim Plan
+```
+Current: 50 หุ้น × $59.41 = $2,970.50 (24.27%) 🔴 TRIM ZONE
+Target:  ~38-39 หุ้น (18-19% NAV)
+Trim:    ~11-12 หุ้น (~$650-700)
+Proceed: หลัง Research confirm replacement
+Replacement: QDVO (yield ~10.5% + upside > GPIQ)
+Timeline: หลัง FOMC + deal sign ผ่าน
+```
 
 ---
 
-*ปรัชญาแกนกลาง: ชนะ benchmark ด้วยวินัยและ income ที่สม่ำเสมอ — ไม่ใช่การไล่ราคา*
-*Holdings/positions upload แยกแต่ละ session | ราคาเช็คสดก่อนวางคำสั่งจริงเสมอ*
-*เอกสารนี้เป็นระบบวิเคราะห์ ไม่ใช่คำแนะนำการลงทุนเฉพาะบุคคล — การตัดสินใจเป็นของผู้ลงทุน*
+## SECTION 11 — WATCHLIST (16 มิ.ย. 2026)
+
+### Active Watchlist
+```
+SGOV DEPLOY TARGETS:
+  AVDV  — International small-cap value, dollar อ่อน
+  DFIV  — International large-cap value
+  MAIN  — BDC, yield 8.41%, no cut since 2007
+  O     — REIT, rate cut tailwind
+  QDVO  — GPIQ replacement candidate, yield 10.52%
+
+MOMENTUM RESEARCH:
+  RKLB  — Nasdaq-100 inclusion 22 มิ.ย., 3 catalyst layers
+  CRWV  — CoreWeave, Nasdaq-100 inclusion 22 มิ.ย.
+  UAL   — Airlines, peace dividend
+  BKNG  — Travel, Middle East tourism
+  CAT   — Reconstruction + AI power
+  UNH   — Healthcare re-rate
+```
+
+---
+
+## SECTION 12 — QUARTERLY REVIEW
+
+```
+ทุกไตรมาส (รอบแรก: ก.ย. 2026):
+  □ Performance vs 1.3× SPY
+  □ Yield vs 5% target
+  □ WR verification (≥ 100 trades?)
+  □ Rule effectiveness review
+  □ Data quality audit ([V]% ≥ 70%)
+  □ Team skill update
+  □ Governance rule amendment
+```
+
+---
+
+## SECTION 13 — FUND RECORD
+
+```
+SENTINEL GLOBAL FUND
+════════════════════════════════
+Cost basis:       $10,056.64 [E]
+NAV (16 มิ.ย.):   $12,240.35 [V]
+Total gain:       +$2,183.71
+Return:           +21.7% since inception [E]
+2025 return:      +8.79% [E]
+2026 YTD:         +11.83% [E]
+Dividends 2026:   $300.02 [E]
+Blended yield:    5.08% [V]
+Holdings:         9 positions
+FX rate:          1 USD = 32.45 THB (16 มิ.ย.) [V]
+════════════════════════════════
+[E] = user-provided unaudited
+[V] = verified from feed
+```
+
+---
+
+## HARD RULES (ห้ามละเมิดเด็ดขาด)
+
+```
+❌ ห้าม execute โดยไม่ผ่าน 9 gates ครบ
+❌ ห้าม execute โดยไม่มี ATR stop ระบุ
+❌ ห้าม position เกิน 20% NAV
+❌ ห้าม DATA [U] ได้รับคะแนน
+❌ ห้าม WR claim โดยไม่มี "Component Estimate" label
+❌ ห้าม chase gap open > 3%
+❌ ห้าม average down ในตัวที่ momentum พัง
+❌ ห้าม deploy เกิน 1/3 ก่อน Tier-1 event
+❌ ห้าม trim ก่อน Research หา replacement
+❌ Trailing stop ห้ามปรับลง
+```
