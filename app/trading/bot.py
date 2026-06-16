@@ -427,10 +427,13 @@ class TradingBot:
 
         leverage = getattr(self.connector, "leverage", 1)
         if self.trade_amount_usdt > 0:
-            # Fixed dollar amount per trade (ignores risk_per_trade %)
-            amount = round((self.trade_amount_usdt / price) * leverage, 6)
+            # Fixed notional: TRADE_AMOUNT_USDT is the total position size in USDT
+            # (leverage is handled by OKX automatically via set_leverage_for)
+            amount = round(self.trade_amount_usdt / price, 6)
         else:
-            amount = self.risk.size_position(quote_balance, price) * leverage
+            amount = self.risk.size_position(quote_balance, price)
+        logger.info("[%s] Order attempt: %s BUY %.6f BTC @ %.2f  (trade_usdt=%.1f lev=%dx bal=%.2f)",
+                    strategy_name, sym, amount, price, self.trade_amount_usdt, leverage, quote_balance)
         if amount <= 0:
             logger.info("Position size 0 for %s — tracking virtually", sym)
             if sl_p and tp_p:
@@ -465,7 +468,8 @@ class TradingBot:
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
             if self.telegram:
-                self.telegram.notify_order_error(sym, strategy_name, str(e))
+                err_detail = f"{e}\n\nAttempted: {amount:.6f} BTC @ ${price:,.0f} = ${amount*price:,.1f} USDT"
+                self.telegram.notify_order_error(sym, strategy_name, err_detail)
             self._sig.unlock_strategy(sym, strategy_name)
 
     async def _refresh_balance(self):
