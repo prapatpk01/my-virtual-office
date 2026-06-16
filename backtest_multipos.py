@@ -81,7 +81,7 @@ def get_buy_signals(strategies, candles):
             mi = strat.n1 + strat.n2 + 14 + 10
             sigs[sname] = {i for i in range(mi, n-1) if b[i]}
         elif name == "KNNStrategy":
-            b,_,_ = strat._build_signals(candles)
+            b,_,_,_ = strat._build_signals(candles)
             sigs[sname] = {i for i in range(n) if b[i]}
         else:
             sigs[sname] = set()
