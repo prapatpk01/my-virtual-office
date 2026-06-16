@@ -75,15 +75,15 @@ def build_config() -> dict:
         "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
-            "wt_adx":         _env_bool("STRATEGY_WT_ADX",          True),
-            "macd_ema":       _env_bool("STRATEGY_MACD_EMA",         True),
-            "momentum_score": _env_bool("STRATEGY_MOMENTUM_SCORE",   True),
-            "ut_bot":         _env_bool("STRATEGY_UT_BOT",           True),
+            "mcdx":      _env_bool("STRATEGY_MCDX",       True),
+            "sentinel":  _env_bool("STRATEGY_SENTINEL",    True),
+            "ai_signal": _env_bool("STRATEGY_AI_SIGNAL",   False),  # requires ANTHROPIC_API_KEY
         },
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
-        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
-        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.06")),
-        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "3")),
+        # Fixed SL/TP applied to every trade (overrides ATR-based from strategies)
+        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.046")),   # 4.6%
+        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.048")),   # 4.8%
+        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "3")),  # 1 per strategy
         "max_drawdown":    float(os.environ.get("MAX_DRAWDOWN_PCT", "0.30")),
         "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID",   ""),
@@ -99,16 +99,23 @@ def build_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def _make_strategies(symbols: list, flags: dict):
-    from trading.strategies.wt_adx_strategy import WTADXStrategy
-    from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-    from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-    from trading.strategies.ut_bot_strategy import UTBotStrategy
+    from trading.strategies.mcdx_strategy import MCDXStrategy
+    from trading.strategies.sentinel_strategy import SentinelStrategy
     strategies = []
     for sym in symbols:
-        if flags.get("wt_adx"):          strategies.append(WTADXStrategy(sym))
-        if flags.get("macd_ema"):        strategies.append(MACDEMAStrategy(sym))
-        if flags.get("momentum_score"):  strategies.append(MomentumScoreStrategy(sym))
-        if flags.get("ut_bot"):          strategies.append(UTBotStrategy(sym))
+        if flags.get("mcdx"):     strategies.append(MCDXStrategy(sym))
+        if flags.get("sentinel"): strategies.append(SentinelStrategy(sym))
+        if flags.get("ai_signal"):
+            if os.environ.get("ANTHROPIC_API_KEY"):
+                from trading.strategies.ai_signal import AISignalStrategy
+                strategies.append(AISignalStrategy(sym))
+            else:
+                logger.warning("STRATEGY_AI_SIGNAL=true but ANTHROPIC_API_KEY not set — skipping")
+    if not strategies:
+        logger.warning("No strategies enabled — defaulting to MCDXStrategy")
+        from trading.strategies.mcdx_strategy import MCDXStrategy
+        for sym in symbols:
+            strategies.append(MCDXStrategy(sym))
     return strategies
 
 
@@ -163,9 +170,6 @@ def build_crypto_bot(config: dict, telegram):
         )
 
     strategies = _make_strategies(config["symbols"], config["strategies"])
-    if not strategies:
-        from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-        strategies = [MACDEMAStrategy(config["symbols"][0])]
 
     risk = RiskManager(
         max_risk_per_trade_pct=config["risk_per_trade"],
@@ -174,10 +178,15 @@ def build_crypto_bot(config: dict, telegram):
         max_open_positions=config["max_positions"],
         max_drawdown_pct=config["max_drawdown"],
     )
+    logger.info("Bot config: SL=%.1f%%  TP=%.1f%%  max_positions=%d  strategies=%s",
+                config["stop_loss_pct"] * 100, config["take_profit_pct"] * 100,
+                config["max_positions"], [s.name for s in strategies])
     return TradingBot(
         connector=connector, strategies=strategies,
         risk_manager=risk, interval_seconds=config["interval"],
         broadcast_fn=None, telegram=telegram,
+        fixed_sl_pct=config["stop_loss_pct"],
+        fixed_tp_pct=config["take_profit_pct"],
     )
 
 
@@ -212,15 +221,11 @@ _stop_signal = asyncio.Event()
 
 
 async def _run_backtest(crypto_bot, config: dict, telegram):
-    """Fetch candles on first symbol, run backtest, apply best SL/TP to each strategy."""
-    from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-    from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-    from trading.strategies.ut_bot_strategy import UTBotStrategy
-    from trading.strategies.wt_adx_strategy import WTADXStrategy
-    backtestable = [s for s in crypto_bot.strategies
-                    if isinstance(s, (MACDEMAStrategy, MomentumScoreStrategy,
-                                      UTBotStrategy, WTADXStrategy))]
+    """Fetch candles on first symbol, run backtest on strategies that support it."""
+    # MCDX / Sentinel / AISignal don't have a backtest() method — skip silently
+    backtestable = [s for s in crypto_bot.strategies if hasattr(s, "backtest")]
     if not backtestable:
+        logger.info("Startup backtest skipped (active strategies use fixed SL/TP from config)")
         return
     strat = backtestable[0]
     symbol = strat.symbol

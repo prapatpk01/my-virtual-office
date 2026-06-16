@@ -65,6 +65,8 @@ class TradingBot:
         broadcast_fn: Optional[Callable[[dict], Any]] = None,
         telegram: Optional[TelegramNotifier] = None,
         state_file: Optional[str] = None,
+        fixed_sl_pct: float = 0.0,
+        fixed_tp_pct: float = 0.0,
     ):
         self.connector = connector
         self.strategies = strategies
@@ -76,6 +78,9 @@ class TradingBot:
         self._task: Optional[asyncio.Task] = None
         self._start_balance = 0.0
         self._trade_history: list[TradeRecord] = []
+        # Fixed SL/TP percentages — when set, override signal metadata
+        self.fixed_sl_pct = fixed_sl_pct  # e.g. 0.046 = 4.6%
+        self.fixed_tp_pct = fixed_tp_pct  # e.g. 0.048 = 4.8%
         # Persistent signal state — survives restarts
         kwargs = {"path": state_file} if state_file else {}
         self._sig = SignalState(**kwargs)
@@ -443,9 +448,15 @@ class TradingBot:
         quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
         ticker = await self.connector.fetch_ticker(sym)
         price = ticker["last"]
-        meta  = signal.metadata or {}
-        sl_p  = meta.get("stop_loss")
-        tp_p  = meta.get("take_profit")
+
+        # Fixed SL/TP (% from config) takes priority; fallback to signal metadata
+        if self.fixed_sl_pct > 0 and self.fixed_tp_pct > 0:
+            sl_p = round(price * (1 - self.fixed_sl_pct), 8)
+            tp_p = round(price * (1 + self.fixed_tp_pct), 8)
+        else:
+            meta = signal.metadata or {}
+            sl_p = meta.get("stop_loss") or meta.get("sl")
+            tp_p = meta.get("take_profit") or meta.get("tp1")
 
         amount = self.risk.size_position(quote_balance, price)
         if amount <= 0:
@@ -459,7 +470,6 @@ class TradingBot:
 
         try:
             order = await self.connector.create_order(sym, "buy", amount)
-            # Use ATR-based SL/TP from signal; fall back to % if not provided
             self.risk.open_position(sym, "long", price, amount, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
             trade = TradeRecord(

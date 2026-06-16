@@ -78,9 +78,6 @@ class RiskManager:
         key = f"{symbol}||{strategy}"
         if key in self._positions:
             return False, f"{strategy} already has open position for {symbol}"
-        sym_count = sum(1 for k in self._positions if k.startswith(f"{symbol}||"))
-        if sym_count >= 2:
-            return False, f"Max 2 positions per symbol for {symbol}"
         if len(self._positions) >= self.max_open_positions:
             return False, f"Max open positions ({self.max_open_positions}) reached"
         return True, "ok"
