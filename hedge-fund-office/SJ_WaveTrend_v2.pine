@@ -1,0 +1,151 @@
+//@version=5
+strategy("SJ WaveTrend", shorttitle="SJ-WT", overlay=false,
+         default_qty_type=strategy.fixed, default_qty_value=1)
+
+// ══════════════════════════════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════════════════════════════
+n1      = input.int(10,    "Channel Length")
+n2      = input.int(21,    "Average Length")
+osLevel = input.float(-25, "Oversold  (BUY zone)")
+obLevel = input.float(30,  "Overbought (SELL zone)")
+atrLen  = input.int(14,    "ATR Length")
+slMult  = input.float(1.5, "SL × ATR")
+rrRatio = input.float(1.5, "R:R Ratio")
+
+// ── Filter Toggles ──────────────────────────────────────────────
+useCandle = input.bool(true,  "✅ Candle Confirm Filter (Bar-3 open gap)",   group="Filters")
+useVolume = input.bool(true,  "✅ Volume Filter (above MA)",                 group="Filters")
+volLen    = input.int(20,     "Volume MA Length",                            group="Filters")
+volMult   = input.float(1.0,  "Volume × MA threshold",                      group="Filters")
+
+// ══════════════════════════════════════════════════════════════════
+//  WAVETREND CORE
+// ══════════════════════════════════════════════════════════════════
+ap  = hlc3
+esa = ta.ema(ap, n1)
+d   = ta.ema(math.abs(ap - esa), n1)
+ci  = (ap - esa) / (0.015 * d)
+wt1 = ta.ema(ci, n2)
+wt2 = ta.sma(wt1, 4)
+
+// ══════════════════════════════════════════════════════════════════
+//  BASE SIGNALS  (crossover / crossunder in WT zone)
+// ══════════════════════════════════════════════════════════════════
+baseBuy  = ta.crossover(wt1, wt2)  and wt1 < osLevel
+baseSell = ta.crossunder(wt1, wt2) and wt1 > obLevel
+
+// ══════════════════════════════════════════════════════════════════
+//  FILTER 1 — CANDLE CONFIRMATION  (bar-3 open-gap rule)
+// ══════════════════════════════════════════════════════════════════
+//
+//  BUY  logic  (triggered on the OPEN of the 3rd bar after cross)
+//    • bar[2] and bar[1] must be GREEN (close > open)
+//    • current bar OPEN must be HIGHER than bar[1] open
+//    Signal fires at current bar open, i.e. we know bar[2] & bar[1]
+//    fully closed and the current candle just opened.
+//
+//  SELL logic  (triggered on the OPEN of the 3rd bar after cross)
+//    • bar[2] and bar[1] must be RED   (close < open)
+//    • current bar OPEN must be LOWER  than bar[1] close  ← spec says "lower than close of prev 2 bars"
+//      (using bar[1] close as the reference, conservative)
+//
+//  NOTE: baseBuy/baseSell fire on bar[2] relative to NOW
+//        → we check baseBuy[2] / baseSell[2]
+// ──────────────────────────────────────────────────────────────────
+// Candle colours
+isGreen(offset) => close[offset] > open[offset]
+isRed(offset)   => close[offset] < open[offset]
+
+// BUY candle confirm: cross was 2 bars ago, prev 2 bars green, open > prev open
+candleBuy  = baseBuy[2]
+           and isGreen(1) and isGreen(0)[1]   // bar[-1] and bar[-2] both green
+           and open > open[1]                  // current open > prior open
+
+// ─── Rewrite using only confirmed (closed) bar references ──────
+// At realtime bar:
+//   [0] = current  (candle 3)
+//   [1] = previous (candle 2) — fully closed
+//   [2] = two bars ago (candle 1) — fully closed
+//   cross happened at bar[2]
+
+candleConfirmBuy  = baseBuy[2]
+                  and isGreen(2) and isGreen(1)   // candle1 & candle2 green
+                  and open > open[1]               // candle3 open > candle2 open
+
+candleConfirmSell = baseSell[2]
+                  and isRed(2) and isRed(1)        // candle1 & candle2 red
+                  and open < close[1]              // candle3 open < candle2 close
+
+// ══════════════════════════════════════════════════════════════════
+//  FILTER 2 — VOLUME  (current volume above MA × multiplier)
+// ══════════════════════════════════════════════════════════════════
+volMA     = ta.sma(volume, volLen)
+volFilter = volume >= volMA * volMult
+
+// ══════════════════════════════════════════════════════════════════
+//  FINAL SIGNAL SELECTION
+// ══════════════════════════════════════════════════════════════════
+//  Each filter is independently togglable.
+//  If filter is OFF → treat as TRUE (no restriction).
+// ──────────────────────────────────────────────────────────────────
+
+// Original signals (no candle delay)
+rawBuy  = baseBuy
+rawSell = baseSell
+
+// Candle-confirmed signals (fire on bar-3 open)
+candleBuyFinal  = useCandle ? candleConfirmBuy  : baseBuy[2]
+candleSellFinal = useCandle ? candleConfirmSell : baseSell[2]
+
+// Volume gate applied to whichever signal variant is active
+volGateBuy  = useVolume ? (candleBuyFinal  and volFilter) : candleBuyFinal
+volGateSell = useVolume ? (candleSellFinal and volFilter) : candleSellFinal
+
+// Combine: use raw OR delayed based on candle filter toggle
+buySig  = useCandle ? volGateBuy  : (useVolume ? (rawBuy  and volFilter) : rawBuy)
+sellSig = useCandle ? volGateSell : (useVolume ? (rawSell and volFilter) : rawSell)
+
+// ══════════════════════════════════════════════════════════════════
+//  ATR
+// ══════════════════════════════════════════════════════════════════
+atr = ta.atr(atrLen)
+
+// ══════════════════════════════════════════════════════════════════
+//  EXECUTION
+// ══════════════════════════════════════════════════════════════════
+if buySig
+    strategy.entry("BUY", strategy.long)
+    strategy.exit("BUY-X", "BUY",
+                  stop  = close - slMult * atr,
+                  limit = close + slMult * rrRatio * atr)
+
+if sellSig
+    strategy.entry("SELL", strategy.short)
+    strategy.exit("SELL-X", "SELL",
+                  stop  = close + slMult * atr,
+                  limit = close - slMult * rrRatio * atr)
+
+// ══════════════════════════════════════════════════════════════════
+//  PLOT
+// ══════════════════════════════════════════════════════════════════
+plot(wt1, color=color.lime, title="WT1", linewidth=2)
+plot(wt2, color=color.red,  title="WT2")
+hline(obLevel, color=color.new(color.red,   50), linestyle=hline.style_dashed)
+hline(osLevel, color=color.new(color.green, 50), linestyle=hline.style_dashed)
+hline(0,       color=color.gray)
+
+// Main signals
+plotshape(buySig  ? wt1 : na, style=shape.triangleup,
+          location=location.absolute, color=color.lime,
+          size=size.small, title="BUY Signal")
+plotshape(sellSig ? wt1 : na, style=shape.triangledown,
+          location=location.absolute, color=color.red,
+          size=size.small, title="SELL Signal")
+
+// Volume bar colouring (subplot bottom) — dim if below threshold
+barcolor(volume >= volMA * volMult ? color.new(color.teal, 70) : color.new(color.gray, 85))
+
+// ── Debug labels (optional — comment out in production) ─────────
+// label.new(bar_index, wt1, text="B3", style=label.style_label_up, color=color.lime, size=size.tiny, condition=candleConfirmBuy)
+// label.new(bar_index, wt1, text="S3", style=label.style_label_down, color=color.red, size=size.tiny, condition=candleConfirmSell)
