@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from typing import Optional
 
 logger = logging.getLogger("signal_state")
 
@@ -27,6 +28,7 @@ class SignalState:
         self._fired: list[dict] = []       # every signal alert sent
         self._outcomes: list[dict] = []    # closed trade results
         self._pending: dict[str, dict] = {}  # virtual open trades awaiting SL/TP
+        self._open_pos: dict[str, dict] = {}  # real positions — survive restarts
         self._load()
 
     # ------------------------------------------------------------------
@@ -37,12 +39,14 @@ class SignalState:
         try:
             with open(self.path) as f:
                 data = json.load(f)
-            self._active   = data.get("active",   {})
-            self._fired    = data.get("fired",     [])
-            self._outcomes = data.get("outcomes",  [])
-            self._pending  = data.get("pending",   {})
-            logger.info("Signal state loaded: %d locks, %d fired, %d outcomes, %d pending",
-                        len(self._active), len(self._fired), len(self._outcomes), len(self._pending))
+            self._active   = data.get("active",    {})
+            self._fired    = data.get("fired",      [])
+            self._outcomes = data.get("outcomes",   [])
+            self._pending  = data.get("pending",    {})
+            self._open_pos = data.get("open_pos",   {})
+            logger.info("Signal state loaded: %d locks, %d fired, %d outcomes, %d pending, %d open_pos",
+                        len(self._active), len(self._fired), len(self._outcomes),
+                        len(self._pending), len(self._open_pos))
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -56,6 +60,7 @@ class SignalState:
                     "fired":    self._fired[-1000:],
                     "outcomes": self._outcomes[-500:],
                     "pending":  self._pending,
+                    "open_pos": self._open_pos,
                 }, f, indent=2)
         except Exception as e:
             logger.warning("Could not save signal state: %s", e)
@@ -95,6 +100,37 @@ class SignalState:
 
     def count_active(self, symbol: str) -> int:
         return sum(1 for k in self._active if k.startswith(f"{symbol}||"))
+
+    # ------------------------------------------------------------------
+    # Open position persistence (survives restarts)
+    # ------------------------------------------------------------------
+
+    def save_position(self, key: str, symbol: str, side: str, entry: float,
+                      amount: float, sl: Optional[float], tp: Optional[float],
+                      strategy: str):
+        """Persist a live open position so it survives bot restarts."""
+        self._open_pos[key] = {
+            "symbol":   symbol,
+            "side":     side,
+            "entry":    round(entry, 8),
+            "amount":   amount,
+            "sl":       sl,
+            "tp":       tp,
+            "strategy": strategy,
+            "ts":       int(time.time() * 1000),
+        }
+        self._save()
+        logger.info("Position persisted: %s [%s] entry=%.4f amount=%.6f", symbol, strategy, entry, amount)
+
+    def remove_position(self, key: str):
+        """Remove a persisted position (called when it closes)."""
+        if key in self._open_pos:
+            del self._open_pos[key]
+            self._save()
+
+    def get_saved_positions(self) -> list[dict]:
+        """Return all persisted open positions (used on restart to restore state)."""
+        return list(self._open_pos.values())
 
     # ------------------------------------------------------------------
     # Virtual outcome tracking (forex signal-only + paper/0-balance crypto)

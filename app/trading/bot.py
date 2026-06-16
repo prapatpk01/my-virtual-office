@@ -149,6 +149,7 @@ class TradingBot:
                 ))
                 self.risk.close_position(sym, strategy=strategy_name)
                 self._sig.unlock_strategy(sym, strategy_name)
+                self._sig.remove_position(f"{sym}||{strategy_name}")
                 closed += 1
                 pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"−${abs(pnl):.2f}"
                 logger.info("Closed %s [%s] @ %.4f  entry=%.4f  pnl=%s",
@@ -205,7 +206,38 @@ class TradingBot:
     # Core loop
     # ------------------------------------------------------------------
 
+    async def _restore_positions(self):
+        """Re-register persisted open positions into RiskManager after a restart."""
+        saved = self._sig.get_saved_positions()
+        if not saved:
+            return
+        logger.info("Restoring %d open position(s) from saved state...", len(saved))
+        restored = []
+        for p in saved:
+            sym      = p["symbol"]
+            strategy = p["strategy"]
+            try:
+                self.risk.open_position(
+                    sym, p["side"], p["entry"], p["amount"],
+                    strategy=strategy, stop_loss=p.get("sl"), take_profit=p.get("tp"),
+                )
+                restored.append(p)
+                logger.info("Restored: %s [%s] entry=%.4f  SL=%.4f  TP=%.4f",
+                            sym, strategy, p["entry"], p.get("sl") or 0, p.get("tp") or 0)
+            except Exception as e:
+                logger.warning("Could not restore %s [%s]: %s", sym, strategy, e)
+        if restored and self.telegram:
+            lines = "\n".join(
+                f"`{p['symbol']}` [{p['strategy']}] entry=${p['entry']:,.2f} ×{p['amount']:.6f}"
+                for p in restored
+            )
+            self.telegram.notify(
+                f"🔄 *Bot restarted* — {len(restored)} position(s) restored:\n{lines}\n"
+                f"_Monitoring TP/SL continues_"
+            )
+
     async def _run_loop(self):
+        await self._restore_positions()
         await self._refresh_balance()
         self._start_balance = self.state.total_balance
         self.risk.update_peak(self._start_balance)
@@ -262,6 +294,7 @@ class TradingBot:
                     reason=trigger, strategy=strategy_name,
                 )
                 self._sig.unlock_strategy(sym, strategy_name)
+                self._sig.remove_position(f"{sym}||{strategy_name}")
                 self.risk.close_position(sym, strategy=strategy_name)
                 logger.info("Position closed by %s: %s [%s] → signal lock released", trigger, sym, strategy_name)
                 if self.telegram:
@@ -512,6 +545,11 @@ class TradingBot:
             # Use ATR-based SL/TP from signal; fall back to % if not provided
             self.risk.open_position(sym, "long", price, amount, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
+            # Persist position so it survives a bot restart
+            self._sig.save_position(
+                f"{sym}||{strategy_name}", sym, "long", price, amount,
+                sl_p, tp_p, strategy_name,
+            )
             trade = TradeRecord(
                 timestamp=int(time.time() * 1000),
                 symbol=sym, side="buy",
