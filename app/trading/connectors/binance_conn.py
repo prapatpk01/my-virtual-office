@@ -84,9 +84,11 @@ class BinanceConnector(BaseConnector):
         kwargs: dict = {}
         if order_type == "limit" and price:
             kwargs["price"] = price
-        # OKX margin requires tdMode param
-        if self._exchange_id == "okx" and self.leverage > 1:
-            kwargs["params"] = {"tdMode": self.margin_mode}
+        # OKX Unified Account always requires tdMode:
+        #   spot/cash → "cash"  |  margin → "cross"/"isolated"
+        if self._exchange_id == "okx":
+            td = self.margin_mode if self.leverage > 1 else "cash"
+            kwargs["params"] = {"tdMode": td}
 
         raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
         return OrderResult(
