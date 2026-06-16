@@ -1,0 +1,84 @@
+//@version=5
+// ══════════════════════════════════════════════════════════════
+// SJ-MomentumScore Bot Strategy  (TF: 1H)
+// 5-indicator scoring, threshold=2/5, re-entry=10 bars
+// SL=2.0×ATR(14), TP=SL×1.2 — computed on Heikin Ashi candles
+// ══════════════════════════════════════════════════════════════
+strategy("2. SJ-MomentumScore [Bot 1H]", overlay=true,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         initial_capital=300, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ── Parameters ──────────────────────────────────────────────
+rsi_len     = input.int(14,   "RSI Length")
+rsi_ema_len = input.int(9,    "RSI EMA Length")
+ema_len     = input.int(14,   "HA EMA Length (trend)")
+macd_fast   = input.int(12,   "MACD Fast")
+macd_slow   = input.int(26,   "MACD Slow")
+macd_sig_p  = input.int(9,    "MACD Signal")
+threshold   = input.int(2,    "Score Threshold (1–5)")
+reentry     = input.int(10,   "Re-entry Bars")
+atr_len     = input.int(14,   "ATR Period")
+sl_mult     = input.float(2.0,"SL × ATR", step=0.5)
+rr          = input.float(1.2,"R:R Ratio", step=0.1)
+
+// ── Heikin Ashi (same formula as bot) ───────────────────────
+ha_c = (open + high + low + close) / 4
+var float ha_o = na
+ha_o := na(ha_o[1]) ? (open + close) / 2 : (ha_o[1] + ha_c[1]) / 2
+ha_h = math.max(high, math.max(ha_o, ha_c))
+ha_l = math.min(low,  math.min(ha_o, ha_c))
+
+// ── Indicators on HA close ───────────────────────────────────
+rsi_v              = ta.rsi(ha_c, rsi_len)
+rsi_ema_v          = ta.ema(rsi_v, rsi_ema_len)
+ema_v              = ta.ema(ha_c, ema_len)
+[ml, sl_line, _]   = ta.macd(ha_c, macd_fast, macd_slow, macd_sig_p)
+
+// ── Scoring (5 conditions, 1 point each) ─────────────────────
+bull_score = (rsi_v > 50       ? 1 : 0) +
+             (rsi_v > rsi_ema_v ? 1 : 0) +
+             (ha_c  > ha_o      ? 1 : 0) +
+             (ha_c  > ema_v     ? 1 : 0) +
+             (ml    > sl_line   ? 1 : 0)
+
+bear_score = (rsi_v < 50       ? 1 : 0) +
+             (rsi_v < rsi_ema_v ? 1 : 0) +
+             (ha_c  < ha_o      ? 1 : 0) +
+             (ha_c  < ema_v     ? 1 : 0) +
+             (ml    < sl_line   ? 1 : 0)
+
+// ── Re-entry tracking ────────────────────────────────────────
+// Signal fires on first transition into threshold, then re-fires
+// every reentry bars while score remains ≥ threshold.
+var int last_buy_bar  = -9999
+var int last_sell_bar = -9999
+
+bull_on = bull_score >= threshold
+bear_on = bear_score >= threshold
+
+buy  = bull_on and (bull_score[1] < threshold or (bar_index - last_buy_bar)  >= reentry)
+sell = bear_on and (bear_score[1] < threshold or (bar_index - last_sell_bar) >= reentry)
+
+if buy
+    last_buy_bar := bar_index
+if sell
+    last_sell_bar := bar_index
+
+// ── SL / TP ──────────────────────────────────────────────────
+atr  = ta.atr(atr_len)
+sl_p = close - sl_mult * atr
+tp_p = close + sl_mult * rr * atr
+
+// ── Orders ───────────────────────────────────────────────────
+if buy
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit", "Long", stop=sl_p, limit=tp_p)
+if sell
+    strategy.close("Long", comment="Score↓")
+
+// ── Visuals ──────────────────────────────────────────────────
+plot(bull_score, "Bull Score", color.new(color.green, 0), display=display.pane)
+plot(bear_score, "Bear Score", color.new(color.red,   0), display=display.pane)
+hline(threshold, "Threshold", color.gray, linestyle=hline.style_dashed, display=display.pane)
+plotshape(buy,  "BUY",  shape.triangleup,   location.belowbar, color.lime, size=size.normal)
+plotshape(sell, "SELL", shape.triangledown, location.abovebar, color.red,  size=size.normal)

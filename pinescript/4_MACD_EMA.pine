@@ -1,0 +1,59 @@
+//@version=5
+// ══════════════════════════════════════════════════════════════
+// SJ-MACD/EMA Bot Strategy  (TF: 1H)
+// MACD(5,13,4) histogram crossover + HMA(9) trend gate
+// Computed on Heikin Ashi candles
+// BUY:  hist crosses ≤0→>0  AND  HA close > HMA
+// SELL: hist crosses ≥0→<0
+// SL=2.0×ATR(14), TP=SL×1.2
+// ══════════════════════════════════════════════════════════════
+strategy("4. SJ-MACD-EMA [Bot 1H]", overlay=true,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         initial_capital=300, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ── Parameters ──────────────────────────────────────────────
+macd_fast  = input.int(5,    "MACD Fast")
+macd_slow  = input.int(13,   "MACD Slow")
+macd_sig_p = input.int(4,    "MACD Signal")
+hma_period = input.int(9,    "HMA Period")
+atr_len    = input.int(14,   "ATR Period")
+sl_mult    = input.float(2.0,"SL × ATR", step=0.5)
+rr         = input.float(1.2,"R:R Ratio", step=0.1)
+
+// ── Heikin Ashi (same formula as bot) ───────────────────────
+ha_c = (open + high + low + close) / 4
+var float ha_o = na
+ha_o := na(ha_o[1]) ? (open + close) / 2 : (ha_o[1] + ha_c[1]) / 2
+ha_h = math.max(high, math.max(ha_o, ha_c))
+ha_l = math.min(low,  math.min(ha_o, ha_c))
+
+// ── MACD on HA close ──────────────────────────────────────────
+[ml, sl_line, _] = ta.macd(ha_c, macd_fast, macd_slow, macd_sig_p)
+hist = ml - sl_line
+
+// ── HMA (Hull MA) on HA close ────────────────────────────────
+half   = math.round(hma_period / 2)
+sqrt_p = math.round(math.sqrt(hma_period))
+hma    = ta.wma(2 * ta.wma(ha_c, half) - ta.wma(ha_c, hma_period), sqrt_p)
+
+// ── Signals ──────────────────────────────────────────────────
+buy  = hist > 0 and hist[1] <= 0 and ha_c > hma
+sell = hist < 0 and hist[1] >= 0
+
+// ── SL / TP (ATR-based, same as bot) ────────────────────────
+atr  = ta.atr(atr_len)
+sl_p = close - sl_mult * atr
+tp_p = close + sl_mult * rr * atr
+
+// ── Orders ───────────────────────────────────────────────────
+if buy
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit", "Long", stop=sl_p, limit=tp_p)
+if sell
+    strategy.close("Long", comment="MACD hist↓")
+
+// ── Visuals ──────────────────────────────────────────────────
+plot(hist, "MACD Hist", color = hist >= 0 ? color.green : color.red, style=plot.style_histogram, display=display.pane)
+plot(hma, "HMA", color.new(color.blue, 0))
+plotshape(buy,  "BUY",  shape.triangleup,   location.belowbar, color.lime, size=size.normal)
+plotshape(sell, "SELL", shape.triangledown, location.abovebar, color.red,  size=size.normal)

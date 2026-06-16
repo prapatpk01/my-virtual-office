@@ -1,0 +1,93 @@
+//@version=5
+// ══════════════════════════════════════════════════════════════
+// SJ-kNN v2 Bot Strategy  (TF: 1H, Long-only)
+// Layer 1: kNN vote ≈ 6-feature directional alignment ≥ strict_ratio
+//   (RSI, MACD hist, ROC, Williams%R, CCI, Stoch%K — bot's real kNN
+//    does a z-scored nearest-neighbour search; Pine approximates the
+//    same 6 features with a direct bullish-alignment vote, since a
+//    full historical k-NN search isn't practical in Pine Script)
+// Layer 2: Momentum gate — need confirm_n of 3
+//   A) RSI > rsi_thresh AND RSI > EMA9(RSI)
+//   B) MACD hist > 0 (MACD line > signal)
+//   C) HA close > HMA(20)
+// Layer 3: Cooldown between signals
+// TP=4.8% / SL=4.6% fixed (not ATR-based) — matches bot exactly
+// ══════════════════════════════════════════════════════════════
+strategy("5. SJ-kNN [Bot 1H]", overlay=true,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         initial_capital=300, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ── Parameters ──────────────────────────────────────────────
+strict_ratio = input.float(0.8, "kNN strict ratio (≈4/6 ÷ 5/6)", step=0.05)
+confirm_n    = input.int(2,     "Momentum gates needed (0-3)")
+rsi_thresh   = input.float(50.0,"RSI threshold")
+hma_period   = input.int(20,    "HMA Period")
+cooldown     = input.int(5,     "Cooldown bars")
+sl_pct       = input.float(4.6, "SL %", step=0.1) / 100
+tp_pct       = input.float(4.8, "TP %", step=0.1) / 100
+
+// ── Heikin Ashi (same formula as bot) ───────────────────────
+ha_c = (open + high + low + close) / 4
+var float ha_o = na
+ha_o := na(ha_o[1]) ? (open + close) / 2 : (ha_o[1] + ha_c[1]) / 2
+ha_h = math.max(high, math.max(ha_o, ha_c))
+ha_l = math.min(low,  math.min(ha_o, ha_c))
+
+// ── 6 features (on HA candles, same indicators as bot) ──────
+rsi_v   = ta.rsi(ha_c, 14)
+[ml, sl_line, hist] = ta.macd(ha_c, 12, 26, 9)
+roc_v   = (ha_c - ha_c[10]) / ha_c[10] * 100
+hh14    = ta.highest(ha_h, 14)
+ll14    = ta.lowest(ha_l, 14)
+wr_v    = (hh14 - ll14) > 0 ? (hh14 - ha_c) / (hh14 - ll14) * -100 : -50.0
+tp_v    = (ha_h + ha_l + ha_c) / 3
+tp_sma  = ta.sma(tp_v, 20)
+tp_mad  = ta.sma(math.abs(tp_v - tp_sma), 20)
+cci_v   = tp_mad > 0 ? (tp_v - tp_sma) / (0.015 * tp_mad) : 0.0
+hh14b   = ta.highest(ha_h, 14)
+ll14b   = ta.lowest(ha_l, 14)
+stoch_k = (hh14b - ll14b) > 0 ? (ha_c - ll14b) / (hh14b - ll14b) * 100 : 50.0
+
+// ── Layer 1: kNN-proxy vote (6 features, fraction bullish) ──
+bull_votes = (rsi_v   > 50  ? 1 : 0) +
+             (hist    > 0   ? 1 : 0) +
+             (roc_v   > 0   ? 1 : 0) +
+             (wr_v    > -50 ? 1 : 0) +
+             (cci_v   > 0   ? 1 : 0) +
+             (stoch_k > 50  ? 1 : 0)
+knn_vote = bull_votes / 6.0
+knn_pass = knn_vote >= strict_ratio
+
+// ── Layer 2: Momentum gate (need confirm_n of 3) ─────────────
+rsi_ema_v = ta.ema(rsi_v, 9)
+half      = math.round(hma_period / 2)
+sqrt_p    = math.round(math.sqrt(hma_period))
+hma_v     = ta.wma(2 * ta.wma(ha_c, half) - ta.wma(ha_c, hma_period), sqrt_p)
+
+gate_a = rsi_v > rsi_thresh and rsi_v > rsi_ema_v
+gate_b = ml > sl_line and hist > 0
+gate_c = ha_c > hma_v
+gates  = (gate_a ? 1 : 0) + (gate_b ? 1 : 0) + (gate_c ? 1 : 0)
+
+// ── Layer 3: Cooldown ─────────────────────────────────────────
+var int last_signal_bar = -9999
+ready = (bar_index - last_signal_bar) >= cooldown
+
+buy = knn_pass and gates >= confirm_n and ready
+if buy
+    last_signal_bar := bar_index
+
+// ── SL / TP (fixed %, same as bot) ───────────────────────────
+sl_p = close * (1 - sl_pct)
+tp_p = close * (1 + tp_pct)
+
+// ── Orders (long-only) ────────────────────────────────────────
+if buy
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit", "Long", stop=sl_p, limit=tp_p)
+
+// ── Visuals ──────────────────────────────────────────────────
+plot(knn_vote, "kNN Vote", color.new(color.purple, 0), display=display.pane)
+hline(strict_ratio, "Strict Ratio", color.gray, linestyle=hline.style_dashed, display=display.pane)
+plot(gates, "Gates (0-3)", color.new(color.teal, 0), display=display.pane)
+plotshape(buy, "BUY", shape.triangleup, location.belowbar, color.lime, size=size.normal)

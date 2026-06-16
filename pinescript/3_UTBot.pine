@@ -1,0 +1,58 @@
+//@version=5
+// ══════════════════════════════════════════════════════════════
+// SJ-UTBot v2 Strategy  (TF: 1H)
+// ATR Trailing Stop: mult=0.30, len=14 — computed on Heikin Ashi close
+// BUY: HA close crosses above TSL | SELL: HA close crosses below TSL
+// SL=2.5×ATR(14), TP=SL×1.2
+// ══════════════════════════════════════════════════════════════
+strategy("3. SJ-UTBot [Bot 1H]", overlay=true,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         initial_capital=300, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ── Parameters ──────────────────────────────────────────────
+ut_mult = input.float(0.30, "UT ATR Multiplier", step=0.05)
+ut_len  = input.int(14,     "UT ATR Period")
+atr_len = input.int(14,     "SL ATR Period")
+sl_mult = input.float(2.5,  "SL × ATR", step=0.5)
+rr      = input.float(1.2, "R:R Ratio", step=0.1)
+
+// ── Heikin Ashi (same formula as bot) ───────────────────────
+ha_c = (open + high + low + close) / 4
+var float ha_o = na
+ha_o := na(ha_o[1]) ? (open + close) / 2 : (ha_o[1] + ha_c[1]) / 2
+ha_h = math.max(high, math.max(ha_o, ha_c))
+ha_l = math.min(low,  math.min(ha_o, ha_c))
+
+// ── ATR Trailing Stop (exact UT Bot v2 logic, on HA close) ──
+ut_atr = ta.atr(ut_len)
+slval  = ut_atr * ut_mult
+src    = ha_c
+src_p  = ha_c[1]
+
+var float tsl = na
+tsl := na(tsl[1]) ? src + slval :
+       src > tsl[1] and src_p > tsl[1] ? math.max(tsl[1], src - slval) :
+       src < tsl[1] and src_p < tsl[1] ? math.min(tsl[1], src + slval) :
+       src > tsl[1] ? src - slval :
+       src + slval
+
+// ── Signals (crossover/crossunder of HA close vs TSL) ───────
+buy  = src_p < tsl[1] and src > tsl
+sell = src_p > tsl[1] and src < tsl
+
+// ── SL / TP (ATR-based, same as bot) ────────────────────────
+atr  = ta.atr(atr_len)
+sl_p = close - sl_mult * atr
+tp_p = close + sl_mult * rr * atr
+
+// ── Orders ───────────────────────────────────────────────────
+if buy
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit", "Long", stop=sl_p, limit=tp_p)
+if sell
+    strategy.close("Long", comment="TSL cross↓")
+
+// ── Visuals ──────────────────────────────────────────────────
+plot(tsl, "TSL", color.new(color.orange, 0), linewidth=2)
+plotshape(buy,  "BUY",  shape.triangleup,   location.belowbar, color.lime, size=size.normal)
+plotshape(sell, "SELL", shape.triangledown, location.abovebar, color.red,  size=size.normal)

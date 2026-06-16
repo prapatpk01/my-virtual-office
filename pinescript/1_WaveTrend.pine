@@ -1,0 +1,55 @@
+//@version=5
+// ══════════════════════════════════════════════════════════════
+// SJ-WaveTrend Bot Strategy  (TF: 1H)
+// Matches: WTADXStrategy  n1=2, n2=4, SL=2.5×ATR, TP=SL×1.2
+// Uses Heikin Ashi candles internally (same as bot)
+// ══════════════════════════════════════════════════════════════
+strategy("1. SJ-WaveTrend [Bot 1H]", overlay=true,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         initial_capital=300, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ── Parameters ──────────────────────────────────────────────
+n1      = input.int(2,    "WT Channel Length", minval=1)
+n2      = input.int(4,    "WT Average Length",  minval=1)
+atr_len = input.int(14,   "ATR Period")
+sl_mult = input.float(2.5,"SL × ATR", step=0.5)
+rr      = input.float(1.2,"R:R Ratio", step=0.1)
+
+// ── Heikin Ashi (same formula as bot) ───────────────────────
+ha_c = (open + high + low + close) / 4
+var float ha_o = na
+ha_o := na(ha_o[1]) ? (open + close) / 2 : (ha_o[1] + ha_c[1]) / 2
+ha_h = math.max(high, math.max(ha_o, ha_c))
+ha_l = math.min(low,  math.min(ha_o, ha_c))
+
+// ── WaveTrend (computed on HA) ───────────────────────────────
+ap  = (ha_h + ha_l + ha_c) / 3
+esa = ta.ema(ap, n1)
+d   = ta.ema(math.abs(ap - esa), n1)
+ci  = d > 1e-10 ? (ap - esa) / (0.015 * d) : 0.0
+wt1 = ta.ema(ci, n2)
+wt2 = ta.sma(wt1, 4)
+
+// ── Signals ──────────────────────────────────────────────────
+// crossover-only mode (ob=os=100 → always true → just crossover/under)
+buy  = ta.crossover(wt1, wt2)
+sell = ta.crossunder(wt1, wt2)
+
+// ── SL / TP (ATR-based, same as bot) ────────────────────────
+atr  = ta.atr(atr_len)
+sl_p = close - sl_mult * atr
+tp_p = close + sl_mult * rr * atr
+
+// ── Orders ───────────────────────────────────────────────────
+if buy
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit", "Long", stop=sl_p, limit=tp_p)
+if sell
+    strategy.close("Long", comment="WT cross↓")
+
+// ── Visuals ──────────────────────────────────────────────────
+plot(wt1, "WT1", color.new(color.green, 0), display=display.pane)
+plot(wt2, "WT2", color.new(color.red,   0), display=display.pane)
+hline(0, "Zero", color.gray, linestyle=hline.style_dashed, display=display.pane)
+plotshape(buy,  "BUY",  shape.triangleup,   location.belowbar, color.lime,  size=size.normal)
+plotshape(sell, "SELL", shape.triangledown, location.abovebar, color.red,   size=size.normal)
