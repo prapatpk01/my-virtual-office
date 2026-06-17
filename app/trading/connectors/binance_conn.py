@@ -178,5 +178,30 @@ class BinanceConnector(BaseConnector):
                 for k, v in raw.items()
                 if isinstance(v, dict) and (v.get("total") or 0) > 0]
 
+    async def get_open_position_symbols(self) -> set[str]:
+        """Return set of symbols that have open positions on the exchange.
+
+        Used by the bot to detect when OKX's native OCO has already closed a
+        position so the bot can clean up its internal state without placing a
+        redundant SELL order (which would open an unwanted short).
+
+        Returns empty set for paper mode or non-OKX exchanges (caller skips sync).
+        """
+        if self.paper or self._exchange_id != "okx" or self.leverage <= 1:
+            return set()
+        try:
+            raw = await self._exchange.fetch_positions()
+            return {
+                p["symbol"]
+                for p in raw
+                if p.get("contracts") and float(p["contracts"]) > 0
+            }
+        except Exception as e:
+            import logging
+            logging.getLogger("binance_conn").warning(
+                "fetch_positions failed (skipping sync): %s", e)
+            return set()
+
     async def close(self):
         await self._exchange.close()
+

@@ -328,6 +328,48 @@ class TradingBot:
             self._broadcast_state()
             return
 
+        # ── OKX margin: sync positions that were closed by native OCO ──────────
+        # When OKX's attached TP/SL algo fires, the exchange closes the position
+        # automatically.  If the bot doesn't learn about this before calling
+        # create_order("sell"), it would accidentally open a short.  We detect
+        # these by fetching actual open positions from OKX and cleaning up any
+        # that are no longer there.
+        if hasattr(self.connector, "get_open_position_symbols"):
+            try:
+                live_syms = await self.connector.get_open_position_symbols()
+                if live_syms is not None:  # empty set is valid (all closed)
+                    for pos_info in list(self.risk.get_positions()):
+                        sym = pos_info["symbol"]
+                        strategy_name = pos_info.get("strategy", "")
+                        if sym not in live_syms:
+                            # OKX already closed this — reconcile internal state
+                            ticker = await self.connector.fetch_ticker(sym)
+                            price  = ticker["last"]
+                            pnl = (price - pos_info["entry"]) * pos_info["amount"]
+                            self._sig.record_outcome(
+                                symbol=sym, side=pos_info["side"],
+                                entry=pos_info["entry"], exit_price=price,
+                                sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
+                                reason="okx_ocofilled", strategy=strategy_name,
+                            )
+                            self._sig.unlock_strategy(sym, strategy_name)
+                            self._sig.remove_position(f"{sym}||{strategy_name}")
+                            self.risk.close_position(sym, strategy=strategy_name)
+                            logger.info(
+                                "[OKX-sync] %s [%s] closed by native OCO — internal state synced (pnl≈%.2f)",
+                                sym, strategy_name, pnl)
+                            if self.telegram:
+                                reason = "tp" if pnl > 0 else "sl"
+                                self.telegram.notify_trade_closed(
+                                    sym, reason, price,
+                                    pos_info["entry"],
+                                    pos_info.get("stop_loss"),
+                                    pos_info.get("take_profit"),
+                                    self._sig.summary(),
+                                )
+            except Exception as e:
+                logger.warning("OKX position sync failed: %s", e)
+
         # Check stop-loss / take-profit on open positions
         for pos_info in list(self.risk.get_positions()):
             sym = pos_info["symbol"]
@@ -337,8 +379,15 @@ class TradingBot:
             trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
             if trigger:
                 side = "sell" if pos_info["side"] == "long" else "buy"
-                await self.connector.create_order(sym, side, pos_info["amount"])
                 pnl = (price - pos_info["entry"]) * pos_info["amount"] if side == "sell" else 0
+                try:
+                    await self.connector.create_order(sym, side, pos_info["amount"])
+                except Exception as e:
+                    # Position may have already been closed by OKX's OCO algo
+                    # between the sync above and now — safe to ignore and clean up.
+                    logger.warning(
+                        "[%s] Close order failed for %s (likely OCO already filled): %s",
+                        strategy_name, sym, e)
                 trade = TradeRecord(
                     timestamp=int(time.time() * 1000),
                     symbol=sym, side=side,
