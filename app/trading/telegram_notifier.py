@@ -304,8 +304,20 @@ class TelegramNotifier:
     # Command polling loop
     # ------------------------------------------------------------------
 
+    async def _drain_old_updates(self):
+        """Discard all pending updates so stale /stop_bot commands don't fire on restart."""
+        try:
+            updates = await self._get_updates()
+            if updates:
+                self._last_update_id = max(u["update_id"] for u in updates)
+                logger.info("Telegram: drained %d stale update(s) (last_id=%d)",
+                            len(updates), self._last_update_id)
+        except Exception as e:
+            logger.debug("Telegram drain error: %s", e)
+
     async def _poll_loop(self):
         logger.info("Telegram command polling started")
+        await self._drain_old_updates()
         while True:
             try:
                 updates = await self._get_updates()
