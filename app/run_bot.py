@@ -243,7 +243,7 @@ def build_forex_bot(config: dict, telegram):
 # Main
 # ---------------------------------------------------------------------------
 
-_stop_signal = asyncio.Event()
+_stop_signal: asyncio.Event = None  # created inside the event loop in main()
 
 
 async def _run_backtest(crypto_bot, config: dict, telegram):
@@ -314,6 +314,9 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
 
 
 async def main():
+    global _stop_signal
+    _stop_signal = asyncio.Event()  # must be created inside the running event loop
+
     config = build_config()
     logger.info("=== Bot starting [%s] crypto=%s forex=%s ===",
                 "PAPER" if config["paper"] else "LIVE",
@@ -339,10 +342,15 @@ async def main():
         except (NotImplementedError, RuntimeError):
             pass
 
+    def _stop_bot_fn():
+        """Stop-bot callable: sets the event and returns a message dict."""
+        _stop_signal.set()
+        return {"message": "Stopping bot..."}
+
     if telegram:
         telegram.get_state_fn    = crypto_bot.get_state
         telegram.get_stats_fn    = crypto_bot.get_stats
-        telegram.stop_bot_fn     = lambda: _stop_signal.set()
+        telegram.stop_bot_fn     = _stop_bot_fn
         telegram.start_bot_fn    = lambda: {"message": "Bot is already running"}
         telegram.fetch_candles_fn = crypto_bot.export_candles
 

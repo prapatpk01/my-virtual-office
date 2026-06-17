@@ -127,6 +127,14 @@ class UTBotStrategy(BaseStrategy):
                 },
             )
 
+        # Only reset _last_signal when the opposite crossover occurs (not on every HOLD).
+        # Resetting on every no-signal tick allows the same signal to re-fire spuriously.
+        if sell_sig[n]:
+            self._last_signal = -1
+        elif buy_sig[n]:
+            self._last_signal = 1
+        # If neither, keep last direction to prevent duplicate fires on consecutive ticks.
+
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
             f"[UT Bot] {trend} | TSL={tsl_v:.4f}",

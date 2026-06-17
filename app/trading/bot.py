@@ -290,7 +290,7 @@ class TradingBot:
         for sym in symbols:
             try:
                 candles4h = await self.connector.fetch_ohlcv(sym, timeframe="4h", limit=220)
-                if not candles4h or len(candles4h) < 22:
+                if not candles4h or len(candles4h) < 25:  # need at least EMA20 worth of bars
                     self._4h_bias[sym] = 0
                     continue
                 closes = [float(c.close) for c in candles4h]
@@ -299,6 +299,10 @@ class TradingBot:
                 last  = closes[-1]
                 e20   = em20[-1]
                 e200  = em200[-1]
+                if math.isnan(e20):
+                    # EMA20 not yet valid — not enough bars; treat as neutral
+                    self._4h_bias[sym] = 0
+                    continue
                 macro_bull = True if math.isnan(e200) else last > e200
                 bull  = last > e20 and macro_bull
                 bear  = last < e20 and not macro_bull
@@ -334,10 +338,19 @@ class TradingBot:
         # create_order("sell"), it would accidentally open a short.  We detect
         # these by fetching actual open positions from OKX and cleaning up any
         # that are no longer there.
-        if hasattr(self.connector, "get_open_position_symbols"):
+        #
+        # IMPORTANT: get_open_position_symbols() returns set() (empty) for paper
+        # mode and non-OKX exchanges — that must NOT trigger a sync wipe.
+        # We only sync when the connector is OKX live (leverage > 1, not paper).
+        _okx_live = (
+            not getattr(self.connector, "paper", True)
+            and getattr(self.connector, "_exchange_id", "") == "okx"
+            and getattr(self.connector, "leverage", 1) > 1
+        )
+        if _okx_live and hasattr(self.connector, "get_open_position_symbols"):
             try:
                 live_syms = await self.connector.get_open_position_symbols()
-                if live_syms is not None:  # empty set is valid (all closed)
+                if live_syms is not None:  # empty set means all closed on exchange
                     for pos_info in list(self.risk.get_positions()):
                         sym = pos_info["symbol"]
                         strategy_name = pos_info.get("strategy", "")
@@ -346,11 +359,20 @@ class TradingBot:
                             ticker = await self.connector.fetch_ticker(sym)
                             price  = ticker["last"]
                             pnl = (price - pos_info["entry"]) * pos_info["amount"]
+                            # Infer whether TP or SL was hit by comparing price to levels
+                            _tp = pos_info.get("take_profit")
+                            _sl = pos_info.get("stop_loss")
+                            if _tp and abs(price - _tp) < abs(price - (_sl or price)):
+                                _outcome_reason = "take_profit"
+                            elif _sl and abs(price - _sl) < abs(price - (_tp or price)):
+                                _outcome_reason = "stop_loss"
+                            else:
+                                _outcome_reason = "take_profit" if pnl >= 0 else "stop_loss"
                             self._sig.record_outcome(
                                 symbol=sym, side=pos_info["side"],
                                 entry=pos_info["entry"], exit_price=price,
-                                sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
-                                reason="okx_ocofilled", strategy=strategy_name,
+                                sl=_sl, tp=_tp,
+                                reason=_outcome_reason, strategy=strategy_name,
                             )
                             self._sig.unlock_strategy(sym, strategy_name)
                             self._sig.remove_position(f"{sym}||{strategy_name}")

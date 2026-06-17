@@ -151,8 +151,14 @@ class WTADXStrategy(BaseStrategy):
                 },
             )
 
-        if not buy_sig[n] and not sell_sig[n]:
-            self._last_signal = 0
+        # Only reset _last_signal when the opposite crossover has occurred (not on every HOLD).
+        # Resetting on every no-signal tick would allow the same directional signal to
+        # re-fire on consecutive ticks while the cross condition is still True.
+        if sell_sig[n]:
+            self._last_signal = -1
+        elif buy_sig[n]:
+            self._last_signal = 1
+        # If neither, keep the last direction to suppress duplicate fires.
 
         zone = (f"OB({curr_wt1:.1f})" if curr_wt1 > self.ob_level else
                 f"OS({curr_wt1:.1f})" if curr_wt1 < self.os_level else

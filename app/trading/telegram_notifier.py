@@ -452,7 +452,11 @@ class TelegramNotifier:
         elif cmd in ("stop_bot", "stop"):
             if self.stop_bot_fn:
                 result = self.stop_bot_fn()
-                msg = result.get("message", "Stopping...") if isinstance(result, dict) else "Stopping..."
+                # stop_bot_fn may return None (e.g. asyncio.Event.set()) or a dict
+                if isinstance(result, dict):
+                    msg = result.get("message", "Stopping...")
+                else:
+                    msg = "Stopping bot..."
                 await self._send(f"⏹ {msg}")
             else:
                 await self._send("⚠️ stop\\_bot not configured")
