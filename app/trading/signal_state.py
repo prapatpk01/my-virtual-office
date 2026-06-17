@@ -262,6 +262,7 @@ class SignalState:
                 "pending": len(self._pending),
                 "total_signals": total_fired,
                 "signals_per_day": self.signals_per_day(),
+                "weekly": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0},
             }
 
         wins       = [o for o in out if o["pnl_r"] > 0]
@@ -280,6 +281,13 @@ class SignalState:
                 else:
                     break
 
+        # 7-day slice
+        cutoff_7d  = int(time.time() * 1000) - 7 * 86_400_000
+        out_7d     = [o for o in out if o["ts"] >= cutoff_7d]
+        wins_7d    = [o for o in out_7d if o["pnl_r"] > 0]
+        losses_7d  = [o for o in out_7d if o["pnl_r"] <= 0]
+        wr_7d      = round(len(wins_7d) / len(out_7d) * 100, 1) if out_7d else 0.0
+
         return {
             "trades":             len(out),
             "wins":               len(wins),
@@ -292,5 +300,11 @@ class SignalState:
             "total_signals":      total_fired,
             "signals_per_day":    self.signals_per_day(),
             "strategy_breakdown": self.strategy_stats(days=7),
-            "recent":             out[-10:],
+            "recent":             out[-5:],
+            "weekly": {
+                "trades":   len(out_7d),
+                "wins":     len(wins_7d),
+                "losses":   len(losses_7d),
+                "win_rate": wr_7d,
+            },
         }
