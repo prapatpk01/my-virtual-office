@@ -1,10 +1,10 @@
 """
 Margin Backtest — BTC/USDT 1H | Jan–May 2026 | OKX Cross Margin x5
-Reuses signal computation from backtest_live_sim.py (identical logic).
+Strategies: UTBot + WT#0 only (highest WR, above fee break-even)
 Adds realistic OKX trading costs:
   - Taker fee: 0.1% per side on notional ($250)
   - Margin borrow: 0.02%/day on borrowed USDT ($200)
-MAX_POSITIONS: 4 | $50 collateral → $250 exposure per trade
+MAX_POSITIONS: 2 | $50 collateral → $250 exposure per trade | R:R 1:1
 """
 import types, numpy as np, sys, os
 from datetime import datetime, timezone
@@ -30,10 +30,10 @@ LEVERAGE        = 5.0
 NOTIONAL        = TRADE_USDT * LEVERAGE      # $250
 BORROWED        = TRADE_USDT * (LEVERAGE-1)  # $200
 
-MAX_POSITIONS   = 4
+MAX_POSITIONS   = 2
 START_CAPITAL   = 300.0
 SL_MULT         = 1.5
-TP_MULT         = 1.5
+TP_MULT         = 1.5    # R:R 1:1 (SL_MULT == TP_MULT)
 
 TAKER_FEE_PCT   = 0.001          # OKX taker 0.1% per side (market order)
 BORROW_RATE_DAY = 0.0002         # OKX cross USDT ~0.02%/day on borrowed amount
@@ -58,31 +58,26 @@ def main():
     t0 = ts_str(c1h[0].ts, "%Y-%m-%d"); t1 = ts_str(c1h[-1].ts, "%Y-%m-%d")
 
     print("Computing signals...")
-    wt_buy,  wt_sell,  wt_atr,  wt_hc,  *_ = compute_wt_signals(c1h)
-    md_buy,  md_sell,  md_atr,  md_hc,  *_ = compute_macd_signals(c1h)
-    mo_buy,  mo_sell,  mo_atr,  mo_hc,  *_ = compute_mom_signals(c1h)
-    ut_buy,  ut_sell,  ut_atr,  ut_hc,  *_ = compute_ut_signals(c1h)
+    wt_buy, wt_sell, wt_atr, wt_hc, *_ = compute_wt_signals(c1h)
+    ut_buy, ut_sell, ut_atr, ut_hc, *_ = compute_ut_signals(c1h)
 
     print("Computing 4H bias...")
     bias4h  = build_4h_bias(c4h)
     ts4map  = build_ts_index(c4h)
     bias_at = np.array([get_4h_bias_at(c1h[i].ts, c4h, ts4map, bias4h) for i in range(n)])
 
-    print(f"  WT BUY signals: {wt_buy.sum()} | MACD: {md_buy.sum()} | Momentum: {mo_buy.sum()} | UTBot: {ut_buy.sum()}")
+    print(f"  WT BUY signals: {wt_buy.sum()} | UTBot: {ut_buy.sum()}")
 
     def get_sigs(i):
         return [
-            ("WT#0",     bool(wt_buy[i]), float(wt_atr[i]), float(wt_hc[i])),
-            ("WT#1",     bool(wt_buy[i]), float(wt_atr[i]), float(wt_hc[i])),
-            ("MACD",     bool(md_buy[i]), float(md_atr[i]), float(md_hc[i])),
-            ("Momentum", bool(mo_buy[i]), float(mo_atr[i]), float(mo_hc[i])),
-            ("UTBot",    bool(ut_buy[i]), float(ut_atr[i]), float(ut_hc[i])),
+            ("WT#0",  bool(wt_buy[i]), float(wt_atr[i]), float(wt_hc[i])),
+            ("UTBot", bool(ut_buy[i]), float(ut_atr[i]), float(ut_hc[i])),
         ]
 
     # ── State ─────────────────────────────────────────────────────────────────
     capital   = START_CAPITAL
     open_pos  = {}
-    strategies = ["WT#0","WT#1","MACD","Momentum","UTBot"]
+    strategies = ["WT#0", "UTBot"]
 
     def zstat():
         return {"trades":0,"wins":0,"losses":0,
@@ -146,13 +141,10 @@ def main():
         for k in to_close: del open_pos[k]
 
         # ── Open positions ────────────────────────────────────────────────────
-        bias   = int(bias_at[i])
-        wt_used = False
+        bias = int(bias_at[i])
 
         for sk, is_buy, atr_v, hc_v in get_sigs(i):
             if not is_buy: continue
-            if sk in ("WT#0","WT#1") and wt_used: continue
-
             if bias != 1:
                 stat[sk]["blk_mtf"] += 1; continue
             if sk in open_pos:
@@ -170,7 +162,6 @@ def main():
             open_pos[sk] = {"entry":entry,"sl":sl,"tp":tp,"btc":btc,
                              "strat":sk,"open_ts":ts}
             stat[sk]["trades"] += 1
-            if sk.startswith("WT"): wt_used = True
 
     # ── Close any still-open positions at last price ──────────────────────────
     last_p = float(c1h[-1].close); last_ts = c1h[-1].ts
@@ -203,7 +194,7 @@ def main():
     print("="*W)
     print(f"  MARGIN BACKTEST — BTC/USDT 1H  {t0} → {t1}")
     print(f"  Capital ${START_CAPITAL:.0f}  |  Trade: ${TRADE_USDT:.0f} collateral x{LEVERAGE:.0f} = ${NOTIONAL:.0f} notional")
-    print(f"  MAX_POSITIONS: {MAX_POSITIONS}  |  Borrowed/trade: ${BORROWED:.0f}  |  OKX taker {TAKER_FEE_PCT*100:.1f}%/side  |  Margin {BORROW_RATE_DAY*100:.3f}%/day")
+    print(f"  Strategies: UTBot + WT#0  |  MAX_POSITIONS: {MAX_POSITIONS}  |  R:R 1:1  |  OKX taker {TAKER_FEE_PCT*100:.1f}%/side  |  Margin {BORROW_RATE_DAY*100:.3f}%/day")
     print("="*W)
 
     print(f"\n  EXECUTION SUMMARY")
