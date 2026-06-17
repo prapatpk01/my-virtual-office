@@ -43,6 +43,14 @@ class MCDXStrategy(BaseStrategy):
         self.mtf_fast_ema = self.params.get("mtf_fast_ema", 21)
         self.mtf_slow_ema = self.params.get("mtf_slow_ema", 50)
 
+        # ── RSI gate: only enter when RSI is in a healthy momentum zone ────
+        # Avoids buying deeply oversold (below rsi_min) or overbought (above rsi_max).
+        self.rsi_min_gate = self.params.get("rsi_min_gate", 40)
+        self.rsi_max_gate = self.params.get("rsi_max_gate", 72)
+
+        # ── Price confirmation: require price > EMA(21) before BUY ────────
+        self.price_ema_confirm = self.params.get("price_ema_confirm", True)
+
         # Allow overriding the strategy name for multi-instance setups (P1/P2).
         if "name" in self.params:
             self.name = self.params["name"]
@@ -211,19 +219,6 @@ class MCDXStrategy(BaseStrategy):
                 return True, (f"PB-EMA{self.pb_ema_len} bounce +{dist:.1f}% | "
                               f"DWCS={curr_dwcs:.1f} RSI={curr_rsi:.1f} RVOL={rvol:.1f}x")
 
-        # ── Mode 2: PC Rebound ────────────────────────────────────────────
-        if trend_bull and n >= 15:
-            pc_window = [float(p) for p in pc_arr[-15:] if not np.isnan(p)]
-            if len(pc_window) >= 8:
-                pc_was_strong = any(p > 55 for p in pc_window[:-3])
-                pc_dipped     = prev2_pc < self.pb_pc_low
-                pc_rising_2   = curr_pc > prev_pc and prev_pc > prev2_pc
-                above_sma     = price >= curr_sma * 0.995
-                rsi_range     = 32 < curr_rsi < 65
-                if pc_was_strong and pc_dipped and pc_rising_2 and above_sma and rsi_range:
-                    return True, (f"PB-PC rebound {prev2_pc:.0f}→{curr_pc:.0f} | "
-                                  f"DWCS={curr_dwcs:.1f} RSI={curr_rsi:.1f}")
-
         # ── Mode 3: RSI Dip Rebound ───────────────────────────────────────
         if trend_strong and n >= 5:
             rsi_min   = min(prev_rsi, prev2_rsi)
@@ -306,6 +301,15 @@ class MCDXStrategy(BaseStrategy):
 
         conf_pct = abs(curr_dwcs - 50) / 50
 
+        # RSI gate: momentum zone check
+        rsi_gate_ok = self.rsi_min_gate <= curr_rsi <= self.rsi_max_gate
+
+        # Price > EMA(21) confirmation (local uptrend)
+        ema21_arr = self.ema(closes, self.pb_ema_len)
+        price_ok  = (not self.price_ema_confirm
+                     or np.isnan(ema21_arr[-1])
+                     or current_price > float(ema21_arr[-1]))
+
         # ── MTF bias gate: 1H + 4H EMA(fast/slow) both bullish ────────────
         # Blocks BUY signals when higher-TF trend is not aligned.
         mtf_bias_bull = True
@@ -325,8 +329,12 @@ class MCDXStrategy(BaseStrategy):
                 mtf_label = f" [MTF blocked: {','.join(blocked_by)} bear]"
 
         # ── Primary BUY: Golden Cross OR DWCS bull zone cross ─────────────
-        dwcs_buy_confirmed = dwcs_buy_signal and rvol >= self.rvol_min
-        if (golden_cross or dwcs_buy_confirmed) and not mtf_bias_bull:
+        # dwcs_buy_confirmed requires: DWCS cross + volume + RSI gate + price > EMA21
+        dwcs_buy_confirmed = (dwcs_buy_signal and rvol >= self.rvol_min
+                              and rsi_gate_ok and price_ok)
+        # golden cross: looser (no RSI gate needed — it's a chip-distribution signal)
+        golden_cross_ok = golden_cross and price_ok
+        if (golden_cross_ok or dwcs_buy_confirmed) and not mtf_bias_bull:
             # Signal exists but MTF trend is against it — hold
             return Signal(
                 SignalType.HOLD, self.symbol, current_price, 0,
@@ -335,8 +343,8 @@ class MCDXStrategy(BaseStrategy):
                 metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
                           "rsi": curr_rsi, "rvol": rvol, "mtf_bias": "bear"},
             )
-        if golden_cross or dwcs_buy_confirmed:
-            reason = "Golden Cross" if golden_cross else f"DWCS Bull zone + RVOL={rvol:.1f}x"
+        if golden_cross_ok or dwcs_buy_confirmed:
+            reason = "Golden Cross" if golden_cross_ok else f"DWCS Bull zone + RVOL={rvol:.1f}x"
             return Signal(
                 SignalType.BUY, self.symbol, current_price,
                 amount=self.position_pct,
