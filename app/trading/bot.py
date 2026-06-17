@@ -587,9 +587,9 @@ class TradingBot:
             tp_p = meta.get("take_profit") or meta.get("tp1")
             # Invert if strategy returned long-side levels
             if sl_p and sl_p < price:
-                sl_p = round(price * (1 + self.fixed_sl_pct or 0.015), 8)
+                sl_p = round(price * (1 + (self.fixed_sl_pct or self.risk.stop_loss_pct)), 8)
             if tp_p and tp_p > price:
-                tp_p = round(price * (1 - self.fixed_tp_pct or 0.030), 8)
+                tp_p = round(price * (1 - (self.fixed_tp_pct or self.risk.take_profit_pct)), 8)
 
         amount = self.risk.size_position(quote_balance, price)
         if amount <= 0:

@@ -53,6 +53,8 @@ class BaseStrategy(ABC):
     @staticmethod
     def ema(values: list[float], period: int) -> np.ndarray:
         arr = np.array(values, dtype=float)
+        if len(arr) < period:
+            return np.full(len(arr), np.nan)
         result = np.full_like(arr, np.nan)
         k = 2.0 / (period + 1)
         result[period - 1] = arr[:period].mean()
@@ -71,6 +73,8 @@ class BaseStrategy(ABC):
     @staticmethod
     def rsi(values: list[float], period: int = 14) -> np.ndarray:
         arr = np.array(values, dtype=float)
+        if len(arr) <= period:
+            return np.full(len(arr), np.nan)
         delta = np.diff(arr)
         gain = np.where(delta > 0, delta, 0.0)
         loss = np.where(delta < 0, -delta, 0.0)
@@ -91,10 +95,11 @@ class BaseStrategy(ABC):
         fast_ema = BaseStrategy.ema(values, fast)
         slow_ema = BaseStrategy.ema(values, slow)
         macd_line = fast_ema - slow_ema
-        signal_line = BaseStrategy.ema(
-            [v for v in macd_line if not np.isnan(v)], signal
-        )
-        # Pad signal_line to match macd_line length
+        valid = [v for v in macd_line if not np.isnan(v)]
+        if len(valid) < signal:
+            nan_arr = np.full(len(macd_line), np.nan)
+            return macd_line, nan_arr, nan_arr
+        signal_line = BaseStrategy.ema(valid, signal)
         pad = len(macd_line) - len(signal_line)
         signal_padded = np.concatenate([np.full(pad, np.nan), signal_line])
         histogram = macd_line - signal_padded

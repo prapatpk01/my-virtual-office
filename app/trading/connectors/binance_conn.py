@@ -64,6 +64,8 @@ class BinanceConnector(BaseConnector):
         self._exchange = exchange_class(cfg)
 
         _bal = float(os.environ.get("PAPER_BALANCE", "10000"))
+        if _bal <= 0:
+            _bal = 10000.0
         self._paper_balance = {"USDT": _bal, "BTC": 0.0, "ETH": 0.0}
         self._paper_open_orders: list[OrderResult] = []
         self._leverage_set: set[str] = set()
