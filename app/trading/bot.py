@@ -87,6 +87,10 @@ class TradingBot:
         self.wt_verify: bool = os.getenv("WTV", "false").lower() == "true"
         if self.wt_verify:
             logger.info("[WTV] WaveTrend verify ENABLED (WT1 gate ±10 active)")
+        # FUTURES_MODE=true → SELL signals open short positions (perpetual swap)
+        self.futures_mode: bool = os.getenv("FUTURES_MODE", "false").lower() == "true"
+        if self.futures_mode:
+            logger.info("[FUTURES] Futures mode ENABLED — SELL opens short, BUY closes short")
 
     # ------------------------------------------------------------------
     # Public control
@@ -178,9 +182,12 @@ class TradingBot:
             price = ticker["last"]
             trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
             if trigger:
-                side = "sell" if pos_info["side"] == "long" else "buy"
-                await self.connector.create_order(sym, side, pos_info["amount"])
-                pnl = (price - pos_info["entry"]) * pos_info["amount"] if side == "sell" else 0
+                is_long = pos_info["side"] == "long"
+                side = "sell" if is_long else "buy"
+                ps   = ("long" if is_long else "short") if self.futures_mode else ""
+                await self.connector.create_order(sym, side, pos_info["amount"], pos_side=ps)
+                pnl_mult = 1 if is_long else -1
+                pnl = pnl_mult * (price - pos_info["entry"]) * pos_info["amount"]
                 trade = TradeRecord(
                     timestamp=int(time.time() * 1000),
                     symbol=sym, side=side,
@@ -383,38 +390,60 @@ class TradingBot:
             await self._execute_signal(signal, slot_key)
             return
 
-        # ── Normal strategies: BUY-only ──────────────────────────────────
-        if signal.type == SignalType.SELL:
-            # Close long belonging to THIS strategy; ignore if no position
-            if self._sig.is_locked_for_strategy(sym, strategy_name):
-                positions = self.risk.get_positions()
-                existing  = next((p for p in positions
-                                  if p["symbol"] == sym and p["strategy"] == strategy_name), None)
-                if existing and existing["side"] == "long":
-                    logger.info("[%s] SELL signal — exiting long on %s", strategy_name, sym)
-                    try:
-                        ticker     = await self.connector.fetch_ticker(sym)
-                        exit_price = ticker["last"]
-                        await self.connector.create_order(sym, "sell", existing["amount"])
-                        self._sig.record_outcome(
-                            symbol=sym, side="long",
-                            entry=existing["entry"], exit_price=exit_price,
-                            sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
-                            reason="sell_signal", strategy=strategy_name,
-                        )
-                        self._sig.unlock_strategy(sym, strategy_name)
-                        self.risk.close_position(sym, strategy=strategy_name)
-                        if self.telegram:
-                            self.telegram.notify_trade_closed(
-                                sym, "sell_signal", exit_price,
-                                existing["entry"], existing.get("stop_loss"),
-                                existing.get("take_profit"), self._sig.summary(),
-                            )
-                    except Exception as e:
-                        logger.error("Exit on SELL signal failed [%s]: %s", strategy_name, e)
-            return  # Never open short
+        # ── Normal strategies (spot / futures hedge) ─────────────────────
+        # In futures mode: BUY opens LONG, SELL opens SHORT independently.
+        # Both can coexist simultaneously (OKX hedge mode).
+        # Each position carries its own TP/SL — no forced opposite-close.
+        short_name = strategy_name + "_short"
 
-        # BUY signal — open long if not already holding one for this strategy
+        if signal.type == SignalType.SELL:
+            if self.futures_mode:
+                # Futures: open SHORT (don't close long — hedge mode)
+                if self._sig.is_locked_for_strategy(sym, short_name):
+                    logger.debug("%s [%s] already short — suppressing SELL", sym, short_name)
+                    return
+                can, reason = self.risk.can_open(sym, strategy=short_name)
+                if not can:
+                    logger.debug("[%s] SHORT blocked — %s", short_name, reason)
+                    return
+                self._sig.lock_strategy(sym, short_name, "sell")
+                self._sig.record_signal(sym, "sell", signal.price,
+                                        signal.confidence, strategy=short_name)
+                if self.telegram:
+                    self.telegram.notify_signal({**sig_dict, "strategy": short_name,
+                                                 "side": "short"})
+                await self._execute_short(signal, short_name)
+            else:
+                # Spot: close long belonging to THIS strategy
+                if self._sig.is_locked_for_strategy(sym, strategy_name):
+                    positions = self.risk.get_positions()
+                    existing  = next((p for p in positions
+                                      if p["symbol"] == sym and p["strategy"] == strategy_name), None)
+                    if existing and existing["side"] == "long":
+                        logger.info("[%s] SELL — exiting long on %s", strategy_name, sym)
+                        try:
+                            ticker     = await self.connector.fetch_ticker(sym)
+                            exit_price = ticker["last"]
+                            await self.connector.create_order(sym, "sell", existing["amount"])
+                            self._sig.record_outcome(
+                                symbol=sym, side="long",
+                                entry=existing["entry"], exit_price=exit_price,
+                                sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
+                                reason="sell_signal", strategy=strategy_name,
+                            )
+                            self._sig.unlock_strategy(sym, strategy_name)
+                            self.risk.close_position(sym, strategy=strategy_name)
+                            if self.telegram:
+                                self.telegram.notify_trade_closed(
+                                    sym, "sell_signal", exit_price,
+                                    existing["entry"], existing.get("stop_loss"),
+                                    existing.get("take_profit"), self._sig.summary(),
+                                )
+                        except Exception as e:
+                            logger.error("Exit long on SELL failed [%s]: %s", strategy_name, e)
+            return
+
+        # BUY signal — open LONG (hedge mode: short stays open independently)
         if self._sig.is_locked_for_strategy(sym, strategy_name):
             logger.debug("%s [%s] already long — suppressing BUY", sym, strategy_name)
             return
@@ -469,7 +498,8 @@ class TradingBot:
 
         try:
             order = await self.connector.create_order(
-                sym, "buy", amount, tp_price=tp_p, sl_price=sl_p
+                sym, "buy", amount, tp_price=tp_p, sl_price=sl_p,
+                pos_side="long" if self.futures_mode else "",
             )
             self.risk.open_position(sym, "long", price, amount, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
@@ -481,13 +511,67 @@ class TradingBot:
                 paper=self.connector.paper,
             )
             self._record_trade(trade)
-            logger.info("[%s] BUY %s @ %.4f  SL=%.4f  TP=%.4f (paper=%s)",
+            logger.info("[%s] LONG %s @ %.4f  SL=%.4f  TP=%.4f (paper=%s)",
                         strategy_name, sym, price, sl_p or 0, tp_p or 0, self.connector.paper)
             if self.telegram:
                 self.telegram.notify_order(sym, "buy", amount, order.price,
                                            strategy_name, self.connector.paper)
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
+            self._sig.unlock_strategy(sym, strategy_name)
+
+    async def _execute_short(self, signal: Signal, strategy_name: str):
+        """Open a SHORT position (futures only). Called for SELL signals in futures_mode."""
+        sym = signal.symbol
+
+        balances = await self.connector.fetch_balance()
+        quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
+        ticker = await self.connector.fetch_ticker(sym)
+        price  = ticker["last"]
+
+        # SL above entry, TP below entry (opposite of long)
+        if self.fixed_sl_pct > 0 and self.fixed_tp_pct > 0:
+            sl_p = round(price * (1 + self.fixed_sl_pct), 8)
+            tp_p = round(price * (1 - self.fixed_tp_pct), 8)
+        else:
+            meta = signal.metadata or {}
+            sl_p = meta.get("stop_loss") or meta.get("sl")
+            tp_p = meta.get("take_profit") or meta.get("tp1")
+            # Invert if strategy returned long-side levels
+            if sl_p and sl_p < price:
+                sl_p = round(price * (1 + self.fixed_sl_pct or 0.015), 8)
+            if tp_p and tp_p > price:
+                tp_p = round(price * (1 - self.fixed_tp_pct or 0.030), 8)
+
+        amount = self.risk.size_position(quote_balance, price)
+        if amount <= 0:
+            logger.info("Position size 0 for %s short — skipping", sym)
+            self._sig.unlock_strategy(sym, strategy_name)
+            return
+
+        try:
+            order = await self.connector.create_order(
+                sym, "sell", amount,
+                tp_price=tp_p, sl_price=sl_p,
+                pos_side="short",
+            )
+            self.risk.open_position(sym, "short", price, amount, strategy=strategy_name,
+                                    stop_loss=sl_p, take_profit=tp_p)
+            trade = TradeRecord(
+                timestamp=int(time.time() * 1000),
+                symbol=sym, side="sell",
+                price=order.price, amount=amount,
+                pnl=0.0, strategy=strategy_name, reason=signal.reason,
+                paper=self.connector.paper,
+            )
+            self._record_trade(trade)
+            logger.info("[%s] SHORT %s @ %.4f  SL=%.4f  TP=%.4f (paper=%s)",
+                        strategy_name, sym, price, sl_p or 0, tp_p or 0, self.connector.paper)
+            if self.telegram:
+                self.telegram.notify_order(sym, "sell_short", amount, order.price,
+                                           strategy_name, self.connector.paper)
+        except Exception as e:
+            logger.error("Short order failed for %s: %s", sym, e)
             self._sig.unlock_strategy(sym, strategy_name)
 
     async def _refresh_balance(self):

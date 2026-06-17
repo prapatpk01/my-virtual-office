@@ -57,12 +57,12 @@ class BaseConnector(ABC):
     async def create_order(self, symbol: str, side: str, amount: float,
                            order_type: str = "market", price: Optional[float] = None,
                            tp_price: Optional[float] = None,
-                           sl_price: Optional[float] = None) -> OrderResult:
+                           sl_price: Optional[float] = None,
+                           pos_side: str = "") -> OrderResult:
         """Place an order (or simulate if paper=True).
 
-        tp_price / sl_price — when provided and supported by the exchange
-        (currently OKX), the trigger prices are attached inline to the order
-        so TP/SL execute even if the bot goes offline.
+        tp_price / sl_price — attach TP/SL inline (OKX keeps them active offline).
+        pos_side — "long" | "short" | "" (OKX futures hedge mode only).
         """
 
     @abstractmethod

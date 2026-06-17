@@ -66,9 +66,11 @@ def build_config() -> dict:
         "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
         "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),  # OKX required
         "paper":           _env_bool("PAPER_TRADING", True),
-        # ── Margin / leverage (OKX Cross Margin) ──────────────────────────────
-        # MARGIN_MODE: "cross" | "isolated" | "" (spot/no margin)
+        # ── Margin / leverage ──────────────────────────────────────────────────
+        # MARGIN_MODE: "cross" | "isolated" | "" (spot)
+        # MARKET_TYPE: "swap" for OKX Perpetual Futures, "" for spot/margin
         "margin_mode": os.environ.get("MARGIN_MODE", ""),
+        "market_type": os.environ.get("MARKET_TYPE", ""),   # "swap" = futures
         "leverage":    int(os.environ.get("LEVERAGE", "1")),
         # ── OANDA ─────────────────────────────────────────────────────────────
         "oanda_api_key":   os.environ.get("OANDA_API_KEY", ""),
@@ -209,6 +211,7 @@ def build_crypto_bot(config: dict, telegram):
             paper=config["paper"], exchange_id=exchange,
             passphrase=config.get("api_passphrase", ""),
             margin_mode=config.get("margin_mode", ""),
+            market_type=config.get("market_type", ""),
             leverage=config.get("leverage", 1),
         )
     else:
