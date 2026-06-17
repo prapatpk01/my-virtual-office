@@ -27,12 +27,14 @@ class RiskManager:
 
     def __init__(self,
                  max_risk_per_trade_pct: float = 0.02,   # 2% of balance per trade
-                 stop_loss_pct: float = 0.03,            # 3% stop-loss
-                 take_profit_pct: float = 0.06,          # 6% take-profit (2:1 RR)
+                 stop_loss_pct: float = 0.03,
+                 take_profit_pct: float = 0.06,
                  max_open_positions: int = 5,
-                 max_drawdown_pct: float = 0.15,         # halt if 15% drawdown
+                 max_drawdown_pct: float = 0.15,
+                 fixed_trade_usdt: float = 0.0,          # >0 → fixed USDT margin per trade
                  ):
         self.max_risk_per_trade_pct = max_risk_per_trade_pct
+        self.fixed_trade_usdt = fixed_trade_usdt         # 0 = use % mode
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.max_open_positions = max_open_positions
@@ -56,11 +58,16 @@ class RiskManager:
         return True
 
     def size_position(self, balance: float, price: float) -> float:
-        """Calculate position size: spend risk_pct% of balance per trade."""
+        """Calculate position size in base asset units.
+
+        Fixed mode  (fixed_trade_usdt > 0): always use fixed USDT as margin.
+        Percent mode (default):             use risk_pct% of current balance.
+        """
         if price <= 0:
             return 0
-        risk_amount = balance * self.max_risk_per_trade_pct
-        return round(risk_amount / price, 6)
+        usdt = self.fixed_trade_usdt if self.fixed_trade_usdt > 0 \
+               else balance * self.max_risk_per_trade_pct
+        return round(usdt / price, 6)
 
     def compute_stops(self, side: str, entry_price: float) -> tuple[float, float]:
         """Returns (stop_loss_price, take_profit_price). Accepts 'buy'/'long' or 'sell'/'short'."""

@@ -71,7 +71,7 @@ def build_config() -> dict:
         # MARKET_TYPE: "swap" for OKX Perpetual Futures, "" for spot/margin
         "margin_mode": os.environ.get("MARGIN_MODE", ""),
         "market_type": os.environ.get("MARKET_TYPE", ""),   # "swap" = futures
-        "leverage":    int(os.environ.get("LEVERAGE", "10")),
+        "leverage":    int(os.environ.get("LEVERAGE", "20")),
         # ── OANDA ─────────────────────────────────────────────────────────────
         "oanda_api_key":   os.environ.get("OANDA_API_KEY", ""),
         "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
@@ -89,7 +89,9 @@ def build_config() -> dict:
             "rsi_macd": _env_bool("STRATEGY_RSI_MACD",  False),
         },
         # ── Risk / SL / TP ────────────────────────────────────────────────────
-        "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
+        "risk_per_trade":    float(os.environ.get("RISK_PER_TRADE",    "0.02")),
+        # Fixed USDT margin per trade — overrides risk_per_trade when > 0
+        "fixed_trade_usdt":  float(os.environ.get("FIXED_TRADE_USDT",  "20")),
         # BTC 1H 10x margin: SL 1.5%, TP 3.0%
         # Net RR ~1:1.83 after 0.25% fees | break-even WR = 35%
         # At 10x: loss ~15% capital | win ~27.5% capital per trade
@@ -228,13 +230,17 @@ def build_crypto_bot(config: dict, telegram):
         take_profit_pct=config["take_profit_pct"],
         max_open_positions=config["max_positions"],
         max_drawdown_pct=config["max_drawdown"],
+        fixed_trade_usdt=config["fixed_trade_usdt"],
     )
-    margin_info = (f"  margin={config['margin_mode'].upper()} x{config['leverage']}"
-                   if config.get("margin_mode") else "  spot")
+    mkt = config.get("market_type", "") or config.get("margin_mode", "") or "spot"
+    size_info = (f"fixed={config['fixed_trade_usdt']:.0f}USDT"
+                 if config["fixed_trade_usdt"] > 0
+                 else f"risk={config['risk_per_trade']*100:.1f}%")
     logger.info(
-        "Bot config: SL=%.2f%%  TP=%.2f%%  max_positions=%d  strategies=%s%s",
+        "Bot config: SL=%.2f%%  TP=%.2f%%  size=%s  lev=x%d  mode=%s  positions=%d  strategies=%s",
         config["stop_loss_pct"] * 100, config["take_profit_pct"] * 100,
-        config["max_positions"], [s.name for s in strategies], margin_info,
+        size_info, config["leverage"], mkt.upper(),
+        config["max_positions"], [s.name for s in strategies],
     )
     return TradingBot(
         connector=connector, strategies=strategies,
