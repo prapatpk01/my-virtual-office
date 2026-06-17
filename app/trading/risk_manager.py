@@ -26,15 +26,17 @@ class RiskManager:
     """
 
     def __init__(self,
-                 max_risk_per_trade_pct: float = 0.02,   # 2% of balance per trade
+                 max_risk_per_trade_pct: float = 0.02,
                  stop_loss_pct: float = 0.03,
                  take_profit_pct: float = 0.06,
                  max_open_positions: int = 5,
                  max_drawdown_pct: float = 0.15,
-                 fixed_trade_usdt: float = 0.0,          # >0 → fixed USDT margin per trade
+                 fixed_trade_usdt: float = 0.0,  # >0 → fixed USDT margin per trade
+                 leverage: int = 1,              # futures leverage (multiplies notional)
                  ):
         self.max_risk_per_trade_pct = max_risk_per_trade_pct
-        self.fixed_trade_usdt = fixed_trade_usdt         # 0 = use % mode
+        self.fixed_trade_usdt = fixed_trade_usdt
+        self.leverage = max(leverage, 1)
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.max_open_positions = max_open_positions
@@ -60,14 +62,15 @@ class RiskManager:
     def size_position(self, balance: float, price: float) -> float:
         """Calculate position size in base asset units.
 
-        Fixed mode  (fixed_trade_usdt > 0): always use fixed USDT as margin.
-        Percent mode (default):             use risk_pct% of current balance.
+        Fixed mode  (fixed_trade_usdt > 0): margin = fixed USDT, notional = margin × leverage.
+        Percent mode (default):             margin = balance × risk_pct, notional × leverage.
         """
         if price <= 0:
             return 0
-        usdt = self.fixed_trade_usdt if self.fixed_trade_usdt > 0 \
-               else balance * self.max_risk_per_trade_pct
-        return round(usdt / price, 6)
+        margin = self.fixed_trade_usdt if self.fixed_trade_usdt > 0 \
+                 else balance * self.max_risk_per_trade_pct
+        notional = margin * self.leverage
+        return round(notional / price, 6)
 
     def compute_stops(self, side: str, entry_price: float) -> tuple[float, float]:
         """Returns (stop_loss_price, take_profit_price). Accepts 'buy'/'long' or 'sell'/'short'."""

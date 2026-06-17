@@ -231,6 +231,7 @@ def build_crypto_bot(config: dict, telegram):
         max_open_positions=config["max_positions"],
         max_drawdown_pct=config["max_drawdown"],
         fixed_trade_usdt=config["fixed_trade_usdt"],
+        leverage=config["leverage"],
     )
     mkt = config.get("market_type", "") or config.get("margin_mode", "") or "spot"
     size_info = (f"fixed={config['fixed_trade_usdt']:.0f}USDT"
