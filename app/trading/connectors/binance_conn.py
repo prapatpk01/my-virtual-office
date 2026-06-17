@@ -104,14 +104,21 @@ class BinanceConnector(BaseConnector):
             kwargs["params"] = okx_params
 
         raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
+        # For market orders, OKX returns price=None; use average (filled price) instead
+        exec_price = (
+            raw.get("average")
+            or raw.get("price")
+            or price
+            or 0.0
+        )
         return OrderResult(
             order_id=str(raw.get("id", uuid.uuid4())),
             symbol=symbol,
             side=side,
             amount=amount,
-            price=raw.get("price") or price or 0.0,
-            filled=raw.get("filled", 0.0),
-            status=raw.get("status", "open"),
+            price=float(exec_price),
+            filled=raw.get("filled") or raw.get("amount") or amount,
+            status=raw.get("status", "closed"),
         )
 
     async def _paper_order(self, symbol: str, side: str, amount: float,

@@ -533,7 +533,7 @@ class TelegramNotifier:
             if not self.fetch_candles_fn:
                 await self._send("⚠️ Export not available — connector not wired")
                 return
-            await self._send("⏳ Fetching BTC/USDT 1H candles from OKX\\.\\.\\.")
+            await self._send("⏳ Fetching BTC/USDT 1H candles from OKX...")
             try:
                 import io
                 from datetime import datetime, timezone

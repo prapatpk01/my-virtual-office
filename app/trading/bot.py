@@ -381,9 +381,8 @@ class TradingBot:
                                 "[OKX-sync] %s [%s] closed by native OCO — internal state synced (pnl≈%.2f)",
                                 sym, strategy_name, pnl)
                             if self.telegram:
-                                reason = "tp" if pnl > 0 else "sl"
                                 self.telegram.notify_trade_closed(
-                                    sym, reason, price,
+                                    sym, _outcome_reason, price,
                                     pos_info["entry"],
                                     pos_info.get("stop_loss"),
                                     pos_info.get("take_profit"),

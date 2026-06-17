@@ -54,6 +54,8 @@ class BaseStrategy(ABC):
     def ema(values: list[float], period: int) -> np.ndarray:
         arr = np.array(values, dtype=float)
         result = np.full_like(arr, np.nan)
+        if len(arr) < period:
+            return result  # not enough data — all NaN
         k = 2.0 / (period + 1)
         result[period - 1] = arr[:period].mean()
         for i in range(period, len(arr)):

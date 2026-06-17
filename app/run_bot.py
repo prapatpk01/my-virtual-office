@@ -358,9 +358,12 @@ async def main():
     await _run_backtest(crypto_bot, config, telegram)
 
     # Start both bots concurrently
-    tasks = [asyncio.create_task(crypto_bot.start())]
+    # Note: start() returns after launching the internal _run_loop task,
+    # so these outer tasks complete quickly. We await them here to surface
+    # any startup errors before proceeding.
+    await crypto_bot.start()
     if forex_bot:
-        tasks.append(asyncio.create_task(forex_bot.start()))
+        await forex_bot.start()
         logger.info("Forex signal bot started: %s", config["forex_symbols"])
 
     await _stop_signal.wait()
