@@ -492,18 +492,15 @@ class TradingBot:
 
             if signal.type == SignalType.SELL:
                 # Do NOT close WT positions on SELL signal — let TP/SL handle exits.
-                # Block new BUY slots for 10 bars.
-                for s in range(_WT_MAX):
-                    block_key = f"{sym}||{_WT}#{s}"
-                    self._blocked_until[block_key] = self._bar_counter + 10
-                logger.debug("[WT] SELL on %s — blocking all WT slots for 10 bars", sym)
+                # In a bull market SELL signals are often just pullbacks; no block.
+                logger.debug("[WT] SELL on %s — ignored (TP/SL handles exits)", sym)
                 return  # Never open short
 
-            # BUY: MTF 4H gate
+            # BUY: MTF 4H gate — strict mode: only trade when 4H is clearly bullish
             if self._mtf_gate:
                 bias4h = self._4h_bias.get(sym, 0)
-                if bias4h == -1:
-                    logger.debug("[MTF4H] %s [WT] BUY blocked — 4H bias bearish", sym)
+                if bias4h != 1:
+                    logger.debug("[MTF4H] %s [WT] BUY blocked — 4H bias not bullish (%d)", sym, bias4h)
                     return
             # BUY: stack longs up to _WT_MAX
             if len(wt_longs) >= _WT_MAX:
@@ -534,28 +531,18 @@ class TradingBot:
         # ── Normal strategies: BUY-only, pure TP/SL exits ───────────────
         if signal.type == SignalType.SELL:
             # Do NOT close position on SELL signal — let TP/SL handle exits.
-            # Instead, block new BUY signals for this sym+strategy for 10 bars.
-            block_key = f"{sym}||{strategy_name}"
-            self._blocked_until[block_key] = self._bar_counter + 10
-            logger.debug("[%s] SELL signal on %s — blocking new BUYs for 10 bars (bar %d→%d)",
-                         strategy_name, sym, self._bar_counter, self._bar_counter + 10)
+            # In a bull market SELL signals are often just pullbacks; no block.
+            logger.debug("[%s] SELL signal on %s — ignored (TP/SL handles exits)",
+                         strategy_name, sym)
             return  # Never open short, never close on SELL
 
-        # BUY signal — MTF 4H gate: block if 4H trend is bearish
+        # BUY signal — MTF 4H gate strict: only trade when 4H is clearly bullish
         if self._mtf_gate and signal.type == SignalType.BUY:
             bias4h = self._4h_bias.get(sym, 0)
-            if bias4h == -1:
-                logger.debug("[MTF4H] %s [%s] BUY blocked — 4H bias bearish",
-                             sym, strategy_name)
+            if bias4h != 1:
+                logger.debug("[MTF4H] %s [%s] BUY blocked — 4H bias not bullish (%d)",
+                             sym, strategy_name, bias4h)
                 return
-
-        # BUY signal — open long if not already holding one for this strategy
-        # and not blocked from a recent SELL signal
-        block_key = f"{sym}||{strategy_name}"
-        if self._bar_counter < self._blocked_until.get(block_key, 0):
-            logger.debug("[%s] BUY on %s blocked until bar %d (current %d)",
-                         strategy_name, sym, self._blocked_until[block_key], self._bar_counter)
-            return
 
         if self._sig.is_locked_for_strategy(sym, strategy_name):
             logger.debug("%s [%s] already long — suppressing BUY", sym, strategy_name)

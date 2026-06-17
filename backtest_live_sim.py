@@ -321,15 +321,7 @@ def main():
         wt_slot_used_this_bar = False   # only 1 WT slot per bar
 
         for strat_key, is_buy, is_sell, atr_v, hc_v, hh_v, hl_v in sigs:
-            # SELL signal → block this strategy for SELL_BLOCK bars
-            if is_sell:
-                if strat_key.startswith("WT"):
-                    # Block both WT slots
-                    blocked["WT#0"] = bar_ctr + SELL_BLOCK
-                    blocked["WT#1"] = bar_ctr + SELL_BLOCK
-                else:
-                    blocked[strat_key] = bar_ctr + SELL_BLOCK
-
+            # SELL signal: ignored — TP/SL handles all exits (no SELL block)
             if not is_buy:
                 continue
 
@@ -337,14 +329,9 @@ def main():
             if strat_key in ("WT#0","WT#1") and wt_slot_used_this_bar:
                 continue
 
-            # ── Check MTF 4H gate ──────────────────────────────────────────
-            if bias == -1:
+            # ── Check MTF 4H gate (strict: require bullish, not just block bearish) ──
+            if bias != 1:
                 stat[strat_key]["blk_mtf"] += 1
-                continue
-
-            # ── Check SELL block ───────────────────────────────────────────
-            if bar_ctr < blocked.get(strat_key, 0):
-                stat[strat_key]["blk_sell"] += 1
                 continue
 
             # ── Check strategy lock (already in position) ──────────────────
