@@ -541,7 +541,7 @@ class TradingBot:
             await self.connector.set_leverage_for(sym)
 
         try:
-            order = await self.connector.create_order(sym, "buy", amount)
+            order = await self.connector.create_order(sym, "buy", amount, tp=tp_p, sl=sl_p)
             # Use ATR-based SL/TP from signal; fall back to % if not provided
             self.risk.open_position(sym, "long", price, amount, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)

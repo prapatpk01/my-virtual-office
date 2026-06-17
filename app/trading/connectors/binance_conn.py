@@ -77,7 +77,8 @@ class BinanceConnector(BaseConnector):
                 "set_leverage %sx %s failed: %s", self.leverage, symbol, e)
 
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: Optional[float] = None) -> OrderResult:
+                           order_type: str = "market", price: Optional[float] = None,
+                           tp: Optional[float] = None, sl: Optional[float] = None) -> OrderResult:
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price)
 
@@ -88,7 +89,19 @@ class BinanceConnector(BaseConnector):
         #   spot/cash → "cash"  |  margin → "cross"/"isolated"
         if self._exchange_id == "okx":
             td = self.margin_mode if self.leverage > 1 else "cash"
-            kwargs["params"] = {"tdMode": td}
+            okx_params: dict = {"tdMode": td}
+            # Attach TP/SL to the order so OKX manages them natively
+            if side == "buy" and tp and sl and tp > 0 and sl > 0:
+                okx_params["attachAlgoOrds"] = [{
+                    "attachType":       "oco",
+                    "tpTriggerPx":      f"{tp:.2f}",
+                    "tpOrdPx":          "-1",       # market order when TP triggers
+                    "tpTriggerPxType":  "last",
+                    "slTriggerPx":      f"{sl:.2f}",
+                    "slOrdPx":          "-1",       # market order when SL triggers
+                    "slTriggerPxType":  "last",
+                }]
+            kwargs["params"] = okx_params
 
         raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
         return OrderResult(
