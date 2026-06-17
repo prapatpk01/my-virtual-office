@@ -6,6 +6,7 @@ Supported symbols:
   XAUUSD, EURUSD, USDJPY, GBPUSD, USDCHF, AUDUSD, USDCAD, NZDUSD
 """
 import asyncio
+import os
 import time
 from typing import List
 import numpy as np
@@ -63,7 +64,8 @@ class YahooConnector(BaseConnector):
     def __init__(self, **kwargs):
         super().__init__(api_key="", api_secret="", paper=True)
         self._price_cache: dict = {}
-        self._paper_balance = {"USDT": 10000.0}
+        _bal = float(os.environ.get("PAPER_BALANCE", "10000"))
+        self._paper_balance = {"USDT": _bal}
         self._paper_open_orders: list[OrderResult] = []
 
     def _yf_symbol(self, symbol: str) -> str:

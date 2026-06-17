@@ -56,7 +56,8 @@ class BinanceConnector(BaseConnector):
         exchange_class = getattr(ccxt, exchange_id)
         self._exchange = exchange_class(cfg)
 
-        self._paper_balance = {"USDT": 10_000.0, "BTC": 0.0, "ETH": 0.0}
+        _bal = float(os.environ.get("PAPER_BALANCE", "10000"))
+        self._paper_balance = {"USDT": _bal, "BTC": 0.0, "ETH": 0.0}
         self._paper_open_orders: list[OrderResult] = []
         self._leverage_set: set[str] = set()   # symbols where leverage already set
 
