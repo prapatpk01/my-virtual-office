@@ -278,7 +278,14 @@ class TradingBot:
         return result
 
     async def _update_4h_bias(self):
-        """Fetch 4H candles and compute EMA20+EMA200 trend bias per symbol."""
+        """Fetch 4H candles and compute EMA20+EMA200 trend bias per symbol.
+        Yahoo connector has no native 4H → set neutral (allow all BUYs in paper mode).
+        """
+        # YahooConnector maps '4h'→'1h' so data would be wrong; skip gate in paper/Yahoo mode
+        if type(self.connector).__name__ == "YahooConnector":
+            for s in self.strategies:
+                self._4h_bias[s.symbol] = 0
+            return
         symbols = list({s.symbol for s in self.strategies})
         for sym in symbols:
             try:
@@ -365,7 +372,7 @@ class TradingBot:
         _resolved_symbols: set[str] = set()  # check virtual SL/TP once per symbol per tick
         for strategy in self.strategies:
             try:
-                _tf    = os.getenv("CANDLE_TF", "15m")
+                _tf    = os.getenv("CANDLE_TF", "1h")
                 _limit = int(os.getenv("CANDLE_LIMIT", "300"))
                 candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe=_tf, limit=_limit)
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
@@ -385,7 +392,7 @@ class TradingBot:
                             )
                 # Fetch MTF candles for higher-TF bias (skip if already on 1h/4h)
                 mtf_candles = {}
-                _base_tf = os.getenv("CANDLE_TF", "15m")
+                _base_tf = os.getenv("CANDLE_TF", "1h")
                 _mtf_tfs = [t for t in ("1h", "4h") if t != _base_tf]
                 for tf in _mtf_tfs:
                     try:
