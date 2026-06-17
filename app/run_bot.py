@@ -354,8 +354,9 @@ async def main():
         telegram.start_bot_fn    = lambda: {"message": "Bot is already running"}
         telegram.fetch_candles_fn = crypto_bot.export_candles
 
-    # Auto-optimize SL/TP via backtest on first symbol
-    await _run_backtest(crypto_bot, config, telegram)
+    # Auto-optimize disabled — params are pre-tuned via comprehensive backtest
+    # (Config A: SL=1.5×ATR, RR=1.0 → WR 71.8%, NET +$57 over 5 months)
+    # await _run_backtest(crypto_bot, config, telegram)
 
     # Start both bots concurrently
     # Note: start() returns after launching the internal _run_loop task,
