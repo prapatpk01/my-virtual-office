@@ -1,20 +1,22 @@
 """
-MCDX Plus v3.0 → Python port.
+MCDX Plus v3.1 → Python port.
 
 Signals generated:
   BUY  — Golden Cross (SMA_PC crosses above SMA_LC)
          OR DWCS Bull zone cross/sustain + ADX trend-strength confirm
+         OR WaveTrend WT1 cross above WT2 in mid-zone
          OR Pullback/Rebound: EMA bounce, RSI dip rebound, Supertrend bounce
   SELL — Death Cross (SMA_PC crosses below SMA_LC) OR DWCS Bear zone cross
-  HOLD — otherwise, reports DWCS score
+  HOLD — otherwise, reports DWCS + WT scores
 
 Key indicators ported:
   - Profit Chips (PC): normalized price position
   - Locked Chips (LC): shares locked above market
   - DWCS v6: 4-pillar composite score (Momentum, Trend, Sentiment, FundFlow)
+  - WaveTrend (WT1/WT2, n1=10, n2=21): momentum oscillator, overbought/oversold
   - ADX(14): Wilder Average Directional Index — trend strength gate
   - Supertrend(7, 3.0): ATR-adaptive trend direction gate
-  - OBV: On-Balance Volume slope confirmation
+  - OBV: On-Balance Volume slope (soft confirmation, not hard gate)
   - Pullback/Rebound engine: 4-mode secondary entry in established bull trend
 """
 import numpy as np
@@ -29,10 +31,10 @@ class MCDXStrategy(BaseStrategy):
         self.nr = self.params.get("length", 100)
         self.sma_pc_len = self.params.get("sma_pc_len", 10)
         self.sma_lc_len = self.params.get("sma_lc_len", 10)
-        self.dwcs_buy   = self.params.get("dwcs_buy",  57)
+        self.dwcs_buy   = self.params.get("dwcs_buy",  53)   # lowered from 57
         self.dwcs_sell  = self.params.get("dwcs_sell", 43)
         self.min_conf   = self.params.get("min_conf",  48)
-        self.rvol_min   = self.params.get("rvol_min",  1.1)  # volume confirm for DWCS entry
+        self.rvol_min   = self.params.get("rvol_min",  0.9)  # lowered from 1.1
         self.position_pct = self.params.get("position_pct", 0.08)
 
         # ── Pullback / Rebound params ──────────────────────────────────────
@@ -70,8 +72,15 @@ class MCDXStrategy(BaseStrategy):
         # Prevents "fringe cross" entries where DWCS barely ticked over.
         self.dwcs_stability   = self.params.get("dwcs_stability",   True)
 
-        # ── OBV confirmation for primary entries ──────────────────────────
+        # ── OBV: soft signal, no longer a hard gate ───────────────────────
         self.use_obv_confirm  = self.params.get("use_obv_confirm",  True)
+
+        # ── WaveTrend Oscillator (LazyBear WT) ────────────────────────────
+        self.use_wavetrend = self.params.get("use_wavetrend", True)
+        self.wt_n1         = self.params.get("wt_n1", 10)   # channel length
+        self.wt_n2         = self.params.get("wt_n2", 21)   # average length
+        self.wt_ob         = self.params.get("wt_ob",  60)  # overbought level
+        self.wt_os         = self.params.get("wt_os", -60)  # oversold level
 
         # Allow overriding the strategy name for multi-instance setups (P1/P2).
         if "name" in self.params:
@@ -293,6 +302,32 @@ class MCDXStrategy(BaseStrategy):
         return out
 
     # ------------------------------------------------------------------ #
+    # WaveTrend Oscillator (LazyBear)
+    # ------------------------------------------------------------------ #
+
+    def _wavetrend(self, highs, lows, closes, n1=10, n2=21):
+        """
+        WaveTrend Oscillator.
+          WT1 > WT2  → bullish momentum cross
+          WT1 > wt_ob → overbought (avoid new longs)
+          WT1 < wt_os → oversold  (potential reversal / PB entry)
+        Returns (wt1, wt2) arrays.
+        """
+        h    = np.array(highs,  dtype=float)
+        l    = np.array(lows,   dtype=float)
+        c    = np.array(closes, dtype=float)
+        hlc3 = (h + l + c) / 3.0
+        # Fill early NaN to prevent NaN propagation through chained EMAs
+        esa_raw = np.array(self.ema(hlc3.tolist(), n1), dtype=float)
+        esa = np.where(np.isnan(esa_raw), hlc3, esa_raw)
+        d_raw = np.array(self.ema(np.abs(hlc3 - esa).tolist(), n1), dtype=float)
+        d = np.where(np.isnan(d_raw) | (np.abs(d_raw) < 1e-8), 1e-8, d_raw)
+        ci  = (hlc3 - esa) / (0.015 * d)
+        wt1 = np.nan_to_num(np.array(self.ema(ci.tolist(), n2), dtype=float), nan=0.0)
+        wt2 = np.nan_to_num(np.array(self.sma(wt1.tolist(), 4), dtype=float), nan=0.0)
+        return wt1, wt2
+
+    # ------------------------------------------------------------------ #
     # Pullback / Rebound engine
     # ------------------------------------------------------------------ #
 
@@ -450,7 +485,7 @@ class MCDXStrategy(BaseStrategy):
         st_bullish = bool(st_dir[-1] == 1) if self.use_supertrend else True
         curr_st    = float(np.nan_to_num(st_line[-1], nan=0))
 
-        # ── OBV rising confirmation ───────────────────────────────────────
+        # ── OBV rising (soft signal — used for confidence, not hard gate) ─
         obv_raw  = self._obv(closes, volumes)
         obv_ema5 = self.ema(obv_raw.tolist(), 5)
         obv_rising = (
@@ -458,6 +493,18 @@ class MCDXStrategy(BaseStrategy):
             and not any(np.isnan([obv_ema5[-1], obv_ema5[-2], obv_ema5[-3]]))
             and float(obv_ema5[-1]) > float(obv_ema5[-2]) > float(obv_ema5[-3])
         ) if self.use_obv_confirm else True
+
+        # ── WaveTrend ─────────────────────────────────────────────────────
+        wt1_arr, wt2_arr = (self._wavetrend(highs, lows, closes, self.wt_n1, self.wt_n2)
+                            if self.use_wavetrend else (np.full(len(closes), 0.0),
+                                                        np.full(len(closes), 0.0)))
+        curr_wt1   = float(np.nan_to_num(wt1_arr[-1], nan=0))
+        curr_wt2   = float(np.nan_to_num(wt2_arr[-1], nan=0))
+        prev_wt1   = float(np.nan_to_num(wt1_arr[-2], nan=0))
+        prev_wt2   = float(np.nan_to_num(wt2_arr[-2], nan=0))
+        wt_cross_up   = prev_wt1 <= prev_wt2 and curr_wt1 > curr_wt2   # bullish cross
+        wt_overbought = curr_wt1 > self.wt_ob
+        wt_oversold   = curr_wt1 < self.wt_os
 
         # ── MTF bias gate: 1H + 4H EMA(fast/slow) both bullish ────────────
         mtf_bias_bull = True
@@ -486,46 +533,56 @@ class MCDXStrategy(BaseStrategy):
             regime_notes.append(f"Supertrend bear (ST={curr_st:.0f})")
 
         # ── Primary BUY: Golden Cross OR DWCS bull zone cross/sustain ────
-        # DWCS fresh cross: needs ADX≥threshold to confirm trend strength.
-        # DWCS sustained: already above threshold for 2 bars + strong ADX.
-        dwcs_stable  = (curr_dwcs >= self.dwcs_buy
-                        and float(dwcs[-2]) >= self.dwcs_buy
-                        if self.dwcs_stability else True)
-        adx_ok       = curr_adx >= self.adx_threshold
-        adx_strong   = curr_adx > 25
+        dwcs_stable = (curr_dwcs >= self.dwcs_buy and float(dwcs[-2]) >= self.dwcs_buy
+                       if self.dwcs_stability else True)
+        adx_ok      = curr_adx >= self.adx_threshold
+
+        # OBV is a soft weight — worsens confidence rather than hard-blocking.
+        # WaveTrend overbought blocks new entries to avoid chasing tops.
+        wt_block = self.use_wavetrend and wt_overbought
 
         dwcs_buy_confirmed = (
-            # Fresh cross: ADX confirms trend is developing
-            (dwcs_buy_signal and adx_ok and rvol >= self.rvol_min
-             and rsi_gate_ok and price_ok and obv_rising)
-            or
-            # Sustained above threshold with strong ADX and clear lead
-            (dwcs_stable and adx_strong and rvol >= self.rvol_min
-             and rsi_gate_ok and price_ok and curr_dwcs > self.dwcs_buy + 2
-             and obv_rising)
+            not wt_block and (
+                # Fresh cross above dwcs_buy: ADX + RSI zone + local uptrend
+                (dwcs_buy_signal and adx_ok and rsi_gate_ok and price_ok)
+                or
+                # Sustained above threshold: 2-bar stable + moderate ADX
+                (dwcs_stable and adx_ok and rsi_gate_ok and price_ok
+                 and curr_dwcs > self.dwcs_buy + 2)
+                or
+                # WaveTrend bullish cross in non-overbought zone — standalone entry
+                (wt_cross_up and not wt_overbought and curr_dwcs >= 50
+                 and adx_ok and rsi_gate_ok and price_ok)
+            )
         )
-        golden_cross_ok = golden_cross and price_ok and obv_rising
+        golden_cross_ok = golden_cross and price_ok
 
         if (golden_cross_ok or dwcs_buy_confirmed) and regime_blocked:
             return Signal(
                 SignalType.HOLD, self.symbol, current_price, 0,
                 f"[{self.name}] BUY blocked — {'; '.join(regime_notes)} "
-                f"DWCS={curr_dwcs:.1f} ADX={curr_adx:.0f} RVOL={rvol:.1f}x",
+                f"DWCS={curr_dwcs:.1f} WT={curr_wt1:.0f} ADX={curr_adx:.0f}",
                 metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
                           "rsi": curr_rsi, "rvol": rvol,
-                          "adx": curr_adx, "st_bull": st_bullish},
+                          "adx": curr_adx, "st_bull": st_bullish,
+                          "wt1": curr_wt1, "wt2": curr_wt2},
             )
         if golden_cross_ok or dwcs_buy_confirmed:
-            reason = "Golden Cross" if golden_cross_ok else f"DWCS Bull zone + RVOL={rvol:.1f}x"
+            if golden_cross_ok:
+                reason = "Golden Cross"
+            elif wt_cross_up and curr_dwcs >= 50:
+                reason = f"WT cross WT1={curr_wt1:.1f}→{curr_wt2:.1f} DWCS={curr_dwcs:.1f}"
+            else:
+                reason = f"DWCS Bull zone DWCS={curr_dwcs:.1f} ADX={curr_adx:.0f}"
+            obv_note = " OBV↑" if obv_rising else ""
             return Signal(
                 SignalType.BUY, self.symbol, current_price,
                 amount=self.position_pct,
-                reason=(f"[MCDX] {reason} | DWCS={curr_dwcs:.1f} "
-                        f"RSI={curr_rsi:.1f} ADX={curr_adx:.0f}"),
-                confidence=min(1.0, 0.5 + conf_pct * 0.5),
+                reason=(f"[MCDX] {reason} | RSI={curr_rsi:.1f} RVOL={rvol:.1f}x{obv_note}"),
+                confidence=min(1.0, 0.5 + conf_pct * 0.5 + (0.05 if obv_rising else 0)),
                 metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
                           "rsi": curr_rsi, "rvol": rvol, "adx": curr_adx,
-                          "signal": "breakout"},
+                          "wt1": curr_wt1, "wt2": curr_wt2, "signal": "breakout"},
             )
 
         # ── Primary SELL: Death Cross OR DWCS bear zone cross ────────────
@@ -575,16 +632,17 @@ class MCDXStrategy(BaseStrategy):
                           "rsi": curr_rsi, "rvol": rvol, "signal": "pullback"},
             )
 
-        trend = "Bull" if curr_dwcs > 55 else "Bear" if curr_dwcs < 45 else "Neutral"
-        cross_state = "above" if c_sma_pc > c_sma_lc else "below"
-        st_state = "↑" if st_bullish else "↓"
+        trend     = "Bull" if curr_dwcs > 55 else "Bear" if curr_dwcs < 45 else "Neutral"
+        st_state  = "↑" if st_bullish else "↓"
+        wt_state  = "OB" if wt_overbought else "OS" if wt_oversold else f"{curr_wt1:.0f}"
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
             (f"[MCDX] DWCS={curr_dwcs:.1f} ({trend}) "
-             f"ADX={curr_adx:.0f} ST{st_state} RSI={curr_rsi:.0f} RVOL={rvol:.1f}x"),
+             f"WT={wt_state} ADX={curr_adx:.0f} ST{st_state} RSI={curr_rsi:.0f}"),
             metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
                       "rsi": curr_rsi, "rvol": rvol,
-                      "adx": curr_adx, "st_bull": st_bullish},
+                      "adx": curr_adx, "st_bull": st_bullish,
+                      "wt1": curr_wt1, "wt2": curr_wt2},
         )
 
 
