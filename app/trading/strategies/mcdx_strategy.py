@@ -1,10 +1,10 @@
 """
-MCDX Plus v2.1 → Python port.
+MCDX Plus v3.0 → Python port.
 
 Signals generated:
   BUY  — Golden Cross (SMA_PC crosses above SMA_LC)
-         OR DWCS Bull zone cross + volume confirm
-         OR Pullback/Rebound: EMA bounce, PC rebound, RSI dip rebound
+         OR DWCS Bull zone cross/sustain + ADX trend-strength confirm
+         OR Pullback/Rebound: EMA bounce, RSI dip rebound, Supertrend bounce
   SELL — Death Cross (SMA_PC crosses below SMA_LC) OR DWCS Bear zone cross
   HOLD — otherwise, reports DWCS score
 
@@ -12,7 +12,10 @@ Key indicators ported:
   - Profit Chips (PC): normalized price position
   - Locked Chips (LC): shares locked above market
   - DWCS v6: 4-pillar composite score (Momentum, Trend, Sentiment, FundFlow)
-  - Pullback/Rebound engine: 3-mode secondary entry in established bull trend
+  - ADX(14): Wilder Average Directional Index — trend strength gate
+  - Supertrend(7, 3.0): ATR-adaptive trend direction gate
+  - OBV: On-Balance Volume slope confirmation
+  - Pullback/Rebound engine: 4-mode secondary entry in established bull trend
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -44,12 +47,31 @@ class MCDXStrategy(BaseStrategy):
         self.mtf_slow_ema = self.params.get("mtf_slow_ema", 50)
 
         # ── RSI gate: only enter when RSI is in a healthy momentum zone ────
-        # Avoids buying deeply oversold (below rsi_min) or overbought (above rsi_max).
-        self.rsi_min_gate = self.params.get("rsi_min_gate", 40)
-        self.rsi_max_gate = self.params.get("rsi_max_gate", 72)
+        self.rsi_min_gate = self.params.get("rsi_min_gate", 35)
+        self.rsi_max_gate = self.params.get("rsi_max_gate", 75)
 
         # ── Price confirmation: require price > EMA(21) before BUY ────────
         self.price_ema_confirm = self.params.get("price_ema_confirm", True)
+
+        # ── ADX trend-strength gate ────────────────────────────────────────
+        # Only fire primary DWCS signals when ADX confirms a trending market.
+        # ADX < threshold → ranging market → skip DWCS crosses.
+        self.adx_period    = self.params.get("adx_period",    14)
+        self.adx_threshold = self.params.get("adx_threshold", 18)
+
+        # ── Supertrend(7, 3.0) trend-direction gate ───────────────────────
+        # Replaces/extends MTF gate with an ATR-adaptive indicator that
+        # catches reversals faster than EMA crossovers.
+        self.use_supertrend   = self.params.get("use_supertrend",   True)
+        self.st_period        = self.params.get("st_period",        7)
+        self.st_multiplier    = self.params.get("st_multiplier",    3.0)
+
+        # ── DWCS stability: require DWCS ≥ threshold for 2 consecutive bars
+        # Prevents "fringe cross" entries where DWCS barely ticked over.
+        self.dwcs_stability   = self.params.get("dwcs_stability",   True)
+
+        # ── OBV confirmation for primary entries ──────────────────────────
+        self.use_obv_confirm  = self.params.get("use_obv_confirm",  True)
 
         # Allow overriding the strategy name for multi-instance setups (P1/P2).
         if "name" in self.params:
@@ -160,26 +182,134 @@ class MCDXStrategy(BaseStrategy):
         return np.nan_to_num(dwcs_arr, nan=50)
 
     # ------------------------------------------------------------------ #
+    # ADX — Wilder Average Directional Index
+    # ------------------------------------------------------------------ #
+
+    def _adx(self, highs, lows, closes, period=14):
+        """
+        Returns (adx, +DI, -DI) arrays.
+        ADX > 20 = trending; ADX < 15 = ranging/weak.
+        """
+        h = np.array(highs, dtype=float)
+        l = np.array(lows,  dtype=float)
+        c = np.array(closes, dtype=float)
+        n = len(c)
+        tr   = np.zeros(n)
+        pdm  = np.zeros(n)
+        mdm  = np.zeros(n)
+        tr[0] = h[0] - l[0]
+        for i in range(1, n):
+            tr[i]  = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+            up, dn = h[i] - h[i-1], l[i-1] - l[i]
+            pdm[i] = up if up > dn and up > 0 else 0.0
+            mdm[i] = dn if dn > up and dn > 0 else 0.0
+        str_ = np.full(n, np.nan)
+        spdm = np.full(n, np.nan)
+        smdm = np.full(n, np.nan)
+        if n > period:
+            str_[period] = tr[1:period+1].sum()
+            spdm[period] = pdm[1:period+1].sum()
+            smdm[period] = mdm[1:period+1].sum()
+            for i in range(period + 1, n):
+                str_[i] = str_[i-1] - str_[i-1] / period + tr[i]
+                spdm[i] = spdm[i-1] - spdm[i-1] / period + pdm[i]
+                smdm[i] = smdm[i-1] - smdm[i-1] / period + mdm[i]
+        eps = 1e-8
+        pdi = np.where(str_ > 0, 100 * spdm / np.clip(str_, eps, None), np.nan)
+        mdi = np.where(str_ > 0, 100 * smdm / np.clip(str_, eps, None), np.nan)
+        dm_sum = np.nan_to_num(pdi) + np.nan_to_num(mdi)
+        dx = np.where(dm_sum > 0,
+                      100 * np.abs(np.nan_to_num(pdi) - np.nan_to_num(mdi)) / dm_sum,
+                      np.nan)
+        adx = np.full(n, np.nan)
+        start = 2 * period
+        if n > start:
+            adx[start] = np.nanmean(dx[period:start])
+            for i in range(start + 1, n):
+                if not np.isnan(adx[i-1]) and not np.isnan(dx[i]):
+                    adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
+        return adx, np.nan_to_num(pdi, nan=0), np.nan_to_num(mdi, nan=0)
+
+    # ------------------------------------------------------------------ #
+    # Supertrend — ATR-adaptive trend direction
+    # ------------------------------------------------------------------ #
+
+    def _supertrend(self, highs, lows, closes, period=7, multiplier=3.0):
+        """
+        Returns (supertrend_line, direction) arrays.
+        direction = +1 when bullish (price > ST line), -1 when bearish.
+        """
+        h = np.array(highs,  dtype=float)
+        l = np.array(lows,   dtype=float)
+        c = np.array(closes, dtype=float)
+        n = len(c)
+        tr  = np.zeros(n)
+        atr = np.zeros(n)
+        tr[0] = h[0] - l[0]
+        for i in range(1, n):
+            tr[i] = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+        atr[period] = np.mean(tr[:period+1])
+        for i in range(period + 1, n):
+            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
+        hl2  = (h + l) / 2.0
+        bu   = hl2 + multiplier * atr
+        bl   = hl2 - multiplier * atr
+        fu   = np.full(n, np.nan)
+        fl   = np.full(n, np.nan)
+        st   = np.full(n, np.nan)
+        direction = np.zeros(n, dtype=int)
+        for i in range(period, n):
+            fu[i] = bu[i] if i == period or bu[i] < fu[i-1] or c[i-1] > fu[i-1] else fu[i-1]
+            fl[i] = bl[i] if i == period or bl[i] > fl[i-1] or c[i-1] < fl[i-1] else fl[i-1]
+            if i == period:
+                direction[i] = 1 if c[i] > fu[i] else -1
+            else:
+                if direction[i-1] == -1 and c[i] > fu[i]:
+                    direction[i] = 1
+                elif direction[i-1] == 1 and c[i] < fl[i]:
+                    direction[i] = -1
+                else:
+                    direction[i] = direction[i-1]
+            st[i] = fl[i] if direction[i] == 1 else fu[i]
+        return st, direction
+
+    # ------------------------------------------------------------------ #
+    # OBV — On-Balance Volume
+    # ------------------------------------------------------------------ #
+
+    def _obv(self, closes, volumes):
+        """Cumulative OBV: +volume on up-close bars, -volume on down-close bars."""
+        c = np.array(closes,  dtype=float)
+        v = np.array(volumes, dtype=float)
+        n = len(c)
+        out = np.zeros(n)
+        for i in range(1, n):
+            if c[i] > c[i-1]:
+                out[i] = out[i-1] + v[i]
+            elif c[i] < c[i-1]:
+                out[i] = out[i-1] - v[i]
+            else:
+                out[i] = out[i-1]
+        return out
+
+    # ------------------------------------------------------------------ #
     # Pullback / Rebound engine
     # ------------------------------------------------------------------ #
 
     def _pullback_rebound(self, closes, highs, lows, volumes,
                           pc_arr, dwcs, rsi_arr, rvol, curr_dwcs):
         """
-        Three secondary BUY modes for entries during a bull-trend pullback.
+        Secondary BUY modes for entries during a bull-trend pullback.
 
         Mode 1 — EMA Pullback Bounce
           Trend intact (avg DWCS ≥ pb_dwcs_min), EMA rising,
           low touched EMA within pb_tol in last 1-3 bars,
           close back above EMA, PC recovering, RSI < 68.
 
-        Mode 2 — PC Rebound
-          PC was strong (>55) in last 15 bars, pulled back below pb_pc_low,
-          now rising 2 consecutive bars, price near/above SMA20, RSI 32-65.
-
         Mode 3 — RSI Dip Rebound
           Strong trend (avg DWCS ≥ 55), RSI dipped to 32-48 range,
-          recovering 2 bars, volume above average, price above SMA20.
+          recovering 2 bars with RSI now < 62 (not entering near overbought),
+          volume above average, price above SMA20.
 
         Returns (signal: bool, reason: str).
         """
@@ -225,7 +355,7 @@ class MCDXStrategy(BaseStrategy):
             rsi_dipped   = 32 < rsi_min < 48
             rsi_rising_2 = curr_rsi > prev_rsi > prev2_rsi
             above_sma    = price >= curr_sma * 0.995
-            if rsi_dipped and rsi_rising_2 and above_sma and rvol >= 0.9:
+            if rsi_dipped and rsi_rising_2 and above_sma and rvol >= 0.9 and curr_rsi < 62:
                 return True, (f"PB-RSI rebound {prev2_rsi:.0f}→{curr_rsi:.0f} | "
                               f"DWCS={curr_dwcs:.1f} RVOL={rvol:.1f}x")
 
@@ -310,8 +440,26 @@ class MCDXStrategy(BaseStrategy):
                      or np.isnan(ema21_arr[-1])
                      or current_price > float(ema21_arr[-1]))
 
+        # ── ADX trend-strength gate ───────────────────────────────────────
+        adx_arr, _, _ = self._adx(highs, lows, closes, self.adx_period)
+        curr_adx = float(np.nan_to_num(adx_arr[-1], nan=0))
+
+        # ── Supertrend direction gate ─────────────────────────────────────
+        st_line, st_dir = self._supertrend(highs, lows, closes,
+                                           self.st_period, self.st_multiplier)
+        st_bullish = bool(st_dir[-1] == 1) if self.use_supertrend else True
+        curr_st    = float(np.nan_to_num(st_line[-1], nan=0))
+
+        # ── OBV rising confirmation ───────────────────────────────────────
+        obv_raw  = self._obv(closes, volumes)
+        obv_ema5 = self.ema(obv_raw.tolist(), 5)
+        obv_rising = (
+            len(obv_ema5) >= 3
+            and not any(np.isnan([obv_ema5[-1], obv_ema5[-2], obv_ema5[-3]]))
+            and float(obv_ema5[-1]) > float(obv_ema5[-2]) > float(obv_ema5[-3])
+        ) if self.use_obv_confirm else True
+
         # ── MTF bias gate: 1H + 4H EMA(fast/slow) both bullish ────────────
-        # Blocks BUY signals when higher-TF trend is not aligned.
         mtf_bias_bull = True
         mtf_label = ""
         if mtf_candles:
@@ -328,30 +476,56 @@ class MCDXStrategy(BaseStrategy):
                 mtf_bias_bull = False
                 mtf_label = f" [MTF blocked: {','.join(blocked_by)} bear]"
 
-        # ── Primary BUY: Golden Cross OR DWCS bull zone cross ─────────────
-        # dwcs_buy_confirmed requires: DWCS cross + volume + RSI gate + price > EMA21
-        dwcs_buy_confirmed = (dwcs_buy_signal and rvol >= self.rvol_min
-                              and rsi_gate_ok and price_ok)
-        # golden cross: looser (no RSI gate needed — it's a chip-distribution signal)
-        golden_cross_ok = golden_cross and price_ok
-        if (golden_cross_ok or dwcs_buy_confirmed) and not mtf_bias_bull:
-            # Signal exists but MTF trend is against it — hold
+        # ── Regime gate: MTF + Supertrend must both be bullish ───────────
+        # Supertrend (ATR-adaptive) catches reversals faster than EMA cross.
+        regime_blocked = not mtf_bias_bull or (self.use_supertrend and not st_bullish)
+        regime_notes   = []
+        if not mtf_bias_bull:
+            regime_notes.append(f"MTF bear{mtf_label}")
+        if self.use_supertrend and not st_bullish:
+            regime_notes.append(f"Supertrend bear (ST={curr_st:.0f})")
+
+        # ── Primary BUY: Golden Cross OR DWCS bull zone cross/sustain ────
+        # DWCS fresh cross: needs ADX≥threshold to confirm trend strength.
+        # DWCS sustained: already above threshold for 2 bars + strong ADX.
+        dwcs_stable  = (curr_dwcs >= self.dwcs_buy
+                        and float(dwcs[-2]) >= self.dwcs_buy
+                        if self.dwcs_stability else True)
+        adx_ok       = curr_adx >= self.adx_threshold
+        adx_strong   = curr_adx > 25
+
+        dwcs_buy_confirmed = (
+            # Fresh cross: ADX confirms trend is developing
+            (dwcs_buy_signal and adx_ok and rvol >= self.rvol_min
+             and rsi_gate_ok and price_ok and obv_rising)
+            or
+            # Sustained above threshold with strong ADX and clear lead
+            (dwcs_stable and adx_strong and rvol >= self.rvol_min
+             and rsi_gate_ok and price_ok and curr_dwcs > self.dwcs_buy + 2
+             and obv_rising)
+        )
+        golden_cross_ok = golden_cross and price_ok and obv_rising
+
+        if (golden_cross_ok or dwcs_buy_confirmed) and regime_blocked:
             return Signal(
                 SignalType.HOLD, self.symbol, current_price, 0,
-                f"[{self.name}] BUY blocked — MTF bias bear{mtf_label} "
-                f"DWCS={curr_dwcs:.1f} RVOL={rvol:.1f}x",
+                f"[{self.name}] BUY blocked — {'; '.join(regime_notes)} "
+                f"DWCS={curr_dwcs:.1f} ADX={curr_adx:.0f} RVOL={rvol:.1f}x",
                 metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
-                          "rsi": curr_rsi, "rvol": rvol, "mtf_bias": "bear"},
+                          "rsi": curr_rsi, "rvol": rvol,
+                          "adx": curr_adx, "st_bull": st_bullish},
             )
         if golden_cross_ok or dwcs_buy_confirmed:
             reason = "Golden Cross" if golden_cross_ok else f"DWCS Bull zone + RVOL={rvol:.1f}x"
             return Signal(
                 SignalType.BUY, self.symbol, current_price,
                 amount=self.position_pct,
-                reason=f"[MCDX] {reason} | DWCS={curr_dwcs:.1f} RSI={curr_rsi:.1f}",
+                reason=(f"[MCDX] {reason} | DWCS={curr_dwcs:.1f} "
+                        f"RSI={curr_rsi:.1f} ADX={curr_adx:.0f}"),
                 confidence=min(1.0, 0.5 + conf_pct * 0.5),
                 metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
-                          "rsi": curr_rsi, "rvol": rvol, "signal": "breakout"},
+                          "rsi": curr_rsi, "rvol": rvol, "adx": curr_adx,
+                          "signal": "breakout"},
             )
 
         # ── Primary SELL: Death Cross OR DWCS bear zone cross ────────────
@@ -371,8 +545,26 @@ class MCDXStrategy(BaseStrategy):
         pb_sig, pb_reason = self._pullback_rebound(
             closes, highs, lows, volumes, pc_arr, dwcs, rsi_arr, rvol, curr_dwcs
         )
-        if pb_sig and not mtf_bias_bull:
-            pb_sig = False  # MTF bear bias suppresses pullback entries too
+        if pb_sig and regime_blocked:
+            pb_sig = False  # regime gate suppresses all pullback entries too
+
+        # ── PB Mode 4: Supertrend bounce (new in v3) ─────────────────────
+        # Price touched the Supertrend support line and recovered.
+        if (not pb_sig and self.use_supertrend and st_bullish
+                and not regime_blocked and curr_adx >= self.adx_threshold
+                and curr_st > 0 and len(lows) >= 3):
+            touched_st = any(
+                float(lows[-(k + 1)]) <= curr_st * 1.005
+                for k in range(1, 3)
+            )
+            above_st = current_price > curr_st * 1.001
+            if touched_st and above_st and rsi_gate_ok and rvol >= 0.8:
+                avg_dwcs_5 = float(np.nanmean(dwcs[-5:]))
+                if avg_dwcs_5 >= 52:
+                    pb_sig    = True
+                    pb_reason = (f"PB-ST bounce +{(current_price/curr_st-1)*100:.1f}% | "
+                                 f"DWCS={curr_dwcs:.1f} ADX={curr_adx:.0f}")
+
         if pb_sig:
             return Signal(
                 SignalType.BUY, self.symbol, current_price,
@@ -385,11 +577,14 @@ class MCDXStrategy(BaseStrategy):
 
         trend = "Bull" if curr_dwcs > 55 else "Bear" if curr_dwcs < 45 else "Neutral"
         cross_state = "above" if c_sma_pc > c_sma_lc else "below"
+        st_state = "↑" if st_bullish else "↓"
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            f"[MCDX] DWCS={curr_dwcs:.1f} ({trend}) PC_SMA {cross_state} LC_SMA RVOL={rvol:.1f}x",
+            (f"[MCDX] DWCS={curr_dwcs:.1f} ({trend}) "
+             f"ADX={curr_adx:.0f} ST{st_state} RSI={curr_rsi:.0f} RVOL={rvol:.1f}x"),
             metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
-                      "rsi": curr_rsi, "rvol": rvol},
+                      "rsi": curr_rsi, "rvol": rvol,
+                      "adx": curr_adx, "st_bull": st_bullish},
         )
 
 
