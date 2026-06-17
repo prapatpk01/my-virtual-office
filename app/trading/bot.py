@@ -97,7 +97,7 @@ class TradingBot:
         # 15M entry refinement: queue 1H BUY signals, enter on 15M EMA20 confirmation
         self._pending_entries: dict = {}   # "sym||strategy" → {symbol, strategy_name, signal, expires_at}
         self._last_1h_tick: float = 0.0
-        self._entry_tf: int = int(os.getenv("ENTRY_TF_SECONDS", "900"))
+        self._entry_tf: int = int(os.getenv("ENTRY_TF_SECONDS", "0"))
         if self._entry_tf > 0:
             logger.info("15M entry refinement ENABLED (entry check every %ds, expire 4h)", self._entry_tf)
 
