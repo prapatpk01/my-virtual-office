@@ -192,9 +192,10 @@ def build_crypto_bot(config: dict, telegram):
 
     exchange = config["exchange"]
 
-    # Paper trading → use Yahoo Finance for market data (no exchange API key needed,
-    # avoids geo-blocking issues with Binance/Bybit on cloud servers)
-    if config["paper"] and exchange in ("binance", "bybit", "okx"):
+    # Paper trading: OKX uses real market data (OHLCV is public, no auth needed)
+    # so we keep BinanceConnector with paper=True — simulates orders but gets
+    # real prices. Other exchanges fall back to Yahoo Finance.
+    if config["paper"] and exchange in ("binance", "bybit"):
         connector = YahooConnector()
         logger.info("Paper trading: using Yahoo Finance for market data (exchange=%s)", exchange)
     elif exchange == "oanda":
