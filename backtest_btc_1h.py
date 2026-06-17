@@ -1,7 +1,7 @@
 """
-BTC/USDT 1H Parameter Optimizer — OKX Cross Margin x10
-Fee model: 0.10% open + 0.10% close + 0.05% daily borrow = 0.25%/trade on notional
-Intraday: max hold = 8 bars (8h), positions force-closed at day end
+BTC/USDT 1H Fine-tuner — Target WR ≥ 67%
+SL=2.5%  TP=3.0% fixed  |  Fee=0.25%/trade on notional
+Net RR 1:1  |  Break-even WR = 50%  |  Max hold = 48h (2 days)
 
 Usage:
     python backtest_btc_1h.py
@@ -19,31 +19,57 @@ from app.trading.strategies.mcdx_strategy import MCDXStrategy
 from app.trading.strategies.sentinel_strategy import SentinelStrategy
 from app.trading.strategies.base import SignalType
 
-WARMUP     = 200
-STAGE_BARS = 250          # ~10 days of 1H bars
-N_STAGES   = 4            # 4 stages ≈ 40 trading days ≈ 2 months
-CTX_WINDOW = 250
+# ── Backtest config ───────────────────────────────────────────────────────────
+WARMUP     = 300
+STAGE_BARS = 200          # ~8 days of 1H bars per stage
+N_STAGES   = 6            # 6 stages ≈ 50 days ≈ ~1.5 months
+CTX_WINDOW = 300
 FETCH_BARS = WARMUP + STAGE_BARS * N_STAGES
-LOOKFWD    = 8            # max 8h hold (intraday)
+LOOKFWD    = 48           # max 48h hold (2 days at 1H)
 
-FEE_OPEN   = 0.0010
-FEE_CLOSE  = 0.0010
-FEE_BORROW = 0.0005       # avg ~4h borrow per trade
-FEE_TOTAL  = FEE_OPEN + FEE_CLOSE + FEE_BORROW
+SL_PCT = 0.025            # fixed SL 2.5%
+TP_PCT = 0.030            # fixed TP 3.0%
+
+FEE_TOTAL  = 0.0025       # 0.10% open + 0.10% close + 0.05% borrow
 
 LEVERAGE   = 10
-RISK_USD   = 100.0
+RISK_USD   = 100.0        # capital per trade
 
-BTC_START  = 65_000.0
-BTC_SEED   = 42
-BAR_MS     = 60 * 60 * 1000
+# Break-even WR: net SL = net TP → exactly 50%
+NET_WIN = TP_PCT - FEE_TOTAL        # 2.75%
+NET_LOS = SL_PCT + FEE_TOTAL        # 2.75%
+BE_WR   = NET_LOS / (NET_WIN + NET_LOS) * 100   # 50.0%
+
+# Seeds for cross-validation (avoid single lucky run)
+SEEDS = [42, 77, 99]
+
+BTC_START = 65_000.0
+BAR_MS    = 60 * 60 * 1000
+
+# ── Parameter grids ───────────────────────────────────────────────────────────
+# MCDX: push dwcs_buy higher → fewer but more selective entries
+MCDX_GRID = [
+    {"dwcs_buy": b, "dwcs_sell": 100 - b, "rvol_min": r}
+    for b in [55, 57, 60, 62, 65]
+    for r in [1.0, 1.2, 1.4]
+]
+
+# Sentinel: tighten min_conf + fresh_bos_bars window
+SENTINEL_GRID = [
+    {"min_conf": c, "fresh_bos_bars": f, "dwcs_bull_min": d}
+    for c in [60, 65, 70, 75]
+    for f in [8, 12, 16, 20]
+    for d in [52, 55]
+]
+
+TARGET_WR = 67.0
+MIN_TRADES = 8            # minimum trades across all stages
 
 
-def generate_btc_1h(n: int, seed: int = BTC_SEED) -> list:
-    """GBM 1H BTC: realistic crypto vol ~0.35%/bar, 6 regime phases."""
+def generate_btc_1h(n: int, seed: int) -> list:
+    """Synthetic BTC 1H: GBM with 6 regime phases, vol ~0.35%/bar."""
     rng = np.random.default_rng(seed)
     closes = [BTC_START]
-    regime_len = 168   # 7 days per phase
     phases = [
         (+0.00030, 0.0035),   # bull
         (-0.00020, 0.0035),   # bear
@@ -52,9 +78,9 @@ def generate_btc_1h(n: int, seed: int = BTC_SEED) -> list:
         (-0.00040, 0.0050),   # strong bear
         (+0.00000, 0.0015),   # tight range
     ]
+    regime_len = max(STAGE_BARS, 168)
     for i in range(1, n):
-        phase_idx = (i // regime_len) % len(phases)
-        drift, vol = phases[phase_idx]
+        drift, vol = phases[(i // regime_len) % len(phases)]
         closes.append(max(closes[-1] * (1 + rng.normal(drift, vol)), 1.0))
 
     base_ts = 1_700_000_000_000
@@ -83,7 +109,7 @@ def find_exit(candles, entry_idx, direction, sl_p, tp_p):
     return min(entry_idx + LOOKFWD, len(candles) - 1), 0
 
 
-async def run_stage(strategy, candles, start, end, sl_pct, tp_pct):
+async def run_stage(strategy, candles, start, end):
     trades, lock_until = [], -1
     for i in range(start, end):
         if i <= lock_until:
@@ -97,146 +123,175 @@ async def run_stage(strategy, candles, start, end, sl_pct, tp_pct):
         if sig.type == SignalType.HOLD:
             continue
         d    = 1 if sig.type == SignalType.BUY else -1
-        sl_p = price * (1 - sl_pct) if d == 1 else price * (1 + sl_pct)
-        tp_p = price * (1 + tp_pct) if d == 1 else price * (1 - tp_pct)
+        sl_p = price * (1 - SL_PCT) if d == 1 else price * (1 + SL_PCT)
+        tp_p = price * (1 + TP_PCT) if d == 1 else price * (1 - TP_PCT)
         eb, oc = find_exit(candles, i, d, sl_p, tp_p)
         if oc == 1:
-            net_pct = tp_pct - FEE_TOTAL
+            net_r = NET_WIN / SL_PCT
         elif oc == -1:
-            net_pct = -(sl_pct + FEE_TOTAL)
+            net_r = -(NET_LOS / SL_PCT)
         else:
-            net_pct = -FEE_TOTAL
-        trades.append({"outcome": oc, "net_pct": net_pct, "net_r": net_pct / sl_pct})
+            net_r = -(FEE_TOTAL / SL_PCT)
+        trades.append({"outcome": oc, "net_r": net_r})
         lock_until = eb
     return trades
 
 
-def calc(trades, sl_pct, tp_pct):
+def calc(trades):
     if not trades:
-        return {"n": 0, "wr": 0.0, "pf": 0.0, "net_r": 0.0, "pnl_usd": 0.0}
+        return {"n": 0, "wr": 0.0, "pf": 0.0, "net_r": 0.0, "pnl_usd": 0.0, "timo": 0}
     wins = [t for t in trades if t["outcome"] ==  1]
     loss = [t for t in trades if t["outcome"] == -1]
+    timo = [t for t in trades if t["outcome"] ==  0]
     dec  = len(wins) + len(loss)
     wr   = len(wins) / max(dec, 1) * 100
     net_r   = sum(t["net_r"] for t in trades)
-    pnl_usd = sum(t["net_pct"] * LEVERAGE * RISK_USD for t in trades)
-    net_tp  = tp_pct - FEE_TOTAL
-    net_sl  = sl_pct + FEE_TOTAL
-    pf      = (len(wins) * net_tp) / max(len(loss) * net_sl, 1e-9)
+    pnl_usd = net_r * SL_PCT * LEVERAGE * RISK_USD
+    pf      = (len(wins) * NET_WIN) / max(len(loss) * NET_LOS, 1e-9)
     return {
         "n": len(trades), "wins": len(wins), "losses": len(loss),
-        "timo": len(trades) - dec,
+        "timo": len(timo),
         "wr": round(wr, 1), "pf": round(pf, 2),
         "net_r": round(net_r, 2), "pnl_usd": round(pnl_usd, 1),
     }
 
 
-SL_TP_GRID = [
-    (0.010, 0.018),   # SL 1.0%, TP 1.8%
-    (0.012, 0.020),   # SL 1.2%, TP 2.0%
-    (0.015, 0.025),   # SL 1.5%, TP 2.5%  ← likely sweet spot
-    (0.015, 0.030),   # SL 1.5%, TP 3.0%
-    (0.020, 0.030),   # SL 2.0%, TP 3.0%
-    (0.020, 0.040),   # SL 2.0%, TP 4.0%
-]
+async def run_combo(StratCls, symbol, params, all_candles_per_seed):
+    """Run one param combo across all seeds; return avg stats."""
+    per_seed = []
+    for candles in all_candles_per_seed:
+        stages = [(WARMUP + s * STAGE_BARS,
+                   min(WARMUP + (s + 1) * STAGE_BARS, len(candles)))
+                  for s in range(N_STAGES)]
+        strat = StratCls(symbol, params)
+        all_trades = []
+        for start, end in stages:
+            all_trades += await run_stage(strat, candles, start, end)
+        per_seed.append(calc(all_trades))
 
-MCDX_PARAMS = [
-    {"dwcs_buy": 52, "dwcs_sell": 48, "rvol_min": 1.0},
-    {"dwcs_buy": 55, "dwcs_sell": 45, "rvol_min": 1.0},
-    {"dwcs_buy": 57, "dwcs_sell": 43, "rvol_min": 1.1},
-]
-
-SENTINEL_PARAMS = [
-    {"min_conf": 50, "fresh_bos_bars": 30, "dwcs_bull_min": 45},
-    {"min_conf": 55, "fresh_bos_bars": 25, "dwcs_bull_min": 50},
-    {"min_conf": 58, "fresh_bos_bars": 20, "dwcs_bull_min": 52},
-]
+    # Average across seeds
+    n_seeds = len(per_seed)
+    avg = {
+        "n":       sum(s["n"]       for s in per_seed) / n_seeds,
+        "wr":      sum(s["wr"]      for s in per_seed) / n_seeds,
+        "pf":      sum(s["pf"]      for s in per_seed) / n_seeds,
+        "net_r":   sum(s["net_r"]   for s in per_seed) / n_seeds,
+        "pnl_usd": sum(s["pnl_usd"] for s in per_seed) / n_seeds,
+        "timo":    sum(s["timo"]    for s in per_seed) / n_seeds,
+        "per_seed": per_seed,
+    }
+    return avg
 
 
 async def main():
-    W = 82
+    W = 90
     print("\n" + "═" * W)
-    print("  BTC/USDT 1H OPTIMIZER  |  OKX Cross Margin x10  |  Intraday (max 8h hold)")
-    print(f"  Fee: {FEE_TOTAL*100:.2f}%/trade on notional  |  4 stages × 250 bars ≈ 2 months")
+    print(f"  BTC/USDT 1H  |  SL={SL_PCT*100:.1f}%  TP={TP_PCT*100:.1f}%  "
+          f"|  Fee={FEE_TOTAL*100:.2f}%  |  Max hold={LOOKFWD}h  |  Target WR≥{TARGET_WR:.0f}%")
+    print(f"  Net RR 1:{NET_WIN/NET_LOS:.2f}  |  BE WR={BE_WR:.1f}%  "
+          f"|  Seeds={SEEDS}  |  {N_STAGES} stages × {STAGE_BARS} bars each")
     print("═" * W)
 
-    candles = generate_btc_1h(FETCH_BARS)
-    stages  = [(WARMUP + s * STAGE_BARS,
-                min(WARMUP + (s + 1) * STAGE_BARS, len(candles)))
-               for s in range(N_STAGES)]
-
-    print(f"  BTC 1H: {len(candles)} bars  "
-          f"${min(c.low for c in candles):,.0f} – ${max(c.high for c in candles):,.0f}  "
-          f"seed={BTC_SEED}\n")
+    # Pre-generate candles for each seed
+    print(f"  Generating candles for {len(SEEDS)} seeds × {FETCH_BARS} bars...")
+    all_candles = [generate_btc_1h(FETCH_BARS, s) for s in SEEDS]
+    price_lo = min(c.low  for cds in all_candles for c in cds)
+    price_hi = max(c.high for cds in all_candles for c in cds)
+    print(f"  BTC range: ${price_lo:,.0f} – ${price_hi:,.0f}\n")
 
     results = []
-    best_mcdx, best_sentinel = None, None
 
-    print(f"  [1/2] MCDX  ({len(SL_TP_GRID)} SL/TP × {len(MCDX_PARAMS)} param sets)...")
-    for (sl, tp), params in product(SL_TP_GRID, MCDX_PARAMS):
-        strat = MCDXStrategy("BTC/USDT", params)
-        all_trades = []
-        for start, end in stages:
-            all_trades += await run_stage(strat, candles, start, end, sl, tp)
-        s = calc(all_trades, sl, tp)
-        label = f"dwcs_buy={params['dwcs_buy']} rvol≥{params['rvol_min']}"
-        results.append(("MCDX", label, sl, tp, s))
-        if s["n"] >= 10 and s["net_r"] > 0 and s["wr"] >= 50:
-            if best_mcdx is None or s["net_r"] > best_mcdx[4]["net_r"]:
-                best_mcdx = ("MCDX", label, sl, tp, s)
+    n_mcdx = len(MCDX_GRID)
+    n_sent = len(SENTINEL_GRID)
+    print(f"  [1/2] MCDX  ({n_mcdx} param combos × {len(SEEDS)} seeds)...")
+    for params in MCDX_GRID:
+        avg = await run_combo(MCDXStrategy, "BTC/USDT", params, all_candles)
+        label = (f"buy={params['dwcs_buy']} sell={params['dwcs_sell']} "
+                 f"rv≥{params['rvol_min']}")
+        results.append(("MCDX", label, avg, params))
 
-    print(f"  [2/2] Sentinel  ({len(SL_TP_GRID)} SL/TP × {len(SENTINEL_PARAMS)} param sets)...")
-    for (sl, tp), params in product(SL_TP_GRID, SENTINEL_PARAMS):
-        strat = SentinelStrategy("BTC/USDT", params)
-        all_trades = []
-        for start, end in stages:
-            all_trades += await run_stage(strat, candles, start, end, sl, tp)
-        s = calc(all_trades, sl, tp)
-        label = f"conf={params['min_conf']} fresh={params['fresh_bos_bars']}"
-        results.append(("Sentinel", label, sl, tp, s))
-        if s["n"] >= 10 and s["net_r"] > 0 and s["wr"] >= 50:
-            if best_sentinel is None or s["net_r"] > best_sentinel[4]["net_r"]:
-                best_sentinel = ("Sentinel", label, sl, tp, s)
+    print(f"  [2/2] Sentinel  ({n_sent} param combos × {len(SEEDS)} seeds)...")
+    for params in SENTINEL_GRID:
+        avg = await run_combo(SentinelStrategy, "BTC/USDT", params, all_candles)
+        label = (f"conf≥{params['min_conf']} fresh≤{params['fresh_bos_bars']} "
+                 f"dwcs≥{params['dwcs_bull_min']}")
+        results.append(("Sentinel", label, avg, params))
 
+    # ── Results table ─────────────────────────────────────────────────────────
     print(f"\n{'─' * W}")
-    print(f"  {'Strategy':<10}  {'Params':<30}  {'SL%':>4}  {'TP%':>4}  "
-          f"{'N':>4}  {'WR%':>6}  {'PF':>5}  {'NetR':>6}  {'USD($10x)':>10}")
-    print(f"  {'─' * 78}")
+    print(f"  {'ST':<8}  {'Params':<44}  {'N':>5}  {'WR%':>6}  {'PF':>5}  "
+          f"{'NetR':>6}  {'USD':>8}  {'Timo':>5}")
+    print(f"  {'─' * 86}")
 
-    for strat_name in ["MCDX", "Sentinel"]:
-        subset = [r for r in results if r[0] == strat_name]
-        subset.sort(key=lambda x: (-(1 if x[4]["net_r"] > 0 else 0), -x[4]["net_r"]))
-        for sn, lbl, sl, tp, s in subset[:6]:
-            star = " ★" if s["net_r"] > 0 and s["n"] >= 10 and s["wr"] >= 50 else "  "
-            print(f"  {sn:<10}  {lbl:<30}  {sl*100:.1f}%  {tp*100:.1f}%  "
-                  f"{s['n']:>4}  {s['wr']:>5.1f}%{star}  {s['pf']:>5.2f}  "
-                  f"{s['net_r']:>+6.2f}  ${s['pnl_usd']:>+8.1f}")
-        print()
+    # Sort by WR desc (among those with enough trades), then net_r
+    passed = [r for r in results if r[2]["wr"] >= TARGET_WR and r[2]["n"] >= MIN_TRADES]
+    others = [r for r in results if r not in passed]
 
-    print(f"{'═' * W}")
-    print("  RECOMMENDED (Net-R > 0 AND WR ≥ 50% AND Trades ≥ 10)")
-    print(f"  {'─' * 78}")
+    passed.sort(key=lambda x: (-x[2]["wr"], -x[2]["net_r"]))
+    others.sort(key=lambda x: (-x[2]["wr"], -x[2]["net_r"]))
 
-    best_list = [b for b in [best_mcdx, best_sentinel] if b]
-    if best_list:
-        for sn, lbl, sl, tp, s in best_list:
-            eff_rr = (tp - FEE_TOTAL) / (sl + FEE_TOTAL)
-            be_wr  = (sl + FEE_TOTAL) / (tp + sl) * 100
-            print(f"\n  ★ {sn}")
-            print(f"    Params     : {lbl}")
-            print(f"    SL / TP    : {sl*100:.1f}% / {tp*100:.1f}%  (gross RR 1:{tp/sl:.2f})")
-            print(f"    Net RR     : 1:{eff_rr:.2f} after fees  |  Break-even WR: {be_wr:.1f}%")
-            print(f"    Result     : {s['n']} trades  WR={s['wr']}%  PF={s['pf']}  "
-                  f"Net-R={s['net_r']:+.2f}  ~${s['pnl_usd']:+.1f} ({LEVERAGE}x, ${RISK_USD}/trade)")
+    def print_row(sn, lbl, s, star=""):
+        timo_pct = s["timo"] / max(s["n"], 1) * 100
+        print(f"  {sn:<8}  {lbl:<44}  {s['n']:>5.1f}  {s['wr']:>5.1f}%  "
+              f"{s['pf']:>5.2f}  {s['net_r']:>+6.2f}  "
+              f"${s['pnl_usd']:>+6.1f}  {timo_pct:>4.0f}%{star}")
+
+    if passed:
+        print(f"\n  ★ PASS  WR≥{TARGET_WR:.0f}%  N≥{MIN_TRADES}  (avg across {len(SEEDS)} seeds)")
+        for sn, lbl, s, _ in passed[:15]:
+            print_row(sn, lbl, s, "  ★")
     else:
-        print("\n  ไม่มี config ผ่านเกณฑ์ — closest by Net-R:")
-        cands = sorted([r for r in results if r[4]["n"] >= 5], key=lambda x: -x[4]["net_r"])
-        for sn, lbl, sl, tp, s in cands[:8]:
-            print(f"    {sn:<10}  {lbl:<30}  SL={sl*100:.1f}%  TP={tp*100:.1f}%  "
-                  f"N={s['n']}  WR={s['wr']}%  Net-R={s['net_r']:+.2f}")
+        print(f"\n  No combo passed WR≥{TARGET_WR:.0f}% — showing top by WR:")
 
-    print(f"\n  Compare: 15m WR=38-46% (fail) vs 1H WR above (strategies designed for 1H)")
-    print(f"  Note: 1H intraday (max 8h hold) = วันเดียวจบ เหมือนกัน แค่ signal ใช้ 1H candle")
+    print(f"\n  Top combos overall (sorted by WR):")
+    shown = set(id(r) for r in passed[:15])
+    top_others = [r for r in others if id(r) not in shown]
+    for sn, lbl, s, _ in top_others[:12]:
+        star = "  ▲" if s["wr"] >= BE_WR and s["n"] >= MIN_TRADES else ""
+        print_row(sn, lbl, s, star)
+
+    # ── Per-seed breakdown for best combos ───────────────────────────────────
+    best_list = passed[:5] if passed else sorted(results, key=lambda x: -x[2]["wr"])[:3]
+    print(f"\n{'═' * W}")
+    print(f"  PER-SEED BREAKDOWN  (best {len(best_list)} combos)")
+    print(f"  {'─' * 86}")
+    for sn, lbl, avg, _ in best_list:
+        print(f"\n  {sn}  |  {lbl}")
+        for seed, ps in zip(SEEDS, avg["per_seed"]):
+            timo_pct = ps["timo"] / max(ps["n"], 1) * 100
+            flag = "✓" if ps["wr"] >= TARGET_WR and ps["n"] >= MIN_TRADES else "✗"
+            print(f"    seed={seed}  N={ps['n']:>3}  WR={ps['wr']:>5.1f}%  "
+                  f"PF={ps['pf']:>5.2f}  Net-R={ps['net_r']:>+6.2f}  "
+                  f"Timo={timo_pct:.0f}%  {flag}")
+
+    # ── Recommendation ───────────────────────────────────────────────────────
+    print(f"\n{'═' * W}")
+    print(f"  RECOMMENDATION  (SL={SL_PCT*100:.1f}%  TP={TP_PCT*100:.1f}%  10x margin)")
+    print(f"  {'─' * 86}")
+    if passed:
+        sn, lbl, s, params = passed[0]
+        eff_rr = NET_WIN / NET_LOS
+        print(f"\n  ★ Best: {sn}  |  {lbl}")
+        print(f"    Avg N={s['n']:.1f} trades  WR={s['wr']:.1f}%  PF={s['pf']:.2f}  "
+              f"Net-R={s['net_r']:+.2f}  ~${s['pnl_usd']:+.1f} (10x, $100/trade)")
+        print(f"    Net RR 1:{eff_rr:.2f}  |  Break-even WR={BE_WR:.1f}%  |  Timeout={s['timo']/max(s['n'],1)*100:.0f}%")
+        print(f"\n    .env.example settings:")
+        print(f"    STOP_LOSS_PCT={SL_PCT}")
+        print(f"    TAKE_PROFIT_PCT={TP_PCT}")
+        if sn == "MCDX":
+            for k, v in params.items():
+                print(f"    # MCDX {k}={v}")
+        else:
+            for k, v in params.items():
+                print(f"    # Sentinel {k}={v}")
+    else:
+        best_wr = sorted(results, key=lambda x: -x[2]["wr"])
+        sn, lbl, s, params = best_wr[0]
+        print(f"\n  No combo reached WR≥{TARGET_WR:.0f}% — closest: {sn} {lbl}")
+        print(f"    WR={s['wr']:.1f}%  N={s['n']:.1f}  Net-R={s['net_r']:+.2f}")
+        print(f"\n  Suggestion: strategies may need real market data or a wider LOOKFWD to hit 67%+")
+        print(f"  Consider: ETH/USDT 1H (vol ×1.4 vs BTC) which historically showed 66.7% WR")
+
     print("═" * W + "\n")
 
 
