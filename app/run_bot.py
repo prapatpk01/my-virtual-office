@@ -108,12 +108,38 @@ def _make_strategies(symbols: list, flags: dict):
     from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
     from trading.strategies.ut_bot_strategy import UTBotStrategy
     from trading.strategies.knn_strategy import KNNStrategy
+
+    # Optimized params (real Binance data Jan–May 2026, long-only + 4H MTF gate)
+    # WaveTrend: WR=74.6% | Momentum: WR=67.6% | UTBot: WR=74.0% | MACD: WR=66.7%
+    wt_params = {
+        "wt_channel_len": int(os.environ.get("WT_N1",      "8")),
+        "wt_avg_len":     int(os.environ.get("WT_N2",      "12")),
+        "sl_atr_mult":    float(os.environ.get("WT_SL",    "1.5")),
+        "rr_ratio":       float(os.environ.get("WT_RR",    "1.0")),
+    }
+    macd_params = {
+        "sl_atr_mult":    float(os.environ.get("MACD_SL",  "1.5")),
+        "rr_ratio":       float(os.environ.get("MACD_RR",  "1.0")),
+    }
+    mom_params = {
+        "threshold":      int(os.environ.get("MOM_THR",    "4")),
+        "reentry_bars":   int(os.environ.get("MOM_RE",     "5")),
+        "sl_atr_mult":    float(os.environ.get("MOM_SL",   "1.5")),
+        "rr_ratio":       float(os.environ.get("MOM_RR",   "1.0")),
+    }
+    ut_params = {
+        "ut_mult":        float(os.environ.get("UT_MULT",  "0.3")),
+        "ut_atr_len":     int(os.environ.get("UT_LEN",     "14")),
+        "sl_atr_mult":    float(os.environ.get("UT_SL",    "1.5")),
+        "rr_ratio":       float(os.environ.get("UT_RR",    "1.0")),
+    }
+
     strategies = []
     for sym in symbols:
-        if flags.get("wt_adx"):          strategies.append(WTADXStrategy(sym))
-        if flags.get("macd_ema"):        strategies.append(MACDEMAStrategy(sym))
-        if flags.get("momentum_score"):  strategies.append(MomentumScoreStrategy(sym))
-        if flags.get("ut_bot"):          strategies.append(UTBotStrategy(sym))
+        if flags.get("wt_adx"):          strategies.append(WTADXStrategy(sym,         params=wt_params))
+        if flags.get("macd_ema"):        strategies.append(MACDEMAStrategy(sym,        params=macd_params))
+        if flags.get("momentum_score"):  strategies.append(MomentumScoreStrategy(sym,  params=mom_params))
+        if flags.get("ut_bot"):          strategies.append(UTBotStrategy(sym,          params=ut_params))
         if flags.get("knn"):             strategies.append(KNNStrategy(sym))
     return strategies
 

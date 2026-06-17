@@ -91,6 +91,9 @@ class TradingBot:
         # Bar-level blocking: SELL signal blocks new BUYs for 10 bars per sym+strategy
         self._blocked_until: dict = {}  # key="sym||strategy" → bar_index to unblock
         self._bar_counter: int = 0  # incremented each tick
+        # 4H bias cache: sym → +1 bull | 0 neutral | -1 bear (updated each tick)
+        self._4h_bias: dict = {}
+        self._mtf_gate: bool = os.getenv("MTF_GATE", "true").lower() in ("1","true","yes")
 
     # ------------------------------------------------------------------
     # Public control
@@ -259,10 +262,54 @@ class TradingBot:
                 self.state.error = str(e)
             await asyncio.sleep(self.interval)
 
+    # ------------------------------------------------------------------
+    # MTF 4H bias gate
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ema_simple(values: list, period: int) -> list:
+        result = [float("nan")] * len(values)
+        if len(values) < period:
+            return result
+        k = 2.0 / (period + 1)
+        result[period - 1] = sum(values[:period]) / period
+        for i in range(period, len(values)):
+            result[i] = values[i] * k + result[i - 1] * (1 - k)
+        return result
+
+    async def _update_4h_bias(self):
+        """Fetch 4H candles and compute EMA20+EMA200 trend bias per symbol."""
+        symbols = list({s.symbol for s in self.strategies})
+        for sym in symbols:
+            try:
+                candles4h = await self.connector.fetch_ohlcv(sym, timeframe="4h", limit=220)
+                if not candles4h or len(candles4h) < 22:
+                    self._4h_bias[sym] = 0
+                    continue
+                closes = [float(c.close) for c in candles4h]
+                em20  = self._ema_simple(closes, 20)
+                em200 = self._ema_simple(closes, 200)
+                last  = closes[-1]
+                e20   = em20[-1]
+                e200  = em200[-1]
+                macro_bull = True if math.isnan(e200) else last > e200
+                bull  = last > e20 and macro_bull
+                bear  = last < e20 and not macro_bull
+                self._4h_bias[sym] = 1 if bull else (-1 if bear else 0)
+                logger.debug("[MTF4H] %s close=%.0f EMA20=%.0f EMA200=%s bias=%+d",
+                             sym, last, e20,
+                             f"{e200:.0f}" if not math.isnan(e200) else "—",
+                             self._4h_bias[sym])
+            except Exception as e:
+                logger.debug("4H bias update failed for %s: %s", sym, e)
+                self._4h_bias[sym] = 0
+
     async def _tick(self):
         self.state.error = ""
         self._bar_counter += 1
         await self._refresh_balance()
+        if self._mtf_gate:
+            await self._update_4h_bias()
 
         if not self.risk.check_drawdown(self.state.total_balance):
             logger.warning("Max drawdown hit — bot paused")
@@ -445,6 +492,12 @@ class TradingBot:
                 logger.debug("[WT] SELL on %s — blocking all WT slots for 10 bars", sym)
                 return  # Never open short
 
+            # BUY: MTF 4H gate
+            if self._mtf_gate:
+                bias4h = self._4h_bias.get(sym, 0)
+                if bias4h == -1:
+                    logger.debug("[MTF4H] %s [WT] BUY blocked — 4H bias bearish", sym)
+                    return
             # BUY: stack longs up to _WT_MAX
             if len(wt_longs) >= _WT_MAX:
                 logger.debug("[WT] %s max stack (%d) reached, suppressing", sym, _WT_MAX)
@@ -480,6 +533,14 @@ class TradingBot:
             logger.debug("[%s] SELL signal on %s — blocking new BUYs for 10 bars (bar %d→%d)",
                          strategy_name, sym, self._bar_counter, self._bar_counter + 10)
             return  # Never open short, never close on SELL
+
+        # BUY signal — MTF 4H gate: block if 4H trend is bearish
+        if self._mtf_gate and signal.type == SignalType.BUY:
+            bias4h = self._4h_bias.get(sym, 0)
+            if bias4h == -1:
+                logger.debug("[MTF4H] %s [%s] BUY blocked — 4H bias bearish",
+                             sym, strategy_name)
+                return
 
         # BUY signal — open long if not already holding one for this strategy
         # and not blocked from a recent SELL signal
