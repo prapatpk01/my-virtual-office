@@ -94,6 +94,12 @@ class TradingBot:
         # 4H bias cache: sym → +1 bull | 0 neutral | -1 bear (updated each tick)
         self._4h_bias: dict = {}
         self._mtf_gate: bool = os.getenv("MTF_GATE", "true").lower() in ("1","true","yes")
+        # 15M entry refinement: queue 1H BUY signals, enter on 15M EMA20 confirmation
+        self._pending_entries: dict = {}   # "sym||strategy" → {symbol, strategy_name, signal, expires_at}
+        self._last_1h_tick: float = 0.0
+        self._entry_tf: int = int(os.getenv("ENTRY_TF_SECONDS", "900"))
+        if self._entry_tf > 0:
+            logger.info("15M entry refinement ENABLED (entry check every %ds, expire 4h)", self._entry_tf)
 
     # ------------------------------------------------------------------
     # Public control
@@ -251,16 +257,21 @@ class TradingBot:
         await self._refresh_balance()
         self._start_balance = self.state.total_balance
         self.risk.update_peak(self._start_balance)
+        self._last_1h_tick = 0.0  # force 1H analysis on first tick
 
         while self.state.running:
             try:
-                await self._tick()
+                run_strategy = (time.time() - self._last_1h_tick) >= self.interval
+                await self._tick(run_strategy=run_strategy)
+                if run_strategy:
+                    self._last_1h_tick = time.time()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Bot tick error: %s", e, exc_info=True)
                 self.state.error = str(e)
-            await asyncio.sleep(self.interval)
+            _sleep = self._entry_tf if self._entry_tf > 0 else self.interval
+            await asyncio.sleep(_sleep)
 
     # ------------------------------------------------------------------
     # MTF 4H bias gate
@@ -315,11 +326,56 @@ class TradingBot:
                 logger.debug("4H bias update failed for %s: %s", sym, e)
                 self._4h_bias[sym] = 0
 
-    async def _tick(self):
+    async def _check_pending_entries(self):
+        """Try to enter queued 1H signals when 15M candle closes above EMA20."""
+        now = time.time()
+        for key in list(self._pending_entries.keys()):
+            pend  = self._pending_entries[key]
+            sym   = pend["symbol"]
+            strat = pend["strategy_name"]
+
+            if now > pend["expires_at"]:
+                logger.info("[15M] %s [%s] expired — no 15M confirm within 4h, cancelled", sym, strat)
+                del self._pending_entries[key]
+                if self.telegram:
+                    self.telegram.notify(
+                        f"⏰ *Signal expired* — no 15M EMA20 confirm in 4h\n"
+                        f"`{sym}` [{strat}] — skipped"
+                    )
+                continue
+
+            try:
+                candles_15m = await self.connector.fetch_ohlcv(sym, timeframe="15m", limit=30)
+                if not candles_15m or len(candles_15m) < 21:
+                    logger.debug("[15M] %s: not enough 15M candles, retrying next tick", sym)
+                    continue
+                closes = [float(c.close) for c in candles_15m]
+                ema20  = self._ema_simple(closes, 20)
+                close  = closes[-1]
+                e20    = ema20[-1]
+                if math.isnan(e20):
+                    continue
+                logger.debug("[15M] %s [%s] close=%.4f EMA20=%.4f", sym, strat, close, e20)
+                if close > e20:
+                    logger.info("[15M] %s [%s] confirmed: close %.4f > EMA20 %.4f → entering",
+                                sym, strat, close, e20)
+                    del self._pending_entries[key]
+                    self._sig.lock_strategy(sym, strat, "buy")
+                    await self._execute_signal(pend["signal"], strat)
+                    if self.telegram:
+                        self.telegram.notify(
+                            f"✅ *15M entry confirmed*\n"
+                            f"`{sym}` [{strat}]  close={close:,.2f} > EMA20={e20:,.2f}"
+                        )
+            except Exception as e:
+                logger.warning("[15M] Pending entry check error for %s [%s]: %s", sym, strat, e)
+
+    async def _tick(self, run_strategy: bool = True):
         self.state.error = ""
-        self._bar_counter += 1
+        if run_strategy:
+            self._bar_counter += 1
         await self._refresh_balance()
-        if self._mtf_gate:
+        if self._mtf_gate and run_strategy:
             await self._update_4h_bias()
 
         if not self.risk.check_drawdown(self.state.total_balance):
@@ -437,7 +493,17 @@ class TradingBot:
                         self._sig.summary(),
                     )
 
-        # Run each strategy
+        # Check 15M pending entries (runs on every 15M tick, not just 1H)
+        if self._pending_entries:
+            await self._check_pending_entries()
+
+        if not run_strategy:
+            self.state.open_positions = self.risk.get_positions()
+            self.state.last_updated = int(time.time() * 1000)
+            self._broadcast_state()
+            return
+
+        # Run each strategy (1H only)
         new_signals = []
         _resolved_symbols: set[str] = set()  # check virtual SL/TP once per symbol per tick
         for strategy in self.strategies:
@@ -581,6 +647,7 @@ class TradingBot:
                 candidate = f"{_WT}#{s}"
                 block_key = f"{sym}||{candidate}"
                 if (not self._sig.is_locked_for_strategy(sym, candidate)
+                        and f"{sym}||{candidate}" not in self._pending_entries
                         and self._bar_counter >= self._blocked_until.get(block_key, 0)):
                     slot_key = candidate
                     break
@@ -590,12 +657,26 @@ class TradingBot:
             if not can:
                 logger.debug("[WT] %s can_open blocked: %s", sym, reason)
                 return
-            self._sig.lock_strategy(sym, slot_key, signal.type.value)
             self._sig.record_signal(sym, signal.type.value, signal.price,
                                     signal.confidence, strategy=slot_key)
             if self.telegram:
                 self.telegram.notify_signal(sig_dict)
-            await self._execute_signal(signal, slot_key)
+            if self._entry_tf > 0:
+                pending_key = f"{sym}||{slot_key}"
+                self._pending_entries[pending_key] = {
+                    "symbol": sym, "strategy_name": slot_key,
+                    "signal": signal, "expires_at": time.time() + 4 * 3600,
+                }
+                logger.info("[15M] %s [%s] queued — waiting for 15M EMA20 confirm", sym, slot_key)
+                if self.telegram:
+                    self.telegram.notify(
+                        f"⏳ *Waiting for 15M entry*\n"
+                        f"`{sym}` [{slot_key}]  1H signal @ ${signal.price:,.2f}\n"
+                        f"_Will enter when 15M candle closes above EMA20_"
+                    )
+            else:
+                self._sig.lock_strategy(sym, slot_key, signal.type.value)
+                await self._execute_signal(signal, slot_key)
             return
 
         # ── Normal strategies: BUY-only, pure TP/SL exits ───────────────
@@ -614,19 +695,33 @@ class TradingBot:
                              sym, strategy_name, bias4h)
                 return
 
-        if self._sig.is_locked_for_strategy(sym, strategy_name):
-            logger.debug("%s [%s] already long — suppressing BUY", sym, strategy_name)
+        _pending_key = f"{sym}||{strategy_name}"
+        if self._sig.is_locked_for_strategy(sym, strategy_name) or _pending_key in self._pending_entries:
+            logger.debug("%s [%s] already long or pending — suppressing BUY", sym, strategy_name)
             return
         can, reason = self.risk.can_open(sym, strategy=strategy_name)
         if not can:
             logger.debug("Crypto %s suppressed — %s", sym, reason)
             return
-        self._sig.lock_strategy(sym, strategy_name, signal.type.value)
         self._sig.record_signal(sym, signal.type.value, signal.price,
                                 signal.confidence, strategy=strategy_name)
         if self.telegram:
             self.telegram.notify_signal(sig_dict)
-        await self._execute_signal(signal, strategy_name)
+        if self._entry_tf > 0:
+            self._pending_entries[_pending_key] = {
+                "symbol": sym, "strategy_name": strategy_name,
+                "signal": signal, "expires_at": time.time() + 4 * 3600,
+            }
+            logger.info("[15M] %s [%s] queued — waiting for 15M EMA20 confirm", sym, strategy_name)
+            if self.telegram:
+                self.telegram.notify(
+                    f"⏳ *Waiting for 15M entry*\n"
+                    f"`{sym}` [{strategy_name}]  1H signal @ ${signal.price:,.2f}\n"
+                    f"_Will enter when 15M candle closes above EMA20_"
+                )
+        else:
+            self._sig.lock_strategy(sym, strategy_name, signal.type.value)
+            await self._execute_signal(signal, strategy_name)
 
     async def _execute_signal(self, signal: Signal, strategy_name: str):
         """Open a LONG position. Only called for BUY signals."""
