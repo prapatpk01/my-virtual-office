@@ -190,12 +190,18 @@ class BinanceConnector(BaseConnector):
         if self.paper or self._exchange_id != "okx" or self.leverage <= 1:
             return set()
         try:
-            raw = await self._exchange.fetch_positions()
-            return {
-                p["symbol"]
-                for p in raw
-                if p.get("contracts") and float(p["contracts"]) > 0
-            }
+            # OKX margin positions require instType=MARGIN (not SWAP/FUTURES)
+            raw = await self._exchange.fetch_positions(
+                params={"instType": "MARGIN"}
+            )
+            open_syms: set[str] = set()
+            for p in raw:
+                # OKX margin: check notional or availSubPos; contracts may be 0 for margin mode
+                notional = p.get("notional") or p.get("initialMargin") or 0
+                contracts = p.get("contracts") or 0
+                if float(notional) > 0 or float(contracts) > 0:
+                    open_syms.add(p["symbol"])
+            return open_syms
         except Exception as e:
             import logging
             logging.getLogger("binance_conn").warning(
