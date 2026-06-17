@@ -114,9 +114,47 @@ def _make_strategies(symbols: list, flags: dict):
     from trading.strategies.mcdx_strategy import MCDXStrategy
     from trading.strategies.sentinel_strategy import SentinelStrategy
     from trading.strategies.rsi_macd import RSIMACDStrategy
+
+    # ── Dual-param MCDX mode: P1(rv≥0.8) + P2(rv≥1.2), same SL/TP ────────
+    # Activate with MCDX_DUAL=true in .env.  Each param set gets its own
+    # position slot so both can hold simultaneously (max 2 positions total).
+    mcdx_dual = _env_bool("MCDX_DUAL", False)
+    mcdx_dwcs_buy  = int(os.environ.get("MCDX_DWCS_BUY", "57"))
+    mcdx_p1_rvol   = float(os.environ.get("MCDX_P1_RVOL", "0.8"))
+    mcdx_p2_rvol   = float(os.environ.get("MCDX_P2_RVOL", "1.2"))
+    mtf_fast_ema   = int(os.environ.get("MTF_FAST_EMA", "21"))
+    mtf_slow_ema   = int(os.environ.get("MTF_SLOW_EMA", "50"))
+
     strategies = []
     for sym in symbols:
-        if flags.get("mcdx"):     strategies.append(MCDXStrategy(sym))
+        if flags.get("mcdx"):
+            if mcdx_dual:
+                # P1 — aggressive entry (rv≥0.8, more trades)
+                strategies.append(MCDXStrategy(sym, params={
+                    "name":         "MCDX-P1",
+                    "dwcs_buy":     mcdx_dwcs_buy,
+                    "dwcs_sell":    100 - mcdx_dwcs_buy,
+                    "rvol_min":     mcdx_p1_rvol,
+                    "mtf_fast_ema": mtf_fast_ema,
+                    "mtf_slow_ema": mtf_slow_ema,
+                }))
+                # P2 — selective entry (rv≥1.2, higher WR)
+                strategies.append(MCDXStrategy(sym, params={
+                    "name":         "MCDX-P2",
+                    "dwcs_buy":     mcdx_dwcs_buy,
+                    "dwcs_sell":    100 - mcdx_dwcs_buy,
+                    "rvol_min":     mcdx_p2_rvol,
+                    "mtf_fast_ema": mtf_fast_ema,
+                    "mtf_slow_ema": mtf_slow_ema,
+                }))
+                logger.info(
+                    "MCDX Dual-Param mode: P1(rv≥%.1f) + P2(rv≥%.1f) "
+                    "dwcs_buy=%d  MTF EMA(%d/%d)",
+                    mcdx_p1_rvol, mcdx_p2_rvol, mcdx_dwcs_buy,
+                    mtf_fast_ema, mtf_slow_ema,
+                )
+            else:
+                strategies.append(MCDXStrategy(sym))
         if flags.get("sentinel"): strategies.append(SentinelStrategy(sym))
         if flags.get("rsi_macd"): strategies.append(RSIMACDStrategy(sym))
     if not strategies:

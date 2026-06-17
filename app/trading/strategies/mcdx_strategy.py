@@ -38,6 +38,15 @@ class MCDXStrategy(BaseStrategy):
         self.pb_dwcs_min = self.params.get("pb_dwcs_min", 52)    # min DWCS to qualify trend
         self.pb_pc_low   = self.params.get("pb_pc_low",   42)    # PC dip threshold
 
+        # ── MTF bias (1H + 4H EMA alignment) ──────────────────────────────
+        # Both timeframes must show EMA_fast > EMA_slow before a BUY fires.
+        self.mtf_fast_ema = self.params.get("mtf_fast_ema", 21)
+        self.mtf_slow_ema = self.params.get("mtf_slow_ema", 50)
+
+        # Allow overriding the strategy name for multi-instance setups (P1/P2).
+        if "name" in self.params:
+            self.name = self.params["name"]
+
     # ------------------------------------------------------------------ #
     # Chip calculations
     # ------------------------------------------------------------------ #
@@ -297,8 +306,35 @@ class MCDXStrategy(BaseStrategy):
 
         conf_pct = abs(curr_dwcs - 50) / 50
 
+        # ── MTF bias gate: 1H + 4H EMA(fast/slow) both bullish ────────────
+        # Blocks BUY signals when higher-TF trend is not aligned.
+        mtf_bias_bull = True
+        mtf_label = ""
+        if mtf_candles:
+            blocked_by = []
+            for tf in ("1h", "4h"):
+                tf_bars = mtf_candles.get(tf, [])
+                if len(tf_bars) >= self.mtf_slow_ema + 1:
+                    tf_closes = [float(c.close) for c in tf_bars]
+                    tf_fast = float(self.ema(tf_closes, self.mtf_fast_ema)[-1])
+                    tf_slow = float(self.ema(tf_closes, self.mtf_slow_ema)[-1])
+                    if tf_fast <= tf_slow:
+                        blocked_by.append(tf)
+            if blocked_by:
+                mtf_bias_bull = False
+                mtf_label = f" [MTF blocked: {','.join(blocked_by)} bear]"
+
         # ── Primary BUY: Golden Cross OR DWCS bull zone cross ─────────────
         dwcs_buy_confirmed = dwcs_buy_signal and rvol >= self.rvol_min
+        if (golden_cross or dwcs_buy_confirmed) and not mtf_bias_bull:
+            # Signal exists but MTF trend is against it — hold
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                f"[{self.name}] BUY blocked — MTF bias bear{mtf_label} "
+                f"DWCS={curr_dwcs:.1f} RVOL={rvol:.1f}x",
+                metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
+                          "rsi": curr_rsi, "rvol": rvol, "mtf_bias": "bear"},
+            )
         if golden_cross or dwcs_buy_confirmed:
             reason = "Golden Cross" if golden_cross else f"DWCS Bull zone + RVOL={rvol:.1f}x"
             return Signal(
@@ -327,6 +363,8 @@ class MCDXStrategy(BaseStrategy):
         pb_sig, pb_reason = self._pullback_rebound(
             closes, highs, lows, volumes, pc_arr, dwcs, rsi_arr, rvol, curr_dwcs
         )
+        if pb_sig and not mtf_bias_bull:
+            pb_sig = False  # MTF bear bias suppresses pullback entries too
         if pb_sig:
             return Signal(
                 SignalType.BUY, self.symbol, current_price,
