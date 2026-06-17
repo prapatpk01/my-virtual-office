@@ -81,7 +81,7 @@ def build_config() -> dict:
             "macd_ema":       _env_bool("STRATEGY_MACD_EMA",         True),
             "momentum_score": _env_bool("STRATEGY_MOMENTUM_SCORE",   True),
             "ut_bot":         _env_bool("STRATEGY_UT_BOT",           True),
-            "knn":            _env_bool("STRATEGY_KNN",              True),
+            "knn":            _env_bool("STRATEGY_KNN",              False),
         },
         "trade_amount_usdt": float(os.environ.get("TRADE_AMOUNT_USDT", "0")),   # fixed $ per trade
         "risk_per_trade":    float(os.environ.get("RISK_PER_TRADE",  "0.02")),
