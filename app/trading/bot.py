@@ -238,10 +238,13 @@ class TradingBot:
                             self.telegram.notify_virtual_closed(
                                 strategy.symbol, v_reason, v_price, self._sig.summary()
                             )
-                # Fetch MTF candles for higher-TF bias (skip if already on 1h/4h)
+                # Fetch MTF candles — use strategy's declared timeframes if available
                 mtf_candles = {}
                 _base_tf = os.getenv("CANDLE_TF", "15m")
-                _mtf_tfs = [t for t in ("1h", "4h") if t != _base_tf]
+                if hasattr(strategy, "MTF_TIMEFRAMES"):
+                    _mtf_tfs = [t for t in strategy.MTF_TIMEFRAMES if t != _base_tf]
+                else:
+                    _mtf_tfs = [t for t in ("1h", "4h") if t != _base_tf]
                 for tf in _mtf_tfs:
                     try:
                         mtf_candles[tf] = await self.connector.fetch_ohlcv(
