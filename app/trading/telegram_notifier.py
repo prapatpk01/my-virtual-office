@@ -25,6 +25,8 @@ import threading
 from typing import Callable, Optional
 import aiohttp
 
+_BOT_START_TIME = time.time()   # used to ignore commands sent before this process started
+
 logger = logging.getLogger("telegram_notifier")
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
@@ -306,12 +308,32 @@ class TelegramNotifier:
 
     async def _drain_old_updates(self):
         """Discard all pending updates so stale /stop_bot commands don't fire on restart."""
+        url = TELEGRAM_API.format(token=self.token, method="getUpdates")
         try:
-            updates = await self._get_updates()
-            if updates:
-                self._last_update_id = max(u["update_id"] for u in updates)
+            drained = 0
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    params = {
+                        "offset": self._last_update_id + 1,
+                        "timeout": 0,           # non-blocking — return immediately
+                        "limit": 100,
+                        "allowed_updates": ["message"],
+                    }
+                    async with session.get(
+                        url, params=params,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as r:
+                        if r.status != 200:
+                            break
+                        data = await r.json()
+                        updates = data.get("result", [])
+                        if not updates:
+                            break
+                        self._last_update_id = max(u["update_id"] for u in updates)
+                        drained += len(updates)
+            if drained:
                 logger.info("Telegram: drained %d stale update(s) (last_id=%d)",
-                            len(updates), self._last_update_id)
+                            drained, self._last_update_id)
         except Exception as e:
             logger.debug("Telegram drain error: %s", e)
 
@@ -328,6 +350,12 @@ class TelegramNotifier:
                     # Only respond to our own chat_id for security
                     chat = str(msg.get("chat", {}).get("id", ""))
                     if chat != self.chat_id:
+                        continue
+                    # Ignore commands sent before this bot process started (stale queue)
+                    msg_time = msg.get("date", 0)
+                    if msg_time < _BOT_START_TIME - 5:
+                        logger.debug("Telegram: skipping stale command '%s' (age=%ds)",
+                                     text[:30], int(time.time() - msg_time))
                         continue
                     if text:
                         await self._handle_command(text)
