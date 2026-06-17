@@ -71,7 +71,7 @@ def build_config() -> dict:
         # MARKET_TYPE: "swap" for OKX Perpetual Futures, "" for spot/margin
         "margin_mode": os.environ.get("MARGIN_MODE", ""),
         "market_type": os.environ.get("MARKET_TYPE", ""),   # "swap" = futures
-        "leverage":    int(os.environ.get("LEVERAGE", "1")),
+        "leverage":    int(os.environ.get("LEVERAGE", "10")),
         # ── OANDA ─────────────────────────────────────────────────────────────
         "oanda_api_key":   os.environ.get("OANDA_API_KEY", ""),
         "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
