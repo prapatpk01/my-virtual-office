@@ -39,6 +39,7 @@ class TelegramNotifier:
         get_stats_fn: Optional[Callable] = None,
         start_bot_fn: Optional[Callable] = None,
         stop_bot_fn: Optional[Callable] = None,
+        fetch_candles_fn: Optional[Callable] = None,
         min_confidence: float = 0.5,
     ):
         self.token = token.strip()
@@ -47,6 +48,7 @@ class TelegramNotifier:
         self.get_stats_fn = get_stats_fn
         self.start_bot_fn = start_bot_fn
         self.stop_bot_fn = stop_bot_fn
+        self.fetch_candles_fn = fetch_candles_fn
         self.min_confidence = min_confidence
 
         self._last_update_id = 0
@@ -246,6 +248,26 @@ class TelegramNotifier:
     # Telegram HTTP helpers
     # ------------------------------------------------------------------
 
+    async def _send_document(self, filename: str, data: bytes, caption: str = "") -> bool:
+        url = TELEGRAM_API.format(token=self.token, method="sendDocument")
+        form = aiohttp.FormData()
+        form.add_field("chat_id", self.chat_id)
+        form.add_field("document", data, filename=filename, content_type="text/csv")
+        if caption:
+            form.add_field("caption", caption)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, data=form,
+                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        logger.warning("Telegram sendDocument failed %s: %s", r.status, body[:200])
+                        return False
+                    return True
+        except Exception as e:
+            logger.warning("Telegram sendDocument error: %s", e)
+            return False
+
     async def _send(self, text: str, parse_mode: str = "Markdown") -> bool:
         url = TELEGRAM_API.format(token=self.token, method="sendMessage")
         payload = {"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
@@ -315,6 +337,7 @@ class TelegramNotifier:
                 "/stats — win rate & signal statistics\n"
                 "/start\\_bot — start the bot\n"
                 "/stop\\_bot — stop the bot\n"
+                "/export\\_candles — download BTC 1H CSV (3 months)\n"
                 "/help — this message"
             )
 
@@ -461,6 +484,30 @@ class TelegramNotifier:
                     )
 
             await self._send("\n".join(lines))
+
+        elif cmd == "export_candles":
+            if not self.fetch_candles_fn:
+                await self._send("⚠️ Export not available — connector not wired")
+                return
+            await self._send("⏳ Fetching BTC/USDT 1H candles from OKX\\.\\.\\.")
+            try:
+                import io
+                from datetime import datetime, timezone
+                bars = await self.fetch_candles_fn("BTC/USDT", "1h", 2200)
+                buf = io.StringIO()
+                buf.write("timestamp,open,high,low,close,volume\n")
+                for b in bars:
+                    buf.write(f"{b[0]},{b[1]},{b[2]},{b[3]},{b[4]},{b[5]}\n")
+                csv_bytes = buf.getvalue().encode("utf-8")
+                start_dt = datetime.fromtimestamp(bars[0][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                end_dt   = datetime.fromtimestamp(bars[-1][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                caption  = f"BTC/USDT 1H — {len(bars)} bars  {start_dt} → {end_dt}"
+                ok = await self._send_document("btc_1h_3mo.csv", csv_bytes, caption)
+                if not ok:
+                    await self._send("❌ Failed to send file")
+            except Exception as e:
+                logger.exception("export_candles error")
+                await self._send(f"❌ Export error: {e}")
 
         else:
             await self._send(f"❓ Unknown command: `{text}`\nType /help for commands.")

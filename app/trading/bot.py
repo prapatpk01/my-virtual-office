@@ -185,6 +185,13 @@ class TradingBot:
             self.telegram.notify_bot_stopped()
         logger.info("TradingBot stopped")
 
+    async def export_candles(self, symbol: str, timeframe: str, limit: int) -> list:
+        """Fetch raw OHLCV from the exchange — used by Telegram /export_candles."""
+        exchange = getattr(self.connector, "_exchange", None)
+        if exchange is None:
+            raise ValueError("Connector has no underlying exchange object")
+        return await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+
     async def manual_signal(self, symbol: str, side: str, amount: float, reason: str = "manual"):
         """Execute a manual trade bypassing strategy analysis."""
         try:

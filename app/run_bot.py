@@ -314,10 +314,11 @@ async def main():
             pass
 
     if telegram:
-        telegram.get_state_fn = crypto_bot.get_state
-        telegram.get_stats_fn = crypto_bot.get_stats
-        telegram.stop_bot_fn  = lambda: _stop_signal.set()
-        telegram.start_bot_fn = lambda: {"message": "Bot is already running"}
+        telegram.get_state_fn    = crypto_bot.get_state
+        telegram.get_stats_fn    = crypto_bot.get_stats
+        telegram.stop_bot_fn     = lambda: _stop_signal.set()
+        telegram.start_bot_fn    = lambda: {"message": "Bot is already running"}
+        telegram.fetch_candles_fn = crypto_bot.export_candles
 
     # Auto-optimize SL/TP via backtest on first symbol
     await _run_backtest(crypto_bot, config, telegram)
