@@ -64,31 +64,44 @@ def build_config() -> dict:
         "exchange":        os.environ.get("EXCHANGE", "binance"),
         "api_key":         os.environ.get("EXCHANGE_API_KEY", ""),
         "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
-        "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),  # OKX only
+        "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),  # OKX required
         "paper":           _env_bool("PAPER_TRADING", True),
-        # OANDA-specific
+        # ── Margin / leverage (OKX Cross Margin) ──────────────────────────────
+        # MARGIN_MODE: "cross" | "isolated" | "" (spot/no margin)
+        "margin_mode": os.environ.get("MARGIN_MODE", ""),
+        "leverage":    int(os.environ.get("LEVERAGE", "1")),
+        # ── OANDA ─────────────────────────────────────────────────────────────
         "oanda_api_key":   os.environ.get("OANDA_API_KEY", ""),
         "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
         "oanda_env":       os.environ.get("OANDA_ENV", "practice"),
-        "symbols":      _env_list("SYMBOLS", "ETH/USDT"),
-        "candle_tf":    os.environ.get("CANDLE_TF", "15m"),     # 15m | 1h | 4h
+        # ── Candles / timing ──────────────────────────────────────────────────
+        "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
+        "candle_tf":    os.environ.get("CANDLE_TF", "15m"),       # 15m recommended for BTC intraday
         "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
+        # ── Strategies ────────────────────────────────────────────────────────
+        # RSI+MACD disabled by default — BTC 15m uses MCDX + Sentinel only
         "strategies": {
             "mcdx":     _env_bool("STRATEGY_MCDX",     True),
             "sentinel": _env_bool("STRATEGY_SENTINEL",  True),
-            "rsi_macd": _env_bool("STRATEGY_RSI_MACD",  True),
+            "rsi_macd": _env_bool("STRATEGY_RSI_MACD",  False),
         },
+        # ── Risk / SL / TP ────────────────────────────────────────────────────
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
-        # Fixed SL/TP applied to every trade (overrides ATR-based from strategies)
-        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.046")),   # 4.6%
-        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.048")),   # 4.8%
-        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "3")),  # 1 per strategy
+        # BTC 15m 10x margin: SL 0.8%, TP 1.6% (net RR 1:1.77 after 0.25% fees)
+        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.008")),   # 0.8%
+        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.016")),   # 1.6%
+        # Max 2 positions: 1 per strategy (MCDX + Sentinel)
+        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "2")),
         "max_drawdown":    float(os.environ.get("MAX_DRAWDOWN_PCT", "0.30")),
+        # ── Intraday close ────────────────────────────────────────────────────
+        # Close all positions before this UTC hour (0-23). 0 = disabled.
+        "intraday_close_hour": int(os.environ.get("INTRADAY_CLOSE_HOUR", "23")),
+        # ── Telegram ──────────────────────────────────────────────────────────
         "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID",   ""),
         "tg_min_confidence": float(os.environ.get("TG_MIN_CONFIDENCE", "0.5")),
-        # Forex / Gold signal-only symbols (Yahoo Finance, no order execution)
+        # ── Forex / Gold signal-only ───────────────────────────────────────────
         "forex_symbols": _env_list("FOREX_SYMBOLS", "XAUUSD"),
         "forex_enabled": _env_bool("FOREX_SIGNALS", True),
         "forex_interval": int(os.environ.get("FOREX_INTERVAL_SECONDS", "60")),
@@ -158,6 +171,8 @@ def build_crypto_bot(config: dict, telegram):
             api_key=config["api_key"], api_secret=config["api_secret"],
             paper=config["paper"], exchange_id=exchange,
             passphrase=config.get("api_passphrase", ""),
+            margin_mode=config.get("margin_mode", ""),
+            leverage=config.get("leverage", 1),
         )
     else:
         connector = AlpacaConnector(
@@ -174,15 +189,20 @@ def build_crypto_bot(config: dict, telegram):
         max_open_positions=config["max_positions"],
         max_drawdown_pct=config["max_drawdown"],
     )
-    logger.info("Bot config: SL=%.1f%%  TP=%.1f%%  max_positions=%d  strategies=%s",
-                config["stop_loss_pct"] * 100, config["take_profit_pct"] * 100,
-                config["max_positions"], [s.name for s in strategies])
+    margin_info = (f"  margin={config['margin_mode'].upper()} x{config['leverage']}"
+                   if config.get("margin_mode") else "  spot")
+    logger.info(
+        "Bot config: SL=%.2f%%  TP=%.2f%%  max_positions=%d  strategies=%s%s",
+        config["stop_loss_pct"] * 100, config["take_profit_pct"] * 100,
+        config["max_positions"], [s.name for s in strategies], margin_info,
+    )
     return TradingBot(
         connector=connector, strategies=strategies,
         risk_manager=risk, interval_seconds=config["interval"],
         broadcast_fn=None, telegram=telegram,
         fixed_sl_pct=config["stop_loss_pct"],
         fixed_tp_pct=config["take_profit_pct"],
+        intraday_close_hour=config.get("intraday_close_hour", 0),
     )
 
 

@@ -1,6 +1,5 @@
-"""Binance connector via CCXT (supports paper trading simulation)."""
-import asyncio
-import time
+"""Binance / OKX / Bybit connector via CCXT (supports spot, cross-margin, paper trading)."""
+import logging
 import uuid
 from typing import Optional
 
@@ -8,11 +7,16 @@ import ccxt.async_support as ccxt
 
 from .base import OHLCV, Balance, BaseConnector, OrderResult
 
+logger = logging.getLogger(__name__)
+
 
 class BinanceConnector(BaseConnector):
     """
-    Crypto connector for Binance (or any CCXT-compatible exchange).
-    Set paper=True (default) to simulate trades without real API keys.
+    Crypto connector for Binance / OKX / Bybit via CCXT.
+
+    Margin mode (OKX only):
+      margin_mode="cross"  → OKX Spot Margin, Cross, auto-borrow enabled
+      leverage             → sets leverage on the pair before first order
     """
 
     TIMEFRAME_MAP = {
@@ -22,30 +26,46 @@ class BinanceConnector(BaseConnector):
 
     def __init__(self, api_key: str = "", api_secret: str = "",
                  paper: bool = True, exchange_id: str = "binance",
-                 passphrase: str = ""):
+                 passphrase: str = "",
+                 margin_mode: str = "",   # "cross" | "isolated" | "" (spot)
+                 leverage: int = 1):
         super().__init__(api_key, api_secret, paper)
-        exchange_class = getattr(ccxt, exchange_id)
-        options: dict = {"defaultType": "spot"}
+        self._exchange_id  = exchange_id
+        self._margin_mode  = margin_mode.lower()  # "cross", "isolated", or ""
+        self._leverage     = leverage
+
+        # Choose defaultType based on margin mode
+        if self._margin_mode in ("cross", "isolated"):
+            default_type = "margin"
+        else:
+            default_type = "spot"
+
+        options: dict = {"defaultType": default_type}
         if exchange_id == "bybit":
             options["fetchCurrencies"] = False
+
         cfg: dict = {
-            "apiKey": api_key,
-            "secret": api_secret,
+            "apiKey":          api_key,
+            "secret":          api_secret,
             "enableRateLimit": True,
-            "options": options,
+            "options":         options,
         }
-        if passphrase:  # OKX requires password (passphrase)
+        if passphrase:
             cfg["password"] = passphrase
+
+        exchange_class = getattr(ccxt, exchange_id)
         self._exchange = exchange_class(cfg)
-        self._exchange_id = exchange_id
-        self._paper_balance = {"USDT": 10000.0, "BTC": 0.0, "ETH": 0.0}
+
+        self._paper_balance = {"USDT": 10_000.0, "BTC": 0.0, "ETH": 0.0}
         self._paper_open_orders: list[OrderResult] = []
+        self._leverage_set: set[str] = set()   # symbols where leverage already set
 
-    # ------------------------------------------------------------------
-    # Market data (always live, no API key needed for public endpoints)
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # Market data
+    # ──────────────────────────────────────────────────────────────────
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str = "1h", limit: int = 200) -> list[OHLCV]:
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = "1h",
+                          limit: int = 300) -> list[OHLCV]:
         tf = self.TIMEFRAME_MAP.get(timeframe, "1h")
         raw = await self._exchange.fetch_ohlcv(symbol, tf, limit=limit)
         return [OHLCV(ts, o, h, l, c, v) for ts, o, h, l, c, v in raw]
@@ -53,25 +73,56 @@ class BinanceConnector(BaseConnector):
     async def fetch_ticker(self, symbol: str) -> dict:
         return await self._exchange.fetch_ticker(symbol)
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # Leverage / margin setup (called once per symbol on first order)
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _ensure_leverage(self, symbol: str):
+        """Set cross-margin leverage on OKX (once per symbol per session)."""
+        if self._exchange_id != "okx" or not self._margin_mode:
+            return
+        if symbol in self._leverage_set:
+            return
+        try:
+            # OKX: set_leverage requires marginMode and side for isolated; cross needs no side
+            await self._exchange.set_leverage(
+                self._leverage, symbol,
+                params={"mgnMode": self._margin_mode}
+            )
+            self._leverage_set.add(symbol)
+            logger.info("OKX leverage set: %s × %dx cross-margin", symbol, self._leverage)
+        except Exception as e:
+            logger.warning("set_leverage failed (%s): %s — continuing", symbol, e)
+            self._leverage_set.add(symbol)   # don't retry on every order
+
+    # ──────────────────────────────────────────────────────────────────
     # Orders
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
 
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: Optional[float] = None) -> OrderResult:
+                           order_type: str = "market",
+                           price: Optional[float] = None) -> OrderResult:
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price)
 
-        kwargs = {}
-        if order_type == "limit" and price:
-            kwargs["price"] = price
+        await self._ensure_leverage(symbol)
 
-        raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
+        params: dict = {}
+        if order_type == "limit" and price:
+            params["price"] = price
+
+        # OKX Spot Margin: must set tdMode and ccy (quote currency) per order
+        if self._exchange_id == "okx" and self._margin_mode:
+            params["tdMode"] = self._margin_mode      # "cross" | "isolated"
+            params["ccy"]    = symbol.split("/")[1] if "/" in symbol else "USDT"
+
+        raw = await self._exchange.create_order(
+            symbol, order_type, side, amount, price if order_type == "limit" else None,
+            params=params,
+        )
         return OrderResult(
             order_id=str(raw.get("id", uuid.uuid4())),
-            symbol=symbol,
-            side=side,
-            amount=amount,
+            symbol=symbol, side=side, amount=amount,
             price=raw.get("price") or price or 0.0,
             filled=raw.get("filled", 0.0),
             status=raw.get("status", "open"),
@@ -79,7 +130,7 @@ class BinanceConnector(BaseConnector):
 
     async def _paper_order(self, symbol: str, side: str, amount: float,
                            order_type: str, price: Optional[float]) -> OrderResult:
-        ticker = await self.fetch_ticker(symbol)
+        ticker     = await self.fetch_ticker(symbol)
         exec_price = price if (order_type == "limit" and price) else ticker["last"]
         base_asset = symbol.split("/")[0]
         quote_asset = symbol.split("/")[1] if "/" in symbol else "USDT"
@@ -87,30 +138,33 @@ class BinanceConnector(BaseConnector):
         if side == "buy":
             cost = amount * exec_price
             if self._paper_balance.get(quote_asset, 0) < cost:
-                raise ValueError(f"[Paper] Insufficient {quote_asset}: need {cost:.2f}, have {self._paper_balance.get(quote_asset, 0):.2f}")
+                raise ValueError(
+                    f"[Paper] Insufficient {quote_asset}: "
+                    f"need {cost:.2f}, have {self._paper_balance.get(quote_asset, 0):.2f}"
+                )
             self._paper_balance[quote_asset] = self._paper_balance.get(quote_asset, 0) - cost
-            self._paper_balance[base_asset] = self._paper_balance.get(base_asset, 0) + amount
+            self._paper_balance[base_asset]  = self._paper_balance.get(base_asset,  0) + amount
         else:
             if self._paper_balance.get(base_asset, 0) < amount:
-                raise ValueError(f"[Paper] Insufficient {base_asset}: need {amount}, have {self._paper_balance.get(base_asset, 0)}")
-            self._paper_balance[base_asset] = self._paper_balance.get(base_asset, 0) - amount
+                raise ValueError(
+                    f"[Paper] Insufficient {base_asset}: "
+                    f"need {amount}, have {self._paper_balance.get(base_asset, 0)}"
+                )
+            self._paper_balance[base_asset]  = self._paper_balance.get(base_asset,  0) - amount
             self._paper_balance[quote_asset] = self._paper_balance.get(quote_asset, 0) + amount * exec_price
 
         order = OrderResult(
-            order_id=str(uuid.uuid4())[:8],
-            symbol=symbol,
-            side=side,
-            amount=amount,
-            price=exec_price,
-            filled=amount,
-            status="closed",
+            order_id=str(uuid.uuid4())[:8], symbol=symbol, side=side,
+            amount=amount, price=exec_price, filled=amount, status="closed",
         )
         self._paper_open_orders.append(order)
         return order
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         if self.paper:
-            self._paper_open_orders = [o for o in self._paper_open_orders if o.order_id != order_id]
+            self._paper_open_orders = [
+                o for o in self._paper_open_orders if o.order_id != order_id
+            ]
             return True
         await self._exchange.cancel_order(order_id, symbol)
         return True
@@ -121,13 +175,9 @@ class BinanceConnector(BaseConnector):
                     if symbol is None or o.symbol == symbol]
         raw_list = await self._exchange.fetch_open_orders(symbol)
         return [OrderResult(
-            order_id=str(r["id"]),
-            symbol=r["symbol"],
-            side=r["side"],
-            amount=r["amount"],
-            price=r.get("price") or 0.0,
-            filled=r.get("filled", 0.0),
-            status=r.get("status", "open"),
+            order_id=str(r["id"]), symbol=r["symbol"], side=r["side"],
+            amount=r["amount"], price=r.get("price") or 0.0,
+            filled=r.get("filled", 0.0), status=r.get("status", "open"),
         ) for r in raw_list]
 
     async def fetch_balance(self) -> list[Balance]:
