@@ -88,6 +88,7 @@ def build_config() -> dict:
             "sentinel":  _env_bool("STRATEGY_SENTINEL",   True),
             "rsi_macd":  _env_bool("STRATEGY_RSI_MACD",   False),
             "utbot_wt":  _env_bool("STRATEGY_UTBOT_WT",   False),
+            "sjutbot":   _env_bool("STRATEGY_SJUTBOT",    False),
         },
         # ── Risk / SL / TP ────────────────────────────────────────────────────
         "risk_per_trade":    float(os.environ.get("RISK_PER_TRADE",    "0.02")),
@@ -120,6 +121,7 @@ def _make_strategies(symbols: list, flags: dict):
     from trading.strategies.sentinel_strategy import SentinelStrategy
     from trading.strategies.rsi_macd import RSIMACDStrategy
     from trading.strategies.utbot_wt_strategy import UTBotWTStrategy
+    from trading.strategies.sjutbot_strategy import SJUTBotStrategy
 
     # ── Dual-param MCDX mode: P1(rv≥0.8) + P2(rv≥1.2), same SL/TP ────────
     # Activate with MCDX_DUAL=true in .env.  Each param set gets its own
@@ -164,6 +166,7 @@ def _make_strategies(symbols: list, flags: dict):
         if flags.get("sentinel"):  strategies.append(SentinelStrategy(sym))
         if flags.get("rsi_macd"):  strategies.append(RSIMACDStrategy(sym))
         if flags.get("utbot_wt"):  strategies.append(UTBotWTStrategy(sym))
+        if flags.get("sjutbot"):   strategies.append(SJUTBotStrategy(sym))
     if not strategies:
         logger.warning("No strategies enabled — defaulting to MCDXStrategy")
         from trading.strategies.mcdx_strategy import MCDXStrategy

@@ -91,6 +91,11 @@ class TradingBot:
         self.futures_mode: bool = os.getenv("FUTURES_MODE", "false").lower() == "true"
         if self.futures_mode:
             logger.info("[FUTURES] Futures mode ENABLED — SELL opens short, BUY closes short")
+        # REVERSAL_MODE=true → BUY first closes any open SHORT, SELL first closes any open LONG
+        # (sequential / always-in-market; requires FUTURES_MODE=true)
+        self.reversal_mode: bool = os.getenv("REVERSAL_MODE", "false").lower() == "true"
+        if self.reversal_mode:
+            logger.info("[REVERSAL] Reversal mode ENABLED — signals flip position")
 
     # ------------------------------------------------------------------
     # Public control
@@ -401,6 +406,10 @@ class TradingBot:
 
         if signal.type == SignalType.SELL:
             if self.futures_mode:
+                # Reversal: close existing LONG before opening SHORT
+                if self.reversal_mode and self._sig.is_locked_for_strategy(sym, strategy_name):
+                    await self._close_leg(sym, strategy_name, "long", "sell_signal → flip to short")
+
                 # Futures: open SHORT (don't close long — hedge mode)
                 if self._sig.is_locked_for_strategy(sym, short_name):
                     logger.debug("%s [%s] already short — suppressing SELL", sym, short_name)
@@ -446,6 +455,11 @@ class TradingBot:
                             logger.error("Exit long on SELL failed [%s]: %s", strategy_name, e)
             return
 
+        # Reversal: close existing SHORT before opening LONG
+        if self.reversal_mode and self.futures_mode \
+                and self._sig.is_locked_for_strategy(sym, short_name):
+            await self._close_leg(sym, short_name, "short", "buy_signal → flip to long")
+
         # BUY signal — open LONG (hedge mode: short stays open independently)
         if self._sig.is_locked_for_strategy(sym, strategy_name):
             logger.debug("%s [%s] already long — suppressing BUY", sym, strategy_name)
@@ -460,6 +474,37 @@ class TradingBot:
         if self.telegram:
             self.telegram.notify_signal(sig_dict)
         await self._execute_signal(signal, strategy_name)
+
+    async def _close_leg(self, sym: str, strategy_name: str, leg_side: str, reason: str):
+        """Close one leg (long or short) for reversal mode."""
+        positions = self.risk.get_positions()
+        pos = next((p for p in positions if p["symbol"] == sym and p["strategy"] == strategy_name), None)
+        if not pos:
+            self._sig.unlock_strategy(sym, strategy_name)
+            return
+        close_side = "sell" if leg_side == "long" else "buy"
+        try:
+            ticker     = await self.connector.fetch_ticker(sym)
+            exit_price = ticker["last"]
+            ps = leg_side if self.futures_mode else ""
+            await self.connector.create_order(sym, close_side, pos["amount"], pos_side=ps)
+            self._sig.record_outcome(
+                symbol=sym, side=leg_side,
+                entry=pos["entry"], exit_price=exit_price,
+                sl=pos.get("stop_loss"), tp=pos.get("take_profit"),
+                reason=reason, strategy=strategy_name,
+            )
+            self._sig.unlock_strategy(sym, strategy_name)
+            self.risk.close_position(sym, strategy=strategy_name)
+            logger.info("[REV] Closed %s %s @ %.2f (%s)", leg_side.upper(), sym, exit_price, reason)
+            if self.telegram:
+                self.telegram.notify_trade_closed(
+                    sym, reason, exit_price,
+                    pos["entry"], pos.get("stop_loss"), pos.get("take_profit"),
+                    self._sig.summary(),
+                )
+        except Exception as e:
+            logger.error("_close_leg failed [%s %s]: %s", strategy_name, leg_side, e)
 
     async def _execute_signal(self, signal: Signal, strategy_name: str):
         """Open a LONG position. Only called for BUY signals."""
