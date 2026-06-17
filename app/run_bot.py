@@ -85,7 +85,7 @@ def build_config() -> dict:
         # RSI+MACD disabled by default — BTC 15m uses MCDX + Sentinel only
         "strategies": {
             "mcdx":      _env_bool("STRATEGY_MCDX",      True),
-            "sentinel":  _env_bool("STRATEGY_SENTINEL",   True),
+            "sentinel":  _env_bool("STRATEGY_SENTINEL",   False),  # disable: adds untested fees
             "rsi_macd":  _env_bool("STRATEGY_RSI_MACD",   False),
             "utbot_wt":  _env_bool("STRATEGY_UTBOT_WT",   False),
             "sjutbot":   _env_bool("STRATEGY_SJUTBOT",    False),
@@ -94,11 +94,11 @@ def build_config() -> dict:
         "risk_per_trade":    float(os.environ.get("RISK_PER_TRADE",    "0.02")),
         # Fixed USDT margin per trade — overrides risk_per_trade when > 0
         "fixed_trade_usdt":  float(os.environ.get("FIXED_TRADE_USDT",  "20")),
-        # BTC 1H 10x margin: SL 1.5%, TP 3.0%
-        # Net RR ~1:1.83 after 0.25% fees | break-even WR = 35%
-        # At 10x: loss ~15% capital | win ~27.5% capital per trade
+        # Backtest-optimised (15m MCDX, Jan-May 2026, incl OKX fees):
+        # SL=1.5%  TP=2.5%  R:R 1:1.67  BE-WR=37.5%  actual-WR≈44%
+        # Net +$43.60 / 5mo on $20 margin×20x  (163 trades)
         "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.015")),   # 1.5%
-        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.030")),   # 3.0%
+        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.025")),   # 2.5%
         # Max 2 positions: 1 per strategy (MCDX + Sentinel)
         "max_positions":   int(os.environ.get("MAX_POSITIONS",     "2")),
         "max_drawdown":    float(os.environ.get("MAX_DRAWDOWN_PCT", "0.30")),
