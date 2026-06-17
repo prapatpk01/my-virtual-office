@@ -1,16 +1,18 @@
 """
-MCDX Plus v2.0 → Python port.
+MCDX Plus v2.1 → Python port.
 
 Signals generated:
-  BUY  — Golden Cross (SMA_PC crosses above SMA_LC) OR BC (bullish confirmation) OR OS
-  SELL — Death Cross (SMA_PC crosses below SMA_LC) OR OB (overbought)
+  BUY  — Golden Cross (SMA_PC crosses above SMA_LC)
+         OR DWCS Bull zone cross + volume confirm
+         OR Pullback/Rebound: EMA bounce, PC rebound, RSI dip rebound
+  SELL — Death Cross (SMA_PC crosses below SMA_LC) OR DWCS Bear zone cross
   HOLD — otherwise, reports DWCS score
 
 Key indicators ported:
   - Profit Chips (PC): normalized price position
   - Locked Chips (LC): shares locked above market
   - DWCS v6: 4-pillar composite score (Momentum, Trend, Sentiment, FundFlow)
-  - BC / OS / OB: event-based alerts
+  - Pullback/Rebound engine: 3-mode secondary entry in established bull trend
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -24,11 +26,17 @@ class MCDXStrategy(BaseStrategy):
         self.nr = self.params.get("length", 100)
         self.sma_pc_len = self.params.get("sma_pc_len", 10)
         self.sma_lc_len = self.params.get("sma_lc_len", 10)
-        self.dwcs_buy   = self.params.get("dwcs_buy",  57)   # optimized: 66.7% WR in backtest
-        self.dwcs_sell  = self.params.get("dwcs_sell", 43)   # optimized: was 47
+        self.dwcs_buy   = self.params.get("dwcs_buy",  57)
+        self.dwcs_sell  = self.params.get("dwcs_sell", 43)
         self.min_conf   = self.params.get("min_conf",  48)
         self.rvol_min   = self.params.get("rvol_min",  1.1)  # volume confirm for DWCS entry
         self.position_pct = self.params.get("position_pct", 0.08)
+
+        # ── Pullback / Rebound params ──────────────────────────────────────
+        self.pb_ema_len  = self.params.get("pb_ema_len",  21)    # EMA level for pullback
+        self.pb_tol      = self.params.get("pb_tol",    0.010)   # touch tolerance (1%)
+        self.pb_dwcs_min = self.params.get("pb_dwcs_min", 52)    # min DWCS to qualify trend
+        self.pb_pc_low   = self.params.get("pb_pc_low",   42)    # PC dip threshold
 
     # ------------------------------------------------------------------ #
     # Chip calculations
@@ -135,6 +143,91 @@ class MCDXStrategy(BaseStrategy):
         return np.nan_to_num(dwcs_arr, nan=50)
 
     # ------------------------------------------------------------------ #
+    # Pullback / Rebound engine
+    # ------------------------------------------------------------------ #
+
+    def _pullback_rebound(self, closes, highs, lows, volumes,
+                          pc_arr, dwcs, rsi_arr, rvol, curr_dwcs):
+        """
+        Three secondary BUY modes for entries during a bull-trend pullback.
+
+        Mode 1 — EMA Pullback Bounce
+          Trend intact (avg DWCS ≥ pb_dwcs_min), EMA rising,
+          low touched EMA within pb_tol in last 1-3 bars,
+          close back above EMA, PC recovering, RSI < 68.
+
+        Mode 2 — PC Rebound
+          PC was strong (>55) in last 15 bars, pulled back below pb_pc_low,
+          now rising 2 consecutive bars, price near/above SMA20, RSI 32-65.
+
+        Mode 3 — RSI Dip Rebound
+          Strong trend (avg DWCS ≥ 55), RSI dipped to 32-48 range,
+          recovering 2 bars, volume above average, price above SMA20.
+
+        Returns (signal: bool, reason: str).
+        """
+        n = len(closes)
+        if n < self.pb_ema_len + 15:
+            return False, ""
+
+        ema_pb  = np.nan_to_num(self.ema(closes, self.pb_ema_len), nan=closes[-1])
+        sma20   = np.nan_to_num(self.sma(closes, 20),              nan=closes[-1])
+
+        price    = closes[-1]
+        curr_ema = float(ema_pb[-1])
+        curr_sma = float(sma20[-1])
+
+        rsi_safe  = np.nan_to_num(rsi_arr, nan=50.0)
+        curr_rsi  = float(rsi_safe[-1])
+        prev_rsi  = float(rsi_safe[-2]) if n >= 2 else curr_rsi
+        prev2_rsi = float(rsi_safe[-3]) if n >= 3 else prev_rsi
+
+        curr_pc  = float(pc_arr[-1]) if not np.isnan(pc_arr[-1]) else 50.0
+        prev_pc  = float(pc_arr[-2]) if not np.isnan(pc_arr[-2]) else curr_pc
+        prev2_pc = float(pc_arr[-3]) if not np.isnan(pc_arr[-3]) else prev_pc
+
+        recent_dwcs  = float(np.mean(dwcs[-5:])) if n >= 5 else curr_dwcs
+        trend_bull   = recent_dwcs >= self.pb_dwcs_min
+        trend_strong = recent_dwcs >= 55
+        ema_rising   = ema_pb[-1] > ema_pb[-6] if n >= 6 else False
+
+        # ── Mode 1: EMA Pullback Bounce ───────────────────────────────────
+        if trend_bull and ema_rising and price > curr_ema:
+            touched = any(
+                float(lows[-(k + 1)]) <= curr_ema * (1.0 + self.pb_tol)
+                for k in range(1, min(4, n))
+            )
+            if touched and curr_pc > prev_pc and curr_rsi < 68 and rvol >= 0.8:
+                dist = (price - curr_ema) / curr_ema * 100
+                return True, (f"PB-EMA{self.pb_ema_len} bounce +{dist:.1f}% | "
+                              f"DWCS={curr_dwcs:.1f} RSI={curr_rsi:.1f} RVOL={rvol:.1f}x")
+
+        # ── Mode 2: PC Rebound ────────────────────────────────────────────
+        if trend_bull and n >= 15:
+            pc_window = [float(p) for p in pc_arr[-15:] if not np.isnan(p)]
+            if len(pc_window) >= 8:
+                pc_was_strong = any(p > 55 for p in pc_window[:-3])
+                pc_dipped     = prev2_pc < self.pb_pc_low
+                pc_rising_2   = curr_pc > prev_pc and prev_pc > prev2_pc
+                above_sma     = price >= curr_sma * 0.995
+                rsi_range     = 32 < curr_rsi < 65
+                if pc_was_strong and pc_dipped and pc_rising_2 and above_sma and rsi_range:
+                    return True, (f"PB-PC rebound {prev2_pc:.0f}→{curr_pc:.0f} | "
+                                  f"DWCS={curr_dwcs:.1f} RSI={curr_rsi:.1f}")
+
+        # ── Mode 3: RSI Dip Rebound ───────────────────────────────────────
+        if trend_strong and n >= 5:
+            rsi_min   = min(prev_rsi, prev2_rsi)
+            rsi_dipped   = 32 < rsi_min < 48
+            rsi_rising_2 = curr_rsi > prev_rsi > prev2_rsi
+            above_sma    = price >= curr_sma * 0.995
+            if rsi_dipped and rsi_rising_2 and above_sma and rvol >= 0.9:
+                return True, (f"PB-RSI rebound {prev2_rsi:.0f}→{curr_rsi:.0f} | "
+                              f"DWCS={curr_dwcs:.1f} RVOL={rvol:.1f}x")
+
+        return False, ""
+
+    # ------------------------------------------------------------------ #
     # BC signal
     # ------------------------------------------------------------------ #
 
@@ -204,7 +297,7 @@ class MCDXStrategy(BaseStrategy):
 
         conf_pct = abs(curr_dwcs - 50) / 50
 
-        # BUY: Golden Cross (strongest) OR DWCS Bull zone cross + volume confirm
+        # ── Primary BUY: Golden Cross OR DWCS bull zone cross ─────────────
         dwcs_buy_confirmed = dwcs_buy_signal and rvol >= self.rvol_min
         if golden_cross or dwcs_buy_confirmed:
             reason = "Golden Cross" if golden_cross else f"DWCS Bull zone + RVOL={rvol:.1f}x"
@@ -214,10 +307,10 @@ class MCDXStrategy(BaseStrategy):
                 reason=f"[MCDX] {reason} | DWCS={curr_dwcs:.1f} RSI={curr_rsi:.1f}",
                 confidence=min(1.0, 0.5 + conf_pct * 0.5),
                 metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
-                          "rsi": curr_rsi, "rvol": rvol},
+                          "rsi": curr_rsi, "rvol": rvol, "signal": "breakout"},
             )
 
-        # SELL: Death Cross OR DWCS Bear zone cross + volume confirm
+        # ── Primary SELL: Death Cross OR DWCS bear zone cross ────────────
         dwcs_sell_confirmed = dwcs_sell_signal and rvol >= self.rvol_min
         if death_cross or dwcs_sell_confirmed:
             reason = "Death Cross" if death_cross else f"DWCS Bear zone + RVOL={rvol:.1f}x"
@@ -227,7 +320,21 @@ class MCDXStrategy(BaseStrategy):
                 reason=f"[MCDX] {reason} | DWCS={curr_dwcs:.1f} RSI={curr_rsi:.1f}",
                 confidence=min(1.0, 0.5 + conf_pct * 0.5),
                 metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
-                          "rsi": curr_rsi, "rvol": rvol},
+                          "rsi": curr_rsi, "rvol": rvol, "signal": "breakdown"},
+            )
+
+        # ── Secondary BUY: Pullback / Rebound (fires when trend intact) ───
+        pb_sig, pb_reason = self._pullback_rebound(
+            closes, highs, lows, volumes, pc_arr, dwcs, rsi_arr, rvol, curr_dwcs
+        )
+        if pb_sig:
+            return Signal(
+                SignalType.BUY, self.symbol, current_price,
+                amount=self.position_pct,
+                reason=f"[MCDX] {pb_reason}",
+                confidence=min(0.82, 0.42 + conf_pct * 0.40),
+                metadata={"dwcs": curr_dwcs, "pc": curr_pc, "lc": curr_lc,
+                          "rsi": curr_rsi, "rvol": rvol, "signal": "pullback"},
             )
 
         trend = "Bull" if curr_dwcs > 55 else "Bear" if curr_dwcs < 45 else "Neutral"
