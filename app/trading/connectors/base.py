@@ -55,8 +55,15 @@ class BaseConnector(ABC):
 
     @abstractmethod
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: Optional[float] = None) -> OrderResult:
-        """Place an order (or simulate if paper=True)."""
+                           order_type: str = "market", price: Optional[float] = None,
+                           tp_price: Optional[float] = None,
+                           sl_price: Optional[float] = None) -> OrderResult:
+        """Place an order (or simulate if paper=True).
+
+        tp_price / sl_price — when provided and supported by the exchange
+        (currently OKX), the trigger prices are attached inline to the order
+        so TP/SL execute even if the bot goes offline.
+        """
 
     @abstractmethod
     async def cancel_order(self, order_id: str, symbol: str) -> bool:

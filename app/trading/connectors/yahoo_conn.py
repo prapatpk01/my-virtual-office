@@ -113,7 +113,8 @@ class YahooConnector(BaseConnector):
         return {"last": price, "symbol": symbol}
 
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: float = None) -> OrderResult:
+                           order_type: str = "market", price: float = None,
+                           tp_price: float = None, sl_price: float = None) -> OrderResult:
         exec_price = self._price_cache.get(symbol, price or 0.0)
         quote = symbol.split("/")[1] if "/" in symbol else "USDT"
         import uuid as _uuid

@@ -101,7 +101,9 @@ class BinanceConnector(BaseConnector):
 
     async def create_order(self, symbol: str, side: str, amount: float,
                            order_type: str = "market",
-                           price: Optional[float] = None) -> OrderResult:
+                           price: Optional[float] = None,
+                           tp_price: Optional[float] = None,
+                           sl_price: Optional[float] = None) -> OrderResult:
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price)
 
@@ -111,10 +113,25 @@ class BinanceConnector(BaseConnector):
         if order_type == "limit" and price:
             params["price"] = price
 
-        # OKX Spot Margin: must set tdMode and ccy (quote currency) per order
+        # OKX Spot Margin: tdMode + ccy required per order
         if self._exchange_id == "okx" and self._margin_mode:
-            params["tdMode"] = self._margin_mode      # "cross" | "isolated"
+            params["tdMode"] = self._margin_mode
             params["ccy"]    = symbol.split("/")[1] if "/" in symbol else "USDT"
+
+            # Attach TP/SL inline (OKX API v5 — works for spot margin buy orders).
+            # Uses "last" price as trigger; order executes at market (-1).
+            # This keeps TP/SL active on OKX even if the bot goes offline.
+            if side == "buy" and tp_price and sl_price:
+                params["tpTriggerPx"]     = str(round(tp_price, 2))
+                params["tpOrdPx"]         = "-1"       # market order on TP hit
+                params["tpTriggerPxType"] = "last"
+                params["slTriggerPx"]     = str(round(sl_price, 2))
+                params["slOrdPx"]         = "-1"       # market order on SL hit
+                params["slTriggerPxType"] = "last"
+                logger.info(
+                    "OKX order: %s %s %.6f  TP=%.2f  SL=%.2f",
+                    side.upper(), symbol, amount, tp_price, sl_price,
+                )
 
         raw = await self._exchange.create_order(
             symbol, order_type, side, amount, price if order_type == "limit" else None,

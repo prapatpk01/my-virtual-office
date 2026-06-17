@@ -133,7 +133,9 @@ class OANDAConnector(BaseConnector):
 
     async def create_order(self, symbol: str, side: str, amount: float,
                            order_type: str = "market",
-                           price: Optional[float] = None) -> OrderResult:
+                           price: Optional[float] = None,
+                           tp_price: Optional[float] = None,
+                           sl_price: Optional[float] = None) -> OrderResult:
         if self.paper:
             return await self._paper_order(symbol, side, amount)
 
