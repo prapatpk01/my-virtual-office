@@ -76,7 +76,7 @@ def build_config() -> dict:
         "oanda_env":       os.environ.get("OANDA_ENV", "practice"),
         # ── Candles / timing ──────────────────────────────────────────────────
         "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
-        "candle_tf":    os.environ.get("CANDLE_TF", "15m"),       # 15m recommended for BTC intraday
+        "candle_tf":    os.environ.get("CANDLE_TF", "1h"),        # 1h: proven WR for MCDX + Sentinel
         "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         # ── Strategies ────────────────────────────────────────────────────────
@@ -88,15 +88,14 @@ def build_config() -> dict:
         },
         # ── Risk / SL / TP ────────────────────────────────────────────────────
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
-        # BTC 15m 10x margin: SL 0.8%, TP 1.6% (net RR 1:1.77 after 0.25% fees)
-        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.008")),   # 0.8%
-        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.016")),   # 1.6%
+        # BTC 1H 10x margin: SL 1.5%, TP 3.0%
+        # Net RR ~1:1.83 after 0.25% fees | break-even WR = 35%
+        # At 10x: loss ~15% capital | win ~27.5% capital per trade
+        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.015")),   # 1.5%
+        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.030")),   # 3.0%
         # Max 2 positions: 1 per strategy (MCDX + Sentinel)
         "max_positions":   int(os.environ.get("MAX_POSITIONS",     "2")),
         "max_drawdown":    float(os.environ.get("MAX_DRAWDOWN_PCT", "0.30")),
-        # ── Intraday close ────────────────────────────────────────────────────
-        # Close all positions before this UTC hour (0-23). 0 = disabled.
-        "intraday_close_hour": int(os.environ.get("INTRADAY_CLOSE_HOUR", "23")),
         # ── Telegram ──────────────────────────────────────────────────────────
         "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID",   ""),
@@ -202,7 +201,6 @@ def build_crypto_bot(config: dict, telegram):
         broadcast_fn=None, telegram=telegram,
         fixed_sl_pct=config["stop_loss_pct"],
         fixed_tp_pct=config["take_profit_pct"],
-        intraday_close_hour=config.get("intraday_close_hour", 0),
     )
 
 

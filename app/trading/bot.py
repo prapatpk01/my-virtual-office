@@ -67,7 +67,6 @@ class TradingBot:
         state_file: Optional[str] = None,
         fixed_sl_pct: float = 0.0,
         fixed_tp_pct: float = 0.0,
-        intraday_close_hour: int = 0,   # UTC hour to force-close all; 0 = disabled
     ):
         self.connector = connector
         self.strategies = strategies
@@ -79,12 +78,8 @@ class TradingBot:
         self._task: Optional[asyncio.Task] = None
         self._start_balance = 0.0
         self._trade_history: list[TradeRecord] = []
-        # Fixed SL/TP percentages — when set, override signal metadata
-        self.fixed_sl_pct = fixed_sl_pct  # e.g. 0.008 = 0.8%
-        self.fixed_tp_pct = fixed_tp_pct  # e.g. 0.016 = 1.6%
-        # Intraday close: force-close all positions at this UTC hour (0 = disabled)
-        self.intraday_close_hour = intraday_close_hour
-        self._intraday_closed_today: bool = False
+        self.fixed_sl_pct = fixed_sl_pct
+        self.fixed_tp_pct = fixed_tp_pct
         # Persistent signal state — survives restarts
         kwargs = {"path": state_file} if state_file else {}
         self._sig = SignalState(**kwargs)
@@ -142,43 +137,6 @@ class TradingBot:
         except Exception as e:
             logger.error("Manual order failed: %s", e)
 
-    async def _force_close_all(self, reason: str = "intraday_close"):
-        """Market-sell / buy-back all open positions (intraday end-of-day close)."""
-        positions = list(self.risk.get_positions())
-        if not positions:
-            return
-        logger.info("Force-closing %d position(s): reason=%s", len(positions), reason)
-        for pos in positions:
-            sym           = pos["symbol"]
-            strategy_name = pos.get("strategy", "")
-            try:
-                ticker = await self.connector.fetch_ticker(sym)
-                price  = ticker["last"]
-                side   = "sell" if pos["side"] == "long" else "buy"
-                await self.connector.create_order(sym, side, pos["amount"])
-                pnl = (price - pos["entry"]) * pos["amount"] if side == "sell" else 0.0
-                trade = TradeRecord(
-                    timestamp=int(time.time() * 1000),
-                    symbol=sym, side=side,
-                    price=price, amount=pos["amount"],
-                    pnl=pnl, strategy=strategy_name, reason=reason,
-                    paper=self.connector.paper,
-                )
-                self._record_trade(trade)
-                self._sig.record_outcome(
-                    symbol=sym, side=pos["side"],
-                    entry=pos["entry"], exit_price=price,
-                    sl=pos.get("stop_loss"), tp=pos.get("take_profit"),
-                    reason=reason, strategy=strategy_name,
-                )
-                self._sig.unlock_strategy(sym, strategy_name)
-                self.risk.close_position(sym, strategy=strategy_name)
-                logger.info("Force-closed %s [%s] @ %.2f  PnL=%.2f", sym, strategy_name, price, pnl)
-                if self.telegram:
-                    self.telegram.notify_trade(trade.__dict__)
-            except Exception as e:
-                logger.error("Force-close failed for %s: %s", sym, e)
-
     # ------------------------------------------------------------------
     # Core loop
     # ------------------------------------------------------------------
@@ -201,18 +159,6 @@ class TradingBot:
     async def _tick(self):
         self.state.error = ""
         await self._refresh_balance()
-
-        # ── Intraday close: force-exit all positions before INTRADAY_CLOSE_HOUR UTC ──
-        if self.intraday_close_hour > 0:
-            import datetime as _dt
-            utc_now = _dt.datetime.now(_dt.timezone.utc)
-            is_close_window = utc_now.hour == self.intraday_close_hour
-            if is_close_window and not self._intraday_closed_today:
-                await self._force_close_all("intraday_close")
-                self._intraday_closed_today = True
-                logger.info("Intraday close complete at %s UTC", utc_now.strftime("%H:%M"))
-            elif not is_close_window and self._intraday_closed_today:
-                self._intraday_closed_today = False   # reset for next day
 
         if not self.risk.check_drawdown(self.state.total_balance):
             logger.warning("Max drawdown hit — bot paused")
