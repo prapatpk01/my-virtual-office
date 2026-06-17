@@ -98,7 +98,7 @@ class TelegramNotifier:
         sig_type = signal_dict.get("type", "hold")
         if sig_type == "hold":
             return
-        conf = signal_dict.get("confidence", 0)
+        conf = signal_dict.get("confidence") or 0
         if conf < self.min_confidence:
             return
         emoji  = "🟢" if sig_type == "buy" else "🔴"
@@ -225,7 +225,7 @@ class TelegramNotifier:
         self.notify(text)
 
     def notify_drawdown_halt(self, balance: float, peak: float):
-        dd = (peak - balance) / peak * 100
+        dd = (peak - balance) / peak * 100 if peak else 0.0
         text = (
             f"⚠️ *Max Drawdown Reached — Trading Halted*\n"
             f"Balance: `${balance:,.2f}` (peak `${peak:,.2f}`)\n"

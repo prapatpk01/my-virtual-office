@@ -192,10 +192,17 @@ class BinanceConnector(BaseConnector):
         position so the bot can clean up its internal state without placing a
         redundant SELL order (which would open an unwanted short).
 
-        Returns empty set for paper mode or non-OKX exchanges (caller skips sync).
+        Returns None for paper/non-OKX exchanges OR on API error — the caller
+        treats None as "could not determine, skip sync". An empty set is only
+        returned when the API call succeeds and genuinely reports zero open
+        positions; that legitimately means everything closed on the exchange.
+
+        CRITICAL: never return an empty set on failure. The bot interprets an
+        empty set as "all positions closed" and would wipe every tracked
+        position — a transient network/rate-limit error must not do that.
         """
         if self.paper or self._exchange_id != "okx" or self.leverage <= 1:
-            return set()
+            return None
         try:
             # OKX margin positions require instType=MARGIN (not SWAP/FUTURES)
             raw = await self._exchange.fetch_positions(
@@ -213,7 +220,7 @@ class BinanceConnector(BaseConnector):
             import logging
             logging.getLogger("binance_conn").warning(
                 "fetch_positions failed (skipping sync): %s", e)
-            return set()
+            return None
 
     async def close(self):
         await self._exchange.close()
