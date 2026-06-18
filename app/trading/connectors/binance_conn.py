@@ -114,13 +114,17 @@ class BinanceConnector(BaseConnector):
                 f"Set TRADE_AMOUNT_USDT >= {needed}."
             )
 
-        # Main order — tdMode=cross ALWAYS for OKX Unified Account
+        # Main order — tdMode=cross ALWAYS for OKX Unified Account.
+        # tgtCcy=base_ccy: for market BUY, OKX default tgtCcy is quote_ccy (USDT),
+        # so OKX would interpret sz=0.001558 as $0.001558 USDT → error 51020.
+        # Setting base_ccy explicitly tells OKX sz is in BTC for all order types.
         req: dict = {
             "instId": inst_id,
             "tdMode": "cross",
             "side": side,
             "ordType": order_type,
             "sz": sz_str,
+            "tgtCcy": "base_ccy",
         }
         if order_type == "limit" and price:
             req["px"] = self._exchange.price_to_precision(symbol, price)
