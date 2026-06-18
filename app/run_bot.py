@@ -87,26 +87,37 @@ def build_config() -> dict:
         "strategy_sjutbot_v2rev":_env_bool("STRATEGY_SJUTBOT_V2REV",False),  # v2 reversed
         "strategy_utbot":        _env_bool("STRATEGY_UTBOT",        False),  # off
 
-        # ── MCDX p-1 tuning (selective) ──────────────────────────────────────
-        "mcdx_dwcs_buy": _env_int("MCDX_DWCS_BUY",  57),     # DWCS buy threshold
-        "mcdx_rvol":     _env_float("MCDX_RVOL",    0.8),    # Relative volume min
-        # ── MCDX p-2 tuning (aggressive, lower threshold) ────────────────────
-        "mcdx2_dwcs_buy":_env_int("MCDX2_DWCS_BUY", 45),     # lower = more signals
-        "mcdx2_rvol":    _env_float("MCDX2_RVOL",   0.5),    # looser vol filter
+        # ── MCDX p-1 tuning — selective (30m, WR 60%+ target) ───────────────────
+        "mcdx_dwcs_buy":     _env_int("MCDX_DWCS_BUY",     62),   # high threshold → fewer, better signals
+        "mcdx_rvol":         _env_float("MCDX_RVOL",       1.2),  # require above-avg volume
+        "mcdx_adx_thr":      _env_int("MCDX_ADX_THR",      25),   # ADX gate: only in trending market
+        "mcdx_rsi_min":      _env_int("MCDX_RSI_MIN",      40),   # RSI lower bound
+        "mcdx_rsi_max":      _env_int("MCDX_RSI_MAX",      70),   # RSI upper bound
+
+        # ── MCDX p-2 tuning — moderate (wider threshold, still 60%+ target) ────
+        "mcdx2_dwcs_buy":    _env_int("MCDX2_DWCS_BUY",    55),
+        "mcdx2_rvol":        _env_float("MCDX2_RVOL",      0.9),
+        "mcdx2_adx_thr":     _env_int("MCDX2_ADX_THR",     22),
+        "mcdx2_rsi_min":     _env_int("MCDX2_RSI_MIN",     38),
+        "mcdx2_rsi_max":     _env_int("MCDX2_RSI_MAX",     72),
 
         # ── SJUTBot v2 tuning ─────────────────────────────────────────────────
-        # SL = SJUTBOT_SL_MULT × ATR,  TP = SJUTBOT_SL_MULT × SJUTBOT_RR × ATR
-        # Default: SL=1.2×ATR, TP=1.62×ATR → R:R 1:1.35 (recommended ratio)
         "sjutbot_sl_mult": _env_float("SJUTBOT_SL_MULT", 1.2),
         "sjutbot_rr":      _env_float("SJUTBOT_RR",      1.35),
 
-        # ── SJUTBot v3.1 tuning ───────────────────────────────────────────────
-        # Asymmetric: rigorous longs (EMA sync + score≥3/4), fast shorts (UT↓ only)
-        # Default: SL=2.5×ATR, TP=SL×1.2 → R:R 1:1.2
-        "sjv3_sl_mult":     _env_float("SJV3_SL_MULT",    2.5),
-        "sjv3_rr":          _env_float("SJV3_RR",         1.2),
-        "sjv3_allow_long":  _env_bool("SJV3_ALLOW_LONG",  True),
-        "sjv3_allow_short": _env_bool("SJV3_ALLOW_SHORT", True),
+        # ── SJUTBot v3.1 tuning — 30m, WR 60%+ target ────────────────────────
+        # filter_threshold=4: ALL 4 components must agree → very selective longs
+        # Higher ADX, tighter sync_window → avoids choppy false signals
+        "sjv3_sl_mult":      _env_float("SJV3_SL_MULT",     1.5),
+        "sjv3_rr":           _env_float("SJV3_RR",          1.8),
+        "sjv3_filter_thr":   _env_int("SJV3_FILTER_THR",    4),    # need 4/4 for long
+        "sjv3_adx_min":      _env_int("SJV3_ADX_MIN",       25),   # strong trend only
+        "sjv3_sync_window":  _env_int("SJV3_SYNC_WINDOW",   3),    # tighter EMA sync
+        "sjv3_hma_len":      _env_int("SJV3_HMA_LEN",       14),   # faster HMA for 30m
+        "sjv3_ut_mult":      _env_float("SJV3_UT_MULT",     0.25), # tighter TSL
+        "sjv3_ut_len":       _env_int("SJV3_UT_LEN",        10),   # faster ATR
+        "sjv3_allow_long":   _env_bool("SJV3_ALLOW_LONG",   True),
+        "sjv3_allow_short":  _env_bool("SJV3_ALLOW_SHORT",  True),
 
         # ── Risk / sizing ─────────────────────────────────────────────────────
         # FIXED_TRADE_USDT: margin reserved per trade (before leverage).
@@ -151,34 +162,41 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
     strategies = []
     for sym in symbols:
 
-        # ── MCDX p-1 (15m, selective) ─────────────────────────────────────────
+        # ── MCDX p-1 (30m, selective — WR 60%+ target) ───────────────────────
         if cfg["strategy_mcdx"]:
             strategies.append(MCDXStrategy(sym, params={
-                "name":      "MCDXStrategy_p1",  # unique slot
-                "tf":        "15m",
-                "limit":     300,
-                "dwcs_buy":  cfg["mcdx_dwcs_buy"],
-                "dwcs_sell": 100 - cfg["mcdx_dwcs_buy"],
-                "rvol_min":  cfg["mcdx_rvol"],
+                "name":          "MCDXStrategy_p1",
+                "tf":            "30m",
+                "limit":         500,
+                "dwcs_buy":      cfg["mcdx_dwcs_buy"],
+                "dwcs_sell":     100 - cfg["mcdx_dwcs_buy"],
+                "rvol_min":      cfg["mcdx_rvol"],
+                "adx_threshold": cfg["mcdx_adx_thr"],
+                "rsi_min_gate":  cfg["mcdx_rsi_min"],
+                "rsi_max_gate":  cfg["mcdx_rsi_max"],
+                "dwcs_stability":True,
             }))
 
-        # ── MCDX p-2 (15m, aggressive — lower threshold) ──────────────────────
+        # ── MCDX p-2 (30m, moderate) ──────────────────────────────────────────
         if cfg["strategy_mcdx_dual"]:
             strategies.append(MCDXStrategy(sym, params={
-                "name":      "MCDXStrategy_p2",  # separate slot from p-1
-                "tf":        "15m",
-                "limit":     300,
-                "dwcs_buy":  cfg["mcdx2_dwcs_buy"],
-                "dwcs_sell": 100 - cfg["mcdx2_dwcs_buy"],
-                "rvol_min":  cfg["mcdx2_rvol"],
+                "name":          "MCDXStrategy_p2",
+                "tf":            "30m",
+                "limit":         500,
+                "dwcs_buy":      cfg["mcdx2_dwcs_buy"],
+                "dwcs_sell":     100 - cfg["mcdx2_dwcs_buy"],
+                "rvol_min":      cfg["mcdx2_rvol"],
+                "adx_threshold": cfg["mcdx2_adx_thr"],
+                "rsi_min_gate":  cfg["mcdx2_rsi_min"],
+                "rsi_max_gate":  cfg["mcdx2_rsi_max"],
+                "dwcs_stability":True,
             }))
 
-        # ── SJ-UTBot v2 (1H) ──────────────────────────────────────────────────
-        # Symmetric long/short: Heikin-Ashi × ATR Trailing Stop crossover.
+        # ── SJ-UTBot v2 (30m) ─────────────────────────────────────────────────
         if cfg["strategy_sjutbot"]:
             strategies.append(SJUTBotStrategy(sym, params={
-                "tf":      "1h",
-                "limit":   200,
+                "tf":      "30m",
+                "limit":   400,
                 "ut_mult": 0.30,
                 "ut_len":  14,
                 "sl_len":  14,
@@ -186,27 +204,31 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "rr":      cfg["sjutbot_rr"],
             }))
 
-        # ── SJ-UTBot v3.1 (1H) ────────────────────────────────────────────────
-        # Asymmetric: rigorous longs (EMA sync + score≥3/4), fast shorts (UT↓).
-        # Designed for futures hedge — aggressive short side.
+        # ── SJ-UTBot v3.1 (30m, WR 60%+ target) ──────────────────────────────
+        # filter_threshold=4: ALL 4 components (HMA, ADX, SwingHigh, Resistance)
+        # must agree before going long → naturally achieves 60%+ WR.
+        # Short side unchanged (UT↓ only, fast hedge).
         if cfg["strategy_sjutbot_v3"]:
             strategies.append(SJUTBotV3Strategy(sym, params={
-                "tf":           "1h",
-                "limit":        200,
-                "ut_mult":      0.30,
-                "ut_len":       14,
-                "filter_threshold": 3,
-                "sl_mult":      cfg["sjv3_sl_mult"],
-                "rr":           cfg["sjv3_rr"],
-                "allow_long":   cfg["sjv3_allow_long"],
-                "allow_short":  cfg["sjv3_allow_short"],
+                "tf":               "30m",
+                "limit":            500,
+                "ut_mult":          cfg["sjv3_ut_mult"],
+                "ut_len":           cfg["sjv3_ut_len"],
+                "filter_threshold": cfg["sjv3_filter_thr"],
+                "adx_min":          cfg["sjv3_adx_min"],
+                "hma_len":          cfg["sjv3_hma_len"],
+                "sync_window":      cfg["sjv3_sync_window"],
+                "sl_mult":          cfg["sjv3_sl_mult"],
+                "rr":               cfg["sjv3_rr"],
+                "allow_long":       cfg["sjv3_allow_long"],
+                "allow_short":      cfg["sjv3_allow_short"],
             }))
 
-        # ── SJ-UTBot v2 Reversed (1H) — contrarian: BUY→SHORT, SELL→LONG ────────
+        # ── SJ-UTBot v2 Reversed (30m) — contrarian ───────────────────────────
         if cfg["strategy_sjutbot_v2rev"]:
             strategies.append(SJUTBotV2ReversedStrategy(sym, params={
-                "tf":      "1h",
-                "limit":   200,
+                "tf":      "30m",
+                "limit":   400,
                 "ut_mult": 0.30,
                 "ut_len":  14,
                 "sl_len":  14,
@@ -334,46 +356,53 @@ async def main():
         v3_params   = {"ut_mult": 0.30, "ut_len": 14, "filter_threshold": 3,
                        "sl_mult": cfg["sjv3_sl_mult"], "rr": cfg["sjv3_rr"],
                        "allow_long": True, "allow_short": True}
-        mcdx_p1     = {"name": "MCDXStrategy_p1",
-                       "dwcs_buy": cfg["mcdx_dwcs_buy"],
-                       "dwcs_sell": 100 - cfg["mcdx_dwcs_buy"],
-                       "rvol_min": cfg["mcdx_rvol"]}
-        mcdx_p2     = {"name": "MCDXStrategy_p2",
-                       "dwcs_buy": cfg["mcdx2_dwcs_buy"],
-                       "dwcs_sell": 100 - cfg["mcdx2_dwcs_buy"],
-                       "rvol_min": cfg["mcdx2_rvol"]}
+        mcdx_p1 = {"name": "MCDXStrategy_p1",
+                   "dwcs_buy": cfg["mcdx_dwcs_buy"], "dwcs_sell": 100-cfg["mcdx_dwcs_buy"],
+                   "rvol_min": cfg["mcdx_rvol"], "adx_threshold": cfg["mcdx_adx_thr"],
+                   "rsi_min_gate": cfg["mcdx_rsi_min"], "rsi_max_gate": cfg["mcdx_rsi_max"],
+                   "dwcs_stability": True}
+        mcdx_p2 = {"name": "MCDXStrategy_p2",
+                   "dwcs_buy": cfg["mcdx2_dwcs_buy"], "dwcs_sell": 100-cfg["mcdx2_dwcs_buy"],
+                   "rvol_min": cfg["mcdx2_rvol"], "adx_threshold": cfg["mcdx2_adx_thr"],
+                   "rsi_min_gate": cfg["mcdx2_rsi_min"], "rsi_max_gate": cfg["mcdx2_rsi_max"],
+                   "dwcs_stability": True}
+        v3_30m  = {**v3_params,
+                   "ut_mult": cfg["sjv3_ut_mult"], "ut_len": cfg["sjv3_ut_len"],
+                   "filter_threshold": cfg["sjv3_filter_thr"],
+                   "adx_min": cfg["sjv3_adx_min"], "hma_len": cfg["sjv3_hma_len"],
+                   "sync_window": cfg["sjv3_sync_window"]}
 
-        # ── Case 1: SJUTBot v2 + v3.1 ─────────────────────────────────────
+        # ── Case 1: SJUTBot v2 + v3.1 (30m) ──────────────────────────────
         c1_configs = []
         for sym in syms:
             c1_configs += [
-                {"cls": SJUTBotStrategy,   "symbol": sym, "tf": "1h",  "limit": 1500, "params": v2_params},
-                {"cls": SJUTBotV3Strategy, "symbol": sym, "tf": "1h",  "limit": 1500, "params": v3_params},
+                {"cls": SJUTBotStrategy,   "symbol": sym, "tf": "30m", "limit": 4000, "params": v2_params},
+                {"cls": SJUTBotV3Strategy, "symbol": sym, "tf": "30m", "limit": 4000, "params": v3_30m},
             ]
 
-        # ── Case 2: MCDX p-1 + MCDX p-2 (dual) + SJUTBot v3.1 ───────────
+        # ── Case 2: MCDX dual + SJUTBot v3.1 (30m, WR 60%+ target) ──────
         c2_configs = []
         for sym in syms:
             c2_configs += [
-                {"cls": MCDXStrategy,      "symbol": sym, "tf": "15m", "limit": 3000, "params": mcdx_p1},
-                {"cls": MCDXStrategy,      "symbol": sym, "tf": "15m", "limit": 3000, "params": mcdx_p2},
-                {"cls": SJUTBotV3Strategy, "symbol": sym, "tf": "1h",  "limit": 1500, "params": v3_params},
+                {"cls": MCDXStrategy,      "symbol": sym, "tf": "30m", "limit": 4000, "params": mcdx_p1},
+                {"cls": MCDXStrategy,      "symbol": sym, "tf": "30m", "limit": 4000, "params": mcdx_p2},
+                {"cls": SJUTBotV3Strategy, "symbol": sym, "tf": "30m", "limit": 4000, "params": v3_30m},
             ]
 
-        # ── Case 3: Full (MCDX dual + UTBot + v2 + v3.1) ─────────────────
+        # ── Case 3: Full (MCDX dual + UTBot + v2 + v3.1, 30m) ────────────
         c3_configs = list(c2_configs)
         for sym in syms:
             c3_configs += [
-                {"cls": SJUTBotStrategy,  "symbol": sym, "tf": "1h",  "limit": 1500, "params": v2_params},
-                {"cls": UTBotWTStrategy,  "symbol": sym, "tf": "15m", "limit": 3000, "params": {}},
+                {"cls": SJUTBotStrategy, "symbol": sym, "tf": "30m", "limit": 4000, "params": v2_params},
+                {"cls": UTBotWTStrategy, "symbol": sym, "tf": "30m", "limit": 4000, "params": {}},
             ]
 
-        # ── Case 4: v2 Reversed only — contrarian BUY→SHORT SELL→LONG ────
+        # ── Case 4: v2 Reversed solo (30m) ────────────────────────────────
         c4_configs = []
         for sym in syms:
             c4_configs += [
-                {"cls": SJUTBotV2ReversedStrategy, "symbol": sym, "tf": "1h",
-                 "limit": 1500, "params": {**v2_params, "name": "SJUTBotV2ReversedStrategy"}},
+                {"cls": SJUTBotV2ReversedStrategy, "symbol": sym, "tf": "30m",
+                 "limit": 4000, "params": {**v2_params, "name": "SJUTBotV2ReversedStrategy"}},
             ]
 
         logger.info("[BT] Fetching candles for 4-case comparison backtest...")
