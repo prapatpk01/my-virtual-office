@@ -37,13 +37,17 @@ TIMEFRAME   = "1h"
 MONTHS      = 5
 CAPITAL     = 260.0
 TRADE_USD   = 100.0
-FEE_RATE    = 0.001          # 0.1% OKX taker per leg
-SL_MULT     = 2.5            # SL = SL_MULT × ATR14
-TP_RR       = 1.2            # TP = SL × TP_RR
-HMA_PERIOD  = 20
+FEE_RATE    = 0.001
 EMA_PERIOD  = 5
 SMA_PERIOD  = 9
-MAX_BARS_IN = 120            # max bars to hold a position (timeout)
+MAX_BARS_IN = 120
+
+# Per-strategy tuned params (from backtest_hma_optimize.py grid search)
+# CROSS_BARS: look-back bars for EMA5 cross SMA9;  0 = "EMA5 > SMA9" (no strict cross)
+STRATEGY_PARAMS = {
+    "WTADXStrategy": dict(hma_period=100, sl_mult=2.5, tp_rr=2.0, cross_bars=0),
+    "UTBotStrategy": dict(hma_period=50,  sl_mult=2.0, tp_rr=1.5, cross_bars=3),
+}
 
 # ─── Fetch real data ──────────────────────────────────────────────────────────
 
@@ -129,8 +133,8 @@ def fetch_candles() -> list:
 
 # ─── Indicator helpers ────────────────────────────────────────────────────────
 
-def hma20(closes: list) -> np.ndarray:
-    return BaseStrategy.hma(closes, HMA_PERIOD)
+def hma_n(closes: list, period: int) -> np.ndarray:
+    return BaseStrategy.hma(closes, period)
 
 def ema5(closes: list) -> np.ndarray:
     return BaseStrategy.ema(closes, EMA_PERIOD)
@@ -144,9 +148,11 @@ def sma9(closes: list) -> np.ndarray:
 def run_strategy(name: str, candles: list,
                  buy_sig: np.ndarray, sell_sig: np.ndarray,
                  atr14: np.ndarray,
-                 hma_a: np.ndarray, ema5_a: np.ndarray, sma9_a: np.ndarray):
+                 hma_a: np.ndarray, ema5_a: np.ndarray, sma9_a: np.ndarray,
+                 sl_mult: float, tp_rr: float, cross_bars: int):
     """
     Returns list of trade dicts. Entry = close of signal bar.
+    cross_bars: 0 = "EMA5 > SMA9" (loose), >0 = strict cross within N bars.
     """
     n       = len(candles)
     closes  = np.array([c.close for c in candles])
@@ -161,26 +167,20 @@ def run_strategy(name: str, candles: list,
     entry_px  = 0.0
     sl_px     = 0.0
     tp_px     = 0.0
-    amount    = 0.0        # BTC amount
-    pending_hma_exit = False   # flag: prev close < HMA20, check next open
+    amount    = 0.0
+    pending_hma_exit = False
 
-    # Warmup: need at least HMA + ATR + strategy warmup bars
-    warmup = max(HMA_PERIOD * 2 + 10, SL_MULT * 2 + ATR_WARMUP(atr14))
+    valid_hma = np.where(~np.isnan(hma_a))[0]
+    warmup    = max(int(valid_hma[0]) + 10 if len(valid_hma) else 50,
+                   ATR_WARMUP(atr14) + 10)
 
     for i in range(int(warmup), n - 1):
         c_close = float(closes[i])
         c_high  = float(highs[i])
         c_low   = float(lows[i])
+        hma_v   = float(hma_a[i])
 
-        hma_v  = float(hma_a[i])
-        hma_p  = float(hma_a[i - 1]) if i > 0 else hma_v
-
-        ema5_v  = float(ema5_a[i])
-        ema5_p  = float(ema5_a[i - 1]) if i > 0 else ema5_v
-        sma9_v  = float(sma9_a[i])
-        sma9_p  = float(sma9_a[i - 1]) if i > 0 else sma9_v
-
-        if any(math.isnan(x) for x in [hma_v, ema5_v, sma9_v]):
+        if any(math.isnan(x) for x in [hma_v, float(ema5_a[i]), float(sma9_a[i])]):
             continue
 
         # ── If in position ────────────────────────────────────────────
@@ -188,7 +188,7 @@ def run_strategy(name: str, candles: list,
             exit_px   = None
             exit_type = None
 
-            # Pending HMA exit from previous bar close < HMA20
+            # Pending HMA exit: prev close < HMA → exit at next open if also < HMA
             if pending_hma_exit and i < n:
                 next_open = float(opens[i])
                 if next_open < float(hma_a[i]):
@@ -196,7 +196,6 @@ def run_strategy(name: str, candles: list,
                     exit_type = "hma_break"
                 pending_hma_exit = False
 
-            # Check TP/SL on this bar (before close-based exits)
             if exit_px is None:
                 if c_high >= tp_px:
                     exit_px   = tp_px
@@ -205,17 +204,14 @@ def run_strategy(name: str, candles: list,
                     exit_px   = sl_px
                     exit_type = "sl"
 
-            # Strategy SELL signal
             if exit_px is None and bool(sell_sig[i]):
                 exit_px   = c_close
                 exit_type = "sell_signal"
 
-            # Timeout
             if exit_px is None and (i - entry_bar) >= MAX_BARS_IN:
                 exit_px   = c_close
                 exit_type = "timeout"
 
-            # HMA close exit — flag for next bar
             if exit_px is None and c_close < hma_v:
                 pending_hma_exit = True
 
@@ -239,38 +235,40 @@ def run_strategy(name: str, candles: list,
                 })
                 in_pos = False
                 pending_hma_exit = False
-            continue   # don't enter a new trade on an exit bar
+            continue
 
-        # ── Entry logic ───────────────────────────────────────────────
+        # ── Entry filters ─────────────────────────────────────────────
         if not bool(buy_sig[i]):
             continue
 
-        # Filter 1: previous candle close > HMA20
+        # Filter 1: previous candle close > HMA
         prev_close = float(closes[i - 1])
         if prev_close <= float(hma_a[i - 1]):
             continue
 
-        # Filter 2: EMA5 crosses above SMA9 within last 3 bars (fresh cross)
-        crossed = False
-        for k in range(max(1, i - 2), i + 1):
-            if (float(ema5_a[k - 1]) <= float(sma9_a[k - 1]) and
-                    float(ema5_a[k]) > float(sma9_a[k])):
-                crossed = True
-                break
-        if not crossed:
-            continue
+        # Filter 2: EMA5 cross / above SMA9
+        if cross_bars == 0:
+            if float(ema5_a[i]) <= float(sma9_a[i]):
+                continue
+        else:
+            crossed = False
+            for k in range(max(1, i - cross_bars + 1), i + 1):
+                if (float(ema5_a[k - 1]) <= float(sma9_a[k - 1]) and
+                        float(ema5_a[k]) > float(sma9_a[k])):
+                    crossed = True
+                    break
+            if not crossed:
+                continue
 
-        # Entry
         atr_v = float(atr14[i])
         if math.isnan(atr_v) or atr_v <= 0:
             continue
 
         entry_px = c_close
-        sl_px    = round(entry_px - SL_MULT * atr_v, 2)
-        tp_px    = round(entry_px + SL_MULT * TP_RR * atr_v, 2)
+        sl_px    = round(entry_px - sl_mult * atr_v, 2)
+        tp_px    = round(entry_px + sl_mult * tp_rr * atr_v, 2)
         amount   = TRADE_USD / entry_px
-        fee_in   = entry_px * amount * FEE_RATE
-        capital -= fee_in
+        capital -= entry_px * amount * FEE_RATE
         in_pos   = True
         entry_bar = i
         pending_hma_exit = False
@@ -285,7 +283,7 @@ def ATR_WARMUP(atr14: np.ndarray) -> int:
 
 # ─── Report ───────────────────────────────────────────────────────────────────
 
-def print_report(name: str, trades: list, n_bars: int):
+def print_report(name: str, trades: list, n_bars: int, params: dict):
     W = 70
     if not trades:
         print(f"\n  [{name}] No trades fired.\n")
@@ -313,11 +311,18 @@ def print_report(name: str, trades: list, n_bars: int):
     for t in trades:
         exit_counts[t["type"]] = exit_counts.get(t["type"], 0) + 1
 
+    hma_p     = params["hma_period"]
+    sl_mult   = params["sl_mult"]
+    tp_rr     = params["tp_rr"]
+    cross_b   = params["cross_bars"]
+    cross_desc = (f"EMA{EMA_PERIOD}>SMA{SMA_PERIOD}"
+                  if cross_b == 0
+                  else f"EMA{EMA_PERIOD} cross SMA{SMA_PERIOD} ({cross_b} bars)")
+
     print(f"\n{'═'*W}")
     print(f"  {name}  |  {SYMBOL} {TIMEFRAME}  |  {MONTHS}-month  |  "
-          f"${TRADE_USD}/trade  |  SL={SL_MULT}×ATR  TP={TP_RR}R")
-    print(f"  Filters: prev_close > HMA{HMA_PERIOD}  |  "
-          f"EMA{EMA_PERIOD} cross SMA{SMA_PERIOD} (within 3 bars)")
+          f"${TRADE_USD}/trade  |  SL={sl_mult}×ATR  TP={tp_rr}R")
+    print(f"  Filters: prev_close > HMA{hma_p}  |  {cross_desc}")
     print(f"{'─'*W}")
     print(f"  Total trades : {total}")
     print(f"  Win / Loss   : {len(wins)}W / {len(losses)}L  →  WR {wr:.1f}%")
@@ -336,7 +341,7 @@ def print_report(name: str, trades: list, n_bars: int):
     print(f"\n  {'#':<4} {'Entry':>10} {'Exit':>10} {'SL':>10} {'TP':>10} "
           f"{'PnL $':>8} {'PnL%':>7} {'Type':<14} {'Balance':>9}")
     print(f"  {'─'*W}")
-    for idx, t in enumerate(trades[-30:], 1):   # last 30 trades
+    for idx, t in enumerate(trades[-30:], 1):
         arrow = "✓" if t["pnl_net"] > 0 else "✗"
         print(f"  {idx:<4} {t['entry']:>10,.2f} {t['exit']:>10,.2f} "
               f"{t['sl']:>10,.2f} {t['tp']:>10,.2f} "
@@ -351,10 +356,14 @@ def print_report(name: str, trades: list, n_bars: int):
 
 def main():
     print("\n" + "═"*70)
-    print(f"  HMA{HMA_PERIOD}/EMA{EMA_PERIOD}-SMA{SMA_PERIOD} Backtest  |  "
-          f"WTADXStrategy + UTBotStrategy")
+    print(f"  HMA Filter Backtest  |  WTADXStrategy + UTBotStrategy")
     print(f"  {SYMBOL} {TIMEFRAME}  |  last {MONTHS} months  |  "
           f"${CAPITAL:.0f} capital  |  ${TRADE_USD}/trade")
+    print(f"  Per-strategy params from grid search (backtest_hma_optimize.py)")
+    for sname, p in STRATEGY_PARAMS.items():
+        cl = "EMA>SMA" if p["cross_bars"] == 0 else f"cross{p['cross_bars']}"
+        print(f"    {sname}: HMA={p['hma_period']} SL={p['sl_mult']}×ATR "
+              f"TP={p['tp_rr']}R  CROSS={cl}")
     print("═"*70)
 
     candles = fetch_candles()
@@ -362,16 +371,20 @@ def main():
         print("ERROR: Not enough candles fetched.")
         sys.exit(1)
 
-    n = len(candles)
+    n      = len(candles)
     closes = [c.close for c in candles]
 
     print(f"\n  Computing indicators on {n} bars...")
-
-    # Shared indicators
-    hma_a  = hma20(closes)
     ema5_a = ema5(closes)
     sma9_a = sma9(closes)
     atr14  = BaseStrategy.atr(candles, 14)
+
+    # Pre-compute one HMA per unique period needed
+    hma_cache = {}
+    for p in STRATEGY_PARAMS.values():
+        hp = p["hma_period"]
+        if hp not in hma_cache:
+            hma_cache[hp] = hma_n(closes, hp)
 
     # ── WTADXStrategy signals ──────────────────────────────────────────
     wt_strat = WTADXStrategy(SYMBOL)
@@ -381,30 +394,35 @@ def main():
     ut_strat = UTBotStrategy(SYMBOL)
     ut_buy, ut_sell, ut_tsl, ut_atr = ut_strat._build_signals(candles)
 
-    # ── Run backtests ──────────────────────────────────────────────────
+    # ── Run backtests with per-strategy params ─────────────────────────
+    wt_p = STRATEGY_PARAMS["WTADXStrategy"]
+    ut_p = STRATEGY_PARAMS["UTBotStrategy"]
+
     print("\n  Running WTADXStrategy backtest...")
     wt_trades = run_strategy(
         "WTADXStrategy", candles,
         wt_buy.astype(bool), wt_sell.astype(bool), wt_atr,
-        hma_a, ema5_a, sma9_a,
+        hma_cache[wt_p["hma_period"]], ema5_a, sma9_a,
+        wt_p["sl_mult"], wt_p["tp_rr"], wt_p["cross_bars"],
     )
 
     print("  Running UTBotStrategy backtest...")
     ut_trades = run_strategy(
         "UTBotStrategy", candles,
         ut_buy.astype(bool), ut_sell.astype(bool), ut_atr,
-        hma_a, ema5_a, sma9_a,
+        hma_cache[ut_p["hma_period"]], ema5_a, sma9_a,
+        ut_p["sl_mult"], ut_p["tp_rr"], ut_p["cross_bars"],
     )
 
-    # ── Combined stats ─────────────────────────────────────────────────
-    print_report("WTADXStrategy", wt_trades, n)
-    print_report("UTBotStrategy", ut_trades, n)
+    # ── Reports ────────────────────────────────────────────────────────
+    print_report("WTADXStrategy", wt_trades, n, wt_p)
+    print_report("UTBotStrategy", ut_trades, n, ut_p)
 
     # ── Combined summary ───────────────────────────────────────────────
     all_trades = sorted(wt_trades + ut_trades, key=lambda t: t["entry_bar"])
     if all_trades:
         print(f"\n{'═'*70}")
-        print(f"  COMBINED SUMMARY  (both strategies, independent)")
+        print(f"  COMBINED SUMMARY  (both strategies, independent, own params)")
         print(f"{'─'*70}")
         total = len(all_trades)
         wins  = sum(1 for t in all_trades if t["pnl_net"] > 0)
@@ -413,6 +431,8 @@ def main():
         print(f"  Total trades: {total}  |  WR: {wr:.1f}%  |  Net P/L: ${net:+.2f}")
         print(f"  (WTADXStrategy: {len(wt_trades)} trades  |  "
               f"UTBotStrategy: {len(ut_trades)} trades)")
+        print(f"\n  NOTE: Results on SYNTHETIC data — network-restricted environment.")
+        print(f"  Run locally with real BTC data for accurate results.")
         print(f"{'═'*70}\n")
 
 
