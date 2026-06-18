@@ -127,7 +127,6 @@ REJECT if: price action is choppy/ranging, RSI is overbought (>75) or diverging,
             response = await client.messages.create(
                 model=self.model,
                 max_tokens=300,
-                thinking={"type": "adaptive"},
                 messages=[{"role": "user", "content": prompt}],
             )
 
