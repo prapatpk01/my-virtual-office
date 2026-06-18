@@ -57,16 +57,20 @@ class UTBotStrategy(BaseStrategy):
     # ── Signal arrays ──────────────────────────────────────────────
 
     def _build_signals(self, candles: list):
-        """Returns (buy_sig, sell_sig, tsl, atr14)."""
+        """Returns (buy_sig, sell_sig, tsl, atr14).
+
+        Matches Pine Script exactly:
+          - HA close used as TSL source (src = ha_c)
+          - ATR computed on ORIGINAL candles (ta.atr() in Pine uses real OHLC, not HA)
+        """
         ha_candles, _, ha_c = self._heikin_ashi(candles)
 
         n      = len(candles)
-        closes = ha_c
-        highs  = np.array([c.high for c in ha_candles], dtype=float)
-        lows   = np.array([c.low  for c in ha_candles], dtype=float)
+        closes = ha_c   # HA close → TSL crossover signal (Pine: src = ha_c)
 
-        ut_atr = np.array(self.atr(ha_candles, self.ut_atr_len), dtype=float)
-        atr14  = np.array(self.atr(ha_candles, _ATR_PERIOD),     dtype=float)
+        # ATR on original candles — matches Pine Script ta.atr() on non-HA chart
+        ut_atr = np.array(self.atr(candles, self.ut_atr_len), dtype=float)
+        atr14  = np.array(self.atr(candles, _ATR_PERIOD),     dtype=float)
         tsl    = self._trailing_stop(closes, ut_atr)
 
         buy_sig  = np.zeros(n, dtype=bool)
