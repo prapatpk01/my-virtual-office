@@ -6,6 +6,7 @@ import os
 import time
 from typing import Optional
 
+from .claude_analyzer import ClaudeAnalyzer
 from .connectors.base import BaseConnector
 from .risk_manager import RiskManager, Position
 from .strategies.base import BaseStrategy, Signal, SignalType
@@ -37,6 +38,7 @@ class TradingBot:
         candle_tf: str = "1h",
         candle_limit: int = 200,
         mtf_gate: bool = False,
+        use_ai_gate: Optional[bool] = None,
     ):
         self.connector = connector
         self.strategies = strategies
@@ -48,6 +50,13 @@ class TradingBot:
         self.candle_tf = candle_tf
         self.candle_limit = candle_limit
         self.mtf_gate = mtf_gate
+
+        # Claude AI gate: confirm BUY signals before executing
+        if use_ai_gate is None:
+            use_ai_gate = os.getenv("USE_AI_GATE", "").lower() in ("1", "true", "yes")
+        self._ai_gate: Optional[ClaudeAnalyzer] = ClaudeAnalyzer() if use_ai_gate else None
+        if self._ai_gate:
+            logger.info("Claude AI gate ENABLED (model=%s)", self._ai_gate.model)
 
         # In-memory position tracking: symbol -> Position
         self._positions: dict[str, Position] = {}
@@ -226,6 +235,29 @@ class TradingBot:
 
                 logger.info("[%s] BUY signal: %s @ %.2f  SL=%.2f  TP=%.2f",
                             strategy.name, sym, price, sl_p, tp_p)
+
+                # Claude AI confirmation gate
+                if self._ai_gate is not None:
+                    indicators = self._build_indicators_snapshot(candles, price, meta)
+                    recent_candles = [
+                        {"open": float(c.open), "high": float(c.high),
+                         "low": float(c.low), "close": float(c.close),
+                         "volume": float(c.volume)}
+                        for c in candles[-10:]
+                    ]
+                    confirmed, ai_reason = await self._ai_gate.confirm_buy(
+                        symbol=sym,
+                        price=price,
+                        strategy_name=strategy.name,
+                        signal_reason=signal.reason,
+                        indicators=indicators,
+                        recent_candles=recent_candles,
+                    )
+                    if not confirmed:
+                        logger.info("[AI-Gate] REJECTED %s %s: %s", strategy.name, sym, ai_reason)
+                        continue
+                    logger.info("[AI-Gate] CONFIRMED %s %s: %s", strategy.name, sym, ai_reason)
+
                 await self._execute_buy(signal, strategy_name=strategy.name)
                 # One BUY per symbol per tick
                 break
@@ -386,6 +418,43 @@ class TradingBot:
         except Exception as e:
             logger.debug("4H MTF check failed for %s: %s", symbol, e)
             return True  # On error, allow trading
+
+    # ------------------------------------------------------------------
+    # Claude AI helpers
+    # ------------------------------------------------------------------
+
+    def _build_indicators_snapshot(self, candles: list, price: float, meta: dict) -> dict:
+        """Compute indicator values from candles for the Claude AI gate prompt."""
+        import numpy as np
+        closes = [float(c.close) for c in candles]
+
+        rsi_arr = BaseStrategy.rsi(closes)
+        rsi_val = float(rsi_arr[-1])
+
+        hma_arr = BaseStrategy.hma(closes, 50)
+        hma_val = float(hma_arr[-1])
+
+        ema5_arr = BaseStrategy.ema(closes, 5)
+        sma9_arr = BaseStrategy.sma(closes, 9)
+        ema5_val = float(ema5_arr[-1])
+        sma9_val = float(sma9_arr[-1])
+
+        def _safe(v):
+            return None if (v is None or (isinstance(v, float) and math.isnan(v))) else v
+
+        return {
+            "rsi": _safe(rsi_val),
+            "hma_period": 50,
+            "price_above_hma": None if math.isnan(hma_val) else price > hma_val,
+            "ema5": _safe(ema5_val),
+            "sma9": _safe(sma9_val),
+            "ema5_above_sma9": None if (math.isnan(ema5_val) or math.isnan(sma9_val))
+                               else ema5_val > sma9_val,
+            "atr": meta.get("atr"),
+            "sl_price": meta.get("stop_loss"),
+            "tp_price": meta.get("take_profit"),
+            "rr": meta.get("rr", 1.2),
+        }
 
     # ------------------------------------------------------------------
     # Balance
