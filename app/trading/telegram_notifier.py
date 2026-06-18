@@ -1,71 +1,38 @@
-"""
-Telegram Bot notifier + command handler for the Trading Bot.
-
-Alerts sent:
-  - Bot started / stopped
-  - BUY / SELL signals (with confidence)
-  - Order executed
-  - Stop-loss / Take-profit triggered
-  - Max drawdown halt
-
-Commands received (polling loop):
-  /status    — current bot state & balance
-  /positions — open positions
-  /trades    — last 5 trades
-  /balance   — balance & P&L
-  /start_bot — start the trading bot
-  /stop_bot  — stop the trading bot
-  /help      — command list
-"""
+"""Telegram notifier and command handler for the trading bot."""
 import asyncio
-import json
 import logging
 import time
-import threading
 from typing import Callable, Optional
-import aiohttp
 
-_BOT_START_TIME = time.time()   # used to ignore commands sent before this process started
+import aiohttp
 
 logger = logging.getLogger("telegram_notifier")
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+_BOT_START_TIME = time.time()
 
 
 class TelegramNotifier:
-    def __init__(
-        self,
-        token: str,
-        chat_id: str,
-        get_state_fn: Optional[Callable] = None,
-        get_stats_fn: Optional[Callable] = None,
-        start_bot_fn: Optional[Callable] = None,
-        stop_bot_fn: Optional[Callable] = None,
-        fetch_candles_fn: Optional[Callable] = None,
-        min_confidence: float = 0.5,
-    ):
+    def __init__(self, token: str, chat_id: str,
+                 min_confidence: float = 0.5):
         self.token = token.strip()
         self.chat_id = str(chat_id).strip()
-        self.get_state_fn = get_state_fn
-        self.get_stats_fn = get_stats_fn
-        self.start_bot_fn = start_bot_fn
-        self.stop_bot_fn = stop_bot_fn
-        self.fetch_candles_fn = fetch_candles_fn
-        self.manual_buy_fn: Optional[Callable] = None   # set by run_bot.py
         self.min_confidence = min_confidence
-
+        self._enabled = bool(token and chat_id)
         self._last_update_id = 0
         self._polling_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._enabled = bool(token and chat_id)
+
+        # Wired by run_bot.py after construction
+        self.bot: object = None          # TradingBot reference
+        self.stop_bot_fn: Optional[Callable] = None
 
     # ------------------------------------------------------------------
-    # Public API
+    # Polling control
     # ------------------------------------------------------------------
 
     def start_polling(self, loop: asyncio.AbstractEventLoop):
-        """Start the Telegram command polling loop on the given event loop."""
-        if not self._enabled or self._polling_task:   # prevent double-start
+        if not self._enabled or self._polling_task:
             return
         self._loop = loop
         self._polling_task = loop.create_task(self._poll_loop())
@@ -76,25 +43,53 @@ class TelegramNotifier:
             self._polling_task.cancel()
 
     # ------------------------------------------------------------------
-    # Notification helpers (sync wrappers — safe to call from any thread)
+    # Notification methods
     # ------------------------------------------------------------------
 
-    def notify(self, text: str):
-        """Fire-and-forget send from any thread."""
+    def send(self, text: str):
+        """Fire-and-forget send."""
         if not self._enabled:
             return
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._send(text), self._loop)
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._send(text), loop)
         else:
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._send(text))
+                cur = asyncio.get_event_loop()
+                if cur.is_running():
+                    cur.create_task(self._send(text))
                 else:
-                    loop.run_until_complete(self._send(text))
+                    cur.run_until_complete(self._send(text))
             except Exception:
                 pass
 
+    # Alias for backward compatibility
+    def notify(self, text: str):
+        self.send(text)
+
+    def notify_buy(self, symbol: str, price: float, amount: float,
+                   sl: float, tp: float, strategy: str):
+        mode = "PAPER" if (self.bot and getattr(self.bot, "_paper", False)) else "LIVE"
+        self.send(
+            f"BUY {symbol} [{strategy}] {mode}\n"
+            f"Price: {price:,.4f}  Amount: {amount:.6f}\n"
+            f"SL: {sl:,.4f}  TP: {tp:,.4f}"
+        )
+
+    def notify_close(self, symbol: str, entry: float, exit_price: float,
+                     pnl_pct: float, reason: str):
+        sign = "+" if pnl_pct >= 0 else ""
+        label = "Take-Profit" if reason == "take_profit" else "Stop-Loss"
+        self.send(
+            f"{label} hit: {symbol}\n"
+            f"Entry: {entry:,.4f}  Exit: {exit_price:,.4f}\n"
+            f"PnL: {sign}{pnl_pct:.2f}%"
+        )
+
+    def notify_error(self, symbol: str, error: str):
+        self.send(f"Order error: {symbol}\n{str(error)[:200]}")
+
+    # Keep older method names used by the old bot (no-op or map to new ones)
     def notify_signal(self, signal_dict: dict):
         sig_type = signal_dict.get("type", "hold")
         if sig_type == "hold":
@@ -102,181 +97,77 @@ class TelegramNotifier:
         conf = signal_dict.get("confidence") or 0
         if conf < self.min_confidence:
             return
-        emoji  = "🟢" if sig_type == "buy" else "🔴"
-        sym    = signal_dict.get("symbol", "")
-        strat  = signal_dict.get("strategy", "")
-        price  = signal_dict.get("price", 0)
+        sym = signal_dict.get("symbol", "")
+        strat = signal_dict.get("strategy", "")
+        price = signal_dict.get("price", 0)
         reason = signal_dict.get("reason", "")
-        meta   = signal_dict.get("metadata", {})
-
-        sl  = meta.get("stop_loss")
-        tp  = meta.get("take_profit")
-        rr  = meta.get("rr")
-
-        sl_tp_line = ""
-        if sl and tp and rr:
-            sl_tp_line = (
-                f"\n🛑 SL: `{sl:,.4f}`\n"
-                f"🎯 TP: `{tp:,.4f}`\n"
-                f"📐 R:R `1:{rr:.1f}`"
-            )
-        text = (
-            f"{emoji} *{sig_type.upper()} Signal*\n"
-            f"`{sym}` @ `{price:,.4f}`\n"
-            f"Strategy: {strat} | Conf: {conf*100:.0f}%\n"
-            f"_{reason}_"
-            f"{sl_tp_line}"
+        meta = signal_dict.get("metadata", {})
+        sl = meta.get("stop_loss")
+        tp = meta.get("take_profit")
+        arrow = "BUY" if sig_type == "buy" else "SELL"
+        sl_tp = f"\nSL: {sl:,.4f}  TP: {tp:,.4f}" if sl and tp else ""
+        self.send(
+            f"{arrow} {sym} [{strat}]  conf={conf*100:.0f}%\n"
+            f"@ {price:,.4f}  {reason}{sl_tp}"
         )
-        self.notify(text)
 
     def notify_order(self, symbol: str, side: str, amount: float,
                      price: float, strategy: str, paper: bool):
-        emoji = "✅" if side == "buy" else "🏁"
-        mode = "📄 PAPER" if paper else "💰 LIVE"
-        text = (
-            f"{emoji} *Order Executed* {mode}\n"
-            f"`{symbol}` — *{side.upper()}*\n"
-            f"Amount: `{amount}` @ `{price:,.4f}`\n"
-            f"Strategy: {strategy}"
+        mode = "PAPER" if paper else "LIVE"
+        self.send(
+            f"Order filled [{mode}] {side.upper()} {symbol}\n"
+            f"Amount: {amount:.6f} @ {price:,.4f}  [{strategy}]"
         )
-        self.notify(text)
 
     def notify_trade_closed(self, symbol: str, reason: str, exit_price: float,
                             entry: float, sl, tp, stats: dict):
-        """Called when a position closes via SL or TP. Full detail + running stats."""
-        won   = reason == "take_profit"
-        emoji = "✅" if won else "❌"
-        label = "Take-Profit Hit" if won else "Stop-Loss Hit"
-        risk  = abs(entry - sl) if sl else 1.0
+        won = reason == "take_profit"
+        label = "Take-Profit" if won else "Stop-Loss"
+        risk = abs(entry - sl) if sl else abs(entry - exit_price) or 1.0
         pnl_r = abs(exit_price - entry) / risk if won else -1.0
-        sign  = "+" if pnl_r >= 0 else ""
-
-        sl_str = f"`{sl:,.4f}`" if sl else "—"
-        tp_str = f"`{tp:,.4f}`" if tp else "—"
-
-        total   = stats.get("trades",    0)
-        wins    = stats.get("wins",      0)
-        losses  = stats.get("losses",    0)
-        wr      = stats.get("win_rate",  0)
-        pf      = stats.get("profit_factor", 0)
-        total_r = stats.get("total_r",   0)
-        streak  = stats.get("streak",    0)
-        sig_day = stats.get("signals_per_day", 0)
-        streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
-        sign_r = "+" if total_r >= 0 else ""
-
-        text = (
-            f"{emoji} *{label}*\n"
-            f"`{symbol}`\n"
-            f"Entry: `{entry:,.4f}` → Exit: `{exit_price:,.4f}`\n"
-            f"SL: {sl_str} | TP: {tp_str}\n"
-            f"Result: `{sign}{pnl_r:.1f}R`\n\n"
-            f"📊 *Backtest Stats* ({total} trades)\n"
-            f"Win/Loss: `{wins}W / {losses}L` | WR: `{wr:.1f}%`\n"
-            f"Profit Factor: `{pf:.2f}` | Total: `{sign_r}{total_r:.1f}R`\n"
-            f"Streak: `{streak_str}` | Avg signals/day: `{sig_day}`"
+        sign = "+" if pnl_r >= 0 else ""
+        wr = stats.get("win_rate", 0) or 0
+        total = stats.get("trades", 0)
+        self.send(
+            f"{label} hit: {symbol}\n"
+            f"Entry: {entry:,.4f}  Exit: {exit_price:,.4f}\n"
+            f"Result: {sign}{pnl_r:.1f}R  |  WR: {wr:.1f}% ({total} trades)"
         )
-        self.notify(text)
-
-    def notify_virtual_closed(self, symbol: str, reason: str, exit_price: float, stats: dict):
-        """Called when a virtual (signal-only / paper-0-balance) trade hits SL or TP."""
-        won   = reason == "take_profit"
-        emoji = "✅" if won else "❌"
-        label = "Take-Profit Hit" if won else "Stop-Loss Hit"
-
-        total   = stats.get("trades",           0)
-        wins    = stats.get("wins",             0)
-        losses  = stats.get("losses",           0)
-        wr      = stats.get("win_rate",         0)
-        pf      = stats.get("profit_factor",    0)
-        total_r = stats.get("total_r",          0)
-        streak  = stats.get("streak",           0)
-        sig_day = stats.get("signals_per_day",  0)
-        streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
-        sign_r = "+" if total_r >= 0 else ""
-
-        text = (
-            f"{emoji} *{label}* _(virtual)_\n"
-            f"`{symbol}` @ `{exit_price:,.4f}`\n\n"
-            f"📊 *Signal Stats* ({total} tracked)\n"
-            f"Win/Loss: `{wins}W / {losses}L` | WR: `{wr:.1f}%`\n"
-            f"Profit Factor: `{pf:.2f}` | Total: `{sign_r}{total_r:.1f}R`\n"
-            f"Streak: `{streak_str}` | Avg signals/day: `{sig_day}`"
-        )
-        self.notify(text)
-
-    def notify_stop_event(self, symbol: str, event: str, price: float, pnl: float):
-        """Legacy — kept for compatibility."""
-        emoji = "🛑" if event == "stop_loss" else "💰"
-        label = "Stop-Loss Hit" if event == "stop_loss" else "Take-Profit Reached"
-        sign = "+" if pnl >= 0 else ""
-        text = (
-            f"{emoji} *{label}*\n"
-            f"`{symbol}` closed @ `{price:,.4f}`\n"
-            f"P&L: `{sign}{pnl:,.2f} USD`"
-        )
-        self.notify(text)
 
     def notify_order_error(self, symbol: str, strategy: str, error: str):
-        text = (
-            f"⚠️ *Order Failed* 💰 LIVE\n"
-            f"`{symbol}` [{strategy}]\n"
-            f"Error: `{error[:200]}`"
+        self.send(f"Order error [{strategy}]: {symbol}\n{str(error)[:200]}")
+
+    def notify_bot_started(self, paper: bool, strategies: list, symbols: list):
+        mode = "Paper" if paper else "Live"
+        self.send(
+            f"Bot started [{mode}]\n"
+            f"Symbols: {', '.join(symbols)}\n"
+            f"Strategies: {', '.join(strategies)}"
         )
-        self.notify(text)
+
+    def notify_bot_stopped(self):
+        self.send("Bot stopped.")
 
     def notify_drawdown_halt(self, balance: float, peak: float):
         dd = (peak - balance) / peak * 100 if peak else 0.0
-        text = (
-            f"⚠️ *Max Drawdown Reached — Trading Halted*\n"
-            f"Balance: `${balance:,.2f}` (peak `${peak:,.2f}`)\n"
-            f"Drawdown: `{dd:.1f}%`\n"
-            f"Use /start\\_bot to resume after reviewing."
+        self.send(
+            f"MAX DRAWDOWN REACHED - Trading halted\n"
+            f"Balance: ${balance:,.2f} (peak ${peak:,.2f})\n"
+            f"Drawdown: {dd:.1f}%"
         )
-        self.notify(text)
-
-    def notify_bot_started(self, paper: bool, strategies: list[str], symbols: list[str]):
-        mode = "📄 Paper" if paper else "💰 Live"
-        text = (
-            f"🤖 *Trading Bot Started* — {mode}\n"
-            f"Symbols: `{'  '.join(symbols)}`\n"
-            f"Strategies: `{'  '.join(strategies)}`"
-        )
-        self.notify(text)
-
-    def notify_bot_stopped(self):
-        self.notify("⏹ *Trading Bot Stopped*")
 
     # ------------------------------------------------------------------
-    # Telegram HTTP helpers
+    # HTTP helpers
     # ------------------------------------------------------------------
 
-    async def _send_document(self, filename: str, data: bytes, caption: str = "") -> bool:
-        url = TELEGRAM_API.format(token=self.token, method="sendDocument")
-        form = aiohttp.FormData()
-        form.add_field("chat_id", self.chat_id)
-        form.add_field("document", data, filename=filename, content_type="text/csv")
-        if caption:
-            form.add_field("caption", caption)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, data=form,
-                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        logger.warning("Telegram sendDocument failed %s: %s", r.status, body[:200])
-                        return False
-                    return True
-        except Exception as e:
-            logger.warning("Telegram sendDocument error: %s", e)
-            return False
-
-    async def _send(self, text: str, parse_mode: str = "Markdown") -> bool:
+    async def _send(self, text: str) -> bool:
         url = TELEGRAM_API.format(token=self.token, method="sendMessage")
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
+        payload = {"chat_id": self.chat_id, "text": text}
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
                     if r.status != 200:
                         body = await r.text()
                         logger.warning("Telegram send failed %s: %s", r.status, body[:200])
@@ -288,11 +179,16 @@ class TelegramNotifier:
 
     async def _get_updates(self) -> list:
         url = TELEGRAM_API.format(token=self.token, method="getUpdates")
-        params = {"offset": self._last_update_id + 1, "timeout": 20, "allowed_updates": ["message"]}
+        params = {
+            "offset": self._last_update_id + 1,
+            "timeout": 20,
+            "allowed_updates": ["message"],
+        }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params,
-                                       timeout=aiohttp.ClientTimeout(total=30)) as r:
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=30)
+                ) as r:
                     if r.status != 200:
                         return []
                     data = await r.json()
@@ -303,26 +199,20 @@ class TelegramNotifier:
             logger.debug("Telegram getUpdates error: %s", e)
             return []
 
-    # ------------------------------------------------------------------
-    # Command polling loop
-    # ------------------------------------------------------------------
-
     async def _drain_old_updates(self):
-        """Discard all pending updates so stale /stop_bot commands don't fire on restart."""
+        """Discard stale updates so old commands don't fire on restart."""
         url = TELEGRAM_API.format(token=self.token, method="getUpdates")
         try:
-            drained = 0
             async with aiohttp.ClientSession() as session:
                 while True:
                     params = {
                         "offset": self._last_update_id + 1,
-                        "timeout": 0,           # non-blocking — return immediately
+                        "timeout": 0,
                         "limit": 100,
                         "allowed_updates": ["message"],
                     }
                     async with session.get(
-                        url, params=params,
-                        timeout=aiohttp.ClientTimeout(total=10),
+                        url, params=params, timeout=aiohttp.ClientTimeout(total=10)
                     ) as r:
                         if r.status != 200:
                             break
@@ -331,12 +221,12 @@ class TelegramNotifier:
                         if not updates:
                             break
                         self._last_update_id = max(u["update_id"] for u in updates)
-                        drained += len(updates)
-            if drained:
-                logger.info("Telegram: drained %d stale update(s) (last_id=%d)",
-                            drained, self._last_update_id)
         except Exception as e:
             logger.debug("Telegram drain error: %s", e)
+
+    # ------------------------------------------------------------------
+    # Polling loop
+    # ------------------------------------------------------------------
 
     async def _poll_loop(self):
         logger.info("Telegram command polling started")
@@ -348,15 +238,12 @@ class TelegramNotifier:
                     self._last_update_id = max(self._last_update_id, update["update_id"])
                     msg = update.get("message", {})
                     text = msg.get("text", "").strip()
-                    # Only respond to our own chat_id for security
                     chat = str(msg.get("chat", {}).get("id", ""))
                     if chat != self.chat_id:
                         continue
-                    # Ignore commands sent before this bot process started (stale queue)
+                    # Ignore stale commands from before this process started
                     msg_time = msg.get("date", 0)
                     if msg_time < _BOT_START_TIME - 5:
-                        logger.debug("Telegram: skipping stale command '%s' (age=%ds)",
-                                     text[:30], int(time.time() - msg_time))
                         continue
                     if text:
                         await self._handle_command(text)
@@ -367,211 +254,82 @@ class TelegramNotifier:
                 await asyncio.sleep(5)
 
     async def _handle_command(self, text: str):
-        cmd = text.split()[0].lower().lstrip("/")
+        parts = text.split()
+        cmd = parts[0].lower().lstrip("/").split("@")[0]
+
         if cmd == "help":
             await self._send(
-                "📋 *Trading Bot Commands*\n\n"
-                "/status — current state & balance\n"
-                "/positions — open positions\n"
-                "/trades — last 5 trades\n"
-                "/balance — balance & P\\&L\n"
-                "/stats — win rate & signal statistics\n"
-                "/start\\_bot — start the bot\n"
-                "/stop\\_bot — stop the bot\n"
-                "/export\\_candles — download BTC 1H CSV (3 months)\n"
-                "/help — this message"
+                "Trading Bot Commands\n\n"
+                "/status - running status, positions, balance\n"
+                "/positions - open positions with PnL estimate\n"
+                "/buy [symbol] - manual buy (e.g. /buy BTC/USDT)\n"
+                "/stop - stop the bot\n"
+                "/help - show this message"
             )
 
         elif cmd == "status":
-            state = self.get_state_fn() if self.get_state_fn else {}
+            if not self.bot:
+                await self._send("Bot not connected.")
+                return
+            state = self.bot.get_state()
             running = state.get("running", False)
             paper = state.get("paper", True)
             balance = state.get("balance", 0)
             pnl = state.get("pnl_total", 0)
             positions = len(state.get("positions", []))
-            mode = "📄 Paper" if paper else "💰 Live"
-            status = "🟢 Running" if running else "⏹ Stopped"
+            mode = "Paper" if paper else "Live"
+            status = "Running" if running else "Stopped"
             sign = "+" if pnl >= 0 else ""
             await self._send(
-                f"📊 *Bot Status*\n"
+                f"Bot Status\n"
                 f"Status: {status} | {mode}\n"
-                f"Balance: `${balance:,.2f}`\n"
-                f"P&L: `{sign}${pnl:,.2f}`\n"
-                f"Open positions: `{positions}`"
-            )
-
-        elif cmd == "balance":
-            state = self.get_state_fn() if self.get_state_fn else {}
-            balance = state.get("balance", 0)
-            equity = state.get("equity", 0)
-            pnl = state.get("pnl_total", 0)
-            sign = "+" if pnl >= 0 else ""
-            await self._send(
-                f"💳 *Balance*\n"
-                f"Cash: `${balance:,.2f}`\n"
-                f"Equity: `${equity:,.2f}`\n"
-                f"P&L: `{sign}${pnl:,.2f}`"
+                f"Balance: ${balance:,.2f}\n"
+                f"PnL: {sign}${pnl:,.2f}\n"
+                f"Open positions: {positions}"
             )
 
         elif cmd == "positions":
-            state = self.get_state_fn() if self.get_state_fn else {}
+            if not self.bot:
+                await self._send("Bot not connected.")
+                return
+            state = self.bot.get_state()
             positions = state.get("positions", [])
             if not positions:
-                await self._send("📭 No open positions")
+                await self._send("No open positions.")
                 return
-            lines = ["📌 *Open Positions*\n"]
+            lines = ["Open Positions\n"]
             for p in positions:
+                entry = p.get("entry", 0)
+                sl = p.get("stop_loss")
+                tp = p.get("take_profit")
+                sl_str = f"{sl:,.4f}" if sl else "-"
+                tp_str = f"{tp:,.4f}" if tp else "-"
                 lines.append(
-                    f"`{p['symbol']}` {p['side']}\n"
-                    f"  Entry: `{p['entry']:,.4f}` | SL: `{p.get('stop_loss','—')}` | TP: `{p.get('take_profit','—')}`"
+                    f"{p['symbol']} {p.get('side', 'long')} [{p.get('strategy', '')}]\n"
+                    f"  Entry: {entry:,.4f}  SL: {sl_str}  TP: {tp_str}"
                 )
             await self._send("\n".join(lines))
-
-        elif cmd == "trades":
-            state = self.get_state_fn() if self.get_state_fn else {}
-            trades = state.get("recent_trades", [])[-5:]
-            if not trades:
-                await self._send("📭 No trades yet")
-                return
-            lines = ["📋 *Recent Trades*\n"]
-            for t in reversed(trades):
-                emoji = "🟢" if t["side"] == "buy" else "🔴"
-                lines.append(
-                    f"{emoji} `{t['symbol']}` {t['side'].upper()} @ `{t['price']:,.4f}`\n"
-                    f"  [{t['strategy']}] {'📄' if t.get('paper') else '💰'}"
-                )
-            await self._send("\n".join(lines))
-
-        elif cmd in ("start_bot", "start"):
-            if self.start_bot_fn:
-                result = self.start_bot_fn()
-                msg = result.get("message", "Starting...") if isinstance(result, dict) else "Starting..."
-                await self._send(f"▶️ {msg}")
-            else:
-                await self._send("⚠️ start\\_bot not configured")
-
-        elif cmd in ("stop_bot", "stop"):
-            if self.stop_bot_fn:
-                result = self.stop_bot_fn()
-                # stop_bot_fn may return None (e.g. asyncio.Event.set()) or a dict
-                if isinstance(result, dict):
-                    msg = result.get("message", "Stopping...")
-                else:
-                    msg = "Stopping bot..."
-                await self._send(f"⏹ {msg}")
-            else:
-                await self._send("⚠️ stop\\_bot not configured")
-
-        elif cmd == "stats":
-            s       = self.get_stats_fn() if self.get_stats_fn else {}
-            total   = s.get("trades",          0)
-            sig_all = s.get("total_signals",   0)
-            sig_day = s.get("signals_per_day", 0)
-            pending = s.get("pending",         0)
-
-            if sig_all == 0:
-                await self._send("📭 No signals fired yet.")
-                return
-
-            wins    = s.get("wins",            0)
-            losses  = s.get("losses",          0)
-            wr      = s.get("win_rate",        0.0)
-            pf      = s.get("profit_factor",   0.0)
-            total_r = s.get("total_r",         0.0)
-            streak  = s.get("streak",          0)
-            recent  = s.get("recent",          [])
-            breakdown = s.get("strategy_breakdown", {})
-
-            streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
-            sign_r = "+" if total_r >= 0 else ""
-
-            lines = [f"📊 *Signal Stats — ย้อนหลัง 7 วัน*\n"]
-
-            # ── Per-strategy table ───────────────────────────────────
-            if breakdown:
-                lines.append("*Strategy        Signals    WR*")
-                for strat, d in breakdown.items():
-                    sigs = d["signals"]
-                    wr_s = f"{d['win_rate']:.1f}%" if d["win_rate"] is not None else "—"
-                    cl   = d["wins"] + d["losses"]
-                    cl_s = f"({d['wins']}W/{d['losses']}L)" if cl else ""
-                    lines.append(f"`{strat:<16}` `{sigs:>3}` signals  `{wr_s:>6}` {cl_s}")
-                lines.append("")
-
-            # ── Overall ──────────────────────────────────────────────
-            lines += [
-                f"รวม signals: `{sig_all}` (avg `{sig_day}/day`)",
-                f"ปิด trades: `{total}` (`{wins}W` / `{losses}L`)",
-            ]
-            if total > 0:
-                lines += [
-                    f"Win Rate: `{wr:.1f}%`",
-                    f"Profit Factor: `{pf:.2f}`",
-                    f"Total R: `{sign_r}{total_r:.1f}R`",
-                    f"Streak: `{streak_str}`",
-                ]
-            if pending:
-                lines.append(f"Tracking open: `{pending}` virtual trades")
-
-            lines.append("\n_Last closed trades:_")
-            if not recent:
-                lines.append("_(waiting for SL/TP to be hit)_")
-            else:
-                for o in reversed(recent[-10:]):
-                    e     = "✅" if o["pnl_r"] > 0 else "❌"
-                    sr    = "+" if o["pnl_r"] >= 0 else ""
-                    label = "TP" if o["reason"] == "take_profit" else "SL"
-                    strat = o.get("strategy", "")
-                    strat_tag = f" [{strat}]" if strat else ""
-                    lines.append(
-                        f"{e} `{o['symbol']}` {o['side'].upper()} "
-                        f"`{sr}{o['pnl_r']:.1f}R` [{label}]{strat_tag}"
-                    )
-
-            await self._send("\n".join(lines))
-
-        elif cmd == "export_candles":
-            if not self.fetch_candles_fn:
-                await self._send("⚠️ Export not available — connector not wired")
-                return
-            parts   = text.split()
-            exp_sym = parts[1].upper() if len(parts) > 1 else "BTC/USDT"
-            if "/" not in exp_sym:
-                exp_sym += "/USDT"
-            exp_tf  = parts[2].lower() if len(parts) > 2 else "1h"
-            await self._send(f"⏳ Fetching {exp_sym} {exp_tf.upper()} candles...")
-            try:
-                import io
-                from datetime import datetime, timezone
-                bars = await self.fetch_candles_fn(exp_sym, exp_tf, 2200)
-                buf  = io.StringIO()
-                buf.write("timestamp,open,high,low,close,volume\n")
-                for b in bars:
-                    buf.write(f"{b[0]},{b[1]},{b[2]},{b[3]},{b[4]},{b[5]}\n")
-                csv_bytes = buf.getvalue().encode("utf-8")
-                start_dt  = datetime.fromtimestamp(bars[0][0]  / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-                end_dt    = datetime.fromtimestamp(bars[-1][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-                caption   = f"{exp_sym} {exp_tf.upper()} — {len(bars)} bars  {start_dt} → {end_dt}"
-                safe_sym  = exp_sym.replace("/", "_").lower()
-                ok = await self._send_document(f"{safe_sym}_{exp_tf}.csv", csv_bytes, caption)
-                if not ok:
-                    await self._send("❌ Failed to send file")
-            except Exception as e:
-                logger.exception("export_candles error")
-                await self._send(f"❌ Export error: {e}")
 
         elif cmd == "buy":
-            if not self.manual_buy_fn:
-                await self._send("⚠️ manual\\_buy not configured")
+            if not self.bot:
+                await self._send("Bot not connected.")
                 return
-            parts = text.split()
             sym = parts[1].upper() if len(parts) > 1 else "BTC/USDT"
             if "/" not in sym:
                 sym += "/USDT"
-            await self._send(f"⏳ Sending manual BUY for `{sym}`...")
-            result = await self.manual_buy_fn(sym)
-            ok = "Error" not in result and "Cannot" not in result and "failed" not in result.lower()
-            await self._send(f"{'✅' if ok else '❌'} {result}")
+            await self._send(f"Sending manual BUY for {sym}...")
+            try:
+                result = await self.bot.manual_buy(sym)
+                await self._send(result)
+            except Exception as e:
+                await self._send(f"Error: {e}")
+
+        elif cmd == "stop":
+            await self._send("Stopping bot...")
+            if self.stop_bot_fn:
+                self.stop_bot_fn()
+            elif self.bot:
+                asyncio.create_task(self.bot.stop())
 
         else:
-            await self._send(f"❓ Unknown command: `{text}`\nType /help for commands.")
+            await self._send(f"Unknown command: {text}\nType /help for commands.")

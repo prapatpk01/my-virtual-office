@@ -1,6 +1,5 @@
-"""Binance connector via CCXT (supports paper trading simulation)."""
-import asyncio
-import time
+"""OKX/CCXT connector (named BinanceConnector for backward compatibility)."""
+import logging
 import uuid
 from typing import Optional
 
@@ -8,11 +7,14 @@ import ccxt.async_support as ccxt
 
 from .base import OHLCV, Balance, BaseConnector, OrderResult
 
+_log = logging.getLogger("binance_conn")
+
 
 class BinanceConnector(BaseConnector):
     """
-    Crypto connector for Binance (or any CCXT-compatible exchange).
-    Set paper=True (default) to simulate trades without real API keys.
+    Crypto connector supporting OKX and other CCXT exchanges.
+    Uses paper trading simulation by default.
+    For OKX Unified Account: always sends tdMode=cross for all orders.
     """
 
     TIMEFRAME_MAP = {
@@ -25,32 +27,35 @@ class BinanceConnector(BaseConnector):
                  passphrase: str = "", leverage: int = 1,
                  margin_mode: str = "cross"):
         super().__init__(api_key, api_secret, paper)
-        self.leverage     = max(1, int(leverage))
-        self.margin_mode  = margin_mode  # "cross" | "isolated"
+        self.leverage = max(1, int(leverage))
+        self.margin_mode = margin_mode
+        self._exchange_id = exchange_id
+
         exchange_class = getattr(ccxt, exchange_id)
-        # OKX spot-margin uses defaultType="margin"; others stay "spot"
-        default_type = "margin" if (exchange_id == "okx" and self.leverage > 1) else "spot"
-        options: dict = {"defaultType": default_type}
+        # Always use defaultType="spot" — OKX Unified Account handles cross-margin via tdMode
+        options: dict = {"defaultType": "spot"}
         if exchange_id == "bybit":
             options["fetchCurrencies"] = False
+
         cfg: dict = {
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
             "options": options,
         }
-        if passphrase:  # OKX requires password (passphrase)
+        if passphrase:
             cfg["password"] = passphrase
+
         self._exchange = exchange_class(cfg)
-        self._exchange_id = exchange_id
-        self._paper_balance = {"USDT": 10000.0, "BTC": 0.0, "ETH": 0.0}
+        self._paper_balance: dict = {"USDT": 10000.0, "BTC": 0.0, "ETH": 0.0}
         self._paper_open_orders: list[OrderResult] = []
 
     # ------------------------------------------------------------------
-    # Market data (always live, no API key needed for public endpoints)
+    # Market data
     # ------------------------------------------------------------------
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str = "1h", limit: int = 200) -> list[OHLCV]:
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = "1h",
+                          limit: int = 200) -> list[OHLCV]:
         tf = self.TIMEFRAME_MAP.get(timeframe, "1h")
         raw = await self._exchange.fetch_ohlcv(symbol, tf, limit=limit)
         return [OHLCV(ts, o, h, l, c, v) for ts, o, h, l, c, v in raw]
@@ -62,30 +67,18 @@ class BinanceConnector(BaseConnector):
     # Orders
     # ------------------------------------------------------------------
 
-    async def set_leverage_for(self, symbol: str) -> None:
-        """Set OKX cross/isolated margin leverage. No-op for spot or paper."""
-        if self.paper or self._exchange_id != "okx" or self.leverage <= 1:
-            return
-        try:
-            await self._exchange.set_leverage(
-                self.leverage, symbol,
-                params={"mgnMode": self.margin_mode},
-            )
-        except Exception as e:
-            import logging
-            logging.getLogger("binance_conn").warning(
-                "set_leverage %sx %s failed: %s", self.leverage, symbol, e)
-
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: Optional[float] = None,
-                           tp: Optional[float] = None, sl: Optional[float] = None) -> OrderResult:
+                           order_type: str = "market",
+                           price: Optional[float] = None,
+                           tp: Optional[float] = None,
+                           sl: Optional[float] = None) -> OrderResult:
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price)
 
         if self._exchange_id == "okx":
             return await self._okx_order(symbol, side, amount, order_type, price, tp, sl)
 
-        # Non-OKX: standard CCXT path
+        # Other exchanges: standard CCXT
         kwargs: dict = {}
         if order_type == "limit" and price:
             kwargs["price"] = price
@@ -95,84 +88,75 @@ class BinanceConnector(BaseConnector):
             order_id=str(raw.get("id", uuid.uuid4())),
             symbol=symbol, side=side, amount=amount,
             price=float(exec_price),
-            filled=raw.get("filled") or raw.get("amount") or amount,
+            filled=raw.get("filled") or amount,
             status=raw.get("status", "closed"),
         )
 
     async def _okx_order(self, symbol: str, side: str, amount: float,
                          order_type: str, price: Optional[float],
                          tp: Optional[float], sl: Optional[float]) -> OrderResult:
-        """OKX order placement using direct API calls to control exactly what is sent.
-
-        Spot (leverage=1): no tdMode — Classic and Simple Unified accounts reject it (51000).
-        Margin (leverage>1): tdMode=cross/isolated required.
-        TP/SL placed as a separate OCO algo order after the main fill.
-        """
-        import logging
-        _log = logging.getLogger("binance_conn")
-
+        """OKX order via direct API. Uses tdMode=cross for OKX Unified Account."""
         await self._exchange.load_markets()
-        mkt  = self._exchange.markets.get(symbol) or {}
+        mkt = self._exchange.markets.get(symbol) or {}
         info = mkt.get("info") or {}
         inst_id = info.get("instId") or symbol.replace("/", "-")
-        sz_str  = self._exchange.amount_to_precision(symbol, amount)
+        sz_str = self._exchange.amount_to_precision(symbol, amount)
 
-        # Validate OKX minimum order size
+        # Validate minimum order size
         min_sz = float(info.get("minSz") or 0)
         if min_sz > 0 and float(sz_str or 0) < min_sz:
-            px     = price or 60000.0
-            needed = int(min_sz * px / max(self.leverage, 1)) + 1
+            px = price or 60000.0
+            needed = int(min_sz * px) + 1
             raise ValueError(
-                f"Amount {amount:.6f} below OKX minimum {min_sz} BTC "
-                f"(≈${min_sz * px:,.0f} notional). "
-                f"Set TRADE_AMOUNT_USDT ≥ {needed} in Railway Variables."
+                f"Amount {amount:.6f} below OKX min {min_sz}. "
+                f"Set TRADE_AMOUNT_USDT >= {needed}."
             )
 
-        # Main order — tdMode only for margin mode
-        req: dict = {"instId": inst_id, "side": side, "ordType": order_type, "sz": sz_str}
-        if self.leverage > 1:
-            req["tdMode"] = self.margin_mode
-            if side == "buy":
-                req["ccy"] = "USDT"
+        # Main order — tdMode=cross ALWAYS for OKX Unified Account
+        req: dict = {
+            "instId": inst_id,
+            "tdMode": "cross",
+            "side": side,
+            "ordType": order_type,
+            "sz": sz_str,
+        }
         if order_type == "limit" and price:
             req["px"] = self._exchange.price_to_precision(symbol, price)
 
-        resp     = await self._exchange.privatePostTradeOrder(req)
+        resp = await self._exchange.privatePostTradeOrder(req)
         data_row = ((resp or {}).get("data") or [{}])[0]
-        ord_id   = data_row.get("ordId") or str(uuid.uuid4())
+        ord_id = data_row.get("ordId") or str(uuid.uuid4())
 
         try:
-            ticker     = await self._exchange.fetch_ticker(symbol)
+            ticker = await self._exchange.fetch_ticker(symbol)
             exec_price = float(ticker.get("last") or price or 0)
         except Exception:
             exec_price = float(price or 0)
 
         result = OrderResult(
-            order_id=ord_id, symbol=symbol, side=side, amount=amount,
-            price=exec_price, filled=amount, status="closed",
+            order_id=ord_id, symbol=symbol, side=side,
+            amount=amount, price=exec_price, filled=amount, status="closed",
         )
 
-        # OCO algo order for TP/SL (separate from main order)
+        # OCO algo order for TP/SL after BUY fills
         if side == "buy" and tp and sl and tp > 0 and sl > 0:
-            algo: dict = {
-                "instId":         inst_id,
-                "side":           "sell",
-                "ordType":        "oco",
-                "sz":             sz_str,
-                "tpTriggerPx":    f"{tp:.2f}",
-                "tpOrdPx":        "-1",
-                "tpTriggerPxType":"last",
-                "slTriggerPx":    f"{sl:.2f}",
-                "slOrdPx":        "-1",
-                "slTriggerPxType":"last",
-            }
-            if self.leverage > 1:
-                algo["tdMode"] = self.margin_mode
             try:
-                await self._exchange.privatePostTradeOrderAlgo(algo)
-                _log.info("OCO algo placed: TP=%.2f SL=%.2f", tp, sl)
+                await self._exchange.privatePostTradeOrderAlgo({
+                    "instId": inst_id,
+                    "tdMode": "cross",
+                    "side": "sell",
+                    "ordType": "oco",
+                    "sz": sz_str,
+                    "tpTriggerPx": f"{tp:.2f}",
+                    "tpOrdPx": "-1",
+                    "tpTriggerPxType": "last",
+                    "slTriggerPx": f"{sl:.2f}",
+                    "slOrdPx": "-1",
+                    "slTriggerPxType": "last",
+                })
+                _log.info("OCO placed: TP=%.2f SL=%.2f", tp, sl)
             except Exception as e:
-                _log.warning("OCO algo failed (position open without TP/SL): %s", e)
+                _log.warning("OCO failed: %s", e)
 
         return result
 
@@ -180,36 +164,40 @@ class BinanceConnector(BaseConnector):
                            order_type: str, price: Optional[float]) -> OrderResult:
         ticker = await self.fetch_ticker(symbol)
         exec_price = price if (order_type == "limit" and price) else ticker["last"]
-        base_asset = symbol.split("/")[0]
-        quote_asset = symbol.split("/")[1] if "/" in symbol else "USDT"
+        base = symbol.split("/")[0]
+        quote = symbol.split("/")[1] if "/" in symbol else "USDT"
 
         if side == "buy":
             cost = amount * exec_price
-            if self._paper_balance.get(quote_asset, 0) < cost:
-                raise ValueError(f"[Paper] Insufficient {quote_asset}: need {cost:.2f}, have {self._paper_balance.get(quote_asset, 0):.2f}")
-            self._paper_balance[quote_asset] = self._paper_balance.get(quote_asset, 0) - cost
-            self._paper_balance[base_asset] = self._paper_balance.get(base_asset, 0) + amount
+            if self._paper_balance.get(quote, 0) < cost:
+                raise ValueError(
+                    f"[Paper] Insufficient {quote}: need {cost:.2f}, "
+                    f"have {self._paper_balance.get(quote, 0):.2f}"
+                )
+            self._paper_balance[quote] = self._paper_balance.get(quote, 0) - cost
+            self._paper_balance[base] = self._paper_balance.get(base, 0) + amount
         else:
-            if self._paper_balance.get(base_asset, 0) < amount:
-                raise ValueError(f"[Paper] Insufficient {base_asset}: need {amount}, have {self._paper_balance.get(base_asset, 0)}")
-            self._paper_balance[base_asset] = self._paper_balance.get(base_asset, 0) - amount
-            self._paper_balance[quote_asset] = self._paper_balance.get(quote_asset, 0) + amount * exec_price
+            if self._paper_balance.get(base, 0) < amount:
+                raise ValueError(
+                    f"[Paper] Insufficient {base}: need {amount}, "
+                    f"have {self._paper_balance.get(base, 0)}"
+                )
+            self._paper_balance[base] = self._paper_balance.get(base, 0) - amount
+            self._paper_balance[quote] = self._paper_balance.get(quote, 0) + amount * exec_price
 
         order = OrderResult(
             order_id=str(uuid.uuid4())[:8],
-            symbol=symbol,
-            side=side,
-            amount=amount,
-            price=exec_price,
-            filled=amount,
-            status="closed",
+            symbol=symbol, side=side, amount=amount,
+            price=exec_price, filled=amount, status="closed",
         )
         self._paper_open_orders.append(order)
         return order
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         if self.paper:
-            self._paper_open_orders = [o for o in self._paper_open_orders if o.order_id != order_id]
+            self._paper_open_orders = [
+                o for o in self._paper_open_orders if o.order_id != order_id
+            ]
             return True
         await self._exchange.cancel_order(order_id, symbol)
         return True
@@ -219,64 +207,52 @@ class BinanceConnector(BaseConnector):
             return [o for o in self._paper_open_orders
                     if symbol is None or o.symbol == symbol]
         raw_list = await self._exchange.fetch_open_orders(symbol)
-        return [OrderResult(
-            order_id=str(r["id"]),
-            symbol=r["symbol"],
-            side=r["side"],
-            amount=r["amount"],
-            price=r.get("price") or 0.0,
-            filled=r.get("filled", 0.0),
-            status=r.get("status", "open"),
-        ) for r in raw_list]
+        return [
+            OrderResult(
+                order_id=str(r["id"]),
+                symbol=r["symbol"], side=r["side"],
+                amount=r["amount"], price=r.get("price") or 0.0,
+                filled=r.get("filled", 0.0), status=r.get("status", "open"),
+            )
+            for r in raw_list
+        ]
 
     async def fetch_balance(self) -> list[Balance]:
         if self.paper:
-            return [Balance(asset=k, free=v, used=0.0, total=v)
-                    for k, v in self._paper_balance.items() if v > 0]
+            return [
+                Balance(asset=k, free=v, used=0.0, total=v)
+                for k, v in self._paper_balance.items() if v > 0
+            ]
         raw = await self._exchange.fetch_balance()
-        # raw["total"] = {asset: float}; per-asset dict is raw[asset]
-        return [Balance(asset=k, free=float(v.get("free") or 0),
-                        used=float(v.get("used") or 0), total=float(v.get("total") or 0))
-                for k, v in raw.items()
-                if isinstance(v, dict) and (v.get("total") or 0) > 0]
+        return [
+            Balance(
+                asset=k, free=float(v.get("free") or 0),
+                used=float(v.get("used") or 0), total=float(v.get("total") or 0),
+            )
+            for k, v in raw.items()
+            if isinstance(v, dict) and (v.get("total") or 0) > 0
+        ]
 
-    async def get_open_position_symbols(self) -> set[str]:
-        """Return set of symbols that have open positions on the exchange.
+    async def get_open_position_symbols(self) -> Optional[set]:
+        """Return set of symbols with open cross-margin positions on OKX, or None on error.
 
-        Used by the bot to detect when OKX's native OCO has already closed a
-        position so the bot can clean up its internal state without placing a
-        redundant SELL order (which would open an unwanted short).
-
-        Returns None for paper/non-OKX exchanges OR on API error — the caller
-        treats None as "could not determine, skip sync". An empty set is only
-        returned when the API call succeeds and genuinely reports zero open
-        positions; that legitimately means everything closed on the exchange.
-
-        CRITICAL: never return an empty set on failure. The bot interprets an
-        empty set as "all positions closed" and would wipe every tracked
-        position — a transient network/rate-limit error must not do that.
+        Returns None for paper mode, non-OKX, or on API error.
+        An empty set means OKX confirmed zero open positions.
+        Never return empty set on failure — caller treats empty set as "all closed".
         """
-        if self.paper or self._exchange_id != "okx" or self.leverage <= 1:
+        if self.paper or self._exchange_id != "okx":
             return None
         try:
-            # OKX margin positions require instType=MARGIN (not SWAP/FUTURES)
-            raw = await self._exchange.fetch_positions(
-                params={"instType": "MARGIN"}
-            )
-            open_syms: set[str] = set()
+            raw = await self._exchange.fetch_positions(params={"instType": "MARGIN"})
+            syms: set = set()
             for p in raw:
-                # OKX margin: check notional or availSubPos; contracts may be 0 for margin mode
                 notional = p.get("notional") or p.get("initialMargin") or 0
-                contracts = p.get("contracts") or 0
-                if float(notional) > 0 or float(contracts) > 0:
-                    open_syms.add(p["symbol"])
-            return open_syms
+                if float(notional) > 0:
+                    syms.add(p["symbol"])
+            return syms
         except Exception as e:
-            import logging
-            logging.getLogger("binance_conn").warning(
-                "fetch_positions failed (skipping sync): %s", e)
+            _log.warning("fetch_positions failed: %s", e)
             return None
 
     async def close(self):
         await self._exchange.close()
-
