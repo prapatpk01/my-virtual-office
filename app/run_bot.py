@@ -96,9 +96,12 @@ def build_config() -> dict:
         "max_drawdown":    _env_float("MAX_DRAWDOWN_PCT", 0.30),
         "risk_per_trade":  _env_float("RISK_PER_TRADE", 0.02),
         "strategies": {
-            "wt_adx":         _env_bool("STRATEGY_WT_ADX",         True),
-            "ut_bot":         _env_bool("STRATEGY_UT_BOT",         True),
-            "momentum_score": _env_bool("STRATEGY_MOMENTUM_SCORE", False),
+            "wt_adx":           _env_bool("STRATEGY_WT_ADX",           False),
+            "ut_bot":           _env_bool("STRATEGY_UT_BOT",           False),
+            "momentum_score":   _env_bool("STRATEGY_MOMENTUM_SCORE",   False),
+            "swing_reversal":   _env_bool("STRATEGY_SWING_REVERSAL",   True),
+            "cpk_regime":       _env_bool("STRATEGY_CPK_REGIME",       True),
+            "hybrid_swing":     _env_bool("STRATEGY_HYBRID_SWING",     True),
         },
         "wt_params": {
             "wt_channel_len": _env_int("WT_N1",   8),
@@ -116,6 +119,28 @@ def build_config() -> dict:
             "sl_atr_mult": _env_float("MOM_SL", 1.5),
             "rr_ratio":    _env_float("MOM_RR", 1.0),
         },
+        # Swing v5 Wide config — tune via env vars if needed
+        "sr_params": {
+            "sl_atr":   _env_float("SR_SL",      2.5),
+            "tp_atr":   _env_float("SR_TP",      1.5),
+            "rsi_lo":   _env_float("SR_RSI_LO", 34.0),
+            "rsi_hi":   _env_float("SR_RSI_HI", 62.0),
+            "vol_mult": _env_float("SR_VOL",      1.2),
+        },
+        "cpk_params": {
+            "sl_atr":   _env_float("CPK_SL",      2.5),
+            "tp_atr":   _env_float("CPK_TP",      1.5),
+            "rsi_lo":   _env_float("CPK_RSI_LO", 40.0),
+            "rsi_hi":   _env_float("CPK_RSI_HI", 64.0),
+            "vol_mult": _env_float("CPK_VOL",      1.2),
+        },
+        "hyb_params": {
+            "sl_atr":   _env_float("HYB_SL",      2.5),
+            "tp_atr":   _env_float("HYB_TP",      2.0),
+            "rsi_lo":   _env_float("HYB_RSI_LO", 38.0),
+            "rsi_hi":   _env_float("HYB_RSI_HI", 64.0),
+            "vol_mult": _env_float("HYB_VOL",      1.2),
+        },
         "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
         "mtf_gate":         _env_bool("MTF_GATE", False),
@@ -130,6 +155,9 @@ def _make_strategies(symbols: list, flags: dict, cfg: dict) -> list:
     from trading.strategies.wt_adx_strategy import WTADXStrategy
     from trading.strategies.ut_bot_strategy import UTBotStrategy
     from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
+    from trading.strategies.swing_strategy import (
+        SwingReversalStrategy, CPKRegimeStrategy, HybridSwingStrategy,
+    )
 
     strategies = []
     for sym in symbols:
@@ -139,6 +167,12 @@ def _make_strategies(symbols: list, flags: dict, cfg: dict) -> list:
             strategies.append(UTBotStrategy(sym, params=cfg["ut_params"]))
         if flags.get("momentum_score"):
             strategies.append(MomentumScoreStrategy(sym, params=cfg["mom_params"]))
+        if flags.get("swing_reversal"):
+            strategies.append(SwingReversalStrategy(sym, params=cfg["sr_params"]))
+        if flags.get("cpk_regime"):
+            strategies.append(CPKRegimeStrategy(sym, params=cfg["cpk_params"]))
+        if flags.get("hybrid_swing"):
+            strategies.append(HybridSwingStrategy(sym, params=cfg["hyb_params"]))
     return strategies
 
 
