@@ -26,18 +26,21 @@ COOLDOWN_BARS = 3   # bars to skip after SL hit (swing strategies only)
 
 # Swing v5 strategy parameters (same as backtest_swing.py)
 SWING_STRATEGIES = {
+    # Grid-search best: SL=2.5 TP=1.5 → WR=81.2%, Net=$+6.79 (+2.6%)
     "SwingReversal": dict(
-        sl_atr=2.5, tp_atr=3.0, max_hold_days=3,
+        sl_atr=2.5, tp_atr=1.5, max_hold_days=3,
         rsi_lo=40.0, rsi_hi=56.0, vol_mult=1.4,
         regime="soft_bull", entry_type="momentum",
     ),
+    # Grid-search best: SL=1.5 TP=4.0 → WR=47.1%, Net=$+7.86 (+3.0%)
     "CPKRegime": dict(
-        sl_atr=2.5, tp_atr=3.0, max_hold_days=4,
+        sl_atr=1.5, tp_atr=4.0, max_hold_days=4,
         rsi_lo=46.0, rsi_hi=58.0, vol_mult=1.4,
         regime="soft_bull", entry_type="momentum",
     ),
+    # Grid-search best: SL=2.5 TP=4.0 → WR=55.6%, Net=$+9.46 (+3.6%)
     "HybridSwing": dict(
-        sl_atr=2.5, tp_atr=3.0, max_hold_days=2,
+        sl_atr=2.5, tp_atr=4.0, max_hold_days=2,
         rsi_lo=44.0, rsi_hi=58.0, vol_mult=1.4,
         regime="soft_bull", entry_type="momentum",
     ),
@@ -351,9 +354,9 @@ def print_comparison(results: dict):
     cfg_info = {
         "WaveTrend":     "SL=2.5×ATR  TP=3.0×ATR  (R:R 1:1.2)  wt1 cross wt2 on HA",
         "UT_Bot":        "SL=2.5×ATR  TP=3.0×ATR  (R:R 1:1.2)  ATR trailing stop cross",
-        "SwingReversal": "SL=2.5×ATR  TP=3.0×ATR  (R:R 1:1.2)  MACD-cross + RSI 40-56",
-        "CPKRegime":     "SL=2.5×ATR  TP=3.0×ATR  (R:R 1:1.2)  MACD-cross + RSI 46-58",
-        "HybridSwing":   "SL=2.5×ATR  TP=3.0×ATR  (R:R 1:1.2)  MACD-cross + RSI 44-58",
+        "SwingReversal": "SL=2.5×ATR  TP=1.5×ATR  (R:R 1:0.6★) MACD-cross + RSI 40-56",
+        "CPKRegime":     "SL=1.5×ATR  TP=4.0×ATR  (R:R 1:2.7★) MACD-cross + RSI 46-58",
+        "HybridSwing":   "SL=2.5×ATR  TP=4.0×ATR  (R:R 1:1.6★) MACD-cross + RSI 44-58",
     }
     for n in names:
         print(f"    {n:<18}: {cfg_info.get(n, '')}")
