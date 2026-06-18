@@ -80,11 +80,12 @@ def build_config() -> dict:
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
 
         # ── Strategies ────────────────────────────────────────────────────────
-        "strategy_mcdx":      _env_bool("STRATEGY_MCDX",      True),   # MCDX p-1
-        "strategy_mcdx_dual": _env_bool("STRATEGY_MCDX_DUAL", True),   # MCDX p-2 (aggressive)
-        "strategy_sjutbot":   _env_bool("STRATEGY_SJUTBOT",   False),  # v2 — off
-        "strategy_sjutbot_v3":_env_bool("STRATEGY_SJUTBOT_V3",True),   # v3.1 (asymmetric)
-        "strategy_utbot":     _env_bool("STRATEGY_UTBOT",     False),  # off
+        "strategy_mcdx":         _env_bool("STRATEGY_MCDX",         True),   # MCDX p-1
+        "strategy_mcdx_dual":    _env_bool("STRATEGY_MCDX_DUAL",    True),   # MCDX p-2
+        "strategy_sjutbot":      _env_bool("STRATEGY_SJUTBOT",      False),  # v2
+        "strategy_sjutbot_v3":   _env_bool("STRATEGY_SJUTBOT_V3",   True),   # v3.1
+        "strategy_sjutbot_v2rev":_env_bool("STRATEGY_SJUTBOT_V2REV",False),  # v2 reversed
+        "strategy_utbot":        _env_bool("STRATEGY_UTBOT",        False),  # off
 
         # ── MCDX p-1 tuning (selective) ──────────────────────────────────────
         "mcdx_dwcs_buy": _env_int("MCDX_DWCS_BUY",  57),     # DWCS buy threshold
@@ -141,10 +142,11 @@ def build_config() -> dict:
 # ── Strategy builder ─────────────────────────────────────────────────────────
 
 def build_strategies(symbols: list[str], cfg: dict) -> list:
-    from trading.strategies.mcdx_strategy       import MCDXStrategy
-    from trading.strategies.sjutbot_strategy    import SJUTBotStrategy
-    from trading.strategies.sjutbot_v3_strategy import SJUTBotV3Strategy
-    from trading.strategies.utbot_wt_strategy   import UTBotWTStrategy
+    from trading.strategies.mcdx_strategy                import MCDXStrategy
+    from trading.strategies.sjutbot_strategy             import SJUTBotStrategy
+    from trading.strategies.sjutbot_v2_reversed_strategy import SJUTBotV2ReversedStrategy
+    from trading.strategies.sjutbot_v3_strategy          import SJUTBotV3Strategy
+    from trading.strategies.utbot_wt_strategy            import UTBotWTStrategy
 
     strategies = []
     for sym in symbols:
@@ -200,8 +202,19 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "allow_short":  cfg["sjv3_allow_short"],
             }))
 
+        # ── SJ-UTBot v2 Reversed (1H) — contrarian: BUY→SHORT, SELL→LONG ────────
+        if cfg["strategy_sjutbot_v2rev"]:
+            strategies.append(SJUTBotV2ReversedStrategy(sym, params={
+                "tf":      "1h",
+                "limit":   200,
+                "ut_mult": 0.30,
+                "ut_len":  14,
+                "sl_len":  14,
+                "sl_mult": cfg["sjutbot_sl_mult"],
+                "rr":      cfg["sjutbot_rr"],
+            }))
+
         # ── UT Bot + WaveTrend (15m) ───────────────────────────────────────────
-        # ATR trailing stop with WaveTrend momentum gate.
         if cfg["strategy_utbot"]:
             strategies.append(UTBotWTStrategy(sym, params={
                 "tf":    "15m",
@@ -211,7 +224,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
     if not strategies:
         raise RuntimeError(
             "No strategies enabled — set STRATEGY_SJUTBOT, STRATEGY_SJUTBOT_V3, "
-            "or STRATEGY_UTBOT to true"
+            "STRATEGY_SJUTBOT_V2REV, or STRATEGY_UTBOT to true"
         )
 
     logger.info("Strategies loaded: %s", [s.name for s in strategies])
@@ -305,10 +318,11 @@ async def main():
             run_full_backtest, backtest_with_signals,
             signal_overlap, format_comparison_telegram,
         )
-        from trading.strategies.mcdx_strategy       import MCDXStrategy
-        from trading.strategies.sjutbot_strategy    import SJUTBotStrategy
-        from trading.strategies.sjutbot_v3_strategy import SJUTBotV3Strategy
-        from trading.strategies.utbot_wt_strategy   import UTBotWTStrategy
+        from trading.strategies.mcdx_strategy                import MCDXStrategy
+        from trading.strategies.sjutbot_strategy             import SJUTBotStrategy
+        from trading.strategies.sjutbot_v2_reversed_strategy import SJUTBotV2ReversedStrategy
+        from trading.strategies.sjutbot_v3_strategy          import SJUTBotV3Strategy
+        from trading.strategies.utbot_wt_strategy            import UTBotWTStrategy
 
         syms     = cfg["symbols"]
         sl_pct   = cfg["stop_loss_pct"]
@@ -354,7 +368,15 @@ async def main():
                 {"cls": UTBotWTStrategy,  "symbol": sym, "tf": "15m", "limit": 3000, "params": {}},
             ]
 
-        logger.info("[BT] Fetching candles for 3-case comparison backtest...")
+        # ── Case 4: v2 Reversed only — contrarian BUY→SHORT SELL→LONG ────
+        c4_configs = []
+        for sym in syms:
+            c4_configs += [
+                {"cls": SJUTBotV2ReversedStrategy, "symbol": sym, "tf": "1h",
+                 "limit": 1500, "params": {**v2_params, "name": "SJUTBotV2ReversedStrategy"}},
+            ]
+
+        logger.info("[BT] Fetching candles for 4-case comparison backtest...")
         cache: dict = {}
         case1 = await run_full_backtest(connector, c1_configs,
                                         cfg["fixed_trade_usdt"], cfg["leverage"],
@@ -365,21 +387,29 @@ async def main():
         case3 = await run_full_backtest(connector, c3_configs,
                                         cfg["fixed_trade_usdt"], cfg["leverage"],
                                         sl_pct, tp_pct, _cache=cache)
+        case4 = await run_full_backtest(connector, c4_configs,
+                                        cfg["fixed_trade_usdt"], cfg["leverage"],
+                                        sl_pct, tp_pct, _cache=cache)
 
-        # ── Signal correlation: v2 vs v3.1 per symbol ─────────────────────
+        # ── Signal correlation: v2 vs v2-reversed (should be perfect inverse)
         correlation: dict = {}
         for sym in syms:
             candles = cache.get((sym, "1h"), [])
             if not candles:
                 continue
-            sv2 = SJUTBotStrategy(sym,   params=v2_params)
-            sv3 = SJUTBotV3Strategy(sym, params=v3_params)
-            _, sigs_v2 = await backtest_with_signals(sv2, candles, notional, sl_pct, tp_pct)
-            _, sigs_v3 = await backtest_with_signals(sv3, candles, notional, sl_pct, tp_pct)
-            correlation[sym] = signal_overlap(sigs_v2, sigs_v3)
+            sv2  = SJUTBotStrategy(sym, params=v2_params)
+            srev = SJUTBotV2ReversedStrategy(sym, params={**v2_params, "name": "SJUTBotV2ReversedStrategy"})
+            _, sigs_v2  = await backtest_with_signals(sv2,  candles, notional, sl_pct, tp_pct)
+            _, sigs_rev = await backtest_with_signals(srev, candles, notional, sl_pct, tp_pct)
+            correlation[sym] = signal_overlap(sigs_v2, sigs_rev)
 
         return format_comparison_telegram(
-            {"C1 v2+v3.1": case1, "C2 MCDXdual+v3.1": case2, "C3 Full": case3},
+            {
+                "C1 v2 + v3.1":           case1,
+                "C2 MCDXdual + v3.1":     case2,
+                "C3 Full":                case3,
+                "C4 v2-REVERSED (solo)":  case4,
+            },
             correlation,
             cfg["fixed_trade_usdt"], cfg["leverage"],
         )
