@@ -89,19 +89,9 @@ class BinanceConnector(BaseConnector):
         #   spot/cash → "cash"  |  margin → "cross"/"isolated"
         if self._exchange_id == "okx":
             td = self.margin_mode if self.leverage > 1 else "cash"
-            okx_params: dict = {"tdMode": td}
-            # Attach TP/SL to the order so OKX manages them natively
-            if side == "buy" and tp and sl and tp > 0 and sl > 0:
-                okx_params["attachAlgoOrds"] = [{
-                    "attachType":       "oco",
-                    "tpTriggerPx":      f"{tp:.2f}",
-                    "tpOrdPx":          "-1",       # market order when TP triggers
-                    "tpTriggerPxType":  "last",
-                    "slTriggerPx":      f"{sl:.2f}",
-                    "slOrdPx":          "-1",       # market order when SL triggers
-                    "slTriggerPxType":  "last",
-                }]
-            kwargs["params"] = okx_params
+            # Use single-order endpoint (not batch) — more compatible with margin + TP/SL
+            self._exchange.options["createOrder"] = "privatePostTradeOrder"
+            kwargs["params"] = {"tdMode": td}
 
         raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
         # For market orders, OKX returns price=None; use average (filled price) instead
@@ -111,7 +101,7 @@ class BinanceConnector(BaseConnector):
             or price
             or 0.0
         )
-        return OrderResult(
+        result = OrderResult(
             order_id=str(raw.get("id", uuid.uuid4())),
             symbol=symbol,
             side=side,
@@ -120,6 +110,33 @@ class BinanceConnector(BaseConnector):
             filled=raw.get("filled") or raw.get("amount") or amount,
             status=raw.get("status", "closed"),
         )
+
+        # After main order fills, attach OCO algo order for TP/SL management.
+        # Done as a separate algo order instead of attachAlgoOrds because the
+        # batch-orders endpoint (CCXT default) has stricter minimum size checks
+        # for attached algo orders on margin accounts.
+        if (self._exchange_id == "okx" and side == "buy"
+                and tp and sl and tp > 0 and sl > 0):
+            td = self.margin_mode if self.leverage > 1 else "cash"
+            try:
+                await self._exchange.create_order(
+                    symbol, "oco", "sell", amount,
+                    params={
+                        "tdMode":           td,
+                        "tpTriggerPx":      f"{tp:.2f}",
+                        "tpOrdPx":          "-1",
+                        "tpTriggerPxType":  "last",
+                        "slTriggerPx":      f"{sl:.2f}",
+                        "slOrdPx":          "-1",
+                        "slTriggerPxType":  "last",
+                    },
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger("binance_conn").warning(
+                    "OCO algo order failed (position open without TP/SL): %s", e)
+
+        return result
 
     async def _paper_order(self, symbol: str, side: str, amount: float,
                            order_type: str, price: Optional[float]) -> OrderResult:
