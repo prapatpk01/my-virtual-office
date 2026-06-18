@@ -228,7 +228,7 @@ class MCDXStrategy(BaseStrategy):
         mdi = np.where(str_ > 0, 100 * smdm / np.clip(str_, eps, None), np.nan)
         dm_sum = np.nan_to_num(pdi) + np.nan_to_num(mdi)
         dx = np.where(dm_sum > 0,
-                      100 * np.abs(np.nan_to_num(pdi) - np.nan_to_num(mdi)) / dm_sum,
+                      100 * np.abs(np.nan_to_num(pdi) - np.nan_to_num(mdi)) / np.clip(dm_sum, eps, None),
                       np.nan)
         adx = np.full(n, np.nan)
         start = 2 * period

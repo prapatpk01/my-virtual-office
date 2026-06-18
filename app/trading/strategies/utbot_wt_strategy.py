@@ -153,7 +153,7 @@ class UTBotWTStrategy(BaseStrategy):
         pdi = np.where(sa > 0, 100*sp/np.clip(sa, eps, None), np.nan)
         mdi = np.where(sa > 0, 100*sm/np.clip(sa, eps, None), np.nan)
         ds  = np.nan_to_num(pdi) + np.nan_to_num(mdi)
-        dx  = np.where(ds > 0, 100*np.abs(np.nan_to_num(pdi)-np.nan_to_num(mdi))/ds, np.nan)
+        dx  = np.where(ds > 0, 100*np.abs(np.nan_to_num(pdi)-np.nan_to_num(mdi))/np.clip(ds, eps, None), np.nan)
         adx = np.full(n, np.nan); start = 2*period
         if n > start:
             adx[start] = np.nanmean(dx[period:start])

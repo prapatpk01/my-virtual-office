@@ -62,13 +62,17 @@ class RiskManager:
     def size_position(self, balance: float, price: float) -> float:
         """Calculate position size in base asset units.
 
-        Fixed mode  (fixed_trade_usdt > 0): margin = fixed USDT, notional = margin × leverage.
-        Percent mode (default):             margin = balance × risk_pct, notional × leverage.
+        Fixed mode  (fixed_trade_usdt > 0): margin = min(fixed, 95% of free balance).
+        Percent mode (default):             margin = balance × risk_pct.
+        Notional = margin × leverage.
         """
         if price <= 0:
             return 0
-        margin = self.fixed_trade_usdt if self.fixed_trade_usdt > 0 \
-                 else balance * self.max_risk_per_trade_pct
+        if self.fixed_trade_usdt > 0:
+            # Cap at 95% of available balance so we never attempt to use more than we have
+            margin = min(self.fixed_trade_usdt, balance * 0.95)
+        else:
+            margin = balance * self.max_risk_per_trade_pct
         notional = margin * self.leverage
         return round(notional / price, 6)
 
