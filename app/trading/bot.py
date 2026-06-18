@@ -282,7 +282,8 @@ class TradingBot:
                         slot, side.upper(), sym, price, sl_p, tp_p, amount)
             if self.telegram:
                 label = "buy" if side == "long" else "sell_short"
-                self.telegram.notify_order(sym, label, amount, order.price, slot, self.paper)
+                self.telegram.notify_order(sym, label, amount, order.price, slot, self.paper,
+                                           sl=sl_p, tp=tp_p)
 
         except Exception as e:
             logger.error("[%s] Open %s %s failed: %s", slot, side, sym, e)

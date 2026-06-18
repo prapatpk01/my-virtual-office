@@ -116,11 +116,12 @@ class TelegramNotifier:
         rr  = meta.get("rr")
 
         sl_tp_line = ""
-        if sl and tp and rr:
+        if sl and tp:
+            rr_line = f"\n📐 R:R `1:{rr:.1f}`" if rr else ""
             sl_tp_line = (
-                f"\n🛑 SL: `{sl:,.4f}`\n"
-                f"🎯 TP: `{tp:,.4f}`\n"
-                f"📐 R:R `1:{rr:.1f}`"
+                f"\n🛑 SL: `{sl:,.4f}`"
+                f"\n🎯 TP: `{tp:,.4f}`"
+                f"{rr_line}"
             )
         text = (
             f"{emoji} *{sig_type.upper()} Signal*\n"
@@ -132,14 +133,19 @@ class TelegramNotifier:
         self.notify(text)
 
     def notify_order(self, symbol: str, side: str, amount: float,
-                     price: float, strategy: str, paper: bool):
+                     price: float, strategy: str, paper: bool,
+                     sl: float = None, tp: float = None):
         emoji = "✅" if side == "buy" else "🏁"
         mode = "📄 PAPER" if paper else "💰 LIVE"
+        sl_tp_line = ""
+        if sl and tp:
+            sl_tp_line = f"\n🛑 SL: `{sl:,.4f}` | 🎯 TP: `{tp:,.4f}`"
         text = (
             f"{emoji} *Order Executed* {mode}\n"
             f"`{symbol}` — *{side.upper()}*\n"
             f"Amount: `{amount}` @ `{price:,.4f}`\n"
             f"Strategy: {strategy}"
+            f"{sl_tp_line}"
         )
         self.notify(text)
 
