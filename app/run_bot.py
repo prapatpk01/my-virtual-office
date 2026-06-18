@@ -83,7 +83,7 @@ def build_config() -> dict:
         "strategy_mcdx":      _env_bool("STRATEGY_MCDX",      False),  # off by default
         "strategy_sjutbot":   _env_bool("STRATEGY_SJUTBOT",   True),   # v2
         "strategy_sjutbot_v3":_env_bool("STRATEGY_SJUTBOT_V3",True),   # v3.1 (asymmetric)
-        "strategy_utbot":     _env_bool("STRATEGY_UTBOT",     True),
+        "strategy_utbot":     _env_bool("STRATEGY_UTBOT",     False),  # off by default
 
         # ── MCDX tuning ───────────────────────────────────────────────────────
         "mcdx_dwcs_buy": _env_int("MCDX_DWCS_BUY", 57),      # DWCS buy threshold
