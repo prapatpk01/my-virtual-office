@@ -67,10 +67,14 @@ class TradingBot:
         state_file: Optional[str] = None,
         fixed_sl_pct: float = 0.0,
         fixed_tp_pct: float = 0.0,
+        candle_tf: str = "",        # override CANDLE_TF env var per-bot-instance
+        candle_limit: int = 0,      # override CANDLE_LIMIT env var per-bot-instance
     ):
         self.connector = connector
         self.strategies = strategies
         self.risk = risk_manager or RiskManager()
+        self._candle_tf    = candle_tf    or os.getenv("CANDLE_TF",    "15m")
+        self._candle_limit = candle_limit or int(os.getenv("CANDLE_LIMIT", "300"))
         self.interval = interval_seconds
         self._broadcast = broadcast_fn or (lambda x: None)
         self.telegram = telegram
@@ -229,9 +233,9 @@ class TradingBot:
         _resolved_symbols: set[str] = set()  # check virtual SL/TP once per symbol per tick
         for strategy in self.strategies:
             try:
-                _tf    = os.getenv("CANDLE_TF", "15m")
-                _limit = int(os.getenv("CANDLE_LIMIT", "300"))
-                candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe=_tf, limit=_limit)
+                candles = await self.connector.fetch_ohlcv(
+                    strategy.symbol, timeframe=self._candle_tf, limit=self._candle_limit
+                )
                 ticker = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
 
@@ -249,7 +253,7 @@ class TradingBot:
                             )
                 # Fetch MTF candles — use strategy's declared timeframes if available
                 mtf_candles = {}
-                _base_tf = os.getenv("CANDLE_TF", "15m")
+                _base_tf = self._candle_tf
                 if hasattr(strategy, "MTF_TIMEFRAMES"):
                     _mtf_tfs = [t for t in strategy.MTF_TIMEFRAMES if t != _base_tf]
                 else:

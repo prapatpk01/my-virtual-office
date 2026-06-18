@@ -109,7 +109,7 @@ def build_config() -> dict:
         # ── Forex / Gold signal-only ───────────────────────────────────────────
         "forex_symbols": _env_list("FOREX_SYMBOLS", "XAUUSD"),
         "forex_enabled": _env_bool("FOREX_SIGNALS", True),
-        "forex_interval": int(os.environ.get("FOREX_INTERVAL_SECONDS", "60")),
+        "forex_interval": int(os.environ.get("FOREX_INTERVAL_SECONDS", "3600")),  # check every 1h
     }
 
 # ---------------------------------------------------------------------------
@@ -260,25 +260,36 @@ def build_crypto_bot(config: dict, telegram):
 
 
 def build_forex_bot(config: dict, telegram):
-    """Signal-only bot for Gold / FX using Yahoo Finance data."""
+    """Signal-only bot for Gold / XAU using Yahoo Finance (SJUTBot 1H)."""
     from trading.connectors.yahoo_conn import YahooConnector
+    from trading.strategies.sjutbot_strategy import SJUTBotStrategy
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
 
     connector = YahooConnector()
-    strategies = _make_strategies(config["forex_symbols"], config["strategies"])
-    if not strategies:
-        from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-        strategies = [MACDEMAStrategy(config["forex_symbols"][0])]
+    symbols = config["forex_symbols"]
 
-    # max_open_positions=0 → strategies run + Telegram alerts sent, but no real orders
+    # SJUTBot v2 on 1H gold — ATR TSL crossover signals
+    strategies = [SJUTBotStrategy(sym, params={
+        "ut_mult": 0.30,
+        "ut_len":  14,
+        "sl_len":  14,
+        "sl_mult": 2.5,
+        "rr":      1.2,
+    }) for sym in symbols]
+
+    logger.info("Gold/Forex signal bot: %s  strategy=SJUTBot(1H)  symbols=%s", "signal-only", symbols)
+
+    # max_open_positions=0 → signals sent to Telegram, no real orders placed
     risk = RiskManager(max_open_positions=0)
     bot = TradingBot(
         connector=connector, strategies=strategies,
-        risk_manager=risk, interval_seconds=config["forex_interval"],
+        risk_manager=risk,
+        interval_seconds=config["forex_interval"],
         broadcast_fn=None, telegram=telegram,
+        candle_tf="1h",         # 1H candles for gold
+        candle_limit=200,
     )
-    # Mark as signal-only so bot.start() skips Telegram polling (already started by crypto bot)
     bot._skip_telegram_polling = True
     return bot
 
