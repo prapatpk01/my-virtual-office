@@ -93,6 +93,20 @@ class BinanceConnector(BaseConnector):
             self._exchange.options["createOrder"] = "privatePostTradeOrder"
             kwargs["params"] = {"tdMode": td}
 
+            # Enforce OKX minimum order size (cross-margin has higher minimums than spot).
+            # Load markets first so we can read minSz without an extra round-trip.
+            await self._exchange.load_markets()
+            mkt = self._exchange.markets.get(symbol) or {}
+            min_sz = float((mkt.get("info") or {}).get("minSz") or 0)
+            if min_sz > 0 and amount < min_sz:
+                px = price or 60000.0
+                needed_usdt = int(min_sz * px / self.leverage) + 1
+                raise ValueError(
+                    f"Amount {amount:.6f} BTC is below OKX minimum {min_sz} BTC "
+                    f"(≈${min_sz * px:,.0f} notional). "
+                    f"Set TRADE_AMOUNT_USDT ≥ {needed_usdt} in Railway Variables."
+                )
+
         raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
         # For market orders, OKX returns price=None; use average (filled price) instead
         exec_price = (
