@@ -240,13 +240,19 @@ class BinanceConnector(BaseConnector):
         ]
 
     async def get_open_position_symbols(self) -> Optional[set]:
-        """Return set of symbols with open cross-margin positions on OKX, or None on error.
+        """Return set of symbols with open leveraged positions on OKX, or None.
 
-        Returns None for paper mode, non-OKX, or on API error.
-        An empty set means OKX confirmed zero open positions.
-        Never return empty set on failure — caller treats empty set as "all closed".
+        Returns None for paper mode, non-OKX, leverage=1 (spot), or on API error.
+        The OKX positions API only tracks LEVERAGED margin positions (borrowed funds).
+        For leverage=1 spot cross-margin, no "position" entry is created — the asset
+        simply moves in the balance. Returning None tells the bot to rely on in-memory
+        tracking and price-based SL/TP checks instead.
         """
         if self.paper or self._exchange_id != "okx":
+            return None
+        if self.leverage <= 1:
+            # Spot trading: OKX positions API returns [] because no borrowing occurred.
+            # An empty set would wrongly signal "all positions closed". Return None.
             return None
         try:
             raw = await self._exchange.fetch_positions(params={"instType": "MARGIN"})

@@ -177,7 +177,8 @@ class TradingBot:
 
     async def _tick(self):
         await self._refresh_balance()
-        await self._sync_okx_positions()
+        await self._sync_okx_positions()   # leveraged OKX positions only
+        await self._check_spot_exits()     # spot SL/TP price check
 
         symbols = list({s.symbol for s in self.strategies})
         for sym in symbols:
@@ -312,6 +313,55 @@ class TradingBot:
                     self.telegram.notify_close(
                         sym, pos.entry_price, exit_price, pnl_pct, reason
                     )
+
+    # ------------------------------------------------------------------
+    # Spot SL/TP check (leverage=1, non-paper)
+    # ------------------------------------------------------------------
+
+    async def _check_spot_exits(self):
+        """For spot (leverage=1) live positions: check price vs SL/TP each tick.
+
+        OKX's OCO algo order handles the actual exchange-side close, but the bot
+        needs to detect the closure and update its in-memory state. We check the
+        current price on each tick; if SL or TP is hit, we attempt a market SELL
+        (which will fail gracefully if OCO already closed it) and clear the position.
+        """
+        if self._paper or getattr(self.connector, "leverage", 1) > 1:
+            return
+        for sym in list(self._positions.keys()):
+            pos = self._positions[sym]
+            if not pos.stop_loss and not pos.take_profit:
+                continue
+            try:
+                ticker = await self.connector.fetch_ticker(sym)
+                price = float(ticker["last"])
+            except Exception:
+                continue
+
+            hit_tp = bool(pos.take_profit and price >= pos.take_profit)
+            hit_sl = bool(pos.stop_loss  and price <= pos.stop_loss)
+            if not hit_tp and not hit_sl:
+                continue
+
+            reason = "take_profit" if hit_tp else "stop_loss"
+            await self._close_spot_position(sym, price, reason)
+
+    async def _close_spot_position(self, sym: str, exit_price: float, reason: str):
+        """Market sell to close spot position. If OCO already sold, the sell will
+        fail (no balance) — we catch that and clear the in-memory position anyway."""
+        pos = self._positions.pop(sym, None)
+        if not pos:
+            return
+        try:
+            await self.connector.create_order(sym, "sell", pos.amount)
+        except Exception as e:
+            logger.info("[Spot-Exit] Sell skipped (OCO already closed?): %s — %s", sym, e)
+
+        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+        logger.info("[Spot-Exit] %s %s: exit=%.4f entry=%.4f pnl=%.2f%%",
+                    sym, reason, exit_price, pos.entry_price, pnl_pct)
+        if self.telegram:
+            self.telegram.notify_close(sym, pos.entry_price, exit_price, pnl_pct, reason)
 
     # ------------------------------------------------------------------
     # 4H MTF gate
