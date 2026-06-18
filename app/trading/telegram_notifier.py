@@ -90,6 +90,11 @@ class TelegramNotifier:
             except Exception:
                 pass
 
+    @staticmethod
+    def _md_escape(s: str) -> str:
+        """Escape characters that break Telegram Markdown v1 entity parsing."""
+        return s.replace("[", "\\[").replace("]", "\\]").replace("_", "\\_").replace("*", "\\*")
+
     def notify_signal(self, signal_dict: dict):
         sig_type = signal_dict.get("type", "hold")
         if sig_type == "hold":
@@ -101,7 +106,7 @@ class TelegramNotifier:
         sym    = signal_dict.get("symbol", "")
         strat  = signal_dict.get("strategy", "")
         price  = signal_dict.get("price", 0)
-        reason = signal_dict.get("reason", "")
+        reason = self._md_escape(signal_dict.get("reason", ""))
         meta   = signal_dict.get("metadata", {})
 
         sl  = meta.get("stop_loss")
@@ -244,6 +249,16 @@ class TelegramNotifier:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 400 and parse_mode:
+                        # Markdown parse error — retry as plain text
+                        plain = {"chat_id": self.chat_id, "text": text}
+                        async with session.post(url, json=plain,
+                                                timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                            if r2.status != 200:
+                                body = await r2.text()
+                                logger.warning("Telegram send (plain) failed %s: %s", r2.status, body[:200])
+                                return False
+                            return True
                     if r.status != 200:
                         body = await r.text()
                         logger.warning("Telegram send failed %s: %s", r.status, body[:200])
