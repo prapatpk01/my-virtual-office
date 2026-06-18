@@ -22,8 +22,8 @@ class SJUTBotStrategy(BaseStrategy):
         self.ut_mult   = self.params.get("ut_mult",   0.30)   # TSL ATR multiplier
         self.ut_len    = self.params.get("ut_len",    14)      # TSL ATR period
         self.sl_len    = self.params.get("sl_len",    14)      # SL/TP ATR period
-        self.sl_mult   = self.params.get("sl_mult",   2.0)     # SL = sl_mult × ATR
-        self.rr        = self.params.get("rr",        2.0)     # TP = SL × rr
+        self.sl_mult   = self.params.get("sl_mult",   2.5)     # SL = 2.5 × ATR (Pine Script v2)
+        self.rr        = self.params.get("rr",        1.2)     # TP = SL × 1.2  (Pine Script v2)
         self.position_pct = self.params.get("position_pct", 0.08)
 
     def _wilder_atr(self, highs, lows, closes, period: int) -> np.ndarray:

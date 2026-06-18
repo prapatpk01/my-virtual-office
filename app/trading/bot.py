@@ -87,8 +87,10 @@ class TradingBot:
         self.wt_verify: bool = os.getenv("WTV", "false").lower() == "true"
         if self.wt_verify:
             logger.info("[WTV] WaveTrend verify ENABLED (WT1 gate ±10 active)")
-        # FUTURES_MODE=true → SELL signals open short positions (perpetual swap)
-        self.futures_mode: bool = os.getenv("FUTURES_MODE", "false").lower() == "true"
+        # FUTURES_MODE: auto-enable when MARKET_TYPE=swap; override with explicit env var
+        _mkt = os.getenv("MARKET_TYPE", "").lower()
+        _fm_default = "true" if _mkt == "swap" else "false"
+        self.futures_mode: bool = os.getenv("FUTURES_MODE", _fm_default).lower() == "true"
         if self.futures_mode:
             logger.info("[FUTURES] Futures mode ENABLED — SELL opens short, BUY closes short")
         # REVERSAL_MODE=true → BUY first closes any open SHORT, SELL first closes any open LONG
@@ -190,7 +192,9 @@ class TradingBot:
                 is_long = pos_info["side"] == "long"
                 side = "sell" if is_long else "buy"
                 ps   = ("long" if is_long else "short") if self.futures_mode else ""
-                await self.connector.create_order(sym, side, pos_info["amount"], pos_side=ps)
+                await self.connector.create_order(
+                    sym, side, pos_info["amount"], pos_side=ps, reduce_only=True
+                )
                 pnl_mult = 1 if is_long else -1
                 pnl = pnl_mult * (price - pos_info["entry"]) * pos_info["amount"]
                 trade = TradeRecord(
@@ -253,10 +257,10 @@ class TradingBot:
                 for tf in _mtf_tfs:
                     try:
                         mtf_candles[tf] = await self.connector.fetch_ohlcv(
-                            strategy.symbol, timeframe=tf, limit=100
+                            strategy.symbol, timeframe=tf, limit=150
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("MTF fetch failed [%s %s]: %s", strategy.symbol, tf, e)
 
                 signal = await strategy.analyze(candles, current_price, mtf_candles=mtf_candles)
 
@@ -520,31 +524,35 @@ class TradingBot:
             self._sig.unlock_strategy(sym, strategy_name)
             return
 
-        balances = await self.connector.fetch_balance()
-        quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
-        ticker = await self.connector.fetch_ticker(sym)
-        price = ticker["last"]
-
-        # Fixed SL/TP (% from config) takes priority; fallback to signal metadata
-        if self.fixed_sl_pct > 0 and self.fixed_tp_pct > 0:
-            sl_p = round(price * (1 - self.fixed_sl_pct), 8)
-            tp_p = round(price * (1 + self.fixed_tp_pct), 8)
-        else:
-            meta = signal.metadata or {}
-            sl_p = meta.get("stop_loss") or meta.get("sl")
-            tp_p = meta.get("take_profit") or meta.get("tp1")
-
-        amount = self.risk.size_position(quote_balance, price)
-        if amount <= 0:
-            logger.info("Position size 0 for %s — tracking virtually", sym)
-            if sl_p and tp_p:
-                vkey = f"virtual||{sym}||{strategy_name}||{int(time.time() * 1000)}"
-                self._sig.add_pending(vkey, sym, signal.type.value, signal.price,
-                                      sl_p, tp_p, strategy=strategy_name)
-            self._sig.unlock_strategy(sym, strategy_name)
-            return
-
         try:
+            balances = await self.connector.fetch_balance()
+            quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
+            ticker = await self.connector.fetch_ticker(sym)
+            price = ticker["last"]
+
+            # Fixed SL/TP (% from config) takes priority; fallback to signal metadata
+            if self.fixed_sl_pct > 0 and self.fixed_tp_pct > 0:
+                sl_p = round(price * (1 - self.fixed_sl_pct), 8)
+                tp_p = round(price * (1 + self.fixed_tp_pct), 8)
+            else:
+                meta = signal.metadata or {}
+                sl_p = meta.get("stop_loss") or meta.get("sl")
+                tp_p = meta.get("take_profit") or meta.get("tp1")
+                if not sl_p or not tp_p:
+                    logger.error("[%s] No SL/TP for %s — refusing order without stops", strategy_name, sym)
+                    self._sig.unlock_strategy(sym, strategy_name)
+                    return
+
+            amount = self.risk.size_position(quote_balance, price)
+            if amount <= 0:
+                logger.info("Position size 0 for %s — tracking virtually", sym)
+                if sl_p and tp_p:
+                    vkey = f"virtual||{sym}||{strategy_name}||{int(time.time() * 1000)}"
+                    self._sig.add_pending(vkey, sym, signal.type.value, signal.price,
+                                          sl_p, tp_p, strategy=strategy_name)
+                self._sig.unlock_strategy(sym, strategy_name)
+                return
+
             order = await self.connector.create_order(
                 sym, "buy", amount, tp_price=tp_p, sl_price=sl_p,
                 pos_side="long" if self.futures_mode else "",
@@ -572,32 +580,36 @@ class TradingBot:
         """Open a SHORT position (futures only). Called for SELL signals in futures_mode."""
         sym = signal.symbol
 
-        balances = await self.connector.fetch_balance()
-        quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
-        ticker = await self.connector.fetch_ticker(sym)
-        price  = ticker["last"]
-
-        # SL above entry, TP below entry (opposite of long)
-        if self.fixed_sl_pct > 0 and self.fixed_tp_pct > 0:
-            sl_p = round(price * (1 + self.fixed_sl_pct), 8)
-            tp_p = round(price * (1 - self.fixed_tp_pct), 8)
-        else:
-            meta = signal.metadata or {}
-            sl_p = meta.get("stop_loss") or meta.get("sl")
-            tp_p = meta.get("take_profit") or meta.get("tp1")
-            # Invert if strategy returned long-side levels
-            if sl_p and sl_p < price:
-                sl_p = round(price * (1 + (self.fixed_sl_pct or self.risk.stop_loss_pct)), 8)
-            if tp_p and tp_p > price:
-                tp_p = round(price * (1 - (self.fixed_tp_pct or self.risk.take_profit_pct)), 8)
-
-        amount = self.risk.size_position(quote_balance, price)
-        if amount <= 0:
-            logger.info("Position size 0 for %s short — skipping", sym)
-            self._sig.unlock_strategy(sym, strategy_name)
-            return
-
         try:
+            balances = await self.connector.fetch_balance()
+            quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
+            ticker = await self.connector.fetch_ticker(sym)
+            price  = ticker["last"]
+
+            # SL above entry, TP below entry (opposite of long)
+            if self.fixed_sl_pct > 0 and self.fixed_tp_pct > 0:
+                sl_p = round(price * (1 + self.fixed_sl_pct), 8)
+                tp_p = round(price * (1 - self.fixed_tp_pct), 8)
+            else:
+                meta = signal.metadata or {}
+                sl_p = meta.get("stop_loss") or meta.get("sl")
+                tp_p = meta.get("take_profit") or meta.get("tp1")
+                # Invert if strategy returned long-side levels
+                if sl_p and sl_p < price:
+                    sl_p = round(price * (1 + (self.fixed_sl_pct or self.risk.stop_loss_pct)), 8)
+                if tp_p and tp_p > price:
+                    tp_p = round(price * (1 - (self.fixed_tp_pct or self.risk.take_profit_pct)), 8)
+                if not sl_p or not tp_p:
+                    logger.error("[%s] No SL/TP for %s short — refusing order without stops", strategy_name, sym)
+                    self._sig.unlock_strategy(sym, strategy_name)
+                    return
+
+            amount = self.risk.size_position(quote_balance, price)
+            if amount <= 0:
+                logger.info("Position size 0 for %s short — skipping", sym)
+                self._sig.unlock_strategy(sym, strategy_name)
+                return
+
             order = await self.connector.create_order(
                 sym, "sell", amount,
                 tp_price=tp_p, sl_price=sl_p,
@@ -625,8 +637,9 @@ class TradingBot:
     async def _refresh_balance(self):
         try:
             balances = await self.connector.fetch_balance()
+            # Only count stable/USDT balances — BTC/ETH values are not in USDT terms
             self.state.total_balance = sum(
-                b.total for b in balances if b.asset in ("USDT", "USD", "BUSD", "BTC", "ETH")
+                b.total for b in balances if b.asset in ("USDT", "USD", "BUSD")
             )
             self.state.equity = self.state.total_balance
             if self._start_balance:

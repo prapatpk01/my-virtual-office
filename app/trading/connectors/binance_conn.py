@@ -95,26 +95,32 @@ class BinanceConnector(BaseConnector):
             return
         if symbol in self._leverage_set:
             return
-        try:
-            if self._futures:
-                # OKX hedge mode: set leverage for both sides separately
-                for ps in ("long", "short"):
-                    try:
-                        await self._exchange.set_leverage(
-                            self._leverage, symbol,
-                            params={"mgnMode": "cross", "posSide": ps},
-                        )
-                    except Exception:
-                        pass
-                logger.info("OKX futures leverage: %s × %dx (long+short)", symbol, self._leverage)
-            elif self._margin_mode:
+        if self._futures:
+            # OKX hedge mode: must set leverage for BOTH sides; fail hard if both fail
+            any_ok = False
+            for ps in ("long", "short"):
+                try:
+                    await self._exchange.set_leverage(
+                        self._leverage, symbol,
+                        params={"mgnMode": "cross", "posSide": ps},
+                    )
+                    any_ok = True
+                except Exception as e:
+                    logger.error("set_leverage FAILED %s posSide=%s: %s", symbol, ps, e)
+            if not any_ok:
+                raise RuntimeError(
+                    f"Could not set leverage for {symbol} — cannot place orders safely"
+                )
+            logger.info("OKX futures leverage: %s × %dx (long+short)", symbol, self._leverage)
+        elif self._margin_mode:
+            try:
                 await self._exchange.set_leverage(
                     self._leverage, symbol,
                     params={"mgnMode": self._margin_mode},
                 )
                 logger.info("OKX margin leverage: %s × %dx %s", symbol, self._leverage, self._margin_mode)
-        except Exception as e:
-            logger.warning("set_leverage failed (%s): %s — continuing", symbol, e)
+            except Exception as e:
+                logger.warning("set_leverage failed (%s): %s — continuing", symbol, e)
         self._leverage_set.add(symbol)
 
     # ──────────────────────────────────────────────────────────────────
@@ -126,7 +132,8 @@ class BinanceConnector(BaseConnector):
                            price: Optional[float] = None,
                            tp_price: Optional[float] = None,
                            sl_price: Optional[float] = None,
-                           pos_side: str = "") -> OrderResult:
+                           pos_side: str = "",
+                           reduce_only: bool = False) -> OrderResult:
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price, pos_side)
 
@@ -138,33 +145,60 @@ class BinanceConnector(BaseConnector):
 
         if self._exchange_id == "okx":
             if self._futures:
-                # OKX Perpetual Futures: cross margin, one-way mode (posSide=net)
-                # pos_side="" means one-way (OKX default after account setup).
-                # pos_side="long"|"short" enables hedge mode.
+                # ── OKX Perpetual Futures (hedge mode) ────────────────────────
+                # Convert BTC quantity → integer contract count (1 contract = ctVal BTC)
+                try:
+                    market = self._exchange.market(symbol)
+                    ct_val = float(market.get("contractSize", 0.01))
+                except Exception:
+                    ct_val = 0.01  # OKX BTC/USDT:USDT default
+                contracts = int(amount / ct_val)
+                if contracts < 1:
+                    raise ValueError(
+                        f"Order too small: {amount:.6f} BTC = {amount/ct_val:.3f} contracts. "
+                        f"Minimum is 1 contract = {ct_val} BTC. "
+                        f"Increase FIXED_TRADE_USDT (need ~${ct_val * 1e5 / self._leverage:.0f} "
+                        f"at 100k BTC and {self._leverage}x leverage)."
+                    )
+                btc_amount = amount
+                amount = float(contracts)
+                logger.info("OKX contract conversion: %.6f BTC → %d contracts (ctVal=%.3f BTC)",
+                            btc_amount, contracts, ct_val)
+
                 params["tdMode"] = "cross"
                 if pos_side:
                     params["posSide"] = pos_side
+                if reduce_only:
+                    params["reduceOnly"] = True
+                # Attach algo TP/SL inline (OKX attachAlgoOrds structure)
                 if tp_price and sl_price:
-                    params["tpTriggerPx"]     = str(round(tp_price, 2))
-                    params["tpOrdPx"]         = "-1"
-                    params["tpTriggerPxType"] = "last"
-                    params["slTriggerPx"]     = str(round(sl_price, 2))
-                    params["slOrdPx"]         = "-1"
-                    params["slTriggerPxType"] = "last"
-                logger.info("OKX futures: %s %s %s %.6f  TP=%s  SL=%s  pos=%s",
-                            side.upper(), symbol, order_type, amount,
-                            tp_price or "—", sl_price or "—", pos_side or "net")
+                    params["attachAlgoOrds"] = [{
+                        "attachAlgoClOrdId": str(uuid.uuid4())[:16],
+                        "tpTriggerPx":       str(round(tp_price, 2)),
+                        "tpOrdPx":           "-1",          # market execution at trigger
+                        "tpTriggerPxType":   "last",
+                        "slTriggerPx":       str(round(sl_price, 2)),
+                        "slOrdPx":           "-1",
+                        "slTriggerPxType":   "last",
+                    }]
+                logger.info("OKX futures: %s %s %s %d contracts  TP=%s  SL=%s  pos=%s  reduceOnly=%s",
+                            side.upper(), symbol, order_type, int(amount),
+                            tp_price or "—", sl_price or "—",
+                            pos_side or "net", reduce_only)
             elif self._margin_mode:
-                # OKX Spot Cross Margin (original behaviour)
+                # OKX Spot Cross Margin
                 params["tdMode"] = self._margin_mode
                 params["ccy"]    = symbol.split("/")[1] if "/" in symbol else "USDT"
                 if side == "buy" and tp_price and sl_price:
-                    params["tpTriggerPx"]     = str(round(tp_price, 2))
-                    params["tpOrdPx"]         = "-1"
-                    params["tpTriggerPxType"] = "last"
-                    params["slTriggerPx"]     = str(round(sl_price, 2))
-                    params["slOrdPx"]         = "-1"
-                    params["slTriggerPxType"] = "last"
+                    params["attachAlgoOrds"] = [{
+                        "attachAlgoClOrdId": str(uuid.uuid4())[:16],
+                        "tpTriggerPx":       str(round(tp_price, 2)),
+                        "tpOrdPx":           "-1",
+                        "tpTriggerPxType":   "last",
+                        "slTriggerPx":       str(round(sl_price, 2)),
+                        "slOrdPx":           "-1",
+                        "slTriggerPxType":   "last",
+                    }]
                     logger.info("OKX margin: %s %s %.6f  TP=%.2f  SL=%.2f",
                                 side.upper(), symbol, amount, tp_price, sl_price)
 
@@ -273,9 +307,17 @@ class BinanceConnector(BaseConnector):
             return [Balance(asset=k, free=v, used=0.0, total=v)
                     for k, v in self._paper_balance.items() if v > 0]
         raw = await self._exchange.fetch_balance()
-        return [Balance(asset=k, free=v["free"], used=v["used"], total=v["total"])
-                for k, v in raw["total"].items()
-                if isinstance(raw.get(k), dict) and raw[k].get("total", 0) > 0]
+        # CCXT: top-level keys are asset names; each value is {free, used, total}
+        # "total"/"free"/"used"/"info"/"debt" are summary/meta keys — skip them
+        _skip = {"info", "free", "used", "total", "debt", "datetime", "timestamp"}
+        return [
+            Balance(asset=k, free=float(raw[k].get("free") or 0),
+                    used=float(raw[k].get("used") or 0),
+                    total=float(raw[k].get("total") or 0))
+            for k in raw
+            if k not in _skip and isinstance(raw.get(k), dict)
+            and float(raw[k].get("total") or 0) > 0
+        ]
 
     async def close(self):
         await self._exchange.close()

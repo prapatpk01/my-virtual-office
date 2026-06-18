@@ -77,7 +77,7 @@ def build_config() -> dict:
         "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
         "oanda_env":       os.environ.get("OANDA_ENV", "practice"),
         # ── Candles / timing ──────────────────────────────────────────────────
-        "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
+        "symbols":      _env_list("SYMBOLS", "BTC/USDT:USDT"),
         "candle_tf":    os.environ.get("CANDLE_TF", "1h"),        # 1h: proven WR for MCDX + Sentinel
         "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
@@ -85,10 +85,10 @@ def build_config() -> dict:
         # RSI+MACD disabled by default — BTC 15m uses MCDX + Sentinel only
         "strategies": {
             "mcdx":      _env_bool("STRATEGY_MCDX",      True),
-            "sentinel":  _env_bool("STRATEGY_SENTINEL",   False),  # disable: adds untested fees
+            "sentinel":  _env_bool("STRATEGY_SENTINEL",   False),
             "rsi_macd":  _env_bool("STRATEGY_RSI_MACD",   False),
             "utbot_wt":  _env_bool("STRATEGY_UTBOT_WT",   False),
-            "sjutbot":   _env_bool("STRATEGY_SJUTBOT",    False),
+            "sjutbot":   _env_bool("STRATEGY_SJUTBOT",    True),   # SJ-UTBot v2 enabled
         },
         # ── Risk / SL / TP ────────────────────────────────────────────────────
         "risk_per_trade":    float(os.environ.get("RISK_PER_TRADE",    "0.02")),
@@ -286,9 +286,6 @@ def build_forex_bot(config: dict, telegram):
 # Main
 # ---------------------------------------------------------------------------
 
-_stop_signal = asyncio.Event()
-
-
 async def _run_backtest(crypto_bot, config: dict, telegram):
     """Fetch candles on first symbol, run backtest on strategies that support it."""
     # MCDX / Sentinel / AISignal don't have a backtest() method — skip silently
@@ -353,23 +350,46 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
 
 async def main():
     config = build_config()
+
+    # ── Live trading safety checks ────────────────────────────────────────────
+    if not config["paper"]:
+        missing = []
+        if not config.get("api_key"):        missing.append("EXCHANGE_API_KEY")
+        if not config.get("api_secret"):     missing.append("EXCHANGE_API_SECRET")
+        if config.get("exchange") == "okx" and not config.get("api_passphrase"):
+            missing.append("EXCHANGE_PASSPHRASE")
+        if missing:
+            raise RuntimeError(
+                f"LIVE TRADING ERROR: Missing required credentials: {', '.join(missing)}"
+            )
+        if config.get("exchange") == "okx" and config.get("market_type") != "swap":
+            raise RuntimeError(
+                "LIVE TRADING ERROR: OKX futures requires MARKET_TYPE=swap"
+            )
+        logger.warning(
+            "⚠️  LIVE TRADING ENABLED — exchange=%s  symbols=%s  lev=%dx — real orders will be placed!",
+            config["exchange"], config["symbols"], config["leverage"],
+        )
+
     logger.info("=== Bot starting [%s] crypto=%s forex=%s ===",
                 "PAPER" if config["paper"] else "LIVE",
                 config["symbols"], config["forex_symbols"])
 
     telegram = _make_telegram(config)
 
-    # Crypto bot (Binance)
+    # Crypto bot (Binance/OKX)
     crypto_bot = build_crypto_bot(config, telegram)
 
     # Forex / Gold signal bot (Yahoo Finance)
     forex_bot = build_forex_bot(config, telegram) if config["forex_enabled"] else None
 
+    # asyncio.Event must be created INSIDE the running event loop (Python 3.10+)
+    stop_signal = asyncio.Event()
     loop = asyncio.get_event_loop()
 
     def _handle_signal():
         logger.info("Shutdown signal received")
-        _stop_signal.set()
+        stop_signal.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -380,7 +400,7 @@ async def main():
     if telegram:
         telegram.get_state_fn = crypto_bot.get_state
         telegram.get_stats_fn = crypto_bot.get_stats
-        telegram.stop_bot_fn  = lambda: _stop_signal.set()
+        telegram.stop_bot_fn  = lambda: stop_signal.set()
         telegram.start_bot_fn = lambda: {"message": "Bot is already running"}
 
     # Auto-optimize SL/TP via backtest on first symbol
@@ -392,7 +412,7 @@ async def main():
         tasks.append(asyncio.create_task(forex_bot.start()))
         logger.info("Forex signal bot started: %s", config["forex_symbols"])
 
-    await _stop_signal.wait()
+    await stop_signal.wait()
 
     logger.info("Stopping all bots...")
     await crypto_bot.stop()
