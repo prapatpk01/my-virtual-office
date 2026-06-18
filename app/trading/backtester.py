@@ -320,9 +320,8 @@ def format_backtest_telegram(results: dict[str, dict],
 
 
 def format_comparison_telegram(
-    case1: dict[str, dict],
-    case2: dict[str, dict],
-    correlation: dict[str, dict],   # {symbol: signal_overlap dict}
+    cases: dict[str, dict[str, dict]],   # {case_label: {strategy_label: summary}}
+    correlation: dict[str, dict],         # {symbol: signal_overlap dict}
     fixed_usdt: float,
     leverage: int,
 ) -> str:
@@ -352,29 +351,26 @@ def format_comparison_telegram(
         lines.append(f"  {icon} *Total: {sign}{total_net:.2f}$ ({total_t} trades)*")
         return "\n".join(lines)
 
-    lines = [
+    parts = [
         "📊 *Backtest Comparison*",
         f"${fixed_usdt}×{leverage}x = ${fixed_usdt*leverage:.0f} notional/trade\n",
-        _case_block(case1, "CASE 1 ── SJUTBot v2 + v3.1"),
-        "",
-        _case_block(case2, "CASE 2 ── Full (MCDX + UTBot + v2 + v3.1)"),
-        "",
-        "🔄 *Signal Overlap  v2 vs v3.1*",
     ]
+    for case_label, results in cases.items():
+        parts.append(_case_block(results, case_label))
+        parts.append("")
+
+    parts.append("🔄 *Signal Overlap  v2 vs v3.1*")
     for sym, ov in correlation.items():
         sym_s = sym.split("/")[0]
         ta, tb = ov["total_a"], ov["total_b"]
         sl, ss, op = ov["same_long"], ov["same_short"], ov["opposite"]
         total_concurrent = sl + ss + op
-        lines.append(
-            f"  *{sym_s}*  v2={ta} trades  v3.1={tb} trades"
-        )
+        parts.append(f"  *{sym_s}*  v2={ta} trades  v3.1={tb} trades")
         if total_concurrent:
-            lines.append(
-                f"    ↑↑ Long same={sl}  ↓↓ Short same={ss}  "
-                f"↑↓ Opposite={op}  (concurrent={total_concurrent})"
+            parts.append(
+                f"    ↑↑ Long={sl}  ↓↓ Short={ss}  ↑↓ Opposite={op}"
             )
         else:
-            lines.append("    (no concurrent signals)")
+            parts.append("    (no concurrent signals)")
 
-    return "\n".join(lines)
+    return "\n".join(parts)

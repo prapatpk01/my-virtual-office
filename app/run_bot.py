@@ -80,14 +80,18 @@ def build_config() -> dict:
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
 
         # ── Strategies ────────────────────────────────────────────────────────
-        "strategy_mcdx":      _env_bool("STRATEGY_MCDX",      False),  # off by default
+        "strategy_mcdx":      _env_bool("STRATEGY_MCDX",      False),  # MCDX p-1
+        "strategy_mcdx_dual": _env_bool("STRATEGY_MCDX_DUAL", False),  # MCDX p-2 (aggressive)
         "strategy_sjutbot":   _env_bool("STRATEGY_SJUTBOT",   True),   # v2
         "strategy_sjutbot_v3":_env_bool("STRATEGY_SJUTBOT_V3",True),   # v3.1 (asymmetric)
         "strategy_utbot":     _env_bool("STRATEGY_UTBOT",     False),  # off by default
 
-        # ── MCDX tuning ───────────────────────────────────────────────────────
-        "mcdx_dwcs_buy": _env_int("MCDX_DWCS_BUY", 57),      # DWCS buy threshold
-        "mcdx_rvol":     _env_float("MCDX_RVOL",   0.8),     # Relative volume min
+        # ── MCDX p-1 tuning (selective) ──────────────────────────────────────
+        "mcdx_dwcs_buy": _env_int("MCDX_DWCS_BUY",  57),     # DWCS buy threshold
+        "mcdx_rvol":     _env_float("MCDX_RVOL",    0.8),    # Relative volume min
+        # ── MCDX p-2 tuning (aggressive, lower threshold) ────────────────────
+        "mcdx2_dwcs_buy":_env_int("MCDX2_DWCS_BUY", 45),     # lower = more signals
+        "mcdx2_rvol":    _env_float("MCDX2_RVOL",   0.5),    # looser vol filter
 
         # ── SJUTBot v2 tuning ─────────────────────────────────────────────────
         # SL = SJUTBOT_SL_MULT × ATR,  TP = SJUTBOT_SL_MULT × SJUTBOT_RR × ATR
@@ -145,16 +149,26 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
     strategies = []
     for sym in symbols:
 
-        # ── MCDX Plus v3 (15m) ────────────────────────────────────────────────
-        # Disabled by default (STRATEGY_MCDX=false). Enable only when not using
-        # MCDX p-1+p-2 simultaneously on TradingView.
+        # ── MCDX p-1 (15m, selective) ─────────────────────────────────────────
         if cfg["strategy_mcdx"]:
             strategies.append(MCDXStrategy(sym, params={
+                "name":      "MCDXStrategy_p1",  # unique slot
                 "tf":        "15m",
                 "limit":     300,
                 "dwcs_buy":  cfg["mcdx_dwcs_buy"],
                 "dwcs_sell": 100 - cfg["mcdx_dwcs_buy"],
                 "rvol_min":  cfg["mcdx_rvol"],
+            }))
+
+        # ── MCDX p-2 (15m, aggressive — lower threshold) ──────────────────────
+        if cfg["strategy_mcdx_dual"]:
+            strategies.append(MCDXStrategy(sym, params={
+                "name":      "MCDXStrategy_p2",  # separate slot from p-1
+                "tf":        "15m",
+                "limit":     300,
+                "dwcs_buy":  cfg["mcdx2_dwcs_buy"],
+                "dwcs_sell": 100 - cfg["mcdx2_dwcs_buy"],
+                "rvol_min":  cfg["mcdx2_rvol"],
             }))
 
         # ── SJ-UTBot v2 (1H) ──────────────────────────────────────────────────
@@ -301,37 +315,54 @@ async def main():
         tp_pct   = cfg["take_profit_pct"]
         notional = cfg["fixed_trade_usdt"] * cfg["leverage"]
 
-        v2_params  = {"ut_mult": 0.30, "ut_len": 14, "sl_len": 14,
-                      "sl_mult": cfg["sjutbot_sl_mult"], "rr": cfg["sjutbot_rr"]}
-        v3_params  = {"ut_mult": 0.30, "ut_len": 14, "filter_threshold": 3,
-                      "sl_mult": cfg["sjv3_sl_mult"], "rr": cfg["sjv3_rr"],
-                      "allow_long": True, "allow_short": True}
-        mcdx_p     = {"dwcs_buy": cfg["mcdx_dwcs_buy"],
-                      "dwcs_sell": 100 - cfg["mcdx_dwcs_buy"],
-                      "rvol_min": cfg["mcdx_rvol"]}
+        v2_params   = {"ut_mult": 0.30, "ut_len": 14, "sl_len": 14,
+                       "sl_mult": cfg["sjutbot_sl_mult"], "rr": cfg["sjutbot_rr"]}
+        v3_params   = {"ut_mult": 0.30, "ut_len": 14, "filter_threshold": 3,
+                       "sl_mult": cfg["sjv3_sl_mult"], "rr": cfg["sjv3_rr"],
+                       "allow_long": True, "allow_short": True}
+        mcdx_p1     = {"name": "MCDXStrategy_p1",
+                       "dwcs_buy": cfg["mcdx_dwcs_buy"],
+                       "dwcs_sell": 100 - cfg["mcdx_dwcs_buy"],
+                       "rvol_min": cfg["mcdx_rvol"]}
+        mcdx_p2     = {"name": "MCDXStrategy_p2",
+                       "dwcs_buy": cfg["mcdx2_dwcs_buy"],
+                       "dwcs_sell": 100 - cfg["mcdx2_dwcs_buy"],
+                       "rvol_min": cfg["mcdx2_rvol"]}
 
-        # ── Case 1: v2 + v3.1 ─────────────────────────────────────────────
+        # ── Case 1: SJUTBot v2 + v3.1 ─────────────────────────────────────
         c1_configs = []
         for sym in syms:
             c1_configs += [
-                {"cls": SJUTBotStrategy,  "symbol": sym, "tf": "1h",  "limit": 1500, "params": v2_params},
-                {"cls": SJUTBotV3Strategy,"symbol": sym, "tf": "1h",  "limit": 1500, "params": v3_params},
+                {"cls": SJUTBotStrategy,   "symbol": sym, "tf": "1h",  "limit": 1500, "params": v2_params},
+                {"cls": SJUTBotV3Strategy, "symbol": sym, "tf": "1h",  "limit": 1500, "params": v3_params},
             ]
 
-        # ── Case 2: Full (MCDX + UTBot + v2 + v3.1) ───────────────────────
-        c2_configs = list(c1_configs)
+        # ── Case 2: MCDX p-1 + MCDX p-2 (dual) + SJUTBot v3.1 ───────────
+        c2_configs = []
         for sym in syms:
             c2_configs += [
-                {"cls": MCDXStrategy,    "symbol": sym, "tf": "15m", "limit": 3000, "params": mcdx_p},
-                {"cls": UTBotWTStrategy, "symbol": sym, "tf": "15m", "limit": 3000, "params": {}},
+                {"cls": MCDXStrategy,      "symbol": sym, "tf": "15m", "limit": 3000, "params": mcdx_p1},
+                {"cls": MCDXStrategy,      "symbol": sym, "tf": "15m", "limit": 3000, "params": mcdx_p2},
+                {"cls": SJUTBotV3Strategy, "symbol": sym, "tf": "1h",  "limit": 1500, "params": v3_params},
             ]
 
-        logger.info("[BT] Fetching candles for comparison backtest...")
+        # ── Case 3: Full (MCDX dual + UTBot + v2 + v3.1) ─────────────────
+        c3_configs = list(c2_configs)
+        for sym in syms:
+            c3_configs += [
+                {"cls": SJUTBotStrategy,  "symbol": sym, "tf": "1h",  "limit": 1500, "params": v2_params},
+                {"cls": UTBotWTStrategy,  "symbol": sym, "tf": "15m", "limit": 3000, "params": {}},
+            ]
+
+        logger.info("[BT] Fetching candles for 3-case comparison backtest...")
         cache: dict = {}
         case1 = await run_full_backtest(connector, c1_configs,
                                         cfg["fixed_trade_usdt"], cfg["leverage"],
                                         sl_pct, tp_pct, _cache=cache)
         case2 = await run_full_backtest(connector, c2_configs,
+                                        cfg["fixed_trade_usdt"], cfg["leverage"],
+                                        sl_pct, tp_pct, _cache=cache)
+        case3 = await run_full_backtest(connector, c3_configs,
                                         cfg["fixed_trade_usdt"], cfg["leverage"],
                                         sl_pct, tp_pct, _cache=cache)
 
@@ -348,7 +379,8 @@ async def main():
             correlation[sym] = signal_overlap(sigs_v2, sigs_v3)
 
         return format_comparison_telegram(
-            case1, case2, correlation,
+            {"C1 v2+v3.1": case1, "C2 MCDXdual+v3.1": case2, "C3 Full": case3},
+            correlation,
             cfg["fixed_trade_usdt"], cfg["leverage"],
         )
 

@@ -37,7 +37,8 @@ class BaseStrategy(ABC):
     def __init__(self, symbol: str, params: Optional[dict] = None):
         self.symbol = symbol
         self.params = params or {}
-        self.name = self.__class__.__name__
+        # Allow callers to pass name="..." in params to create distinct strategy slots
+        self.name = self.params.get("name", self.__class__.__name__)
 
     @abstractmethod
     async def analyze(self, candles: list, current_price: float,
