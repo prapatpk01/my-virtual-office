@@ -260,7 +260,44 @@ async def main():
         fixed_tp_pct=cfg["take_profit_pct"],
     )
 
-    # Wire Telegram callbacks
+    # ── Backtest function (called by /backtest Telegram command) ─────────────
+    async def _run_backtest() -> str:
+        from trading.backtester import run_full_backtest, format_backtest_telegram
+        from trading.strategies.mcdx_strategy     import MCDXStrategy
+        from trading.strategies.sjutbot_strategy  import SJUTBotStrategy
+        from trading.strategies.utbot_wt_strategy import UTBotWTStrategy
+
+        bt_configs = []
+        for sym in cfg["symbols"]:
+            if cfg["strategy_mcdx"]:
+                bt_configs.append({"cls": MCDXStrategy, "symbol": sym, "tf": "15m",
+                                   "limit": 3000,
+                                   "params": {"dwcs_buy": cfg["mcdx_dwcs_buy"],
+                                              "dwcs_sell": 100 - cfg["mcdx_dwcs_buy"],
+                                              "rvol_min": cfg["mcdx_rvol"]}})
+            if cfg["strategy_sjutbot"]:
+                bt_configs.append({"cls": SJUTBotStrategy, "symbol": sym, "tf": "1h",
+                                   "limit": 1500,
+                                   "params": {"ut_mult": 0.30, "ut_len": 14, "sl_len": 14,
+                                              "sl_mult": cfg["sjutbot_sl_mult"],
+                                              "rr": cfg["sjutbot_rr"]}})
+            if cfg["strategy_utbot"]:
+                bt_configs.append({"cls": UTBotWTStrategy, "symbol": sym, "tf": "15m",
+                                   "limit": 3000, "params": {}})
+
+        results = await run_full_backtest(
+            connector=connector,
+            strategy_configs=bt_configs,
+            fixed_trade_usdt=cfg["fixed_trade_usdt"],
+            leverage=cfg["leverage"],
+            sl_pct=cfg["stop_loss_pct"],
+            tp_pct=cfg["take_profit_pct"],
+        )
+        return format_backtest_telegram(
+            results, cfg["fixed_trade_usdt"], cfg["leverage"], 3000
+        )
+
+    # ── Wire Telegram callbacks ───────────────────────────────────────────────
     if telegram:
         stop_event_ref: list = []  # forward reference
 
@@ -273,6 +310,7 @@ async def main():
         telegram.get_stats_fn = bot.get_stats
         telegram.stop_bot_fn  = _tg_stop
         telegram.start_bot_fn = lambda: {"message": "Bot is already running"}
+        telegram.backtest_fn  = _run_backtest
 
     # ── Event loop + signal handlers ─────────────────────────────────────────
     stop_signal = asyncio.Event()

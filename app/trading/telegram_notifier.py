@@ -39,12 +39,14 @@ class TelegramNotifier:
         get_stats_fn: Optional[Callable] = None,
         start_bot_fn: Optional[Callable] = None,
         stop_bot_fn: Optional[Callable] = None,
+        backtest_fn: Optional[Callable] = None,
         min_confidence: float = 0.5,
     ):
         self.token = token.strip()
         self.chat_id = str(chat_id).strip()
         self.get_state_fn = get_state_fn
         self.get_stats_fn = get_stats_fn
+        self.backtest_fn  = backtest_fn
         self.start_bot_fn = start_bot_fn
         self.stop_bot_fn = stop_bot_fn
         self.min_confidence = min_confidence
@@ -320,10 +322,22 @@ class TelegramNotifier:
                 "/trades — last 5 trades\n"
                 "/balance — balance & P\\&L\n"
                 "/stats — win rate & signal statistics\n"
+                "/backtest — run historical backtest (takes 1-2 min)\n"
                 "/start\\_bot — start the bot\n"
                 "/stop\\_bot — stop the bot\n"
                 "/help — this message"
             )
+
+        elif cmd == "backtest":
+            if not self.backtest_fn:
+                await self._send("⚠️ Backtest not configured")
+                return
+            await self._send("⏳ Running backtest... (1-2 minutes)")
+            try:
+                result_text = await self.backtest_fn()
+                await self._send(result_text)
+            except Exception as e:
+                await self._send(f"❌ Backtest failed: {e}")
 
         elif cmd == "status":
             state = self.get_state_fn() if self.get_state_fn else {}
