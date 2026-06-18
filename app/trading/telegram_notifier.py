@@ -51,6 +51,7 @@ class TelegramNotifier:
         self.start_bot_fn = start_bot_fn
         self.stop_bot_fn = stop_bot_fn
         self.fetch_candles_fn = fetch_candles_fn
+        self.manual_buy_fn: Optional[Callable] = None   # set by run_bot.py
         self.min_confidence = min_confidence
 
         self._last_update_id = 0
@@ -552,6 +553,19 @@ class TelegramNotifier:
             except Exception as e:
                 logger.exception("export_candles error")
                 await self._send(f"❌ Export error: {e}")
+
+        elif cmd == "buy":
+            if not self.manual_buy_fn:
+                await self._send("⚠️ manual\\_buy not configured")
+                return
+            parts = text.split()
+            sym = parts[1].upper() if len(parts) > 1 else "BTC/USDT"
+            if "/" not in sym:
+                sym += "/USDT"
+            await self._send(f"⏳ Sending manual BUY for `{sym}`...")
+            result = await self.manual_buy_fn(sym)
+            ok = "Error" not in result and "Cannot" not in result and "failed" not in result.lower()
+            await self._send(f"{'✅' if ok else '❌'} {result}")
 
         else:
             await self._send(f"❓ Unknown command: `{text}`\nType /help for commands.")

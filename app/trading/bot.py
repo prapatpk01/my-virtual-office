@@ -201,6 +201,39 @@ class TradingBot:
             raise ValueError("Connector has no underlying exchange object")
         return await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
 
+    async def manual_buy(self, symbol: str) -> str:
+        """Force a BUY position — bypasses strategy/MTF gate, uses configured ATR SL/TP.
+        Used by /buy Telegram command for manual testing."""
+        from .strategies.base import BaseStrategy, Signal, SignalType
+        try:
+            candles = await self.connector.fetch_ohlcv(symbol, timeframe="1h", limit=50)
+            ticker  = await self.connector.fetch_ticker(symbol)
+            price   = ticker["last"]
+            if not candles:
+                return "Error: could not fetch candles"
+            atr_arr = BaseStrategy.atr(candles, 14)
+            atr     = float(atr_arr[-1]) if not math.isnan(float(atr_arr[-1])) else price * 0.015
+            sl_mult = float(os.getenv("UT_SL", "2.5"))
+            rr      = float(os.getenv("UT_RR", "1.2"))
+            sl_p    = round(price - sl_mult * atr, 4)
+            tp_p    = round(price + sl_mult * rr * atr, 4)
+            signal  = Signal(
+                type=SignalType.BUY, symbol=symbol,
+                price=price, amount=0.0, confidence=1.0,
+                reason="manual /buy command",
+                metadata={"stop_loss": sl_p, "take_profit": tp_p, "atr": round(atr, 4)},
+            )
+            strategy_name = "manual"
+            can, reason_str = self.risk.can_open(symbol, strategy=strategy_name)
+            if not can:
+                return f"Cannot open: {reason_str}"
+            self._sig.lock_strategy(symbol, strategy_name, "buy")
+            await self._execute_signal(signal, strategy_name)
+            return (f"BUY `{symbol}` @ ${price:,.2f}\n"
+                    f"SL: ${sl_p:,.2f}  TP: ${tp_p:,.2f}  ATR: ${atr:,.2f}")
+        except Exception as e:
+            return f"Error: {e}"
+
     async def manual_signal(self, symbol: str, side: str, amount: float, reason: str = "manual"):
         """Execute a manual trade bypassing strategy analysis."""
         try:

@@ -353,6 +353,7 @@ async def main():
         telegram.stop_bot_fn     = _stop_bot_fn
         telegram.start_bot_fn    = lambda: {"message": "Bot is already running"}
         telegram.fetch_candles_fn = crypto_bot.export_candles
+        telegram.manual_buy_fn    = crypto_bot.manual_buy
 
     # Auto-optimize disabled — params are pre-tuned via comprehensive backtest
     # (Config A: SL=1.5×ATR, RR=1.0 → WR 71.8%, NET +$57 over 5 months)
