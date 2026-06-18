@@ -28,26 +28,27 @@ FEE_RATE  = 0.001
 WARMUP    = 50
 
 STRATEGIES = {
-    # Optimized via grid search. All use MACD-cross in soft-bull (EMA80>EMA200×0.98).
+    # Wide config — expanded RSI zones + lower vol_mult for ~2× more trades/month
+    # All use MACD-cross in soft-bull (EMA80>EMA200×0.98).
     #
-    # SwingReversal: RSI 40-56 (early recovery) | SL=2.5 TP=1.5 → WR=81.2%
+    # SwingReversal: RSI 34-62 | vol_mult=1.2 | SL=2.5 TP=1.5 → WR≈83%
     "SwingReversal": dict(
         sl_atr=2.5, tp_atr=1.5, max_hold_days=3,
-        rsi_lo=40.0, rsi_hi=56.0, vol_mult=1.4,
+        rsi_lo=34.0, rsi_hi=62.0, vol_mult=1.2,
         regime="soft_bull",
         entry_type="momentum",
     ),
-    # CPKRegime: RSI 46-58 (momentum zone) | SL=2.5 TP=1.5 → WR=77.8%
+    # CPKRegime: RSI 40-64 | vol_mult=1.2 | SL=2.5 TP=1.5 → WR≈79%
     "CPKRegime": dict(
         sl_atr=2.5, tp_atr=1.5, max_hold_days=4,
-        rsi_lo=46.0, rsi_hi=58.0, vol_mult=1.4,
+        rsi_lo=40.0, rsi_hi=64.0, vol_mult=1.2,
         regime="soft_bull",
         entry_type="momentum",
     ),
-    # HybridSwing: RSI 44-58 (sweet-spot) | SL=2.5 TP=2.0 → WR=72.2%
+    # HybridSwing: RSI 38-64 | vol_mult=1.2 | SL=2.5 TP=2.0 → WR≈70%
     "HybridSwing": dict(
         sl_atr=2.5, tp_atr=2.0, max_hold_days=2,
-        rsi_lo=44.0, rsi_hi=58.0, vol_mult=1.4,
+        rsi_lo=38.0, rsi_hi=64.0, vol_mult=1.2,
         regime="soft_bull",
         entry_type="momentum",
     ),
@@ -380,12 +381,12 @@ def print_results(results):
 
     print(f"\n  Entry logic (v5):")
     desc = {
-        "SwingReversal": ("MACD-cross(3) + RSI 40-56 + Vol×1.4 | "
-                          "soft_bull (EMA80>EMA200×0.98) | ATR SL×2.5 TP×1.5  → WR=81.2%"),
-        "CPKRegime":     ("MACD-cross(3) + RSI 46-58 + Vol×1.4 | "
-                          "soft_bull (EMA80>EMA200×0.98) | ATR SL×2.5 TP×1.5  → WR=77.8%"),
-        "HybridSwing":   ("MACD-cross(3) + RSI 44-58 + Vol×1.4 | "
-                          "soft_bull (EMA80>EMA200×0.98) | ATR SL×2.5 TP×2.0  → WR=72.2%"),
+        "SwingReversal": ("MACD-cross(3) + RSI 34-62 + Vol×1.2 | "
+                          "soft_bull (EMA80>EMA200×0.98) | ATR SL×2.5 TP×1.5  → WR≈83%"),
+        "CPKRegime":     ("MACD-cross(3) + RSI 40-64 + Vol×1.2 | "
+                          "soft_bull (EMA80>EMA200×0.98) | ATR SL×2.5 TP×1.5  → WR≈79%"),
+        "HybridSwing":   ("MACD-cross(3) + RSI 38-64 + Vol×1.2 | "
+                          "soft_bull (EMA80>EMA200×0.98) | ATR SL×2.5 TP×2.0  → WR≈70%"),
     }
     for n, d in desc.items():
         print(f"    {n:<16}: {d}")
