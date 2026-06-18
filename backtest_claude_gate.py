@@ -84,36 +84,77 @@ def fetch_candles() -> list:
         except Exception:
             pass
 
-    print("  ⚠ Network restricted — using SYNTHETIC BTC data")
+    print("  ⚠ Network restricted — using BTC-realistic synthetic data")
+    print("  (GARCH volatility + trending regimes + fat tails — mimics real BTC cycles)")
     rng    = np.random.default_rng(42)
     n_bars = MONTHS * 31 * 24 + 50
-    closes = [60_000.0]
+
+    # BTC-like cycle: accumulation → bull trend → euphoria/top → correction → recovery
+    # Each regime: (frac_start, frac_end, hourly_drift, base_vol, vol_persistence, df)
+    # df = degrees of freedom for Student-t (lower = fatter tails; 4=BTC-like)
     regimes = [
-        (0.00, 0.15, +0.00010, 0.0050),
-        (0.15, 0.30, -0.00008, 0.0070),
-        (0.30, 0.50, +0.00005, 0.0040),
-        (0.50, 0.65, +0.00015, 0.0055),
-        (0.65, 0.80, -0.00012, 0.0080),
-        (0.80, 1.00, +0.00010, 0.0045),
+        # Accumulation: slight uptrend, low vol
+        (0.00, 0.12, +0.00008, 0.0030, 0.92, 5),
+        # Bull trend: strong uptrend, moderate vol, momentum builds
+        (0.12, 0.28, +0.00025, 0.0045, 0.90, 4),
+        # Acceleration: very strong drift, vol rises, FOMO
+        (0.28, 0.38, +0.00040, 0.0065, 0.88, 4),
+        # Euphoria / distribution top: drift slows, very choppy, overbought
+        (0.38, 0.48, +0.00005, 0.0090, 0.85, 3),
+        # Sharp correction: strong negative drift, high vol, panic
+        (0.48, 0.58, -0.00035, 0.0110, 0.87, 3),
+        # Dead cat bounce: brief relief rally
+        (0.58, 0.63, +0.00015, 0.0075, 0.88, 4),
+        # Secondary drop / consolidation
+        (0.63, 0.72, -0.00010, 0.0070, 0.90, 4),
+        # Base building: low vol, slight positive drift
+        (0.72, 0.82, +0.00006, 0.0035, 0.93, 5),
+        # New bull leg: strong trend resumes
+        (0.82, 0.92, +0.00030, 0.0050, 0.89, 4),
+        # Late rally / chop: moderate drift, rising vol
+        (0.92, 1.00, +0.00012, 0.0080, 0.86, 3),
     ]
+
+    closes = [42_000.0]   # start ~BTC Jan 2024 level
+    vol    = 0.0035       # initial conditional volatility (GARCH h_t)
+
     for i in range(1, n_bars):
         frac = i / n_bars
-        dr, vl = 0.0, 0.005
-        for s, e, d, v in regimes:
-            if s <= frac < e:
-                dr, vl = d, v; break
-        closes.append(closes[-1] * (1 + rng.normal(dr, vl)))
+        dr, base_v, persist, df = 0.0, 0.005, 0.90, 4
+        for rs, re, d, bv, p, tdf in regimes:
+            if rs <= frac < re:
+                dr, base_v, persist, df = d, bv, p, tdf; break
+
+        # GARCH(1,1)-like volatility clustering
+        shock = float(rng.standard_t(df)) * vol
+        vol   = float(np.sqrt(persist * vol**2 + (1 - persist) * base_v**2 +
+                               0.05 * shock**2))
+        vol   = max(0.0015, min(vol, 0.035))   # clamp to realistic range
+
+        closes.append(max(closes[-1] * (1 + dr + shock), 1000.0))
+
+    # Build OHLCV with realistic intrabar noise proportional to vol
     candles = []
     ts0 = since_ms
     for i, c in enumerate(closes):
         o     = closes[i - 1] if i > 0 else c
-        noise = abs(rng.normal(0, c * 0.0012))
-        candles.append(OHLCV(ts0 + i * 3_600_000, round(o, 2),
-                             round(max(o, c) + noise, 2),
-                             round(min(o, c) - noise, 2),
-                             round(c, 2), float(rng.uniform(200, 2000))))
-    print(f"  Generated {len(candles)} synthetic bars  "
-          f"(start=${closes[0]:,.0f}  end=${closes[-1]:,.0f})")
+        atr_noise = abs(float(rng.normal(0, c * 0.0018)))   # slightly wider H-L
+        vol_mult  = float(rng.lognormal(6.5, 0.6))           # realistic volume spikes
+        candles.append(OHLCV(
+            ts0 + i * 3_600_000,
+            round(o, 2),
+            round(max(o, c) + atr_noise, 2),
+            round(min(o, c) - atr_noise, 2),
+            round(c, 2),
+            round(vol_mult, 0),
+        ))
+
+    peak  = max(closes)
+    trough = min(closes[int(n_bars*0.38):int(n_bars*0.72)])
+    drawdown = (peak - trough) / peak * 100
+    print(f"  Generated {len(candles)} bars  "
+          f"start=${closes[0]:,.0f}  peak=${peak:,.0f}  "
+          f"trough=${trough:,.0f}  drawdown={drawdown:.0f}%  end=${closes[-1]:,.0f}")
     return candles
 
 
