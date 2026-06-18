@@ -802,12 +802,11 @@ class TradingBot:
 
         try:
             order = await self.connector.create_order(sym, "buy", amount, tp=tp_p, sl=sl_p)
-            # Use ATR-based SL/TP from signal; fall back to % if not provided
-            self.risk.open_position(sym, "long", price, amount, strategy=strategy_name,
+            fill_price = order.price or price
+            self.risk.open_position(sym, "long", fill_price, amount, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
-            # Persist position so it survives a bot restart
             self._sig.save_position(
-                f"{sym}||{strategy_name}", sym, "long", price, amount,
+                f"{sym}||{strategy_name}", sym, "long", fill_price, amount,
                 sl_p, tp_p, strategy_name,
             )
             trade = TradeRecord(

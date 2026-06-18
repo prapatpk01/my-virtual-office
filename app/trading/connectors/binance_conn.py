@@ -82,73 +82,97 @@ class BinanceConnector(BaseConnector):
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price)
 
+        if self._exchange_id == "okx":
+            return await self._okx_order(symbol, side, amount, order_type, price, tp, sl)
+
+        # Non-OKX: standard CCXT path
         kwargs: dict = {}
         if order_type == "limit" and price:
             kwargs["price"] = price
-        # OKX Unified Account always requires tdMode:
-        #   spot/cash → "cash"  |  margin → "cross"/"isolated"
-        if self._exchange_id == "okx":
-            td = self.margin_mode if self.leverage > 1 else "cash"
-            # Use single-order endpoint (not batch) — more compatible with margin + TP/SL
-            self._exchange.options["createOrder"] = "privatePostTradeOrder"
-            kwargs["params"] = {"tdMode": td}
-
-            # Enforce OKX minimum order size (cross-margin has higher minimums than spot).
-            # Load markets first so we can read minSz without an extra round-trip.
-            await self._exchange.load_markets()
-            mkt = self._exchange.markets.get(symbol) or {}
-            min_sz = float((mkt.get("info") or {}).get("minSz") or 0)
-            if min_sz > 0 and amount < min_sz:
-                px = price or 60000.0
-                needed_usdt = int(min_sz * px / self.leverage) + 1
-                raise ValueError(
-                    f"Amount {amount:.6f} BTC is below OKX minimum {min_sz} BTC "
-                    f"(≈${min_sz * px:,.0f} notional). "
-                    f"Set TRADE_AMOUNT_USDT ≥ {needed_usdt} in Railway Variables."
-                )
-
         raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
-        # For market orders, OKX returns price=None; use average (filled price) instead
-        exec_price = (
-            raw.get("average")
-            or raw.get("price")
-            or price
-            or 0.0
-        )
-        result = OrderResult(
+        exec_price = raw.get("average") or raw.get("price") or price or 0.0
+        return OrderResult(
             order_id=str(raw.get("id", uuid.uuid4())),
-            symbol=symbol,
-            side=side,
-            amount=amount,
+            symbol=symbol, side=side, amount=amount,
             price=float(exec_price),
             filled=raw.get("filled") or raw.get("amount") or amount,
             status=raw.get("status", "closed"),
         )
 
-        # After main order fills, attach OCO algo order for TP/SL management.
-        # Done as a separate algo order instead of attachAlgoOrds because the
-        # batch-orders endpoint (CCXT default) has stricter minimum size checks
-        # for attached algo orders on margin accounts.
-        if (self._exchange_id == "okx" and side == "buy"
-                and tp and sl and tp > 0 and sl > 0):
-            td = self.margin_mode if self.leverage > 1 else "cash"
+    async def _okx_order(self, symbol: str, side: str, amount: float,
+                         order_type: str, price: Optional[float],
+                         tp: Optional[float], sl: Optional[float]) -> OrderResult:
+        """OKX order placement using direct API calls to control exactly what is sent.
+
+        Spot (leverage=1): no tdMode — Classic and Simple Unified accounts reject it (51000).
+        Margin (leverage>1): tdMode=cross/isolated required.
+        TP/SL placed as a separate OCO algo order after the main fill.
+        """
+        import logging
+        _log = logging.getLogger("binance_conn")
+
+        await self._exchange.load_markets()
+        mkt  = self._exchange.markets.get(symbol) or {}
+        info = mkt.get("info") or {}
+        inst_id = info.get("instId") or symbol.replace("/", "-")
+        sz_str  = self._exchange.amount_to_precision(symbol, amount)
+
+        # Validate OKX minimum order size
+        min_sz = float(info.get("minSz") or 0)
+        if min_sz > 0 and float(sz_str or 0) < min_sz:
+            px     = price or 60000.0
+            needed = int(min_sz * px / max(self.leverage, 1)) + 1
+            raise ValueError(
+                f"Amount {amount:.6f} below OKX minimum {min_sz} BTC "
+                f"(≈${min_sz * px:,.0f} notional). "
+                f"Set TRADE_AMOUNT_USDT ≥ {needed} in Railway Variables."
+            )
+
+        # Main order — tdMode only for margin mode
+        req: dict = {"instId": inst_id, "side": side, "ordType": order_type, "sz": sz_str}
+        if self.leverage > 1:
+            req["tdMode"] = self.margin_mode
+            if side == "buy":
+                req["ccy"] = "USDT"
+        if order_type == "limit" and price:
+            req["px"] = self._exchange.price_to_precision(symbol, price)
+
+        resp     = await self._exchange.privatePostTradeOrder(req)
+        data_row = ((resp or {}).get("data") or [{}])[0]
+        ord_id   = data_row.get("ordId") or str(uuid.uuid4())
+
+        try:
+            ticker     = await self._exchange.fetch_ticker(symbol)
+            exec_price = float(ticker.get("last") or price or 0)
+        except Exception:
+            exec_price = float(price or 0)
+
+        result = OrderResult(
+            order_id=ord_id, symbol=symbol, side=side, amount=amount,
+            price=exec_price, filled=amount, status="closed",
+        )
+
+        # OCO algo order for TP/SL (separate from main order)
+        if side == "buy" and tp and sl and tp > 0 and sl > 0:
+            algo: dict = {
+                "instId":         inst_id,
+                "side":           "sell",
+                "ordType":        "oco",
+                "sz":             sz_str,
+                "tpTriggerPx":    f"{tp:.2f}",
+                "tpOrdPx":        "-1",
+                "tpTriggerPxType":"last",
+                "slTriggerPx":    f"{sl:.2f}",
+                "slOrdPx":        "-1",
+                "slTriggerPxType":"last",
+            }
+            if self.leverage > 1:
+                algo["tdMode"] = self.margin_mode
             try:
-                await self._exchange.create_order(
-                    symbol, "oco", "sell", amount,
-                    params={
-                        "tdMode":           td,
-                        "tpTriggerPx":      f"{tp:.2f}",
-                        "tpOrdPx":          "-1",
-                        "tpTriggerPxType":  "last",
-                        "slTriggerPx":      f"{sl:.2f}",
-                        "slOrdPx":          "-1",
-                        "slTriggerPxType":  "last",
-                    },
-                )
+                await self._exchange.privatePostTradeOrderAlgo(algo)
+                _log.info("OCO algo placed: TP=%.2f SL=%.2f", tp, sl)
             except Exception as e:
-                import logging
-                logging.getLogger("binance_conn").warning(
-                    "OCO algo order failed (position open without TP/SL): %s", e)
+                _log.warning("OCO algo failed (position open without TP/SL): %s", e)
 
         return result
 

@@ -534,20 +534,26 @@ class TelegramNotifier:
             if not self.fetch_candles_fn:
                 await self._send("⚠️ Export not available — connector not wired")
                 return
-            await self._send("⏳ Fetching BTC/USDT 1H candles from OKX...")
+            parts   = text.split()
+            exp_sym = parts[1].upper() if len(parts) > 1 else "BTC/USDT"
+            if "/" not in exp_sym:
+                exp_sym += "/USDT"
+            exp_tf  = parts[2].lower() if len(parts) > 2 else "1h"
+            await self._send(f"⏳ Fetching {exp_sym} {exp_tf.upper()} candles...")
             try:
                 import io
                 from datetime import datetime, timezone
-                bars = await self.fetch_candles_fn("BTC/USDT", "1h", 2200)
-                buf = io.StringIO()
+                bars = await self.fetch_candles_fn(exp_sym, exp_tf, 2200)
+                buf  = io.StringIO()
                 buf.write("timestamp,open,high,low,close,volume\n")
                 for b in bars:
                     buf.write(f"{b[0]},{b[1]},{b[2]},{b[3]},{b[4]},{b[5]}\n")
                 csv_bytes = buf.getvalue().encode("utf-8")
-                start_dt = datetime.fromtimestamp(bars[0][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-                end_dt   = datetime.fromtimestamp(bars[-1][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-                caption  = f"BTC/USDT 1H — {len(bars)} bars  {start_dt} → {end_dt}"
-                ok = await self._send_document("btc_1h_3mo.csv", csv_bytes, caption)
+                start_dt  = datetime.fromtimestamp(bars[0][0]  / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                end_dt    = datetime.fromtimestamp(bars[-1][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                caption   = f"{exp_sym} {exp_tf.upper()} — {len(bars)} bars  {start_dt} → {end_dt}"
+                safe_sym  = exp_sym.replace("/", "_").lower()
+                ok = await self._send_document(f"{safe_sym}_{exp_tf}.csv", csv_bytes, caption)
                 if not ok:
                     await self._send("❌ Failed to send file")
             except Exception as e:
