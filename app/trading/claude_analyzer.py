@@ -7,7 +7,7 @@ from typing import Optional
 
 logger = logging.getLogger("claude_analyzer")
 
-_DEFAULT_MODEL = "claude-opus-4-8"
+_DEFAULT_MODEL = "claude-haiku-4-5"
 
 
 class ClaudeAnalyzer:

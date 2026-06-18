@@ -409,7 +409,7 @@ def print_comparison(name: str, base_trades: list, ai_trades: list, params: dict
 async def main_async():
     W = 72
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    model   = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
+    model   = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
 
     print("\n" + "═"*W)
     print(f"  Backtest: Claude AI Gate  |  WTADXStrategy + UTBotStrategy")
