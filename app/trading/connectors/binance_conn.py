@@ -155,15 +155,14 @@ class BinanceConnector(BaseConnector):
                 contracts = int(amount / ct_val)
                 if contracts < 1:
                     raise ValueError(
-                        f"Order too small: {amount:.6f} BTC = {amount/ct_val:.3f} contracts. "
-                        f"Minimum is 1 contract = {ct_val} BTC. "
-                        f"Increase FIXED_TRADE_USDT (need ~${ct_val * 1e5 / self._leverage:.0f} "
-                        f"at 100k BTC and {self._leverage}x leverage)."
+                        f"Order too small: {amount:.6f} = {amount/ct_val:.3f} contracts. "
+                        f"Minimum 1 contract = {ct_val}. "
+                        f"Increase FIXED_TRADE_USDT or LEVERAGE."
                     )
-                btc_amount = amount
+                raw_amount = amount
                 amount = float(contracts)
-                logger.info("OKX contract conversion: %.6f BTC → %d contracts (ctVal=%.3f BTC)",
-                            btc_amount, contracts, ct_val)
+                logger.info("OKX contract conversion: %.6f → %d contracts (ctVal=%.4f)",
+                            raw_amount, contracts, ct_val)
 
                 params["tdMode"] = "cross"
                 if pos_side:
@@ -171,15 +170,15 @@ class BinanceConnector(BaseConnector):
                 if reduce_only:
                     params["reduceOnly"] = True
                 # Attach algo TP/SL inline (OKX attachAlgoOrds structure)
+                # attachAlgoClOrdId omitted — OKX auto-generates; manual UUID with hyphens → error 51000
                 if tp_price and sl_price:
                     params["attachAlgoOrds"] = [{
-                        "attachAlgoClOrdId": str(uuid.uuid4())[:16],
-                        "tpTriggerPx":       str(round(tp_price, 2)),
-                        "tpOrdPx":           "-1",          # market execution at trigger
-                        "tpTriggerPxType":   "last",
-                        "slTriggerPx":       str(round(sl_price, 2)),
-                        "slOrdPx":           "-1",
-                        "slTriggerPxType":   "last",
+                        "tpTriggerPx":     str(round(tp_price, 2)),
+                        "tpOrdPx":         "-1",    # market execution at trigger
+                        "tpTriggerPxType": "last",
+                        "slTriggerPx":     str(round(sl_price, 2)),
+                        "slOrdPx":         "-1",
+                        "slTriggerPxType": "last",
                     }]
                 logger.info("OKX futures: %s %s %s %d contracts  TP=%s  SL=%s  pos=%s  reduceOnly=%s",
                             side.upper(), symbol, order_type, int(amount),
@@ -191,13 +190,12 @@ class BinanceConnector(BaseConnector):
                 params["ccy"]    = symbol.split("/")[1] if "/" in symbol else "USDT"
                 if side == "buy" and tp_price and sl_price:
                     params["attachAlgoOrds"] = [{
-                        "attachAlgoClOrdId": str(uuid.uuid4())[:16],
-                        "tpTriggerPx":       str(round(tp_price, 2)),
-                        "tpOrdPx":           "-1",
-                        "tpTriggerPxType":   "last",
-                        "slTriggerPx":       str(round(sl_price, 2)),
-                        "slOrdPx":           "-1",
-                        "slTriggerPxType":   "last",
+                        "tpTriggerPx":     str(round(tp_price, 2)),
+                        "tpOrdPx":         "-1",
+                        "tpTriggerPxType": "last",
+                        "slTriggerPx":     str(round(sl_price, 2)),
+                        "slOrdPx":         "-1",
+                        "slTriggerPxType": "last",
                     }]
                     logger.info("OKX margin: %s %s %.6f  TP=%.2f  SL=%.2f",
                                 side.upper(), symbol, amount, tp_price, sl_price)

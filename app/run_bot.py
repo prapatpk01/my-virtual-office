@@ -88,6 +88,12 @@ def build_config() -> dict:
         "mcdx_dwcs_buy": _env_int("MCDX_DWCS_BUY", 57),      # DWCS buy threshold
         "mcdx_rvol":     _env_float("MCDX_RVOL",   0.8),     # Relative volume min
 
+        # ── SJUTBot tuning ────────────────────────────────────────────────────
+        # SL = SJUTBOT_SL_MULT × ATR,  TP = SJUTBOT_SL_MULT × SJUTBOT_RR × ATR
+        # Default: SL=1.2×ATR, TP=1.62×ATR → R:R 1:1.35 (recommended ratio)
+        "sjutbot_sl_mult": _env_float("SJUTBOT_SL_MULT", 1.2),
+        "sjutbot_rr":      _env_float("SJUTBOT_RR",      1.35),
+
         # ── Risk / sizing ─────────────────────────────────────────────────────
         # FIXED_TRADE_USDT: margin reserved per trade (before leverage).
         #   BTC/USDT:USDT @ $100k, 20x: min 1 contract = 0.01 BTC = $1000 notional = $50 margin.
@@ -143,16 +149,16 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
 
         # ── SJ-UTBot v2 (1H) ──────────────────────────────────────────────────
         # Heikin-Ashi × ATR Trailing Stop crossover.
-        # Provides ATR-based SL (sl_mult=2.5) and TP (rr=1.2) in signal metadata.
+        # SL = sl_mult × ATR,  TP = sl_mult × rr × ATR  (R:R = 1:rr)
         if cfg["strategy_sjutbot"]:
             strategies.append(SJUTBotStrategy(sym, params={
                 "tf":      "1h",
                 "limit":   200,
-                "ut_mult": 0.30,  # TSL ATR multiplier
-                "ut_len":  14,    # TSL ATR period
-                "sl_len":  14,    # SL/TP ATR period
-                "sl_mult": 2.5,   # SL = 2.5 × ATR
-                "rr":      1.2,   # TP = SL × 1.2
+                "ut_mult": 0.30,                     # TSL ATR multiplier
+                "ut_len":  14,                       # TSL ATR period
+                "sl_len":  14,                       # SL/TP ATR period
+                "sl_mult": cfg["sjutbot_sl_mult"],   # SL = 1.2 × ATR (recommended)
+                "rr":      cfg["sjutbot_rr"],         # TP = 1.62 × ATR → R:R 1:1.35
             }))
 
         # ── UT Bot + WaveTrend (15m) ───────────────────────────────────────────
