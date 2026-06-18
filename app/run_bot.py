@@ -80,11 +80,11 @@ def build_config() -> dict:
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
 
         # ── Strategies ────────────────────────────────────────────────────────
-        "strategy_mcdx":      _env_bool("STRATEGY_MCDX",      False),  # MCDX p-1
-        "strategy_mcdx_dual": _env_bool("STRATEGY_MCDX_DUAL", False),  # MCDX p-2 (aggressive)
-        "strategy_sjutbot":   _env_bool("STRATEGY_SJUTBOT",   True),   # v2
+        "strategy_mcdx":      _env_bool("STRATEGY_MCDX",      True),   # MCDX p-1
+        "strategy_mcdx_dual": _env_bool("STRATEGY_MCDX_DUAL", True),   # MCDX p-2 (aggressive)
+        "strategy_sjutbot":   _env_bool("STRATEGY_SJUTBOT",   False),  # v2 — off
         "strategy_sjutbot_v3":_env_bool("STRATEGY_SJUTBOT_V3",True),   # v3.1 (asymmetric)
-        "strategy_utbot":     _env_bool("STRATEGY_UTBOT",     False),  # off by default
+        "strategy_utbot":     _env_bool("STRATEGY_UTBOT",     False),  # off
 
         # ── MCDX p-1 tuning (selective) ──────────────────────────────────────
         "mcdx_dwcs_buy": _env_int("MCDX_DWCS_BUY",  57),     # DWCS buy threshold
@@ -122,7 +122,7 @@ def build_config() -> dict:
         # Max open positions across all strategies + symbols.
         # 3 strategies × 2 symbols × 2 sides = 12 theoretical max.
         # Set lower to limit capital exposure (default: 6 = 3 strats × 2 symbols, 1 side each).
-        "max_positions":  _env_int("MAX_POSITIONS",  6),
+        "max_positions":  _env_int("MAX_POSITIONS",  3),
         "max_drawdown":   _env_float("MAX_DRAWDOWN_PCT", 0.30),  # 30% drawdown halt
 
         # ── Timing ────────────────────────────────────────────────────────────
