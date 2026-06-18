@@ -101,13 +101,14 @@ async def backtest_strategy(
             logger.debug("analyze error at bar %d: %s", i, e)
             continue
 
-        if signal.type == SignalType.BUY and open_long is None:
+        # 1-position-per-strategy: open only when no position on either side
+        if signal.type == SignalType.BUY and open_long is None and open_short is None:
             sl, tp = _sl_tp(signal, price, "long", sl_pct, tp_pct)
             open_long = BTrade(
                 symbol=strategy.symbol, strategy=strategy.name,
                 side="long", entry=price, sl=sl, tp=tp, entry_ts=ts,
             )
-        elif signal.type == SignalType.SELL and open_short is None:
+        elif signal.type == SignalType.SELL and open_short is None and open_long is None:
             sl, tp = _sl_tp(signal, price, "short", sl_pct, tp_pct)
             open_short = BTrade(
                 symbol=strategy.symbol, strategy=strategy.name,
@@ -138,13 +139,108 @@ def summarise(trades: list[BTrade]) -> dict:
     }
 
 
+async def backtest_with_signals(
+    strategy: BaseStrategy,
+    candles: list[OHLCV],
+    notional: float,
+    sl_pct: float,
+    tp_pct: float,
+    warmup: int = 60,
+) -> tuple[list[BTrade], list[dict]]:
+    """Like backtest_strategy but also returns every signal event for correlation analysis."""
+    trades: list[BTrade] = []
+    signals: list[dict] = []
+    open_long:  Optional[BTrade] = None
+    open_short: Optional[BTrade] = None
+
+    for i in range(warmup, len(candles)):
+        bar    = candles[i]
+        price  = float(bar.close)
+        b_high = float(bar.high)
+        b_low  = float(bar.low)
+        ts     = int(bar.timestamp)
+
+        for pos, side in [(open_long, "long"), (open_short, "short")]:
+            if pos is None:
+                continue
+            hit_reason = hit_price = None
+            if side == "long":
+                if b_low  <= pos.sl: hit_reason, hit_price = "stop_loss",   pos.sl
+                if b_high >= pos.tp: hit_reason, hit_price = "take_profit",  pos.tp
+            else:
+                if b_high >= pos.sl: hit_reason, hit_price = "stop_loss",   pos.sl
+                if b_low  <= pos.tp: hit_reason, hit_price = "take_profit",  pos.tp
+            if hit_reason:
+                mult    = 1 if side == "long" else -1
+                pnl_pct = mult * (hit_price - pos.entry) / pos.entry
+                fee     = notional * TAKER_FEE * 2
+                pos.exit_price  = hit_price
+                pos.exit_reason = hit_reason
+                pos.exit_ts     = ts
+                pos.pnl_usdt    = round(pnl_pct * notional - fee, 4)
+                trades.append(pos)
+                if side == "long":  open_long  = None
+                else:               open_short = None
+
+        try:
+            signal = await strategy.analyze(candles[:i], price)
+        except Exception as e:
+            logger.debug("analyze error at bar %d: %s", i, e)
+            continue
+
+        if signal.type == SignalType.BUY and open_long is None and open_short is None:
+            sl, tp = _sl_tp(signal, price, "long", sl_pct, tp_pct)
+            open_long = BTrade(
+                symbol=strategy.symbol, strategy=strategy.name,
+                side="long", entry=price, sl=sl, tp=tp, entry_ts=ts,
+            )
+            signals.append({"ts": ts, "side": "long", "price": price})
+        elif signal.type == SignalType.SELL and open_short is None and open_long is None:
+            sl, tp = _sl_tp(signal, price, "short", sl_pct, tp_pct)
+            open_short = BTrade(
+                symbol=strategy.symbol, strategy=strategy.name,
+                side="short", entry=price, sl=sl, tp=tp, entry_ts=ts,
+            )
+            signals.append({"ts": ts, "side": "short", "price": price})
+
+    return trades, signals
+
+
+def signal_overlap(
+    signals_a: list[dict],
+    signals_b: list[dict],
+    window_ms: int = 3_600_000,
+) -> dict:
+    """
+    Count how often two strategy signal streams agree vs disagree.
+    Two signals are 'concurrent' if their timestamps are within window_ms (default 1H).
+    """
+    same_long = same_short = opposite = 0
+    for a in signals_a:
+        for b in signals_b:
+            if abs(a["ts"] - b["ts"]) <= window_ms:
+                if a["side"] == b["side"]:
+                    if a["side"] == "long": same_long  += 1
+                    else:                   same_short += 1
+                else:
+                    opposite += 1
+    return {
+        "same_long":  same_long,
+        "same_short": same_short,
+        "opposite":   opposite,
+        "total_a":    len(signals_a),
+        "total_b":    len(signals_b),
+    }
+
+
 async def run_full_backtest(
     connector,
-    strategy_configs: list[dict],  # [{"cls": ..., "symbol": ..., "tf": ..., "limit": ..., "params": ...}]
+    strategy_configs: list[dict],
     fixed_trade_usdt: float,
     leverage: int,
     sl_pct: float,
     tp_pct: float,
+    _cache: dict | None = None,   # optional pre-fetched {(sym,tf): candles}
 ) -> dict[str, dict]:
     """
     Fetch candles and backtest each strategy config.
@@ -152,7 +248,7 @@ async def run_full_backtest(
     """
     notional = fixed_trade_usdt * leverage
     results: dict[str, dict] = {}
-    cache: dict[tuple, list] = {}
+    cache: dict[tuple, list] = dict(_cache) if _cache else {}
 
     for cfg in strategy_configs:
         sym   = cfg["symbol"]
@@ -219,5 +315,66 @@ def format_backtest_telegram(results: dict[str, dict],
     if all_t > 0:
         sign = "+" if all_net >= 0 else ""
         lines.append(f"\n{'✅' if all_net >= 0 else '❌'} *Total: {sign}{all_net:.2f}$ ({all_t} trades)*")
+
+    return "\n".join(lines)
+
+
+def format_comparison_telegram(
+    case1: dict[str, dict],
+    case2: dict[str, dict],
+    correlation: dict[str, dict],   # {symbol: signal_overlap dict}
+    fixed_usdt: float,
+    leverage: int,
+) -> str:
+    def _case_block(results: dict, title: str) -> str:
+        lines = [f"*{title}*"]
+        total_net, total_t = 0.0, 0
+        for label, s in results.items():
+            if s.get("trades", 0) == 0:
+                lines.append(f"  `{label}` — no signals")
+                continue
+            net  = s.get("net_usdt", 0)
+            wr   = s.get("win_rate", 0)
+            pf   = s.get("profit_factor", 0)
+            t    = s["trades"]
+            aw   = s.get("avg_win", 0)
+            al   = s.get("avg_loss", 0)
+            icon = "✅" if net >= 0 else "❌"
+            sign = "+" if net >= 0 else ""
+            lines.append(
+                f"  {icon} `{label}` T={t} WR={wr:.0f}% PF={pf:.2f} "
+                f"Net=`{sign}{net:.2f}$` AvgW={aw:+.1f} AvgL={al:+.1f}"
+            )
+            total_net += net
+            total_t   += t
+        icon = "✅" if total_net >= 0 else "❌"
+        sign = "+" if total_net >= 0 else ""
+        lines.append(f"  {icon} *Total: {sign}{total_net:.2f}$ ({total_t} trades)*")
+        return "\n".join(lines)
+
+    lines = [
+        "📊 *Backtest Comparison*",
+        f"${fixed_usdt}×{leverage}x = ${fixed_usdt*leverage:.0f} notional/trade\n",
+        _case_block(case1, "CASE 1 ── SJUTBot v2 + v3.1"),
+        "",
+        _case_block(case2, "CASE 2 ── Full (MCDX + UTBot + v2 + v3.1)"),
+        "",
+        "🔄 *Signal Overlap  v2 vs v3.1*",
+    ]
+    for sym, ov in correlation.items():
+        sym_s = sym.split("/")[0]
+        ta, tb = ov["total_a"], ov["total_b"]
+        sl, ss, op = ov["same_long"], ov["same_short"], ov["opposite"]
+        total_concurrent = sl + ss + op
+        lines.append(
+            f"  *{sym_s}*  v2={ta} trades  v3.1={tb} trades"
+        )
+        if total_concurrent:
+            lines.append(
+                f"    ↑↑ Long same={sl}  ↓↓ Short same={ss}  "
+                f"↑↓ Opposite={op}  (concurrent={total_concurrent})"
+            )
+        else:
+            lines.append("    (no concurrent signals)")
 
     return "\n".join(lines)
