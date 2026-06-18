@@ -91,45 +91,46 @@ def fetch_candles() -> list:
 
     # BTC-like cycle: accumulation → bull trend → euphoria/top → correction → recovery
     # Each regime: (frac_start, frac_end, hourly_drift, base_vol, vol_persistence, df)
-    # df = degrees of freedom for Student-t (lower = fatter tails; 4=BTC-like)
+    # df = degrees of freedom for Student-t (higher df = lighter tails; 6-8 = mild fat tails)
+    # GARCH shock coeff=0.02 keeps the process stationary (E[vol^2] doesn't blow up).
+    # BTC 5-month cycle targeting ~30-40% peak drawdown, 2 bull legs, ~60% recovery.
     regimes = [
-        # Accumulation: slight uptrend, low vol
-        (0.00, 0.12, +0.00008, 0.0030, 0.92, 5),
-        # Bull trend: strong uptrend, moderate vol, momentum builds
-        (0.12, 0.28, +0.00025, 0.0045, 0.90, 4),
-        # Acceleration: very strong drift, vol rises, FOMO
-        (0.28, 0.38, +0.00040, 0.0065, 0.88, 4),
-        # Euphoria / distribution top: drift slows, very choppy, overbought
-        (0.38, 0.48, +0.00005, 0.0090, 0.85, 3),
-        # Sharp correction: strong negative drift, high vol, panic
-        (0.48, 0.58, -0.00035, 0.0110, 0.87, 3),
-        # Dead cat bounce: brief relief rally
-        (0.58, 0.63, +0.00015, 0.0075, 0.88, 4),
-        # Secondary drop / consolidation
-        (0.63, 0.72, -0.00010, 0.0070, 0.90, 4),
-        # Base building: low vol, slight positive drift
-        (0.72, 0.82, +0.00006, 0.0035, 0.93, 5),
-        # New bull leg: strong trend resumes
-        (0.82, 0.92, +0.00030, 0.0050, 0.89, 4),
-        # Late rally / chop: moderate drift, rising vol
-        (0.92, 1.00, +0.00012, 0.0080, 0.86, 3),
+        # Phase 1 — Accumulation/early bull: slow grind up, low vol
+        (0.00, 0.15, +0.00012, 0.0020, 0.93, 8),
+        # Phase 2 — Bull trend: clear uptrend, moderate vol
+        (0.15, 0.30, +0.00022, 0.0030, 0.91, 7),
+        # Phase 3 — Acceleration/FOMO: strong drift, vol rises
+        (0.30, 0.40, +0.00030, 0.0040, 0.89, 6),
+        # Phase 4 — Distribution top: drift stalls, choppy
+        (0.40, 0.48, +0.00003, 0.0050, 0.86, 6),
+        # Phase 5 — Correction: mild negative drift (~30-40% drawdown target)
+        (0.48, 0.58, -0.00015, 0.0060, 0.88, 6),
+        # Phase 6 — Stabilisation: near flat, vol subsides
+        (0.58, 0.66, +0.00002, 0.0035, 0.90, 7),
+        # Phase 7 — Base building: low vol, gradual accumulation
+        (0.66, 0.76, +0.00008, 0.0022, 0.93, 8),
+        # Phase 8 — New bull leg: strong recovery, trend re-establishes
+        (0.76, 0.90, +0.00025, 0.0032, 0.90, 7),
+        # Phase 9 — Late-cycle rally/chop: moderate drift, vol rises again
+        (0.90, 1.00, +0.00010, 0.0045, 0.87, 6),
     ]
 
-    closes = [42_000.0]   # start ~BTC Jan 2024 level
-    vol    = 0.0035       # initial conditional volatility (GARCH h_t)
+    closes = [32_000.0]   # start at a reasonable BTC early-cycle level
+    vol    = 0.0022       # initial conditional volatility
 
     for i in range(1, n_bars):
         frac = i / n_bars
-        dr, base_v, persist, df = 0.0, 0.005, 0.90, 4
+        dr, base_v, persist, df = 0.0, 0.003, 0.90, 7
         for rs, re, d, bv, p, tdf in regimes:
             if rs <= frac < re:
                 dr, base_v, persist, df = d, bv, p, tdf; break
 
         # GARCH(1,1)-like volatility clustering
+        # coeff=0.02 (not 0.05) keeps process stationary even with mild fat tails
         shock = float(rng.standard_t(df)) * vol
         vol   = float(np.sqrt(persist * vol**2 + (1 - persist) * base_v**2 +
-                               0.05 * shock**2))
-        vol   = max(0.0015, min(vol, 0.035))   # clamp to realistic range
+                               0.02 * shock**2))
+        vol   = max(0.0010, min(vol, 0.015))   # tight clamp: max 1.5% per hour
 
         closes.append(max(closes[-1] * (1 + dr + shock), 1000.0))
 
@@ -162,9 +163,9 @@ def fetch_candles() -> list:
 
 def build_snapshot(
     candles, i, price, atr_v, sl_px, tp_px, rr,
-    hma_a, ema5_a, sma9_a, rsi_a, hma_period
-) -> tuple[dict, list]:
-    """Build indicators dict + recent_candles list for ClaudeAnalyzer."""
+    hma_a, ema5_a, sma9_a, rsi_a, hma_period, ema200_a,
+) -> tuple[dict, list, float, str]:
+    """Build indicators dict + recent_candles + vol_ratio + mtf_bias for ClaudeAnalyzer."""
     e5  = float(ema5_a[i])
     s9  = float(sma9_a[i])
     hma = float(hma_a[i])
@@ -185,14 +186,32 @@ def build_snapshot(
         "rr": rr,
     }
 
-    recent = candles[max(0, i - 9): i + 1]
+    recent = candles[max(0, i - 19): i + 1]
     recent_candles = [
         {"open": float(c.open), "high": float(c.high),
          "low": float(c.low),  "close": float(c.close),
          "volume": float(c.volume)}
         for c in recent
     ]
-    return indicators, recent_candles
+
+    # Volume ratio: current bar / 20-bar average
+    vols = [float(candles[j].volume) for j in range(max(0, i - 20), i + 1)]
+    vol_avg = sum(vols[:-1]) / max(len(vols) - 1, 1) if len(vols) > 1 else 1.0
+    vol_ratio = round(vols[-1] / vol_avg if vol_avg > 0 else 1.0, 2)
+
+    # MTF bias: price vs EMA200 (1H EMA200 as 4H proxy)
+    ema200_v = float(ema200_a[i])
+    if not math.isnan(ema200_v):
+        if price > ema200_v * 1.005:
+            mtf_bias = "bullish"
+        elif price < ema200_v * 0.995:
+            mtf_bias = "bearish"
+        else:
+            mtf_bias = "neutral"
+    else:
+        mtf_bias = "unknown"
+
+    return indicators, recent_candles, vol_ratio, mtf_bias
 
 
 # ─── Backtest engine (async — calls Claude per signal) ────────────────────────
@@ -207,6 +226,7 @@ async def run_strategy_with_ai(
     ema5_a: np.ndarray,
     sma9_a: np.ndarray,
     rsi_a: np.ndarray,
+    ema200_a: np.ndarray,
     analyzer: ClaudeAnalyzer,
     hma_period: int,
     sl_mult: float,
@@ -246,6 +266,7 @@ async def run_strategy_with_ai(
     ai_calls = 0
     ai_confirmations = 0
     ai_rejections = 0
+    ai_outcomes: list = []  # rolling last-10 AI-confirmed trade outcomes for feedback
 
     for i in range(warmup, n - 1):
         c_close = float(closes[i])
@@ -308,14 +329,18 @@ async def run_strategy_with_ai(
             if ep is not None:
                 pnl = (ep - ai_entry) * ai_amount - ep * ai_amount * FEE_RATE
                 ai_capital += pnl
+                pnl_pct = round((ep - ai_entry) / ai_entry * 100, 3)
                 ai_trades.append({
                     "bar": i, "entry": round(ai_entry, 2), "exit": round(ep, 2),
                     "sl": round(ai_sl, 2), "tp": round(ai_tp, 2),
                     "pnl_net": round(pnl, 4),
-                    "pnl_pct": round((ep - ai_entry) / ai_entry * 100, 3),
+                    "pnl_pct": pnl_pct,
                     "type": et, "capital": round(ai_capital, 2),
                     "ai_confirmed": True,
                 })
+                ai_outcomes.append({"type": et, "pnl_pct": pnl_pct})
+                if len(ai_outcomes) > 10:
+                    ai_outcomes = ai_outcomes[-10:]
                 ai_in = False; ai_pending_hma = False
 
         # ── Skip if both already in position ──────────────────────────
@@ -353,9 +378,9 @@ async def run_strategy_with_ai(
 
         # ── AI gate: ask Claude ────────────────────────────────────────
         if not ai_in:
-            indicators, recent_candles = build_snapshot(
+            indicators, recent_candles, vol_ratio, mtf_bias = build_snapshot(
                 candles, i, entry_px, atr_v, sl_px, tp_px, tp_rr,
-                hma_a, ema5_a, sma9_a, rsi_a, hma_period,
+                hma_a, ema5_a, sma9_a, rsi_a, hma_period, ema200_a,
             )
             ai_calls += 1
             confirmed, ai_reason = await analyzer.confirm_buy(
@@ -365,6 +390,9 @@ async def run_strategy_with_ai(
                 signal_reason=f"bar={i} RSI={rsi_v:.1f} HMA={hma_v:.0f}",
                 indicators=indicators,
                 recent_candles=recent_candles,
+                mtf_bias=mtf_bias,
+                volume_ratio=vol_ratio,
+                recent_outcomes=list(ai_outcomes),
             )
             print(f"  [AI #{ai_calls}] bar={i:>4} ${entry_px:>9,.0f} "
                   f"{'✓ CONFIRM' if confirmed else '✗ REJECT ':9s}  {ai_reason}")
@@ -387,7 +415,7 @@ async def run_strategy_with_ai(
 
 def _stats(trades: list, capital: float = CAPITAL) -> dict:
     if not trades:
-        return {"trades": 0, "wins": 0, "wr": 0.0, "net": 0.0,
+        return {"trades": 0, "wins": 0, "losses": 0, "wr": 0.0, "net": 0.0,
                 "avg_win": 0.0, "avg_loss": 0.0, "pf": 0.0, "final": capital}
     wins   = [t for t in trades if t["pnl_net"] > 0]
     losses = [t for t in trades if t["pnl_net"] <= 0]
@@ -470,10 +498,11 @@ async def main_async():
     closes = [c.close for c in candles]
     print(f"\n  Computing indicators on {n} bars...")
 
-    ema5_a = BaseStrategy.ema(closes, EMA_PERIOD)
-    sma9_a = BaseStrategy.sma(closes, SMA_PERIOD)
-    atr14  = BaseStrategy.atr(candles, 14)
-    rsi14  = BaseStrategy.rsi(closes, RSI_PERIOD)
+    ema5_a  = BaseStrategy.ema(closes, EMA_PERIOD)
+    sma9_a  = BaseStrategy.sma(closes, SMA_PERIOD)
+    atr14   = BaseStrategy.atr(candles, 14)
+    rsi14   = BaseStrategy.rsi(closes, RSI_PERIOD)
+    ema200_a = BaseStrategy.ema(closes, 200)
 
     hma_cache = {}
     for p in STRATEGY_PARAMS.values():
@@ -496,7 +525,7 @@ async def main_async():
         "WTADXStrategy", candles,
         wt_buy.astype(bool), wt_sell.astype(bool),
         atr14, hma_cache[wt_p["hma_period"]],
-        ema5_a, sma9_a, rsi14, analyzer, **wt_p,
+        ema5_a, sma9_a, rsi14, ema200_a, analyzer, **wt_p,
     )
 
     print(f"\n  {'─'*W}")
@@ -506,7 +535,7 @@ async def main_async():
         "UTBotStrategy", candles,
         ut_buy.astype(bool), ut_sell.astype(bool),
         atr14, hma_cache[ut_p["hma_period"]],
-        ema5_a, sma9_a, rsi14, analyzer, **ut_p,
+        ema5_a, sma9_a, rsi14, ema200_a, analyzer, **ut_p,
     )
 
     # ── Results ────────────────────────────────────────────────────────
