@@ -1,7 +1,7 @@
 """
 OKX Perpetual Futures trading bot runner.
 
-Strategies  : MCDX (15m) + SJUTBot (1H) + UTBot (15m)
+Strategies  : SJUTBot v2 (1H) + SJUTBot v3.1 (1H) + UTBot (15m)  [MCDX off by default]
 Symbols     : BTC/USDT:USDT, XAU/USDT:USDT  (configurable via SYMBOLS)
 Exchange    : OKX, swap market, hedge mode
 
@@ -80,19 +80,28 @@ def build_config() -> dict:
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
 
         # ── Strategies ────────────────────────────────────────────────────────
-        "strategy_mcdx":   _env_bool("STRATEGY_MCDX",   True),
-        "strategy_sjutbot":_env_bool("STRATEGY_SJUTBOT", True),
-        "strategy_utbot":  _env_bool("STRATEGY_UTBOT",   True),
+        "strategy_mcdx":      _env_bool("STRATEGY_MCDX",      False),  # off by default
+        "strategy_sjutbot":   _env_bool("STRATEGY_SJUTBOT",   True),   # v2
+        "strategy_sjutbot_v3":_env_bool("STRATEGY_SJUTBOT_V3",True),   # v3.1 (asymmetric)
+        "strategy_utbot":     _env_bool("STRATEGY_UTBOT",     True),
 
         # ── MCDX tuning ───────────────────────────────────────────────────────
         "mcdx_dwcs_buy": _env_int("MCDX_DWCS_BUY", 57),      # DWCS buy threshold
         "mcdx_rvol":     _env_float("MCDX_RVOL",   0.8),     # Relative volume min
 
-        # ── SJUTBot tuning ────────────────────────────────────────────────────
+        # ── SJUTBot v2 tuning ─────────────────────────────────────────────────
         # SL = SJUTBOT_SL_MULT × ATR,  TP = SJUTBOT_SL_MULT × SJUTBOT_RR × ATR
         # Default: SL=1.2×ATR, TP=1.62×ATR → R:R 1:1.35 (recommended ratio)
         "sjutbot_sl_mult": _env_float("SJUTBOT_SL_MULT", 1.2),
         "sjutbot_rr":      _env_float("SJUTBOT_RR",      1.35),
+
+        # ── SJUTBot v3.1 tuning ───────────────────────────────────────────────
+        # Asymmetric: rigorous longs (EMA sync + score≥3/4), fast shorts (UT↓ only)
+        # Default: SL=2.5×ATR, TP=SL×1.2 → R:R 1:1.2
+        "sjv3_sl_mult":     _env_float("SJV3_SL_MULT",    2.5),
+        "sjv3_rr":          _env_float("SJV3_RR",         1.2),
+        "sjv3_allow_long":  _env_bool("SJV3_ALLOW_LONG",  True),
+        "sjv3_allow_short": _env_bool("SJV3_ALLOW_SHORT", True),
 
         # ── Risk / sizing ─────────────────────────────────────────────────────
         # FIXED_TRADE_USDT: margin reserved per trade (before leverage).
@@ -128,16 +137,17 @@ def build_config() -> dict:
 # ── Strategy builder ─────────────────────────────────────────────────────────
 
 def build_strategies(symbols: list[str], cfg: dict) -> list:
-    from trading.strategies.mcdx_strategy    import MCDXStrategy
-    from trading.strategies.sjutbot_strategy import SJUTBotStrategy
-    from trading.strategies.utbot_wt_strategy import UTBotWTStrategy
+    from trading.strategies.mcdx_strategy       import MCDXStrategy
+    from trading.strategies.sjutbot_strategy    import SJUTBotStrategy
+    from trading.strategies.sjutbot_v3_strategy import SJUTBotV3Strategy
+    from trading.strategies.utbot_wt_strategy   import UTBotWTStrategy
 
     strategies = []
     for sym in symbols:
 
         # ── MCDX Plus v3 (15m) ────────────────────────────────────────────────
-        # Composite DWCS momentum + ADX + Supertrend + WaveTrend regime.
-        # Optimised: SL=1.5%, TP=2.5%, dwcs_buy=57, rvol≥0.8  → +$43.60/5mo
+        # Disabled by default (STRATEGY_MCDX=false). Enable only when not using
+        # MCDX p-1+p-2 simultaneously on TradingView.
         if cfg["strategy_mcdx"]:
             strategies.append(MCDXStrategy(sym, params={
                 "tf":        "15m",
@@ -148,17 +158,32 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             }))
 
         # ── SJ-UTBot v2 (1H) ──────────────────────────────────────────────────
-        # Heikin-Ashi × ATR Trailing Stop crossover.
-        # SL = sl_mult × ATR,  TP = sl_mult × rr × ATR  (R:R = 1:rr)
+        # Symmetric long/short: Heikin-Ashi × ATR Trailing Stop crossover.
         if cfg["strategy_sjutbot"]:
             strategies.append(SJUTBotStrategy(sym, params={
                 "tf":      "1h",
                 "limit":   200,
-                "ut_mult": 0.30,                     # TSL ATR multiplier
-                "ut_len":  14,                       # TSL ATR period
-                "sl_len":  14,                       # SL/TP ATR period
-                "sl_mult": cfg["sjutbot_sl_mult"],   # SL = 1.2 × ATR (recommended)
-                "rr":      cfg["sjutbot_rr"],         # TP = 1.62 × ATR → R:R 1:1.35
+                "ut_mult": 0.30,
+                "ut_len":  14,
+                "sl_len":  14,
+                "sl_mult": cfg["sjutbot_sl_mult"],
+                "rr":      cfg["sjutbot_rr"],
+            }))
+
+        # ── SJ-UTBot v3.1 (1H) ────────────────────────────────────────────────
+        # Asymmetric: rigorous longs (EMA sync + score≥3/4), fast shorts (UT↓).
+        # Designed for futures hedge — aggressive short side.
+        if cfg["strategy_sjutbot_v3"]:
+            strategies.append(SJUTBotV3Strategy(sym, params={
+                "tf":           "1h",
+                "limit":        200,
+                "ut_mult":      0.30,
+                "ut_len":       14,
+                "filter_threshold": 3,
+                "sl_mult":      cfg["sjv3_sl_mult"],
+                "rr":           cfg["sjv3_rr"],
+                "allow_long":   cfg["sjv3_allow_long"],
+                "allow_short":  cfg["sjv3_allow_short"],
             }))
 
         # ── UT Bot + WaveTrend (15m) ───────────────────────────────────────────
@@ -171,7 +196,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
 
     if not strategies:
         raise RuntimeError(
-            "No strategies enabled — set STRATEGY_MCDX, STRATEGY_SJUTBOT, "
+            "No strategies enabled — set STRATEGY_SJUTBOT, STRATEGY_SJUTBOT_V3, "
             "or STRATEGY_UTBOT to true"
         )
 
@@ -263,9 +288,10 @@ async def main():
     # ── Backtest function (called by /backtest Telegram command) ─────────────
     async def _run_backtest() -> str:
         from trading.backtester import run_full_backtest, format_backtest_telegram
-        from trading.strategies.mcdx_strategy     import MCDXStrategy
-        from trading.strategies.sjutbot_strategy  import SJUTBotStrategy
-        from trading.strategies.utbot_wt_strategy import UTBotWTStrategy
+        from trading.strategies.mcdx_strategy       import MCDXStrategy
+        from trading.strategies.sjutbot_strategy    import SJUTBotStrategy
+        from trading.strategies.sjutbot_v3_strategy import SJUTBotV3Strategy
+        from trading.strategies.utbot_wt_strategy   import UTBotWTStrategy
 
         bt_configs = []
         for sym in cfg["symbols"]:
@@ -281,6 +307,15 @@ async def main():
                                    "params": {"ut_mult": 0.30, "ut_len": 14, "sl_len": 14,
                                               "sl_mult": cfg["sjutbot_sl_mult"],
                                               "rr": cfg["sjutbot_rr"]}})
+            if cfg["strategy_sjutbot_v3"]:
+                bt_configs.append({"cls": SJUTBotV3Strategy, "symbol": sym, "tf": "1h",
+                                   "limit": 1500,
+                                   "params": {"ut_mult": 0.30, "ut_len": 14,
+                                              "filter_threshold": 3,
+                                              "sl_mult": cfg["sjv3_sl_mult"],
+                                              "rr": cfg["sjv3_rr"],
+                                              "allow_long": cfg["sjv3_allow_long"],
+                                              "allow_short": cfg["sjv3_allow_short"]}})
             if cfg["strategy_utbot"]:
                 bt_configs.append({"cls": UTBotWTStrategy, "symbol": sym, "tf": "15m",
                                    "limit": 3000, "params": {}})

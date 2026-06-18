@@ -92,6 +92,11 @@ class RiskManager:
         key = f"{symbol}||{strategy}"
         if key in self._positions:
             return False, f"{strategy} already has open position for {symbol}"
+        # Each strategy holds at most 1 position per symbol (long OR short, not both)
+        base     = strategy[:-6] if strategy.endswith("_short") else strategy
+        opposite = base if strategy.endswith("_short") else f"{base}_short"
+        if f"{symbol}||{opposite}" in self._positions:
+            return False, f"{base} already holds a position for {symbol}"
         if len(self._positions) >= self.max_open_positions:
             return False, f"Max open positions ({self.max_open_positions}) reached"
         return True, "ok"
