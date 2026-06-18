@@ -32,8 +32,10 @@ class BinanceConnector(BaseConnector):
         self._exchange_id = exchange_id
 
         exchange_class = getattr(ccxt, exchange_id)
-        # Always use defaultType="spot" — OKX Unified Account handles cross-margin via tdMode
-        options: dict = {"defaultType": "spot"}
+        # OKX: use defaultType="margin" so market data (minSz, lotSz, precision) matches
+        # the cross-margin instrument we trade via tdMode=cross. Using "spot" would give
+        # the wrong minSz and cause OKX error 51020 on otherwise valid order sizes.
+        options: dict = {"defaultType": "margin" if exchange_id == "okx" else "spot"}
         if exchange_id == "bybit":
             options["fetchCurrencies"] = False
 
