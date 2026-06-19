@@ -123,7 +123,6 @@ class SJUTBotV3Strategy(BaseStrategy):
             up, dn = h[i]-h[i-1], l[i-1]-l[i]
             if up > dn and up > 0: pdm[i] = up
             if dn > up and dn > 0: mdm[i] = dn
-        sa = sp = sm = np.zeros(n), np.zeros(n), np.zeros(n)
         sa, sp, sm = np.zeros(n), np.zeros(n), np.zeros(n)
         if n > period:
             sa[period] = tr[1:period+1].sum()

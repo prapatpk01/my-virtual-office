@@ -77,11 +77,11 @@ async def backtest_strategy(
                 continue
             hit_reason = hit_price = None
             if side == "long":
-                if b_low  <= pos.sl: hit_reason, hit_price = "stop_loss",   pos.sl
-                if b_high >= pos.tp: hit_reason, hit_price = "take_profit",  pos.tp
+                if b_low  <= pos.sl:   hit_reason, hit_price = "stop_loss",  pos.sl
+                elif b_high >= pos.tp: hit_reason, hit_price = "take_profit", pos.tp
             else:
-                if b_high >= pos.sl: hit_reason, hit_price = "stop_loss",   pos.sl
-                if b_low  <= pos.tp: hit_reason, hit_price = "take_profit",  pos.tp
+                if b_high >= pos.sl:  hit_reason, hit_price = "stop_loss",  pos.sl
+                elif b_low <= pos.tp: hit_reason, hit_price = "take_profit", pos.tp
             if hit_reason:
                 mult    = 1 if side == "long" else -1
                 pnl_pct = mult * (hit_price - pos.entry) / pos.entry
@@ -165,11 +165,11 @@ async def backtest_with_signals(
                 continue
             hit_reason = hit_price = None
             if side == "long":
-                if b_low  <= pos.sl: hit_reason, hit_price = "stop_loss",   pos.sl
-                if b_high >= pos.tp: hit_reason, hit_price = "take_profit",  pos.tp
+                if b_low  <= pos.sl:   hit_reason, hit_price = "stop_loss",  pos.sl
+                elif b_high >= pos.tp: hit_reason, hit_price = "take_profit", pos.tp
             else:
-                if b_high >= pos.sl: hit_reason, hit_price = "stop_loss",   pos.sl
-                if b_low  <= pos.tp: hit_reason, hit_price = "take_profit",  pos.tp
+                if b_high >= pos.sl:  hit_reason, hit_price = "stop_loss",  pos.sl
+                elif b_low <= pos.tp: hit_reason, hit_price = "take_profit", pos.tp
             if hit_reason:
                 mult    = 1 if side == "long" else -1
                 pnl_pct = mult * (hit_price - pos.entry) / pos.entry

@@ -107,8 +107,8 @@ class RiskManager:
                       strategy: str = "", stop_loss: float = None, take_profit: float = None) -> Position:
         if stop_loss is None or take_profit is None:
             sl_default, tp_default = self.compute_stops(side, entry_price)
-            stop_loss  = stop_loss  or sl_default
-            take_profit = take_profit or tp_default
+            stop_loss   = stop_loss   if stop_loss   is not None else sl_default
+            take_profit = take_profit if take_profit is not None else tp_default
         pos = Position(symbol=symbol, side=side, entry_price=entry_price, amount=amount,
                        stop_loss=stop_loss, take_profit=take_profit)
         self._positions[f"{symbol}||{strategy}"] = pos

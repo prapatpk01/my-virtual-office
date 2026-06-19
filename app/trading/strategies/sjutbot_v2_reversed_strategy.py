@@ -32,7 +32,7 @@ class SJUTBotV2ReversedStrategy(SJUTBotStrategy):
         meta = dict(sig.metadata or {})
         sl = meta.get("stop_loss")
         tp = meta.get("take_profit")
-        if sl and tp:
+        if sl is not None and tp is not None:
             meta["stop_loss"]   = round(2 * current_price - sl, 2)
             meta["take_profit"] = round(2 * current_price - tp, 2)
 

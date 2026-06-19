@@ -423,7 +423,7 @@ async def main():
         # ── Signal correlation: v2 vs v2-reversed (should be perfect inverse)
         correlation: dict = {}
         for sym in syms:
-            candles = cache.get((sym, "1h"), [])
+            candles = cache.get((sym, "30m"), [])
             if not candles:
                 continue
             sv2  = SJUTBotStrategy(sym, params=v2_params)

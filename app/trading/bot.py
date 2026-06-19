@@ -358,14 +358,14 @@ class TradingBot:
         sl   = meta.get("stop_loss")
         tp   = meta.get("take_profit")
 
-        if sl and tp:
+        if sl is not None and tp is not None:
             # Validate orientation for short (strategy should provide short-side values)
             if side == "short":
                 if sl < price:  # SL should be above entry for shorts
                     sl = round(price * (1 + self.fixed_sl_pct), 8) if self.fixed_sl_pct else None
                 if tp > price:  # TP should be below entry for shorts
                     tp = round(price * (1 - self.fixed_tp_pct), 8) if self.fixed_tp_pct else None
-            if sl and tp:
+            if sl is not None and tp is not None:
                 return sl, tp
 
         # Fallback: fixed percentage
