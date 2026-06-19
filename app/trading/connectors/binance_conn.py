@@ -221,38 +221,39 @@ class BinanceConnector(BaseConnector):
         quote_asset = symbol.split("/")[1].split(":")[0] if "/" in symbol else "USDT"
 
         if self._futures:
-            # Futures paper — hedge mode: key = "symbol||side" so long+short can coexist
+            # Futures paper — hedge mode: key = "symbol||side", value = list of open legs
+            # Multiple strategies can hold the same direction (e.g. v2 short + v3 short)
             margin   = (amount * exec_price) / max(self._leverage, 1)
             fut_side = pos_side if pos_side else ("long" if side == "buy" else "short")
             fut_key  = f"{symbol}||{fut_side}"
             is_close = (fut_side == "long" and side == "sell") or \
                        (fut_side == "short" and side == "buy")
-            pos = self._paper_futures.get(fut_key)
-            if pos and is_close:
-                # Close this leg → realise PnL
+            legs: list = self._paper_futures.get(fut_key, [])
+            if is_close and legs:
+                # Close oldest open leg (FIFO)
+                pos = legs.pop(0)
                 pnl_mult = 1 if fut_side == "long" else -1
                 pnl = pnl_mult * (exec_price - pos["entry"]) * pos["amount"]
                 self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) + pos["margin"] + pnl
                 logger.info("[Paper Futures] Close %s %s @ %.2f  PnL=%.2f USDT",
                             fut_side.upper(), symbol, exec_price, pnl)
-                del self._paper_futures[fut_key]
+                if legs:
+                    self._paper_futures[fut_key] = legs
+                else:
+                    self._paper_futures.pop(fut_key, None)
             elif not is_close:
-                # Open new leg
-                if pos:
-                    logger.warning("[Paper Futures] %s already open, ignoring duplicate", fut_key)
-                elif self._paper_balance.get("USDT", 0) < margin:
+                # Open new leg — allow multiple per direction (different strategies)
+                if self._paper_balance.get("USDT", 0) < margin:
                     raise ValueError(
                         f"[Paper Futures] Insufficient USDT margin: "
                         f"need {margin:.2f}, have {self._paper_balance.get('USDT', 0):.2f}"
                     )
-                else:
-                    self._paper_balance["USDT"] -= margin
-                    self._paper_futures[fut_key] = {
-                        "side": fut_side, "amount": amount,
-                        "entry": exec_price, "margin": margin,
-                    }
-                    logger.info("[Paper Futures] Open %s %s %.6f @ %.2f  margin=%.2f USDT",
-                                fut_side.upper(), symbol, amount, exec_price, margin)
+                self._paper_balance["USDT"] -= margin
+                legs.append({"side": fut_side, "amount": amount,
+                             "entry": exec_price, "margin": margin})
+                self._paper_futures[fut_key] = legs
+                logger.info("[Paper Futures] Open %s %s %.6f @ %.2f  margin=%.2f USDT  legs=%d",
+                            fut_side.upper(), symbol, amount, exec_price, margin, len(legs))
         else:
             # Spot / margin paper
             if side == "buy":
