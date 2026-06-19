@@ -15,6 +15,36 @@ class OHLCV:
     volume: float
 
 
+def to_heikin_ashi(candles: list["OHLCV"]) -> list["OHLCV"]:
+    """Convert standard OHLCV candles to Heikin Ashi.
+
+    HA_Close = (O + H + L + C) / 4
+    HA_Open  = (prev_HA_Open + prev_HA_Close) / 2
+    HA_High  = max(H, HA_Open, HA_Close)
+    HA_Low   = min(L, HA_Open, HA_Close)
+
+    Volume and timestamp are preserved unchanged.
+    """
+    if not candles:
+        return candles
+    result: list[OHLCV] = []
+    ha_open = (candles[0].open + candles[0].close) / 2.0
+    for c in candles:
+        ha_close = (c.open + c.high + c.low + c.close) / 4.0
+        ha_high  = max(c.high, ha_open, ha_close)
+        ha_low   = min(c.low,  ha_open, ha_close)
+        result.append(OHLCV(
+            timestamp=c.timestamp,
+            open=ha_open,
+            high=ha_high,
+            low=ha_low,
+            close=ha_close,
+            volume=c.volume,
+        ))
+        ha_open = (ha_open + ha_close) / 2.0
+    return result
+
+
 @dataclass
 class OrderResult:
     order_id: str

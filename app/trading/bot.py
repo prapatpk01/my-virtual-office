@@ -7,7 +7,7 @@ import time
 from typing import Optional
 
 from .claude_analyzer import ClaudeAnalyzer
-from .connectors.base import BaseConnector
+from .connectors.base import BaseConnector, to_heikin_ashi
 from .risk_manager import RiskManager, Position
 from .strategies.base import BaseStrategy, Signal, SignalType
 from .telegram_notifier import TelegramNotifier
@@ -158,6 +158,7 @@ class TradingBot:
         """Force a BUY — bypasses strategy, uses ATR-based SL/TP."""
         try:
             candles = await self.connector.fetch_ohlcv(symbol, timeframe="1h", limit=50)
+            candles = to_heikin_ashi(candles)
             ticker = await self.connector.fetch_ticker(symbol)
             price = float(ticker["last"])
             if not candles:
@@ -232,6 +233,7 @@ class TradingBot:
                 candles = await self.connector.fetch_ohlcv(
                     sym, timeframe=self.candle_tf, limit=self.candle_limit
                 )
+                candles = to_heikin_ashi(candles)
                 ticker = await self.connector.fetch_ticker(sym)
                 price  = float(ticker["last"])
             except Exception as e:
@@ -250,13 +252,13 @@ class TradingBot:
         if sym in self._positions or len(self._positions) >= self.max_positions:
             return
 
-        # Fetch 4h and 1d for multi-TF context
+        # Fetch 4h and 1d for multi-TF context (HA already applied to 1h)
         candles_by_tf: dict = {"1h": candles_1h}
         for tf in ("4h", "1d"):
             try:
                 c = await self.connector.fetch_ohlcv(sym, timeframe=tf, limit=120)
                 if c and len(c) >= 30:
-                    candles_by_tf[tf] = c
+                    candles_by_tf[tf] = to_heikin_ashi(c)
             except Exception as e:
                 logger.debug("Failed to fetch %s for %s: %s", tf, sym, e)
 
