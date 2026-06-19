@@ -79,15 +79,20 @@ def build_config() -> dict:
         # ── Symbols ───────────────────────────────────────────────────────────
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT"),
 
-        # ── Strategies ────────────────────────────────────────────────────────
-        "strategy_mcdx":         _env_bool("STRATEGY_MCDX",         True),   # MCDX p-1
-        "strategy_mcdx_dual":    _env_bool("STRATEGY_MCDX_DUAL",    True),   # MCDX p-2
-        "strategy_sjutbot":      _env_bool("STRATEGY_SJUTBOT",      False),  # v2
-        "strategy_sjutbot_v3":   _env_bool("STRATEGY_SJUTBOT_V3",   True),   # v3.1
-        "strategy_sjutbot_v2rev":_env_bool("STRATEGY_SJUTBOT_V2REV",False),  # v2 reversed
-        "strategy_utbot":        _env_bool("STRATEGY_UTBOT",        False),  # off
-        "strategy_scalp_trend":  _env_bool("STRATEGY_SCALP_TREND",  False),  # scalp trend
-        "strategy_prof_bot":     _env_bool("STRATEGY_PROF_BOT",     False),  # profitable bot
+        # ── Strategies (legacy — all off) ────────────────────────────────────
+        "strategy_mcdx":         _env_bool("STRATEGY_MCDX",         False),
+        "strategy_mcdx_dual":    _env_bool("STRATEGY_MCDX_DUAL",    False),
+        "strategy_sjutbot":      _env_bool("STRATEGY_SJUTBOT",      False),
+        "strategy_sjutbot_v3":   _env_bool("STRATEGY_SJUTBOT_V3",   False),
+        "strategy_sjutbot_v2rev":_env_bool("STRATEGY_SJUTBOT_V2REV",False),
+        "strategy_utbot":        _env_bool("STRATEGY_UTBOT",        False),
+        "strategy_scalp_trend":  _env_bool("STRATEGY_SCALP_TREND",  False),
+        "strategy_prof_bot":     _env_bool("STRATEGY_PROF_BOT",     False),
+
+        # ── Unified Bot strategies (active) ───────────────────────────────
+        "strategy_mean_reversion":   _env_bool("STRATEGY_MEAN_REVERSION",   True),
+        "strategy_trend_cont":       _env_bool("STRATEGY_TREND_CONT",       True),
+        "strategy_smart_money":      _env_bool("STRATEGY_SMART_MONEY",      True),
 
         # ── MCDX p-1 tuning — selective (30m, WR 60%+ target) ───────────────────
         "mcdx_dwcs_buy":     _env_int("MCDX_DWCS_BUY",     62),   # high threshold → fewer, better signals
@@ -102,6 +107,35 @@ def build_config() -> dict:
         "mcdx2_adx_thr":     _env_int("MCDX2_ADX_THR",     22),
         "mcdx2_rsi_min":     _env_int("MCDX2_RSI_MIN",     38),
         "mcdx2_rsi_max":     _env_int("MCDX2_RSI_MAX",     72),
+
+        # ── Mean Reversion tuning (1H entry / 4H MTF) ────────────────────────
+        # sl_mult=1.2, tp_mult=2.0 → R:R 1:1.67  (break-even WR 37.5%)
+        # 2-bar RSI confirmation, 3/4 conditions required
+        "mr_sl_mult":         _env_float("MR_SL_MULT",       1.2),
+        "mr_tp_mult":         _env_float("MR_TP_MULT",       2.0),
+        "mr_rsi_oversold":    _env_float("MR_RSI_OVERSOLD",  35.0),
+        "mr_rsi_overbought":  _env_float("MR_RSI_OVERBOUGHT",65.0),
+        "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     3),
+
+        # ── Trend Continuation tuning (15m entry / 1H+4H MTF) ────────────
+        # sl_mult=0.8, tp_mult=2.0 → R:R 1:2.5  (break-even WR 28.6%)
+        # Tight pullback ±1.5%, ALL 4 conditions required
+        "tc_sl_mult":         _env_float("TC_SL_MULT",       0.8),
+        "tc_tp_mult":         _env_float("TC_TP_MULT",       2.0),
+        "tc_rsi_min":         _env_float("TC_RSI_MIN",      42.0),
+        "tc_rsi_max":         _env_float("TC_RSI_MAX",      65.0),
+        "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",  0.015),
+        "tc_vol_mult":        _env_float("TC_VOL_MULT",      1.2),
+
+        # ── Smart Money tuning (15m entry / 1H+4H MTF) ───────────────────
+        # sl_mult=1.8, rr=1.8 → R:R 1:1.8  (break-even WR 35.7%)
+        # BOS/CHoCH + EMA alignment + multi-TF score gates
+        "sm_sl_mult":         _env_float("SM_SL_MULT",       1.8),
+        "sm_rr":              _env_float("SM_RR",            1.8),
+        "sm_min_confidence":  _env_float("SM_MIN_CONFIDENCE",75.0),
+        "sm_min_multi_tf":    _env_float("SM_MIN_MULTI_TF",  70.0),
+        "sm_min_bos_choch":   _env_float("SM_MIN_BOS_CHOCH", 60.0),
+        "sm_min_ema_cross":   _env_float("SM_MIN_EMA_CROSS", 60.0),
 
         # ── Scalp Trend tuning (15m entry / 1H+4H MTF) ───────────────────────
         # sl_mult=1.5, tp_mult=1.875 → R:R 1:1.25 (break-even WR=44.4%)
@@ -180,6 +214,9 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
     from trading.strategies.utbot_wt_strategy            import UTBotWTStrategy
     from trading.strategies.scalp_trend_strategy         import ScalpTrendStrategy
     from trading.strategies.profitable_bot_strategy      import ProfitableBotStrategy
+    from trading.strategies.mean_reversion_strategy      import MeanReversionStrategy
+    from trading.strategies.trend_continuation_strategy  import TrendContinuationStrategy
+    from trading.strategies.smart_money_strategy         import SmartMoneyStrategy
 
     strategies = []
     for sym in symbols:
@@ -282,7 +319,6 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             }))
 
         # ── Profitable Bot (1H entry / 4H MTF) ────────────────────────────────
-        # SL=1.5×ATR, TP=1.875×ATR → R:R 1:1.25, 2/4 conditions needed
         if cfg["strategy_prof_bot"]:
             strategies.append(ProfitableBotStrategy(sym, params={
                 "name":           "ProfBot",
@@ -295,11 +331,52 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "min_conditions": cfg["prof_min_cond"],
             }))
 
+        # ── Mean Reversion (1H entry / 4H MTF) — unified_trading_bot style 1 ─
+        if cfg["strategy_mean_reversion"]:
+            strategies.append(MeanReversionStrategy(sym, params={
+                "name":           "MeanReversion",
+                "tf":             "1h",
+                "limit":          300,
+                "sl_mult":        cfg["mr_sl_mult"],
+                "tp_mult":        cfg["mr_tp_mult"],
+                "rsi_oversold":   cfg["mr_rsi_oversold"],
+                "rsi_overbought": cfg["mr_rsi_overbought"],
+                "min_conditions": cfg["mr_min_conditions"],
+            }))
+
+        # ── Trend Continuation (15m entry / 1H+4H MTF) — unified style 2 ─────
+        if cfg["strategy_trend_cont"]:
+            strategies.append(TrendContinuationStrategy(sym, params={
+                "name":         "TrendCont",
+                "tf":           "15m",
+                "limit":        300,
+                "sl_mult":      cfg["tc_sl_mult"],
+                "tp_mult":      cfg["tc_tp_mult"],
+                "rsi_min":      cfg["tc_rsi_min"],
+                "rsi_max":      cfg["tc_rsi_max"],
+                "pullback_pct": cfg["tc_pullback_pct"],
+                "vol_mult":     cfg["tc_vol_mult"],
+            }))
+
+        # ── Smart Money (15m entry / 1H+4H MTF) — unified style 3 ────────────
+        if cfg["strategy_smart_money"]:
+            strategies.append(SmartMoneyStrategy(sym, params={
+                "name":           "SmartMoney",
+                "tf":             "15m",
+                "limit":          300,
+                "sl_mult":        cfg["sm_sl_mult"],
+                "rr":             cfg["sm_rr"],
+                "min_confidence": cfg["sm_min_confidence"],
+                "min_multi_tf":   cfg["sm_min_multi_tf"],
+                "min_bos_choch":  cfg["sm_min_bos_choch"],
+                "min_ema_cross":  cfg["sm_min_ema_cross"],
+            }))
+
     if not strategies:
         raise RuntimeError(
-            "No strategies enabled — set one of: STRATEGY_MCDX, STRATEGY_MCDX_DUAL, "
-            "STRATEGY_SJUTBOT, STRATEGY_SJUTBOT_V3, STRATEGY_SJUTBOT_V2REV, "
-            "STRATEGY_UTBOT, STRATEGY_SCALP_TREND, STRATEGY_PROF_BOT to true"
+            "No strategies enabled — set one of: "
+            "STRATEGY_MEAN_REVERSION, STRATEGY_TREND_CONT, STRATEGY_SMART_MONEY "
+            "(or legacy: STRATEGY_MCDX, STRATEGY_SJUTBOT_V3, etc.) to true"
         )
 
     logger.info("Strategies loaded: %s", [s.name for s in strategies])
