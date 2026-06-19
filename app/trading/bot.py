@@ -58,6 +58,16 @@ class TradingBot:
         if self._ai_gate:
             logger.info("Claude AI gate ENABLED (model=%s)", self._ai_gate.model)
 
+        # Claude Chief: independent decision-maker; strategies become advisors
+        use_ai_chief = os.getenv("USE_AI_CHIEF", "").lower() in ("1", "true", "yes")
+        self._ai_chief: Optional[ClaudeAnalyzer] = (
+            ClaudeAnalyzer(chief_mode=True) if use_ai_chief else None
+        )
+        self._chief_min_conf = float(os.getenv("CHIEF_MIN_CONFIDENCE", "65"))
+        if self._ai_chief:
+            logger.info("Claude CHIEF MODE ENABLED (model=%s, min_conf=%.0f%%)",
+                        self._ai_chief.model, self._chief_min_conf)
+
         # In-memory position tracking: symbol -> Position
         self._positions: dict[str, Position] = {}
         self._position_lock = asyncio.Lock()   # prevents duplicate orders on same symbol
@@ -200,8 +210,8 @@ class TradingBot:
 
     async def _tick(self):
         await self._refresh_balance()
-        await self._sync_okx_positions()   # leveraged OKX positions only
-        await self._check_spot_exits()     # spot SL/TP price check
+        await self._sync_okx_positions()
+        await self._check_spot_exits()
 
         symbols = list({s.symbol for s in self.strategies})
         for sym in symbols:
@@ -210,71 +220,139 @@ class TradingBot:
                     sym, timeframe=self.candle_tf, limit=self.candle_limit
                 )
                 ticker = await self.connector.fetch_ticker(sym)
-                price = float(ticker["last"])
+                price  = float(ticker["last"])
             except Exception as e:
                 logger.warning("Failed to fetch data for %s: %s", sym, e)
                 continue
 
-            # MTF gate: check 4H EMA20 > EMA200 for bullish bias
-            if self.mtf_gate and not await self._is_4h_bullish(sym):
-                logger.debug("[MTF] %s 4H not bullish — skipping", sym)
+            if self._ai_chief:
+                # ── Chief mode: Claude decides independently ───────────────
+                await self._tick_chief(sym, candles, price)
+            else:
+                # ── Strategy mode (+ optional gate) ───────────────────────
+                await self._tick_strategies(sym, candles, price)
+
+    async def _tick_chief(self, sym: str, candles_1h: list, price: float):
+        """Chief mode: collect strategy opinions, ask Claude, execute if BUY."""
+        if sym in self._positions or len(self._positions) >= self.max_positions:
+            return
+
+        # Fetch 4h and 1d for multi-TF context
+        candles_by_tf: dict = {"1h": candles_1h}
+        for tf in ("4h", "1d"):
+            try:
+                c = await self.connector.fetch_ohlcv(sym, timeframe=tf, limit=120)
+                if c and len(c) >= 30:
+                    candles_by_tf[tf] = c
+            except Exception as e:
+                logger.debug("Failed to fetch %s for %s: %s", tf, sym, e)
+
+        # Gather strategy opinions (they advise, they don't gate)
+        opinions = []
+        for strat in [s for s in self.strategies if s.symbol == sym]:
+            try:
+                sig = await strat.analyze(candles_1h, price)
+                opinions.append({
+                    "name":   strat.name,
+                    "signal": sig.type.value.upper(),
+                    "reason": (sig.reason or "")[:100],
+                })
+            except Exception as e:
+                logger.debug("Strategy opinion error %s: %s", strat.name, e)
+
+        from .claude_analyzer import build_snapshot, fetch_news
+        snapshot = build_snapshot(sym, candles_by_tf, opinions)
+        news     = await fetch_news(sym)
+
+        decision = await self._ai_chief.chief_decide(snapshot, news)
+
+        if decision.action != "BUY" or decision.confidence < self._chief_min_conf:
+            logger.debug("[Chief] %s HOLD (conf=%.0f) | %s",
+                         sym, decision.confidence, decision.reasoning[:60])
+            return
+
+        # Compute ATR-based SL/TP
+        atr_arr = BaseStrategy.atr(candles_1h, 14)
+        atr_val = float(atr_arr[-1]) if not math.isnan(float(atr_arr[-1])) else price * 0.015
+        sl_atr  = float(os.getenv("CHIEF_SL_ATR", "2.5"))
+        tp_atr  = float(os.getenv("CHIEF_TP_ATR", "1.5"))
+        sl_p    = round(price - sl_atr * atr_val, 4)
+        tp_p    = round(price + tp_atr * atr_val, 4)
+
+        # Telegram: send Chief analysis before the order
+        if self.telegram:
+            lines = [f"Chief Analysis — {sym}",
+                     f"BUY (มั่นใจ {decision.confidence:.0f}%)",
+                     decision.reasoning]
+            if decision.confluence:
+                lines += ["สนับสนุน:"] + [f"  + {c}" for c in decision.confluence[:3]]
+            if decision.risk_flags:
+                lines += ["ความเสี่ยง:"] + [f"  ! {r}" for r in decision.risk_flags[:2]]
+            self.telegram.send("\n".join(lines))
+
+        signal = Signal(
+            type=SignalType.BUY, symbol=sym, price=price, amount=0.0,
+            confidence=decision.confidence / 100,
+            reason=f"[Chief] {decision.reasoning[:80]}",
+            metadata={
+                "stop_loss":   sl_p,
+                "take_profit": tp_p,
+                "atr":         round(atr_val, 4),
+                "chief_confluence": decision.confluence,
+                "chief_risk_flags": decision.risk_flags,
+            },
+        )
+        await self._execute_buy(signal, strategy_name="Chief")
+
+    async def _tick_strategies(self, sym: str, candles: list, price: float):
+        """Strategy mode: run each strategy; optionally confirm with gate."""
+        if self.mtf_gate and not await self._is_4h_bullish(sym):
+            logger.debug("[MTF] %s 4H not bullish — skipping", sym)
+            return
+
+        if sym in self._positions or len(self._positions) >= self.max_positions:
+            return
+
+        for strategy in [s for s in self.strategies if s.symbol == sym]:
+            try:
+                signal = await strategy.analyze(candles, price)
+            except Exception as e:
+                logger.error("Strategy %s error on %s: %s", strategy.name, sym, e)
                 continue
 
-            # Skip if already in position
-            if sym in self._positions:
+            if signal.type != SignalType.BUY:
                 continue
 
-            # Skip if max positions reached
-            if len(self._positions) >= self.max_positions:
+            meta = signal.metadata or {}
+            sl_p = meta.get("stop_loss")
+            tp_p = meta.get("take_profit")
+            if not sl_p or not tp_p:
+                logger.warning("[%s] BUY missing SL/TP — skipping", strategy.name)
                 continue
 
-            # Run strategies for this symbol
-            sym_strategies = [s for s in self.strategies if s.symbol == sym]
-            for strategy in sym_strategies:
-                try:
-                    signal = await strategy.analyze(candles, price)
-                except Exception as e:
-                    logger.error("Strategy %s error on %s: %s", strategy.name, sym, e)
+            logger.info("[%s] BUY: %s @ %.2f  SL=%.2f  TP=%.2f",
+                        strategy.name, sym, price, sl_p, tp_p)
+
+            if self._ai_gate is not None:
+                indicators    = self._build_indicators_snapshot(candles, price, meta)
+                recent_candles = [
+                    {"open": float(c.open), "high": float(c.high),
+                     "low": float(c.low), "close": float(c.close),
+                     "volume": float(c.volume)}
+                    for c in candles[-10:]
+                ]
+                confirmed, ai_reason = await self._ai_gate.confirm_buy(
+                    symbol=sym, price=price, strategy_name=strategy.name,
+                    signal_reason=signal.reason, indicators=indicators,
+                    recent_candles=recent_candles,
+                )
+                if not confirmed:
+                    logger.info("[Gate] REJECTED %s %s: %s", strategy.name, sym, ai_reason)
                     continue
+                logger.info("[Gate] CONFIRMED %s %s: %s", strategy.name, sym, ai_reason)
 
-                if signal.type != SignalType.BUY:
-                    continue
-
-                meta = signal.metadata or {}
-                sl_p = meta.get("stop_loss")
-                tp_p = meta.get("take_profit")
-                if not sl_p or not tp_p:
-                    logger.warning("[%s] BUY signal missing SL/TP metadata — skipping", strategy.name)
-                    continue
-
-                logger.info("[%s] BUY signal: %s @ %.2f  SL=%.2f  TP=%.2f",
-                            strategy.name, sym, price, sl_p, tp_p)
-
-                # Claude AI confirmation gate
-                if self._ai_gate is not None:
-                    indicators = self._build_indicators_snapshot(candles, price, meta)
-                    recent_candles = [
-                        {"open": float(c.open), "high": float(c.high),
-                         "low": float(c.low), "close": float(c.close),
-                         "volume": float(c.volume)}
-                        for c in candles[-10:]
-                    ]
-                    confirmed, ai_reason = await self._ai_gate.confirm_buy(
-                        symbol=sym,
-                        price=price,
-                        strategy_name=strategy.name,
-                        signal_reason=signal.reason,
-                        indicators=indicators,
-                        recent_candles=recent_candles,
-                    )
-                    if not confirmed:
-                        logger.info("[AI-Gate] REJECTED %s %s: %s", strategy.name, sym, ai_reason)
-                        continue
-                    logger.info("[AI-Gate] CONFIRMED %s %s: %s", strategy.name, sym, ai_reason)
-
-                await self._execute_buy(signal, strategy_name=strategy.name)
-                # One BUY per symbol per tick
-                break
+            await self._execute_buy(signal, strategy_name=strategy.name)
+            break   # one BUY per symbol per tick
 
     async def _execute_buy(self, signal: Signal, strategy_name: str):
         sym = signal.symbol

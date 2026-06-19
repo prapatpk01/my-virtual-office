@@ -141,9 +141,11 @@ def build_config() -> dict:
             "rsi_hi":   _env_float("HYB_RSI_HI", 64.0),
             "vol_mult": _env_float("HYB_VOL",      1.2),
         },
-        "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-        "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
-        "mtf_gate":         _env_bool("MTF_GATE", False),
+        "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+        "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
+        "mtf_gate":            _env_bool("MTF_GATE", False),
+        "use_ai_chief":        _env_bool("USE_AI_CHIEF", False),
+        "chief_min_confidence": _env_float("CHIEF_MIN_CONFIDENCE", 65.0),
     }
 
 
