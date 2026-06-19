@@ -113,8 +113,8 @@ def build_config() -> dict:
         # single-bar RSI, 2/4 conditions required
         "mr_sl_mult":         _env_float("MR_SL_MULT",       1.2),
         "mr_tp_mult":         _env_float("MR_TP_MULT",       2.0),
-        "mr_rsi_oversold":    _env_float("MR_RSI_OVERSOLD",  42.0),   # ↑ from 35
-        "mr_rsi_overbought":  _env_float("MR_RSI_OVERBOUGHT",58.0),   # ↓ from 65
+        "mr_rsi_oversold":    _env_float("MR_RSI_OVERSOLD",  48.0),   # ↑ from 42
+        "mr_rsi_overbought":  _env_float("MR_RSI_OVERBOUGHT",52.0),   # ↓ from 58
         "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     2),    # ↓ from 3
 
         # ── Trend Continuation tuning (15m entry / 1H+4H MTF) ────────────
@@ -127,15 +127,12 @@ def build_config() -> dict:
         "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",  0.025),
         "tc_vol_mult":        _env_float("TC_VOL_MULT",      1.0),
 
-        # ── Smart Money tuning (15m entry / 1H+4H MTF) ───────────────────
-        # sl_mult=1.8, rr=1.8 → R:R 1:1.8  (break-even WR 35.7%)
-        # 2/3 component majority vote, aggressive thresholds for more signals
-        "sm_sl_mult":         _env_float("SM_SL_MULT",       1.8),
-        "sm_rr":              _env_float("SM_RR",            1.8),
-        "sm_min_confidence":  _env_float("SM_MIN_CONFIDENCE",42.0),   # ↓ from 55
-        "sm_min_multi_tf":    _env_float("SM_MIN_MULTI_TF",  40.0),   # ↓ from 55
-        "sm_min_bos_choch":   _env_float("SM_MIN_BOS_CHOCH", 35.0),   # ↓ from 50
-        "sm_min_ema_cross":   _env_float("SM_MIN_EMA_CROSS", 35.0),   # ↓ from 50
+        # ── Smart Money / MTF Momentum tuning (15m entry / 1H+4H MTF) ──────
+        # sl_mult=1.5, tp_mult=2.5 → R:R 1:1.67  (break-even WR 37.5%)
+        # comp_pct from compute_mtf_bias() must exceed bias_threshold
+        "sm_sl_mult":         _env_float("SM_SL_MULT",       1.5),
+        "sm_tp_mult":         _env_float("SM_TP_MULT",       2.5),
+        "sm_bias_threshold":  _env_float("SM_BIAS_THRESHOLD",25.0),   # comp_pct gate
 
         # ── Scalp Trend tuning (15m entry / 1H+4H MTF) ───────────────────────
         # sl_mult=1.5, tp_mult=1.875 → R:R 1:1.25 (break-even WR=44.4%)
@@ -358,18 +355,15 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "vol_mult":     cfg["tc_vol_mult"],
             }))
 
-        # ── Smart Money (15m entry / 1H+4H MTF) — unified style 3 ────────────
+        # ── Smart Money / MTF Momentum (15m entry / 1H+4H MTF) — style 3 ──
         if cfg["strategy_smart_money"]:
             strategies.append(SmartMoneyStrategy(sym, params={
                 "name":           "SmartMoney",
                 "tf":             "15m",
                 "limit":          300,
                 "sl_mult":        cfg["sm_sl_mult"],
-                "rr":             cfg["sm_rr"],
-                "min_confidence": cfg["sm_min_confidence"],
-                "min_multi_tf":   cfg["sm_min_multi_tf"],
-                "min_bos_choch":  cfg["sm_min_bos_choch"],
-                "min_ema_cross":  cfg["sm_min_ema_cross"],
+                "tp_mult":        cfg["sm_tp_mult"],
+                "bias_threshold": cfg["sm_bias_threshold"],
             }))
 
     if not strategies:
@@ -606,16 +600,13 @@ async def main():
                 )
                 case5[f"TrendCont/{tag}"] = summarise(trades)
 
-            # SmartMoney (primary=15m, mtf=1h+4h)
+            # SmartMoney / MTF Momentum (primary=15m, mtf=1h+4h)
             if c15m and c1h and c4h:
                 sm = SmartMoneyStrategy(sym, params={
                     "name":           "SmartMoney",
                     "sl_mult":        cfg["sm_sl_mult"],
-                    "rr":             cfg["sm_rr"],
-                    "min_confidence": cfg["sm_min_confidence"],
-                    "min_multi_tf":   cfg["sm_min_multi_tf"],
-                    "min_bos_choch":  cfg["sm_min_bos_choch"],
-                    "min_ema_cross":  cfg["sm_min_ema_cross"],
+                    "tp_mult":        cfg["sm_tp_mult"],
+                    "bias_threshold": cfg["sm_bias_threshold"],
                 })
                 trades = await backtest_strategy_mtf(
                     sm, c15m, {"1h": c1h, "4h": c4h}, notional_c5, sl_pct, tp_pct,

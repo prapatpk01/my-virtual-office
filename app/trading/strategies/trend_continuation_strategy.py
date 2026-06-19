@@ -30,8 +30,9 @@ class TrendContinuationStrategy(BaseStrategy):
         self.ema_slow     = self.params.get("ema_slow",      50)
         self.ema_micro    = self.params.get("ema_micro",      9)
         self.rsi_period   = self.params.get("rsi_period",    14)
-        self.rsi_min_buy  = self.params.get("rsi_min",      38.0)  # ↓ from 42
-        self.rsi_max_buy  = self.params.get("rsi_max",      72.0)  # ↑ from 65
+        self.rsi_min_buy  = self.params.get("rsi_min",      35.0)  # ↓ from 38
+        self.rsi_max_buy  = self.params.get("rsi_max",      75.0)  # ↑ from 72
+        self.bias_gate    = self.params.get("bias_gate",    15.0)  # comp_pct threshold
         self.rsi_min_sell = self.params.get("rsi_min_sell", 28.0)  # ↓ from 35
         self.rsi_max_sell = self.params.get("rsi_max_sell", 65.0)  # ↑ from 58
         self.pullback_pct = self.params.get("pullback_pct", 0.025) # ↑ from 0.015 ±2.5%
@@ -89,6 +90,20 @@ class TrendContinuationStrategy(BaseStrategy):
         at_pullback_long  = near_ema or wick_bounce_l
         at_pullback_short = near_ema or wick_reject_s
 
+        # ── MTF bias pre-filter: 15m+1H+4H alignment gate ────────────────
+        comp_pct, bias_label = self.compute_mtf_bias(
+            candles, mtf_candles,
+            ema_fast=20, ema_slow=50, rsi_period=14, rsi_bull=55.0, rsi_bear=45.0,
+        )
+        long_bias_ok  = comp_pct >  self.bias_gate
+        short_bias_ok = comp_pct < -self.bias_gate
+        if not (long_bias_ok or short_bias_ok):
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                reason=(f"[TrendCont] MTF bias too weak: comp={comp_pct:.0f} ({bias_label}) "
+                        f"need >{self.bias_gate:.0f} for long / <-{self.bias_gate:.0f} for short"),
+            )
+
         # ── 15m indicators (last closed bar = [-2]) ───────────────────────
         ef15  = self.ema(closes_15m, self.ema_fast)
         em9   = self.ema(closes_15m, self.ema_micro)
@@ -120,8 +135,8 @@ class TrendContinuationStrategy(BaseStrategy):
                 return round(current_price - dist, 2), round(current_price + tp_d, 2)
             return round(current_price + dist, 2), round(current_price - tp_d, 2)
 
-        # ── BUY: 4H up + 1H up + pullback + min_entry_cond/4 ────────────
-        if macro_up and mid_up and at_pullback_long:
+        # ── BUY: 4H up + 1H up + pullback + bias aligned + min_entry_cond/4 ─
+        if macro_up and mid_up and at_pullback_long and long_bias_ok:
             c1 = close_b > ema9_b
             c2 = close_b > ema20_b
             c3 = self.rsi_min_buy <= rsi_b <= self.rsi_max_buy
@@ -132,14 +147,14 @@ class TrendContinuationStrategy(BaseStrategy):
                 return Signal(
                     SignalType.BUY, self.symbol, current_price,
                     amount=0.08,
-                    reason=(f"[TrendCont] 4H↑ 1H↑ EMA20pull cond={met}/4 RSI={rsi_b:.0f} "
-                            f"ATR={atr_v:.0f} RR=1:{rr:.2f}"),
+                    reason=(f"[TrendCont] 4H↑ 1H↑ bias={comp_pct:.0f} EMA20pull "
+                            f"cond={met}/4 RSI={rsi_b:.0f} ATR={atr_v:.0f} RR=1:{rr:.2f}"),
                     confidence=0.65 + met * 0.02,
                     metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
                 )
 
-        # ── SELL: 4H down + 1H down + resistance + min_entry_cond/4 ─────
-        if macro_down and mid_down and at_pullback_short:
+        # ── SELL: 4H down + 1H down + resistance + bias aligned + min_entry_cond/4
+        if macro_down and mid_down and at_pullback_short and short_bias_ok:
             c1 = close_b < ema9_b
             c2 = close_b < ema20_b
             c3 = self.rsi_min_sell <= rsi_b <= self.rsi_max_sell
@@ -150,8 +165,8 @@ class TrendContinuationStrategy(BaseStrategy):
                 return Signal(
                     SignalType.SELL, self.symbol, current_price,
                     amount=0.08,
-                    reason=(f"[TrendCont] 4H↓ 1H↓ EMA20resist cond={met}/4 RSI={rsi_b:.0f} "
-                            f"ATR={atr_v:.0f} RR=1:{rr:.2f}"),
+                    reason=(f"[TrendCont] 4H↓ 1H↓ bias={comp_pct:.0f} EMA20resist "
+                            f"cond={met}/4 RSI={rsi_b:.0f} ATR={atr_v:.0f} RR=1:{rr:.2f}"),
                     confidence=0.65 + met * 0.02,
                     metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
                 )
@@ -161,5 +176,5 @@ class TrendContinuationStrategy(BaseStrategy):
             reason=(f"[TrendCont] "
                     f"4H={'↑' if macro_up else '↓' if macro_down else '→'} "
                     f"1H={'↑' if mid_up else '↓' if mid_down else '→'} "
-                    f"pull-L={at_pullback_long} pull-S={at_pullback_short}"),
+                    f"bias={comp_pct:.0f} pull-L={at_pullback_long} pull-S={at_pullback_short}"),
         )
