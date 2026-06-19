@@ -77,7 +77,7 @@ def build_config() -> dict:
         "leverage":    _env_int("LEVERAGE", 20),
 
         # ── Symbols ───────────────────────────────────────────────────────────
-        "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
+        "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT"),
 
         # ── Strategies ────────────────────────────────────────────────────────
         "strategy_mcdx":         _env_bool("STRATEGY_MCDX",         True),   # MCDX p-1
@@ -113,10 +113,10 @@ def build_config() -> dict:
         "scalp_min_entry":    _env_int("SCALP_MIN_ENTRY",          3),  # 3/4 conditions
 
         # ── Profitable Bot tuning (1H entry / 4H MTF) ────────────────────────
-        # sl_mult=1.5, tp_mult=1.875 → R:R 1:1.25 (break-even WR=44.4%)
+        # sl_mult=1.2, tp_mult=1.5 → R:R 1:1.25 (break-even WR=44.4%)
         # min_cond=2 (2/4), rsi_oversold=42 — higher trigger frequency
-        "prof_sl_mult":       _env_float("PROF_SL_MULT",       1.5),
-        "prof_tp_mult":       _env_float("PROF_TP_MULT",      1.875),
+        "prof_sl_mult":       _env_float("PROF_SL_MULT",       1.2),
+        "prof_tp_mult":       _env_float("PROF_TP_MULT",       1.5),
         "prof_rsi_oversold":  _env_float("PROF_RSI_OVERSOLD",  42.0),   # ↑ from 35
         "prof_rsi_overbought":_env_float("PROF_RSI_OVERBOUGHT",58.0),   # ↓ from 65
         "prof_min_cond":      _env_int("PROF_MIN_COND",             2),  # ↓ from 3

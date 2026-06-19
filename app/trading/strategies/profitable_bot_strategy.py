@@ -8,7 +8,7 @@ Adapted from profitable.py, extended to support both long and short positions.
   Layer 2 — 1H entry: min_cond / 4 conditions required (default 2/4)
   Layer 3 — ATR-based SL/TP
 
-sl_mult=1.5, tp_mult=1.875 → R:R = 1:1.25 (break-even WR = 44.4%)
+sl_mult=1.2, tp_mult=1.5 → R:R = 1:1.25 (break-even WR = 44.4%)
 
 BUY  (long)  : 4H NOT "down" + 1H oversold bounce (min_cond/4 conditions met)
 SELL (short) : 4H "down"     + 1H overbought rejection (min_cond/4 conditions met)
@@ -43,8 +43,8 @@ class ProfitableBotStrategy(BaseStrategy):
         self.vol_mult        = self.params.get("vol_mult",         1.2)
         self.min_cond        = self.params.get("min_conditions",     2)  # ↓ from 3 — 2/4 needed
         self.atr_period      = self.params.get("atr_period",       14)
-        self.sl_mult         = self.params.get("sl_mult",          1.5)
-        self.tp_mult         = self.params.get("tp_mult",        1.875)  # SL×1.25 → R:R 1:1.25
+        self.sl_mult         = self.params.get("sl_mult",          1.2)
+        self.tp_mult         = self.params.get("tp_mult",          1.5)  # SL×1.25 → R:R 1:1.25
         self.sl_min_pct      = self.params.get("sl_min_pct",      0.010)
         self.sl_max_pct      = self.params.get("sl_max_pct",      0.070)
         self.trend_ema_fast  = self.params.get("trend_ema_fast",   20)
