@@ -97,7 +97,11 @@ class BinanceConnector(BaseConnector):
     async def _okx_order(self, symbol: str, side: str, amount: float,
                          order_type: str, price: Optional[float],
                          tp: Optional[float], sl: Optional[float]) -> OrderResult:
-        """OKX order via direct API. Uses tdMode=cross for OKX Unified Account."""
+        """OKX order via direct API. Uses attachAlgoOrds to attach TP/SL atomically.
+
+        TP/SL are attached to the main order in a single API call — if the order fills,
+        OKX guarantees the algo orders are created. No separate OCO call needed.
+        """
         await self._exchange.load_markets()
         mkt = self._exchange.markets.get(symbol) or {}
         info = mkt.get("info") or {}
@@ -114,10 +118,16 @@ class BinanceConnector(BaseConnector):
                 f"Set TRADE_AMOUNT_USDT >= {needed}."
             )
 
-        # Main order — tdMode=cross ALWAYS for OKX Unified Account.
+        # Validate SL/TP direction before sending to exchange
+        if side == "buy" and sl and tp and price:
+            if sl >= price:
+                raise ValueError(f"SL {sl:.2f} must be below entry {price:.2f}")
+            if tp <= price:
+                raise ValueError(f"TP {tp:.2f} must be above entry {price:.2f}")
+
+        # Build main order — tdMode=cross ALWAYS for OKX Unified Account.
         # tgtCcy=base_ccy: for market BUY, OKX default tgtCcy is quote_ccy (USDT),
         # so OKX would interpret sz=0.001558 as $0.001558 USDT → error 51020.
-        # Setting base_ccy explicitly tells OKX sz is in BTC for all order types.
         req: dict = {
             "instId": inst_id,
             "tdMode": "cross",
@@ -129,42 +139,42 @@ class BinanceConnector(BaseConnector):
         if order_type == "limit" and price:
             req["px"] = self._exchange.price_to_precision(symbol, price)
 
+        # Attach TP/SL to the order atomically — OKX creates algo orders when order fills.
+        # Using attachAlgoOrds instead of a separate OCO call eliminates the race condition
+        # where the main order fills but the OCO call fails or times out.
+        if side == "buy" and tp and sl and tp > 0 and sl > 0:
+            req["attachAlgoOrds"] = [{
+                "attachAlgoClOrdId": str(uuid.uuid4()).replace("-", "")[:32],
+                "tpTriggerPx": f"{tp:.2f}",
+                "tpOrdPx": "-1",          # -1 = market order when TP triggers
+                "tpTriggerPxType": "last",
+                "slTriggerPx": f"{sl:.2f}",
+                "slOrdPx": "-1",          # -1 = market order when SL triggers
+                "slTriggerPxType": "last",
+            }]
+            _log.info("Order with attached TP=%.2f SL=%.2f", tp, sl)
+
         resp = await self._exchange.privatePostTradeOrder(req)
         data_row = ((resp or {}).get("data") or [{}])[0]
         ord_id = data_row.get("ordId") or str(uuid.uuid4())
 
+        # Fetch actual fill price from order detail (more accurate than ticker)
+        exec_price = float(price or 0)
         try:
-            ticker = await self._exchange.fetch_ticker(symbol)
-            exec_price = float(ticker.get("last") or price or 0)
+            order_detail = await self._exchange.fetch_order(ord_id, symbol)
+            exec_price = float(order_detail.get("average") or
+                               order_detail.get("price") or exec_price)
         except Exception:
-            exec_price = float(price or 0)
+            try:
+                ticker = await self._exchange.fetch_ticker(symbol)
+                exec_price = float(ticker.get("last") or exec_price)
+            except Exception:
+                pass
 
-        result = OrderResult(
+        return OrderResult(
             order_id=ord_id, symbol=symbol, side=side,
             amount=amount, price=exec_price, filled=amount, status="closed",
         )
-
-        # OCO algo order for TP/SL after BUY fills
-        if side == "buy" and tp and sl and tp > 0 and sl > 0:
-            try:
-                await self._exchange.privatePostTradeOrderAlgo({
-                    "instId": inst_id,
-                    "tdMode": "cross",
-                    "side": "sell",
-                    "ordType": "oco",
-                    "sz": sz_str,
-                    "tpTriggerPx": f"{tp:.2f}",
-                    "tpOrdPx": "-1",
-                    "tpTriggerPxType": "last",
-                    "slTriggerPx": f"{sl:.2f}",
-                    "slOrdPx": "-1",
-                    "slTriggerPxType": "last",
-                })
-                _log.info("OCO placed: TP=%.2f SL=%.2f", tp, sl)
-            except Exception as e:
-                _log.warning("OCO failed: %s", e)
-
-        return result
 
     async def _paper_order(self, symbol: str, side: str, amount: float,
                            order_type: str, price: Optional[float]) -> OrderResult:

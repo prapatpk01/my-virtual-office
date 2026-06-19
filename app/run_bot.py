@@ -215,6 +215,16 @@ def _make_telegram(cfg: dict):
 
 async def main():
     cfg = build_config()
+
+    # Pre-flight: refuse to start live mode with missing credentials
+    if not cfg["paper"]:
+        missing = [k for k in ("api_key", "api_secret") if not cfg.get(k, "").strip()]
+        if missing:
+            logger.critical("LIVE MODE but %s not set — set env vars and restart", missing)
+            sys.exit(1)
+        if not cfg.get("telegram_token"):
+            logger.warning("⚠ Telegram not configured — no trade alerts in LIVE mode")
+
     logger.info(
         "=== Bot starting [%s] exchange=%s symbols=%s ===",
         "PAPER" if cfg["paper"] else "LIVE",

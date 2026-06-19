@@ -60,6 +60,7 @@ class TradingBot:
 
         # In-memory position tracking: symbol -> Position
         self._positions: dict[str, Position] = {}
+        self._position_lock = asyncio.Lock()   # prevents duplicate orders on same symbol
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -75,6 +76,19 @@ class TradingBot:
         if self._task and not self._task.done():
             logger.warning("Bot already running")
             return
+        # Pre-flight check: warn loudly if live mode but credentials missing
+        if not self._paper:
+            cfg_key = getattr(self.connector, "_exchange", None)
+            api_key = getattr(self.connector._exchange if cfg_key else self.connector,
+                              "apiKey", "") or ""
+            if not api_key.strip():
+                logger.critical(
+                    "LIVE MODE enabled but EXCHANGE_API_KEY is not set — stopping."
+                )
+                raise RuntimeError("LIVE MODE: EXCHANGE_API_KEY missing")
+            logger.warning("=" * 60)
+            logger.warning("  ⚠  LIVE TRADING MODE — real money at risk")
+            logger.warning("=" * 60)
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
         logger.info("TradingBot started (paper=%s, interval=%ds, symbols=%s)",
@@ -268,47 +282,64 @@ class TradingBot:
         sl_p = meta.get("stop_loss")
         tp_p = meta.get("take_profit")
 
-        # Refresh price
-        try:
-            ticker = await self.connector.fetch_ticker(sym)
-            price = float(ticker["last"])
-        except Exception as e:
-            logger.error("fetch_ticker failed for %s: %s", sym, e)
-            if self.telegram:
-                self.telegram.notify_error(sym, str(e))
-            return
+        async with self._position_lock:
+            # Re-check inside lock — another strategy may have entered while we awaited
+            if sym in self._positions:
+                logger.debug("[%s] Position for %s already taken — skipping", strategy_name, sym)
+                return
+            if len(self._positions) >= self.max_positions:
+                logger.debug("[%s] Max positions reached — skipping", strategy_name)
+                return
 
-        if self.trade_amount_usdt > 0:
-            amount = round(self.trade_amount_usdt / price, 6)
-        else:
-            # Fall back to 1% of balance
-            amount = round(self._current_balance * 0.01 / price, 6)
+            # Refresh price
+            try:
+                ticker = await self.connector.fetch_ticker(sym)
+                price = float(ticker["last"])
+            except Exception as e:
+                logger.error("fetch_ticker failed for %s: %s", sym, e)
+                if self.telegram:
+                    self.telegram.notify_error(sym, str(e))
+                return
 
-        if amount <= 0:
-            logger.warning("Computed amount=0 for %s — skipping", sym)
-            return
+            # Validate SL/TP direction
+            if sl_p and tp_p:
+                if sl_p >= price:
+                    logger.warning("[%s] SL %.2f >= price %.2f — skipping", strategy_name, sl_p, price)
+                    return
+                if tp_p <= price:
+                    logger.warning("[%s] TP %.2f <= price %.2f — skipping", strategy_name, tp_p, price)
+                    return
 
-        try:
-            order = await self.connector.create_order(
-                sym, "buy", amount, tp=tp_p, sl=sl_p
-            )
-            fill_price = order.price or price
-            pos = Position(
-                symbol=sym, side="long",
-                entry_price=fill_price, amount=amount,
-                stop_loss=sl_p, take_profit=tp_p,
-            )
-            self._positions[sym] = pos
-            logger.info("[%s] BUY filled: %s %.6f @ %.2f  SL=%.2f  TP=%.2f",
-                        strategy_name, sym, amount, fill_price,
-                        sl_p or 0, tp_p or 0)
-            if self.telegram:
-                self.telegram.notify_buy(sym, fill_price, amount,
-                                         sl_p or 0.0, tp_p or 0.0, strategy_name)
-        except Exception as e:
-            logger.error("[%s] Order failed for %s: %s", strategy_name, sym, e)
-            if self.telegram:
-                self.telegram.notify_error(sym, str(e))
+            if self.trade_amount_usdt > 0:
+                amount = round(self.trade_amount_usdt / price, 6)
+            else:
+                amount = round(self._current_balance * 0.01 / price, 6)
+
+            if amount <= 0:
+                logger.warning("Computed amount=0 for %s — skipping", sym)
+                return
+
+            try:
+                order = await self.connector.create_order(
+                    sym, "buy", amount, tp=tp_p, sl=sl_p
+                )
+                fill_price = order.price or price
+                pos = Position(
+                    symbol=sym, side="long",
+                    entry_price=fill_price, amount=amount,
+                    stop_loss=sl_p, take_profit=tp_p,
+                )
+                self._positions[sym] = pos
+                logger.info("[%s] BUY filled: %s %.6f @ %.2f  SL=%.2f  TP=%.2f",
+                            strategy_name, sym, amount, fill_price,
+                            sl_p or 0, tp_p or 0)
+                if self.telegram:
+                    self.telegram.notify_buy(sym, fill_price, amount,
+                                             sl_p or 0.0, tp_p or 0.0, strategy_name)
+            except Exception as e:
+                logger.error("[%s] Order failed for %s: %s", strategy_name, sym, e)
+                if self.telegram:
+                    self.telegram.notify_error(sym, str(e))
 
     # ------------------------------------------------------------------
     # OKX position sync
