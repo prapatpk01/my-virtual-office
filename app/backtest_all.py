@@ -853,7 +853,7 @@ def run_backtest(ha: dict, ind: dict, ind_ext: dict | None = None) -> tuple[list
     # Swing strategy configs: (name, sl_mult, tp_mult, rsi_lo, rsi_hi, vol_mult, cooldown_bars)
     _SWING = [
         ("SwingReversalStrategy", 2.5, 1.5, 34.0, 62.0, 1.2, 4),
-        ("CPKRegimeStrategy",     2.5, 1.5, 40.0, 64.0, 1.2, 5),
+        ("CPKRegimeStrategy",     2.0, 1.2, 44.0, 60.0, 1.5, 4),
     ]
     ALL_STRAT_NAMES = [sn for sn, *_ in _SWING] + ["ProfitableBot", "ScalpTrendBot"]
     SWING_WARMUP = 210
@@ -992,23 +992,24 @@ def run_backtest(ha: dict, ind: dict, ind_ext: dict | None = None) -> tuple[list
                                     buy_sigs.append(("ProfitableBot", sl_p, tp_p))
                                     cooldown[key_pb] = 2
 
-            # ScalpTrendBot BUY (1H proxy — pullback ±4% of EMA20_1h)
+            # ScalpTrendBot BUY (1H proxy — EMA20 cross-above in uptrend)
             key_sc = (sym, "ScalpTrendBot")
             if cooldown[key_sc] > 0:
                 cooldown[key_sc] -= 1
-            elif i >= NEW_WARMUP and d_e is not None:
-                e20_1h_sc = float(d_e["ema20_1h"][i])
-                e50_1h_sc = float(d_e["ema50_1h"][i])
-                rsi_sc    = float(d_e["rsi14_1h"][i])
-                atr_sc    = float(d_e["atr14_1h"][i])
-                if not any(math.isnan(v) for v in [e20_1h_sc, e50_1h_sc, rsi_sc, atr_sc]):
+            elif i >= NEW_WARMUP + 1 and d_e is not None:
+                e20_1h_sc = float(d_e["ema20_1h"][i]);   e50_1h_sc = float(d_e["ema50_1h"][i])
+                e20_p_sc  = float(d_e["ema20_1h"][i - 1])
+                rsi_sc    = float(d_e["rsi14_1h"][i]);   atr_sc    = float(d_e["atr14_1h"][i])
+                cp_prev   = float(d["closes"][i - 1])
+                if not any(math.isnan(v) for v in [e20_1h_sc, e50_1h_sc, rsi_sc, atr_sc, e20_p_sc]):
                     if (e20_1h_sc > e50_1h_sc
-                            and abs(cp - e20_1h_sc) / e20_1h_sc <= 0.04
-                            and 35.0 <= rsi_sc <= 70.0):
-                        sl_dist = max(1.5 * atr_sc, cp * 0.008)
-                        sl_dist = min(sl_dist, cp * 0.04)
+                            and cp_prev < e20_p_sc
+                            and cp > e20_1h_sc
+                            and 40.0 <= rsi_sc <= 65.0):
+                        sl_dist = max(2.0 * atr_sc, cp * 0.008)
+                        sl_dist = min(sl_dist, cp * 0.05)
                         sl_p = round(cp - sl_dist, 4)
-                        tp_p = round(cp + 1.0 * atr_sc, 4)
+                        tp_p = round(cp + 1.5 * atr_sc, 4)
                         if sl_p < cp < tp_p:
                             buy_sigs.append(("ScalpTrendBot", sl_p, tp_p))
                             cooldown[key_sc] = 8
@@ -1172,7 +1173,9 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
                 close_pos(pos, p, r, bar_i)
                 continue
 
-            time_limit = 8 if pos.strategy == "ScalpTrendBot" else 72
+            if pos.strategy == "ScalpTrendBot":        time_limit = 20
+            elif pos.strategy == "CPKRegimeStrategy": time_limit = 96
+            else:                                      time_limit = 72
             if (bar_i - pos.entry_bar) >= time_limit:
                 close_pos(pos, cp, "max_hold", bar_i)
 
@@ -1217,11 +1220,11 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
                 cb_c    = bool(d["candle_bull"][i]); mc_c = bool(d["macd_cross"][i])
                 dv_c    = not any(math.isnan(v) for v in [e80_c, e200_c, rsi_c, vma_c])
                 if (dv_c and e80_c >= e200_c * 0.98 and cb_c and mc_c
-                        and 40.0 <= rsi_c <= 64.0 and vol_c >= vma_c * 1.2):
+                        and 44.0 <= rsi_c <= 60.0 and vol_c >= vma_c * 1.5):
                     sl_p = round(cp - 2.5 * atr_v, 4)
                     tp_p = round(cp + 1.5 * atr_v, 4)
                     if sl_p < cp < tp_p:
-                        _try_open("CPKRegimeStrategy", sl_p, tp_p, 5)
+                        _try_open("CPKRegimeStrategy", sl_p, tp_p, 2)
 
             # ProfitableBot (1H trend-following, 2/4 conditions)
             key_pb = (sym, "ProfitableBot")
@@ -1254,21 +1257,24 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
                                 if sl_p < cp < tp_p:
                                     _try_open("ProfitableBot", sl_p, tp_p, 2)
 
-            # ScalpTrendBot (1H proxy — pullback ±4% of EMA20_1h)
+            # ScalpTrendBot (1H proxy — EMA20 cross-above in uptrend)
             key_sc = (sym, "ScalpTrendBot")
             if cooldown[key_sc] > 0:
                 cooldown[key_sc] -= 1
-            elif i >= NEW_WARMUP:
-                e20_sc = float(d_e["ema20_1h"][i]);  e50_sc = float(d_e["ema50_1h"][i])
-                rsi_sc = float(d_e["rsi14_1h"][i]);  atr_sc = float(d_e["atr14_1h"][i])
-                if not any(math.isnan(v) for v in [e20_sc, e50_sc, rsi_sc, atr_sc]):
-                    if (e20_sc > e50_sc
-                            and abs(cp - e20_sc) / e20_sc <= 0.04
-                            and 35.0 <= rsi_sc <= 70.0):
-                        sl_dist = max(1.5 * atr_sc, cp * 0.008)
-                        sl_dist = min(sl_dist, cp * 0.04)
+            elif i >= NEW_WARMUP + 1:
+                e20_sc  = float(d_e["ema20_1h"][i]);   e50_sc  = float(d_e["ema50_1h"][i])
+                e20_p   = float(d_e["ema20_1h"][i - 1])
+                rsi_sc  = float(d_e["rsi14_1h"][i]);   atr_sc  = float(d_e["atr14_1h"][i])
+                cp_prev = float(d["closes"][i - 1])
+                if not any(math.isnan(v) for v in [e20_sc, e50_sc, rsi_sc, atr_sc, e20_p]):
+                    if (e20_sc > e50_sc                       # 1H uptrend
+                            and cp_prev < e20_p               # previous bar below EMA20
+                            and cp > e20_sc                   # current bar crossed above EMA20
+                            and 40.0 <= rsi_sc <= 65.0):
+                        sl_dist = max(2.0 * atr_sc, cp * 0.008)
+                        sl_dist = min(sl_dist, cp * 0.05)
                         sl_p = round(cp - sl_dist, 4)
-                        tp_p = round(cp + 1.0 * atr_sc, 4)
+                        tp_p = round(cp + 1.5 * atr_sc, 4)
                         if sl_p < cp < tp_p:
                             _try_open("ScalpTrendBot", sl_p, tp_p, 8)
 
