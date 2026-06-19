@@ -289,6 +289,114 @@ def _precompute(sym: str, ha: dict) -> dict:
     }
 
 
+def _precompute_ext(sym: str, ha: dict) -> dict:
+    """Additional indicators for ProfitableBot (1H/4H) and ScalpTrendBot (15m/1H/4H)."""
+    ha_1h  = ha[sym]["1h"]
+    ha_15m = ha[sym].get("15m", [])
+    n1h    = len(ha_1h)
+
+    closes_1h  = np.array([c.close  for c in ha_1h], dtype=float)
+    volumes_1h = np.array([c.volume for c in ha_1h], dtype=float)
+    ts_1h      = np.array([c.timestamp for c in ha_1h], dtype=np.int64)
+
+    # ── 1H indicators ──────────────────────────────────────────────────────────
+    ema20_1h = BaseStrategy.ema(closes_1h.tolist(), 20)
+    ema50_1h = BaseStrategy.ema(closes_1h.tolist(), 50)
+    rsi14_1h = BaseStrategy.rsi(closes_1h.tolist(), 14)
+    atr14_1h = BaseStrategy.atr(ha_1h, 14)
+    volma20_1h = BaseStrategy.sma(volumes_1h.tolist(), 20)
+    _, _, mhist_1h = BaseStrategy.macd(closes_1h.tolist(), 12, 26, 9)
+    mhist_1h = mhist_1h.astype(float)
+    bb_lower_1h = _bb_lower(closes_1h, 20, 2.0)
+
+    # ── 4H data (resample: group every 4 1H bars) ─────────────────────────────
+    n4h = n1h // 4
+    closes_4h = np.array([ha_1h[k * 4 + 3].close for k in range(n4h)], dtype=float)
+    ema20_4h_raw = BaseStrategy.ema(closes_4h.tolist(), 20)
+    ema50_4h_raw = BaseStrategy.ema(closes_4h.tolist(), 50)
+
+    # Expand 4H EMAs back to 1H index (bar i → 4H index i//4)
+    ema20_4h = np.full(n1h, np.nan)
+    ema50_4h = np.full(n1h, np.nan)
+    for i in range(n1h):
+        k = i // 4
+        if k < n4h:
+            ema20_4h[i] = ema20_4h_raw[k]
+            ema50_4h[i] = ema50_4h_raw[k]
+
+    # 4H EMA20 slope: change over 1 4H bar (= 4 1H bars)
+    ema20_4h_slope = np.full(n1h, np.nan)
+    for i in range(4, n1h):
+        if not (math.isnan(ema20_4h[i]) or math.isnan(ema20_4h[i - 4])):
+            ema20_4h_slope[i] = ema20_4h[i] - ema20_4h[i - 4]
+
+    # ── 15m indicators ─────────────────────────────────────────────────────────
+    if len(ha_15m) < 30:
+        return {
+            "ema20_1h": ema20_1h, "ema50_1h": ema50_1h,
+            "rsi14_1h": rsi14_1h, "atr14_1h": atr14_1h,
+            "volma20_1h": volma20_1h, "mhist_1h": mhist_1h,
+            "bb_lower_1h": bb_lower_1h,
+            "ema20_4h": ema20_4h, "ema50_4h": ema50_4h,
+            "ema20_4h_slope": ema20_4h_slope,
+            # 15m stubs
+            "c15": np.array([]), "h15": np.array([]), "l15": np.array([]),
+            "v15": np.array([]), "ts_15m": np.array([], dtype=np.int64),
+            "ema9_15m": np.array([]), "ema20_15m": np.array([]),
+            "ema50_15m": np.array([]),
+            "rsi14_15m": np.array([]), "volma20_15m": np.array([]),
+            "atr14_15m": np.array([]),
+            "ema20_1h_at15m": np.array([]), "ema50_1h_at15m": np.array([]),
+            "ema20_4h_at15m": np.array([]), "ema50_4h_at15m": np.array([]),
+        }
+
+    c15   = np.array([b.close  for b in ha_15m], dtype=float)
+    h15   = np.array([b.high   for b in ha_15m], dtype=float)
+    l15   = np.array([b.low    for b in ha_15m], dtype=float)
+    v15   = np.array([b.volume for b in ha_15m], dtype=float)
+    ts_15m = np.array([b.timestamp for b in ha_15m], dtype=np.int64)
+
+    ema9_15m   = BaseStrategy.ema(c15.tolist(), 9)
+    ema20_15m  = BaseStrategy.ema(c15.tolist(), 20)
+    ema50_15m  = BaseStrategy.ema(c15.tolist(), 50)
+    rsi14_15m  = BaseStrategy.rsi(c15.tolist(), 14)
+    volma20_15m = BaseStrategy.sma(v15.tolist(), 20)
+    atr14_15m  = BaseStrategy.atr(ha_15m, 14)
+
+    # Align 1H and 4H indicators to 15m timestamps
+    n15 = len(ha_15m)
+    ema20_1h_at15m = np.full(n15, np.nan)
+    ema50_1h_at15m = np.full(n15, np.nan)
+    ema20_4h_at15m = np.full(n15, np.nan)
+    ema50_4h_at15m = np.full(n15, np.nan)
+
+    for j in range(n15):
+        # Find latest 1H bar where ts_1h[idx] <= ts_15m[j]
+        idx = np.searchsorted(ts_1h, ts_15m[j] + 1) - 1
+        if 0 <= idx < n1h:
+            ema20_1h_at15m[j] = ema20_1h[idx]
+            ema50_1h_at15m[j] = ema50_1h[idx]
+            ema20_4h_at15m[j] = ema20_4h[idx]
+            ema50_4h_at15m[j] = ema50_4h[idx]
+
+    return {
+        "ema20_1h": ema20_1h, "ema50_1h": ema50_1h,
+        "rsi14_1h": rsi14_1h, "atr14_1h": atr14_1h,
+        "volma20_1h": volma20_1h, "mhist_1h": mhist_1h,
+        "bb_lower_1h": bb_lower_1h,
+        "ema20_4h": ema20_4h, "ema50_4h": ema50_4h,
+        "ema20_4h_slope": ema20_4h_slope,
+        "c15": c15, "h15": h15, "l15": l15,
+        "v15": v15, "ts_15m": ts_15m,
+        "ema9_15m": ema9_15m, "ema20_15m": ema20_15m,
+        "ema50_15m": ema50_15m,
+        "rsi14_15m": rsi14_15m, "volma20_15m": volma20_15m,
+        "atr14_15m": atr14_15m,
+        "ema20_1h_at15m": ema20_1h_at15m, "ema50_1h_at15m": ema50_1h_at15m,
+        "ema20_4h_at15m": ema20_4h_at15m, "ema50_4h_at15m": ema50_4h_at15m,
+    }
+
+
 # ── Standalone per-strategy config ────────────────────────────────────────────
 # Each SJ runs on its OWN slot (1 position per symbol). Tuned so every SJ is
 # active (10+ trades/month) and the TP/SL geometry yields a healthy win rate.
@@ -425,12 +533,346 @@ def _simulate_standalone(sym: str, name: str, ind: dict, ha: dict) -> list[Trade
     return trades
 
 
-def run_standalone(ind: dict, ha: dict) -> dict[str, list[Trade]]:
+_MAJOR_COINS = {"BTC/USDT", "ETH/USDT", "BNB/USDT"}
+
+
+def _simulate_profitable(sym: str, d_ext: dict, ha: dict) -> list[Trade]:
+    """ProfitableBot: 1H entry with 4H trend guard."""
+    bars_1h = ha[sym]["1h"]
+    n = len(bars_1h)
+    if n < 50:
+        return []
+
+    closes   = np.array([b.close  for b in bars_1h], dtype=float)
+    highs    = np.array([b.high   for b in bars_1h], dtype=float)
+    lows     = np.array([b.low    for b in bars_1h], dtype=float)
+    volumes  = np.array([b.volume for b in bars_1h], dtype=float)
+
+    rsi14     = d_ext["rsi14_1h"]
+    mhist     = d_ext["mhist_1h"]
+    bb_lower  = d_ext["bb_lower_1h"]
+    volma20   = d_ext["volma20_1h"]
+    atr14     = d_ext["atr14_1h"]
+    ema20_4h  = d_ext["ema20_4h"]
+    ema50_4h  = d_ext["ema50_4h"]
+    ema20_4h_slope = d_ext["ema20_4h_slope"]
+
+    is_major = sym in _MAJOR_COINS
+    sl_mult  = 1.5 if is_major else 2.0
+    tp_mult  = 2.5 if is_major else 3.0
+    sl_min_pct = 0.015
+    sl_max_pct = 0.07
+
+    trades: list[Trade] = []
+    pos: dict | None = None
+    cooldown = 0
+    WARMUP = 60
+
+    for i in range(1, n):
+        cp  = float(closes[i])
+        bar = bars_1h[i]
+
+        # Exit handling
+        if pos is not None and i > pos["entry_bar"]:
+            h_sl = bar.low  <= pos["sl"]
+            h_tp = bar.high >= pos["tp"]
+            exit_r = exit_p = None
+
+            if h_tp and not h_sl:
+                exit_r, exit_p = "tp", pos["tp"]
+            elif h_sl and not h_tp:
+                exit_r, exit_p = "sl", pos["sl"]
+            elif h_sl and h_tp:
+                exit_r, exit_p = (("tp", pos["tp"])
+                                  if abs(bar.open - pos["tp"]) < abs(bar.open - pos["sl"])
+                                  else ("sl", pos["sl"]))
+
+            # Breakeven lock
+            if exit_r is None:
+                atr_e = pos["atr_entry"]
+                if not pos["be_locked"] and (cp - pos["entry_price"]) >= 1.0 * atr_e:
+                    new_sl = pos["entry_price"] * 1.002
+                    if new_sl > pos["sl"]:
+                        pos["sl"] = new_sl
+                        pos["be_locked"] = True
+
+            # Time stop: 72 bars
+            if exit_r is None and (i - pos["entry_bar"]) >= 72:
+                exit_r, exit_p = "max_hold", cp
+
+            if exit_r is not None:
+                trades.append(_mk_trade(sym, "ProfitableBot", pos, exit_p, exit_r, i))
+                pos = None
+                cooldown = 5
+            continue  # no new entry bar while pos is open (checked above, but after exit)
+
+        # Cooldown
+        if cooldown > 0:
+            cooldown -= 1
+            continue
+
+        # Warmup
+        if i < WARMUP:
+            continue
+
+        # Data validity
+        rsi_cur  = float(rsi14[i])
+        rsi_prev = float(rsi14[i - 1])
+        hist_cur  = float(mhist[i])
+        hist_prev = float(mhist[i - 1])
+        bb_l_cur  = float(bb_lower[i])
+        bb_l_prev = float(bb_lower[i - 1])
+        close_cur  = cp
+        close_prev = float(closes[i - 1])
+        vol_cur   = float(volumes[i])
+        vma_cur   = float(volma20[i])
+        atr_cur   = float(atr14[i])
+        e20_4h    = float(ema20_4h[i])
+        e50_4h    = float(ema50_4h[i])
+        slope_4h  = float(ema20_4h_slope[i]) if not math.isnan(ema20_4h_slope[i]) else 0.0
+
+        if any(math.isnan(v) for v in [rsi_cur, rsi_prev, hist_cur, hist_prev,
+                                        bb_l_cur, bb_l_prev, vma_cur, atr_cur]):
+            continue
+
+        # 4H trend guard: block if EMA20_4h < EMA50_4h AND slope negative
+        if not math.isnan(e20_4h) and not math.isnan(e50_4h):
+            if e20_4h < e50_4h and slope_4h < 0:
+                continue
+
+        # Count entry conditions (need 3/4)
+        conds = 0
+        # Cond 1: RSI ≤ 35 for 2 bars AND bouncing
+        if rsi_prev <= 35.0 and rsi_cur <= 35.0 and rsi_cur > rsi_prev:
+            conds += 1
+        # Cond 2: MACD histogram
+        if (hist_prev < 0 and hist_cur > 0) or (hist_cur > 0 and hist_cur > hist_prev):
+            conds += 1
+        # Cond 3: BB lower bounce
+        if close_prev <= bb_l_prev and close_cur > bb_l_cur:
+            conds += 1
+        # Cond 4: Volume spike
+        if vol_cur >= vma_cur * 1.3:
+            conds += 1
+
+        if conds < 3:
+            continue
+
+        # Compute SL/TP
+        sl_dist = sl_mult * atr_cur
+        tp_dist = tp_mult * atr_cur
+        sl_dist = max(sl_dist, close_cur * sl_min_pct)
+        sl_dist = min(sl_dist, close_cur * sl_max_pct)
+
+        sl_p = round(close_cur - sl_dist, 4)
+        tp_p = round(close_cur + tp_dist, 4)
+        if sl_p >= close_cur or tp_p <= close_cur:
+            continue
+
+        pos = {
+            "entry_price": close_cur,
+            "entry_bar":   i,
+            "sl":          sl_p,
+            "tp":          tp_p,
+            "amount":      round(TRADE_USDT / close_cur, 6),
+            "atr_entry":   atr_cur,
+            "be_locked":   False,
+        }
+
+    if pos is not None:
+        ep = float(bars_1h[-1].close)
+        trades.append(_mk_trade(sym, "ProfitableBot", pos, ep, "end", n - 1))
+    return trades
+
+
+def _simulate_scalp(sym: str, d_ext: dict, ha: dict) -> list[Trade]:
+    """ScalpTrendBot: 15m entry with 1H trend + pullback + 4H macro."""
+    ha_15m = ha[sym].get("15m", [])
+    n15 = len(ha_15m)
+    if n15 < 30:
+        return []
+
+    c15    = d_ext["c15"]
+    h15    = d_ext["h15"]
+    l15    = d_ext["l15"]
+    v15    = d_ext["v15"]
+    ema9   = d_ext["ema9_15m"]
+    ema20  = d_ext["ema20_15m"]
+    rsi14  = d_ext["rsi14_15m"]
+    volma  = d_ext["volma20_15m"]
+    atr14  = d_ext["atr14_15m"]
+    e20_1h = d_ext["ema20_1h_at15m"]
+    e50_1h = d_ext["ema50_1h_at15m"]
+    e20_4h = d_ext["ema20_4h_at15m"]
+    e50_4h = d_ext["ema50_4h_at15m"]
+
+    is_major = sym in _MAJOR_COINS
+    sl_mult   = 0.8 if is_major else 1.0
+    tp1_mult  = 1.0 if is_major else 1.2
+    tp2_mult  = 2.0 if is_major else 2.5
+    sl_min_pct = 0.008
+    sl_max_pct = 0.04
+    WARMUP = 50
+    TIME_STOP = 32   # 15m bars = 8h
+    MIN_HOLD  = 8    # 15m bars = 2h
+    COOLDOWN  = 10   # 15m bars
+
+    trades: list[Trade] = []
+    pos: dict | None = None
+    cooldown = 0
+
+    for j in range(1, n15):
+        cp   = float(c15[j])
+        hj   = float(h15[j])
+        lj   = float(l15[j])
+        bar  = ha_15m[j]
+
+        # Exit handling
+        if pos is not None and j > pos["entry_bar"]:
+            bars_held = j - pos["entry_bar"]
+            tp1_hit = hj >= pos["tp1"]
+            tp2_hit = hj >= pos["tp2"]
+            sl_hit  = lj <= pos["sl"]
+            exit_r = exit_p = None
+
+            # After TP1 hit, SL moves to breakeven
+            if pos.get("tp1_hit") and not pos.get("be_locked"):
+                pos["sl"] = pos["entry_price"] * 1.001
+                pos["be_locked"] = True
+
+            if tp1_hit and not pos.get("tp1_hit"):
+                pos["tp1_hit"] = True
+                pos["sl"] = pos["entry_price"] * 1.001
+                pos["be_locked"] = True
+
+            if tp2_hit and pos.get("tp1_hit") and bars_held >= MIN_HOLD:
+                # Both TP hit → weighted avg
+                weighted = (pos["tp1"] * 0.5) + (pos["tp2"] * 0.5)
+                exit_r, exit_p = "tp", weighted
+            elif sl_hit and bars_held >= MIN_HOLD:
+                if pos.get("tp1_hit"):
+                    # TP1 hit, then SL → weighted
+                    weighted = (pos["tp1"] * 0.5) + (pos["sl"] * 0.5)
+                    exit_r, exit_p = "sl", weighted
+                else:
+                    exit_r, exit_p = "sl", pos["sl"]
+            elif bars_held >= TIME_STOP:
+                if pos.get("tp1_hit"):
+                    weighted = (pos["tp1"] * 0.5) + (cp * 0.5)
+                    exit_r, exit_p = "max_hold", weighted
+                else:
+                    exit_r, exit_p = "max_hold", cp
+
+            if exit_r is not None:
+                gross = (exit_p - pos["entry_price"]) / pos["entry_price"] * pos["amount"] * pos["entry_price"]
+                fee   = pos["amount"] * pos["entry_price"] * FEE_RT
+                pct   = (exit_p - pos["entry_price"]) / pos["entry_price"] * 100
+                t = Trade(
+                    symbol=sym, strategy="ScalpTrendBot",
+                    entry_price=pos["entry_price"], exit_price=exit_p,
+                    sl=pos["orig_sl"], tp=pos["tp2"], amount=pos["amount"],
+                    pnl_usdt=gross - fee, pnl_pct=pct,
+                    reason=exit_r, bars_held=bars_held,
+                )
+                trades.append(t)
+                pos = None
+                cooldown = COOLDOWN
+            continue
+
+        if cooldown > 0:
+            cooldown -= 1
+            continue
+
+        if j < WARMUP:
+            continue
+
+        # Read indicators
+        e9j    = float(ema9[j])
+        e20j   = float(ema20[j])
+        rsi_j  = float(rsi14[j])
+        vma_j  = float(volma[j])
+        atr_j  = float(atr14[j])
+        e201h  = float(e20_1h[j])
+        e501h  = float(e50_1h[j])
+        e204h  = float(e20_4h[j])
+        e504h  = float(e50_4h[j])
+        vol_j  = float(v15[j])
+
+        if any(math.isnan(v) for v in [e9j, e20j, rsi_j, vma_j, atr_j,
+                                         e201h, e501h, e204h, e504h]):
+            continue
+
+        # Cond 1: 4H trend UP
+        if not (e204h > e504h):
+            continue
+        # Cond 2: 1H trend UP
+        if not (e201h > e501h):
+            continue
+        # Cond 3: Pullback zone
+        pullback_ok = (abs(cp - e201h) / e201h <= 0.015 or
+                       (float(l15[j]) <= e201h * 1.003 and cp > e201h))
+        if not pullback_ok:
+            continue
+        # Cond 4: 15m momentum
+        if not (cp > e9j and cp > e20j):
+            continue
+        # Cond 5: RSI range
+        if not (42.0 <= rsi_j <= 65.0):
+            continue
+        # Cond 6: Volume
+        if not (vol_j >= vma_j * 1.2):
+            continue
+
+        # Compute SL/TP
+        sl_dist = sl_mult * atr_j
+        sl_dist = max(sl_dist, cp * sl_min_pct)
+        sl_dist = min(sl_dist, cp * sl_max_pct)
+        sl_p    = round(cp - sl_dist, 6)
+        tp1_p   = round(cp + tp1_mult * atr_j, 6)
+        tp2_p   = round(cp + tp2_mult * atr_j, 6)
+        if sl_p >= cp or tp1_p <= cp:
+            continue
+
+        pos = {
+            "entry_price": cp,
+            "entry_bar":   j,
+            "sl":          sl_p,
+            "orig_sl":     sl_p,
+            "tp1":         tp1_p,
+            "tp2":         tp2_p,
+            "amount":      round(TRADE_USDT / cp, 6),
+            "tp1_hit":     False,
+            "be_locked":   False,
+        }
+
+    if pos is not None:
+        ep = float(c15[-1])
+        bars_held = n15 - 1 - pos["entry_bar"]
+        gross = (ep - pos["entry_price"]) / pos["entry_price"] * pos["amount"] * pos["entry_price"]
+        fee   = pos["amount"] * pos["entry_price"] * FEE_RT
+        pct   = (ep - pos["entry_price"]) / pos["entry_price"] * 100
+        trades.append(Trade(
+            symbol=sym, strategy="ScalpTrendBot",
+            entry_price=pos["entry_price"], exit_price=ep,
+            sl=pos["orig_sl"], tp=pos["tp2"], amount=pos["amount"],
+            pnl_usdt=gross - fee, pnl_pct=pct,
+            reason="end", bars_held=bars_held,
+        ))
+    return trades
+
+
+def run_standalone(ind: dict, ha: dict, ind_ext: dict | None = None) -> dict[str, list[Trade]]:
     """Per-strategy standalone backtest (each SJ on its own slot)."""
     out: dict[str, list[Trade]] = {name: [] for name in STRAT_ORDER}
     for name in STRAT_ORDER:
         for sym in SYMBOLS:
             out[name].extend(_simulate_standalone(sym, name, ind, ha))
+    if ind_ext is not None:
+        out["ProfitableBot"] = []
+        out["ScalpTrendBot"] = []
+        for sym in SYMBOLS:
+            out["ProfitableBot"].extend(_simulate_profitable(sym, ind_ext[sym], ha))
+            out["ScalpTrendBot"].extend(_simulate_scalp(sym, ind_ext[sym], ha))
     return out
 
 
@@ -472,6 +914,7 @@ def run_backtest(ha: dict, ind: dict) -> tuple[list[Trade], dict]:
     blocked:        dict[str, int] = defaultdict(int)
     chief_approved: list[dict]     = []
     chief_filtered: list[dict]     = []
+    maxpos_blocked: int             = 0
 
     cooldown: dict[tuple, int] = {
         (sym, sn): 0 for sym in SYMBOLS for sn in ALL_STRAT_NAMES
@@ -597,6 +1040,7 @@ def run_backtest(ha: dict, ind: dict) -> tuple[list[Trade], dict]:
             if len(positions) >= MAX_POSITIONS:
                 for sn, _, _ in buy_sigs:
                     blocked[sn] += 1
+                maxpos_blocked += 1
                 continue
 
             sn0, sl0, tp0 = buy_sigs[0]
@@ -655,6 +1099,297 @@ def run_backtest(ha: dict, ind: dict) -> tuple[list[Trade], dict]:
     stats: dict = {
         "bars_total":     n_bars,
         "blocked":        dict(blocked),
+        "maxpos_blocked": maxpos_blocked,
+        "chief_approved": chief_approved,
+        "chief_filtered": chief_filtered,
+    }
+    return trades, stats
+
+
+def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade], dict]:
+    """Portfolio: SwingReversal + ProfitableBot + ScalpTrendBot + Chief (≥2) + max 3 slots."""
+    master_1h = ha[SYMBOLS[0]]["1h"]
+    n_bars    = len(master_1h)
+
+    ts_map: dict[str, dict[int, int]] = {
+        sym: {int(c.timestamp): i for i, c in enumerate(ha[sym]["1h"])}
+        for sym in SYMBOLS
+    }
+
+    positions:      list[Position] = []
+    trades:         list[Trade]    = []
+    blocked:        dict[str, int] = defaultdict(int)
+    chief_approved: list[dict]     = []
+    chief_filtered: list[dict]     = []
+    maxpos_blocked  = 0
+
+    cooldown: dict[tuple, int] = {}
+    for sym in SYMBOLS:
+        for sn in ["SwingReversalStrategy", "ProfitableBot", "ScalpTrendBot"]:
+            cooldown[(sym, sn)] = 0
+
+    # Breakeven tracking per position (use position object identity)
+    be_locked: set = set()
+
+    def sym_pos(sym: str) -> Position | None:
+        return next((p for p in positions if p.symbol == sym), None)
+
+    def close_pos(pos: Position, exit_price: float, reason: str, bar_i: int):
+        gross = (exit_price - pos.entry_price) / pos.entry_price * pos.amount * pos.entry_price
+        fee   = pos.amount * pos.entry_price * FEE_RT
+        pct   = (exit_price - pos.entry_price) / pos.entry_price * 100
+        trades.append(Trade(
+            symbol=pos.symbol, strategy=pos.strategy,
+            entry_price=pos.entry_price, exit_price=exit_price,
+            sl=pos.sl, tp=pos.tp, amount=pos.amount,
+            pnl_usdt=gross - fee, pnl_pct=pct,
+            reason=reason, bars_held=bar_i - pos.entry_bar,
+        ))
+        be_locked.discard(id(pos))
+        positions.remove(pos)
+
+    SWING_WARMUP  = 210
+    INTERN_WARMUP = 60
+
+    print(f"  [Case 3] Simulating {n_bars} bars × {len(SYMBOLS)} symbols × 3 strategies...")
+
+    for bar_i, master_bar in enumerate(master_1h):
+        ts = int(master_bar.timestamp)
+
+        # 1. Price-based SL/TP exits
+        for pos in list(positions):
+            if pos.entry_bar == bar_i:
+                continue
+            idx = ts_map[pos.symbol].get(ts)
+            if idx is None:
+                continue
+            bar  = ha[pos.symbol]["1h"][idx]
+            i    = idx
+            d    = ind[pos.symbol]
+            d_e  = ind_ext[pos.symbol]
+            cp   = float(d["closes"][i]) if i < len(d["closes"]) else pos.entry_price
+
+            # Breakeven check
+            if id(pos) not in be_locked:
+                atr_1h = float(d_e["atr14_1h"][i]) if i < len(d_e["atr14_1h"]) else 0.0
+                if not math.isnan(atr_1h) and atr_1h > 0:
+                    if (cp - pos.entry_price) >= 1.0 * atr_1h:
+                        new_sl = pos.entry_price * 1.002
+                        if new_sl > pos.sl:
+                            pos.sl = new_sl
+                            be_locked.add(id(pos))
+
+            h_sl = bar.low  <= pos.sl
+            h_tp = bar.high >= pos.tp
+            if h_sl or h_tp:
+                if h_tp and not h_sl:
+                    r, p = "tp", pos.tp
+                elif h_sl and not h_tp:
+                    r, p = "sl", pos.sl
+                else:
+                    r, p = (("tp", pos.tp)
+                             if abs(bar.open - pos.tp) < abs(bar.open - pos.sl)
+                             else ("sl", pos.sl))
+                close_pos(pos, p, r, bar_i)
+                continue
+
+            # Time stop: 72 bars for all (Scalp in portfolio uses 1H loop so 8 1H = 8h equiv)
+            time_limit = 8 if pos.strategy == "ScalpTrendBot" else 72
+            if (bar_i - pos.entry_bar) >= time_limit:
+                close_pos(pos, cp, "max_hold", bar_i)
+
+        # 2. Strategy signals per symbol
+        for sym in SYMBOLS:
+            idx = ts_map[sym].get(ts)
+            if idx is None or idx < 1:
+                continue
+            i    = idx
+            d    = ind[sym]
+            d_e  = ind_ext[sym]
+            cp   = float(d["closes"][i])
+            atr_v = float(d["atr14"][i])
+            if math.isnan(atr_v):
+                atr_v = cp * 0.015
+
+            pos = sym_pos(sym)
+            if pos:
+                continue  # no new entry while in position
+
+            buy_sigs: list[tuple[str, float, float]] = []
+
+            # SwingReversal signal
+            key_sw = (sym, "SwingReversalStrategy")
+            if cooldown[key_sw] > 0:
+                cooldown[key_sw] -= 1
+            elif i >= SWING_WARMUP:
+                e80   = float(d["ema80"][i]);   e200  = float(d["ema200"][i])
+                rsi_v = float(d["rsi14"][i]);   vol_v = float(d["volumes"][i])
+                vma_v = float(d["vol_ma"][i])
+                cb    = bool(d["candle_bull"][i]); mc = bool(d["macd_cross"][i])
+                data_valid = not any(math.isnan(v) for v in [e80, e200, rsi_v, vma_v])
+                if (data_valid and e80 >= e200 * 0.98 and cb and mc
+                        and 34.0 <= rsi_v <= 62.0 and vol_v >= vma_v * 1.2):
+                    sl_p = round(cp - 2.5 * atr_v, 4)
+                    tp_p = round(cp + 1.5 * atr_v, 4)
+                    if sl_p < cp < tp_p:
+                        buy_sigs.append(("SwingReversalStrategy", sl_p, tp_p))
+                        cooldown[key_sw] = 4
+
+            # ProfitableBot signal
+            key_pb = (sym, "ProfitableBot")
+            if cooldown[key_pb] > 0:
+                cooldown[key_pb] -= 1
+            elif i >= 60:
+                rsi14_e   = d_e["rsi14_1h"]
+                mhist_e   = d_e["mhist_1h"]
+                bb_lower_e = d_e["bb_lower_1h"]
+                volma20_e = d_e["volma20_1h"]
+                atr14_e   = d_e["atr14_1h"]
+                ema20_4h_e = d_e["ema20_4h"]
+                ema50_4h_e = d_e["ema50_4h"]
+                ema20_4h_slope_e = d_e["ema20_4h_slope"]
+
+                if i < len(rsi14_e) and i - 1 >= 0:
+                    rsi_cur  = float(rsi14_e[i])
+                    rsi_prev = float(rsi14_e[i - 1])
+                    hist_cur  = float(mhist_e[i])
+                    hist_prev = float(mhist_e[i - 1])
+                    bb_l_cur  = float(bb_lower_e[i])
+                    bb_l_prev = float(bb_lower_e[i - 1])
+                    close_prev = float(d["closes"][i - 1])
+                    vol_cur   = float(d["volumes"][i])
+                    vma_cur   = float(volma20_e[i])
+                    atr_cur   = float(atr14_e[i])
+                    e20_4h    = float(ema20_4h_e[i])
+                    e50_4h    = float(ema50_4h_e[i])
+                    slope_4h  = float(ema20_4h_slope_e[i]) if not math.isnan(ema20_4h_slope_e[i]) else 0.0
+
+                    if not any(math.isnan(v) for v in [rsi_cur, rsi_prev, hist_cur, hist_prev,
+                                                        bb_l_cur, bb_l_prev, vma_cur, atr_cur]):
+                        # 4H guard
+                        trend_blocked = (not math.isnan(e20_4h) and not math.isnan(e50_4h)
+                                         and e20_4h < e50_4h and slope_4h < 0)
+                        if not trend_blocked:
+                            conds = 0
+                            if rsi_prev <= 35.0 and rsi_cur <= 35.0 and rsi_cur > rsi_prev:
+                                conds += 1
+                            if (hist_prev < 0 and hist_cur > 0) or (hist_cur > 0 and hist_cur > hist_prev):
+                                conds += 1
+                            if close_prev <= bb_l_prev and cp > bb_l_cur:
+                                conds += 1
+                            if vol_cur >= vma_cur * 1.3:
+                                conds += 1
+                            if conds >= 3:
+                                is_major = sym in _MAJOR_COINS
+                                sl_mult_pb = 1.5 if is_major else 2.0
+                                tp_mult_pb = 2.5 if is_major else 3.0
+                                sl_dist = sl_mult_pb * atr_cur
+                                sl_dist = max(sl_dist, cp * 0.015)
+                                sl_dist = min(sl_dist, cp * 0.07)
+                                sl_p = round(cp - sl_dist, 4)
+                                tp_p = round(cp + tp_mult_pb * atr_cur, 4)
+                                if sl_p < cp < tp_p:
+                                    buy_sigs.append(("ProfitableBot", sl_p, tp_p))
+                                    cooldown[key_pb] = 5
+
+            # ScalpTrendBot signal (use 1H indicators as proxy)
+            key_sc = (sym, "ScalpTrendBot")
+            if cooldown[key_sc] > 0:
+                cooldown[key_sc] -= 1
+            elif i >= 60:
+                e20_1h = float(d_e["ema20_1h"][i])
+                e50_1h = float(d_e["ema50_1h"][i])
+                e20_4h_v = float(d_e["ema20_4h"][i])
+                e50_4h_v = float(d_e["ema50_4h"][i])
+                rsi_1h  = float(d_e["rsi14_1h"][i])
+                vol_v   = float(d["volumes"][i])
+                vma_v   = float(d_e["volma20_1h"][i])
+                atr_1h_v = float(d_e["atr14_1h"][i])
+
+                if not any(math.isnan(v) for v in [e20_1h, e50_1h, e20_4h_v, e50_4h_v,
+                                                     rsi_1h, vma_v, atr_1h_v]):
+                    if (e20_4h_v > e50_4h_v and e20_1h > e50_1h
+                            and 42.0 <= rsi_1h <= 65.0
+                            and vol_v >= vma_v * 1.2):
+                        is_major = sym in _MAJOR_COINS
+                        sl_mult_sc = 0.8 if is_major else 1.0
+                        tp1_m = 1.0 if is_major else 1.2
+                        tp2_m = 2.0 if is_major else 2.5
+                        sl_dist = sl_mult_sc * atr_1h_v
+                        sl_dist = max(sl_dist, cp * 0.008)
+                        sl_dist = min(sl_dist, cp * 0.04)
+                        sl_p = round(cp - sl_dist, 4)
+                        # Use TP2 as the portfolio TP for simplicity
+                        tp_p = round(cp + tp2_m * atr_1h_v, 4)
+                        if sl_p < cp < tp_p:
+                            buy_sigs.append(("ScalpTrendBot", sl_p, tp_p))
+                            cooldown[key_sc] = 8
+
+            if not buy_sigs:
+                continue
+
+            n_agree = len(buy_sigs)
+            sn0, sl0, tp0 = buy_sigs[0]
+            sig_rec = {
+                "bar_i":    bar_i,
+                "symbol":   sym,
+                "strategy": sn0,
+                "n_agree":  n_agree,
+                "price":    cp,
+                "sl":       sl0,
+                "tp":       tp0,
+                "strategies_agreeing": [sn for sn, _, _ in buy_sigs],
+            }
+
+            if n_agree >= CHIEF_N_AGREE:
+                if len(positions) >= MAX_POSITIONS:
+                    maxpos_blocked += 1
+                    for sn, _, _ in buy_sigs:
+                        blocked[sn] += 1
+                else:
+                    chief_approved.append(sig_rec)
+                    positions.append(Position(
+                        symbol=sym, strategy=sn0,
+                        entry_price=cp, entry_bar=bar_i,
+                        sl=sl0, tp=tp0,
+                        amount=round(TRADE_USDT / cp, 6),
+                    ))
+            else:
+                chief_filtered.append(sig_rec)
+
+    # Close remaining open positions
+    last_ts = int(master_1h[-1].timestamp)
+    for pos in list(positions):
+        idx = ts_map[pos.symbol].get(last_ts)
+        ep  = (float(ha[pos.symbol]["1h"][idx].close)
+               if idx is not None else pos.entry_price)
+        close_pos(pos, ep, "end", n_bars - 1)
+
+    # Retrospective outcome for Chief-filtered signals
+    for ms in chief_filtered:
+        future = ha[ms["symbol"]]["1h"][ms["bar_i"] + 1: ms["bar_i"] + 1 + CHIEF_LOOKFWD]
+        outcome = "unknown"
+        for bar in future:
+            if bar.low  <= ms["sl"]: outcome = "sl"; break
+            if bar.high >= ms["tp"]: outcome = "tp"; break
+        ms["outcome"] = outcome
+        ep  = ms["price"]
+        exp = ms["tp"] if outcome == "tp" else ms["sl"] if outcome == "sl" else ep
+        ms["pnl_usdt"] = (exp - ep) / ep * TRADE_USDT - TRADE_USDT * FEE_RT
+
+    for ap in chief_approved:
+        match = next(
+            (t for t in trades
+             if t.symbol == ap["symbol"] and t.entry_price == ap["price"]),
+            None,
+        )
+        ap["outcome"]  = match.reason   if match else "unknown"
+        ap["pnl_usdt"] = match.pnl_usdt if match else 0.0
+
+    stats: dict = {
+        "bars_total":     n_bars,
+        "blocked":        dict(blocked),
+        "maxpos_blocked": maxpos_blocked,
         "chief_approved": chief_approved,
         "chief_filtered": chief_filtered,
     }
@@ -683,6 +1418,16 @@ def _bep(trade_list: list[Trade]) -> float:
     avg_w = sum(wins) / len(wins)
     avg_l = abs(sum(losses) / len(losses))
     return avg_l / (avg_w + avg_l) * 100  # = % WR needed to break even
+
+
+def _bb_lower(closes: np.ndarray, period: int = 20, std_mult: float = 2.0) -> np.ndarray:
+    """Rolling Bollinger Band lower = SMA(period) - std_mult * StdDev(period)."""
+    n = len(closes)
+    out = np.full(n, np.nan)
+    for i in range(period - 1, n):
+        window = closes[i - period + 1: i + 1]
+        out[i] = window.mean() - std_mult * window.std(ddof=0)
+    return out
 
 
 _INTERN_KEYS   = {"InternStrategy", "InternStrategy(faithful)"}
@@ -743,6 +1488,33 @@ def print_standalone(standalone: dict[str, list[Trade]], bars: int):
         print("─" * W)
         print(f"{'ALL excl. faithful Intern':<30} {len(all_t):>4} {len(all_t)/months:>5.1f} "
               f"{wins/len(all_t)*100:>5.1f}%        {pnl:>+9.2f}")
+
+    # New bots section
+    new_bot_keys = ["ProfitableBot", "ScalpTrendBot"]
+    if any(k in standalone for k in new_bot_keys):
+        print("\n" + "─" * W)
+        print("  New Bots (standalone — no Chief gate)")
+        print("─" * W)
+        for name in new_bot_keys:
+            ts = standalone.get(name, [])
+            if not ts:
+                print(f"{name:<30} {'—':>4}")
+                continue
+            wins    = sum(1 for t in ts if t.pnl_usdt > 0)
+            wr      = wins / len(ts) * 100
+            bep     = _bep(ts)
+            pnl, dd = _equity_curve(ts)
+            avg_pct = sum(t.pnl_pct for t in ts) / len(ts)
+            if name == "ScalpTrendBot":
+                avg_h = sum(t.bars_held for t in ts) / len(ts) / 4  # 15m bars → hours
+            else:
+                avg_h = sum(t.bars_held for t in ts) / len(ts)
+            per_mo  = len(ts) / months if months else 0
+            ok      = pnl > 0 and per_mo >= 5
+            flag    = "  ✓" if ok else "  ⚠"
+            print(f"{name:<30} {len(ts):>4} {per_mo:>5.1f} {wr:>5.1f}% {bep:>5.1f}% "
+                  f"{pnl:>+9.2f} {avg_pct:>+7.2f}% {dd:>+8.2f} {avg_h:>4.1f}h{flag}")
+
     print(f"\n  BEP  = break-even WR computed from actual avg-win / avg-loss (fees included)")
     print(f"  ✓ = PnL > 0  AND  ≥10 trades/month   (Intern rows are informational)")
     print(f"  Core 3 SJs: {'✓ ALL PROFITABLE' if all_pass else '⚠ some not profitable'}")
@@ -829,6 +1601,10 @@ def print_report(trades: list[Trade], stats: dict):
         for name, cnt in sorted(blocked.items(), key=lambda x: -x[1]):
             print(f"  {name:<30} {cnt:>5}×")
 
+    maxpos_blocked = stats.get("maxpos_blocked", 0)
+    if maxpos_blocked:
+        print(f"\n  Max-position blocks: {maxpos_blocked}×")
+
     # ── Chief simulation stats ────────────────────────────────────────────────
     approved       = stats.get("chief_approved", [])
     filtered       = stats.get("chief_filtered", [])
@@ -905,6 +1681,135 @@ def print_report(trades: list[Trade], stats: dict):
     print("═" * 74)
 
 
+def print_case3_report(trades: list[Trade], stats: dict, bars: int):
+    if not trades:
+        print("\nNo trades generated in Case 3.")
+        return
+
+    days = bars / 24
+    from datetime import datetime, timezone
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    is_syn     = stats.get("is_synthetic", False)
+    data_label = "⚠ SYNTHETIC GBM DATA" if is_syn else "REAL MARKET DATA"
+    print("\n" + "═" * 74)
+    print(f"{'  CASE 3: Swing + Profitable + Scalp + Chief  ' + data_label:^74}")
+    print(f"{'  Period: ~%.0f days  (%d bars 1h)  Data to: %s' % (days, bars, now_str):^74}")
+    print(f"{'  Symbols: %s  |  Slots: %d  |  Trade: $%.0f USDT' % (', '.join(SYMBOLS), MAX_POSITIONS, TRADE_USDT):^74}")
+    print(f"{'  Chief gate: require ≥%d strategies to agree' % CHIEF_N_AGREE:^74}")
+    print("═" * 74)
+
+    by_strat: dict[str, list[Trade]] = defaultdict(list)
+    for t in trades:
+        by_strat[t.strategy].append(t)
+
+    print(f"\n{'Strategy':<28} {'#':>4} {'Win%':>6} {'PnL$':>8} {'AvgPnL%':>8} "
+          f"{'MaxDD$':>8} {'AvgHold':>8}")
+    print("─" * 74)
+
+    strat_order = ["SwingReversalStrategy", "ProfitableBot", "ScalpTrendBot"]
+    all_pnl = 0.0
+    for name in strat_order:
+        ts = by_strat.get(name, [])
+        if not ts:
+            print(f"{name:<28} {'—':>4}")
+            continue
+        wins    = sum(1 for t in ts if t.pnl_usdt > 0)
+        pnl, dd = _equity_curve(ts)
+        avg_pct = sum(t.pnl_pct for t in ts) / len(ts)
+        if name == "ScalpTrendBot":
+            avg_h = sum(t.bars_held for t in ts) / len(ts)  # already 1H bars in portfolio
+        else:
+            avg_h = sum(t.bars_held for t in ts) / len(ts)
+        print(f"{name:<28} {len(ts):>4} {wins/len(ts)*100:>5.1f}% {pnl:>+8.2f} "
+              f"{avg_pct:>+7.2f}% {dd:>+8.2f} {avg_h:>6.1f}h")
+        all_pnl += pnl
+
+    print("─" * 74)
+    all_wins     = sum(1 for t in trades if t.pnl_usdt > 0)
+    all_pnl2, dd = _equity_curve(trades)
+    avg_h_all    = sum(t.bars_held for t in trades) / len(trades)
+    print(f"{'TOTAL':<28} {len(trades):>4} {all_wins/len(trades)*100:>5.1f}% "
+          f"{all_pnl2:>+8.2f} {sum(t.pnl_pct for t in trades)/len(trades):>+7.2f}% "
+          f"{dd:>+8.2f} {avg_h_all:>6.1f}h")
+
+    # By symbol
+    print(f"\n{'Symbol':<14} {'#':>4} {'Win%':>6} {'PnL$':>8}")
+    print("─" * 36)
+    by_sym: dict[str, list[Trade]] = defaultdict(list)
+    for t in trades:
+        by_sym[t.symbol].append(t)
+    for sym, ts in sorted(by_sym.items()):
+        wins = sum(1 for t in ts if t.pnl_usdt > 0)
+        pnl  = sum(t.pnl_usdt for t in ts)
+        print(f"{sym:<14} {len(ts):>4} {wins/len(ts)*100:>5.1f}% {pnl:>+8.2f}")
+
+    # Exit reasons
+    print("\nExit reason breakdown:")
+    print(f"  {'Reason':<14} {'Count':>5} {'%':>6} {'Avg PnL$':>10}")
+    print("  " + "─" * 38)
+    reasons = Counter(t.reason for t in trades)
+    for r, cnt in sorted(reasons.items(), key=lambda x: -x[1]):
+        pct     = cnt / len(trades) * 100
+        avg_pnl = sum(t.pnl_usdt for t in trades if t.reason == r) / cnt
+        print(f"  {r:<14} {cnt:>5} {pct:>5.1f}% {avg_pnl:>+10.2f}")
+
+    # Chief stats
+    approved       = stats.get("chief_approved", [])
+    filtered       = stats.get("chief_filtered", [])
+    maxpos_blocked = stats.get("maxpos_blocked", 0)
+    total_signals  = len(approved) + len(filtered)
+
+    print(f"\n{'─'*74}")
+    print(f"Chief Simulation  (require ≥{CHIEF_N_AGREE} strategies to agree)")
+    print(f"{'─'*74}")
+    print(f"  Total BUY signals generated : {total_signals}")
+    print(f"  Chief APPROVED              : {len(approved)} "
+          f"({len(approved)/max(total_signals,1)*100:.1f}%)")
+    print(f"  Chief FILTERED              : {len(filtered)} "
+          f"({len(filtered)/max(total_signals,1)*100:.1f}%)")
+    print(f"  Max-position blocks         : {maxpos_blocked}")
+
+    if approved:
+        ap_tp  = sum(1 for a in approved if a.get("outcome") == "tp")
+        ap_sl  = sum(1 for a in approved if a.get("outcome") == "sl")
+        ap_pnl = sum(a.get("pnl_usdt", 0) for a in approved)
+        print(f"\n  Approved outcomes:")
+        print(f"    TP hit  : {ap_tp} ({ap_tp/len(approved)*100:.1f}%)  → correct entry")
+        print(f"    SL hit  : {ap_sl} ({ap_sl/len(approved)*100:.1f}%)  → loss accepted")
+        print(f"    Net P&L : ${ap_pnl:+.2f}")
+
+    if filtered:
+        fi_tp  = sum(1 for f in filtered if f.get("outcome") == "tp")
+        fi_sl  = sum(1 for f in filtered if f.get("outcome") == "sl")
+        fi_unk = sum(1 for f in filtered if f.get("outcome") == "unknown")
+        fi_pnl = sum(f.get("pnl_usdt", 0) for f in filtered)
+        print(f"\n  Filtered signal outcomes (what would have happened):")
+        print(f"    TP hit  : {fi_tp} ({fi_tp/len(filtered)*100:.1f}%)  ⚠ MISSED PROFIT")
+        print(f"    SL hit  : {fi_sl} ({fi_sl/len(filtered)*100:.1f}%)  ✓ GOOD FILTER (saved loss)")
+        print(f"    Unknown : {fi_unk}  (lookfwd {CHIEF_LOOKFWD}h expired)")
+        if fi_tp + fi_sl > 0:
+            print(f"    Net delta: ${fi_pnl:+.2f}  (negative = Chief saved money)")
+
+    # Top / worst trades
+    def _fmt(t: Trade) -> str:
+        return (f"  {t.strategy:<28}  {t.symbol:<10}  "
+                f"{t.reason:<12}  {t.pnl_usdt:>+8.2f}$  "
+                f"({t.pnl_pct:>+6.2f}%)  {t.bars_held}h")
+
+    print("\nTop 5 trades by P&L:")
+    for t in sorted(trades, key=lambda x: x.pnl_usdt, reverse=True)[:5]:
+        print(_fmt(t))
+
+    print("\nWorst 5 trades:")
+    for t in sorted(trades, key=lambda x: x.pnl_usdt)[:5]:
+        print(_fmt(t))
+
+    all_pnl2, dd = _equity_curve(trades)
+    print(f"\nTotal P&L: ${all_pnl2:+.2f}  |  Max drawdown: ${dd:.2f}")
+    print("═" * 74)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 async def main():
     if "--clear" in sys.argv and CACHE_FILE.exists():
@@ -922,19 +1827,42 @@ async def main():
     t0 = time.time()
     ha, ind = prepare(data)
 
-    # (a) standalone per-SJ
-    standalone = run_standalone(ind, ha)
-    # (b) portfolio with Chief consensus gate
-    trades, stats = run_backtest(ha, ind)
-    stats["is_synthetic"] = is_synthetic
+    # Compute extended indicators
+    print("  Precomputing extended indicators...", end="", flush=True)
+    ind_ext = {sym: _precompute_ext(sym, ha) for sym in SYMBOLS}
+    print(" done")
+
+    # Case 1: All strategies standalone
+    standalone = run_standalone(ind, ha, ind_ext)
+
+    # Case 2: SJ4 + Chief portfolio (existing run_backtest)
+    trades_c2, stats_c2 = run_backtest(ha, ind)
+    stats_c2["is_synthetic"] = is_synthetic
+
+    # Case 3: Swing + Profitable + Scalp + Chief portfolio
+    trades_c3, stats_c3 = run_portfolio_case3(ha, ind, ind_ext)
+    stats_c3["is_synthetic"] = is_synthetic
+    stats_c3["bars_total"] = stats_c2["bars_total"]
+
     elapsed = time.time() - t0
     n_standalone = sum(len(v) for v in standalone.values())
-    print(f"  Done: {n_standalone} standalone + {len(trades)} portfolio trades "
-          f"in {elapsed:.1f}s")
+    print(f"  Done: {n_standalone} standalone + {len(trades_c2)} case2 + {len(trades_c3)} case3 portfolio trades in {elapsed:.1f}s")
 
     print("\n[3/3] Results")
-    print_standalone(standalone, stats.get("bars_total", 0))
-    print_report(trades, stats)
+    print("\n" + "╔" + "═"*78 + "╗")
+    print("║" + "  CASE 1 — All strategies standalone  (no Chief, no slot limit)".center(78) + "║")
+    print("╚" + "═"*78 + "╝")
+    print_standalone(standalone, stats_c2.get("bars_total", 0))
+
+    print("\n" + "╔" + "═"*78 + "╗")
+    print("║" + "  CASE 2 — SJ4 + Chief (SwingReversal · CPK · Hybrid · Intern)".center(78) + "║")
+    print("╚" + "═"*78 + "╝")
+    print_report(trades_c2, stats_c2)
+
+    print("\n" + "╔" + "═"*78 + "╗")
+    print("║" + "  CASE 3 — SwingReversal + Profitable + ScalpTrend + Chief".center(78) + "║")
+    print("╚" + "═"*78 + "╝")
+    print_case3_report(trades_c3, stats_c3, stats_c3["bars_total"])
 
 
 if __name__ == "__main__":
