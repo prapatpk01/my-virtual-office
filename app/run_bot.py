@@ -477,6 +477,9 @@ async def main():
         from trading.strategies.utbot_wt_strategy            import UTBotWTStrategy
         from trading.strategies.scalp_trend_strategy         import ScalpTrendStrategy
         from trading.strategies.profitable_bot_strategy      import ProfitableBotStrategy
+        from trading.strategies.mean_reversion_strategy      import MeanReversionStrategy
+        from trading.strategies.trend_continuation_strategy  import TrendContinuationStrategy
+        from trading.strategies.smart_money_strategy         import SmartMoneyStrategy
 
         syms     = cfg["symbols"]
         sl_pct   = cfg["stop_loss_pct"]
@@ -552,8 +555,7 @@ async def main():
                                         cfg["fixed_trade_usdt"], cfg["leverage"],
                                         sl_pct, tp_pct, _cache=cache)
 
-        # ── Case 5: ScalpTrend (15m/1H/4H) + ProfBot (1H/4H) ────────────
-        # Fetch extra TFs needed by the new MTF strategies
+        # ── Case 5: Unified Bot 3 styles (MeanRev/TrendCont/SmartMoney) ──
         case5: dict[str, dict] = {}
         notional_c5 = cfg["fixed_trade_usdt"] * cfg["leverage"]
         for sym in syms:
@@ -570,39 +572,55 @@ async def main():
             c15m = cache.get((sym, "15m"), [])
             c1h  = cache.get((sym, "1h"),  [])
             c4h  = cache.get((sym, "4h"),  [])
+            tag  = sym.split('/')[0]
 
-            if c15m and c1h and c4h:
-                st = ScalpTrendStrategy(sym, params={
-                    "name": "ScalpTrend",
-                    "sl_mult":       cfg["scalp_sl_mult"],
-                    "tp_mult":       cfg["scalp_tp_mult"],
-                    "rsi_min":       cfg["scalp_rsi_min"],
-                    "rsi_max":       cfg["scalp_rsi_max"],
-                    "pullback_pct":  cfg["scalp_pullback_pct"],
-                    "min_entry_cond":cfg["scalp_min_entry"],
-                    "vol_mult": 1.0,
-                })
-                trades = await backtest_strategy_mtf(
-                    st, c15m, {"1h": c1h, "4h": c4h},
-                    notional_c5, sl_pct, tp_pct,
-                )
-                case5[f"ScalpTrend/{sym.split('/')[0]}"] = summarise(trades)
-
+            # MeanReversion (primary=1h, mtf=4h)
             if c1h and c4h:
-                pb = ProfitableBotStrategy(sym, params={
-                    "name": "ProfBot",
-                    "sl_mult":        cfg["prof_sl_mult"],
-                    "tp_mult":        cfg["prof_tp_mult"],
-                    "rsi_oversold":   cfg["prof_rsi_oversold"],
-                    "rsi_overbought": cfg["prof_rsi_overbought"],
-                    "min_conditions": cfg["prof_min_cond"],
+                mr = MeanReversionStrategy(sym, params={
+                    "name":           "MeanReversion",
+                    "sl_mult":        cfg["mr_sl_mult"],
+                    "tp_mult":        cfg["mr_tp_mult"],
+                    "rsi_oversold":   cfg["mr_rsi_oversold"],
+                    "rsi_overbought": cfg["mr_rsi_overbought"],
+                    "min_conditions": cfg["mr_min_conditions"],
                 })
                 trades = await backtest_strategy_mtf(
-                    pb, c1h, {"4h": c4h},
-                    notional_c5, sl_pct, tp_pct,
+                    mr, c1h, {"4h": c4h}, notional_c5, sl_pct, tp_pct,
                     primary_window=200,
                 )
-                case5[f"ProfBot/{sym.split('/')[0]}"] = summarise(trades)
+                case5[f"MeanRev/{tag}"] = summarise(trades)
+
+            # TrendCont (primary=15m, mtf=1h+4h)
+            if c15m and c1h and c4h:
+                tc = TrendContinuationStrategy(sym, params={
+                    "name":         "TrendCont",
+                    "sl_mult":      cfg["tc_sl_mult"],
+                    "tp_mult":      cfg["tc_tp_mult"],
+                    "rsi_min":      cfg["tc_rsi_min"],
+                    "rsi_max":      cfg["tc_rsi_max"],
+                    "pullback_pct": cfg["tc_pullback_pct"],
+                    "vol_mult":     cfg["tc_vol_mult"],
+                })
+                trades = await backtest_strategy_mtf(
+                    tc, c15m, {"1h": c1h, "4h": c4h}, notional_c5, sl_pct, tp_pct,
+                )
+                case5[f"TrendCont/{tag}"] = summarise(trades)
+
+            # SmartMoney (primary=15m, mtf=1h+4h)
+            if c15m and c1h and c4h:
+                sm = SmartMoneyStrategy(sym, params={
+                    "name":           "SmartMoney",
+                    "sl_mult":        cfg["sm_sl_mult"],
+                    "rr":             cfg["sm_rr"],
+                    "min_confidence": cfg["sm_min_confidence"],
+                    "min_multi_tf":   cfg["sm_min_multi_tf"],
+                    "min_bos_choch":  cfg["sm_min_bos_choch"],
+                    "min_ema_cross":  cfg["sm_min_ema_cross"],
+                })
+                trades = await backtest_strategy_mtf(
+                    sm, c15m, {"1h": c1h, "4h": c4h}, notional_c5, sl_pct, tp_pct,
+                )
+                case5[f"SmartMoney/{tag}"] = summarise(trades)
 
         # ── Signal correlation: v2 vs v2-reversed (should be perfect inverse)
         correlation: dict = {}
@@ -617,7 +635,7 @@ async def main():
             correlation[sym] = signal_overlap(sigs_v2, sigs_rev)
 
         # ── Build C5 section of message ───────────────────────────────────
-        c5_lines = ["\n📊 *C5: ScalpTrend + ProfBot (MTF)*"]
+        c5_lines = ["\n📊 *C5: MeanRev / TrendCont / SmartMoney (MTF)*"]
         c5_lines.append(f"${cfg['fixed_trade_usdt']}×{cfg['leverage']}x = "
                         f"${notional_c5:.0f} notional")
         c5_total_net = 0.0
