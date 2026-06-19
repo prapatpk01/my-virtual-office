@@ -96,6 +96,21 @@ class SignalState:
     def count_active(self, symbol: str) -> int:
         return sum(1 for k in self._active if k.startswith(f"{symbol}||"))
 
+    def clear_stale_strategy_locks(self, max_age_hours: int = 2) -> list[str]:
+        """Remove strategy locks older than max_age_hours.
+        Called on bot startup so a crash mid-trade doesn't permanently block a slot.
+        OKX's own algo SL/TP orders protect the position even when bot is offline.
+        """
+        cutoff = int(time.time() * 1000) - max_age_hours * 3_600_000
+        stale = [k for k, v in self._active.items()
+                 if "||" in k and v.get("ts", 0) < cutoff]
+        for k in stale:
+            del self._active[k]
+            logger.warning("Cleared stale strategy lock on startup: %s", k)
+        if stale:
+            self._save()
+        return stale
+
     # ------------------------------------------------------------------
     # Virtual outcome tracking (forex signal-only + paper/0-balance crypto)
     # ------------------------------------------------------------------

@@ -109,6 +109,12 @@ class TradingBot:
     # ── Core loop ─────────────────────────────────────────────────────────
 
     async def _run_loop(self):
+        # Clear locks older than 2h so a crash mid-trade doesn't permanently block slots.
+        # OKX algo SL/TP orders remain active on exchange even when bot is offline.
+        stale = self._sig.clear_stale_strategy_locks(max_age_hours=2)
+        if stale:
+            logger.warning("[BOT] Cleared %d stale strategy lock(s) from previous session: %s",
+                           len(stale), stale)
         await self._refresh_balance()
         self._start_balance = self._balance
         self.risk.update_peak(self._balance)

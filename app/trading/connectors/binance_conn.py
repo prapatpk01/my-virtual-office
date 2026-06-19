@@ -167,7 +167,9 @@ class BinanceConnector(BaseConnector):
                 params["tdMode"] = "cross"
                 if pos_side:
                     params["posSide"] = pos_side
-                if reduce_only:
+                # OKX hedge mode: posSide already specifies which leg to close;
+                # reduceOnly is incompatible with hedge mode and causes API error 51000
+                if reduce_only and not pos_side:
                     params["reduceOnly"] = True
                 # Attach algo TP/SL inline (OKX attachAlgoOrds structure)
                 # attachAlgoClOrdId omitted — OKX auto-generates; manual UUID with hyphens → error 51000
