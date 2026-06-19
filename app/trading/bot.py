@@ -246,6 +246,15 @@ class TradingBot:
                 logger.warning("Failed to fetch data for %s: %s", sym, e)
                 continue
 
+            # Fetch 4H candles for multi-TF strategies (e.g. ProfitableBot 4H guard)
+            mtf: dict = {}
+            try:
+                c4h = await self.connector.fetch_ohlcv(sym, timeframe="4h", limit=120)
+                if c4h and len(c4h) >= 50:
+                    mtf["4h"] = to_heikin_ashi(c4h)
+            except Exception:
+                pass  # 4H optional — strategies degrade gracefully without it
+
             if self._ai_chief:
                 # ── Chief mode: strategy exits first, then Chief decides ───
                 if sym in self._positions:
@@ -253,7 +262,7 @@ class TradingBot:
                 await self._tick_chief(sym, candles, price)
             else:
                 # ── Strategy mode (+ optional gate) ───────────────────────
-                await self._tick_strategies(sym, candles, price)
+                await self._tick_strategies(sym, candles, price, mtf)
 
     async def _tick_chief(self, sym: str, candles_1h: list, price: float):
         """Chief mode: collect strategy opinions, ask Claude, execute if BUY."""
@@ -327,7 +336,8 @@ class TradingBot:
         )
         await self._execute_buy(signal, strategy_name="Chief")
 
-    async def _tick_strategies(self, sym: str, candles: list, price: float):
+    async def _tick_strategies(self, sym: str, candles: list, price: float,
+                               mtf_candles: dict = None):
         """Strategy mode: run each strategy; optionally confirm with gate."""
         if self.mtf_gate and not await self._is_4h_bullish(sym):
             logger.debug("[MTF] %s 4H not bullish — skipping", sym)
@@ -337,7 +347,7 @@ class TradingBot:
 
         for strategy in [s for s in self.strategies if s.symbol == sym]:
             try:
-                signal = await strategy.analyze(candles, price)
+                signal = await strategy.analyze(candles, price, mtf_candles=mtf_candles)
             except Exception as e:
                 logger.error("Strategy %s error on %s: %s", strategy.name, sym, e)
                 continue
@@ -545,32 +555,52 @@ class TradingBot:
     # ------------------------------------------------------------------
 
     async def _check_spot_exits(self):
-        """For spot (leverage=1) live positions: check price vs SL/TP each tick.
+        """Detect exchange-side position closures (OKX algo orders / Binance OCO).
 
-        OKX's OCO algo order handles the actual exchange-side close, but the bot
-        needs to detect the closure and update its in-memory state. We check the
-        current price on each tick; if SL or TP is hit, we attempt a market SELL
-        (which will fail gracefully if OCO already closed it) and clear the position.
+        Two detection methods run in order:
+          1. Balance check: if base asset dropped below 10% of expected, the exchange
+             already closed it (most reliable — catches bounced-price scenarios).
+          2. Price check: fallback for when balance hasn't settled yet.
         """
         if self._paper or getattr(self.connector, "leverage", 1) > 1:
             return
+        if not self._positions:
+            return
+
+        # Fetch all balances once for the whole loop
+        try:
+            balances  = await self.connector.fetch_balance()
+            bal_map   = {b.asset: b.free for b in balances}
+        except Exception:
+            bal_map = {}
+
         for sym in list(self._positions.keys()):
             pos = self._positions[sym]
-            if not pos.stop_loss and not pos.take_profit:
-                continue
+            base = sym.split("/")[0]
+
             try:
                 ticker = await self.connector.fetch_ticker(sym)
-                price = float(ticker["last"])
+                price  = float(ticker["last"])
             except Exception:
                 continue
 
-            hit_tp = bool(pos.take_profit and price >= pos.take_profit)
-            hit_sl = bool(pos.stop_loss  and price <= pos.stop_loss)
-            if not hit_tp and not hit_sl:
+            # Method 1: base asset gone → exchange algo already closed the position
+            actual_base = bal_map.get(base, 0.0)
+            if actual_base < pos.amount * 0.1:
+                reason = "take_profit" if price > pos.entry_price else "stop_loss"
+                logger.info("[Spot-Exit] %s detected closed by exchange algo (balance=%.6f < %.6f)",
+                            sym, actual_base, pos.amount)
+                await self._close_spot_position(sym, price, reason)
                 continue
 
-            reason = "take_profit" if hit_tp else "stop_loss"
-            await self._close_spot_position(sym, price, reason)
+            # Method 2: price crossed SL/TP → trigger our own market sell
+            if not pos.stop_loss and not pos.take_profit:
+                continue
+            hit_tp = bool(pos.take_profit and price >= pos.take_profit)
+            hit_sl = bool(pos.stop_loss  and price <= pos.stop_loss)
+            if hit_tp or hit_sl:
+                reason = "take_profit" if hit_tp else "stop_loss"
+                await self._close_spot_position(sym, price, reason)
 
     async def _close_spot_position(self, sym: str, exit_price: float, reason: str):
         """Market sell to close spot position. If OCO already sold, the sell will

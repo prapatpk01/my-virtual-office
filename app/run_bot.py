@@ -131,11 +131,12 @@ def build_config() -> dict:
             "vol_mult": _env_float("SR_VOL",      1.2),
         },
         "cpk_params": {
-            "sl_atr":   _env_float("CPK_SL",      2.5),
-            "tp_atr":   _env_float("CPK_TP",      1.5),
-            "rsi_lo":   _env_float("CPK_RSI_LO", 40.0),
-            "rsi_hi":   _env_float("CPK_RSI_HI", 64.0),
-            "vol_mult": _env_float("CPK_VOL",      1.2),
+            "sl_atr":        _env_float("CPK_SL",      2.5),
+            "tp_atr":        _env_float("CPK_TP",      1.5),
+            "rsi_lo":        _env_float("CPK_RSI_LO", 44.0),
+            "rsi_hi":        _env_float("CPK_RSI_HI", 60.0),
+            "vol_mult":      _env_float("CPK_VOL",      1.5),
+            "max_hold_days": _env_float("CPK_HOLD",     4.0),
         },
         "hyb_params": {
             "sl_atr":   _env_float("HYB_SL",      2.5),
