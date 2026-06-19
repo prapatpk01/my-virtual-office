@@ -96,8 +96,10 @@ async def backtest_strategy(
                 else:               open_short = None
 
         # ── Run strategy ─────────────────────────────────────────────────
+        # Pass candles[:i+1] so that [-1] is bar i (mimics live "forming" bar)
+        # and [-2] is the last closed bar, matching strategy index conventions.
         try:
-            signal = await strategy.analyze(candles[:i], price)
+            signal = await strategy.analyze(candles[:i + 1], price)
         except Exception as e:
             logger.debug("analyze error at bar %d: %s", i, e)
             continue
@@ -181,7 +183,9 @@ async def backtest_strategy_mtf(
                 else:               open_short = None
 
         # ── Build rolling slices ─────────────────────────────────────────────
-        prim_slice = primary_candles[max(0, i - primary_window): i]
+        # Include bar i at [-1] (forming bar) so strategies use [-2] = last closed,
+        # matching live OKX fetch_ohlcv where [-1] is the still-forming candle.
+        prim_slice = primary_candles[max(0, i - primary_window): i + 1]
 
         mtf_sliced: dict[str, list[OHLCV]] = {}
         for tf, ts_idx in mtf_ts_index.items():
@@ -278,7 +282,7 @@ async def backtest_with_signals(
                 else:               open_short = None
 
         try:
-            signal = await strategy.analyze(candles[:i], price)
+            signal = await strategy.analyze(candles[:i + 1], price)
         except Exception as e:
             logger.debug("analyze error at bar %d: %s", i, e)
             continue

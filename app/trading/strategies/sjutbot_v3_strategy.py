@@ -31,6 +31,7 @@ class SJUTBotV3Strategy(BaseStrategy):
         self.resist_len   = self.params.get("resist_len",        15)  # resistance lookback
         # SL / TP
         self.atr_len      = self.params.get("atr_len",          14)
+        self.adx_len      = self.params.get("adx_len",          14)
         self.sl_mult      = self.params.get("sl_mult",          2.5)
         self.rr           = self.params.get("rr",               1.2)
         # Direction
@@ -186,7 +187,7 @@ class SJUTBotV3Strategy(BaseStrategy):
 
         # ── Filters ───────────────────────────────────────────────────────────
         hma_arr  = self._hma(cl, self.hma_len)
-        adx_arr  = self._adx(h, l, cl, 14)
+        adx_arr  = self._adx(h, l, cl, self.adx_len)
 
         # Swing high/low and resistance/support (rolling max/min with 1-bar lag)
         swing_h  = np.array([np.max(h[max(0,i-self.swing_len+1):i+1])  for i in range(n)])
