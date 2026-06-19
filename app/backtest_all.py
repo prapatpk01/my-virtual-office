@@ -39,14 +39,16 @@ from trading.strategies.base import BaseStrategy
 # ── Config ───────────────────────────────────────────────────────────────────
 SYMBOLS       = os.environ.get("BT_SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
 EXCHANGE_ID   = os.environ.get("EXCHANGE",   "binance")
-MONTHS        = 5
+MONTHS        = int(os.environ.get("BT_MONTHS", "5"))
 TRADE_USDT    = float(os.environ.get("TRADE_AMOUNT_USDT", "100"))
 MAX_POSITIONS = 3
 FEE_RT        = 0.0020   # 0.10% in + 0.10% out
 CACHE_FILE    = Path(__file__).parent / ".bt_cache_5m.json"
 
-CHIEF_N_AGREE = int(os.environ.get("CHIEF_N_AGREE",  "2"))
-CHIEF_LOOKFWD = int(os.environ.get("CHIEF_LOOKFWD", "100"))
+CHIEF_N_AGREE   = int(os.environ.get("CHIEF_N_AGREE",  "2"))
+CHIEF_LOOKFWD   = int(os.environ.get("CHIEF_LOOKFWD", "100"))
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY",    "")
+BINANCE_SECRET  = os.environ.get("BINANCE_SECRET",     "")
 
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
@@ -144,7 +146,11 @@ async def fetch_or_load() -> tuple[dict, bool]:
 
     try:
         ex_cls = getattr(ccxt, EXCHANGE_ID)
-        ex = ex_cls({"enableRateLimit": True})
+        ex_cfg: dict = {"enableRateLimit": True}
+        if BINANCE_API_KEY:
+            ex_cfg["apiKey"] = BINANCE_API_KEY
+            ex_cfg["secret"] = BINANCE_SECRET
+        ex = ex_cls(ex_cfg)
         if EXCHANGE_ID == "okx":
             ex.options["defaultType"] = "margin"
 
