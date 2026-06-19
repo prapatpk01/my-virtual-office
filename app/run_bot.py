@@ -81,7 +81,7 @@ def _env_int(key: str, default: int) -> int:
 
 def build_config() -> dict:
     return {
-        "exchange":        os.environ.get("EXCHANGE", "binance"),
+        "exchange":        os.environ.get("EXCHANGE", "okx"),
         "api_key":         os.environ.get("EXCHANGE_API_KEY", ""),
         "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
         "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),
@@ -252,7 +252,10 @@ async def main():
 
     # Pre-flight: refuse to start live mode with missing credentials
     if not cfg["paper"]:
-        missing = [k for k in ("api_key", "api_secret") if not cfg.get(k, "").strip()]
+        required = ["api_key", "api_secret"]
+        if cfg["exchange"] == "okx":
+            required.append("api_passphrase")  # OKX mandates passphrase
+        missing = [k for k in required if not cfg.get(k, "").strip()]
         if missing:
             logger.critical("LIVE MODE but %s not set — set env vars and restart", missing)
             sys.exit(1)
