@@ -30,13 +30,14 @@ class TrendContinuationStrategy(BaseStrategy):
         self.ema_slow     = self.params.get("ema_slow",      50)
         self.ema_micro    = self.params.get("ema_micro",      9)
         self.rsi_period   = self.params.get("rsi_period",    14)
-        self.rsi_min_buy  = self.params.get("rsi_min",      42.0)
-        self.rsi_max_buy  = self.params.get("rsi_max",      65.0)
-        self.rsi_min_sell = self.params.get("rsi_min_sell", 35.0)
-        self.rsi_max_sell = self.params.get("rsi_max_sell", 58.0)
-        self.pullback_pct = self.params.get("pullback_pct", 0.015)  # tight ±1.5%
+        self.rsi_min_buy  = self.params.get("rsi_min",      38.0)  # ↓ from 42
+        self.rsi_max_buy  = self.params.get("rsi_max",      72.0)  # ↑ from 65
+        self.rsi_min_sell = self.params.get("rsi_min_sell", 28.0)  # ↓ from 35
+        self.rsi_max_sell = self.params.get("rsi_max_sell", 65.0)  # ↑ from 58
+        self.pullback_pct = self.params.get("pullback_pct", 0.025) # ↑ from 0.015 ±2.5%
         self.vol_period   = self.params.get("vol_period",    20)
-        self.vol_mult     = self.params.get("vol_mult",      1.2)
+        self.vol_mult     = self.params.get("vol_mult",      1.0)  # ↓ from 1.2
+        self.min_entry_cond = self.params.get("min_entry_cond", 3) # 3/4 not ALL 4
         self.atr_period   = self.params.get("atr_period",   14)
         self.sl_mult      = self.params.get("sl_mult",       0.8)
         self.tp_mult      = self.params.get("tp_mult",       2.0)
@@ -119,37 +120,39 @@ class TrendContinuationStrategy(BaseStrategy):
                 return round(current_price - dist, 2), round(current_price + tp_d, 2)
             return round(current_price + dist, 2), round(current_price - tp_d, 2)
 
-        # ── BUY: 4H up + 1H up + pullback + ALL 4 conditions ─────────────
+        # ── BUY: 4H up + 1H up + pullback + min_entry_cond/4 ────────────
         if macro_up and mid_up and at_pullback_long:
             c1 = close_b > ema9_b
             c2 = close_b > ema20_b
             c3 = self.rsi_min_buy <= rsi_b <= self.rsi_max_buy
             c4 = vol_ok
-            if c1 and c2 and c3 and c4:
+            met = sum([c1, c2, c3, c4])
+            if met >= self.min_entry_cond:
                 sl, tp = _sl_tp("long")
                 return Signal(
                     SignalType.BUY, self.symbol, current_price,
                     amount=0.08,
-                    reason=(f"[TrendCont] 4H↑ 1H↑ EMA20pull RSI={rsi_b:.0f} "
+                    reason=(f"[TrendCont] 4H↑ 1H↑ EMA20pull cond={met}/4 RSI={rsi_b:.0f} "
                             f"ATR={atr_v:.0f} RR=1:{rr:.2f}"),
-                    confidence=0.72,
+                    confidence=0.65 + met * 0.02,
                     metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
                 )
 
-        # ── SELL: 4H down + 1H down + resistance + ALL 4 conditions ──────
+        # ── SELL: 4H down + 1H down + resistance + min_entry_cond/4 ─────
         if macro_down and mid_down and at_pullback_short:
             c1 = close_b < ema9_b
             c2 = close_b < ema20_b
             c3 = self.rsi_min_sell <= rsi_b <= self.rsi_max_sell
             c4 = vol_ok
-            if c1 and c2 and c3 and c4:
+            met = sum([c1, c2, c3, c4])
+            if met >= self.min_entry_cond:
                 sl, tp = _sl_tp("short")
                 return Signal(
                     SignalType.SELL, self.symbol, current_price,
                     amount=0.08,
-                    reason=(f"[TrendCont] 4H↓ 1H↓ EMA20resist RSI={rsi_b:.0f} "
+                    reason=(f"[TrendCont] 4H↓ 1H↓ EMA20resist cond={met}/4 RSI={rsi_b:.0f} "
                             f"ATR={atr_v:.0f} RR=1:{rr:.2f}"),
-                    confidence=0.72,
+                    confidence=0.65 + met * 0.02,
                     metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
                 )
 

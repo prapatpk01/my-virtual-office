@@ -28,16 +28,16 @@ class MeanReversionStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self.rsi_period     = self.params.get("rsi_period",     14)
-        self.rsi_oversold   = self.params.get("rsi_oversold",  35.0)
-        self.rsi_overbought = self.params.get("rsi_overbought",65.0)
+        self.rsi_oversold   = self.params.get("rsi_oversold",  42.0)  # ↑ from 35
+        self.rsi_overbought = self.params.get("rsi_overbought",58.0)  # ↓ from 65
         self.macd_fast      = self.params.get("macd_fast",      12)
         self.macd_slow      = self.params.get("macd_slow",      26)
         self.macd_sig       = self.params.get("macd_signal",     9)
         self.bb_period      = self.params.get("bb_period",      20)
         self.bb_std         = self.params.get("bb_std",         2.0)
         self.vol_period     = self.params.get("vol_period",     20)
-        self.vol_spike_mult = self.params.get("vol_spike_mult", 1.3)
-        self.min_conditions = self.params.get("min_conditions",   3)
+        self.vol_spike_mult = self.params.get("vol_spike_mult", 1.2)
+        self.min_conditions = self.params.get("min_conditions",   2)  # ↓ from 3
         self.atr_period     = self.params.get("atr_period",     14)
         self.sl_mult        = self.params.get("sl_mult",        1.2)
         self.tp_mult        = self.params.get("tp_mult",        2.0)
@@ -104,10 +104,10 @@ class MeanReversionStrategy(BaseStrategy):
                 return round(current_price - dist, 2), round(current_price + tp_d, 2)
             return round(current_price + dist, 2), round(current_price - tp_d, 2)
 
-        # ── BUY (long): 4H NOT "down" + 3/4 1H conditions ────────────────
+        # ── BUY (long): 4H NOT "down" + min_conditions/4 ─────────────────
         if trend_4h != "down":
-            # 2-bar confirmation: both bars must be oversold, cur bouncing
-            c1  = (rsi_p <= self.rsi_oversold) and (rsi_c <= self.rsi_oversold) and (rsi_c > rsi_p)
+            # Single-bar RSI: oversold + bouncing (removed 2-bar confirmation)
+            c1  = rsi_c <= self.rsi_oversold and rsi_c > rsi_p
             c2  = (hist_p < 0 and hist_c > 0) or (hist_c > 0 and hist_c > hist_p and not np.isnan(hist_p))
             c3  = (close_p <= bbl_p) and (close_c > bbl_c)
             met = sum([c1, c2, c3, vol_ok])
@@ -116,16 +116,16 @@ class MeanReversionStrategy(BaseStrategy):
                 return Signal(
                     SignalType.BUY, self.symbol, current_price,
                     amount=0.08,
-                    reason=(f"[MeanRev] 4H={trend_4h} RSI={rsi_c:.0f}(2bar) "
+                    reason=(f"[MeanRev] 4H={trend_4h} RSI={rsi_c:.0f} "
                             f"MACD={'✓' if c2 else '✗'} BB={'✓' if c3 else '✗'} "
                             f"cond={met}/4 RR=1:{rr:.2f}"),
                     confidence=min(0.55 + met * 0.08, 0.87),
                     metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
                 )
 
-        # ── SELL (short): 4H NOT "up" + 3/4 1H conditions ────────────────
+        # ── SELL (short): 4H NOT "up" + min_conditions/4 ─────────────────
         if trend_4h != "up":
-            c1  = (rsi_p >= self.rsi_overbought) and (rsi_c >= self.rsi_overbought) and (rsi_c < rsi_p)
+            c1  = rsi_c >= self.rsi_overbought and rsi_c < rsi_p
             c2  = (hist_p > 0 and hist_c < 0) or (hist_c < 0 and hist_c < hist_p and not np.isnan(hist_p))
             c3  = (close_p >= bbu_p) and (close_c < bbu_c)
             met = sum([c1, c2, c3, vol_ok])
@@ -134,7 +134,7 @@ class MeanReversionStrategy(BaseStrategy):
                 return Signal(
                     SignalType.SELL, self.symbol, current_price,
                     amount=0.08,
-                    reason=(f"[MeanRev] 4H={trend_4h} RSI={rsi_c:.0f}(2bar) "
+                    reason=(f"[MeanRev] 4H={trend_4h} RSI={rsi_c:.0f} "
                             f"MACD={'✓' if c2 else '✗'} BB={'✓' if c3 else '✗'} "
                             f"cond={met}/4 RR=1:{rr:.2f}"),
                     confidence=min(0.55 + met * 0.08, 0.87),

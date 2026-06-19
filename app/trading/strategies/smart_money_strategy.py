@@ -34,10 +34,10 @@ class SmartMoneyStrategy(BaseStrategy):
         self.atr_period     = self.params.get("atr_period",     14)
         self.sl_mult        = self.params.get("sl_mult",        1.8)
         self.rr             = self.params.get("rr",             1.8)
-        self.min_confidence = self.params.get("min_confidence", 75.0)
-        self.min_multi_tf   = self.params.get("min_multi_tf",   70.0)
-        self.min_bos_choch  = self.params.get("min_bos_choch",  60.0)
-        self.min_ema_cross  = self.params.get("min_ema_cross",  60.0)
+        self.min_confidence = self.params.get("min_confidence", 55.0)  # ↓ from 75
+        self.min_multi_tf   = self.params.get("min_multi_tf",   55.0)  # ↓ from 70
+        self.min_bos_choch  = self.params.get("min_bos_choch",  50.0)  # ↓ from 60
+        self.min_ema_cross  = self.params.get("min_ema_cross",  50.0)  # ↓ from 60
 
     # ── Market structure helpers ──────────────────────────────────────────
 
@@ -113,11 +113,16 @@ class SmartMoneyStrategy(BaseStrategy):
         return {"bias": "neutral", "score": 30.0}
 
     def _composite(self, mtf: dict, ema_c: dict, struct: dict) -> tuple[float, str]:
+        # Majority vote: 2/3 components agreeing on direction is enough
         biases = [mtf["bias"], ema_c["bias"], struct["bias"]]
-        if len(set(biases)) > 1 or "neutral" in biases:
-            agree, direction = 0.5, "neutral"
+        bull = biases.count("bullish")
+        bear = biases.count("bearish")
+        if bull >= 2:
+            direction, agree = "bullish", 1.0 if bull == 3 else 0.8
+        elif bear >= 2:
+            direction, agree = "bearish", 1.0 if bear == 3 else 0.8
         else:
-            agree, direction = 1.0, biases[0]
+            direction, agree = "neutral", 0.5
         raw = mtf["score"] * 0.35 + ema_c["score"] * 0.25 + struct["score"] * 0.40
         return raw * agree, direction
 
