@@ -86,6 +86,8 @@ def build_config() -> dict:
         "strategy_sjutbot_v3":   _env_bool("STRATEGY_SJUTBOT_V3",   True),   # v3.1
         "strategy_sjutbot_v2rev":_env_bool("STRATEGY_SJUTBOT_V2REV",False),  # v2 reversed
         "strategy_utbot":        _env_bool("STRATEGY_UTBOT",        False),  # off
+        "strategy_scalp_trend":  _env_bool("STRATEGY_SCALP_TREND",  False),  # scalp trend
+        "strategy_prof_bot":     _env_bool("STRATEGY_PROF_BOT",     False),  # profitable bot
 
         # ── MCDX p-1 tuning — selective (30m, WR 60%+ target) ───────────────────
         "mcdx_dwcs_buy":     _env_int("MCDX_DWCS_BUY",     62),   # high threshold → fewer, better signals
@@ -100,6 +102,22 @@ def build_config() -> dict:
         "mcdx2_adx_thr":     _env_int("MCDX2_ADX_THR",     22),
         "mcdx2_rsi_min":     _env_int("MCDX2_RSI_MIN",     38),
         "mcdx2_rsi_max":     _env_int("MCDX2_RSI_MAX",     72),
+
+        # ── Scalp Trend tuning (15m entry / 1H+4H MTF) ───────────────────────
+        # sl_mult=0.8, tp_mult=1.0 → TP1-only (high hit-rate scalp style)
+        "scalp_sl_mult":     _env_float("SCALP_SL_MULT",      0.8),
+        "scalp_tp_mult":     _env_float("SCALP_TP_MULT",      1.0),
+        "scalp_rsi_min":     _env_float("SCALP_RSI_MIN",     42.0),
+        "scalp_rsi_max":     _env_float("SCALP_RSI_MAX",     65.0),
+        "scalp_pullback_pct":_env_float("SCALP_PULLBACK_PCT",  0.015),
+
+        # ── Profitable Bot tuning (1H entry / 4H MTF) ────────────────────────
+        # sl_mult=1.5, tp_mult=2.5 → R:R ≈ 1:1.67 (ATR-based, no fixed %)
+        "prof_sl_mult":       _env_float("PROF_SL_MULT",      1.5),
+        "prof_tp_mult":       _env_float("PROF_TP_MULT",      2.5),
+        "prof_rsi_oversold":  _env_float("PROF_RSI_OVERSOLD", 35.0),
+        "prof_rsi_overbought":_env_float("PROF_RSI_OVERBOUGHT",65.0),
+        "prof_min_cond":      _env_int("PROF_MIN_COND",         3),
 
         # ── SJUTBot v2 tuning ─────────────────────────────────────────────────
         "sjutbot_sl_mult": _env_float("SJUTBOT_SL_MULT", 1.2),
@@ -158,6 +176,8 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
     from trading.strategies.sjutbot_v2_reversed_strategy import SJUTBotV2ReversedStrategy
     from trading.strategies.sjutbot_v3_strategy          import SJUTBotV3Strategy
     from trading.strategies.utbot_wt_strategy            import UTBotWTStrategy
+    from trading.strategies.scalp_trend_strategy         import ScalpTrendStrategy
+    from trading.strategies.profitable_bot_strategy      import ProfitableBotStrategy
 
     strategies = []
     for sym in symbols:
@@ -243,10 +263,37 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "limit": 300,
             }))
 
+        # ── Scalp Trend (15m entry / 1H+4H MTF) ───────────────────────────────
+        if cfg["strategy_scalp_trend"]:
+            strategies.append(ScalpTrendStrategy(sym, params={
+                "name":        "ScalpTrend",
+                "tf":          "15m",
+                "limit":       200,
+                "sl_mult":     cfg["scalp_sl_mult"],
+                "tp_mult":     cfg["scalp_tp_mult"],
+                "rsi_min":     cfg["scalp_rsi_min"],
+                "rsi_max":     cfg["scalp_rsi_max"],
+                "pullback_pct":cfg["scalp_pullback_pct"],
+            }))
+
+        # ── Profitable Bot (1H entry / 4H MTF) ────────────────────────────────
+        if cfg["strategy_prof_bot"]:
+            strategies.append(ProfitableBotStrategy(sym, params={
+                "name":           "ProfBot",
+                "tf":             "1h",
+                "limit":          200,
+                "sl_mult":        cfg["prof_sl_mult"],
+                "tp_mult":        cfg["prof_tp_mult"],
+                "rsi_oversold":   cfg["prof_rsi_oversold"],
+                "rsi_overbought": cfg["prof_rsi_overbought"],
+                "min_conditions": cfg["prof_min_cond"],
+            }))
+
     if not strategies:
         raise RuntimeError(
-            "No strategies enabled — set STRATEGY_SJUTBOT, STRATEGY_SJUTBOT_V3, "
-            "STRATEGY_SJUTBOT_V2REV, or STRATEGY_UTBOT to true"
+            "No strategies enabled — set one of: STRATEGY_MCDX, STRATEGY_MCDX_DUAL, "
+            "STRATEGY_SJUTBOT, STRATEGY_SJUTBOT_V3, STRATEGY_SJUTBOT_V2REV, "
+            "STRATEGY_UTBOT, STRATEGY_SCALP_TREND, STRATEGY_PROF_BOT to true"
         )
 
     logger.info("Strategies loaded: %s", [s.name for s in strategies])
