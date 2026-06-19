@@ -1105,7 +1105,7 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
 
     cooldown: dict[tuple, int] = {}
     for sym in SYMBOLS:
-        for sn in ["SwingReversalStrategy", "CPKRegimeStrategy", "ProfitableBot", "ScalpTrendBot"]:
+        for sn in ["CPKRegimeStrategy", "ProfitableBot", "ScalpTrendBot"]:
             cooldown[(sym, sn)] = 0
 
     be_locked: set = set()
@@ -1132,7 +1132,7 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
     NEW_WARMUP   = 60
 
     print(f"  [Case 3] No-Chief portfolio — {n_bars} bars × {len(SYMBOLS)} symbols "
-          f"× 4 strategies, 1 pos/SJ, max {MAX_POSITIONS} slots...")
+          f"× 3 strategies (CPK+Profitable+Scalp), 1 pos/SJ, max {MAX_POSITIONS} slots...")
 
     for bar_i, master_bar in enumerate(master_1h):
         ts = int(master_bar.timestamp)
@@ -1205,23 +1205,6 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
                 ))
                 cooldown[(sym, sn)] = cd
                 return True
-
-            # SwingReversalStrategy
-            key_sw = (sym, "SwingReversalStrategy")
-            if cooldown[key_sw] > 0:
-                cooldown[key_sw] -= 1
-            elif i >= SWING_WARMUP:
-                e80   = float(d["ema80"][i]);   e200  = float(d["ema200"][i])
-                rsi_v = float(d["rsi14"][i]);   vol_v = float(d["volumes"][i])
-                vma_v = float(d["vol_ma"][i])
-                cb    = bool(d["candle_bull"][i]); mc = bool(d["macd_cross"][i])
-                dv    = not any(math.isnan(v) for v in [e80, e200, rsi_v, vma_v])
-                if (dv and e80 >= e200 * 0.98 and cb and mc
-                        and 34.0 <= rsi_v <= 62.0 and vol_v >= vma_v * 1.2):
-                    sl_p = round(cp - 2.5 * atr_v, 4)
-                    tp_p = round(cp + 1.5 * atr_v, 4)
-                    if sl_p < cp < tp_p:
-                        _try_open("SwingReversalStrategy", sl_p, tp_p, 4)
 
             # CPKRegimeStrategy
             key_cpk = (sym, "CPKRegimeStrategy")
@@ -1605,7 +1588,7 @@ def print_case3_report(trades: list[Trade], stats: dict, bars: int):
     W = 86
     print("\n" + "═" * W)
     print(f"{'  CASE 3: No-Chief Portfolio  ' + data_label:^{W}}")
-    print(f"{'  SwingReversal · CPK · ProfitableBot · ScalpTrend':^{W}}")
+    print(f"{'  CPKRegime · ProfitableBot · ScalpTrend':^{W}}")
     print(f"{'  1 pos/strategy · max %d slots total · ~%.0f months · %s' % (MAX_POSITIONS, months, now_str):^{W}}")
     print("═" * W)
 
@@ -1617,7 +1600,7 @@ def print_case3_report(trades: list[Trade], stats: dict, bars: int):
           f"{'PnL$':>9} {'AvgPnL%':>8} {'MaxDD$':>8} {'Hold':>5}")
     print("─" * W)
 
-    strat_order = ["SwingReversalStrategy", "CPKRegimeStrategy", "ProfitableBot", "ScalpTrendBot"]
+    strat_order = ["CPKRegimeStrategy", "ProfitableBot", "ScalpTrendBot"]
     all_pnl = 0.0
     for name in strat_order:
         ts = by_strat.get(name, [])
@@ -1749,7 +1732,7 @@ async def main():
     print_report(trades_c2, stats_c2)
 
     print("\n" + "╔" + "═"*78 + "╗")
-    print("║" + "  CASE 3 — No-Chief · 4 SJ independent · 1 pos/SJ · max 3 slots".center(78) + "║")
+    print("║" + "  CASE 3 — No-Chief · CPK + Profitable + Scalp · 1 pos/SJ · max 3 slots".center(78) + "║")
     print("╚" + "═"*78 + "╝")
     print_case3_report(trades_c3, stats_c3, stats_c3["bars_total"])
 
