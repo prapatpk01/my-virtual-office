@@ -81,7 +81,7 @@ def _env_int(key: str, default: int) -> int:
 
 def build_config() -> dict:
     return {
-        "exchange":        os.environ.get("EXCHANGE", "okx"),
+        "exchange":        os.environ.get("EXCHANGE", "binance"),
         "api_key":         os.environ.get("EXCHANGE_API_KEY", ""),
         "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
         "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),
@@ -89,7 +89,7 @@ def build_config() -> dict:
         "leverage":        _env_int("LEVERAGE", 1),
         "symbols":         _env_list("SYMBOLS", "BTC/USDT,ETH/USDT"),
         "candle_tf":       os.environ.get("CANDLE_TF", "1h"),
-        "candle_limit":    _env_int("CANDLE_LIMIT", 200),
+        "candle_limit":    _env_int("CANDLE_LIMIT", 250),
         "interval":        _env_int("INTERVAL_SECONDS", 3600),
         "trade_amount_usdt": _env_float("TRADE_AMOUNT_USDT", 100.0),
         "max_positions":   _env_int("MAX_POSITIONS", 3),

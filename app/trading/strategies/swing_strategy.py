@@ -104,9 +104,9 @@ class SwingStrategy(BaseStrategy):
             sl_p  = round(current_price - self.sl_atr * atr_v, 4)
             tp_p  = round(current_price + self.tp_atr * atr_v, 4)
             rsi_v = float(rsi14[n]) if not math.isnan(float(rsi14[n])) else 0.0
-            # Self-throttle: don't re-emit the same BUY every tick while the MACD
-            # cross + RSI conditions persist across consecutive bars.
-            self._cooldown = self.max_hold // 24 + 1
+            # Self-throttle: block re-entry for the full expected hold duration.
+            # max_hold is already in bars (hours on 1H TF).
+            self._cooldown = self.max_hold
             return Signal(
                 type=SignalType.BUY,
                 symbol=self.symbol,

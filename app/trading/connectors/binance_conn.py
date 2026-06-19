@@ -80,7 +80,10 @@ class BinanceConnector(BaseConnector):
         if self._exchange_id == "okx":
             return await self._okx_order(symbol, side, amount, order_type, price, tp, sl)
 
-        # Other exchanges: standard CCXT
+        if self._exchange_id == "binance":
+            return await self._binance_order(symbol, side, amount, order_type, price, tp, sl)
+
+        # Other exchanges: standard CCXT (no exchange-side SL/TP)
         kwargs: dict = {}
         if order_type == "limit" and price:
             kwargs["price"] = price
@@ -175,6 +178,69 @@ class BinanceConnector(BaseConnector):
         return OrderResult(
             order_id=ord_id, symbol=symbol, side=side,
             amount=amount, price=exec_price, filled=amount, status="closed",
+        )
+
+    async def _binance_order(self, symbol: str, side: str, amount: float,
+                              order_type: str, price: Optional[float],
+                              tp: Optional[float], sl: Optional[float]) -> OrderResult:
+        """Binance spot: market/limit order + OCO sell order for SL/TP protection.
+
+        Two-step process:
+          1. Execute the main entry order (market or limit).
+          2. Immediately place an OCO sell order: TP as limit + SL as stop-limit.
+             The OCO is atomic — only one of the two legs can fill.
+
+        If OCO placement fails the position is already open and unprotected, so we
+        raise immediately so the bot can log/alert and the user can intervene.
+        """
+        await self._exchange.load_markets()
+        mkt     = self._exchange.markets.get(symbol) or {}
+        amt_str = self._exchange.amount_to_precision(symbol, amount)
+        famt    = float(amt_str)
+
+        # Validate direction
+        if side == "buy" and sl and tp and price:
+            if sl >= price:
+                raise ValueError(f"SL {sl:.4f} must be < entry {price:.4f}")
+            if tp <= price:
+                raise ValueError(f"TP {tp:.4f} must be > entry {price:.4f}")
+
+        # Step 1 — main order
+        kwargs: dict = {}
+        if order_type == "limit" and price:
+            kwargs["price"] = self._exchange.price_to_precision(symbol, price)
+        raw = await self._exchange.create_order(symbol, order_type, side, famt, **kwargs)
+        ord_id     = str(raw.get("id", uuid.uuid4()))
+        exec_price = await self._resolve_fill_price(ord_id, symbol, price)
+
+        # Step 2 — OCO sell order (only after a successful buy with valid SL/TP)
+        if side == "buy" and tp and sl and tp > 0 and sl > 0:
+            # sl_limit: slightly below the stop trigger to ensure fill in fast markets
+            prec       = int(mkt.get("precision", {}).get("price") or 2)
+            sl_limit   = round(sl * 0.995, prec)
+            tp_precise = self._exchange.price_to_precision(symbol, tp)
+            sl_precise = self._exchange.price_to_precision(symbol, sl)
+            sl_lim_str = self._exchange.price_to_precision(symbol, sl_limit)
+            try:
+                await self._exchange.create_order(
+                    symbol, "oco", "sell", famt, price=float(tp_precise),
+                    params={
+                        "stopPrice":            float(sl_precise),
+                        "stopLimitPrice":       float(sl_lim_str),
+                        "stopLimitTimeInForce": "GTC",
+                    },
+                )
+                _log.info("[Binance] OCO placed: TP=%.4f  SL=%.4f  SL-limit=%.4f",
+                          tp, sl, sl_limit)
+            except Exception as e:
+                _log.error(
+                    "[Binance] OCO FAILED — position OPEN WITHOUT stop protection! %s", e
+                )
+                raise RuntimeError(f"Binance OCO failed after entry fill: {e}") from e
+
+        return OrderResult(
+            order_id=ord_id, symbol=symbol, side=side,
+            amount=famt, price=exec_price, filled=famt, status="closed",
         )
 
     async def _resolve_fill_price(self, ord_id: str, symbol: str,

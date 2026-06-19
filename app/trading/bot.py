@@ -1,5 +1,6 @@
 """Trading bot: fetches candles, runs strategies, executes BUY orders with OCO TP/SL."""
 import asyncio
+import json
 import logging
 import math
 import os
@@ -13,6 +14,8 @@ from .strategies.base import BaseStrategy, Signal, SignalType
 from .telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("trading_bot")
+
+_POSITIONS_FILE = os.environ.get("POSITIONS_FILE", "/data/positions.json")
 
 
 class TradingBot:
@@ -100,6 +103,7 @@ class TradingBot:
             logger.warning("=" * 60)
             logger.warning("  ⚠  LIVE TRADING MODE — real money at risk")
             logger.warning("=" * 60)
+        await self._load_positions()
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
         logger.info("TradingBot started (paper=%s, interval=%ds, symbols=%s)",
@@ -226,6 +230,8 @@ class TradingBot:
                         self._current_balance, self.risk._peak_balance)
                 self._dd_halted_notified = True
             return
+        # Balance recovered — reset notification flag so next halt sends a fresh alert
+        self._dd_halted_notified = False
 
         symbols = list({s.symbol for s in self.strategies})
         for sym in symbols:
@@ -351,8 +357,8 @@ class TradingBot:
             meta = signal.metadata or {}
             sl_p = meta.get("stop_loss")
             tp_p = meta.get("take_profit")
-            if not sl_p or not tp_p:
-                logger.warning("[%s] BUY missing SL/TP — skipping", strategy.name)
+            if sl_p is None or tp_p is None or sl_p <= 0 or tp_p <= 0:
+                logger.warning("[%s] BUY missing/invalid SL/TP — skipping", strategy.name)
                 continue
 
             logger.info("[%s] BUY: %s @ %.2f  SL=%.2f  TP=%.2f",
@@ -433,6 +439,7 @@ class TradingBot:
                     stop_loss=sl_p, take_profit=tp_p,
                 )
                 self._positions[sym] = pos
+                self._save_positions()
                 logger.info("[%s] BUY filled: %s %.6f @ %.2f  SL=%.2f  TP=%.2f",
                             strategy_name, sym, amount, fill_price,
                             sl_p or 0, tp_p or 0)
@@ -474,6 +481,7 @@ class TradingBot:
             exit_price = order.price or price
             pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
             self._positions.pop(sym, None)
+            self._save_positions()
             logger.info(
                 "[%s] Early exit %s @ %.2f  entry=%.2f  pnl=%.2f%%  | %s",
                 strategy_name, sym, exit_price, pos.entry_price, pnl_pct, reason,
@@ -508,6 +516,7 @@ class TradingBot:
         for sym in list(self._positions.keys()):
             if sym not in live_syms:
                 pos = self._positions.pop(sym)
+                self._save_positions()
                 try:
                     ticker = await self.connector.fetch_ticker(sym)
                     exit_price = float(ticker["last"])
@@ -569,6 +578,7 @@ class TradingBot:
         pos = self._positions.pop(sym, None)
         if not pos:
             return
+        self._save_positions()
         try:
             await self.connector.create_order(sym, "sell", pos.amount)
         except Exception as e:
@@ -654,3 +664,70 @@ class TradingBot:
             self._current_balance = float(usdt)
         except Exception as e:
             logger.warning("Balance refresh failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Position persistence (survive container restarts)
+    # ------------------------------------------------------------------
+
+    def _save_positions(self):
+        """Write open positions to disk so they survive a restart."""
+        data = {
+            sym: {
+                "symbol":      pos.symbol,
+                "side":        pos.side,
+                "entry_price": pos.entry_price,
+                "amount":      pos.amount,
+                "stop_loss":   pos.stop_loss,
+                "take_profit": pos.take_profit,
+                "opened_at":   pos.opened_at,
+            }
+            for sym, pos in self._positions.items()
+        }
+        try:
+            os.makedirs(os.path.dirname(_POSITIONS_FILE), exist_ok=True)
+            with open(_POSITIONS_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.warning("Could not save positions: %s", e)
+
+    async def _load_positions(self):
+        """Reload persisted positions on startup; reconcile with exchange balance."""
+        if self._paper:
+            return
+        try:
+            if not os.path.exists(_POSITIONS_FILE):
+                return
+            with open(_POSITIONS_FILE) as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning("Could not load positions file: %s", e)
+            return
+
+        if not data:
+            return
+
+        try:
+            balances = await self.connector.fetch_balance()
+            bal_map  = {b.asset: b.total for b in balances}
+        except Exception as e:
+            logger.warning("Balance fetch failed during position reload: %s", e)
+            return
+
+        for sym, pd in data.items():
+            base   = sym.split("/")[0]
+            on_exch = bal_map.get(base, 0.0)
+            if on_exch >= pd["amount"] * 0.9:
+                pos = Position(
+                    symbol=pd["symbol"], side=pd["side"],
+                    entry_price=pd["entry_price"], amount=pd["amount"],
+                    stop_loss=pd.get("stop_loss"),
+                    take_profit=pd.get("take_profit"),
+                    opened_at=pd.get("opened_at", int(time.time())),
+                )
+                self._positions[sym] = pos
+                logger.info("[Restart] Restored %s: %.6f @ %.2f  SL=%.2f  TP=%.2f",
+                            sym, pos.amount, pos.entry_price,
+                            pos.stop_loss or 0, pos.take_profit or 0)
+            else:
+                logger.info("[Restart] %s was closed while offline (balance=%.6f < %.6f)",
+                            sym, on_exch, pd["amount"])

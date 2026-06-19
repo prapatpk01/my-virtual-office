@@ -46,14 +46,20 @@ class RiskManager:
             self._peak_balance = balance
 
     def check_drawdown(self, current_balance: float) -> bool:
-        """Returns True if within drawdown limit (trading allowed)."""
-        if self._peak_balance == 0:
-            return True
+        """Returns True if within drawdown limit (trading allowed).
+
+        Auto-resets the halt once balance recovers to within half the drawdown threshold,
+        preventing the bot from staying halted indefinitely after a recovery.
+        """
+        if self._peak_balance <= 0 or current_balance <= 0:
+            return True  # no meaningful data yet — allow trading
         drawdown = (self._peak_balance - current_balance) / self._peak_balance
         if drawdown >= self.max_drawdown_pct:
             self._halted = True
             return False
-        return True
+        if self._halted and drawdown < self.max_drawdown_pct * 0.5:
+            self._halted = False  # balance recovered sufficiently
+        return not self._halted
 
     def size_position(self, balance: float, price: float) -> float:
         """Calculate position size: spend risk_pct% of balance per trade."""
