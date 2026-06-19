@@ -102,6 +102,7 @@ def build_config() -> dict:
             "swing_reversal":   _env_bool("STRATEGY_SWING_REVERSAL",   True),
             "cpk_regime":       _env_bool("STRATEGY_CPK_REGIME",       True),
             "hybrid_swing":     _env_bool("STRATEGY_HYBRID_SWING",     True),
+            "intern":           _env_bool("STRATEGY_INTERN",           False),
         },
         "wt_params": {
             "wt_channel_len": _env_int("WT_N1",   8),
@@ -141,6 +142,13 @@ def build_config() -> dict:
             "rsi_hi":   _env_float("HYB_RSI_HI", 64.0),
             "vol_mult": _env_float("HYB_VOL",      1.2),
         },
+        "intern_params": {
+            "hma_len":  _env_int("INTERN_HMA_LEN",   15),
+            "sl_atr":   _env_float("INTERN_SL",      2.5),
+            "tp_atr":   _env_float("INTERN_TP",      2.0),
+            "mtf_lo":   os.environ.get("INTERN_MTF_LO",  "15m"),
+            "mtf_mid":  os.environ.get("INTERN_MTF_MID", "30m"),
+        },
         "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
         "mtf_gate":            _env_bool("MTF_GATE", False),
@@ -153,13 +161,15 @@ def build_config() -> dict:
 # Build strategies
 # ---------------------------------------------------------------------------
 
-def _make_strategies(symbols: list, flags: dict, cfg: dict) -> list:
+def _make_strategies(symbols: list, flags: dict, cfg: dict,
+                     connector=None) -> list:
     from trading.strategies.wt_adx_strategy import WTADXStrategy
     from trading.strategies.ut_bot_strategy import UTBotStrategy
     from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
     from trading.strategies.swing_strategy import (
         SwingReversalStrategy, CPKRegimeStrategy, HybridSwingStrategy,
     )
+    from trading.strategies.intern_strategy import InternStrategy
 
     strategies = []
     for sym in symbols:
@@ -175,6 +185,10 @@ def _make_strategies(symbols: list, flags: dict, cfg: dict) -> list:
             strategies.append(CPKRegimeStrategy(sym, params=cfg["cpk_params"]))
         if flags.get("hybrid_swing"):
             strategies.append(HybridSwingStrategy(sym, params=cfg["hyb_params"]))
+        if flags.get("intern"):
+            strategies.append(
+                InternStrategy(sym, params=cfg["intern_params"], connector=connector)
+            )
     return strategies
 
 
@@ -235,7 +249,8 @@ async def main():
     )
 
     connector = _make_connector(cfg)
-    strategies = _make_strategies(cfg["symbols"], cfg["strategies"], cfg)
+    strategies = _make_strategies(cfg["symbols"], cfg["strategies"], cfg,
+                                  connector=connector)
     if not strategies:
         logger.error("No strategies enabled — exiting")
         sys.exit(1)

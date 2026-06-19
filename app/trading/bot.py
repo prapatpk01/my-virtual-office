@@ -241,7 +241,9 @@ class TradingBot:
                 continue
 
             if self._ai_chief:
-                # ── Chief mode: Claude decides independently ───────────────
+                # ── Chief mode: strategy exits first, then Chief decides ───
+                if sym in self._positions:
+                    await self._check_strategy_exits(sym, candles, price)
                 await self._tick_chief(sym, candles, price)
             else:
                 # ── Strategy mode (+ optional gate) ───────────────────────
@@ -250,7 +252,7 @@ class TradingBot:
     async def _tick_chief(self, sym: str, candles_1h: list, price: float):
         """Chief mode: collect strategy opinions, ask Claude, execute if BUY."""
         if sym in self._positions or len(self._positions) >= self.max_positions:
-            return
+            return  # exits already handled by _check_strategy_exits before this call
 
         # Fetch 4h and 1d for multi-TF context (HA already applied to 1h)
         candles_by_tf: dict = {"1h": candles_1h}
@@ -325,8 +327,7 @@ class TradingBot:
             logger.debug("[MTF] %s 4H not bullish — skipping", sym)
             return
 
-        if sym in self._positions or len(self._positions) >= self.max_positions:
-            return
+        buy_blocked = sym in self._positions or len(self._positions) >= self.max_positions
 
         for strategy in [s for s in self.strategies if s.symbol == sym]:
             try:
@@ -335,7 +336,16 @@ class TradingBot:
                 logger.error("Strategy %s error on %s: %s", strategy.name, sym, e)
                 continue
 
+            # SELL: close existing long immediately — no gate/Chief needed
+            if signal.type == SignalType.SELL:
+                if sym in self._positions:
+                    await self._execute_sell_early(sym, price, signal.reason, strategy.name)
+                continue
+
             if signal.type != SignalType.BUY:
+                continue
+
+            if buy_blocked:
                 continue
 
             meta = signal.metadata or {}
@@ -433,6 +443,49 @@ class TradingBot:
                 logger.error("[%s] Order failed for %s: %s", strategy_name, sym, e)
                 if self.telegram:
                     self.telegram.notify_error(sym, str(e))
+
+    # ------------------------------------------------------------------
+    # Strategy-driven early exit
+    # ------------------------------------------------------------------
+
+    async def _check_strategy_exits(self, sym: str, candles: list, price: float):
+        """Poll strategies for a SELL signal; execute early exit if one fires.
+
+        Called in Chief mode before _tick_chief so exit signals are honored
+        independently of the Chief's BUY/HOLD decision.
+        """
+        for strat in [s for s in self.strategies if s.symbol == sym]:
+            try:
+                sig = await strat.analyze(candles, price)
+            except Exception:
+                continue
+            if sig.type == SignalType.SELL:
+                await self._execute_sell_early(sym, price, sig.reason, strat.name)
+                return  # position closed — stop checking
+
+    async def _execute_sell_early(self, sym: str, price: float,
+                                   reason: str, strategy_name: str):
+        """Market-sell to close a long position on a strategy SELL signal."""
+        pos = self._positions.get(sym)
+        if not pos:
+            return
+        try:
+            order = await self.connector.create_order(sym, "sell", pos.amount)
+            exit_price = order.price or price
+            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+            self._positions.pop(sym, None)
+            logger.info(
+                "[%s] Early exit %s @ %.2f  entry=%.2f  pnl=%.2f%%  | %s",
+                strategy_name, sym, exit_price, pos.entry_price, pnl_pct, reason,
+            )
+            if self.telegram:
+                self.telegram.notify_close(
+                    sym, pos.entry_price, exit_price, pnl_pct, "strategy_exit"
+                )
+        except Exception as e:
+            logger.error("[%s] Early exit failed for %s: %s", strategy_name, sym, e)
+            if self.telegram:
+                self.telegram.notify_error(sym, f"Early exit failed: {e}")
 
     # ------------------------------------------------------------------
     # OKX position sync
