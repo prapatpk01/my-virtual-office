@@ -144,8 +144,8 @@ class SwingReversalStrategy(SwingStrategy):
 
 
 class CPKRegimeStrategy(SwingStrategy):
-    _DEFAULTS = dict(sl_atr=2.5, tp_atr=1.5, rsi_lo=40.0, rsi_hi=64.0,
-                     vol_mult=1.2, max_hold_days=4)
+    _DEFAULTS = dict(sl_atr=2.5, tp_atr=1.5, rsi_lo=44.0, rsi_hi=60.0,
+                     vol_mult=1.5, max_hold_days=4)
 
 
 class HybridSwingStrategy(SwingStrategy):
