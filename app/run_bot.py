@@ -384,14 +384,16 @@ async def main():
     # ── Backtest function (called by /backtest Telegram command) ─────────────
     async def _run_backtest() -> str:
         from trading.backtester import (
-            run_full_backtest, backtest_with_signals,
-            signal_overlap, format_comparison_telegram,
+            run_full_backtest, backtest_with_signals, backtest_strategy_mtf,
+            signal_overlap, format_comparison_telegram, summarise,
         )
         from trading.strategies.mcdx_strategy                import MCDXStrategy
         from trading.strategies.sjutbot_strategy             import SJUTBotStrategy
         from trading.strategies.sjutbot_v2_reversed_strategy import SJUTBotV2ReversedStrategy
         from trading.strategies.sjutbot_v3_strategy          import SJUTBotV3Strategy
         from trading.strategies.utbot_wt_strategy            import UTBotWTStrategy
+        from trading.strategies.scalp_trend_strategy         import ScalpTrendStrategy
+        from trading.strategies.profitable_bot_strategy      import ProfitableBotStrategy
 
         syms     = cfg["symbols"]
         sl_pct   = cfg["stop_loss_pct"]
@@ -467,6 +469,51 @@ async def main():
                                         cfg["fixed_trade_usdt"], cfg["leverage"],
                                         sl_pct, tp_pct, _cache=cache)
 
+        # ── Case 5: ScalpTrend (15m/1H/4H) + ProfBot (1H/4H) ────────────
+        # Fetch extra TFs needed by the new MTF strategies
+        case5: dict[str, dict] = {}
+        notional_c5 = cfg["fixed_trade_usdt"] * cfg["leverage"]
+        for sym in syms:
+            for tf, lim in [("15m", 2000), ("1h", 700), ("4h", 180)]:
+                k = (sym, tf)
+                if k not in cache:
+                    logger.info("[BT-C5] Fetching %s %s %d bars...", sym, tf, lim)
+                    try:
+                        cache[k] = await connector.fetch_ohlcv(sym, timeframe=tf, limit=lim)
+                    except Exception as e:
+                        logger.error("[BT-C5] fetch %s %s failed: %s", sym, tf, e)
+                        cache[k] = []
+
+            c15m = cache.get((sym, "15m"), [])
+            c1h  = cache.get((sym, "1h"),  [])
+            c4h  = cache.get((sym, "4h"),  [])
+
+            if c15m and c1h and c4h:
+                st = ScalpTrendStrategy(sym, params={
+                    "name": "ScalpTrend", "sl_mult": cfg["scalp_sl_mult"],
+                    "tp_mult": cfg["scalp_tp_mult"],
+                })
+                trades = await backtest_strategy_mtf(
+                    st, c15m, {"1h": c1h, "4h": c4h},
+                    notional_c5, sl_pct, tp_pct,
+                )
+                case5[f"ScalpTrend/{sym.split('/')[0]}"] = summarise(trades)
+
+            if c1h and c4h:
+                pb = ProfitableBotStrategy(sym, params={
+                    "name": "ProfBot", "sl_mult": cfg["prof_sl_mult"],
+                    "tp_mult": cfg["prof_tp_mult"],
+                    "rsi_oversold":   cfg["prof_rsi_oversold"],
+                    "rsi_overbought": cfg["prof_rsi_overbought"],
+                    "min_conditions": cfg["prof_min_cond"],
+                })
+                trades = await backtest_strategy_mtf(
+                    pb, c1h, {"4h": c4h},
+                    notional_c5, sl_pct, tp_pct,
+                    primary_window=200,
+                )
+                case5[f"ProfBot/{sym.split('/')[0]}"] = summarise(trades)
+
         # ── Signal correlation: v2 vs v2-reversed (should be perfect inverse)
         correlation: dict = {}
         for sym in syms:
@@ -479,7 +526,32 @@ async def main():
             _, sigs_rev = await backtest_with_signals(srev, candles, notional, sl_pct, tp_pct)
             correlation[sym] = signal_overlap(sigs_v2, sigs_rev)
 
-        return format_comparison_telegram(
+        # ── Build C5 section of message ───────────────────────────────────
+        c5_lines = ["\n📊 *C5: ScalpTrend + ProfBot (MTF)*"]
+        c5_lines.append(f"${cfg['fixed_trade_usdt']}×{cfg['leverage']}x = "
+                        f"${notional_c5:.0f} notional")
+        c5_total_net = 0.0
+        c5_total_t   = 0
+        for label, s in case5.items():
+            if s.get("trades", 0) == 0:
+                c5_lines.append(f"  `{label}` — no signals")
+                continue
+            net  = s.get("net_usdt", 0)
+            wr   = s.get("win_rate", 0)
+            pf   = s.get("profit_factor", 0)
+            t    = s["trades"]
+            icon = "✅" if net >= 0 else "❌"
+            sign = "+" if net >= 0 else ""
+            c5_lines.append(f"  {icon} `{label}` T={t} WR={wr:.0f}% PF={pf:.2f} Net=`{sign}{net:.2f}$`")
+            c5_total_net += net
+            c5_total_t   += t
+        if c5_total_t:
+            icon = "✅" if c5_total_net >= 0 else "❌"
+            sign = "+" if c5_total_net >= 0 else ""
+            c5_lines.append(f"  {icon} *Total: {sign}{c5_total_net:.2f}$ ({c5_total_t} trades)*")
+        c5_block = "\n".join(c5_lines)
+
+        comp_text = format_comparison_telegram(
             {
                 "C1 v2 + v3.1":           case1,
                 "C2 MCDXdual + v3.1":     case2,
@@ -489,6 +561,7 @@ async def main():
             correlation,
             cfg["fixed_trade_usdt"], cfg["leverage"],
         )
+        return comp_text + c5_block
 
     # ── Wire Telegram callbacks ───────────────────────────────────────────────
     if telegram:

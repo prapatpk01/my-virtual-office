@@ -4,6 +4,7 @@ Uses the same strategy.analyze() as live trading.
 Supports long + short positions with fixed % or ATR-based SL/TP.
 """
 import asyncio
+import bisect
 import logging
 import time
 from dataclasses import dataclass
@@ -102,6 +103,100 @@ async def backtest_strategy(
             continue
 
         # 1-position-per-strategy: open only when no position on either side
+        if signal.type == SignalType.BUY and open_long is None and open_short is None:
+            sl, tp = _sl_tp(signal, price, "long", sl_pct, tp_pct)
+            open_long = BTrade(
+                symbol=strategy.symbol, strategy=strategy.name,
+                side="long", entry=price, sl=sl, tp=tp, entry_ts=ts,
+            )
+        elif signal.type == SignalType.SELL and open_short is None and open_long is None:
+            sl, tp = _sl_tp(signal, price, "short", sl_pct, tp_pct)
+            open_short = BTrade(
+                symbol=strategy.symbol, strategy=strategy.name,
+                side="short", entry=price, sl=sl, tp=tp, entry_ts=ts,
+            )
+
+    return trades
+
+
+async def backtest_strategy_mtf(
+    strategy: BaseStrategy,
+    primary_candles: list[OHLCV],
+    mtf_candles: dict[str, list[OHLCV]],
+    notional: float,
+    sl_pct: float,
+    tp_pct: float,
+    warmup: int = 100,
+    primary_window: int = 300,
+    mtf_windows: Optional[dict] = None,
+) -> list[BTrade]:
+    """
+    Walk-forward backtest with MTF candle support.
+
+    For each primary bar i, passes:
+      - primary_candles[i-primary_window:i]  (rolling, avoids O(n²))
+      - mtf_candles[tf][:k] sliced up to primary bar's timestamp (via bisect)
+
+    strategy.analyze() must accept mtf_candles kwarg (e.g. ScalpTrendStrategy).
+    """
+    trades: list[BTrade] = []
+    open_long:  Optional[BTrade] = None
+    open_short: Optional[BTrade] = None
+
+    _mtf_windows = {"1h": 200, "4h": 120, "30m": 300}
+    if mtf_windows:
+        _mtf_windows.update(mtf_windows)
+
+    # Pre-index MTF timestamps for O(log n) slicing
+    mtf_ts_index = {tf: [c.timestamp for c in clist] for tf, clist in mtf_candles.items()}
+
+    for i in range(warmup, len(primary_candles)):
+        bar    = primary_candles[i]
+        ts     = bar.timestamp
+        price  = float(bar.close)
+        b_high = float(bar.high)
+        b_low  = float(bar.low)
+
+        # ── Check exits ──────────────────────────────────────────────────────
+        for pos, side in [(open_long, "long"), (open_short, "short")]:
+            if pos is None:
+                continue
+            hit_reason = hit_price = None
+            if side == "long":
+                if b_low  <= pos.sl:   hit_reason, hit_price = "stop_loss",  pos.sl
+                elif b_high >= pos.tp: hit_reason, hit_price = "take_profit", pos.tp
+            else:
+                if b_high >= pos.sl:  hit_reason, hit_price = "stop_loss",  pos.sl
+                elif b_low  <= pos.tp: hit_reason, hit_price = "take_profit", pos.tp
+            if hit_reason:
+                mult        = 1 if side == "long" else -1
+                pnl_pct     = mult * (hit_price - pos.entry) / pos.entry
+                fee         = notional * TAKER_FEE * 2
+                pos.exit_price  = hit_price
+                pos.exit_reason = hit_reason
+                pos.exit_ts     = ts
+                pos.pnl_usdt    = round(pnl_pct * notional - fee, 4)
+                trades.append(pos)
+                if side == "long":  open_long  = None
+                else:               open_short = None
+
+        # ── Build rolling slices ─────────────────────────────────────────────
+        prim_slice = primary_candles[max(0, i - primary_window): i]
+
+        mtf_sliced: dict[str, list[OHLCV]] = {}
+        for tf, ts_idx in mtf_ts_index.items():
+            idx_end   = bisect.bisect_right(ts_idx, ts)
+            win       = _mtf_windows.get(tf, 200)
+            idx_start = max(0, idx_end - win)
+            mtf_sliced[tf] = mtf_candles[tf][idx_start:idx_end]
+
+        # ── Strategy signal ──────────────────────────────────────────────────
+        try:
+            signal = await strategy.analyze(prim_slice, price, mtf_candles=mtf_sliced)
+        except Exception as e:
+            logger.debug("MTF analyze error at bar %d: %s", i, e)
+            continue
+
         if signal.type == SignalType.BUY and open_long is None and open_short is None:
             sl, tp = _sl_tp(signal, price, "long", sl_pct, tp_pct)
             open_long = BTrade(
