@@ -111,10 +111,15 @@ class BinanceConnector(BaseConnector):
         # Validate minimum order size
         min_sz = float(info.get("minSz") or 0)
         if min_sz > 0 and float(sz_str or 0) < min_sz:
-            px = price or 60000.0
-            needed = int(min_sz * px) + 1
+            px = price
+            if not px:
+                try:
+                    px = float((await self._exchange.fetch_ticker(symbol)).get("last") or 0)
+                except Exception:
+                    px = 0.0
+            needed = int(min_sz * px) + 1 if px else "more"
             raise ValueError(
-                f"Amount {amount:.6f} below OKX min {min_sz}. "
+                f"Amount {amount:.6f} below OKX min {min_sz} for {symbol}. "
                 f"Set TRADE_AMOUNT_USDT >= {needed}."
             )
 
@@ -139,16 +144,21 @@ class BinanceConnector(BaseConnector):
         if order_type == "limit" and price:
             req["px"] = self._exchange.price_to_precision(symbol, price)
 
+        # A SELL on a spot/cross-margin long must REDUCE the position, never open a short.
+        # reduceOnly prevents OKX from borrowing to open a new short if balance allows it.
+        if side == "sell":
+            req["reduceOnly"] = True
+
         # Attach TP/SL to the order atomically — OKX creates algo orders when order fills.
         # Using attachAlgoOrds instead of a separate OCO call eliminates the race condition
         # where the main order fills but the OCO call fails or times out.
         if side == "buy" and tp and sl and tp > 0 and sl > 0:
             req["attachAlgoOrds"] = [{
                 "attachAlgoClOrdId": str(uuid.uuid4()).replace("-", "")[:32],
-                "tpTriggerPx": f"{tp:.2f}",
+                "tpTriggerPx": self._exchange.price_to_precision(symbol, tp),
                 "tpOrdPx": "-1",          # -1 = market order when TP triggers
                 "tpTriggerPxType": "last",
-                "slTriggerPx": f"{sl:.2f}",
+                "slTriggerPx": self._exchange.price_to_precision(symbol, sl),
                 "slOrdPx": "-1",          # -1 = market order when SL triggers
                 "slTriggerPxType": "last",
             }]
@@ -158,23 +168,44 @@ class BinanceConnector(BaseConnector):
         data_row = ((resp or {}).get("data") or [{}])[0]
         ord_id = data_row.get("ordId") or str(uuid.uuid4())
 
-        # Fetch actual fill price from order detail (more accurate than ticker)
-        exec_price = float(price or 0)
-        try:
-            order_detail = await self._exchange.fetch_order(ord_id, symbol)
-            exec_price = float(order_detail.get("average") or
-                               order_detail.get("price") or exec_price)
-        except Exception:
-            try:
-                ticker = await self._exchange.fetch_ticker(symbol)
-                exec_price = float(ticker.get("last") or exec_price)
-            except Exception:
-                pass
+        # Resolve actual fill price. A market order may not be filled the instant the
+        # POST returns, so poll fetch_order briefly. Never accept 0 as a fill price.
+        exec_price = await self._resolve_fill_price(ord_id, symbol, price)
 
         return OrderResult(
             order_id=ord_id, symbol=symbol, side=side,
             amount=amount, price=exec_price, filled=amount, status="closed",
         )
+
+    async def _resolve_fill_price(self, ord_id: str, symbol: str,
+                                  fallback: Optional[float]) -> float:
+        """Poll the order for its average fill price; fall back to ticker, then `fallback`.
+
+        Returns a strictly positive price. Raises ValueError if no positive price can be
+        found anywhere (so the bot never stores entry_price=0 and corrupts PnL/exit math).
+        """
+        import asyncio
+        for attempt in range(3):
+            try:
+                od = await self._exchange.fetch_order(ord_id, symbol)
+                px = float(od.get("average") or od.get("price") or 0)
+                if px > 0:
+                    return px
+            except Exception:
+                pass
+            await asyncio.sleep(0.5 * (attempt + 1))
+
+        try:
+            ticker = await self._exchange.fetch_ticker(symbol)
+            px = float(ticker.get("last") or 0)
+            if px > 0:
+                return px
+        except Exception:
+            pass
+
+        if fallback and float(fallback) > 0:
+            return float(fallback)
+        raise ValueError(f"Could not resolve fill price for {symbol} order {ord_id}")
 
     async def _paper_order(self, symbol: str, side: str, amount: float,
                            order_type: str, price: Optional[float]) -> OrderResult:

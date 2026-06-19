@@ -49,6 +49,38 @@ def _s(v) -> Optional[float]:
         return None
 
 
+def _extract_json(text: str) -> dict:
+    """Pull the first JSON object out of a model response, tolerating ```json fences.
+
+    Uses brace-matching rather than lstrip('json') (which strips stray j/s/o/n chars).
+    """
+    if not text:
+        raise json.JSONDecodeError("empty", "", 0)
+    t = text.strip()
+    # Remove code fences if present
+    if "```" in t:
+        for seg in t.split("```"):
+            seg = seg.strip()
+            if seg.startswith("json"):
+                seg = seg[4:].strip()
+            if seg.startswith("{"):
+                t = seg
+                break
+    # Brace-match from first { to its matching }
+    start = t.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("no object", t, 0)
+    depth = 0
+    for i in range(start, len(t)):
+        if t[i] == "{":
+            depth += 1
+        elif t[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(t[start:i + 1])
+    return json.loads(t[start:])
+
+
 def _extract_tf_metrics(candles: list) -> dict:
     """RSI, MACD hist, EMA20/50, volume ratio for one TF (uses confirmed closed bar)."""
     from .strategies.base import BaseStrategy
@@ -320,12 +352,16 @@ class ClaudeAnalyzer:
         try:
             async with client.messages.stream(
                 model=self.model,
-                max_tokens=1200,
+                max_tokens=8000,   # adaptive thinking shares this budget — keep generous
                 thinking={"type": "adaptive"},
                 system=_CHIEF_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
             ) as stream:
                 msg = await stream.get_final_message()
+
+            if getattr(msg, "stop_reason", None) == "max_tokens":
+                logger.warning("[Chief] response truncated (max_tokens) — HOLD")
+                return ChiefDecision("HOLD", 0, "Chief: response truncated — HOLD")
 
             text = ""
             for block in msg.content:
@@ -336,16 +372,9 @@ class ClaudeAnalyzer:
             if not text:
                 return ChiefDecision("HOLD", 0, "Chief: empty response — HOLD")
 
-            if "```" in text:
-                for part in text.split("```"):
-                    p = part.strip().lstrip("json").strip()
-                    if p.startswith("{"):
-                        text = p
-                        break
-
-            parsed = json.loads(text)
+            parsed = _extract_json(text)
             action = "BUY" if str(parsed.get("action", "HOLD")).upper() == "BUY" else "HOLD"
-            conf   = float(parsed.get("confidence", 0))
+            conf   = max(0.0, min(100.0, float(parsed.get("confidence", 0))))
             reason = str(parsed.get("reasoning", ""))
 
             decision = ChiefDecision(
@@ -374,9 +403,15 @@ class ClaudeAnalyzer:
         mtf_bias: str = "unknown", volume_ratio: float = 1.0,
         recent_outcomes: list = None,
     ) -> tuple[bool, str]:
-        """Gate mode: confirm or reject a strategy BUY signal. Uses Haiku."""
+        """Gate mode: confirm or reject a strategy BUY signal. Uses Haiku.
+
+        Note: this gate fails OPEN — on missing key, parse error, or API failure it
+        returns confirm=True so AI downtime never blocks an otherwise-valid strategy
+        signal. (Chief mode fails CLOSED — it returns HOLD on any failure.)
+        """
         client = self._get_client()
         if client is None:
+            logger.warning("[Gate] ANTHROPIC_API_KEY not set — confirming without AI review")
             return True, "AI gate skipped — ANTHROPIC_API_KEY not set"
 
         sl_p = indicators.get("sl_price")
@@ -429,25 +464,24 @@ class ClaudeAnalyzer:
                     text = block.text.strip()
                     break
 
-            if "```" in text:
-                for part in text.split("```"):
-                    p = part.strip().lstrip("json").strip()
-                    if p.startswith("{"):
-                        text = p
-                        break
-
-            parsed  = json.loads(text)
+            parsed  = _extract_json(text)
             confirm = bool(parsed.get("confirm", True))
             conf    = float(parsed.get("confidence", 0.5))
             reason  = str(parsed.get("reason", ""))
 
             scores = parsed.get("scores", {})
             if scores and len(scores) == 5:
-                avg_score = sum(scores.values()) / 5
-                min_score = min(scores.values())
-                if min_score <= 1 or avg_score < 3.5:
-                    confirm = False
-                    reason  = f"score override avg={avg_score:.1f} min={min_score} | {reason}"
+                # Coerce to float — a model returning "4" as a string must not
+                # crash sum()/min() and fall through to the fail-open default.
+                try:
+                    vals = [float(v) for v in scores.values()]
+                    avg_score = sum(vals) / 5
+                    min_score = min(vals)
+                    if min_score <= 1 or avg_score < 3.5:
+                        confirm = False
+                        reason  = f"score override avg={avg_score:.1f} min={min_score:.0f} | {reason}"
+                except (TypeError, ValueError):
+                    logger.warning("[Gate] non-numeric scores: %s", scores)
 
             logger.info("[Gate] %s %s → confirm=%s conf=%.2f | %s",
                         strategy_name, symbol, confirm, conf, reason)

@@ -77,6 +77,7 @@ class TradingBot:
         self._start_balance: float = 0.0
         self._current_balance: float = 0.0
         self._paper = connector.paper
+        self._dd_halted_notified = False
 
     # ------------------------------------------------------------------
     # Public control
@@ -105,7 +106,7 @@ class TradingBot:
                     self._paper, self.interval,
                     list({s.symbol for s in self.strategies}))
         if self.telegram:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self.telegram.start_polling(loop)
             self.telegram.notify_bot_started(
                 self._paper,
@@ -212,6 +213,18 @@ class TradingBot:
         await self._refresh_balance()
         await self._sync_okx_positions()
         await self._check_spot_exits()
+
+        # Drawdown guard: halt new entries if equity fell past the max-drawdown limit.
+        self.risk.update_peak(self._current_balance)
+        if not self.risk.check_drawdown(self._current_balance):
+            if not self._dd_halted_notified:
+                logger.error("MAX DRAWDOWN reached — halting new entries (balance=%.2f peak=%.2f)",
+                             self._current_balance, self.risk._peak_balance)
+                if self.telegram:
+                    self.telegram.notify_drawdown_halt(
+                        self._current_balance, self.risk._peak_balance)
+                self._dd_halted_notified = True
+            return
 
         symbols = list({s.symbol for s in self.strategies})
         for sym in symbols:
@@ -447,7 +460,15 @@ class TradingBot:
                     exit_price = pos.entry_price
 
                 pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
-                reason = "take_profit" if exit_price >= pos.entry_price else "stop_loss"
+                # Infer close reason from which level the exit price is closest to,
+                # not from entry — a TP close that ticked back below entry should still
+                # report take_profit. Fall back to entry comparison if levels missing.
+                if pos.take_profit and pos.stop_loss:
+                    d_tp = abs(exit_price - pos.take_profit)
+                    d_sl = abs(exit_price - pos.stop_loss)
+                    reason = "take_profit" if d_tp <= d_sl else "stop_loss"
+                else:
+                    reason = "take_profit" if exit_price >= pos.entry_price else "stop_loss"
                 logger.info("[OKX-sync] %s closed by OCO: exit=%.2f entry=%.2f pnl=%.2f%%",
                             sym, exit_price, pos.entry_price, pnl_pct)
                 if self.telegram:

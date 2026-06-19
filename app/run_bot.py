@@ -264,12 +264,12 @@ async def main():
         mtf_gate=cfg["mtf_gate"],
     )
 
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
     if telegram:
         telegram.bot = bot
         telegram.stop_bot_fn = lambda: stop_event.set()
-
-    stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
 
     def _handle_signal():
         logger.info("Shutdown signal received")
