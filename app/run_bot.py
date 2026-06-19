@@ -104,20 +104,22 @@ def build_config() -> dict:
         "mcdx2_rsi_max":     _env_int("MCDX2_RSI_MAX",     72),
 
         # ── Scalp Trend tuning (15m entry / 1H+4H MTF) ───────────────────────
-        # sl_mult=0.8, tp_mult=1.0 → TP1-only (high hit-rate scalp style)
-        "scalp_sl_mult":     _env_float("SCALP_SL_MULT",      0.8),
-        "scalp_tp_mult":     _env_float("SCALP_TP_MULT",      1.0),
-        "scalp_rsi_min":     _env_float("SCALP_RSI_MIN",     42.0),
-        "scalp_rsi_max":     _env_float("SCALP_RSI_MAX",     65.0),
-        "scalp_pullback_pct":_env_float("SCALP_PULLBACK_PCT",  0.015),
+        # sl_mult=1.5, tp_mult=1.875 → R:R 1:1.25 (break-even WR=44.4%)
+        "scalp_sl_mult":      _env_float("SCALP_SL_MULT",      1.5),
+        "scalp_tp_mult":      _env_float("SCALP_TP_MULT",     1.875),
+        "scalp_rsi_min":      _env_float("SCALP_RSI_MIN",     38.0),   # wider RSI band
+        "scalp_rsi_max":      _env_float("SCALP_RSI_MAX",     72.0),
+        "scalp_pullback_pct": _env_float("SCALP_PULLBACK_PCT",  0.025), # ±2.5% zone
+        "scalp_min_entry":    _env_int("SCALP_MIN_ENTRY",          3),  # 3/4 conditions
 
         # ── Profitable Bot tuning (1H entry / 4H MTF) ────────────────────────
-        # sl_mult=1.5, tp_mult=2.5 → R:R ≈ 1:1.67 (ATR-based, no fixed %)
-        "prof_sl_mult":       _env_float("PROF_SL_MULT",      1.5),
-        "prof_tp_mult":       _env_float("PROF_TP_MULT",      2.5),
-        "prof_rsi_oversold":  _env_float("PROF_RSI_OVERSOLD", 35.0),
-        "prof_rsi_overbought":_env_float("PROF_RSI_OVERBOUGHT",65.0),
-        "prof_min_cond":      _env_int("PROF_MIN_COND",         3),
+        # sl_mult=1.5, tp_mult=1.875 → R:R 1:1.25 (break-even WR=44.4%)
+        # min_cond=2 (2/4), rsi_oversold=42 — higher trigger frequency
+        "prof_sl_mult":       _env_float("PROF_SL_MULT",       1.5),
+        "prof_tp_mult":       _env_float("PROF_TP_MULT",      1.875),
+        "prof_rsi_oversold":  _env_float("PROF_RSI_OVERSOLD",  42.0),   # ↑ from 35
+        "prof_rsi_overbought":_env_float("PROF_RSI_OVERBOUGHT",58.0),   # ↓ from 65
+        "prof_min_cond":      _env_int("PROF_MIN_COND",             2),  # ↓ from 3
 
         # ── SJUTBot v2 tuning ─────────────────────────────────────────────────
         "sjutbot_sl_mult": _env_float("SJUTBOT_SL_MULT", 1.2),
@@ -264,24 +266,28 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             }))
 
         # ── Scalp Trend (15m entry / 1H+4H MTF) ───────────────────────────────
+        # SL=1.5×ATR, TP=1.875×ATR → R:R 1:1.25, break-even WR=44.4%
         if cfg["strategy_scalp_trend"]:
             strategies.append(ScalpTrendStrategy(sym, params={
-                "name":        "ScalpTrend",
-                "tf":          "15m",
-                "limit":       200,
-                "sl_mult":     cfg["scalp_sl_mult"],
-                "tp_mult":     cfg["scalp_tp_mult"],
-                "rsi_min":     cfg["scalp_rsi_min"],
-                "rsi_max":     cfg["scalp_rsi_max"],
-                "pullback_pct":cfg["scalp_pullback_pct"],
+                "name":          "ScalpTrend",
+                "tf":            "15m",
+                "limit":         300,
+                "sl_mult":       cfg["scalp_sl_mult"],
+                "tp_mult":       cfg["scalp_tp_mult"],
+                "rsi_min":       cfg["scalp_rsi_min"],
+                "rsi_max":       cfg["scalp_rsi_max"],
+                "pullback_pct":  cfg["scalp_pullback_pct"],
+                "min_entry_cond":cfg["scalp_min_entry"],
+                "vol_mult":      1.0,     # lenient volume gate
             }))
 
         # ── Profitable Bot (1H entry / 4H MTF) ────────────────────────────────
+        # SL=1.5×ATR, TP=1.875×ATR → R:R 1:1.25, 2/4 conditions needed
         if cfg["strategy_prof_bot"]:
             strategies.append(ProfitableBotStrategy(sym, params={
                 "name":           "ProfBot",
                 "tf":             "1h",
-                "limit":          200,
+                "limit":          300,
                 "sl_mult":        cfg["prof_sl_mult"],
                 "tp_mult":        cfg["prof_tp_mult"],
                 "rsi_oversold":   cfg["prof_rsi_oversold"],
@@ -490,8 +496,14 @@ async def main():
 
             if c15m and c1h and c4h:
                 st = ScalpTrendStrategy(sym, params={
-                    "name": "ScalpTrend", "sl_mult": cfg["scalp_sl_mult"],
-                    "tp_mult": cfg["scalp_tp_mult"],
+                    "name": "ScalpTrend",
+                    "sl_mult":       cfg["scalp_sl_mult"],
+                    "tp_mult":       cfg["scalp_tp_mult"],
+                    "rsi_min":       cfg["scalp_rsi_min"],
+                    "rsi_max":       cfg["scalp_rsi_max"],
+                    "pullback_pct":  cfg["scalp_pullback_pct"],
+                    "min_entry_cond":cfg["scalp_min_entry"],
+                    "vol_mult": 1.0,
                 })
                 trades = await backtest_strategy_mtf(
                     st, c15m, {"1h": c1h, "4h": c4h},
@@ -501,8 +513,9 @@ async def main():
 
             if c1h and c4h:
                 pb = ProfitableBotStrategy(sym, params={
-                    "name": "ProfBot", "sl_mult": cfg["prof_sl_mult"],
-                    "tp_mult": cfg["prof_tp_mult"],
+                    "name": "ProfBot",
+                    "sl_mult":        cfg["prof_sl_mult"],
+                    "tp_mult":        cfg["prof_tp_mult"],
                     "rsi_oversold":   cfg["prof_rsi_oversold"],
                     "rsi_overbought": cfg["prof_rsi_overbought"],
                     "min_conditions": cfg["prof_min_cond"],

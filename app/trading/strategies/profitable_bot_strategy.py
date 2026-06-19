@@ -4,17 +4,19 @@ Profitable Bot Strategy — Futures Long & Short
 Adapted from profitable.py, extended to support both long and short positions.
 
 3-layer filter:
-  Layer 1 — 4H trend guard (EMA20 vs EMA50 + slope)
-  Layer 2 — 1H entry: 3/4 conditions required
-  Layer 3 — ATR-based SL/TP with R:R ≈ 1:1.67
+  Layer 1 — 4H trend guard (EMA20 vs EMA50 position)
+  Layer 2 — 1H entry: min_cond / 4 conditions required (default 2/4)
+  Layer 3 — ATR-based SL/TP
 
-BUY  (long)  : 4H NOT "down" + 1H oversold bounce (RSI 2-bar confirm + 3/4)
-SELL (short) : 4H "down"     + 1H overbought rejection (RSI 2-bar confirm + 3/4)
+sl_mult=1.5, tp_mult=1.875 → R:R = 1:1.25 (break-even WR = 44.4%)
 
-1H conditions:
-  1. RSI 2-bar confirmation (oversold/overbought for 2 consecutive bars + bounce/drop)
-  2. MACD histogram direction (positive / negative crossover or continuation)
-  3. Bollinger Band bounce/rejection (prev close at/beyond band, curr close past band back)
+BUY  (long)  : 4H NOT "down" + 1H oversold bounce (min_cond/4 conditions met)
+SELL (short) : 4H "down"     + 1H overbought rejection (min_cond/4 conditions met)
+
+1H conditions (any min_cond of 4):
+  1. RSI oversold / overbought (single bar, adjustable threshold)
+  2. MACD histogram direction crossover or continuation
+  3. Bollinger Band bounce off lower / rejection off upper band
   4. Volume spike ≥ vol_mult × MA20
 
 MTF candles required: 4h (fetched automatically via MTF_TIMEFRAMES).
@@ -29,24 +31,24 @@ class ProfitableBotStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.rsi_period      = self.params.get("rsi_period",      14)
-        self.rsi_oversold    = self.params.get("rsi_oversold",    35.0)
-        self.rsi_overbought  = self.params.get("rsi_overbought",  65.0)
-        self.macd_fast       = self.params.get("macd_fast",       12)
-        self.macd_slow       = self.params.get("macd_slow",       26)
-        self.macd_sig        = self.params.get("macd_signal",      9)
-        self.bb_period       = self.params.get("bb_period",       20)
-        self.bb_std          = self.params.get("bb_std",          2.0)
-        self.vol_period      = self.params.get("vol_period",      20)
-        self.vol_mult        = self.params.get("vol_mult",        1.3)
-        self.min_cond        = self.params.get("min_conditions",   3)
-        self.atr_period      = self.params.get("atr_period",      14)
-        self.sl_mult         = self.params.get("sl_mult",         1.5)
-        self.tp_mult         = self.params.get("tp_mult",         2.5)
-        self.sl_min_pct      = self.params.get("sl_min_pct",      0.015)
-        self.sl_max_pct      = self.params.get("sl_max_pct",      0.07)
-        self.trend_ema_fast  = self.params.get("trend_ema_fast",  20)
-        self.trend_ema_slow  = self.params.get("trend_ema_slow",  50)
+        self.rsi_period      = self.params.get("rsi_period",       14)
+        self.rsi_oversold    = self.params.get("rsi_oversold",    42.0)  # ↑ from 35 — more signals
+        self.rsi_overbought  = self.params.get("rsi_overbought",  58.0)  # ↓ from 65 — more signals
+        self.macd_fast       = self.params.get("macd_fast",        12)
+        self.macd_slow       = self.params.get("macd_slow",        26)
+        self.macd_sig        = self.params.get("macd_signal",       9)
+        self.bb_period       = self.params.get("bb_period",        20)
+        self.bb_std          = self.params.get("bb_std",           2.0)
+        self.vol_period      = self.params.get("vol_period",       20)
+        self.vol_mult        = self.params.get("vol_mult",         1.2)
+        self.min_cond        = self.params.get("min_conditions",     2)  # ↓ from 3 — 2/4 needed
+        self.atr_period      = self.params.get("atr_period",       14)
+        self.sl_mult         = self.params.get("sl_mult",          1.5)
+        self.tp_mult         = self.params.get("tp_mult",        1.875)  # SL×1.25 → R:R 1:1.25
+        self.sl_min_pct      = self.params.get("sl_min_pct",      0.010)
+        self.sl_max_pct      = self.params.get("sl_max_pct",      0.070)
+        self.trend_ema_fast  = self.params.get("trend_ema_fast",   20)
+        self.trend_ema_slow  = self.params.get("trend_ema_slow",   50)
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
@@ -61,16 +63,16 @@ class ProfitableBotStrategy(BaseStrategy):
         vols      = [c.volume for c in candles]
         closes_4h = [c.close for c in candles_4h]
 
-        # ── 4H trend guard ────────────────────────────────────────────────────
+        # ── 4H trend guard (position only, no slope required) ────────────────
         ef4 = self.ema(closes_4h, self.trend_ema_fast)
         es4 = self.ema(closes_4h, self.trend_ema_slow)
-        if np.isnan(ef4[-1]) or np.isnan(es4[-1]) or np.isnan(ef4[-2]):
+        if np.isnan(ef4[-1]) or np.isnan(es4[-1]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           "[ProfBot] 4H EMA not ready")
-        slope_up_4h = bool(ef4[-1] > ef4[-2])
-        if ef4[-1] > es4[-1] and slope_up_4h:
+        # Simple position-based trend (removed slope requirement for more signals)
+        if ef4[-1] > es4[-1]:
             trend_4h = "up"
-        elif ef4[-1] < es4[-1] and not slope_up_4h:
+        elif ef4[-1] < es4[-1]:
             trend_4h = "down"
         else:
             trend_4h = "flat"
@@ -96,7 +98,7 @@ class ProfitableBotStrategy(BaseStrategy):
                           "[ProfBot] Indicators not ready")
 
         vol_ok = volma_c > 0 and vol_c >= volma_c * self.vol_mult
-        rr = (atr_v * self.tp_mult) / max(atr_v * self.sl_mult, 1e-9)
+        rr     = self.tp_mult / max(self.sl_mult, 1e-9)
 
         def _sl_tp(side: str) -> tuple[float, float]:
             raw  = atr_v * self.sl_mult
@@ -106,14 +108,14 @@ class ProfitableBotStrategy(BaseStrategy):
                 return round(current_price - dist, 2), round(current_price + atr_v * self.tp_mult, 2)
             return round(current_price + dist, 2), round(current_price - atr_v * self.tp_mult, 2)
 
-        # ── BUY (long): 4H not down, 1H oversold bounce ───────────────────────
+        # ── BUY (long): 4H up/flat + 1H oversold bounce ──────────────────────
         if trend_4h != "down":
-            rsi_2bar = (rsi_p <= self.rsi_oversold and
-                        rsi_c <= self.rsi_oversold and rsi_c > rsi_p)
-            macd_bull = ((hist_p < 0 and hist_c > 0) or
-                         (hist_c > 0 and hist_c > hist_p and not np.isnan(hist_p)))
-            bb_bounce = (close_p <= bbl_p) and (close_c > bbl_c)
-            met = sum([rsi_2bar, macd_bull, bb_bounce, vol_ok])
+            # Single-bar RSI check (not 2-bar, more lenient)
+            rsi_bull   = rsi_c <= self.rsi_oversold and rsi_c > rsi_p   # oversold + bouncing
+            macd_bull  = ((hist_p < 0 and hist_c > 0) or
+                          (hist_c > 0 and hist_c > hist_p and not np.isnan(hist_p)))
+            bb_bounce  = (close_p <= bbl_p) and (close_c > bbl_c)
+            met = sum([rsi_bull, macd_bull, bb_bounce, vol_ok])
             if met >= self.min_cond:
                 sl, tp = _sl_tp("long")
                 return Signal(
@@ -121,19 +123,18 @@ class ProfitableBotStrategy(BaseStrategy):
                     amount=0.08,
                     reason=(f"[ProfBot] 4H={trend_4h} RSI={rsi_c:.0f} "
                             f"MACD={'✓' if macd_bull else '✗'} BB={'✓' if bb_bounce else '✗'} "
-                            f"cond={met}/4 RR=1:{rr:.1f}"),
-                    confidence=min(0.60 + met * 0.05, 0.85),
+                            f"cond={met}/4 RR=1:{rr:.2f}"),
+                    confidence=min(0.55 + met * 0.07, 0.85),
                     metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
                 )
 
-        # ── SELL (short): 4H down, 1H overbought rejection ────────────────────
+        # ── SELL (short): 4H down + 1H overbought rejection ──────────────────
         if trend_4h == "down":
-            rsi_2bar = (rsi_p >= self.rsi_overbought and
-                        rsi_c >= self.rsi_overbought and rsi_c < rsi_p)
-            macd_bear = ((hist_p > 0 and hist_c < 0) or
-                         (hist_c < 0 and hist_c < hist_p and not np.isnan(hist_p)))
-            bb_reject = (close_p >= bbu_p) and (close_c < bbu_c)
-            met = sum([rsi_2bar, macd_bear, bb_reject, vol_ok])
+            rsi_bear   = rsi_c >= self.rsi_overbought and rsi_c < rsi_p   # overbought + dropping
+            macd_bear  = ((hist_p > 0 and hist_c < 0) or
+                          (hist_c < 0 and hist_c < hist_p and not np.isnan(hist_p)))
+            bb_reject  = (close_p >= bbu_p) and (close_c < bbu_c)
+            met = sum([rsi_bear, macd_bear, bb_reject, vol_ok])
             if met >= self.min_cond:
                 sl, tp = _sl_tp("short")
                 return Signal(
@@ -141,12 +142,12 @@ class ProfitableBotStrategy(BaseStrategy):
                     amount=0.08,
                     reason=(f"[ProfBot] 4H=down RSI={rsi_c:.0f} "
                             f"MACD={'✓' if macd_bear else '✗'} BB={'✓' if bb_reject else '✗'} "
-                            f"cond={met}/4 RR=1:{rr:.1f}"),
-                    confidence=min(0.60 + met * 0.05, 0.85),
+                            f"cond={met}/4 RR=1:{rr:.2f}"),
+                    confidence=min(0.55 + met * 0.07, 0.85),
                     metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
                 )
 
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            reason=f"[ProfBot] 4H={trend_4h} RSI={rsi_c:.0f} conditions not met",
+            reason=f"[ProfBot] 4H={trend_4h} RSI={rsi_c:.0f} cond not met",
         )
