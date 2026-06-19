@@ -293,21 +293,27 @@ SWING_WARMUP  = 210
 INTERN_WARMUP = 60
 
 STANDALONE_CFG: dict[str, dict] = {
-    "SwingReversalStrategy": dict(sl=2.5, tp=1.5, rlo=30.0, rhi=68.0, vol=1.0, cd=1, hold=72),
-    "CPKRegimeStrategy":     dict(sl=2.5, tp=1.5, rlo=36.0, rhi=70.0, vol=1.0, cd=1, hold=96),
-    "HybridSwingStrategy":   dict(sl=2.5, tp=1.6, rlo=34.0, rhi=70.0, vol=1.0, cd=1, hold=48),
-    # Intern uses favorable R:R (TP=2×SL) → BEP ≈ 38%.
-    # sell_in_bt=False: disables HMA-cross early exit in backtest.
-    # On synthetic GBM, HMA whipsaws every ~4h and converts winning trades
-    # into small-profit early exits — this is a GBM artifact, not a real edge.
-    # On live BTC/ETH trends, HMA holds much longer so the sell works as intended.
-    # Setting sell_in_bt=False isolates entry quality (TP/SL geometry) from
-    # exit timing, giving a fair read on whether the entry conditions have edge.
-    "InternStrategy":        dict(sl=1.5, tp=3.0, cd=3, hold=60,
-                                  bias_lo=1.0, bias_mid=1.0, sell_in_bt=False),
+    "SwingReversalStrategy":   dict(sl=2.5, tp=1.5, rlo=30.0, rhi=68.0, vol=1.0, cd=1, hold=72),
+    "CPKRegimeStrategy":       dict(sl=2.5, tp=1.5, rlo=36.0, rhi=70.0, vol=1.0, cd=1, hold=96),
+    "HybridSwingStrategy":     dict(sl=2.5, tp=1.6, rlo=34.0, rhi=70.0, vol=1.0, cd=1, hold=48),
+    # Intern — shown twice:
+    #   (entry-only): sell disabled — isolates entry quality (TP/SL geometry)
+    #   (faithful)  : sell fires on HMA-cross-down, identical to live behaviour
+    "InternStrategy":          dict(sl=1.5, tp=3.0, cd=3, hold=60,
+                                    bias_lo=1.0, bias_mid=1.0, sell_in_bt=False),
+    "InternStrategy(faithful)": dict(sl=1.5, tp=1.5, cd=3, hold=60,
+                                     bias_lo=1.0, bias_mid=1.0, sell_in_bt=True),
 }
-STRAT_ORDER = ["SwingReversalStrategy", "CPKRegimeStrategy",
-               "HybridSwingStrategy", "InternStrategy"]
+# STRAT_ORDER: key in STANDALONE_CFG; display_name maps to InternStrategy class
+STRAT_ORDER = [
+    "SwingReversalStrategy",
+    "CPKRegimeStrategy",
+    "HybridSwingStrategy",
+    "InternStrategy",
+    "InternStrategy(faithful)",
+]
+# Map config-key → strategy class name used in _simulate_standalone
+STRAT_CLASS = {k: k.split("(")[0] for k in STRAT_ORDER}
 
 
 def _mk_trade(sym, name, pos, exit_price, reason, bar_i) -> Trade:
@@ -326,7 +332,8 @@ def _mk_trade(sym, name, pos, exit_price, reason, bar_i) -> Trade:
 def _simulate_standalone(sym: str, name: str, ind: dict, ha: dict) -> list[Trade]:
     """Run ONE strategy on ONE symbol with its own position slot."""
     cfg       = STANDALONE_CFG[name]
-    is_intern = name == "InternStrategy"
+    cls_name  = STRAT_CLASS[name]          # "InternStrategy" or swing name
+    is_intern = cls_name == "InternStrategy"
     d         = ind[sym]
     bars      = ha[sym]["1h"]
     n         = len(bars)
@@ -672,23 +679,39 @@ def _bep(trade_list: list[Trade]) -> float:
     return avg_l / (avg_w + avg_l) * 100  # = % WR needed to break even
 
 
+_INTERN_KEYS   = {"InternStrategy", "InternStrategy(faithful)"}
+_DISPLAY_NAMES = {
+    "InternStrategy":           "Intern(entry-only TP/SL)",
+    "InternStrategy(faithful)": "Intern(faithful+HMA-exit)",
+}
+
+
 def print_standalone(standalone: dict[str, list[Trade]], bars: int):
     """Per-SJ standalone performance — each strategy on its own slot."""
     months = bars / 24 / 30.0
-    print("\n" + "═" * 82)
-    print(f"{'  STANDALONE PER-STRATEGY REPORT  (each SJ trades on its own slot)':^82}")
-    print(f"{'  ~%.1f months  |  %d symbols  |  $%.0f / trade' % (months, len(SYMBOLS), TRADE_USDT):^82}")
-    print("═" * 82)
-    print(f"\n{'Strategy':<26} {'#':>4} {'/mo':>5} {'WR%':>6} {'BEP%':>6} "
+    W = 86
+    print("\n" + "═" * W)
+    print(f"{'  STANDALONE PER-STRATEGY REPORT  (each SJ trades on its own slot)':^{W}}")
+    print(f"{'  ~%.1f months  |  %d symbols  |  $%.0f / trade' % (months, len(SYMBOLS), TRADE_USDT):^{W}}")
+    print("═" * W)
+    print(f"\n{'Strategy':<30} {'#':>4} {'/mo':>5} {'WR%':>6} {'BEP%':>6} "
           f"{'PnL$':>9} {'AvgPnL%':>8} {'MaxDD$':>8} {'Hold':>5}")
-    print("─" * 82)
+    print("─" * W)
 
     all_pass = True
+    intern_separator_done = False
     for name in STRAT_ORDER:
+        # Print a blank separator line before the two Intern rows
+        if name in _INTERN_KEYS and not intern_separator_done:
+            print("  ┄ Intern shown twice: entry-only (TP/SL geometry) vs faithful (live logic)")
+            intern_separator_done = True
+
+        display = _DISPLAY_NAMES.get(name, name)
         ts = standalone.get(name, [])
         if not ts:
-            print(f"{name:<26} {'—':>4}")
-            all_pass = False
+            print(f"{display:<30} {'—':>4}")
+            if name not in _INTERN_KEYS:
+                all_pass = False
             continue
         wins    = sum(1 for t in ts if t.pnl_usdt > 0)
         wr      = wins / len(ts) * 100
@@ -698,22 +721,25 @@ def print_standalone(standalone: dict[str, list[Trade]], bars: int):
         avg_h   = sum(t.bars_held for t in ts) / len(ts)
         per_mo  = len(ts) / months if months else 0
         ok      = pnl > 0 and per_mo >= 10
-        if not ok:
+        # For overall pass/fail only count non-Intern (Intern's pass is informational)
+        if name not in _INTERN_KEYS and not ok:
             all_pass = False
         flag    = "  ✓" if ok else "  ⚠"
-        print(f"{name:<26} {len(ts):>4} {per_mo:>5.1f} {wr:>5.1f}% {bep:>5.1f}% "
+        print(f"{display:<30} {len(ts):>4} {per_mo:>5.1f} {wr:>5.1f}% {bep:>5.1f}% "
               f"{pnl:>+9.2f} {avg_pct:>+7.2f}% {dd:>+8.2f} {avg_h:>4.1f}h{flag}")
 
-    all_t = [t for ts in standalone.values() for t in ts]
+    # Summary — exclude faithful Intern from "ALL" sum (would double-count entries)
+    main_keys  = [n for n in STRAT_ORDER if n != "InternStrategy(faithful)"]
+    all_t      = [t for n in main_keys for t in standalone.get(n, [])]
     if all_t:
         wins    = sum(1 for t in all_t if t.pnl_usdt > 0)
         pnl, dd = _equity_curve(all_t)
-        print("─" * 82)
-        print(f"{'ALL (sum)':<26} {len(all_t):>4} {len(all_t)/months:>5.1f} "
+        print("─" * W)
+        print(f"{'ALL excl. faithful Intern':<30} {len(all_t):>4} {len(all_t)/months:>5.1f} "
               f"{wins/len(all_t)*100:>5.1f}%        {pnl:>+9.2f}")
-        print(f"\n  BEP = break-even win rate from actual avg win / avg loss")
-        print(f"  Target: each SJ profitable (PnL>0) and ≥10 trades/month")
-        print(f"  Overall: {'✓ ALL PROFITABLE' if all_pass else '⚠ some not profitable'}")
+    print(f"\n  BEP  = break-even WR computed from actual avg-win / avg-loss (fees included)")
+    print(f"  ✓ = PnL > 0  AND  ≥10 trades/month   (Intern rows are informational)")
+    print(f"  Core 3 SJs: {'✓ ALL PROFITABLE' if all_pass else '⚠ some not profitable'}")
 
 
 def print_report(trades: list[Trade], stats: dict):
