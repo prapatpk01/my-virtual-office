@@ -102,7 +102,7 @@ class BinanceConnector(BaseConnector):
                 try:
                     await self._exchange.set_leverage(
                         self._leverage, symbol,
-                        params={"mgnMode": "cross", "posSide": ps},
+                        params={"mgnMode": "isolated", "posSide": ps},
                     )
                     any_ok = True
                 except Exception as e:
@@ -164,7 +164,7 @@ class BinanceConnector(BaseConnector):
                 logger.info("OKX contract conversion: %.6f → %d contracts (ctVal=%.4f)",
                             raw_amount, contracts, ct_val)
 
-                params["tdMode"] = "cross"
+                params["tdMode"] = "isolated"
                 if pos_side:
                     params["posSide"] = pos_side
                 # OKX hedge mode: posSide already specifies which leg to close;

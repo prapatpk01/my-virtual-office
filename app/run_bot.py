@@ -83,7 +83,7 @@ def build_config() -> dict:
         "strategy_mcdx":         _env_bool("STRATEGY_MCDX",         False),
         "strategy_mcdx_dual":    _env_bool("STRATEGY_MCDX_DUAL",    False),
         "strategy_sjutbot":      _env_bool("STRATEGY_SJUTBOT",      False),
-        "strategy_sjutbot_v3":   _env_bool("STRATEGY_SJUTBOT_V3",   False),
+        "strategy_sjutbot_v3":   _env_bool("STRATEGY_SJUTBOT_V3",   True),
         "strategy_sjutbot_v2rev":_env_bool("STRATEGY_SJUTBOT_V2REV",False),
         "strategy_utbot":        _env_bool("STRATEGY_UTBOT",        False),
         "strategy_scalp_trend":  _env_bool("STRATEGY_SCALP_TREND",  False),
@@ -185,7 +185,7 @@ def build_config() -> dict:
         # Max open positions across all strategies + symbols.
         # 3 strategies × 2 symbols × 2 sides = 12 theoretical max.
         # Set lower to limit capital exposure (default: 6 = 3 strats × 2 symbols, 1 side each).
-        "max_positions":  _env_int("MAX_POSITIONS",  3),
+        "max_positions":  _env_int("MAX_POSITIONS",  4),
         "max_drawdown":   _env_float("MAX_DRAWDOWN_PCT", 0.30),  # 30% drawdown halt
 
         # ── Timing ────────────────────────────────────────────────────────────
