@@ -537,29 +537,29 @@ _MAJOR_COINS = {"BTC/USDT", "ETH/USDT", "BNB/USDT"}
 
 
 def _simulate_profitable(sym: str, d_ext: dict, ha: dict) -> list[Trade]:
-    """ProfitableBot: 1H entry with 4H trend guard."""
+    """ProfitableBot: 1H trend-following with relaxed entry (2/4 conditions)."""
     bars_1h = ha[sym]["1h"]
     n = len(bars_1h)
     if n < 50:
         return []
 
-    closes   = np.array([b.close  for b in bars_1h], dtype=float)
-    highs    = np.array([b.high   for b in bars_1h], dtype=float)
-    lows     = np.array([b.low    for b in bars_1h], dtype=float)
-    volumes  = np.array([b.volume for b in bars_1h], dtype=float)
+    closes  = np.array([b.close  for b in bars_1h], dtype=float)
+    volumes = np.array([b.volume for b in bars_1h], dtype=float)
 
-    rsi14     = d_ext["rsi14_1h"]
-    mhist     = d_ext["mhist_1h"]
-    bb_lower  = d_ext["bb_lower_1h"]
-    volma20   = d_ext["volma20_1h"]
-    atr14     = d_ext["atr14_1h"]
-    ema20_4h  = d_ext["ema20_4h"]
-    ema50_4h  = d_ext["ema50_4h"]
+    rsi14    = d_ext["rsi14_1h"]
+    mhist    = d_ext["mhist_1h"]
+    bb_lower = d_ext["bb_lower_1h"]
+    volma20  = d_ext["volma20_1h"]
+    atr14    = d_ext["atr14_1h"]
+    ema20_1h = d_ext["ema20_1h"]
+    ema50_1h = d_ext["ema50_1h"]
+    ema20_4h = d_ext["ema20_4h"]
+    ema50_4h = d_ext["ema50_4h"]
     ema20_4h_slope = d_ext["ema20_4h_slope"]
 
-    is_major = sym in _MAJOR_COINS
-    sl_mult  = 1.5 if is_major else 2.0
-    tp_mult  = 2.5 if is_major else 3.0
+    # TP < SL → high WR on trending moves; R:R is ~0.6 so BEP ~62%
+    sl_mult    = 2.0
+    tp_mult    = 1.2
     sl_min_pct = 0.015
     sl_max_pct = 0.07
 
@@ -587,94 +587,94 @@ def _simulate_profitable(sym: str, d_ext: dict, ha: dict) -> list[Trade]:
                                   if abs(bar.open - pos["tp"]) < abs(bar.open - pos["sl"])
                                   else ("sl", pos["sl"]))
 
-            # Breakeven lock
+            # Breakeven lock when profit reaches 1×ATR
             if exit_r is None:
-                atr_e = pos["atr_entry"]
-                if not pos["be_locked"] and (cp - pos["entry_price"]) >= 1.0 * atr_e:
+                if not pos["be_locked"] and (cp - pos["entry_price"]) >= pos["atr_entry"]:
                     new_sl = pos["entry_price"] * 1.002
                     if new_sl > pos["sl"]:
                         pos["sl"] = new_sl
                         pos["be_locked"] = True
 
-            # Time stop: 72 bars
             if exit_r is None and (i - pos["entry_bar"]) >= 72:
                 exit_r, exit_p = "max_hold", cp
 
             if exit_r is not None:
                 trades.append(_mk_trade(sym, "ProfitableBot", pos, exit_p, exit_r, i))
                 pos = None
-                cooldown = 5
-            continue  # no new entry bar while pos is open (checked above, but after exit)
+                cooldown = 2
+            continue
 
-        # Cooldown
         if cooldown > 0:
             cooldown -= 1
             continue
 
-        # Warmup
         if i < WARMUP:
             continue
 
-        # Data validity
-        rsi_cur  = float(rsi14[i])
-        rsi_prev = float(rsi14[i - 1])
+        rsi_cur   = float(rsi14[i])
+        rsi_prev  = float(rsi14[i - 1])
         hist_cur  = float(mhist[i])
         hist_prev = float(mhist[i - 1])
         bb_l_cur  = float(bb_lower[i])
         bb_l_prev = float(bb_lower[i - 1])
-        close_cur  = cp
         close_prev = float(closes[i - 1])
         vol_cur   = float(volumes[i])
         vma_cur   = float(volma20[i])
         atr_cur   = float(atr14[i])
+        e20_1h    = float(ema20_1h[i])
+        e50_1h    = float(ema50_1h[i])
         e20_4h    = float(ema20_4h[i])
         e50_4h    = float(ema50_4h[i])
         slope_4h  = float(ema20_4h_slope[i]) if not math.isnan(ema20_4h_slope[i]) else 0.0
 
         if any(math.isnan(v) for v in [rsi_cur, rsi_prev, hist_cur, hist_prev,
-                                        bb_l_cur, bb_l_prev, vma_cur, atr_cur]):
+                                        bb_l_cur, bb_l_prev, vma_cur, atr_cur,
+                                        e20_1h, e50_1h]):
             continue
 
-        # 4H trend guard: block if EMA20_4h < EMA50_4h AND slope negative
+        # Mandatory base: 1H uptrend
+        if e20_1h <= e50_1h:
+            continue
+
+        # Soft 4H guard: only block sharply bearish 4H (both below AND slope strongly negative)
         if not math.isnan(e20_4h) and not math.isnan(e50_4h):
-            if e20_4h < e50_4h and slope_4h < 0:
+            if e20_4h < e50_4h and slope_4h < -0.001:
                 continue
 
-        # Count entry conditions (need 3/4)
+        # Entry conditions (need 2/4)
         conds = 0
-        # Cond 1: RSI ≤ 35 for 2 bars AND bouncing
-        if rsi_prev <= 35.0 and rsi_cur <= 35.0 and rsi_cur > rsi_prev:
+        # c1: RSI ≤ 48 AND turning up (relaxed from ≤35 over 2 bars)
+        if rsi_cur <= 48.0 and rsi_cur > rsi_prev:
             conds += 1
-        # Cond 2: MACD histogram
+        # c2: MACD histogram positive or crossing up
         if (hist_prev < 0 and hist_cur > 0) or (hist_cur > 0 and hist_cur > hist_prev):
             conds += 1
-        # Cond 3: BB lower bounce
-        if close_prev <= bb_l_prev and close_cur > bb_l_cur:
+        # c3: BB lower bounce
+        if close_prev <= bb_l_prev and cp > bb_l_cur:
             conds += 1
-        # Cond 4: Volume spike
-        if vol_cur >= vma_cur * 1.3:
+        # c4: Volume above average (relaxed from 1.3× to 1.1×)
+        if vol_cur >= vma_cur * 1.1:
             conds += 1
 
-        if conds < 3:
+        if conds < 2:
             continue
 
-        # Compute SL/TP
         sl_dist = sl_mult * atr_cur
         tp_dist = tp_mult * atr_cur
-        sl_dist = max(sl_dist, close_cur * sl_min_pct)
-        sl_dist = min(sl_dist, close_cur * sl_max_pct)
+        sl_dist = max(sl_dist, cp * sl_min_pct)
+        sl_dist = min(sl_dist, cp * sl_max_pct)
 
-        sl_p = round(close_cur - sl_dist, 4)
-        tp_p = round(close_cur + tp_dist, 4)
-        if sl_p >= close_cur or tp_p <= close_cur:
+        sl_p = round(cp - sl_dist, 4)
+        tp_p = round(cp + tp_dist, 4)
+        if sl_p >= cp or tp_p <= cp:
             continue
 
         pos = {
-            "entry_price": close_cur,
+            "entry_price": cp,
             "entry_bar":   i,
             "sl":          sl_p,
             "tp":          tp_p,
-            "amount":      round(TRADE_USDT / close_cur, 6),
+            "amount":      round(TRADE_USDT / cp, 6),
             "atr_entry":   atr_cur,
             "be_locked":   False,
         }
@@ -686,95 +686,68 @@ def _simulate_profitable(sym: str, d_ext: dict, ha: dict) -> list[Trade]:
 
 
 def _simulate_scalp(sym: str, d_ext: dict, ha: dict) -> list[Trade]:
-    """ScalpTrendBot: 15m entry with 1H trend + pullback + 4H macro."""
+    """ScalpTrendBot: 15m entry — 1H uptrend + pullback to EMA (simplified single TP)."""
     ha_15m = ha[sym].get("15m", [])
     n15 = len(ha_15m)
     if n15 < 30:
         return []
 
-    c15    = d_ext["c15"]
-    h15    = d_ext["h15"]
-    l15    = d_ext["l15"]
-    v15    = d_ext["v15"]
-    ema9   = d_ext["ema9_15m"]
-    ema20  = d_ext["ema20_15m"]
-    rsi14  = d_ext["rsi14_15m"]
-    volma  = d_ext["volma20_15m"]
-    atr14  = d_ext["atr14_15m"]
+    c15   = d_ext["c15"]
+    h15   = d_ext["h15"]
+    l15   = d_ext["l15"]
+    ema9  = d_ext["ema9_15m"]
+    rsi14 = d_ext["rsi14_15m"]
+    atr14 = d_ext["atr14_15m"]
     e20_1h = d_ext["ema20_1h_at15m"]
     e50_1h = d_ext["ema50_1h_at15m"]
-    e20_4h = d_ext["ema20_4h_at15m"]
-    e50_4h = d_ext["ema50_4h_at15m"]
 
-    is_major = sym in _MAJOR_COINS
-    sl_mult   = 0.8 if is_major else 1.0
-    tp1_mult  = 1.0 if is_major else 1.2
-    tp2_mult  = 2.0 if is_major else 2.5
+    # TP < SL → high WR on momentum continuation
+    sl_mult    = 1.5
+    tp_mult    = 1.0
     sl_min_pct = 0.008
     sl_max_pct = 0.04
-    WARMUP = 50
-    TIME_STOP = 32   # 15m bars = 8h
-    MIN_HOLD  = 8    # 15m bars = 2h
-    COOLDOWN  = 10   # 15m bars
+    WARMUP    = 50
+    TIME_STOP = 32   # 15m bars ≈ 8h
+    COOLDOWN  = 8
 
     trades: list[Trade] = []
     pos: dict | None = None
     cooldown = 0
 
     for j in range(1, n15):
-        cp   = float(c15[j])
-        hj   = float(h15[j])
-        lj   = float(l15[j])
-        bar  = ha_15m[j]
+        cp = float(c15[j])
+        hj = float(h15[j])
+        lj = float(l15[j])
 
-        # Exit handling
+        # Exit
         if pos is not None and j > pos["entry_bar"]:
             bars_held = j - pos["entry_bar"]
-            tp1_hit = hj >= pos["tp1"]
-            tp2_hit = hj >= pos["tp2"]
-            sl_hit  = lj <= pos["sl"]
+            sl_hit = lj <= pos["sl"]
+            tp_hit = hj >= pos["tp"]
             exit_r = exit_p = None
 
-            # After TP1 hit, SL moves to breakeven
-            if pos.get("tp1_hit") and not pos.get("be_locked"):
-                pos["sl"] = pos["entry_price"] * 1.001
-                pos["be_locked"] = True
-
-            if tp1_hit and not pos.get("tp1_hit"):
-                pos["tp1_hit"] = True
-                pos["sl"] = pos["entry_price"] * 1.001
-                pos["be_locked"] = True
-
-            if tp2_hit and pos.get("tp1_hit") and bars_held >= MIN_HOLD:
-                # Both TP hit → weighted avg
-                weighted = (pos["tp1"] * 0.5) + (pos["tp2"] * 0.5)
-                exit_r, exit_p = "tp", weighted
-            elif sl_hit and bars_held >= MIN_HOLD:
-                if pos.get("tp1_hit"):
-                    # TP1 hit, then SL → weighted
-                    weighted = (pos["tp1"] * 0.5) + (pos["sl"] * 0.5)
-                    exit_r, exit_p = "sl", weighted
-                else:
-                    exit_r, exit_p = "sl", pos["sl"]
+            if tp_hit and not sl_hit:
+                exit_r, exit_p = "tp", pos["tp"]
+            elif sl_hit and not tp_hit:
+                exit_r, exit_p = "sl", pos["sl"]
+            elif sl_hit and tp_hit:
+                op = float(ha_15m[j].open)
+                exit_r, exit_p = (("tp", pos["tp"]) if abs(op - pos["tp"]) < abs(op - pos["sl"])
+                                   else ("sl", pos["sl"]))
             elif bars_held >= TIME_STOP:
-                if pos.get("tp1_hit"):
-                    weighted = (pos["tp1"] * 0.5) + (cp * 0.5)
-                    exit_r, exit_p = "max_hold", weighted
-                else:
-                    exit_r, exit_p = "max_hold", cp
+                exit_r, exit_p = "max_hold", cp
 
             if exit_r is not None:
                 gross = (exit_p - pos["entry_price"]) / pos["entry_price"] * pos["amount"] * pos["entry_price"]
                 fee   = pos["amount"] * pos["entry_price"] * FEE_RT
                 pct   = (exit_p - pos["entry_price"]) / pos["entry_price"] * 100
-                t = Trade(
+                trades.append(Trade(
                     symbol=sym, strategy="ScalpTrendBot",
                     entry_price=pos["entry_price"], exit_price=exit_p,
-                    sl=pos["orig_sl"], tp=pos["tp2"], amount=pos["amount"],
+                    sl=pos["sl"], tp=pos["tp"], amount=pos["amount"],
                     pnl_usdt=gross - fee, pnl_pct=pct,
                     reason=exit_r, bars_held=bars_held,
-                )
-                trades.append(t)
+                ))
                 pos = None
                 cooldown = COOLDOWN
             continue
@@ -786,63 +759,42 @@ def _simulate_scalp(sym: str, d_ext: dict, ha: dict) -> list[Trade]:
         if j < WARMUP:
             continue
 
-        # Read indicators
-        e9j    = float(ema9[j])
-        e20j   = float(ema20[j])
-        rsi_j  = float(rsi14[j])
-        vma_j  = float(volma[j])
-        atr_j  = float(atr14[j])
-        e201h  = float(e20_1h[j])
-        e501h  = float(e50_1h[j])
-        e204h  = float(e20_4h[j])
-        e504h  = float(e50_4h[j])
-        vol_j  = float(v15[j])
+        e9j   = float(ema9[j])
+        rsi_j = float(rsi14[j])
+        atr_j = float(atr14[j])
+        e201h = float(e20_1h[j])
+        e501h = float(e50_1h[j])
 
-        if any(math.isnan(v) for v in [e9j, e20j, rsi_j, vma_j, atr_j,
-                                         e201h, e501h, e204h, e504h]):
+        if any(math.isnan(v) for v in [e9j, rsi_j, atr_j, e201h, e501h]):
             continue
 
-        # Cond 1: 4H trend UP
-        if not (e204h > e504h):
-            continue
-        # Cond 2: 1H trend UP
+        # Cond 1: 1H uptrend (dropped 4H requirement)
         if not (e201h > e501h):
             continue
-        # Cond 3: Pullback zone
-        pullback_ok = (abs(cp - e201h) / e201h <= 0.015 or
-                       (float(l15[j]) <= e201h * 1.003 and cp > e201h))
-        if not pullback_ok:
+        # Cond 2: Pullback within ±4% of 1H EMA20 (was ±1.5%)
+        if abs(cp - e201h) / e201h > 0.04:
             continue
-        # Cond 4: 15m momentum
-        if not (cp > e9j and cp > e20j):
+        # Cond 3: 15m momentum resuming — close above EMA9
+        if cp <= e9j:
             continue
-        # Cond 5: RSI range
-        if not (42.0 <= rsi_j <= 65.0):
-            continue
-        # Cond 6: Volume
-        if not (vol_j >= vma_j * 1.2):
+        # Cond 4: RSI not overbought (35–70, widened from 42–65)
+        if not (35.0 <= rsi_j <= 70.0):
             continue
 
-        # Compute SL/TP
         sl_dist = sl_mult * atr_j
         sl_dist = max(sl_dist, cp * sl_min_pct)
         sl_dist = min(sl_dist, cp * sl_max_pct)
         sl_p    = round(cp - sl_dist, 6)
-        tp1_p   = round(cp + tp1_mult * atr_j, 6)
-        tp2_p   = round(cp + tp2_mult * atr_j, 6)
-        if sl_p >= cp or tp1_p <= cp:
+        tp_p    = round(cp + tp_mult * atr_j, 6)
+        if sl_p >= cp or tp_p <= cp:
             continue
 
         pos = {
             "entry_price": cp,
             "entry_bar":   j,
             "sl":          sl_p,
-            "orig_sl":     sl_p,
-            "tp1":         tp1_p,
-            "tp2":         tp2_p,
+            "tp":          tp_p,
             "amount":      round(TRADE_USDT / cp, 6),
-            "tp1_hit":     False,
-            "be_locked":   False,
         }
 
     if pos is not None:
@@ -854,7 +806,7 @@ def _simulate_scalp(sym: str, d_ext: dict, ha: dict) -> list[Trade]:
         trades.append(Trade(
             symbol=sym, strategy="ScalpTrendBot",
             entry_price=pos["entry_price"], exit_price=ep,
-            sl=pos["orig_sl"], tp=pos["tp2"], amount=pos["amount"],
+            sl=pos["sl"], tp=pos["tp"], amount=pos["amount"],
             pnl_usdt=gross - fee, pnl_pct=pct,
             reason="end", bars_held=bars_held,
         ))
@@ -889,11 +841,10 @@ def prepare(data: dict) -> tuple[dict, dict]:
 
 
 # ── Simulation (vectorized — O(n) per bar) ────────────────────────────────────
-def run_backtest(ha: dict, ind: dict) -> tuple[list[Trade], dict]:
+def run_backtest(ha: dict, ind: dict, ind_ext: dict | None = None) -> tuple[list[Trade], dict]:
     master_1h = ha[SYMBOLS[0]]["1h"]
     n_bars    = len(master_1h)
 
-    # O(1) timestamp → bar-index lookup per symbol
     ts_map: dict[str, dict[int, int]] = {
         sym: {int(c.timestamp): i for i, c in enumerate(ha[sym]["1h"])}
         for sym in SYMBOLS
@@ -903,11 +854,10 @@ def run_backtest(ha: dict, ind: dict) -> tuple[list[Trade], dict]:
     _SWING = [
         ("SwingReversalStrategy", 2.5, 1.5, 34.0, 62.0, 1.2, 4),
         ("CPKRegimeStrategy",     2.5, 1.5, 40.0, 64.0, 1.2, 5),
-        ("HybridSwingStrategy",   2.5, 2.0, 38.0, 64.0, 1.2, 3),
     ]
-    ALL_STRAT_NAMES = [sn for sn, *_ in _SWING] + ["InternStrategy"]
-    SWING_WARMUP  = 210
-    INTERN_WARMUP = 60
+    ALL_STRAT_NAMES = [sn for sn, *_ in _SWING] + ["ProfitableBot", "ScalpTrendBot"]
+    SWING_WARMUP = 210
+    NEW_WARMUP   = 60
 
     positions:      list[Position] = []
     trades:         list[Trade]    = []
@@ -936,8 +886,8 @@ def run_backtest(ha: dict, ind: dict) -> tuple[list[Trade], dict]:
         ))
         positions.remove(pos)
 
-    print(f"  Simulating {n_bars} bars × {len(SYMBOLS)} symbols × "
-          f"{len(ALL_STRAT_NAMES)} strategies...")
+    print(f"  [Case 2] Simulating {n_bars} bars × {len(SYMBOLS)} symbols × "
+          f"{len(ALL_STRAT_NAMES)} strategies (Swing+CPK+Profitable+Scalp)...")
 
     for bar_i, master_bar in enumerate(master_1h):
         ts = int(master_bar.timestamp)
@@ -970,23 +920,14 @@ def run_backtest(ha: dict, ind: dict) -> tuple[list[Trade], dict]:
                 continue
             i  = idx
             d  = ind[sym]
+            d_e = ind_ext[sym] if ind_ext else None
             cp = float(d["closes"][i])
             av = float(d["atr14"][i])
             if math.isnan(av):
                 av = cp * 0.015
 
-            # ── Intern SELL (checked before BUY, no cooldown on exits) ──
-            sell = False
-            if i >= INTERN_WARMUP:
-                hp = float(d["hma15"][i - 1]); hc = float(d["hma15"][i])
-                c_p = float(d["closes"][i - 1]); o_c = float(d["opens"][i])
-                if not (math.isnan(hp) or math.isnan(hc)):
-                    sell = c_p < hp and o_c < hc
-
             pos = sym_pos(sym)
             if pos:
-                if sell:
-                    close_pos(pos, cp, "sell_signal", bar_i)
                 continue   # no new entry while in a position
 
             # ── BUY signals ────────────────────────────────────────────
@@ -1013,23 +954,64 @@ def run_backtest(ha: dict, ind: dict) -> tuple[list[Trade], dict]:
                             buy_sigs.append((sn, sl_p, tp_p))
                             cooldown[key] = cd_len
 
-            # InternStrategy BUY
-            key_in = (sym, "InternStrategy")
-            if cooldown[key_in] > 0:
-                cooldown[key_in] -= 1
-            elif i >= INTERN_WARMUP:
-                hp  = float(d["hma15"][i - 1]); hc  = float(d["hma15"][i])
-                c_p = float(d["closes"][i - 1])
-                o_c = float(d["opens"][i]);      o_p = float(d["opens"][i - 1])
-                if not (math.isnan(hp) or math.isnan(hc)):
-                    if (c_p > hp and o_c > hc and o_c > o_p
-                            and d["bias_15m"][i] >= 1.0
-                            and d["bias_30m"][i] >= 1.0):
-                        sl_p = round(cp - 2.5 * av, 4)
-                        tp_p = round(cp + 2.0 * av, 4)
+            # ProfitableBot BUY (1H trend-following, 2/4 conditions)
+            key_pb = (sym, "ProfitableBot")
+            if cooldown[key_pb] > 0:
+                cooldown[key_pb] -= 1
+            elif i >= NEW_WARMUP and d_e is not None:
+                rsi_c  = float(d_e["rsi14_1h"][i])
+                rsi_p  = float(d_e["rsi14_1h"][i - 1])
+                hc     = float(d_e["mhist_1h"][i])
+                hp     = float(d_e["mhist_1h"][i - 1])
+                bbl_c  = float(d_e["bb_lower_1h"][i])
+                bbl_p  = float(d_e["bb_lower_1h"][i - 1])
+                cp_p   = float(d["closes"][i - 1])
+                vma_pb = float(d_e["volma20_1h"][i])
+                atr_pb = float(d_e["atr14_1h"][i])
+                e20_1h = float(d_e["ema20_1h"][i])
+                e50_1h = float(d_e["ema50_1h"][i])
+                e20_4h = float(d_e["ema20_4h"][i])
+                e50_4h = float(d_e["ema50_4h"][i])
+                slope_4h = float(d_e["ema20_4h_slope"][i]) if not math.isnan(d_e["ema20_4h_slope"][i]) else 0.0
+                if not any(math.isnan(v) for v in [rsi_c, rsi_p, hc, hp,
+                                                    bbl_c, bbl_p, vma_pb, atr_pb, e20_1h, e50_1h]):
+                    if e20_1h > e50_1h:
+                        trend_ok = math.isnan(e20_4h) or math.isnan(e50_4h) or not (e20_4h < e50_4h and slope_4h < -0.001)
+                        if trend_ok:
+                            conds = 0
+                            if rsi_c <= 48.0 and rsi_c > rsi_p:         conds += 1
+                            if (hp < 0 and hc > 0) or (hc > 0 and hc > hp): conds += 1
+                            if cp_p <= bbl_p and cp > bbl_c:             conds += 1
+                            if float(d["volumes"][i]) >= vma_pb * 1.1:  conds += 1
+                            if conds >= 2:
+                                sl_dist = max(2.0 * atr_pb, cp * 0.015)
+                                sl_dist = min(sl_dist, cp * 0.07)
+                                sl_p = round(cp - sl_dist, 4)
+                                tp_p = round(cp + 1.2 * atr_pb, 4)
+                                if sl_p < cp < tp_p:
+                                    buy_sigs.append(("ProfitableBot", sl_p, tp_p))
+                                    cooldown[key_pb] = 2
+
+            # ScalpTrendBot BUY (1H proxy — pullback ±4% of EMA20_1h)
+            key_sc = (sym, "ScalpTrendBot")
+            if cooldown[key_sc] > 0:
+                cooldown[key_sc] -= 1
+            elif i >= NEW_WARMUP and d_e is not None:
+                e20_1h_sc = float(d_e["ema20_1h"][i])
+                e50_1h_sc = float(d_e["ema50_1h"][i])
+                rsi_sc    = float(d_e["rsi14_1h"][i])
+                atr_sc    = float(d_e["atr14_1h"][i])
+                if not any(math.isnan(v) for v in [e20_1h_sc, e50_1h_sc, rsi_sc, atr_sc]):
+                    if (e20_1h_sc > e50_1h_sc
+                            and abs(cp - e20_1h_sc) / e20_1h_sc <= 0.04
+                            and 35.0 <= rsi_sc <= 70.0):
+                        sl_dist = max(1.5 * atr_sc, cp * 0.008)
+                        sl_dist = min(sl_dist, cp * 0.04)
+                        sl_p = round(cp - sl_dist, 4)
+                        tp_p = round(cp + 1.0 * atr_sc, 4)
                         if sl_p < cp < tp_p:
-                            buy_sigs.append(("InternStrategy", sl_p, tp_p))
-                            cooldown[key_in] = 3
+                            buy_sigs.append(("ScalpTrendBot", sl_p, tp_p))
+                            cooldown[key_sc] = 8
 
             if not buy_sigs:
                 continue
@@ -1125,7 +1107,7 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
 
     cooldown: dict[tuple, int] = {}
     for sym in SYMBOLS:
-        for sn in ["SwingReversalStrategy", "ProfitableBot", "ScalpTrendBot"]:
+        for sn in ["SwingReversalStrategy", "CPKRegimeStrategy", "ProfitableBot", "ScalpTrendBot"]:
             cooldown[(sym, sn)] = 0
 
     # Breakeven tracking per position (use position object identity)
@@ -1151,7 +1133,7 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
     SWING_WARMUP  = 210
     INTERN_WARMUP = 60
 
-    print(f"  [Case 3] Simulating {n_bars} bars × {len(SYMBOLS)} symbols × 3 strategies...")
+    print(f"  [Case 3] Simulating {n_bars} bars × {len(SYMBOLS)} symbols × 4 strategies (Swing+CPK+Profitable+Scalp)...")
 
     for bar_i, master_bar in enumerate(master_1h):
         ts = int(master_bar.timestamp)
@@ -1235,92 +1217,79 @@ def run_portfolio_case3(ha: dict, ind: dict, ind_ext: dict) -> tuple[list[Trade]
                         buy_sigs.append(("SwingReversalStrategy", sl_p, tp_p))
                         cooldown[key_sw] = 4
 
-            # ProfitableBot signal
+            # CPKRegime signal
+            key_cpk = (sym, "CPKRegimeStrategy")
+            if cooldown[key_cpk] > 0:
+                cooldown[key_cpk] -= 1
+            elif i >= SWING_WARMUP:
+                e80_c   = float(d["ema80"][i]);   e200_c  = float(d["ema200"][i])
+                rsi_c   = float(d["rsi14"][i]);   vol_c   = float(d["volumes"][i])
+                vma_c   = float(d["vol_ma"][i])
+                cb_c    = bool(d["candle_bull"][i]); mc_c = bool(d["macd_cross"][i])
+                dv_c    = not any(math.isnan(v) for v in [e80_c, e200_c, rsi_c, vma_c])
+                if (dv_c and e80_c >= e200_c * 0.98 and cb_c and mc_c
+                        and 40.0 <= rsi_c <= 64.0 and vol_c >= vma_c * 1.2):
+                    sl_p = round(cp - 2.5 * atr_v, 4)
+                    tp_p = round(cp + 1.5 * atr_v, 4)
+                    if sl_p < cp < tp_p:
+                        buy_sigs.append(("CPKRegimeStrategy", sl_p, tp_p))
+                        cooldown[key_cpk] = 5
+
+            # ProfitableBot signal (1H trend-following, 2/4 conditions)
             key_pb = (sym, "ProfitableBot")
             if cooldown[key_pb] > 0:
                 cooldown[key_pb] -= 1
             elif i >= 60:
-                rsi14_e   = d_e["rsi14_1h"]
-                mhist_e   = d_e["mhist_1h"]
-                bb_lower_e = d_e["bb_lower_1h"]
-                volma20_e = d_e["volma20_1h"]
-                atr14_e   = d_e["atr14_1h"]
-                ema20_4h_e = d_e["ema20_4h"]
-                ema50_4h_e = d_e["ema50_4h"]
-                ema20_4h_slope_e = d_e["ema20_4h_slope"]
-
-                if i < len(rsi14_e) and i - 1 >= 0:
-                    rsi_cur  = float(rsi14_e[i])
-                    rsi_prev = float(rsi14_e[i - 1])
-                    hist_cur  = float(mhist_e[i])
-                    hist_prev = float(mhist_e[i - 1])
-                    bb_l_cur  = float(bb_lower_e[i])
-                    bb_l_prev = float(bb_lower_e[i - 1])
-                    close_prev = float(d["closes"][i - 1])
-                    vol_cur   = float(d["volumes"][i])
-                    vma_cur   = float(volma20_e[i])
-                    atr_cur   = float(atr14_e[i])
-                    e20_4h    = float(ema20_4h_e[i])
-                    e50_4h    = float(ema50_4h_e[i])
-                    slope_4h  = float(ema20_4h_slope_e[i]) if not math.isnan(ema20_4h_slope_e[i]) else 0.0
-
-                    if not any(math.isnan(v) for v in [rsi_cur, rsi_prev, hist_cur, hist_prev,
-                                                        bb_l_cur, bb_l_prev, vma_cur, atr_cur]):
-                        # 4H guard
-                        trend_blocked = (not math.isnan(e20_4h) and not math.isnan(e50_4h)
-                                         and e20_4h < e50_4h and slope_4h < 0)
-                        if not trend_blocked:
-                            conds = 0
-                            if rsi_prev <= 35.0 and rsi_cur <= 35.0 and rsi_cur > rsi_prev:
-                                conds += 1
-                            if (hist_prev < 0 and hist_cur > 0) or (hist_cur > 0 and hist_cur > hist_prev):
-                                conds += 1
-                            if close_prev <= bb_l_prev and cp > bb_l_cur:
-                                conds += 1
-                            if vol_cur >= vma_cur * 1.3:
-                                conds += 1
-                            if conds >= 3:
-                                is_major = sym in _MAJOR_COINS
-                                sl_mult_pb = 1.5 if is_major else 2.0
-                                tp_mult_pb = 2.5 if is_major else 3.0
-                                sl_dist = sl_mult_pb * atr_cur
-                                sl_dist = max(sl_dist, cp * 0.015)
-                                sl_dist = min(sl_dist, cp * 0.07)
-                                sl_p = round(cp - sl_dist, 4)
-                                tp_p = round(cp + tp_mult_pb * atr_cur, 4)
+                rsi_c3  = float(d_e["rsi14_1h"][i])
+                rsi_p3  = float(d_e["rsi14_1h"][i - 1])
+                hc3     = float(d_e["mhist_1h"][i])
+                hp3     = float(d_e["mhist_1h"][i - 1])
+                bbl_c3  = float(d_e["bb_lower_1h"][i])
+                bbl_p3  = float(d_e["bb_lower_1h"][i - 1])
+                cp_p3   = float(d["closes"][i - 1])
+                vma3    = float(d_e["volma20_1h"][i])
+                atr3    = float(d_e["atr14_1h"][i])
+                e20_1h3 = float(d_e["ema20_1h"][i])
+                e50_1h3 = float(d_e["ema50_1h"][i])
+                e20_4h3 = float(d_e["ema20_4h"][i])
+                e50_4h3 = float(d_e["ema50_4h"][i])
+                sl4h3   = float(d_e["ema20_4h_slope"][i]) if not math.isnan(d_e["ema20_4h_slope"][i]) else 0.0
+                if not any(math.isnan(v) for v in [rsi_c3, rsi_p3, hc3, hp3,
+                                                    bbl_c3, bbl_p3, vma3, atr3, e20_1h3, e50_1h3]):
+                    if e20_1h3 > e50_1h3:
+                        trend_ok3 = math.isnan(e20_4h3) or math.isnan(e50_4h3) or not (e20_4h3 < e50_4h3 and sl4h3 < -0.001)
+                        if trend_ok3:
+                            conds3 = 0
+                            if rsi_c3 <= 48.0 and rsi_c3 > rsi_p3:             conds3 += 1
+                            if (hp3 < 0 and hc3 > 0) or (hc3 > 0 and hc3 > hp3): conds3 += 1
+                            if cp_p3 <= bbl_p3 and cp > bbl_c3:                 conds3 += 1
+                            if float(d["volumes"][i]) >= vma3 * 1.1:            conds3 += 1
+                            if conds3 >= 2:
+                                sl_dist3 = max(2.0 * atr3, cp * 0.015)
+                                sl_dist3 = min(sl_dist3, cp * 0.07)
+                                sl_p = round(cp - sl_dist3, 4)
+                                tp_p = round(cp + 1.2 * atr3, 4)
                                 if sl_p < cp < tp_p:
                                     buy_sigs.append(("ProfitableBot", sl_p, tp_p))
-                                    cooldown[key_pb] = 5
+                                    cooldown[key_pb] = 2
 
-            # ScalpTrendBot signal (use 1H indicators as proxy)
+            # ScalpTrendBot signal (1H proxy — pullback ±4% of EMA20_1h)
             key_sc = (sym, "ScalpTrendBot")
             if cooldown[key_sc] > 0:
                 cooldown[key_sc] -= 1
             elif i >= 60:
-                e20_1h = float(d_e["ema20_1h"][i])
-                e50_1h = float(d_e["ema50_1h"][i])
-                e20_4h_v = float(d_e["ema20_4h"][i])
-                e50_4h_v = float(d_e["ema50_4h"][i])
-                rsi_1h  = float(d_e["rsi14_1h"][i])
-                vol_v   = float(d["volumes"][i])
-                vma_v   = float(d_e["volma20_1h"][i])
-                atr_1h_v = float(d_e["atr14_1h"][i])
-
-                if not any(math.isnan(v) for v in [e20_1h, e50_1h, e20_4h_v, e50_4h_v,
-                                                     rsi_1h, vma_v, atr_1h_v]):
-                    if (e20_4h_v > e50_4h_v and e20_1h > e50_1h
-                            and 42.0 <= rsi_1h <= 65.0
-                            and vol_v >= vma_v * 1.2):
-                        is_major = sym in _MAJOR_COINS
-                        sl_mult_sc = 0.8 if is_major else 1.0
-                        tp1_m = 1.0 if is_major else 1.2
-                        tp2_m = 2.0 if is_major else 2.5
-                        sl_dist = sl_mult_sc * atr_1h_v
-                        sl_dist = max(sl_dist, cp * 0.008)
+                e20_sc = float(d_e["ema20_1h"][i])
+                e50_sc = float(d_e["ema50_1h"][i])
+                rsi_sc = float(d_e["rsi14_1h"][i])
+                atr_sc = float(d_e["atr14_1h"][i])
+                if not any(math.isnan(v) for v in [e20_sc, e50_sc, rsi_sc, atr_sc]):
+                    if (e20_sc > e50_sc
+                            and abs(cp - e20_sc) / e20_sc <= 0.04
+                            and 35.0 <= rsi_sc <= 70.0):
+                        sl_dist = max(1.5 * atr_sc, cp * 0.008)
                         sl_dist = min(sl_dist, cp * 0.04)
                         sl_p = round(cp - sl_dist, 4)
-                        # Use TP2 as the portfolio TP for simplicity
-                        tp_p = round(cp + tp2_m * atr_1h_v, 4)
+                        tp_p = round(cp + 1.0 * atr_sc, 4)
                         if sl_p < cp < tp_p:
                             buy_sigs.append(("ScalpTrendBot", sl_p, tp_p))
                             cooldown[key_sc] = 8
@@ -1549,7 +1518,7 @@ def print_report(trades: list[Trade], stats: dict):
 
     strat_order = [
         "SwingReversalStrategy", "CPKRegimeStrategy",
-        "HybridSwingStrategy",   "InternStrategy",
+        "ProfitableBot",         "ScalpTrendBot",
     ]
     all_pnl = 0.0
     for name in strat_order:
@@ -1693,7 +1662,7 @@ def print_case3_report(trades: list[Trade], stats: dict, bars: int):
     is_syn     = stats.get("is_synthetic", False)
     data_label = "⚠ SYNTHETIC GBM DATA" if is_syn else "REAL MARKET DATA"
     print("\n" + "═" * 74)
-    print(f"{'  CASE 3: Swing + Profitable + Scalp + Chief  ' + data_label:^74}")
+    print(f"{'  CASE 3: Swing + CPK + Profitable + Scalp + Chief  ' + data_label:^74}")
     print(f"{'  Period: ~%.0f days  (%d bars 1h)  Data to: %s' % (days, bars, now_str):^74}")
     print(f"{'  Symbols: %s  |  Slots: %d  |  Trade: $%.0f USDT' % (', '.join(SYMBOLS), MAX_POSITIONS, TRADE_USDT):^74}")
     print(f"{'  Chief gate: require ≥%d strategies to agree' % CHIEF_N_AGREE:^74}")
@@ -1707,7 +1676,7 @@ def print_case3_report(trades: list[Trade], stats: dict, bars: int):
           f"{'MaxDD$':>8} {'AvgHold':>8}")
     print("─" * 74)
 
-    strat_order = ["SwingReversalStrategy", "ProfitableBot", "ScalpTrendBot"]
+    strat_order = ["SwingReversalStrategy", "CPKRegimeStrategy", "ProfitableBot", "ScalpTrendBot"]
     all_pnl = 0.0
     for name in strat_order:
         ts = by_strat.get(name, [])
@@ -1717,10 +1686,7 @@ def print_case3_report(trades: list[Trade], stats: dict, bars: int):
         wins    = sum(1 for t in ts if t.pnl_usdt > 0)
         pnl, dd = _equity_curve(ts)
         avg_pct = sum(t.pnl_pct for t in ts) / len(ts)
-        if name == "ScalpTrendBot":
-            avg_h = sum(t.bars_held for t in ts) / len(ts)  # already 1H bars in portfolio
-        else:
-            avg_h = sum(t.bars_held for t in ts) / len(ts)
+        avg_h   = sum(t.bars_held for t in ts) / len(ts)
         print(f"{name:<28} {len(ts):>4} {wins/len(ts)*100:>5.1f}% {pnl:>+8.2f} "
               f"{avg_pct:>+7.2f}% {dd:>+8.2f} {avg_h:>6.1f}h")
         all_pnl += pnl
@@ -1835,8 +1801,8 @@ async def main():
     # Case 1: All strategies standalone
     standalone = run_standalone(ind, ha, ind_ext)
 
-    # Case 2: SJ4 + Chief portfolio (existing run_backtest)
-    trades_c2, stats_c2 = run_backtest(ha, ind)
+    # Case 2: Swing + CPK + Profitable + Scalp + Chief portfolio
+    trades_c2, stats_c2 = run_backtest(ha, ind, ind_ext)
     stats_c2["is_synthetic"] = is_synthetic
 
     # Case 3: Swing + Profitable + Scalp + Chief portfolio
@@ -1855,12 +1821,12 @@ async def main():
     print_standalone(standalone, stats_c2.get("bars_total", 0))
 
     print("\n" + "╔" + "═"*78 + "╗")
-    print("║" + "  CASE 2 — SJ4 + Chief (SwingReversal · CPK · Hybrid · Intern)".center(78) + "║")
+    print("║" + "  CASE 2 — Chief (SwingReversal · CPK · ProfitableBot · ScalpTrend)".center(78) + "║")
     print("╚" + "═"*78 + "╝")
     print_report(trades_c2, stats_c2)
 
     print("\n" + "╔" + "═"*78 + "╗")
-    print("║" + "  CASE 3 — SwingReversal + Profitable + ScalpTrend + Chief".center(78) + "║")
+    print("║" + "  CASE 3 — SwingReversal + CPK + Profitable + ScalpTrend + Chief".center(78) + "║")
     print("╚" + "═"*78 + "╝")
     print_case3_report(trades_c3, stats_c3, stats_c3["bars_total"])
 
