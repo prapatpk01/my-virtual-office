@@ -40,9 +40,9 @@ class TrendContinuationStrategy(BaseStrategy):
         self.min_entry_cond = self.params.get("min_entry_cond", 3) # 3/4 not ALL 4
         self.atr_period   = self.params.get("atr_period",   14)
         self.sl_mult      = self.params.get("sl_mult",       0.8)
-        self.tp_mult      = self.params.get("tp_mult",       2.0)
+        self.tp_mult      = self.params.get("tp_mult",       4.0)  # ↑ R:R 1:5 → BE WR 16.7%
         self.sl_min_pct   = self.params.get("sl_min_pct",  0.002)
-        self.sl_max_pct   = self.params.get("sl_max_pct",  0.012)
+        self.sl_max_pct   = self.params.get("sl_max_pct",  0.020)  # ↑ from 0.012
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:

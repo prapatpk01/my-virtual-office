@@ -121,21 +121,21 @@ def build_config() -> dict:
         # sl_mult=0.8, tp_mult=2.0 → R:R 1:2.5  (break-even WR 28.6%)
         # Wider pullback ±2.5%, 3/4 conditions required
         "tc_sl_mult":         _env_float("TC_SL_MULT",       0.8),
-        "tc_tp_mult":         _env_float("TC_TP_MULT",       2.0),
-        "tc_rsi_min":         _env_float("TC_RSI_MIN",      38.0),    # ↓ from 42
-        "tc_rsi_max":         _env_float("TC_RSI_MAX",      72.0),    # ↑ from 65
-        "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",  0.025),  # ↑ from 0.015
-        "tc_vol_mult":        _env_float("TC_VOL_MULT",      1.0),    # ↓ from 1.2
+        "tc_tp_mult":         _env_float("TC_TP_MULT",       4.0),    # ↑ R:R 1:5, BE WR=16.7%
+        "tc_rsi_min":         _env_float("TC_RSI_MIN",      38.0),
+        "tc_rsi_max":         _env_float("TC_RSI_MAX",      72.0),
+        "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",  0.025),
+        "tc_vol_mult":        _env_float("TC_VOL_MULT",      1.0),
 
         # ── Smart Money tuning (15m entry / 1H+4H MTF) ───────────────────
         # sl_mult=1.8, rr=1.8 → R:R 1:1.8  (break-even WR 35.7%)
-        # 2/3 component majority vote, lowered score thresholds
+        # 2/3 component majority vote, aggressive thresholds for more signals
         "sm_sl_mult":         _env_float("SM_SL_MULT",       1.8),
         "sm_rr":              _env_float("SM_RR",            1.8),
-        "sm_min_confidence":  _env_float("SM_MIN_CONFIDENCE",55.0),   # ↓ from 75
-        "sm_min_multi_tf":    _env_float("SM_MIN_MULTI_TF",  55.0),   # ↓ from 70
-        "sm_min_bos_choch":   _env_float("SM_MIN_BOS_CHOCH", 50.0),   # ↓ from 60
-        "sm_min_ema_cross":   _env_float("SM_MIN_EMA_CROSS", 50.0),   # ↓ from 60
+        "sm_min_confidence":  _env_float("SM_MIN_CONFIDENCE",42.0),   # ↓ from 55
+        "sm_min_multi_tf":    _env_float("SM_MIN_MULTI_TF",  40.0),   # ↓ from 55
+        "sm_min_bos_choch":   _env_float("SM_MIN_BOS_CHOCH", 35.0),   # ↓ from 50
+        "sm_min_ema_cross":   _env_float("SM_MIN_EMA_CROSS", 35.0),   # ↓ from 50
 
         # ── Scalp Trend tuning (15m entry / 1H+4H MTF) ───────────────────────
         # sl_mult=1.5, tp_mult=1.875 → R:R 1:1.25 (break-even WR=44.4%)

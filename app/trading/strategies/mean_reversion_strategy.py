@@ -104,9 +104,8 @@ class MeanReversionStrategy(BaseStrategy):
                 return round(current_price - dist, 2), round(current_price + tp_d, 2)
             return round(current_price + dist, 2), round(current_price - tp_d, 2)
 
-        # ── BUY (long): 4H NOT "down" + min_conditions/4 ─────────────────
-        if trend_4h != "down":
-            # Single-bar RSI: oversold + bouncing (removed 2-bar confirmation)
+        # ── BUY (long): 4H strictly "up" + min_conditions/4 ─────────────
+        if trend_4h == "up":
             c1  = rsi_c <= self.rsi_oversold and rsi_c > rsi_p
             c2  = (hist_p < 0 and hist_c > 0) or (hist_c > 0 and hist_c > hist_p and not np.isnan(hist_p))
             c3  = (close_p <= bbl_p) and (close_c > bbl_c)
@@ -116,15 +115,15 @@ class MeanReversionStrategy(BaseStrategy):
                 return Signal(
                     SignalType.BUY, self.symbol, current_price,
                     amount=0.08,
-                    reason=(f"[MeanRev] 4H={trend_4h} RSI={rsi_c:.0f} "
+                    reason=(f"[MeanRev] 4H↑ RSI={rsi_c:.0f} "
                             f"MACD={'✓' if c2 else '✗'} BB={'✓' if c3 else '✗'} "
                             f"cond={met}/4 RR=1:{rr:.2f}"),
                     confidence=min(0.55 + met * 0.08, 0.87),
                     metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
                 )
 
-        # ── SELL (short): 4H NOT "up" + min_conditions/4 ─────────────────
-        if trend_4h != "up":
+        # ── SELL (short): 4H strictly "down" + min_conditions/4 ──────────
+        if trend_4h == "down":
             c1  = rsi_c >= self.rsi_overbought and rsi_c < rsi_p
             c2  = (hist_p > 0 and hist_c < 0) or (hist_c < 0 and hist_c < hist_p and not np.isnan(hist_p))
             c3  = (close_p >= bbu_p) and (close_c < bbu_c)
@@ -134,7 +133,7 @@ class MeanReversionStrategy(BaseStrategy):
                 return Signal(
                     SignalType.SELL, self.symbol, current_price,
                     amount=0.08,
-                    reason=(f"[MeanRev] 4H={trend_4h} RSI={rsi_c:.0f} "
+                    reason=(f"[MeanRev] 4H↓ RSI={rsi_c:.0f} "
                             f"MACD={'✓' if c2 else '✗'} BB={'✓' if c3 else '✗'} "
                             f"cond={met}/4 RR=1:{rr:.2f}"),
                     confidence=min(0.55 + met * 0.08, 0.87),

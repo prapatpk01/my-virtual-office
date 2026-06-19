@@ -34,10 +34,10 @@ class SmartMoneyStrategy(BaseStrategy):
         self.atr_period     = self.params.get("atr_period",     14)
         self.sl_mult        = self.params.get("sl_mult",        1.8)
         self.rr             = self.params.get("rr",             1.8)
-        self.min_confidence = self.params.get("min_confidence", 55.0)  # ↓ from 75
-        self.min_multi_tf   = self.params.get("min_multi_tf",   55.0)  # ↓ from 70
-        self.min_bos_choch  = self.params.get("min_bos_choch",  50.0)  # ↓ from 60
-        self.min_ema_cross  = self.params.get("min_ema_cross",  50.0)  # ↓ from 60
+        self.min_confidence = self.params.get("min_confidence", 42.0)  # ↓ from 55
+        self.min_multi_tf   = self.params.get("min_multi_tf",   40.0)  # ↓ from 55
+        self.min_bos_choch  = self.params.get("min_bos_choch",  35.0)  # ↓ from 50
+        self.min_ema_cross  = self.params.get("min_ema_cross",  35.0)  # ↓ from 50
 
     # ── Market structure helpers ──────────────────────────────────────────
 
