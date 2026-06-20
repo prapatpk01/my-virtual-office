@@ -86,7 +86,7 @@ class MeanReversionStrategy(BaseStrategy):
         bbu_c   = float(bb_upper[-2]);  bbu_p   = float(bb_upper[-3])
         close_c = closes[-2];           close_p = closes[-3]
         vol_c   = vols[-2];             volma_c = float(vol_ma[-2])
-        atr_v   = float(atr_a[-1])
+        atr_v   = float(atr_a[-2])  # use last closed bar's ATR, not forming bar
 
         if any(np.isnan(v) for v in [rsi_c, rsi_p, hist_c, bbl_c, bbu_c, volma_c, atr_v]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
@@ -106,7 +106,7 @@ class MeanReversionStrategy(BaseStrategy):
 
         # ── BUY (long): 4H strictly "up" + min_conditions/4 ─────────────
         if trend_4h == "up":
-            c1  = rsi_c <= self.rsi_oversold and rsi_c > rsi_p
+            c1  = rsi_c <= self.rsi_oversold and rsi_p <= self.rsi_oversold and rsi_c > rsi_p
             c2  = (hist_p < 0 and hist_c > 0) or (hist_c > 0 and hist_c > hist_p and not np.isnan(hist_p))
             c3  = (close_p <= bbl_p) and (close_c > bbl_c)
             met = sum([c1, c2, c3, vol_ok])
@@ -124,7 +124,7 @@ class MeanReversionStrategy(BaseStrategy):
 
         # ── SELL (short): 4H strictly "down" + min_conditions/4 ──────────
         if trend_4h == "down":
-            c1  = rsi_c >= self.rsi_overbought and rsi_c < rsi_p
+            c1  = rsi_c >= self.rsi_overbought and rsi_p >= self.rsi_overbought and rsi_c < rsi_p
             c2  = (hist_p > 0 and hist_c < 0) or (hist_c < 0 and hist_c < hist_p and not np.isnan(hist_p))
             c3  = (close_p >= bbu_p) and (close_c < bbu_c)
             met = sum([c1, c2, c3, vol_ok])

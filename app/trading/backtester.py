@@ -39,7 +39,10 @@ def _sl_tp(signal, price: float, side: str,
     sl = meta.get("stop_loss")
     tp = meta.get("take_profit")
     if sl and tp:
-        if side == "short":
+        if side == "long":
+            if sl > price: sl = round(price * (1 - sl_pct), 6)
+            if tp < price: tp = round(price * (1 + tp_pct), 6)
+        elif side == "short":
             if sl < price: sl = round(price * (1 + sl_pct), 6)
             if tp > price: tp = round(price * (1 - tp_pct), 6)
         if sl and tp:

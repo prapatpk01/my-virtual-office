@@ -76,7 +76,7 @@ class SmartMoneyStrategy(BaseStrategy):
         rsi_b   = float(rsi_a[-2])
         vol_b   = vols_15m[-2]
         volma_b = float(volma[-2])
-        atr_v   = float(atr_a[-1])
+        atr_v   = float(atr_a[-2])
 
         if any(np.isnan(v) for v in [ema9_b, ema21_b, rsi_b, atr_v]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
