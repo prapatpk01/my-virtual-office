@@ -124,6 +124,149 @@ async def backtest_strategy(
     return trades
 
 
+@dataclass
+class BTradeV2:
+    """Partial-close trade: TP1 closes part of the position, then SL→breakeven, TP2 closes rest."""
+    symbol: str
+    strategy: str
+    side: str
+    entry: float
+    sl: float            # mutable — moves to breakeven after TP1
+    tp1: float
+    tp2: float
+    entry_ts: int
+    notional: float
+    partial_pct: float
+    remaining: float = 1.0
+    tp1_hit: bool = False
+    exit_price: float = 0.0
+    exit_reason: str = ""
+    exit_ts: int = 0
+    pnl_usdt: float = 0.0   # net realized PnL after all fees (compatible with summarise())
+
+
+def _realize(pos: BTradeV2, frac: float, px: float) -> float:
+    """Gross PnL minus this portion's close-side taker fee."""
+    mult    = 1 if pos.side == "long" else -1
+    pnl_pct = mult * (px - pos.entry) / pos.entry
+    gross   = pnl_pct * pos.notional * frac
+    fee     = pos.notional * frac * TAKER_FEE
+    return gross - fee
+
+
+async def backtest_strategy_mtf_v2(
+    strategy: BaseStrategy,
+    primary_candles: list[OHLCV],
+    mtf_candles: dict[str, list[OHLCV]],
+    notional: float,
+    warmup: int = 100,
+    primary_window: int = 300,
+    mtf_windows: Optional[dict] = None,
+) -> tuple[list[BTradeV2], dict]:
+    """
+    Walk-forward MTF backtest with TP1 / breakeven / TP2 partial-close logic.
+
+    Reads signal.metadata: tp1, tp2, stop_loss (initial SL), breakeven, partial_pct.
+    Per bar, after entry:
+      • before TP1: full position stops out at initial SL, or TP1 closes partial_pct
+        and the remaining SL jumps to breakeven (entry).
+      • after  TP1: remaining closes at TP2, or at the breakeven SL (risk-free runner).
+    Conservative intrabar rule: SL is checked before TP within the same bar.
+    """
+    trades: list[BTradeV2] = []
+    open_long:  Optional[BTradeV2] = None
+    open_short: Optional[BTradeV2] = None
+    stats = {"tp1": 0, "tp2": 0, "sl_full": 0, "breakeven": 0}
+
+    _mtf_windows = {"1h": 200, "4h": 120, "30m": 300}
+    if mtf_windows:
+        _mtf_windows.update(mtf_windows)
+    mtf_ts_index = {tf: [c.timestamp for c in clist] for tf, clist in mtf_candles.items()}
+
+    def _step_exit(pos: BTradeV2, b_high: float, b_low: float, ts: int) -> bool:
+        """Advance one bar of exit logic. Returns True if the position is now fully closed."""
+        long = pos.side == "long"
+        sl_hit = (b_low <= pos.sl) if long else (b_high >= pos.sl)
+        if not pos.tp1_hit:
+            tp1_hit = (b_high >= pos.tp1) if long else (b_low <= pos.tp1)
+            if sl_hit:                                   # full stop before any TP
+                pos.pnl_usdt += _realize(pos, pos.remaining, pos.sl)
+                pos.exit_reason = "stop_loss"; pos.exit_price = pos.sl; pos.exit_ts = ts
+                stats["sl_full"] += 1
+                return True
+            if tp1_hit:                                  # bank TP1, move SL → breakeven
+                pos.pnl_usdt += _realize(pos, pos.partial_pct, pos.tp1)
+                pos.remaining -= pos.partial_pct
+                pos.tp1_hit = True
+                pos.sl = pos.entry                       # breakeven (risk-free)
+                stats["tp1"] += 1
+            return False
+        # ── after TP1: runner protected at breakeven ──
+        be_hit = (b_low <= pos.sl) if long else (b_high >= pos.sl)
+        tp2_hit = (b_high >= pos.tp2) if long else (b_low <= pos.tp2)
+        if be_hit:
+            pos.pnl_usdt += _realize(pos, pos.remaining, pos.sl)
+            pos.exit_reason = "breakeven"; pos.exit_price = pos.sl; pos.exit_ts = ts
+            stats["breakeven"] += 1
+            return True
+        if tp2_hit:
+            pos.pnl_usdt += _realize(pos, pos.remaining, pos.tp2)
+            pos.exit_reason = "take_profit2"; pos.exit_price = pos.tp2; pos.exit_ts = ts
+            stats["tp2"] += 1
+            return True
+        return False
+
+    for i in range(warmup, len(primary_candles)):
+        bar    = primary_candles[i]
+        ts     = bar.timestamp
+        price  = float(bar.close)
+        b_high = float(bar.high)
+        b_low  = float(bar.low)
+
+        if open_long is not None and _step_exit(open_long, b_high, b_low, ts):
+            trades.append(open_long); open_long = None
+        if open_short is not None and _step_exit(open_short, b_high, b_low, ts):
+            trades.append(open_short); open_short = None
+
+        prim_slice = primary_candles[max(0, i - primary_window): i + 1]
+        mtf_sliced: dict[str, list[OHLCV]] = {}
+        for tf, ts_idx in mtf_ts_index.items():
+            idx_end   = bisect.bisect_right(ts_idx, ts)
+            win       = _mtf_windows.get(tf, 200)
+            mtf_sliced[tf] = mtf_candles[tf][max(0, idx_end - win):idx_end]
+
+        try:
+            signal = await strategy.analyze(prim_slice, price, mtf_candles=mtf_sliced)
+        except Exception as e:
+            logger.debug("MTF v2 analyze error at bar %d: %s", i, e)
+            continue
+
+        if signal.type not in (SignalType.BUY, SignalType.SELL):
+            continue
+        if open_long is not None or open_short is not None:
+            continue  # 1 position per strategy at a time
+
+        meta = signal.metadata or {}
+        sl  = meta.get("sl_init", meta.get("stop_loss"))
+        tp1 = meta.get("tp1")
+        tp2 = meta.get("tp2", meta.get("take_profit"))
+        if sl is None or tp1 is None or tp2 is None:
+            continue
+        side = "long" if signal.type == SignalType.BUY else "short"
+        pos = BTradeV2(
+            symbol=strategy.symbol, strategy=strategy.name, side=side,
+            entry=price, sl=float(sl), tp1=float(tp1), tp2=float(tp2),
+            entry_ts=ts, notional=notional,
+            partial_pct=float(meta.get("partial_pct", 0.5)),
+        )
+        # entry-side taker fee on full notional
+        pos.pnl_usdt -= notional * TAKER_FEE
+        if side == "long": open_long = pos
+        else:              open_short = pos
+
+    return trades, stats
+
+
 async def backtest_strategy_mtf(
     strategy: BaseStrategy,
     primary_candles: list[OHLCV],

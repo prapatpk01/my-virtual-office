@@ -198,6 +198,101 @@ class BaseStrategy(ABC):
                     adx_arr[i] = (adx_arr[i-1] * (period-1) + dx[i]) / period
         return adx_arr, plus_di, minus_di
 
+    def risk_metadata(self, current_price: float, atr_v: float, side: str,
+                      sl_atr: float = 1.2, tp1_atr: float = 1.5, tp2_atr: float = 3.0,
+                      sl_min_pct: float = 0.010, sl_max_pct: float = 0.040,
+                      risk_pct: float = 0.02, partial_pct: float = 0.5) -> dict:
+        """
+        Build the standard Global-Risk metadata block for an entry signal.
+
+        Initial SL = sl_atr×ATR (clamped to [sl_min_pct, sl_max_pct] of price).
+        TP1 = tp1_atr×ATR (close `partial_pct` of position, then move SL → breakeven).
+        TP2 = tp2_atr×ATR (close the remainder, ride the trend).
+        After clamping, TP distances are scaled by the *effective* ATR so the
+        1.2 / 1.5 / 2.2 ratios are preserved even when the SL is widened/narrowed.
+
+        `sl_dist_pct` and `risk_pct` let the RiskManager size the position so the
+        worst-case loss (full size hitting initial SL) ≈ risk_pct of the portfolio.
+        """
+        sl_raw   = sl_atr * atr_v
+        sl_dist  = max(current_price * sl_min_pct,
+                       min(sl_raw, current_price * sl_max_pct))
+        atr_unit = sl_dist / max(sl_atr, 1e-9)      # effective ATR after clamp
+        tp1_dist = tp1_atr * atr_unit
+        tp2_dist = tp2_atr * atr_unit
+        if side == "long":
+            sl  = current_price - sl_dist
+            tp1 = current_price + tp1_dist
+            tp2 = current_price + tp2_dist
+        else:
+            sl  = current_price + sl_dist
+            tp1 = current_price - tp1_dist
+            tp2 = current_price - tp2_dist
+        return {
+            "stop_loss":   round(sl, 2),    # back-compat: initial SL
+            "take_profit": round(tp2, 2),   # back-compat: full TP = TP2
+            "sl_init":     round(sl, 2),
+            "tp1":         round(tp1, 2),
+            "tp2":         round(tp2, 2),
+            "atr":         round(atr_v, 2),
+            "sl_dist_pct": round(sl_dist / current_price, 6),
+            "partial_pct": partial_pct,     # fraction to close at TP1
+            "risk_pct":    risk_pct,        # portfolio risk budget for sizing
+            "breakeven":   round(current_price, 2),
+            "rr_tp1":      round(tp1_dist / sl_dist, 2),
+            "rr_tp2":      round(tp2_dist / sl_dist, 2),
+        }
+
+    @staticmethod
+    def supertrend(candles: list, period: int = 10, multiplier: float = 3.0) -> tuple:
+        """
+        Supertrend indicator. Returns (st_line, direction) where
+          direction = +1  → uptrend  (price above line, "green")
+          direction = -1  → downtrend (price below line, "red")
+        Uses ATR(period) with Wilder smoothing and the classic band-flip logic.
+        """
+        n = len(candles)
+        st  = np.full(n, np.nan)
+        dir_ = np.zeros(n, dtype=int)
+        if n <= period:
+            return st, dir_
+        atr = BaseStrategy.atr(candles, period)
+        hl2 = np.array([(c.high + c.low) / 2.0 for c in candles], dtype=float)
+        basic_up = hl2 + multiplier * atr
+        basic_dn = hl2 - multiplier * atr
+        f_up = np.full(n, np.nan)
+        f_dn = np.full(n, np.nan)
+        start = period  # first bar with a valid ATR
+        f_up[start] = basic_up[start]
+        f_dn[start] = basic_dn[start]
+        dir_[start] = 1
+        st[start]   = f_dn[start]
+        for i in range(start + 1, n):
+            prev_close = candles[i - 1].close
+            f_up[i] = (basic_up[i] if (basic_up[i] < f_up[i - 1] or prev_close > f_up[i - 1])
+                       else f_up[i - 1])
+            f_dn[i] = (basic_dn[i] if (basic_dn[i] > f_dn[i - 1] or prev_close < f_dn[i - 1])
+                       else f_dn[i - 1])
+            close = candles[i].close
+            if dir_[i - 1] == 1:
+                dir_[i] = -1 if close < f_dn[i] else 1
+            else:
+                dir_[i] = 1 if close > f_up[i] else -1
+            st[i] = f_dn[i] if dir_[i] == 1 else f_up[i]
+        return st, dir_
+
+    @staticmethod
+    def obv(candles: list) -> np.ndarray:
+        """On-Balance Volume: cumulative volume signed by close-to-close direction."""
+        n = len(candles)
+        out = np.zeros(n, dtype=float)
+        for i in range(1, n):
+            c, pc = candles[i].close, candles[i - 1].close
+            if   c > pc: out[i] = out[i - 1] + candles[i].volume
+            elif c < pc: out[i] = out[i - 1] - candles[i].volume
+            else:        out[i] = out[i - 1]
+        return out
+
     @staticmethod
     def _heikin_ashi(candles: list):
         """Convert OHLCV candles to Heikin Ashi. Returns (ha_candles, ha_open_arr, ha_close_arr)."""

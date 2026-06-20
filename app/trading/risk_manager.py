@@ -4,19 +4,53 @@ from typing import Optional
 import time
 
 
+def _day_key(ts: Optional[float] = None) -> str:
+    """UTC calendar-day key (YYYY-MM-DD) used to anchor the daily circuit breaker."""
+    return time.strftime("%Y-%m-%d", time.gmtime(ts if ts is not None else time.time()))
+
+
 @dataclass
 class Position:
     symbol: str
     side: str          # 'long' | 'short'
     entry_price: float
-    amount: float
+    amount: float      # CURRENT open size (shrinks after a partial close)
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
     opened_at: int = field(default_factory=lambda: int(time.time()))
+    # ── Partial-close / breakeven state (Global Risk) ──
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    partial_pct: float = 0.5
+    tp1_hit: bool = False
+    full_amount: float = 0.0   # original size at open (for partial math)
 
     @property
     def pnl_pct(self) -> float:
         return 0.0  # filled by bot at runtime
+
+    def stage_check(self, price: float) -> Optional[str]:
+        """
+        Staged exit trigger for the partial-close model. Returns one of:
+          'stop_loss'    — full stop before TP1
+          'tp1'          — TP1 reached (caller closes partial_pct, moves SL→breakeven)
+          'breakeven'    — runner hit breakeven SL after TP1
+          'take_profit2' — runner reached TP2
+          None
+        """
+        long = self.side == "long"
+        if not self.tp1_hit:
+            if self.stop_loss and ((price <= self.stop_loss) if long else (price >= self.stop_loss)):
+                return "stop_loss"
+            if self.tp1 and ((price >= self.tp1) if long else (price <= self.tp1)):
+                return "tp1"
+            return None
+        # after TP1: protected runner
+        if self.stop_loss and ((price <= self.stop_loss) if long else (price >= self.stop_loss)):
+            return "breakeven"
+        if self.tp2 and ((price >= self.tp2) if long else (price <= self.tp2)):
+            return "take_profit2"
+        return None
 
 
 class RiskManager:
@@ -33,6 +67,7 @@ class RiskManager:
                  max_drawdown_pct: float = 0.15,
                  fixed_trade_usdt: float = 0.0,  # >0 → fixed USDT margin per trade
                  leverage: int = 1,              # futures leverage (multiplies notional)
+                 daily_loss_limit_pct: float = 0.05,  # circuit breaker: halt new entries if day PnL ≤ -5%
                  ):
         self.max_risk_per_trade_pct = max_risk_per_trade_pct
         self.fixed_trade_usdt = fixed_trade_usdt
@@ -41,9 +76,14 @@ class RiskManager:
         self.take_profit_pct = take_profit_pct
         self.max_open_positions = max_open_positions
         self.max_drawdown_pct = max_drawdown_pct
+        self.daily_loss_limit_pct = daily_loss_limit_pct
         self._positions: dict[str, Position] = {}
         self._peak_balance: float = 0.0
         self._halted: bool = False
+        # Daily circuit breaker state (anchored to UTC calendar day)
+        self._day: str = _day_key()
+        self._day_start_balance: float = 0.0
+        self._day_realized_pnl: float = 0.0
 
     def update_peak(self, balance: float):
         if balance > self._peak_balance:
@@ -76,6 +116,57 @@ class RiskManager:
         notional = margin * self.leverage
         return round(notional / price, 6)
 
+    def size_by_risk(self, balance: float, price: float,
+                     sl_dist_pct: float, risk_pct: float = 0.02) -> float:
+        """
+        Dynamic sizing: choose notional so the worst-case loss (full size hitting
+        the initial SL) ≈ risk_pct of the portfolio.
+
+          risk_amount = balance × risk_pct
+          loss_at_SL  = notional × sl_dist_pct   →   notional = risk_amount / sl_dist_pct
+
+        Capped at 95% of balance × leverage (can't exceed available margin).
+        Falls back to fixed/percent sizing if sl_dist_pct is unusable.
+        """
+        if price <= 0:
+            return 0.0
+        if sl_dist_pct and sl_dist_pct > 0:
+            risk_amount = balance * max(risk_pct, 0.0)
+            notional    = risk_amount / sl_dist_pct
+            max_notional = balance * 0.95 * self.leverage
+            notional    = min(notional, max_notional)
+            return round(notional / price, 6)
+        # Fallback: existing fixed/percent sizing
+        return self.size_position(balance, price)
+
+    # ── Daily circuit breaker ──────────────────────────────────────────────
+
+    def _roll_day(self, balance: float):
+        """Reset daily PnL accounting when the UTC calendar day changes."""
+        today = _day_key()
+        if today != self._day or self._day_start_balance <= 0:
+            self._day = today
+            self._day_start_balance = balance if balance > 0 else self._day_start_balance
+            self._day_realized_pnl = 0.0
+
+    def register_pnl(self, pnl: float):
+        """Record a realized PnL (per closed position / partial close) for the day."""
+        self._day_realized_pnl += pnl
+
+    def check_daily_circuit(self, balance: float) -> tuple[bool, str]:
+        """
+        Returns (allowed, reason). New entries are blocked for the rest of the
+        UTC day once realized PnL ≤ -daily_loss_limit_pct of the day-start balance.
+        """
+        self._roll_day(balance)
+        if self._day_start_balance <= 0 or self.daily_loss_limit_pct <= 0:
+            return True, "ok"
+        loss_pct = self._day_realized_pnl / self._day_start_balance
+        if loss_pct <= -self.daily_loss_limit_pct:
+            return False, (f"Daily circuit breaker: PnL {loss_pct*100:.1f}% "
+                           f"≤ -{self.daily_loss_limit_pct*100:.0f}% — paused until next day")
+        return True, "ok"
+
     def compute_stops(self, side: str, entry_price: float) -> tuple[float, float]:
         """Returns (stop_loss_price, take_profit_price). Accepts 'buy'/'long' or 'sell'/'short'."""
         if side in ("buy", "long"):
@@ -104,15 +195,20 @@ class RiskManager:
         return True, "ok"
 
     def open_position(self, symbol: str, side: str, entry_price: float, amount: float,
-                      strategy: str = "", stop_loss: float = None, take_profit: float = None) -> Position:
+                      strategy: str = "", stop_loss: float = None, take_profit: float = None,
+                      tp1: float = None, tp2: float = None, partial_pct: float = 0.5) -> Position:
         if stop_loss is None or take_profit is None:
             sl_default, tp_default = self.compute_stops(side, entry_price)
             stop_loss   = stop_loss   if stop_loss   is not None else sl_default
             take_profit = take_profit if take_profit is not None else tp_default
         pos = Position(symbol=symbol, side=side, entry_price=entry_price, amount=amount,
-                       stop_loss=stop_loss, take_profit=take_profit)
+                       stop_loss=stop_loss, take_profit=take_profit,
+                       tp1=tp1, tp2=tp2, partial_pct=partial_pct, full_amount=amount)
         self._positions[f"{symbol}||{strategy}"] = pos
         return pos
+
+    def get_position_obj(self, symbol: str, strategy: str = "") -> Optional[Position]:
+        return self._positions.get(f"{symbol}||{strategy}")
 
     def close_position(self, symbol: str, strategy: str = "") -> Optional[Position]:
         key = f"{symbol}||{strategy}"
@@ -153,6 +249,11 @@ class RiskManager:
                 "amount": p.amount,
                 "stop_loss": p.stop_loss,
                 "take_profit": p.take_profit,
+                "tp1": p.tp1,
+                "tp2": p.tp2,
+                "tp1_hit": p.tp1_hit,
+                "partial_pct": p.partial_pct,
+                "full_amount": p.full_amount,
             })
         return result
 

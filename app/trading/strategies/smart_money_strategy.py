@@ -1,19 +1,18 @@
 """
-Smart Money Strategy — MTF Momentum (rewritten)
-================================================
-Replaces the BOS/CHoCH approach with a clean MTF Momentum strategy.
+Smart Money Strategy — MTF Momentum  (v2 — stronger filters / TP1+TP2)
+=====================================================================
+MTF momentum confirmed by real volume flow (OBV).
 
-Entry logic (3-layer MTF alignment):
-  BUY  (long)  : comp_pct > +bias_threshold AND RSI in [35,65]
-                 AND EMA9 > EMA21 (15m) AND volume >= vol_mult x MA20
-  SELL (short) : comp_pct < -bias_threshold AND RSI in [35,65]
-                 AND EMA9 < EMA21 (15m) AND volume >= vol_mult x MA20
+  BUY  (long)  : comp_pct > +bias_threshold AND EMA9>EMA21 (15m) AND RSI neutral
+                 AND volume ≥ vol_mult×MA20 AND OBV > EMA20(OBV)   [money flowing in]
+  SELL (short) : comp_pct < -bias_threshold AND EMA9<EMA21 (15m) AND RSI neutral
+                 AND volume ≥ vol_mult×MA20 AND OBV < EMA20(OBV)   [money flowing out]
 
-comp_pct from compute_mtf_bias() ranges -100 to +100 and captures
-the composite 15m+1H+4H trend alignment.
+Changes vs v1:
+  • bias_threshold 15 → 40  (skip directionless / sideways chop)
+  • NEW OBV vs EMA20(OBV) confirmation — only trade when big money agrees
 
-SL/TP: ATR-based, clamped to [sl_min_pct, sl_max_pct]
-  sl_mult=1.5, tp_mult=2.5 → R:R 1:1.67  (break-even WR 37.5%)
+Risk (Global): Initial SL 1.5×ATR, TP1 1.2×ATR (close 50% → SL→BE), TP2 2.2×ATR.
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -30,12 +29,17 @@ class SmartMoneyStrategy(BaseStrategy):
         self.rsi_period     = self.params.get("rsi_period",     14)
         self.vol_period     = self.params.get("vol_period",     20)
         self.vol_mult       = self.params.get("vol_mult",       1.0)
-        self.bias_threshold = self.params.get("bias_threshold", 15.0)  # ↓ from 20 — grid-optimised
+        self.bias_threshold = self.params.get("bias_threshold", 40.0)  # ↑ from 15 — skip chop
+        self.obv_ema        = self.params.get("obv_ema",          20)  # NEW: EMA of OBV
         self.atr_period     = self.params.get("atr_period",     14)
-        self.sl_mult        = self.params.get("sl_mult",        1.2)   # Case3 optimised ↓ from 1.5
-        self.tp_mult        = self.params.get("tp_mult",        1.5)   # Case3 optimised ↓ from 2.5
-        self.sl_min_pct     = self.params.get("sl_min_pct",   0.010)  # 1.0% min SL
+        # Global-Risk multiples (grid-tuned: SL 1.2 / TP1 1.5 / TP2 3.0 ATR)
+        self.sl_atr         = self.params.get("sl_atr",         1.2)
+        self.tp1_atr        = self.params.get("tp1_atr",        1.5)
+        self.tp2_atr        = self.params.get("tp2_atr",        3.0)
+        self.sl_min_pct     = self.params.get("sl_min_pct",   0.010)
         self.sl_max_pct     = self.params.get("sl_max_pct",   0.050)
+        self.risk_pct       = self.params.get("risk_pct",      0.02)
+        self.partial_pct    = self.params.get("partial_pct",    0.5)
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
@@ -61,7 +65,7 @@ class SmartMoneyStrategy(BaseStrategy):
             return Signal(
                 SignalType.HOLD, self.symbol, current_price, 0,
                 reason=(f"[SmartMoney] Bias too weak: comp={comp_pct:.0f} ({bias_label}) "
-                        f"need >{self.bias_threshold:.0f} long / <-{self.bias_threshold:.0f} short"),
+                        f"need >|{self.bias_threshold:.0f}|"),
             )
 
         # ── 15m indicators (last closed bar = [-2]) ───────────────────────
@@ -70,6 +74,14 @@ class SmartMoneyStrategy(BaseStrategy):
         rsi_a = self.rsi(closes_15m, self.rsi_period)
         volma = self.sma(vols_15m,   self.vol_period)
         atr_a = self.atr(candles,    self.atr_period)
+
+        # ── OBV flow confirmation (NEW) ───────────────────────────────────
+        obv_a    = self.obv(candles)
+        obv_emaA = self.ema(list(obv_a), self.obv_ema)
+        obv_b    = float(obv_a[-2])
+        obv_e_b  = float(obv_emaA[-2])
+        obv_up   = (not np.isnan(obv_e_b)) and obv_b > obv_e_b
+        obv_down = (not np.isnan(obv_e_b)) and obv_b < obv_e_b
 
         ema9_b  = float(ef9[-2])
         ema21_b = float(ef21[-2])
@@ -84,45 +96,41 @@ class SmartMoneyStrategy(BaseStrategy):
 
         rsi_neutral = 35.0 <= rsi_b <= 65.0
         vol_ok      = volma_b > 0 and vol_b >= volma_b * self.vol_mult
-        rr          = self.tp_mult / max(self.sl_mult, 1e-9)
 
-        def _sl_tp(side: str) -> tuple[float, float]:
-            raw  = atr_v * self.sl_mult
-            dist = max(current_price * self.sl_min_pct,
-                       min(raw, current_price * self.sl_max_pct))
-            tp_d = dist * (self.tp_mult / self.sl_mult)  # scale TP with actual dist to maintain R:R
-            if side == "long":
-                return round(current_price - dist, 2), round(current_price + tp_d, 2)
-            return round(current_price + dist, 2), round(current_price - tp_d, 2)
-
-        # ── BUY: strong bullish bias + EMA9>EMA21 + RSI neutral + volume ─
-        if long_ok and ema9_b > ema21_b and rsi_neutral and vol_ok:
-            sl, tp = _sl_tp("long")
-            return Signal(
-                SignalType.BUY, self.symbol, current_price,
-                amount=0.08,
-                reason=(f"[SmartMoney] LONG comp={comp_pct:.0f} ({bias_label}) "
-                        f"EMA9>EMA21 RSI={rsi_b:.0f} RR=1:{rr:.2f}"),
-                confidence=min(0.50 + abs(comp_pct) / 200.0, 0.85),
-                metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
+        def _meta(side: str) -> dict:
+            return self.risk_metadata(
+                current_price, atr_v, side,
+                sl_atr=self.sl_atr, tp1_atr=self.tp1_atr, tp2_atr=self.tp2_atr,
+                sl_min_pct=self.sl_min_pct, sl_max_pct=self.sl_max_pct,
+                risk_pct=self.risk_pct, partial_pct=self.partial_pct,
             )
 
-        # ── SELL: strong bearish bias + EMA9<EMA21 + RSI neutral + volume ─
-        if short_ok and ema9_b < ema21_b and rsi_neutral and vol_ok:
-            sl, tp = _sl_tp("short")
+        # ── BUY: bias + EMA9>EMA21 + RSI neutral + volume + OBV up ─────────
+        if long_ok and ema9_b > ema21_b and rsi_neutral and vol_ok and obv_up:
+            meta = _meta("long")
             return Signal(
-                SignalType.SELL, self.symbol, current_price,
-                amount=0.08,
-                reason=(f"[SmartMoney] SHORT comp={comp_pct:.0f} ({bias_label}) "
-                        f"EMA9<EMA21 RSI={rsi_b:.0f} RR=1:{rr:.2f}"),
+                SignalType.BUY, self.symbol, current_price, amount=0.08,
+                reason=(f"[SmartMoney] LONG comp={comp_pct:.0f} EMA9>EMA21 OBV↑ "
+                        f"RSI={rsi_b:.0f} TP1={meta['tp1']} TP2={meta['tp2']}"),
                 confidence=min(0.50 + abs(comp_pct) / 200.0, 0.85),
-                metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
+                metadata=meta,
+            )
+
+        # ── SELL: bias + EMA9<EMA21 + RSI neutral + volume + OBV down ──────
+        if short_ok and ema9_b < ema21_b and rsi_neutral and vol_ok and obv_down:
+            meta = _meta("short")
+            return Signal(
+                SignalType.SELL, self.symbol, current_price, amount=0.08,
+                reason=(f"[SmartMoney] SHORT comp={comp_pct:.0f} EMA9<EMA21 OBV↓ "
+                        f"RSI={rsi_b:.0f} TP1={meta['tp1']} TP2={meta['tp2']}"),
+                confidence=min(0.50 + abs(comp_pct) / 200.0, 0.85),
+                metadata=meta,
             )
 
         ema_dir = "EMA9>EMA21" if ema9_b > ema21_b else "EMA9<EMA21"
+        obv_dir = "OBV↑" if obv_up else "OBV↓" if obv_down else "OBV→"
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            reason=(f"[SmartMoney] comp={comp_pct:.0f} ({bias_label}) "
-                    f"{ema_dir} RSI={rsi_b:.0f} vol={'ok' if vol_ok else 'low'} "
-                    f"— conditions not fully met"),
+            reason=(f"[SmartMoney] comp={comp_pct:.0f} {ema_dir} {obv_dir} "
+                    f"RSI={rsi_b:.0f} vol={'ok' if vol_ok else 'low'} — not fully met"),
         )

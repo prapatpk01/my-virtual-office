@@ -91,30 +91,31 @@ def build_config() -> dict:
         "strategy_smart_money":    _env_bool("STRATEGY_SMART_MONEY",    True),
         "strategy_sjutbot_v3":     _env_bool("STRATEGY_SJUTBOT_V3",     True),
 
-        # ── Mean Reversion (1H entry / 4H MTF) ───────────────────────────────
-        # sl=1.2 tp=1.5 → R:R 1:1.25  BE WR 44%  backtest: WR 55.1% +$161/5mo
-        "mr_sl_mult":         _env_float("MR_SL_MULT",        1.2),
-        "mr_tp_mult":         _env_float("MR_TP_MULT",        1.5),
+        # ── Global Risk multiples (shared by MR/TC/SM) ───────────────────────
+        # Grid-tuned: Initial SL 1.2×ATR, TP1 1.5×ATR (close 50% → SL→breakeven), TP2 3.0×ATR.
+        "g_sl_atr":   _env_float("GLOBAL_SL_ATR",   1.2),
+        "g_tp1_atr":  _env_float("GLOBAL_TP1_ATR",  1.5),
+        "g_tp2_atr":  _env_float("GLOBAL_TP2_ATR",  3.0),
+        "g_partial":  _env_float("GLOBAL_PARTIAL_PCT", 0.5),
+
+        # ── Mean Reversion (1H entry / 4H MTF) — fade extremes, avoid strong trends
         "mr_rsi_oversold":    _env_float("MR_RSI_OVERSOLD",  45.0),
         "mr_rsi_overbought":  _env_float("MR_RSI_OVERBOUGHT",55.0),
-        "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     2),
+        "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     3),   # ↑ from 2
+        "mr_adx_cap":         _env_float("MR_ADX_CAP",       50.0),   # no fade if 4H ADX > 50
 
-        # ── Trend Continuation (15m entry / 1H+4H MTF) ───────────────────────
-        # sl=1.2 tp=1.5 → R:R 1:1.25  BE WR 44%  backtest: WR 59.8% +$185/5mo
-        # bias_gate=70 + cond=4/4 + pull=1% → selective, high WR
-        "tc_sl_mult":         _env_float("TC_SL_MULT",        1.2),
-        "tc_tp_mult":         _env_float("TC_TP_MULT",        1.5),
+        # ── Trend Continuation (15m entry / 1H+4H MTF) — ride trend, buy dips ─
         "tc_rsi_min":         _env_float("TC_RSI_MIN",       35.0),
         "tc_rsi_max":         _env_float("TC_RSI_MAX",       75.0),
-        "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",   0.010),
+        "tc_pullback_atr":    _env_float("TC_PULLBACK_ATR",   0.5),   # EMA20 ± 0.5×ATR(1H)
         "tc_vol_mult":        _env_float("TC_VOL_MULT",       1.0),
-        "tc_bias_gate":       _env_float("TC_BIAS_GATE",     70.0),
+        "tc_bias_gate":       _env_float("TC_BIAS_GATE",     55.0),   # ↓ from 70
+        "tc_st_period":       _env_int("TC_ST_PERIOD",         10),   # Supertrend(4H)
+        "tc_st_mult":         _env_float("TC_ST_MULT",        3.0),
 
-        # ── Smart Money (15m entry / 1H+4H MTF) ──────────────────────────────
-        # sl=1.2 tp=1.5 → R:R 1:1.25  BE WR 44%  backtest: WR 52.2% +$118/5mo
-        "sm_sl_mult":         _env_float("SM_SL_MULT",        1.2),
-        "sm_tp_mult":         _env_float("SM_TP_MULT",        1.5),
-        "sm_bias_threshold":  _env_float("SM_BIAS_THRESHOLD",15.0),
+        # ── Smart Money (15m entry / 1H+4H MTF) — MTF momentum + OBV flow ─────
+        "sm_bias_threshold":  _env_float("SM_BIAS_THRESHOLD",40.0),   # ↑ from 15
+        "sm_obv_ema":         _env_int("SM_OBV_EMA",           20),
 
         # ── SJUTBot v3 (30m) ─────────────────────────────────────────────────
         # filter_threshold=4: ALL 4 components must agree → very selective longs
@@ -147,6 +148,10 @@ def build_config() -> dict:
         # Set lower to limit capital exposure (default: 6 = 3 strats × 2 symbols, 1 side each).
         "max_positions":  _env_int("MAX_POSITIONS",  4),
         "max_drawdown":   _env_float("MAX_DRAWDOWN_PCT", 0.30),  # 30% drawdown halt
+        # Daily circuit breaker: pause NEW entries once realized PnL ≤ -X% for the UTC day.
+        "daily_loss_limit": _env_float("DAILY_LOSS_LIMIT_PCT", 0.05),  # -5%
+        # Per-trade risk budget for dynamic sizing (strategies pass risk_pct in metadata).
+        "risk_per_trade":   _env_float("RISK_PER_TRADE_PCT", 0.02),    # 2%
 
         # ── Timing ────────────────────────────────────────────────────────────
         # Tick interval: how often the bot loops (fetches data + evaluates signals).
@@ -189,17 +194,25 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "allow_short":      cfg["sjv3_allow_short"],
             }))
 
+        _grisk = {
+            "sl_atr":      cfg["g_sl_atr"],
+            "tp1_atr":     cfg["g_tp1_atr"],
+            "tp2_atr":     cfg["g_tp2_atr"],
+            "partial_pct": cfg["g_partial"],
+            "risk_pct":    cfg["risk_per_trade"],
+        }
+
         # ── Mean Reversion (1H entry / 4H MTF) ────────────────────────────────
         if cfg["strategy_mean_reversion"]:
             strategies.append(MeanReversionStrategy(sym, params={
                 "name":           "MeanReversion",
                 "tf":             "1h",
                 "limit":          300,
-                "sl_mult":        cfg["mr_sl_mult"],
-                "tp_mult":        cfg["mr_tp_mult"],
                 "rsi_oversold":   cfg["mr_rsi_oversold"],
                 "rsi_overbought": cfg["mr_rsi_overbought"],
                 "min_conditions": cfg["mr_min_conditions"],
+                "adx_cap":        cfg["mr_adx_cap"],
+                **_grisk,
             }))
 
         # ── Trend Continuation (15m entry / 1H+4H MTF) ────────────────────────
@@ -208,13 +221,14 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "name":         "TrendCont",
                 "tf":           "15m",
                 "limit":        300,
-                "sl_mult":      cfg["tc_sl_mult"],
-                "tp_mult":      cfg["tc_tp_mult"],
                 "rsi_min":      cfg["tc_rsi_min"],
                 "rsi_max":      cfg["tc_rsi_max"],
-                "pullback_pct": cfg["tc_pullback_pct"],
+                "pullback_atr": cfg["tc_pullback_atr"],
                 "vol_mult":     cfg["tc_vol_mult"],
                 "bias_gate":    cfg["tc_bias_gate"],
+                "st_period":    cfg["tc_st_period"],
+                "st_mult":      cfg["tc_st_mult"],
+                **_grisk,
             }))
 
         # ── Smart Money (15m entry / 1H+4H MTF) ───────────────────────────────
@@ -223,9 +237,9 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "name":           "SmartMoney",
                 "tf":             "15m",
                 "limit":          300,
-                "sl_mult":        cfg["sm_sl_mult"],
-                "tp_mult":        cfg["sm_tp_mult"],
                 "bias_threshold": cfg["sm_bias_threshold"],
+                "obv_ema":        cfg["sm_obv_ema"],
+                **_grisk,
             }))
 
     if not strategies:
@@ -299,12 +313,13 @@ async def main():
         max_drawdown_pct=cfg["max_drawdown"],
         fixed_trade_usdt=cfg["fixed_trade_usdt"],
         leverage=cfg["leverage"],
+        daily_loss_limit_pct=cfg["daily_loss_limit"],
     )
     logger.info(
-        "Risk: SL=%.1f%%  TP=%.1f%%  fixed=%gUSDT  lev=%dx  max_pos=%d  drawdown=%.0f%%",
+        "Risk: SL=%.1f%%  TP=%.1f%%  fixed=%gUSDT  lev=%dx  max_pos=%d  drawdown=%.0f%%  dailyCB=%.0f%%",
         cfg["stop_loss_pct"] * 100, cfg["take_profit_pct"] * 100,
         cfg["fixed_trade_usdt"], cfg["leverage"],
-        cfg["max_positions"], cfg["max_drawdown"] * 100,
+        cfg["max_positions"], cfg["max_drawdown"] * 100, cfg["daily_loss_limit"] * 100,
     )
 
     # ── Trading bot ───────────────────────────────────────────────────────────
@@ -321,7 +336,7 @@ async def main():
 
     # ── Backtest function (called by /backtest Telegram command) ─────────────
     async def _run_backtest() -> str:
-        from trading.backtester import backtest_strategy_mtf, summarise
+        from trading.backtester import backtest_strategy_mtf, backtest_strategy_mtf_v2, summarise
         from trading.strategies.sjutbot_v3_strategy          import SJUTBotV3Strategy
         from trading.strategies.mean_reversion_strategy      import MeanReversionStrategy
         from trading.strategies.trend_continuation_strategy  import TrendContinuationStrategy
@@ -331,6 +346,11 @@ async def main():
         sl_pct   = cfg["stop_loss_pct"]
         tp_pct   = cfg["take_profit_pct"]
         notional = cfg["fixed_trade_usdt"] * cfg["leverage"]
+        _grisk = {
+            "sl_atr":  cfg["g_sl_atr"],  "tp1_atr": cfg["g_tp1_atr"],
+            "tp2_atr": cfg["g_tp2_atr"], "partial_pct": cfg["g_partial"],
+            "risk_pct": cfg["risk_per_trade"],
+        }
 
         cache: dict = {}
         results: dict[str, dict] = {}
@@ -353,29 +373,29 @@ async def main():
 
             if c1h and c4h:
                 mr = MeanReversionStrategy(sym, params={
-                    "name": "MeanReversion", "sl_mult": cfg["mr_sl_mult"],
-                    "tp_mult": cfg["mr_tp_mult"], "rsi_oversold": cfg["mr_rsi_oversold"],
+                    "name": "MeanReversion", "rsi_oversold": cfg["mr_rsi_oversold"],
                     "rsi_overbought": cfg["mr_rsi_overbought"], "min_conditions": cfg["mr_min_conditions"],
+                    "adx_cap": cfg["mr_adx_cap"], **_grisk,
                 })
-                trades = await backtest_strategy_mtf(mr, c1h, {"4h": c4h}, notional, sl_pct, tp_pct, primary_window=200)
+                trades, _ = await backtest_strategy_mtf_v2(mr, c1h, {"4h": c4h}, notional, primary_window=200)
                 results[f"MeanRev/{tag}"] = summarise(trades)
 
             if c15m and c1h and c4h:
                 tc = TrendContinuationStrategy(sym, params={
-                    "name": "TrendCont", "sl_mult": cfg["tc_sl_mult"], "tp_mult": cfg["tc_tp_mult"],
-                    "rsi_min": cfg["tc_rsi_min"], "rsi_max": cfg["tc_rsi_max"],
-                    "pullback_pct": cfg["tc_pullback_pct"], "vol_mult": cfg["tc_vol_mult"],
-                    "bias_gate": cfg["tc_bias_gate"],
+                    "name": "TrendCont", "rsi_min": cfg["tc_rsi_min"], "rsi_max": cfg["tc_rsi_max"],
+                    "pullback_atr": cfg["tc_pullback_atr"], "vol_mult": cfg["tc_vol_mult"],
+                    "bias_gate": cfg["tc_bias_gate"], "st_period": cfg["tc_st_period"],
+                    "st_mult": cfg["tc_st_mult"], **_grisk,
                 })
-                trades = await backtest_strategy_mtf(tc, c15m, {"1h": c1h, "4h": c4h}, notional, sl_pct, tp_pct)
+                trades, _ = await backtest_strategy_mtf_v2(tc, c15m, {"1h": c1h, "4h": c4h}, notional)
                 results[f"TrendCont/{tag}"] = summarise(trades)
 
             if c15m and c1h and c4h:
                 sm = SmartMoneyStrategy(sym, params={
-                    "name": "SmartMoney", "sl_mult": cfg["sm_sl_mult"], "tp_mult": cfg["sm_tp_mult"],
-                    "bias_threshold": cfg["sm_bias_threshold"],
+                    "name": "SmartMoney", "bias_threshold": cfg["sm_bias_threshold"],
+                    "obv_ema": cfg["sm_obv_ema"], **_grisk,
                 })
-                trades = await backtest_strategy_mtf(sm, c15m, {"1h": c1h, "4h": c4h}, notional, sl_pct, tp_pct)
+                trades, _ = await backtest_strategy_mtf_v2(sm, c15m, {"1h": c1h, "4h": c4h}, notional)
                 results[f"SmartMoney/{tag}"] = summarise(trades)
 
             if c30m:

@@ -66,6 +66,7 @@ class TradingBot:
         self._start_balance = 0.0
         self._pnl_total = 0.0
         self._error = ""
+        self._entries_paused = False   # set by daily circuit breaker
         self._trade_history: list[TradeRecord] = []
         self._signals_cache: list[dict] = []
 
@@ -140,9 +141,16 @@ class TradingBot:
             self._broadcast_state()
             return
 
-        # Check SL/TP on every open position every tick
+        # Check SL/TP (staged: TP1/breakeven/TP2) on every open position every tick
         for pos in list(self.risk.get_positions()):
             await self._check_stop(pos)
+
+        # Daily circuit breaker — block NEW entries (open positions keep running)
+        allowed_daily, dreason = self.risk.check_daily_circuit(self._balance)
+        self._entries_paused = not allowed_daily
+        if self._entries_paused:
+            logger.warning("[BOT] %s", dreason)
+            self._error = dreason
 
         # Run strategies — cache candles per (symbol, timeframe) to avoid duplicate fetches
         candle_cache: dict[tuple, list] = {}
@@ -214,6 +222,10 @@ class TradingBot:
         sym    = signal.symbol
         is_buy = signal.type == SignalType.BUY
 
+        if self._entries_paused:
+            logger.debug("[%s] entries paused (daily circuit breaker) — %s", strategy_name, sym)
+            return
+
         if is_buy:
             slot = strategy_name                    # long slot key
             side = "long"
@@ -259,7 +271,14 @@ class TradingBot:
                 self._sig.unlock_strategy(sym, slot)
                 return
 
-            amount = self.risk.size_position(usdt_free, price)
+            # Dynamic sizing: size by SL distance so worst-case loss ≈ risk_pct of port.
+            meta        = signal.metadata or {}
+            sl_dist_pct = meta.get("sl_dist_pct")
+            risk_pct    = meta.get("risk_pct", 0.02)
+            if sl_dist_pct:
+                amount = self.risk.size_by_risk(usdt_free, price, sl_dist_pct, risk_pct)
+            else:
+                amount = self.risk.size_position(usdt_free, price)
             if amount <= 0:
                 logger.warning("[%s] Position size=0 for %s — skipping", slot, sym)
                 self._sig.unlock_strategy(sym, slot)
@@ -276,6 +295,8 @@ class TradingBot:
             self.risk.open_position(
                 sym, side, price, amount,
                 strategy=slot, stop_loss=sl_p, take_profit=tp_p,
+                tp1=meta.get("tp1"), tp2=meta.get("tp2", tp_p),
+                partial_pct=meta.get("partial_pct", 0.5),
             )
             self._record_trade(TradeRecord(
                 timestamp=int(time.time() * 1000),
@@ -296,9 +317,12 @@ class TradingBot:
             self._sig.unlock_strategy(sym, slot)
 
     async def _check_stop(self, pos_info: dict):
-        """Check price against SL/TP; close position if triggered."""
+        """Staged exit: TP1 closes part + moves SL→breakeven; TP2/breakeven/SL close the rest."""
         sym           = pos_info["symbol"]
         strategy_name = pos_info.get("strategy", "")
+        pos = self.risk.get_position_obj(sym, strategy_name)
+        if pos is None:
+            return
         try:
             ticker = await self.connector.fetch_ticker(sym)
             price  = float(ticker["last"])
@@ -306,51 +330,71 @@ class TradingBot:
             logger.warning("[BOT] Ticker fetch failed for %s: %s", sym, e)
             return
 
-        trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
+        trigger = pos.stage_check(price)
         if not trigger:
             return
 
-        is_long    = pos_info["side"] == "long"
+        is_long    = pos.side == "long"
         close_side = "sell" if is_long else "buy"
         pos_side   = ("long" if is_long else "short") if self.futures_mode else ""
         pnl_mult   = 1 if is_long else -1
-        pnl        = pnl_mult * (price - pos_info["entry"]) * pos_info["amount"]
 
+        # ── TP1: partial close + move stop to breakeven, keep the runner open ──
+        if trigger == "tp1":
+            close_amt = min(round(pos.full_amount * pos.partial_pct, 6), pos.amount)
+            try:
+                await self.connector.create_order(
+                    sym, close_side, close_amt, pos_side=pos_side, reduce_only=True)
+            except Exception as e:
+                logger.warning("[%s] TP1 partial close failed: %s", strategy_name, e)
+            pnl = pnl_mult * (price - pos.entry_price) * close_amt
+            self.risk.register_pnl(pnl)
+            pos.amount     = round(pos.amount - close_amt, 6)
+            pos.tp1_hit    = True
+            pos.stop_loss  = pos.entry_price          # runner is now risk-free
+            self._record_trade(TradeRecord(
+                timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
+                price=price, amount=close_amt, pnl=pnl,
+                strategy=strategy_name, reason="take_profit1", paper=self.paper,
+            ))
+            logger.info("[%s] TP1 %s @ %.4f closed %.6f (%.0f%%) → SL→BE %.4f  pnl≈%.2f",
+                        strategy_name, sym, price, close_amt, pos.partial_pct * 100,
+                        pos.entry_price, pnl)
+            if self.telegram:
+                self.telegram.notify_trade_closed(
+                    sym, "take_profit1", price, pos.entry_price,
+                    pos.stop_loss, pos.tp1, self._sig.summary())
+            return
+
+        # ── Terminal: stop_loss / breakeven / take_profit2 → close remainder ──
+        amount = pos.amount
+        pnl    = pnl_mult * (price - pos.entry_price) * amount
         try:
             await self.connector.create_order(
-                sym, close_side, pos_info["amount"],
-                pos_side=pos_side, reduce_only=True,
-            )
+                sym, close_side, amount, pos_side=pos_side, reduce_only=True)
         except Exception as e:
-            # OKX may have already closed the position via its own SL/TP engine
-            logger.warning("[%s] Close order failed (OKX may have closed already): %s", strategy_name, e)
+            logger.warning("[%s] Close failed (OKX may have closed already): %s", strategy_name, e)
 
-        # Always update internal state after SL/TP trigger
+        self.risk.register_pnl(pnl)
         self._sig.record_outcome(
-            symbol=sym, side=pos_info["side"],
-            entry=pos_info["entry"], exit_price=price,
-            sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
+            symbol=sym, side=pos.side,
+            entry=pos.entry_price, exit_price=price,
+            sl=pos.stop_loss, tp=pos.take_profit,
             reason=trigger, strategy=strategy_name,
         )
         self._sig.unlock_strategy(sym, strategy_name)
         self.risk.close_position(sym, strategy=strategy_name)
         self._record_trade(TradeRecord(
-            timestamp=int(time.time() * 1000),
-            symbol=sym, side=close_side,
-            price=price, amount=pos_info["amount"],
-            pnl=pnl, strategy=strategy_name, reason=trigger,
-            paper=self.paper,
+            timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
+            price=price, amount=amount, pnl=pnl,
+            strategy=strategy_name, reason=trigger, paper=self.paper,
         ))
         logger.info("[%s] CLOSED %s @ %.4f via %s  pnl≈%.2f USDT",
                     strategy_name, sym, price, trigger, pnl)
         if self.telegram:
             self.telegram.notify_trade_closed(
-                sym, trigger, price,
-                pos_info["entry"],
-                pos_info.get("stop_loss"),
-                pos_info.get("take_profit"),
-                self._sig.summary(),
-            )
+                sym, trigger, price, pos.entry_price,
+                pos.stop_loss, pos.take_profit, self._sig.summary())
 
     # ── SL/TP calculation ─────────────────────────────────────────────────
 

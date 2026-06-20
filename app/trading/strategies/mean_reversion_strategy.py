@@ -1,21 +1,23 @@
 """
-Mean Reversion Strategy — Futures Long & Short
-===============================================
-Port of mean_reversion style from unified_trading_bot.py.
+Mean Reversion Strategy — Futures Long & Short  (v2 — High-WR / TP1+TP2)
+=======================================================================
+Counter-trend bounce at extremes, but only in non-violent markets.
 
-  BUY  (long)  : 4H "up" + 1H 2/4 conditions (RSI ≤ 48 bouncing)
-  SELL (short) : 4H "down" + 1H 2/4 conditions (RSI ≥ 52 dropping)
+  BUY  (long)  : 4H "up"   + ADX(4H) ≤ adx_cap + 1H min_conditions/4 (RSI oversold bounce)
+  SELL (short) : 4H "down" + ADX(4H) ≤ adx_cap + 1H min_conditions/4 (RSI overbought drop)
 
-4H trend: EMA20 > EMA50 + positive slope → "up", EMA20 < EMA50 + falling slope → "down"
+4H trend: EMA20 vs EMA50 + slope.
 
-1H conditions (min_conditions/4, default 3):
-  1. RSI ≤ oversold on BOTH current AND prev bar, bouncing up   [2-bar RSI]
-  2. MACD histogram flip up or continuing positive
-  3. Bollinger Band lower bounce (prev close ≤ lower, cur close > lower)
+ADX filter (NEW): a counter-trend entry is REFUSED (HOLD) when ADX(14) on 4H
+> adx_cap (default 30) — a strong trend is too dangerous to fade.
+
+1H conditions (min_conditions/4, default 3 — raised from 2 for selectivity):
+  1. RSI ≤ oversold on BOTH current AND prev bar, bouncing up
+  2. MACD histogram flip up / continuing positive
+  3. Bollinger lower-band bounce
   4. Volume spike ≥ vol_spike_mult × MA20
 
-SL/TP: ATR-based, clamped to [sl_min_pct, sl_max_pct]
-  sl_mult=1.2, tp_mult=2.0 → R:R ≈ 1:1.67  (break-even WR 37.5%)
+Risk (Global): Initial SL 1.5×ATR, TP1 1.2×ATR (close 50% → SL→BE), TP2 2.2×ATR.
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -28,8 +30,8 @@ class MeanReversionStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self.rsi_period     = self.params.get("rsi_period",     14)
-        self.rsi_oversold   = self.params.get("rsi_oversold",  45.0)  # ↓ from 48 — grid-optimised
-        self.rsi_overbought = self.params.get("rsi_overbought",55.0)  # ↑ from 52 — wider overbought
+        self.rsi_oversold   = self.params.get("rsi_oversold",  45.0)
+        self.rsi_overbought = self.params.get("rsi_overbought",55.0)
         self.macd_fast      = self.params.get("macd_fast",      12)
         self.macd_slow      = self.params.get("macd_slow",      26)
         self.macd_sig       = self.params.get("macd_signal",     9)
@@ -37,12 +39,18 @@ class MeanReversionStrategy(BaseStrategy):
         self.bb_std         = self.params.get("bb_std",         2.0)
         self.vol_period     = self.params.get("vol_period",     20)
         self.vol_spike_mult = self.params.get("vol_spike_mult", 1.2)
-        self.min_conditions = self.params.get("min_conditions",   2)  # ↓ from 3
+        self.min_conditions = self.params.get("min_conditions",   3)  # ↑ from 2 — stricter
+        self.adx_period     = self.params.get("adx_period",     14)
+        self.adx_cap        = self.params.get("adx_cap",       50.0)  # NEW: no fade if 4H ADX > 50
         self.atr_period     = self.params.get("atr_period",     14)
-        self.sl_mult        = self.params.get("sl_mult",        1.2)
-        self.tp_mult        = self.params.get("tp_mult",        1.5)   # Case3 optimised ↓ from 2.0
-        self.sl_min_pct     = self.params.get("sl_min_pct",   0.012)  # 1.2% min SL
+        # Global-Risk multiples (grid-tuned: SL 1.2 / TP1 1.5 / TP2 3.0 ATR)
+        self.sl_atr         = self.params.get("sl_atr",         1.2)
+        self.tp1_atr        = self.params.get("tp1_atr",        1.5)
+        self.tp2_atr        = self.params.get("tp2_atr",        3.0)
+        self.sl_min_pct     = self.params.get("sl_min_pct",   0.010)
         self.sl_max_pct     = self.params.get("sl_max_pct",   0.040)
+        self.risk_pct       = self.params.get("risk_pct",      0.02)
+        self.partial_pct    = self.params.get("partial_pct",    0.5)
         self.trend_ema_fast = self.params.get("trend_ema_fast", 20)
         self.trend_ema_slow = self.params.get("trend_ema_slow", 50)
 
@@ -73,6 +81,15 @@ class MeanReversionStrategy(BaseStrategy):
         else:
             trend_4h = "flat"
 
+        # ── ADX(4H) filter: refuse to fade a violent trend ────────────────
+        adx4, _, _ = self.adx(candles_4h, self.adx_period)
+        adx_v = float(adx4[-2]) if not np.isnan(adx4[-2]) else 0.0
+        if adx_v > self.adx_cap:
+            return Signal(
+                SignalType.HOLD, self.symbol, current_price, 0,
+                reason=f"[MeanRev] 4H ADX={adx_v:.0f} > {self.adx_cap:.0f} — trend too strong to fade",
+            )
+
         # ── 1H indicators (last closed = [-2], prev = [-3]) ───────────────
         rsi_a               = self.rsi(closes, self.rsi_period)
         _, _, macd_hist     = self.macd(closes, self.macd_fast, self.macd_slow, self.macd_sig)
@@ -86,61 +103,55 @@ class MeanReversionStrategy(BaseStrategy):
         bbu_c   = float(bb_upper[-2]);  bbu_p   = float(bb_upper[-3])
         close_c = closes[-2];           close_p = closes[-3]
         vol_c   = vols[-2];             volma_c = float(vol_ma[-2])
-        atr_v   = float(atr_a[-2])  # use last closed bar's ATR, not forming bar
+        atr_v   = float(atr_a[-2])  # last closed bar's ATR
 
         if any(np.isnan(v) for v in [rsi_c, rsi_p, hist_c, bbl_c, bbu_c, volma_c, atr_v]):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           "[MeanRev] Indicators not ready")
 
         vol_ok = volma_c > 0 and vol_c >= volma_c * self.vol_spike_mult
-        rr     = self.tp_mult / max(self.sl_mult, 1e-9)
 
-        def _sl_tp(side: str) -> tuple[float, float]:
-            raw  = atr_v * self.sl_mult
-            dist = max(current_price * self.sl_min_pct,
-                       min(raw, current_price * self.sl_max_pct))
-            tp_d = dist * (self.tp_mult / self.sl_mult)  # scale TP with actual dist to maintain R:R
-            if side == "long":
-                return round(current_price - dist, 2), round(current_price + tp_d, 2)
-            return round(current_price + dist, 2), round(current_price - tp_d, 2)
+        def _meta(side: str) -> dict:
+            return self.risk_metadata(
+                current_price, atr_v, side,
+                sl_atr=self.sl_atr, tp1_atr=self.tp1_atr, tp2_atr=self.tp2_atr,
+                sl_min_pct=self.sl_min_pct, sl_max_pct=self.sl_max_pct,
+                risk_pct=self.risk_pct, partial_pct=self.partial_pct,
+            )
 
-        # ── BUY (long): 4H strictly "up" + min_conditions/4 ─────────────
+        # ── BUY (long): 4H "up" + ADX ok + min_conditions/4 ───────────────
         if trend_4h == "up":
             c1  = rsi_c <= self.rsi_oversold and rsi_p <= self.rsi_oversold and rsi_c > rsi_p
             c2  = (hist_p < 0 and hist_c > 0) or (hist_c > 0 and hist_c > hist_p and not np.isnan(hist_p))
             c3  = (close_p <= bbl_p) and (close_c > bbl_c)
             met = sum([c1, c2, c3, vol_ok])
             if met >= self.min_conditions:
-                sl, tp = _sl_tp("long")
+                meta = _meta("long")
                 return Signal(
-                    SignalType.BUY, self.symbol, current_price,
-                    amount=0.08,
-                    reason=(f"[MeanRev] 4H↑ RSI={rsi_c:.0f} "
-                            f"MACD={'✓' if c2 else '✗'} BB={'✓' if c3 else '✗'} "
-                            f"cond={met}/4 RR=1:{rr:.2f}"),
+                    SignalType.BUY, self.symbol, current_price, amount=0.08,
+                    reason=(f"[MeanRev] 4H↑ ADX={adx_v:.0f} RSI={rsi_c:.0f} "
+                            f"cond={met}/4 TP1={meta['tp1']} TP2={meta['tp2']}"),
                     confidence=min(0.55 + met * 0.08, 0.87),
-                    metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
+                    metadata=meta,
                 )
 
-        # ── SELL (short): 4H strictly "down" + min_conditions/4 ──────────
+        # ── SELL (short): 4H "down" + ADX ok + min_conditions/4 ───────────
         if trend_4h == "down":
             c1  = rsi_c >= self.rsi_overbought and rsi_p >= self.rsi_overbought and rsi_c < rsi_p
             c2  = (hist_p > 0 and hist_c < 0) or (hist_c < 0 and hist_c < hist_p and not np.isnan(hist_p))
             c3  = (close_p >= bbu_p) and (close_c < bbu_c)
             met = sum([c1, c2, c3, vol_ok])
             if met >= self.min_conditions:
-                sl, tp = _sl_tp("short")
+                meta = _meta("short")
                 return Signal(
-                    SignalType.SELL, self.symbol, current_price,
-                    amount=0.08,
-                    reason=(f"[MeanRev] 4H↓ RSI={rsi_c:.0f} "
-                            f"MACD={'✓' if c2 else '✗'} BB={'✓' if c3 else '✗'} "
-                            f"cond={met}/4 RR=1:{rr:.2f}"),
+                    SignalType.SELL, self.symbol, current_price, amount=0.08,
+                    reason=(f"[MeanRev] 4H↓ ADX={adx_v:.0f} RSI={rsi_c:.0f} "
+                            f"cond={met}/4 TP1={meta['tp1']} TP2={meta['tp2']}"),
                     confidence=min(0.55 + met * 0.08, 0.87),
-                    metadata={"stop_loss": sl, "take_profit": tp, "atr": atr_v},
+                    metadata=meta,
                 )
 
         return Signal(
             SignalType.HOLD, self.symbol, current_price, 0,
-            reason=f"[MeanRev] 4H={trend_4h} RSI={rsi_c:.0f} cond not met",
+            reason=f"[MeanRev] 4H={trend_4h} ADX={adx_v:.0f} RSI={rsi_c:.0f} cond not met",
         )
