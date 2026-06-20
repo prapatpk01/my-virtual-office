@@ -139,8 +139,8 @@ class SwingStrategy(BaseStrategy):
 # ── Named variants ─────────────────────────────────────────────────────────────
 
 class SwingReversalStrategy(SwingStrategy):
-    _DEFAULTS = dict(sl_atr=2.5, tp_atr=1.5, rsi_lo=34.0, rsi_hi=62.0,
-                     vol_mult=1.2, max_hold_days=3)
+    _DEFAULTS = dict(sl_atr=2.0, tp_atr=2.0, rsi_lo=30.0, rsi_hi=65.0,
+                     vol_mult=1.0, max_hold_days=3)
 
 
 class CPKRegimeStrategy(SwingStrategy):

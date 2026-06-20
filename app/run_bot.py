@@ -99,12 +99,12 @@ def build_config() -> dict:
             "wt_adx":           _env_bool("STRATEGY_WT_ADX",           False),
             "ut_bot":           _env_bool("STRATEGY_UT_BOT",           False),
             "momentum_score":   _env_bool("STRATEGY_MOMENTUM_SCORE",   False),
-            "swing_reversal":   _env_bool("STRATEGY_SWING_REVERSAL",   False),
-            "cpk_regime":       _env_bool("STRATEGY_CPK_REGIME",       True),
+            "swing_reversal":   _env_bool("STRATEGY_SWING_REVERSAL",   True),
+            "cpk_regime":       _env_bool("STRATEGY_CPK_REGIME",       False),
             "hybrid_swing":     _env_bool("STRATEGY_HYBRID_SWING",     False),
             "intern":           _env_bool("STRATEGY_INTERN",           False),
             "profitable_bot":   _env_bool("STRATEGY_PROFITABLE_BOT",   True),
-            "scalp_trend":      _env_bool("STRATEGY_SCALP_TREND",      False),
+            "scalp_trend":      _env_bool("STRATEGY_SCALP_TREND",      True),
         },
         "wt_params": {
             "wt_channel_len": _env_int("WT_N1",   8),
@@ -124,11 +124,12 @@ def build_config() -> dict:
         },
         # Swing v5 Wide config — tune via env vars if needed
         "sr_params": {
-            "sl_atr":   _env_float("SR_SL",      2.5),
-            "tp_atr":   _env_float("SR_TP",      1.5),
-            "rsi_lo":   _env_float("SR_RSI_LO", 34.0),
-            "rsi_hi":   _env_float("SR_RSI_HI", 62.0),
-            "vol_mult": _env_float("SR_VOL",      1.2),
+            "sl_atr":        _env_float("SR_SL",      2.0),
+            "tp_atr":        _env_float("SR_TP",      2.0),
+            "rsi_lo":        _env_float("SR_RSI_LO", 30.0),
+            "rsi_hi":        _env_float("SR_RSI_HI", 65.0),
+            "vol_mult":      _env_float("SR_VOL",      1.0),
+            "max_hold_days": _env_float("SR_HOLD",     3.0),
         },
         "cpk_params": {
             "sl_atr":        _env_float("CPK_SL",      2.5),
