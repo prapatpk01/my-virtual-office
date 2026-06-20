@@ -85,6 +85,11 @@ def build_config() -> dict:
         # ── Symbols ───────────────────────────────────────────────────────────
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT"),
 
+        # ── Strategy variant: "v2" = new partial-close (TP1/TP2 + ADX/ST/OBV),
+        #    "legacy" = original single-TP system (backtest +$149, most robust).
+        #    Flip STRATEGY_VARIANT=legacy to revert without redeploying code.
+        "strategy_variant": os.environ.get("STRATEGY_VARIANT", "v2").strip().lower(),
+
         # ── Active strategies ─────────────────────────────────────────────────
         "strategy_mean_reversion": _env_bool("STRATEGY_MEAN_REVERSION", True),
         "strategy_trend_cont":     _env_bool("STRATEGY_TREND_CONT",     True),
@@ -170,9 +175,17 @@ def build_config() -> dict:
 
 def build_strategies(symbols: list[str], cfg: dict) -> list:
     from trading.strategies.sjutbot_v3_strategy          import SJUTBotV3Strategy
-    from trading.strategies.mean_reversion_strategy      import MeanReversionStrategy
-    from trading.strategies.trend_continuation_strategy  import TrendContinuationStrategy
-    from trading.strategies.smart_money_strategy         import SmartMoneyStrategy
+
+    legacy = cfg["strategy_variant"] == "legacy"
+    if legacy:
+        logger.info("STRATEGY_VARIANT=legacy → original single-TP strategies (backtest +$149)")
+        from trading.strategies.mean_reversion_legacy     import MeanReversionStrategy
+        from trading.strategies.trend_continuation_legacy import TrendContinuationStrategy
+        from trading.strategies.smart_money_legacy        import SmartMoneyStrategy
+    else:
+        from trading.strategies.mean_reversion_strategy      import MeanReversionStrategy
+        from trading.strategies.trend_continuation_strategy  import TrendContinuationStrategy
+        from trading.strategies.smart_money_strategy         import SmartMoneyStrategy
 
     strategies = []
     for sym in symbols:

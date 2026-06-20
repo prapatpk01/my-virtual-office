@@ -39,10 +39,17 @@ class Position:
           None
         """
         long = self.side == "long"
+        # Single-TP mode (legacy strategies / SJUTBotV3 / partial disabled): no TP1 set.
+        if not self.tp1:
+            if self.stop_loss and ((price <= self.stop_loss) if long else (price >= self.stop_loss)):
+                return "stop_loss"
+            if self.take_profit and ((price >= self.take_profit) if long else (price <= self.take_profit)):
+                return "take_profit"
+            return None
         if not self.tp1_hit:
             if self.stop_loss and ((price <= self.stop_loss) if long else (price >= self.stop_loss)):
                 return "stop_loss"
-            if self.tp1 and ((price >= self.tp1) if long else (price <= self.tp1)):
+            if (price >= self.tp1) if long else (price <= self.tp1):
                 return "tp1"
             return None
         # after TP1: protected runner
