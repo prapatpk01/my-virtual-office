@@ -157,6 +157,9 @@ def build_config() -> dict:
         "daily_loss_limit": _env_float("DAILY_LOSS_LIMIT_PCT", 0.05),  # -5%
         # Per-trade risk budget for dynamic sizing (strategies pass risk_pct in metadata).
         "risk_per_trade":   _env_float("RISK_PER_TRADE_PCT", 0.02),    # 2%
+        # DYNAMIC_SIZING=false → use fixed FIXED_TRADE_USDT margin per trade even on v2
+        # (required for small accounts below the 2%-risk → 1-contract minimum).
+        "dynamic_sizing":   _env_bool("DYNAMIC_SIZING", True),
 
         # ── Timing ────────────────────────────────────────────────────────────
         # Tick interval: how often the bot loops (fetches data + evaluates signals).
@@ -345,6 +348,7 @@ async def main():
         telegram=telegram,
         fixed_sl_pct=cfg["stop_loss_pct"],
         fixed_tp_pct=cfg["take_profit_pct"],
+        dynamic_sizing=cfg["dynamic_sizing"],
     )
 
     # ── Backtest function (called by /backtest Telegram command) ─────────────

@@ -49,6 +49,7 @@ class TradingBot:
         state_file: Optional[str] = None,
         fixed_sl_pct: float = 0.0,
         fixed_tp_pct: float = 0.0,
+        dynamic_sizing: bool = True,
     ):
         self.connector = connector
         self.strategies = strategies
@@ -59,6 +60,10 @@ class TradingBot:
         self.paper = connector.paper
         self.fixed_sl_pct = fixed_sl_pct
         self.fixed_tp_pct = fixed_tp_pct
+        # When False, ignore per-trade risk sizing and use fixed FIXED_TRADE_USDT
+        # margin for every order (needed for small accounts where 2%-risk sizing
+        # falls below the exchange's minimum 1-contract order).
+        self._dynamic_sizing = dynamic_sizing
 
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -275,7 +280,7 @@ class TradingBot:
             meta        = signal.metadata or {}
             sl_dist_pct = meta.get("sl_dist_pct")
             risk_pct    = meta.get("risk_pct", 0.02)
-            if sl_dist_pct:
+            if sl_dist_pct and self._dynamic_sizing:
                 amount = self.risk.size_by_risk(usdt_free, price, sl_dist_pct, risk_pct)
             else:
                 amount = self.risk.size_position(usdt_free, price)
