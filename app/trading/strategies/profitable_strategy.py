@@ -1,5 +1,5 @@
 """
-ProfitableBot: 1H trend-following with 2/4-condition entry + MTF Score gate.
+ProfitableBot: 1H trend-following with 2/4-condition entry.
 
 Entry requires:
   - 1H uptrend: EMA20 > EMA50
@@ -10,17 +10,15 @@ Entry requires:
       C2: MACD histogram crossing/growing positive
       C3: price bounced off Bollinger lower band
       C4: volume ≥ 1.1× 20-bar MA
-  - MTF dynamic score ≥ 6/10 (RSI9, MACD, Stoch, Volume, BB)
 
 Risk: SL = max(2×ATR, 1.5% price), cap 7%.  TP = 1.8×ATR.
 Cooldown: 2 bars after entry.
 
 Tuned on BTCUSDT Binance 1H Jan–May 2026 (3624 bars):
-  52 trades | WR 65.4% | P&L +$18.18 per $100/trade
+  64 trades | WR 57.8% | P&L +$9.20 per $100/trade
 """
 import math
 from .base import BaseStrategy, Signal, SignalType
-from .mtf_score_strategy import MTFScoreBot
 
 _WARMUP = 60
 
@@ -104,12 +102,6 @@ class ProfitableBot(BaseStrategy):
         if conds < 2:
             return Signal(SignalType.HOLD, self.symbol, cp, 0,
                           f"[{self.name}] {conds}/4 conditions")
-
-        # MTF dynamic score gate — require ≥ 6/10
-        sc = MTFScoreBot._score(self, closes, candles, n)
-        if sc < 6.0:
-            return Signal(SignalType.HOLD, self.symbol, cp, 0,
-                          f"[{self.name}] MTFScore {sc:.1f} < 6")
 
         sl_dist = max(self.sl_atr * atr_v, cp * 0.015)
         sl_dist = min(sl_dist, cp * 0.07)
