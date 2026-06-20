@@ -2,17 +2,18 @@
 Swing Strategies v5 — Wide Config (live trading).
 
 SwingReversalStrategy: MACD-cross timing in soft-bull regime (EMA80 > EMA200 × 0.98).
-  RSI 30-65 | SL=2.0×ATR | TP=2.0×ATR | hold≤3d
+  RSI 30-65 | SL=2.0×ATR | TP=2.0×ATR | hold≤3d | ADX(14) > 15
 
 Entry filter:
   soft-bull  : EMA80 >= EMA200 × 0.98
+  ADX(14)    : > 15 (trend has momentum — skip sideways)
   candle     : close > 60% of bar range
   MACD cross : histogram crossed neg→pos within last 3 bars
   RSI        : in [rsi_lo, rsi_hi]
   Volume     : >= 20-bar SMA × vol_mult
 
 Tuned on BTCUSDT Binance 1H Jan–May 2026 (3624 bars):
-  20 trades | WR 70.0% | P&L +$11.64 per $100/trade | Max DD $1.52
+  35 trades | WR 62.9% | PF 1.75 | P&L +$12.23 per $100/trade
 """
 import math
 import numpy as np
@@ -29,12 +30,13 @@ class SwingStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         d = self._DEFAULTS
-        self.sl_atr   = float(self.params.get("sl_atr",        d.get("sl_atr",        2.5)))
-        self.tp_atr   = float(self.params.get("tp_atr",        d.get("tp_atr",        1.5)))
-        self.rsi_lo   = float(self.params.get("rsi_lo",        d.get("rsi_lo",       34.0)))
-        self.rsi_hi   = float(self.params.get("rsi_hi",        d.get("rsi_hi",       62.0)))
-        self.vol_mult = float(self.params.get("vol_mult",      d.get("vol_mult",      1.2)))
-        self.max_hold = int(float(self.params.get("max_hold_days", d.get("max_hold_days", 3))) * 24)
+        self.sl_atr    = float(self.params.get("sl_atr",        d.get("sl_atr",        2.5)))
+        self.tp_atr    = float(self.params.get("tp_atr",        d.get("tp_atr",        1.5)))
+        self.rsi_lo    = float(self.params.get("rsi_lo",        d.get("rsi_lo",       34.0)))
+        self.rsi_hi    = float(self.params.get("rsi_hi",        d.get("rsi_hi",       62.0)))
+        self.vol_mult  = float(self.params.get("vol_mult",      d.get("vol_mult",      1.2)))
+        self.adx_thresh= float(self.params.get("adx_thresh",   d.get("adx_thresh",   15.0)))
+        self.max_hold  = int(float(self.params.get("max_hold_days", d.get("max_hold_days", 3))) * 24)
         self._cooldown = 0
 
     # ── Helpers ────────────────────────────────────────────────────────────
@@ -99,6 +101,13 @@ class SwingStrategy(BaseStrategy):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[{self.name}] Cooldown {self._cooldown} bars left")
 
+        # ADX gate — skip entries when trend has no momentum (sideway market)
+        adx_arr, _, _ = self.adx(candles, 14)
+        adx_v = float(adx_arr[n])
+        if not math.isnan(adx_v) and adx_v < self.adx_thresh:
+            return Signal(SignalType.HOLD, self.symbol, current_price, 0,
+                          f"[{self.name}] ADX={adx_v:.1f} < {self.adx_thresh}")
+
         if self._entry_ok(candles, closes, ema80, ema200, rsi14, mh, vol_ma, n):
             atr_v = (float(atr14[n]) if not math.isnan(float(atr14[n]))
                      else current_price * 0.015)
@@ -141,4 +150,4 @@ class SwingStrategy(BaseStrategy):
 
 class SwingReversalStrategy(SwingStrategy):
     _DEFAULTS = dict(sl_atr=2.0, tp_atr=2.0, rsi_lo=30.0, rsi_hi=65.0,
-                     vol_mult=1.0, max_hold_days=3)
+                     vol_mult=1.0, adx_thresh=15.0, max_hold_days=3)

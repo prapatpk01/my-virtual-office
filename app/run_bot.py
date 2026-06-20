@@ -108,11 +108,13 @@ def build_config() -> dict:
             "rsi_hi":        _env_float("SR_RSI_HI", 65.0),
             "vol_mult":      _env_float("SR_VOL",      1.0),
             "max_hold_days": _env_float("SR_HOLD",     3.0),
+            "adx_thresh":    _env_float("SR_ADX",     15.0),
         },
         "profitable_params": {
-            "sl_atr":   _env_float("PB_SL",     1.5),
-            "tp_atr":   _env_float("PB_TP",     2.5),
-            "cooldown": _env_int("PB_COOLDOWN", 2),
+            "sl_atr":      _env_float("PB_SL",       1.5),
+            "tp_atr":      _env_float("PB_TP",       2.5),
+            "cooldown":    _env_int("PB_COOLDOWN",   2),
+            "adx_thresh":  _env_float("PB_ADX",     20.0),
         },
         "scalp_params": {
             "sl_atr":   _env_float("SC_SL",     2.0),

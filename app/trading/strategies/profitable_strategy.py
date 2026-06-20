@@ -5,6 +5,7 @@ Entry requires:
   - 1H uptrend: EMA20 > EMA50
   - EMA20 rising: EMA20[n] > EMA20[n-3]  (short-term momentum filter)
   - 4H guard: block if 4H EMA20 < EMA50  (regime filter — no slope bypass)
+  - ADX(14) > 20  (trend has momentum — skip sideways markets)
   - 2 of 4 soft conditions:
       C1: RSI ≤ 48 and turning up
       C2: MACD histogram crossing/growing positive
@@ -15,7 +16,7 @@ Risk: SL = max(1.5×ATR, 1.5% price), cap 7%.  TP = 2.5×ATR.
 Cooldown: 2 bars after entry.
 
 Tuned on BTCUSDT Binance 1H Jan–May 2026 (3624 bars):
-  36 trades | WR 58.3% | PF 1.11 | P&L +$3.16 per $100/trade
+  32 trades | WR 59.4% | PF 1.27 | P&L +$6.08 per $100/trade
 """
 import math
 from .base import BaseStrategy, Signal, SignalType
@@ -28,9 +29,10 @@ class ProfitableBot(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.sl_atr        = float(self.params.get("sl_atr",    1.5))
-        self.tp_atr        = float(self.params.get("tp_atr",    2.5))
-        self.cooldown_bars = int(self.params.get("cooldown",    2))
+        self.sl_atr        = float(self.params.get("sl_atr",      1.5))
+        self.tp_atr        = float(self.params.get("tp_atr",      2.5))
+        self.cooldown_bars = int(self.params.get("cooldown",      2))
+        self.adx_thresh    = float(self.params.get("adx_thresh", 20.0))
         self._cooldown     = 0
 
     async def analyze(self, candles: list, current_price: float,
@@ -81,6 +83,13 @@ class ProfitableBot(BaseStrategy):
                 if not (math.isnan(v20) or math.isnan(v50)) and v20 < v50:
                     return Signal(SignalType.HOLD, self.symbol, cp, 0,
                                   f"[{self.name}] 4H bearish guard")
+
+        # ADX gate — skip entries when trend has no momentum (sideways market)
+        adx_arr, _, _ = self.adx(candles, 14)
+        adx_v = float(adx_arr[n])
+        if not math.isnan(adx_v) and adx_v < self.adx_thresh:
+            return Signal(SignalType.HOLD, self.symbol, cp, 0,
+                          f"[{self.name}] ADX={adx_v:.1f} < {self.adx_thresh}")
 
         rsi_v  = float(rsi14[n]);    rsi_p = float(rsi14[n-1]) if n >= 1 else rsi_v
         hc     = float(mh[n]);       hp    = float(mh[n-1])    if n >= 1 else hc
