@@ -40,8 +40,8 @@ class MeanReversionStrategy(BaseStrategy):
         self.min_conditions = self.params.get("min_conditions",   2)  # ↓ from 3
         self.atr_period     = self.params.get("atr_period",     14)
         self.sl_mult        = self.params.get("sl_mult",        1.2)
-        self.tp_mult        = self.params.get("tp_mult",        2.0)
-        self.sl_min_pct     = self.params.get("sl_min_pct",   0.010)  # ↑ from 0.004 — fee-adjusted
+        self.tp_mult        = self.params.get("tp_mult",        1.5)   # Case3 optimised ↓ from 2.0
+        self.sl_min_pct     = self.params.get("sl_min_pct",   0.012)  # 1.2% min SL
         self.sl_max_pct     = self.params.get("sl_max_pct",   0.040)
         self.trend_ema_fast = self.params.get("trend_ema_fast", 20)
         self.trend_ema_slow = self.params.get("trend_ema_slow", 50)

@@ -32,9 +32,9 @@ class SmartMoneyStrategy(BaseStrategy):
         self.vol_mult       = self.params.get("vol_mult",       1.0)
         self.bias_threshold = self.params.get("bias_threshold", 15.0)  # ↓ from 20 — grid-optimised
         self.atr_period     = self.params.get("atr_period",     14)
-        self.sl_mult        = self.params.get("sl_mult",        1.5)
-        self.tp_mult        = self.params.get("tp_mult",        2.5)
-        self.sl_min_pct     = self.params.get("sl_min_pct",   0.008)  # grid-optimised min SL
+        self.sl_mult        = self.params.get("sl_mult",        1.2)   # Case3 optimised ↓ from 1.5
+        self.tp_mult        = self.params.get("tp_mult",        1.5)   # Case3 optimised ↓ from 2.5
+        self.sl_min_pct     = self.params.get("sl_min_pct",   0.010)  # 1.0% min SL
         self.sl_max_pct     = self.params.get("sl_max_pct",   0.050)
 
     async def analyze(self, candles: list, current_price: float,

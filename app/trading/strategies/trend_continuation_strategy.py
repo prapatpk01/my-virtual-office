@@ -41,9 +41,9 @@ class TrendContinuationStrategy(BaseStrategy):
         self.vol_mult     = self.params.get("vol_mult",      1.0)  # ↓ from 1.2
         self.min_entry_cond = self.params.get("min_entry_cond", 3) # 3/4 not ALL 4
         self.atr_period   = self.params.get("atr_period",   14)
-        self.sl_mult      = self.params.get("sl_mult",       1.2)   # ↑ from 0.8 — wider SL room
-        self.tp_mult      = self.params.get("tp_mult",       3.0)   # ↓ from 4.0 — R:R 2.5:1, BE WR 28.6%
-        self.sl_min_pct   = self.params.get("sl_min_pct",  0.012)  # 1.2% min SL (~$750 on 63k BTC)
+        self.sl_mult      = self.params.get("sl_mult",       1.0)   # Case3 optimised
+        self.tp_mult      = self.params.get("tp_mult",       2.0)   # Case3 optimised → R:R 2:1, BE WR 33%
+        self.sl_min_pct   = self.params.get("sl_min_pct",  0.012)  # 1.2% min SL
         self.sl_max_pct   = self.params.get("sl_max_pct",  0.035)
 
     async def analyze(self, candles: list, current_price: float,
