@@ -28,8 +28,8 @@ class MeanReversionStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self.rsi_period     = self.params.get("rsi_period",     14)
-        self.rsi_oversold   = self.params.get("rsi_oversold",  48.0)  # ↑ from 42
-        self.rsi_overbought = self.params.get("rsi_overbought",52.0)  # ↓ from 58
+        self.rsi_oversold   = self.params.get("rsi_oversold",  45.0)  # ↓ from 48 — grid-optimised
+        self.rsi_overbought = self.params.get("rsi_overbought",55.0)  # ↑ from 52 — wider overbought
         self.macd_fast      = self.params.get("macd_fast",      12)
         self.macd_slow      = self.params.get("macd_slow",      26)
         self.macd_sig       = self.params.get("macd_signal",     9)
@@ -41,7 +41,7 @@ class MeanReversionStrategy(BaseStrategy):
         self.atr_period     = self.params.get("atr_period",     14)
         self.sl_mult        = self.params.get("sl_mult",        1.2)
         self.tp_mult        = self.params.get("tp_mult",        2.0)
-        self.sl_min_pct     = self.params.get("sl_min_pct",   0.004)
+        self.sl_min_pct     = self.params.get("sl_min_pct",   0.010)  # ↑ from 0.004 — fee-adjusted
         self.sl_max_pct     = self.params.get("sl_max_pct",   0.040)
         self.trend_ema_fast = self.params.get("trend_ema_fast", 20)
         self.trend_ema_slow = self.params.get("trend_ema_slow", 50)

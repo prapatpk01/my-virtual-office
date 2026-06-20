@@ -113,27 +113,27 @@ def build_config() -> dict:
         # single-bar RSI, 2/4 conditions required
         "mr_sl_mult":         _env_float("MR_SL_MULT",       1.2),
         "mr_tp_mult":         _env_float("MR_TP_MULT",       2.0),
-        "mr_rsi_oversold":    _env_float("MR_RSI_OVERSOLD",  48.0),   # ↑ from 42
-        "mr_rsi_overbought":  _env_float("MR_RSI_OVERBOUGHT",52.0),   # ↓ from 58
+        "mr_rsi_oversold":    _env_float("MR_RSI_OVERSOLD",  45.0),   # grid-optimised ↓ from 48
+        "mr_rsi_overbought":  _env_float("MR_RSI_OVERBOUGHT",55.0),   # grid-optimised ↑ from 52
         "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     2),    # ↓ from 3
 
         # ── Trend Continuation tuning (15m entry / 1H+4H MTF) ────────────
         # sl_mult=0.8, tp_mult=4.0 → R:R 1:5, BE WR=16.7%
-        # bias_gate=35 (stricter), sl_min=1.2% (fee-adjusted)
+        # bias_gate=20 (grid-optimised), pullback=2%, sl_min=1.0%
         "tc_sl_mult":         _env_float("TC_SL_MULT",       0.8),
         "tc_tp_mult":         _env_float("TC_TP_MULT",       4.0),
         "tc_rsi_min":         _env_float("TC_RSI_MIN",      35.0),
         "tc_rsi_max":         _env_float("TC_RSI_MAX",      75.0),
-        "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",  0.025),
+        "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",  0.020),  # grid-optimised ↓ from 0.025
         "tc_vol_mult":        _env_float("TC_VOL_MULT",      1.0),
-        "tc_bias_gate":       _env_float("TC_BIAS_GATE",    35.0),    # ↑ from 15, stricter
+        "tc_bias_gate":       _env_float("TC_BIAS_GATE",    20.0),    # grid-optimised ↓ from 35
 
         # ── Smart Money / MTF Momentum tuning (15m entry / 1H+4H MTF) ──────
         # sl_mult=1.5, tp_mult=2.5 → R:R 1:1.67  (break-even WR 37.5%)
-        # bias_threshold=20 (more signals), sl_min=1.0% (fee-adjusted)
+        # bias_threshold=15 (grid-optimised), sl_min=0.8% (grid-optimised)
         "sm_sl_mult":         _env_float("SM_SL_MULT",       1.5),
         "sm_tp_mult":         _env_float("SM_TP_MULT",       2.5),
-        "sm_bias_threshold":  _env_float("SM_BIAS_THRESHOLD",20.0),   # ↓ from 25
+        "sm_bias_threshold":  _env_float("SM_BIAS_THRESHOLD",15.0),   # grid-optimised ↓ from 20
 
         # ── Scalp Trend tuning (15m entry / 1H+4H MTF) ───────────────────────
         # sl_mult=1.5, tp_mult=1.875 → R:R 1:1.25 (break-even WR=44.4%)
