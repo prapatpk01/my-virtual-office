@@ -23,7 +23,8 @@ class Position:
     tp2: Optional[float] = None
     partial_pct: float = 0.5
     tp1_hit: bool = False
-    full_amount: float = 0.0   # original size at open (for partial math)
+    full_amount: float = 0.0     # original size at open (for partial math)
+    contract_size: float = 1.0   # base-asset units per contract (for whole-contract partials)
 
     @property
     def pnl_pct(self) -> float:
@@ -203,14 +204,16 @@ class RiskManager:
 
     def open_position(self, symbol: str, side: str, entry_price: float, amount: float,
                       strategy: str = "", stop_loss: float = None, take_profit: float = None,
-                      tp1: float = None, tp2: float = None, partial_pct: float = 0.5) -> Position:
+                      tp1: float = None, tp2: float = None, partial_pct: float = 0.5,
+                      contract_size: float = 1.0) -> Position:
         if stop_loss is None or take_profit is None:
             sl_default, tp_default = self.compute_stops(side, entry_price)
             stop_loss   = stop_loss   if stop_loss   is not None else sl_default
             take_profit = take_profit if take_profit is not None else tp_default
         pos = Position(symbol=symbol, side=side, entry_price=entry_price, amount=amount,
                        stop_loss=stop_loss, take_profit=take_profit,
-                       tp1=tp1, tp2=tp2, partial_pct=partial_pct, full_amount=amount)
+                       tp1=tp1, tp2=tp2, partial_pct=partial_pct, full_amount=amount,
+                       contract_size=contract_size)
         self._positions[f"{symbol}||{strategy}"] = pos
         return pos
 

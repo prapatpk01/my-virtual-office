@@ -77,6 +77,10 @@ class BaseConnector(ABC):
     async def fetch_balance(self) -> list[Balance]:
         """Get account balances."""
 
+    async def contract_size(self, symbol: str) -> float:
+        """Base-asset units per contract (1.0 for spot / non-contract venues)."""
+        return 1.0
+
     @property
     def name(self) -> str:
         return self.__class__.__name__

@@ -284,6 +284,19 @@ class TradingBot:
                 self._sig.unlock_strategy(sym, slot)
                 return
 
+            # Align size to whole contracts so partial (50%) closes are tradable.
+            # Partial close (TP1) needs ≥2 contracts to split; otherwise the
+            # position runs as a single-TP to TP2 (no partial, no breakeven step).
+            ct = await self.connector.contract_size(sym)
+            contracts = int(round(amount / ct)) if ct > 0 else 0
+            if contracts >= 1:
+                amount = round(contracts * ct, 8)
+            partial_ok = (meta.get("tp1") is not None) and contracts >= 2
+            tp1_val = meta.get("tp1") if partial_ok else None
+            if meta.get("tp1") is not None and not partial_ok:
+                logger.info("[%s] %s: %d contract(s) < 2 → single-TP (no partial close)",
+                            slot, sym, contracts)
+
             order_side = "buy" if side == "long" else "sell"
             pos_side   = side if self.futures_mode else ""
 
@@ -295,8 +308,9 @@ class TradingBot:
             self.risk.open_position(
                 sym, side, price, amount,
                 strategy=slot, stop_loss=sl_p, take_profit=tp_p,
-                tp1=meta.get("tp1"), tp2=meta.get("tp2", tp_p),
+                tp1=tp1_val, tp2=meta.get("tp2", tp_p),
                 partial_pct=meta.get("partial_pct", 0.5),
+                contract_size=ct,
             )
             self._record_trade(TradeRecord(
                 timestamp=int(time.time() * 1000),
@@ -341,7 +355,18 @@ class TradingBot:
 
         # ── TP1: partial close + move stop to breakeven, keep the runner open ──
         if trigger == "tp1":
-            close_amt = min(round(pos.full_amount * pos.partial_pct, 6), pos.amount)
+            # Close a whole number of contracts (≈partial_pct of the position).
+            ct = pos.contract_size or 1.0
+            full_contracts  = int(round(pos.full_amount / ct)) if ct > 0 else 0
+            close_contracts = int(full_contracts * pos.partial_pct)
+            close_amt = round(close_contracts * ct, 8)
+            if close_amt <= 0 or close_amt >= pos.amount:
+                # Can't split into whole contracts → keep position, treat as single-TP:
+                # disable TP1 so the runner exits at TP2 / SL only (no phantom state).
+                pos.tp1 = None
+                logger.info("[%s] %s TP1 hit but not splittable (%d contracts) → single-TP",
+                            strategy_name, sym, full_contracts)
+                return
             try:
                 await self.connector.create_order(
                     sym, close_side, close_amt, pos_side=pos_side, reduce_only=True)

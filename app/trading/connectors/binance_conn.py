@@ -123,6 +123,15 @@ class BinanceConnector(BaseConnector):
                 logger.warning("set_leverage failed (%s): %s — continuing", symbol, e)
         self._leverage_set.add(symbol)
 
+    async def contract_size(self, symbol: str) -> float:
+        """Base-asset units per contract (OKX futures: ctVal, default 0.01 for BTC)."""
+        if self._exchange_id == "okx" and self._futures:
+            try:
+                return float(self._exchange.market(symbol).get("contractSize", 0.01))
+            except Exception:
+                return 0.01
+        return 1.0
+
     # ──────────────────────────────────────────────────────────────────
     # Orders
     # ──────────────────────────────────────────────────────────────────
@@ -232,13 +241,20 @@ class BinanceConnector(BaseConnector):
                        (fut_side == "short" and side == "buy")
             legs: list = self._paper_futures.get(fut_key, [])
             if is_close and legs:
-                # Close oldest open leg (FIFO)
-                pos = legs.pop(0)
-                pnl_mult = 1 if fut_side == "long" else -1
-                pnl = pnl_mult * (exec_price - pos["entry"]) * pos["amount"]
-                self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) + pos["margin"] + pnl
-                logger.info("[Paper Futures] Close %s %s @ %.2f  PnL=%.2f USDT",
-                            fut_side.upper(), symbol, exec_price, pnl)
+                # Close oldest open leg (FIFO) — supports PARTIAL closes (TP1).
+                pos = legs[0]
+                close_amt = min(amount, pos["amount"]) if amount > 0 else pos["amount"]
+                frac      = close_amt / pos["amount"] if pos["amount"] > 0 else 1.0
+                refund    = pos["margin"] * frac
+                pnl_mult  = 1 if fut_side == "long" else -1
+                pnl       = pnl_mult * (exec_price - pos["entry"]) * close_amt
+                self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) + refund + pnl
+                pos["amount"] -= close_amt
+                pos["margin"] -= refund
+                if pos["amount"] <= 1e-9:
+                    legs.pop(0)
+                logger.info("[Paper Futures] Close %s %s %.6f @ %.2f  PnL=%.2f USDT  (leg left=%.6f)",
+                            fut_side.upper(), symbol, close_amt, exec_price, pnl, pos["amount"])
                 if legs:
                     self._paper_futures[fut_key] = legs
                 else:
