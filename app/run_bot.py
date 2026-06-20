@@ -99,6 +99,7 @@ def build_config() -> dict:
             "swing_reversal":   _env_bool("STRATEGY_SWING_REVERSAL",   True),
             "scalp_trend":      _env_bool("STRATEGY_SCALP_TREND",      True),
             "profitable_bot":   _env_bool("STRATEGY_PROFITABLE_BOT",   True),
+            "mtf_score":        _env_bool("STRATEGY_MTF_SCORE",        True),
         },
         # Swing v5 Wide config — tune via env vars if needed
         "sr_params": {
@@ -119,6 +120,13 @@ def build_config() -> dict:
             "tp_atr":   _env_float("SC_TP",     2.0),
             "cooldown": _env_int("SC_COOLDOWN", 8),
         },
+        "mtf_params": {
+            "sl_atr":        _env_float("MTF_SL",       1.5),
+            "tp_atr":        _env_float("MTF_TP",       2.5),
+            "score_thresh":  _env_float("MTF_SCORE",    6.0),
+            "cooldown":      _env_int("MTF_COOLDOWN",   2),
+            "max_hold":      _env_int("MTF_MAX_HOLD",  24),
+        },
         "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
     }
@@ -133,6 +141,7 @@ def _make_strategies(symbols: list, flags: dict, cfg: dict,
     from trading.strategies.swing_strategy import SwingReversalStrategy
     from trading.strategies.scalp_strategy import ScalpTrendBot
     from trading.strategies.profitable_strategy import ProfitableBot
+    from trading.strategies.mtf_score_strategy import MTFScoreBot
 
     strategies = []
     for sym in symbols:
@@ -142,6 +151,8 @@ def _make_strategies(symbols: list, flags: dict, cfg: dict,
             strategies.append(ScalpTrendBot(sym, params=cfg["scalp_params"]))
         if flags.get("profitable_bot"):
             strategies.append(ProfitableBot(sym, params=cfg["profitable_params"]))
+        if flags.get("mtf_score"):
+            strategies.append(MTFScoreBot(sym, params=cfg["mtf_params"]))
     return strategies
 
 
