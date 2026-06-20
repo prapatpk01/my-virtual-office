@@ -160,7 +160,7 @@ def build_config() -> dict:
         },
         "scalp_params": {
             "sl_atr":   _env_float("SC_SL",     2.0),
-            "tp_atr":   _env_float("SC_TP",     1.5),
+            "tp_atr":   _env_float("SC_TP",     2.0),
             "cooldown": _env_int("SC_COOLDOWN", 8),
         },
         "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
