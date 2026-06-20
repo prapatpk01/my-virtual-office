@@ -14,7 +14,8 @@ Entry logic (3-layer MTF):
   4. volume ≥ vol_mult × MA20
 
 SL/TP: ATR-based, clamped to [sl_min_pct, sl_max_pct]
-  sl_mult=0.8, tp_mult=2.0 → R:R 1:2.5  (break-even WR 28.6%)
+  sl_mult=1.2, tp_mult=3.0 → R:R 1:2.5  (break-even WR 28.6%)
+  sl_min_pct=1.2% ensures SL ≥ 750pts on BTC 63k (avoids noise stop-outs)
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -40,10 +41,10 @@ class TrendContinuationStrategy(BaseStrategy):
         self.vol_mult     = self.params.get("vol_mult",      1.0)  # ↓ from 1.2
         self.min_entry_cond = self.params.get("min_entry_cond", 3) # 3/4 not ALL 4
         self.atr_period   = self.params.get("atr_period",   14)
-        self.sl_mult      = self.params.get("sl_mult",       0.8)
-        self.tp_mult      = self.params.get("tp_mult",       4.0)  # ↑ R:R 1:5 → BE WR 16.7%
-        self.sl_min_pct   = self.params.get("sl_min_pct",  0.010)  # grid-optimised min SL
-        self.sl_max_pct   = self.params.get("sl_max_pct",  0.030)
+        self.sl_mult      = self.params.get("sl_mult",       1.2)   # ↑ from 0.8 — wider SL room
+        self.tp_mult      = self.params.get("tp_mult",       3.0)   # ↓ from 4.0 — R:R 2.5:1, BE WR 28.6%
+        self.sl_min_pct   = self.params.get("sl_min_pct",  0.012)  # 1.2% min SL (~$750 on 63k BTC)
+        self.sl_max_pct   = self.params.get("sl_max_pct",  0.035)
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:

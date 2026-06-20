@@ -118,10 +118,10 @@ def build_config() -> dict:
         "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     2),    # ↓ from 3
 
         # ── Trend Continuation tuning (15m entry / 1H+4H MTF) ────────────
-        # sl_mult=0.8, tp_mult=4.0 → R:R 1:5, BE WR=16.7%
-        # bias_gate=20 (grid-optimised), pullback=2%, sl_min=1.0%
-        "tc_sl_mult":         _env_float("TC_SL_MULT",       0.8),
-        "tc_tp_mult":         _env_float("TC_TP_MULT",       4.0),
+        # sl_mult=1.2, tp_mult=3.0 → R:R 1:2.5, BE WR=28.6%
+        # bias_gate=20 (grid-optimised), pullback=2%, sl_min=1.2%
+        "tc_sl_mult":         _env_float("TC_SL_MULT",       1.2),   # wider SL — avoids noise stop-out
+        "tc_tp_mult":         _env_float("TC_TP_MULT",       3.0),   # less greedy TP
         "tc_rsi_min":         _env_float("TC_RSI_MIN",      35.0),
         "tc_rsi_max":         _env_float("TC_RSI_MAX",      75.0),
         "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",  0.020),  # grid-optimised ↓ from 0.025
