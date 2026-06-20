@@ -71,9 +71,10 @@ class TradingBot:
             logger.info("Claude CHIEF MODE ENABLED (model=%s, min_conf=%.0f%%)",
                         self._ai_chief.model, self._chief_min_conf)
 
-        # In-memory position tracking: symbol -> Position
+        # In-memory position tracking: "{symbol}::{strategy_name}" -> Position
+        # Using compound key allows each strategy to hold its own position on the same symbol.
         self._positions: dict[str, Position] = {}
-        self._position_lock = asyncio.Lock()   # prevents duplicate orders on same symbol
+        self._position_lock = asyncio.Lock()
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -133,7 +134,7 @@ class TradingBot:
 
     def get_state(self) -> dict:
         positions = []
-        for sym, pos in self._positions.items():
+        for pos_key, pos in self._positions.items():
             positions.append({
                 "symbol": pos.symbol,
                 "side": pos.side,
@@ -141,7 +142,7 @@ class TradingBot:
                 "amount": pos.amount,
                 "stop_loss": pos.stop_loss,
                 "take_profit": pos.take_profit,
-                "strategy": "",
+                "strategy": pos_key.split("::")[-1] if "::" in pos_key else pos_key,
             })
         pnl_total = self._current_balance - self._start_balance if self._start_balance else 0.0
         return {
@@ -181,11 +182,13 @@ class TradingBot:
                 reason="manual /buy command",
                 metadata={"stop_loss": sl_p, "take_profit": tp_p, "atr": round(atr_val, 4)},
             )
-            if symbol in self._positions:
+            open_syms = {k.split("::")[0] for k in self._positions}
+            if symbol in open_syms:
                 return f"Already in position for {symbol}"
             if len(self._positions) >= self.max_positions:
                 return f"Max positions ({self.max_positions}) reached"
-            await self._execute_buy(signal, strategy_name="manual")
+            await self._execute_buy(signal, strategy_name="manual",
+                                    pos_key=f"{symbol}::manual")
             return (
                 f"BUY {symbol} @ ${price:,.2f}\n"
                 f"SL: ${sl_p:,.2f}  TP: ${tp_p:,.2f}  ATR: ${atr_val:,.2f}"
@@ -257,7 +260,8 @@ class TradingBot:
 
             if self._ai_chief:
                 # ── Chief mode: strategy exits first, then Chief decides ───
-                if sym in self._positions:
+                open_syms = {k.split("::")[0] for k in self._positions}
+                if sym in open_syms:
                     await self._check_strategy_exits(sym, candles, price)
                 await self._tick_chief(sym, candles, price)
             else:
@@ -266,7 +270,8 @@ class TradingBot:
 
     async def _tick_chief(self, sym: str, candles_1h: list, price: float):
         """Chief mode: collect strategy opinions, ask Claude, execute if BUY."""
-        if sym in self._positions or len(self._positions) >= self.max_positions:
+        open_syms = {k.split("::")[0] for k in self._positions}
+        if sym in open_syms or len(self._positions) >= self.max_positions:
             return  # exits already handled by _check_strategy_exits before this call
 
         # Fetch 4h and 1d for multi-TF context (HA already applied to 1h)
@@ -343,25 +348,25 @@ class TradingBot:
             logger.debug("[MTF] %s 4H not bullish — skipping", sym)
             return
 
-        buy_blocked = sym in self._positions or len(self._positions) >= self.max_positions
-
         for strategy in [s for s in self.strategies if s.symbol == sym]:
+            pos_key = f"{sym}::{strategy.name}"
             try:
                 signal = await strategy.analyze(candles, price, mtf_candles=mtf_candles)
             except Exception as e:
                 logger.error("Strategy %s error on %s: %s", strategy.name, sym, e)
                 continue
 
-            # SELL: close existing long immediately — no gate/Chief needed
+            # SELL: close this strategy's own position
             if signal.type == SignalType.SELL:
-                if sym in self._positions:
-                    await self._execute_sell_early(sym, price, signal.reason, strategy.name)
+                if pos_key in self._positions:
+                    await self._execute_sell_early(pos_key, price, signal.reason, strategy.name)
                 continue
 
             if signal.type != SignalType.BUY:
                 continue
 
-            if buy_blocked:
+            # Block if this strategy already has an open position, or max total reached
+            if pos_key in self._positions or len(self._positions) >= self.max_positions:
                 continue
 
             meta = signal.metadata or {}
@@ -392,19 +397,21 @@ class TradingBot:
                     continue
                 logger.info("[Gate] CONFIRMED %s %s: %s", strategy.name, sym, ai_reason)
 
-            await self._execute_buy(signal, strategy_name=strategy.name)
-            break   # one BUY per symbol per tick
+            await self._execute_buy(signal, strategy_name=strategy.name, pos_key=pos_key)
 
-    async def _execute_buy(self, signal: Signal, strategy_name: str):
+    async def _execute_buy(self, signal: Signal, strategy_name: str,
+                           pos_key: str = None):
         sym = signal.symbol
+        if pos_key is None:
+            pos_key = f"{sym}::{strategy_name}"
         meta = signal.metadata or {}
         sl_p = meta.get("stop_loss")
         tp_p = meta.get("take_profit")
 
         async with self._position_lock:
             # Re-check inside lock — another strategy may have entered while we awaited
-            if sym in self._positions:
-                logger.debug("[%s] Position for %s already taken — skipping", strategy_name, sym)
+            if pos_key in self._positions:
+                logger.debug("[%s] Position %s already open — skipping", strategy_name, pos_key)
                 return
             if len(self._positions) >= self.max_positions:
                 logger.debug("[%s] Max positions reached — skipping", strategy_name)
@@ -448,7 +455,7 @@ class TradingBot:
                     entry_price=fill_price, amount=amount,
                     stop_loss=sl_p, take_profit=tp_p,
                 )
-                self._positions[sym] = pos
+                self._positions[pos_key] = pos
                 self._save_positions()
                 logger.info("[%s] BUY filled: %s %.6f @ %.2f  SL=%.2f  TP=%.2f",
                             strategy_name, sym, amount, fill_price,
@@ -480,17 +487,18 @@ class TradingBot:
                 await self._execute_sell_early(sym, price, sig.reason, strat.name)
                 return  # position closed — stop checking
 
-    async def _execute_sell_early(self, sym: str, price: float,
+    async def _execute_sell_early(self, pos_key: str, price: float,
                                    reason: str, strategy_name: str):
         """Market-sell to close a long position on a strategy SELL signal."""
-        pos = self._positions.get(sym)
+        pos = self._positions.get(pos_key)
         if not pos:
             return
+        sym = pos_key.split("::")[0]
         try:
             order = await self.connector.create_order(sym, "sell", pos.amount)
             exit_price = order.price or price
             pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
-            self._positions.pop(sym, None)
+            self._positions.pop(pos_key, None)
             self._save_positions()
             logger.info(
                 "[%s] Early exit %s @ %.2f  entry=%.2f  pnl=%.2f%%  | %s",
@@ -523,9 +531,10 @@ class TradingBot:
             # Paper mode or non-OKX — no sync
             return
 
-        for sym in list(self._positions.keys()):
+        for pos_key in list(self._positions.keys()):
+            sym = pos_key.split("::")[0]
             if sym not in live_syms:
-                pos = self._positions.pop(sym)
+                pos = self._positions.pop(pos_key)
                 self._save_positions()
                 try:
                     ticker = await self.connector.fetch_ticker(sym)
@@ -534,9 +543,6 @@ class TradingBot:
                     exit_price = pos.entry_price
 
                 pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
-                # Infer close reason from which level the exit price is closest to,
-                # not from entry — a TP close that ticked back below entry should still
-                # report take_profit. Fall back to entry comparison if levels missing.
                 if pos.take_profit and pos.stop_loss:
                     d_tp = abs(exit_price - pos.take_profit)
                     d_sl = abs(exit_price - pos.stop_loss)
@@ -544,7 +550,7 @@ class TradingBot:
                 else:
                     reason = "take_profit" if exit_price >= pos.entry_price else "stop_loss"
                 logger.info("[OKX-sync] %s closed by OCO: exit=%.2f entry=%.2f pnl=%.2f%%",
-                            sym, exit_price, pos.entry_price, pnl_pct)
+                            pos_key, exit_price, pos.entry_price, pnl_pct)
                 if self.telegram:
                     self.telegram.notify_close(
                         sym, pos.entry_price, exit_price, pnl_pct, reason
@@ -567,56 +573,77 @@ class TradingBot:
         if not self._positions:
             return
 
-        # Fetch all balances once for the whole loop
+        # Fetch balances and prices once
         try:
-            balances  = await self.connector.fetch_balance()
-            bal_map   = {b.asset: b.free for b in balances}
+            balances = await self.connector.fetch_balance()
+            bal_map  = {b.asset: b.free for b in balances}
         except Exception:
             bal_map = {}
 
-        for sym in list(self._positions.keys()):
-            pos = self._positions[sym]
-            base = sym.split("/")[0]
+        # Pre-fetch prices per unique symbol
+        price_map: dict[str, float] = {}
+        for pos_key in list(self._positions.keys()):
+            sym = pos_key.split("::")[0]
+            if sym not in price_map:
+                try:
+                    ticker = await self.connector.fetch_ticker(sym)
+                    price_map[sym] = float(ticker["last"])
+                except Exception:
+                    pass
 
-            try:
-                ticker = await self.connector.fetch_ticker(sym)
-                price  = float(ticker["last"])
-            except Exception:
+        # Total expected base asset per symbol (sum across all strategies)
+        base_total: dict[str, float] = {}
+        for pos_key, pos in self._positions.items():
+            sym  = pos_key.split("::")[0]
+            base = sym.split("/")[0]
+            base_total[base] = base_total.get(base, 0.0) + pos.amount
+
+        for pos_key in list(self._positions.keys()):
+            pos  = self._positions.get(pos_key)
+            if not pos:
+                continue
+            sym   = pos_key.split("::")[0]
+            base  = sym.split("/")[0]
+            price = price_map.get(sym)
+            if price is None:
                 continue
 
-            # Method 1: base asset gone → exchange algo already closed the position
-            actual_base = bal_map.get(base, 0.0)
-            if actual_base < pos.amount * 0.1:
+            actual_base    = bal_map.get(base, 0.0)
+            total_expected = base_total.get(base, pos.amount)
+
+            # Method 1: total base gone → exchange algo closed all positions for this asset
+            if actual_base < total_expected * 0.1:
                 reason = "take_profit" if price > pos.entry_price else "stop_loss"
                 logger.info("[Spot-Exit] %s detected closed by exchange algo (balance=%.6f < %.6f)",
-                            sym, actual_base, pos.amount)
-                await self._close_spot_position(sym, price, reason)
+                            pos_key, actual_base, total_expected)
+                await self._close_spot_position(pos_key, price, reason)
                 continue
 
-            # Method 2: price crossed SL/TP → trigger our own market sell
+            # Method 2: this position's SL/TP hit — sell its specific amount
             if not pos.stop_loss and not pos.take_profit:
                 continue
             hit_tp = bool(pos.take_profit and price >= pos.take_profit)
             hit_sl = bool(pos.stop_loss  and price <= pos.stop_loss)
             if hit_tp or hit_sl:
                 reason = "take_profit" if hit_tp else "stop_loss"
-                await self._close_spot_position(sym, price, reason)
+                await self._close_spot_position(pos_key, price, reason)
 
-    async def _close_spot_position(self, sym: str, exit_price: float, reason: str):
+    async def _close_spot_position(self, pos_key: str, exit_price: float, reason: str):
         """Market sell to close spot position. If OCO already sold, the sell will
         fail (no balance) — we catch that and clear the in-memory position anyway."""
-        pos = self._positions.pop(sym, None)
+        pos = self._positions.pop(pos_key, None)
         if not pos:
             return
+        sym = pos_key.split("::")[0]
         self._save_positions()
         try:
             await self.connector.create_order(sym, "sell", pos.amount)
         except Exception as e:
-            logger.info("[Spot-Exit] Sell skipped (OCO already closed?): %s — %s", sym, e)
+            logger.info("[Spot-Exit] Sell skipped (OCO already closed?): %s — %s", pos_key, e)
 
         pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
         logger.info("[Spot-Exit] %s %s: exit=%.4f entry=%.4f pnl=%.2f%%",
-                    sym, reason, exit_price, pos.entry_price, pnl_pct)
+                    pos_key, reason, exit_price, pos.entry_price, pnl_pct)
         if self.telegram:
             self.telegram.notify_close(sym, pos.entry_price, exit_price, pnl_pct, reason)
 
@@ -702,16 +729,17 @@ class TradingBot:
     def _save_positions(self):
         """Write open positions to disk so they survive a restart."""
         data = {
-            sym: {
-                "symbol":      pos.symbol,
-                "side":        pos.side,
-                "entry_price": pos.entry_price,
-                "amount":      pos.amount,
-                "stop_loss":   pos.stop_loss,
-                "take_profit": pos.take_profit,
-                "opened_at":   pos.opened_at,
+            pos_key: {
+                "symbol":        pos.symbol,
+                "strategy_name": pos_key.split("::")[-1] if "::" in pos_key else "",
+                "side":          pos.side,
+                "entry_price":   pos.entry_price,
+                "amount":        pos.amount,
+                "stop_loss":     pos.stop_loss,
+                "take_profit":   pos.take_profit,
+                "opened_at":     pos.opened_at,
             }
-            for sym, pos in self._positions.items()
+            for pos_key, pos in self._positions.items()
         }
         try:
             os.makedirs(os.path.dirname(_POSITIONS_FILE), exist_ok=True)
@@ -743,8 +771,9 @@ class TradingBot:
             logger.warning("Balance fetch failed during position reload: %s", e)
             return
 
-        for sym, pd in data.items():
-            base   = sym.split("/")[0]
+        for pos_key, pd in data.items():
+            sym  = pos_key.split("::")[0]
+            base = sym.split("/")[0]
             on_exch = bal_map.get(base, 0.0)
             if on_exch >= pd["amount"] * 0.9:
                 pos = Position(
@@ -754,10 +783,10 @@ class TradingBot:
                     take_profit=pd.get("take_profit"),
                     opened_at=pd.get("opened_at", int(time.time())),
                 )
-                self._positions[sym] = pos
+                self._positions[pos_key] = pos
                 logger.info("[Restart] Restored %s: %.6f @ %.2f  SL=%.2f  TP=%.2f",
-                            sym, pos.amount, pos.entry_price,
+                            pos_key, pos.amount, pos.entry_price,
                             pos.stop_loss or 0, pos.take_profit or 0)
             else:
                 logger.info("[Restart] %s was closed while offline (balance=%.6f < %.6f)",
-                            sym, on_exch, pd["amount"])
+                            pos_key, on_exch, pd["amount"])
