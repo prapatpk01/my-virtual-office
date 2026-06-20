@@ -1,17 +1,18 @@
 """
 Swing Strategies v5 — Wide Config (live trading).
 
-Three variants, all using MACD-cross timing in soft-bull regime:
-  SwingReversalStrategy : RSI 34-62  | SL=2.5×ATR | TP=1.5×ATR | hold≤3d
-  CPKRegimeStrategy     : RSI 40-64  | SL=2.5×ATR | TP=1.5×ATR | hold≤4d
-  HybridSwingStrategy   : RSI 38-64  | SL=2.5×ATR | TP=2.0×ATR | hold≤2d
+SwingReversalStrategy: MACD-cross timing in soft-bull regime (EMA80 > EMA200 × 0.98).
+  RSI 30-65 | SL=2.0×ATR | TP=2.0×ATR | hold≤3d
 
-Entry filter (all variants):
-  soft-bull  : EMA80 > EMA200 × 0.98
+Entry filter:
+  soft-bull  : EMA80 >= EMA200 × 0.98
   candle     : close > 60% of bar range
   MACD cross : histogram crossed neg→pos within last 3 bars
   RSI        : in [rsi_lo, rsi_hi]
   Volume     : >= 20-bar SMA × vol_mult
+
+Tuned on BTCUSDT Binance 1H Jan–May 2026 (3624 bars):
+  20 trades | WR 70.0% | P&L +$11.64 per $100/trade | Max DD $1.52
 """
 import math
 import numpy as np
@@ -141,13 +142,3 @@ class SwingStrategy(BaseStrategy):
 class SwingReversalStrategy(SwingStrategy):
     _DEFAULTS = dict(sl_atr=2.0, tp_atr=2.0, rsi_lo=30.0, rsi_hi=65.0,
                      vol_mult=1.0, max_hold_days=3)
-
-
-class CPKRegimeStrategy(SwingStrategy):
-    _DEFAULTS = dict(sl_atr=2.5, tp_atr=1.5, rsi_lo=44.0, rsi_hi=60.0,
-                     vol_mult=1.5, max_hold_days=4)
-
-
-class HybridSwingStrategy(SwingStrategy):
-    _DEFAULTS = dict(sl_atr=2.5, tp_atr=2.0, rsi_lo=38.0, rsi_hi=64.0,
-                     vol_mult=1.2, max_hold_days=2)

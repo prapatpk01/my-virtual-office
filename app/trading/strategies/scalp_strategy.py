@@ -11,7 +11,7 @@ Risk: SL = max(2×ATR, 0.8% price), cap 5%.  TP = 2.0×ATR.
 Cooldown: 8 bars after entry.
 
 Tuned on BTCUSDT Binance 1H Jan–May 2026 (3624 bars):
-  28 trades | WR 67.9% | P&L +$12.53 per $100/trade | Max DD 3.5%
+  27 trades | WR 63.0% | P&L +$6.24 per $100/trade | Max DD $3.23
 """
 import math
 from .base import BaseStrategy, Signal, SignalType
