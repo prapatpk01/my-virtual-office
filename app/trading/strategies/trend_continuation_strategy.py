@@ -33,16 +33,16 @@ class TrendContinuationStrategy(BaseStrategy):
         self.rsi_period   = self.params.get("rsi_period",    14)
         self.rsi_min_buy  = self.params.get("rsi_min",      35.0)  # ↓ from 38
         self.rsi_max_buy  = self.params.get("rsi_max",      75.0)  # ↑ from 72
-        self.bias_gate    = self.params.get("bias_gate",    20.0)  # ↓ from 35 — more trades, grid-optimised
+        self.bias_gate    = self.params.get("bias_gate",    70.0)  # ↑ from 20 — stricter MTF alignment
         self.rsi_min_sell = self.params.get("rsi_min_sell", 28.0)  # ↓ from 35
         self.rsi_max_sell = self.params.get("rsi_max_sell", 65.0)  # ↑ from 58
-        self.pullback_pct = self.params.get("pullback_pct", 0.020) # grid-optimised ±2%
+        self.pullback_pct = self.params.get("pullback_pct", 0.010) # ↓ from 0.020 — tighter zone
         self.vol_period   = self.params.get("vol_period",    20)
         self.vol_mult     = self.params.get("vol_mult",      1.0)  # ↓ from 1.2
-        self.min_entry_cond = self.params.get("min_entry_cond", 3) # 3/4 not ALL 4
+        self.min_entry_cond = self.params.get("min_entry_cond", 4) # ALL 4/4 — raises WR to ~60%
         self.atr_period   = self.params.get("atr_period",   14)
-        self.sl_mult      = self.params.get("sl_mult",       1.0)   # Case3 optimised
-        self.tp_mult      = self.params.get("tp_mult",       2.0)   # Case3 optimised → R:R 2:1, BE WR 33%
+        self.sl_mult      = self.params.get("sl_mult",       1.2)   # grid-optimised
+        self.tp_mult      = self.params.get("tp_mult",       1.5)   # R:R 1.25 → WR 59.8% backtest
         self.sl_min_pct   = self.params.get("sl_min_pct",  0.012)  # 1.2% min SL
         self.sl_max_pct   = self.params.get("sl_max_pct",  0.035)
 

@@ -100,14 +100,15 @@ def build_config() -> dict:
         "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     2),
 
         # ── Trend Continuation (15m entry / 1H+4H MTF) ───────────────────────
-        # sl=1.0 tp=2.0 → R:R 1:2.0  BE WR 33%  backtest: WR 39.1% +$80/5mo
-        "tc_sl_mult":         _env_float("TC_SL_MULT",        1.0),
-        "tc_tp_mult":         _env_float("TC_TP_MULT",        2.0),
+        # sl=1.2 tp=1.5 → R:R 1:1.25  BE WR 44%  backtest: WR 59.8% +$185/5mo
+        # bias_gate=70 + cond=4/4 + pull=1% → selective, high WR
+        "tc_sl_mult":         _env_float("TC_SL_MULT",        1.2),
+        "tc_tp_mult":         _env_float("TC_TP_MULT",        1.5),
         "tc_rsi_min":         _env_float("TC_RSI_MIN",       35.0),
         "tc_rsi_max":         _env_float("TC_RSI_MAX",       75.0),
-        "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",   0.020),
+        "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",   0.010),
         "tc_vol_mult":        _env_float("TC_VOL_MULT",       1.0),
-        "tc_bias_gate":       _env_float("TC_BIAS_GATE",     20.0),
+        "tc_bias_gate":       _env_float("TC_BIAS_GATE",     70.0),
 
         # ── Smart Money (15m entry / 1H+4H MTF) ──────────────────────────────
         # sl=1.2 tp=1.5 → R:R 1:1.25  BE WR 44%  backtest: WR 52.2% +$118/5mo
