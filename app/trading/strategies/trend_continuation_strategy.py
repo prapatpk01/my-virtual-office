@@ -32,7 +32,7 @@ class TrendContinuationStrategy(BaseStrategy):
         self.rsi_period   = self.params.get("rsi_period",    14)
         self.rsi_min_buy  = self.params.get("rsi_min",      35.0)  # ↓ from 38
         self.rsi_max_buy  = self.params.get("rsi_max",      75.0)  # ↑ from 72
-        self.bias_gate    = self.params.get("bias_gate",    15.0)  # comp_pct threshold
+        self.bias_gate    = self.params.get("bias_gate",    35.0)  # ↑ stricter MTF alignment
         self.rsi_min_sell = self.params.get("rsi_min_sell", 28.0)  # ↓ from 35
         self.rsi_max_sell = self.params.get("rsi_max_sell", 65.0)  # ↑ from 58
         self.pullback_pct = self.params.get("pullback_pct", 0.025) # ↑ from 0.015 ±2.5%
@@ -42,8 +42,8 @@ class TrendContinuationStrategy(BaseStrategy):
         self.atr_period   = self.params.get("atr_period",   14)
         self.sl_mult      = self.params.get("sl_mult",       0.8)
         self.tp_mult      = self.params.get("tp_mult",       4.0)  # ↑ R:R 1:5 → BE WR 16.7%
-        self.sl_min_pct   = self.params.get("sl_min_pct",  0.002)
-        self.sl_max_pct   = self.params.get("sl_max_pct",  0.020)  # ↑ from 0.012
+        self.sl_min_pct   = self.params.get("sl_min_pct",  0.012)  # ↑ fee-adjusted min SL
+        self.sl_max_pct   = self.params.get("sl_max_pct",  0.030)
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
@@ -130,7 +130,7 @@ class TrendContinuationStrategy(BaseStrategy):
             raw  = atr_v * self.sl_mult
             dist = max(current_price * self.sl_min_pct,
                        min(raw, current_price * self.sl_max_pct))
-            tp_d = atr_v * self.tp_mult
+            tp_d = dist * (self.tp_mult / self.sl_mult)  # scale TP with actual dist to maintain R:R
             if side == "long":
                 return round(current_price - dist, 2), round(current_price + tp_d, 2)
             return round(current_price + dist, 2), round(current_price - tp_d, 2)

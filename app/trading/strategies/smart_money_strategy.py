@@ -30,12 +30,12 @@ class SmartMoneyStrategy(BaseStrategy):
         self.rsi_period     = self.params.get("rsi_period",     14)
         self.vol_period     = self.params.get("vol_period",     20)
         self.vol_mult       = self.params.get("vol_mult",       1.0)
-        self.bias_threshold = self.params.get("bias_threshold", 25.0)
+        self.bias_threshold = self.params.get("bias_threshold", 20.0)  # ↓ more signals at same quality
         self.atr_period     = self.params.get("atr_period",     14)
         self.sl_mult        = self.params.get("sl_mult",        1.5)
         self.tp_mult        = self.params.get("tp_mult",        2.5)
-        self.sl_min_pct     = self.params.get("sl_min_pct",   0.005)
-        self.sl_max_pct     = self.params.get("sl_max_pct",   0.040)
+        self.sl_min_pct     = self.params.get("sl_min_pct",   0.010)  # ↑ fee-adjusted min SL
+        self.sl_max_pct     = self.params.get("sl_max_pct",   0.050)
 
     async def analyze(self, candles: list, current_price: float,
                       mtf_candles: dict = None) -> Signal:
@@ -90,7 +90,7 @@ class SmartMoneyStrategy(BaseStrategy):
             raw  = atr_v * self.sl_mult
             dist = max(current_price * self.sl_min_pct,
                        min(raw, current_price * self.sl_max_pct))
-            tp_d = atr_v * self.tp_mult
+            tp_d = dist * (self.tp_mult / self.sl_mult)  # scale TP with actual dist to maintain R:R
             if side == "long":
                 return round(current_price - dist, 2), round(current_price + tp_d, 2)
             return round(current_price + dist, 2), round(current_price - tp_d, 2)

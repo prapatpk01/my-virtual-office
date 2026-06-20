@@ -118,21 +118,22 @@ def build_config() -> dict:
         "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     2),    # ↓ from 3
 
         # ── Trend Continuation tuning (15m entry / 1H+4H MTF) ────────────
-        # sl_mult=0.8, tp_mult=2.0 → R:R 1:2.5  (break-even WR 28.6%)
-        # Wider pullback ±2.5%, 3/4 conditions required
+        # sl_mult=0.8, tp_mult=4.0 → R:R 1:5, BE WR=16.7%
+        # bias_gate=35 (stricter), sl_min=1.2% (fee-adjusted)
         "tc_sl_mult":         _env_float("TC_SL_MULT",       0.8),
-        "tc_tp_mult":         _env_float("TC_TP_MULT",       4.0),    # ↑ R:R 1:5, BE WR=16.7%
-        "tc_rsi_min":         _env_float("TC_RSI_MIN",      38.0),
-        "tc_rsi_max":         _env_float("TC_RSI_MAX",      72.0),
+        "tc_tp_mult":         _env_float("TC_TP_MULT",       4.0),
+        "tc_rsi_min":         _env_float("TC_RSI_MIN",      35.0),
+        "tc_rsi_max":         _env_float("TC_RSI_MAX",      75.0),
         "tc_pullback_pct":    _env_float("TC_PULLBACK_PCT",  0.025),
         "tc_vol_mult":        _env_float("TC_VOL_MULT",      1.0),
+        "tc_bias_gate":       _env_float("TC_BIAS_GATE",    35.0),    # ↑ from 15, stricter
 
         # ── Smart Money / MTF Momentum tuning (15m entry / 1H+4H MTF) ──────
         # sl_mult=1.5, tp_mult=2.5 → R:R 1:1.67  (break-even WR 37.5%)
-        # comp_pct from compute_mtf_bias() must exceed bias_threshold
+        # bias_threshold=20 (more signals), sl_min=1.0% (fee-adjusted)
         "sm_sl_mult":         _env_float("SM_SL_MULT",       1.5),
         "sm_tp_mult":         _env_float("SM_TP_MULT",       2.5),
-        "sm_bias_threshold":  _env_float("SM_BIAS_THRESHOLD",25.0),   # comp_pct gate
+        "sm_bias_threshold":  _env_float("SM_BIAS_THRESHOLD",20.0),   # ↓ from 25
 
         # ── Scalp Trend tuning (15m entry / 1H+4H MTF) ───────────────────────
         # sl_mult=1.5, tp_mult=1.875 → R:R 1:1.25 (break-even WR=44.4%)
@@ -353,6 +354,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "rsi_max":      cfg["tc_rsi_max"],
                 "pullback_pct": cfg["tc_pullback_pct"],
                 "vol_mult":     cfg["tc_vol_mult"],
+                "bias_gate":    cfg["tc_bias_gate"],
             }))
 
         # ── Smart Money / MTF Momentum (15m entry / 1H+4H MTF) — style 3 ──
@@ -594,6 +596,7 @@ async def main():
                     "rsi_max":      cfg["tc_rsi_max"],
                     "pullback_pct": cfg["tc_pullback_pct"],
                     "vol_mult":     cfg["tc_vol_mult"],
+                    "bias_gate":    cfg["tc_bias_gate"],
                 })
                 trades = await backtest_strategy_mtf(
                     tc, c15m, {"1h": c1h, "4h": c4h}, notional_c5, sl_pct, tp_pct,

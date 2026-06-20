@@ -99,7 +99,7 @@ class MeanReversionStrategy(BaseStrategy):
             raw  = atr_v * self.sl_mult
             dist = max(current_price * self.sl_min_pct,
                        min(raw, current_price * self.sl_max_pct))
-            tp_d = atr_v * self.tp_mult
+            tp_d = dist * (self.tp_mult / self.sl_mult)  # scale TP with actual dist to maintain R:R
             if side == "long":
                 return round(current_price - dist, 2), round(current_price + tp_d, 2)
             return round(current_price + dist, 2), round(current_price - tp_d, 2)
