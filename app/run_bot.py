@@ -110,8 +110,8 @@ def build_config() -> dict:
             "max_hold_days": _env_float("SR_HOLD",     3.0),
         },
         "profitable_params": {
-            "sl_atr":   _env_float("PB_SL",     2.0),
-            "tp_atr":   _env_float("PB_TP",     1.8),
+            "sl_atr":   _env_float("PB_SL",     1.5),
+            "tp_atr":   _env_float("PB_TP",     2.5),
             "cooldown": _env_int("PB_COOLDOWN", 2),
         },
         "scalp_params": {

@@ -11,11 +11,11 @@ Entry requires:
       C3: price bounced off Bollinger lower band
       C4: volume ≥ 1.1× 20-bar MA
 
-Risk: SL = max(2×ATR, 1.5% price), cap 7%.  TP = 1.8×ATR.
+Risk: SL = max(1.5×ATR, 1.5% price), cap 7%.  TP = 2.5×ATR.
 Cooldown: 2 bars after entry.
 
 Tuned on BTCUSDT Binance 1H Jan–May 2026 (3624 bars):
-  64 trades | WR 57.8% | P&L +$9.20 per $100/trade
+  36 trades | WR 58.3% | PF 1.11 | P&L +$3.16 per $100/trade
 """
 import math
 from .base import BaseStrategy, Signal, SignalType
@@ -28,8 +28,8 @@ class ProfitableBot(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.sl_atr        = float(self.params.get("sl_atr",    2.0))
-        self.tp_atr        = float(self.params.get("tp_atr",    1.8))
+        self.sl_atr        = float(self.params.get("sl_atr",    1.5))
+        self.tp_atr        = float(self.params.get("tp_atr",    2.5))
         self.cooldown_bars = int(self.params.get("cooldown",    2))
         self._cooldown     = 0
 
