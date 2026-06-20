@@ -154,7 +154,7 @@ def build_config() -> dict:
         },
         "profitable_params": {
             "sl_atr":   _env_float("PB_SL",     2.0),
-            "tp_atr":   _env_float("PB_TP",     1.2),
+            "tp_atr":   _env_float("PB_TP",     1.8),
             "cooldown": _env_int("PB_COOLDOWN", 2),
         },
         "scalp_params": {
