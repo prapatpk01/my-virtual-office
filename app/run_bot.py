@@ -96,31 +96,9 @@ def build_config() -> dict:
         "max_drawdown":    _env_float("MAX_DRAWDOWN_PCT", 0.30),
         "risk_per_trade":  _env_float("RISK_PER_TRADE", 0.02),
         "strategies": {
-            "wt_adx":           _env_bool("STRATEGY_WT_ADX",           False),
-            "ut_bot":           _env_bool("STRATEGY_UT_BOT",           False),
-            "momentum_score":   _env_bool("STRATEGY_MOMENTUM_SCORE",   False),
             "swing_reversal":   _env_bool("STRATEGY_SWING_REVERSAL",   True),
-            "cpk_regime":       _env_bool("STRATEGY_CPK_REGIME",       False),
-            "hybrid_swing":     _env_bool("STRATEGY_HYBRID_SWING",     False),
-            "intern":           _env_bool("STRATEGY_INTERN",           False),
-            "profitable_bot":   _env_bool("STRATEGY_PROFITABLE_BOT",   True),
             "scalp_trend":      _env_bool("STRATEGY_SCALP_TREND",      True),
-        },
-        "wt_params": {
-            "wt_channel_len": _env_int("WT_N1",   8),
-            "wt_avg_len":     _env_int("WT_N2",   12),
-            "sl_atr_mult":    _env_float("WT_SL", 1.5),
-            "rr_ratio":       _env_float("WT_RR", 1.0),
-        },
-        "ut_params": {
-            "ut_mult":     _env_float("UT_MULT", 0.3),
-            "ut_atr_len":  _env_int("UT_LEN",    14),
-            "sl_atr_mult": _env_float("UT_SL",   2.5),
-            "rr_ratio":    _env_float("UT_RR",   1.2),
-        },
-        "mom_params": {
-            "sl_atr_mult": _env_float("MOM_SL", 1.5),
-            "rr_ratio":    _env_float("MOM_RR", 1.0),
+            "profitable_bot":   _env_bool("STRATEGY_PROFITABLE_BOT",   True),
         },
         # Swing v5 Wide config — tune via env vars if needed
         "sr_params": {
@@ -130,28 +108,6 @@ def build_config() -> dict:
             "rsi_hi":        _env_float("SR_RSI_HI", 65.0),
             "vol_mult":      _env_float("SR_VOL",      1.0),
             "max_hold_days": _env_float("SR_HOLD",     3.0),
-        },
-        "cpk_params": {
-            "sl_atr":        _env_float("CPK_SL",      2.5),
-            "tp_atr":        _env_float("CPK_TP",      1.5),
-            "rsi_lo":        _env_float("CPK_RSI_LO", 44.0),
-            "rsi_hi":        _env_float("CPK_RSI_HI", 60.0),
-            "vol_mult":      _env_float("CPK_VOL",      1.5),
-            "max_hold_days": _env_float("CPK_HOLD",     4.0),
-        },
-        "hyb_params": {
-            "sl_atr":   _env_float("HYB_SL",      2.5),
-            "tp_atr":   _env_float("HYB_TP",      2.0),
-            "rsi_lo":   _env_float("HYB_RSI_LO", 38.0),
-            "rsi_hi":   _env_float("HYB_RSI_HI", 64.0),
-            "vol_mult": _env_float("HYB_VOL",      1.2),
-        },
-        "intern_params": {
-            "hma_len":  _env_int("INTERN_HMA_LEN",   15),
-            "sl_atr":   _env_float("INTERN_SL",      2.5),
-            "tp_atr":   _env_float("INTERN_TP",      2.0),
-            "mtf_lo":   os.environ.get("INTERN_MTF_LO",  "15m"),
-            "mtf_mid":  os.environ.get("INTERN_MTF_MID", "30m"),
         },
         "profitable_params": {
             "sl_atr":   _env_float("PB_SL",     2.0),
@@ -165,9 +121,6 @@ def build_config() -> dict:
         },
         "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
-        "mtf_gate":            _env_bool("MTF_GATE", False),
-        "use_ai_chief":        _env_bool("USE_AI_CHIEF", False),
-        "chief_min_confidence": _env_float("CHIEF_MIN_CONFIDENCE", 65.0),
     }
 
 
@@ -177,38 +130,18 @@ def build_config() -> dict:
 
 def _make_strategies(symbols: list, flags: dict, cfg: dict,
                      connector=None) -> list:
-    from trading.strategies.wt_adx_strategy import WTADXStrategy
-    from trading.strategies.ut_bot_strategy import UTBotStrategy
-    from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-    from trading.strategies.swing_strategy import (
-        SwingReversalStrategy, CPKRegimeStrategy, HybridSwingStrategy,
-    )
-    from trading.strategies.intern_strategy import InternStrategy
-    from trading.strategies.profitable_strategy import ProfitableBot
+    from trading.strategies.swing_strategy import SwingReversalStrategy
     from trading.strategies.scalp_strategy import ScalpTrendBot
+    from trading.strategies.profitable_strategy import ProfitableBot
 
     strategies = []
     for sym in symbols:
-        if flags.get("wt_adx"):
-            strategies.append(WTADXStrategy(sym, params=cfg["wt_params"]))
-        if flags.get("ut_bot"):
-            strategies.append(UTBotStrategy(sym, params=cfg["ut_params"]))
-        if flags.get("momentum_score"):
-            strategies.append(MomentumScoreStrategy(sym, params=cfg["mom_params"]))
         if flags.get("swing_reversal"):
             strategies.append(SwingReversalStrategy(sym, params=cfg["sr_params"]))
-        if flags.get("cpk_regime"):
-            strategies.append(CPKRegimeStrategy(sym, params=cfg["cpk_params"]))
-        if flags.get("hybrid_swing"):
-            strategies.append(HybridSwingStrategy(sym, params=cfg["hyb_params"]))
-        if flags.get("intern"):
-            strategies.append(
-                InternStrategy(sym, params=cfg["intern_params"], connector=connector)
-            )
-        if flags.get("profitable_bot"):
-            strategies.append(ProfitableBot(sym, params=cfg["profitable_params"]))
         if flags.get("scalp_trend"):
             strategies.append(ScalpTrendBot(sym, params=cfg["scalp_params"]))
+        if flags.get("profitable_bot"):
+            strategies.append(ProfitableBot(sym, params=cfg["profitable_params"]))
     return strategies
 
 
@@ -299,7 +232,7 @@ async def main():
         max_positions=cfg["max_positions"],
         candle_tf=cfg["candle_tf"],
         candle_limit=cfg["candle_limit"],
-        mtf_gate=cfg["mtf_gate"],
+        mtf_gate=False,
     )
 
     stop_event = asyncio.Event()
