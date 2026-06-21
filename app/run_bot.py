@@ -1,11 +1,12 @@
 """
 OKX Perpetual Futures trading bot runner.
 
-Active strategies (4):
-  MeanReversion  — 1H entry / 4H MTF  — R:R 1:1.25
-  TrendCont      — 15m entry / 1H+4H MTF — R:R 1:2.0
-  SmartMoney     — 15m entry / 1H+4H MTF — R:R 1:1.25
-  SJUTBotV3      — 30m entry            — R:R 1:1.8
+Active strategies (5):
+  SJUTBotV4      — 30m entry / 1H+4H MTF — 8/9 confirmation, 70% TP1, regime TP2
+  MeanReversion  — 1H entry  / 4H MTF    — fade extremes, TP1+TP2 partial
+  TrendCont      — 15m entry / 1H+4H MTF — trend dip buy, TP1+TP2 partial
+  SmartMoney     — 15m entry / 1H+4H MTF — MTF momentum + OBV flow
+  SJUTBotV3      — 30m entry             — UTBot + multi-filter confirmation
 
 Symbols     : BTC/USDT:USDT  (configurable via SYMBOLS)
 Exchange    : OKX, swap market, isolated margin, hedge mode
@@ -136,6 +137,24 @@ def build_config() -> dict:
         "sjv3_allow_long":   _env_bool("SJV3_ALLOW_LONG",   True),
         "sjv3_allow_short":  _env_bool("SJV3_ALLOW_SHORT",  True),
 
+        # ── SJUTBot v4 (30m primary + 1h + 4h MTF) ──────────────────────────
+        # High-WR (68%) selective system: 8/9 confirmations required.
+        # TP1 = 1.2R (close 70%), SL→BE, TP2 = regime-aware (1.5R-3.0R).
+        # Backtest Jan-May 2026: 22 trades, WR 68.2%, Net +$23.37, MaxDD -2.28%.
+        "strategy_sjutbot_v4":  _env_bool("STRATEGY_SJUTBOT_V4", True),
+        "sjv4_ut_mult":         _env_float("SJV4_UT_MULT",      0.30),
+        "sjv4_ut_len":          _env_int("SJV4_UT_LEN",         14),
+        "sjv4_adx_min":         _env_int("SJV4_ADX_MIN",        35),
+        "sjv4_min_score":       _env_int("SJV4_MIN_SCORE",       8),
+        "sjv4_sl_mult":         _env_float("SJV4_SL_MULT",      1.0),
+        "sjv4_tp1_r":           _env_float("SJV4_TP1_R",        1.2),
+        "sjv4_tp1_fraction":    _env_float("SJV4_TP1_FRACTION", 0.70),
+        "sjv4_tp2_strong":      _env_float("SJV4_TP2_STRONG",   3.0),
+        "sjv4_tp2_weak":        _env_float("SJV4_TP2_WEAK",     2.0),
+        "sjv4_tp2_break":       _env_float("SJV4_TP2_BREAK",    2.5),
+        "sjv4_tp2_range":       _env_float("SJV4_TP2_RANGE",    1.5),
+        "sjv4_tp2_chop":        _env_float("SJV4_TP2_CHOP",     1.5),
+
         # ── Risk / sizing ─────────────────────────────────────────────────────
         # FIXED_TRADE_USDT: margin reserved per trade (before leverage).
         #   BTC/USDT:USDT @ $100k, 20x: min 1 contract = 0.01 BTC = $1000 notional = $50 margin.
@@ -177,7 +196,8 @@ def build_config() -> dict:
 # ── Strategy builder ─────────────────────────────────────────────────────────
 
 def build_strategies(symbols: list[str], cfg: dict) -> list:
-    from trading.strategies.sjutbot_v3_strategy          import SJUTBotV3Strategy
+    from trading.strategies.sjutbot_v3_strategy import SJUTBotV3Strategy
+    from trading.strategies.sjutbot_v4_strategy import SJUTBotV4Strategy
 
     legacy = cfg["strategy_variant"] == "legacy"
     if legacy:
@@ -192,6 +212,26 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
 
     strategies = []
     for sym in symbols:
+
+        # ── SJUTBot v4 (30m + 1h + 4h MTF) ──────────────────────────────────
+        if cfg["strategy_sjutbot_v4"]:
+            strategies.append(SJUTBotV4Strategy(sym, params={
+                "name":         "SJUTBotV4",
+                "tf":           "30m",
+                "limit":        500,
+                "ut_mult":      cfg["sjv4_ut_mult"],
+                "ut_len":       cfg["sjv4_ut_len"],
+                "adx_min":      cfg["sjv4_adx_min"],
+                "min_score":    cfg["sjv4_min_score"],
+                "sl_mult":      cfg["sjv4_sl_mult"],
+                "tp1_r":        cfg["sjv4_tp1_r"],
+                "tp1_fraction": cfg["sjv4_tp1_fraction"],
+                "tp2_strong":   cfg["sjv4_tp2_strong"],
+                "tp2_weak":     cfg["sjv4_tp2_weak"],
+                "tp2_break":    cfg["sjv4_tp2_break"],
+                "tp2_range":    cfg["sjv4_tp2_range"],
+                "tp2_chop":     cfg["sjv4_tp2_chop"],
+            }))
 
         # ── SJUTBot v3 (30m) ──────────────────────────────────────────────────
         if cfg["strategy_sjutbot_v3"]:
@@ -260,7 +300,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
 
     if not strategies:
         raise RuntimeError(
-            "No strategies enabled — set STRATEGY_MEAN_REVERSION, "
+            "No strategies enabled — set STRATEGY_SJUTBOT_V4, STRATEGY_MEAN_REVERSION, "
             "STRATEGY_TREND_CONT, STRATEGY_SMART_MONEY, or STRATEGY_SJUTBOT_V3 to true"
         )
 
