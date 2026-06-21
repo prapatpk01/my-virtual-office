@@ -428,7 +428,9 @@ class TradingBot:
                     await self.connector.create_order(
                         sym, close_side, close_amt, pos_side=pos_side, reduce_only=True)
                 except Exception as e:
-                    logger.warning("[%s] TP1 partial close failed: %s", strategy_name, e)
+                    logger.warning("[%s] TP1 partial close failed — will retry next tick: %s",
+                                   strategy_name, e)
+                    return  # do NOT mutate state; next tick will retry
                 pnl = pnl_mult * (price - pos.entry_price) * close_amt
                 self.risk.register_pnl(pnl)
                 pos.amount     = round(pos.amount - close_amt, 6)
@@ -455,7 +457,16 @@ class TradingBot:
                 await self.connector.create_order(
                     sym, close_side, amount, pos_side=pos_side, reduce_only=True)
             except Exception as e:
-                logger.warning("[%s] Close failed (OKX may have closed already): %s", strategy_name, e)
+                if trigger == "stop_loss":
+                    # OKX algo-SL fires before us at the same price level — safe to clean up state.
+                    logger.info("[%s] Close failed for stop_loss (OKX algo likely closed already): %s",
+                                strategy_name, e)
+                else:
+                    # breakeven / take_profit2: OKX hasn't closed the position (its TP is at 3.0R).
+                    # Keep position in state so next tick retries.
+                    logger.warning("[%s] Close failed for %s — will retry next tick: %s",
+                                   strategy_name, trigger, e)
+                    return
 
             self.risk.register_pnl(pnl)
             self._sig.record_outcome(
@@ -559,7 +570,7 @@ class TradingBot:
                     logger.info("[MONITOR] %s %s BULL (pre-TP1) → TP1 raised %.4f → %.4f (max 1.5R)",
                                 strategy, sym, old_tp1 or 0, new_tp1)
                     if self.telegram:
-                        self.telegram.send_message(
+                        self.telegram.notify(
                             f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(pre-TP1)_\n"
                             f"Score {result.score:.0f}%  TP1 raised: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _(max 1.5R)_\n"
                             f"Indicators: {_fmt_details(result.details)}"
@@ -574,7 +585,7 @@ class TradingBot:
                     logger.info("[MONITOR] %s %s BULL (runner) → TP2 extended %.4f → %.4f",
                                 strategy, sym, old_tp or 0, new_tp)
                     if self.telegram:
-                        self.telegram.send_message(
+                        self.telegram.notify(
                             f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(runner)_\n"
                             f"Score {result.score:.0f}%  TP2 extended: `{old_tp or 0:.2f}` → `{new_tp:.2f}`\n"
                             f"Indicators: {_fmt_details(result.details)}"
@@ -630,7 +641,7 @@ class TradingBot:
                     strategy=strategy, reason="health_weak", paper=self.paper,
                 ))
                 if self.telegram:
-                    self.telegram.send_message(
+                    self.telegram.notify(
                         f"⚠️ *Health WEAK* `{sym}` {pos.side.upper()} → closed early\n"
                         f"Score {result.score:.0f}%  PnL≈`{pnl:+.2f}$`\n"
                         f"Indicators: {_fmt_details(result.details)}"

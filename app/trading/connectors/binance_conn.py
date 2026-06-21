@@ -96,20 +96,20 @@ class BinanceConnector(BaseConnector):
         if symbol in self._leverage_set:
             return
         if self._futures:
-            # OKX hedge mode: must set leverage for BOTH sides; fail hard if both fail
-            any_ok = False
+            # OKX hedge mode: must set leverage for BOTH sides; fail hard if either fails.
+            failed = []
             for ps in ("long", "short"):
                 try:
                     await self._exchange.set_leverage(
                         self._leverage, symbol,
                         params={"mgnMode": "isolated", "posSide": ps},
                     )
-                    any_ok = True
                 except Exception as e:
                     logger.error("set_leverage FAILED %s posSide=%s: %s", symbol, ps, e)
-            if not any_ok:
+                    failed.append(ps)
+            if failed:
                 raise RuntimeError(
-                    f"Could not set leverage for {symbol} — cannot place orders safely"
+                    f"Could not set leverage for {symbol} side(s) {failed} — cannot place orders safely"
                 )
             logger.info("OKX futures leverage: %s × %dx (long+short)", symbol, self._leverage)
         elif self._margin_mode:
@@ -123,13 +123,23 @@ class BinanceConnector(BaseConnector):
                 logger.warning("set_leverage failed (%s): %s — continuing", symbol, e)
         self._leverage_set.add(symbol)
 
+    # OKX ctVal per contract when markets haven't loaded yet (fallback only).
+    _OKX_CONTRACT_SIZE: dict[str, float] = {
+        "BTC/USDT:USDT": 0.01,
+        "XAU/USDT:USDT": 1.0,
+        "ETH/USDT:USDT": 0.1,
+    }
+
     async def contract_size(self, symbol: str) -> float:
-        """Base-asset units per contract (OKX futures: ctVal, default 0.01 for BTC)."""
+        """Base-asset units per contract (OKX futures: ctVal)."""
         if self._exchange_id == "okx" and self._futures:
             try:
-                return float(self._exchange.market(symbol).get("contractSize", 0.01))
+                sz = self._exchange.market(symbol).get("contractSize")
+                if sz is not None:
+                    return float(sz)
             except Exception:
-                return 0.01
+                pass
+            return self._OKX_CONTRACT_SIZE.get(symbol, 0.01)
         return 1.0
 
     # ──────────────────────────────────────────────────────────────────
