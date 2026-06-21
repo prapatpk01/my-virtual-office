@@ -256,8 +256,7 @@ def _mtf_bias(s5: pd.Series, s1h: pd.Series, s4h: pd.Series) -> float:
 
 def _classify(score: float) -> str:
     if score >= 85: return "BULL"
-    if score >= 50: return "NEUTRAL"
-    if score >= 40: return "CAUTION"
+    if score >= 45: return "NEUTRAL"
     return "WEAK"
 
 

@@ -568,6 +568,16 @@ class TradingBot:
             pos.health_label  = result.label
             pos.health_checks += 1
 
+            # 2-bar confirmation for WEAK: must be WEAK 2 consecutive cycles before closing
+            if result.label == "WEAK":
+                pos.health_weak_count += 1
+                if pos.health_weak_count < 2:
+                    logger.info("[MONITOR] %s %s WEAK (score=%.0f) — %d/2 confirmation, holding",
+                                strategy, sym, result.score, pos.health_weak_count)
+                    continue
+            else:
+                pos.health_weak_count = 0  # reset on any non-WEAK cycle
+
             await self._health_action(pos, pos_info, strategy, result, monitor)
 
     async def _health_action(self, pos, pos_info: dict, strategy: str,

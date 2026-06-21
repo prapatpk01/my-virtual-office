@@ -29,6 +29,7 @@ class Position:
     one_r: float = 0.0           # original 1R distance (SL size at entry)
     health_label: str = "NEUTRAL"
     health_checks: int = 0       # number of health checks done
+    health_weak_count: int = 0   # consecutive WEAK cycles (2 required before close)
 
     @property
     def pnl_pct(self) -> float:
