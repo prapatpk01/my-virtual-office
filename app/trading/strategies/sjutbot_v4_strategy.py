@@ -262,9 +262,8 @@ class SJUTBotV4Strategy(BaseStrategy):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[SJUTBotV4] compute error: {e}")
 
-        # Use last CLOSED bar ([-2] in the rolling slice, which is [-1] in computed
-        # because the rolling slice ends at current bar which is still forming)
-        last = computed.iloc[-1]
+        # candles[-1] is the still-forming bar; use [-2] = last CLOSED bar
+        last = computed.iloc[-2]
 
         atr = float(last["atr"])
         if np.isnan(atr) or atr <= 0:

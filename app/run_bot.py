@@ -1,16 +1,15 @@
 """
 OKX Perpetual Futures trading bot runner.
 
-Active strategies (5):
-  SJUTBotV4      — 30m entry / 1H+4H MTF — 8/9 confirmation, 70% TP1, regime TP2
-  MeanReversion  — 1H entry  / 4H MTF    — fade extremes, TP1+TP2 partial
-  TrendCont      — 15m entry / 1H+4H MTF — trend dip buy, TP1+TP2 partial
-  SmartMoney     — 15m entry / 1H+4H MTF — MTF momentum + OBV flow
-  SJUTBotV3      — 30m entry             — UTBot + multi-filter confirmation
+Active strategies (2):
+  SJUTBotV4        — 30m entry / 1H+4H MTF — 8/9 confirmation, 70% TP1, regime TP2
+                     Backtest Jan-May 2026: 22 trades, WR 68.2%, +$23.37, MaxDD -2.28%
+  TrendContImproved — 15m entry / 1H+4H MTF — trend pullback + ADX(15m)>30 gate
+                     Backtest Jan-May 2026: 142 trades, WR 77.5%, +$212.94, MaxDD -6.07%
 
 Symbols     : BTC/USDT:USDT  (configurable via SYMBOLS)
 Exchange    : OKX, swap market, isolated margin, hedge mode
-Max positions: 4 (1 per strategy at a time)
+Max positions: 2 (1 per strategy per symbol)
 
 Config via Railway environment variables.
 """
@@ -73,10 +72,10 @@ def _env_int(key: str, default: int) -> int:
 def build_config() -> dict:
     return {
         # ── Exchange credentials ───────────────────────────────────────────────
-        "exchange":       os.environ.get("EXCHANGE",           "okx"),
-        "api_key":        os.environ.get("EXCHANGE_API_KEY",   ""),
-        "api_secret":     os.environ.get("EXCHANGE_API_SECRET",""),
-        "api_passphrase": os.environ.get("EXCHANGE_PASSPHRASE",""),  # OKX required
+        "exchange":       os.environ.get("EXCHANGE",            "okx"),
+        "api_key":        os.environ.get("EXCHANGE_API_KEY",    ""),
+        "api_secret":     os.environ.get("EXCHANGE_API_SECRET", ""),
+        "api_passphrase": os.environ.get("EXCHANGE_PASSPHRASE", ""),  # OKX required
 
         # ── Market mode ───────────────────────────────────────────────────────
         "paper":       _env_bool("PAPER_TRADING", False),
@@ -86,104 +85,64 @@ def build_config() -> dict:
         # ── Symbols ───────────────────────────────────────────────────────────
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT"),
 
-        # ── Strategy variant: "v2" = new partial-close (TP1/TP2 + ADX/ST/OBV),
-        #    "legacy" = original single-TP system (backtest +$149, most robust).
-        #    Flip STRATEGY_VARIANT=legacy to revert without redeploying code.
-        "strategy_variant": os.environ.get("STRATEGY_VARIANT", "v2").strip().lower(),
-
-        # ── Active strategies ─────────────────────────────────────────────────
-        "strategy_mean_reversion": _env_bool("STRATEGY_MEAN_REVERSION", True),
-        "strategy_trend_cont":     _env_bool("STRATEGY_TREND_CONT",     True),
-        "strategy_smart_money":    _env_bool("STRATEGY_SMART_MONEY",    True),
-        "strategy_sjutbot_v3":     _env_bool("STRATEGY_SJUTBOT_V3",     True),
-
-        # ── Global Risk multiples (shared by MR/TC/SM) ───────────────────────
-        # Grid-tuned: Initial SL 1.2×ATR, TP1 1.5×ATR (close 50% → SL→breakeven), TP2 3.0×ATR.
-        "g_sl_atr":   _env_float("GLOBAL_SL_ATR",   1.2),
-        "g_tp1_atr":  _env_float("GLOBAL_TP1_ATR",  1.5),
-        "g_tp2_atr":  _env_float("GLOBAL_TP2_ATR",  3.0),
-        "g_partial":  _env_float("GLOBAL_PARTIAL_PCT", 0.5),
-
-        # ── Mean Reversion (1H entry / 4H MTF) — fade extremes, avoid strong trends
-        "mr_rsi_oversold":    _env_float("MR_RSI_OVERSOLD",  45.0),
-        "mr_rsi_overbought":  _env_float("MR_RSI_OVERBOUGHT",55.0),
-        "mr_min_conditions":  _env_int("MR_MIN_CONDITIONS",     3),   # ↑ from 2
-        "mr_adx_cap":         _env_float("MR_ADX_CAP",       50.0),   # no fade if 4H ADX > 50
-
-        # ── Trend Continuation (15m entry / 1H+4H MTF) — ride trend, buy dips ─
-        "tc_rsi_min":         _env_float("TC_RSI_MIN",       35.0),
-        "tc_rsi_max":         _env_float("TC_RSI_MAX",       75.0),
-        "tc_pullback_atr":    _env_float("TC_PULLBACK_ATR",   0.5),   # EMA20 ± 0.5×ATR(1H)
-        "tc_vol_mult":        _env_float("TC_VOL_MULT",       1.0),
-        "tc_bias_gate":       _env_float("TC_BIAS_GATE",     55.0),   # ↓ from 70
-        "tc_st_period":       _env_int("TC_ST_PERIOD",         10),   # Supertrend(4H)
-        "tc_st_mult":         _env_float("TC_ST_MULT",        3.0),
-
-        # ── Smart Money (15m entry / 1H+4H MTF) — MTF momentum + OBV flow ─────
-        "sm_bias_threshold":  _env_float("SM_BIAS_THRESHOLD",40.0),   # ↑ from 15
-        "sm_obv_ema":         _env_int("SM_OBV_EMA",           20),
-
-        # ── SJUTBot v3 (30m) ─────────────────────────────────────────────────
-        # filter_threshold=4: ALL 4 components must agree → very selective longs
-        # Higher ADX, tighter sync_window → avoids choppy false signals
-        "sjv3_sl_mult":      _env_float("SJV3_SL_MULT",     1.5),
-        "sjv3_rr":           _env_float("SJV3_RR",          1.8),
-        "sjv3_filter_thr":   _env_int("SJV3_FILTER_THR",    4),    # need 4/4 for long
-        "sjv3_adx_min":      _env_int("SJV3_ADX_MIN",       25),   # strong trend only
-        "sjv3_sync_window":  _env_int("SJV3_SYNC_WINDOW",   3),    # tighter EMA sync
-        "sjv3_hma_len":      _env_int("SJV3_HMA_LEN",       14),   # faster HMA for 30m
-        "sjv3_ut_mult":      _env_float("SJV3_UT_MULT",     0.25), # tighter TSL
-        "sjv3_ut_len":       _env_int("SJV3_UT_LEN",        10),   # faster ATR
-        "sjv3_allow_long":   _env_bool("SJV3_ALLOW_LONG",   True),
-        "sjv3_allow_short":  _env_bool("SJV3_ALLOW_SHORT",  True),
-
-        # ── SJUTBot v4 (30m primary + 1h + 4h MTF) ──────────────────────────
-        # High-WR (68%) selective system: 8/9 confirmations required.
-        # TP1 = 1.2R (close 70%), SL→BE, TP2 = regime-aware (1.5R-3.0R).
-        # Backtest Jan-May 2026: 22 trades, WR 68.2%, Net +$23.37, MaxDD -2.28%.
+        # ── SJUTBot v4 (30m primary + 1h + 4h MTF) ───────────────────────────
+        # 8/9 confirmation gate, TP1=1.2R (70%), SL→breakeven, TP2=regime-aware (1.5-3.0R).
+        # Backtest Jan-May 2026: 22 trades, WR 68.2%, Net +$23.37, MaxDD -2.28%, 0 liquidations.
         "strategy_sjutbot_v4":  _env_bool("STRATEGY_SJUTBOT_V4", True),
-        "sjv4_ut_mult":         _env_float("SJV4_UT_MULT",      0.30),
-        "sjv4_ut_len":          _env_int("SJV4_UT_LEN",         14),
-        "sjv4_adx_min":         _env_int("SJV4_ADX_MIN",        35),
-        "sjv4_min_score":       _env_int("SJV4_MIN_SCORE",       8),
-        "sjv4_sl_mult":         _env_float("SJV4_SL_MULT",      1.0),
-        "sjv4_tp1_r":           _env_float("SJV4_TP1_R",        1.2),
-        "sjv4_tp1_fraction":    _env_float("SJV4_TP1_FRACTION", 0.70),
-        "sjv4_tp2_strong":      _env_float("SJV4_TP2_STRONG",   3.0),
-        "sjv4_tp2_weak":        _env_float("SJV4_TP2_WEAK",     2.0),
-        "sjv4_tp2_break":       _env_float("SJV4_TP2_BREAK",    2.5),
-        "sjv4_tp2_range":       _env_float("SJV4_TP2_RANGE",    1.5),
-        "sjv4_tp2_chop":        _env_float("SJV4_TP2_CHOP",     1.5),
+        "sjv4_ut_mult":         _env_float("SJV4_UT_MULT",       0.30),  # UTBot TSL sensitivity
+        "sjv4_ut_len":          _env_int("SJV4_UT_LEN",          14),    # UTBot ATR period
+        "sjv4_adx_min":         _env_int("SJV4_ADX_MIN",         35),    # ADX strength gate
+        "sjv4_min_score":       _env_int("SJV4_MIN_SCORE",        8),    # out of 9 confirmations
+        "sjv4_sl_mult":         _env_float("SJV4_SL_MULT",       1.0),   # SL = 1.0 × ATR
+        "sjv4_tp1_r":           _env_float("SJV4_TP1_R",         1.2),   # TP1 = 1.2R (close 70%)
+        "sjv4_tp1_fraction":    _env_float("SJV4_TP1_FRACTION",  0.70),  # close 70% at TP1
+        "sjv4_tp2_strong":      _env_float("SJV4_TP2_STRONG",    3.0),   # TP2 in strong trend
+        "sjv4_tp2_weak":        _env_float("SJV4_TP2_WEAK",      2.0),   # TP2 in weak trend
+        "sjv4_tp2_break":       _env_float("SJV4_TP2_BREAK",     2.5),   # TP2 in breakout
+        "sjv4_tp2_range":       _env_float("SJV4_TP2_RANGE",     1.5),   # TP2 in range
+        "sjv4_tp2_chop":        _env_float("SJV4_TP2_CHOP",      1.5),   # TP2 in chop
+
+        # ── TrendCont Improved (15m primary + 1h + 4h MTF) ───────────────────
+        # Trend-pullback to 1H EMA20 + 4H macro trend + ADX(15m)>30 filter.
+        # TP1=0.5R (close 40%), SL→breakeven, TP2=2.5R (runner 60%).
+        # Backtest Jan-May 2026: 142 trades, WR 77.5%, Net +$212.94, MaxDD -6.07%.
+        "strategy_tci":         _env_bool("STRATEGY_TCI", True),
+        "tci_bias_gate":        _env_float("TCI_BIAS_GATE",      70.0),  # MTF bias gate (strict)
+        "tci_adx_min":          _env_int("TCI_ADX_MIN",          30),    # 15m ADX filter (key)
+        "tci_sl_mult":          _env_float("TCI_SL_MULT",        1.2),   # SL = 1.2 × ATR
+        "tci_sl_min_pct":       _env_float("TCI_SL_MIN_PCT",     0.012), # floor: 1.2% SL
+        "tci_sl_max_pct":       _env_float("TCI_SL_MAX_PCT",     0.035), # cap:   3.5% SL
+        "tci_tp1_r":            _env_float("TCI_TP1_R",          0.5),   # TP1 = 0.5R
+        "tci_tp1_fraction":     _env_float("TCI_TP1_FRACTION",   0.40),  # close 40% at TP1
+        "tci_tp2_r":            _env_float("TCI_TP2_R",          2.5),   # TP2 = 2.5R
+        "tci_min_entry_cond":   _env_int("TCI_MIN_ENTRY_COND",   4),     # all 4 micro conditions
+        "tci_vol_mult":         _env_float("TCI_VOL_MULT",       1.0),   # volume ≥ MA20 × mult
 
         # ── Risk / sizing ─────────────────────────────────────────────────────
-        # FIXED_TRADE_USDT: margin reserved per trade (before leverage).
-        #   BTC/USDT:USDT @ $100k, 20x: min 1 contract = 0.01 BTC = $1000 notional = $50 margin.
-        #   XAU/USDT:USDT @ $3300, 20x: depends on OKX contract size (check live).
+        # FIXED_TRADE_USDT: margin per trade (before leverage).
+        #   BTCUSDT @ $80k, 20x: min 1 contract = 0.01 BTC = $800 notional = $40 margin.
+        #   $50 margin gives a comfortable buffer above the minimum.
         "fixed_trade_usdt": _env_float("FIXED_TRADE_USDT", 50.0),
 
-        # SL/TP percentages — applied when strategy metadata doesn't provide levels.
-        # MCDX optimised: SL=1.5% TP=2.5% → +$43.60 / 5mo on $50 margin 20x.
-        # SJUTBot / UTBot use ATR-based levels from their own metadata (these are fallback only).
+        # Fallback SL/TP percentages (used only if strategy metadata is missing).
         "stop_loss_pct":   _env_float("STOP_LOSS_PCT",   0.015),  # 1.5%
         "take_profit_pct": _env_float("TAKE_PROFIT_PCT", 0.025),  # 2.5%
 
-        # Max open positions across all strategies + symbols.
-        # 3 strategies × 2 symbols × 2 sides = 12 theoretical max.
-        # Set lower to limit capital exposure (default: 6 = 3 strats × 2 symbols, 1 side each).
-        "max_positions":  _env_int("MAX_POSITIONS",  4),
-        "max_drawdown":   _env_float("MAX_DRAWDOWN_PCT", 0.30),  # 30% drawdown halt
-        # Daily circuit breaker: pause NEW entries once realized PnL ≤ -X% for the UTC day.
+        # Max simultaneous open positions (2 strategies × 2 sides = 4 theoretical max).
+        # Set to 2 for conservative exposure — one trade per strategy at a time.
+        "max_positions":  _env_int("MAX_POSITIONS", 2),
+        "max_drawdown":   _env_float("MAX_DRAWDOWN_PCT", 0.20),   # 20% drawdown halt
+        # Daily circuit breaker: block new entries if day PnL ≤ -X% of account.
         "daily_loss_limit": _env_float("DAILY_LOSS_LIMIT_PCT", 0.05),  # -5%
-        # Per-trade risk budget for dynamic sizing (strategies pass risk_pct in metadata).
+        # Per-trade risk budget. Overridden to fixed sizing when DYNAMIC_SIZING=false.
         "risk_per_trade":   _env_float("RISK_PER_TRADE_PCT", 0.02),    # 2%
-        # DYNAMIC_SIZING=false → use fixed FIXED_TRADE_USDT margin per trade even on v2
-        # (required for small accounts below the 2%-risk → 1-contract minimum).
-        "dynamic_sizing":   _env_bool("DYNAMIC_SIZING", True),
+        # DYNAMIC_SIZING=false → use fixed FIXED_TRADE_USDT regardless of account size.
+        # Required for small accounts where 2%-risk sizing < 1-contract minimum.
+        "dynamic_sizing":   _env_bool("DYNAMIC_SIZING", False),
 
         # ── Timing ────────────────────────────────────────────────────────────
-        # Tick interval: how often the bot loops (fetches data + evaluates signals).
-        # MCDX/UTBot work on 15m candles → 60s tick is fine.
-        # SJUTBot works on 1H → signal fires once per hour at most.
+        # 60s tick: fast enough for 15m candles (TrendContImproved),
+        # and fine for 30m (SJUTBotV4 — checks closed bar once per tick, no rush).
         "interval": _env_int("INTERVAL_SECONDS", 60),
 
         # ── Telegram ──────────────────────────────────────────────────────────
@@ -196,19 +155,8 @@ def build_config() -> dict:
 # ── Strategy builder ─────────────────────────────────────────────────────────
 
 def build_strategies(symbols: list[str], cfg: dict) -> list:
-    from trading.strategies.sjutbot_v3_strategy import SJUTBotV3Strategy
-    from trading.strategies.sjutbot_v4_strategy import SJUTBotV4Strategy
-
-    legacy = cfg["strategy_variant"] == "legacy"
-    if legacy:
-        logger.info("STRATEGY_VARIANT=legacy → original single-TP strategies (backtest +$149)")
-        from trading.strategies.mean_reversion_legacy     import MeanReversionStrategy
-        from trading.strategies.trend_continuation_legacy import TrendContinuationStrategy
-        from trading.strategies.smart_money_legacy        import SmartMoneyStrategy
-    else:
-        from trading.strategies.mean_reversion_strategy      import MeanReversionStrategy
-        from trading.strategies.trend_continuation_strategy  import TrendContinuationStrategy
-        from trading.strategies.smart_money_strategy         import SmartMoneyStrategy
+    from trading.strategies.sjutbot_v4_strategy           import SJUTBotV4Strategy
+    from trading.strategies.trend_cont_improved_strategy  import TrendContImprovedStrategy
 
     strategies = []
     for sym in symbols:
@@ -233,75 +181,27 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
                 "tp2_chop":     cfg["sjv4_tp2_chop"],
             }))
 
-        # ── SJUTBot v3 (30m) ──────────────────────────────────────────────────
-        if cfg["strategy_sjutbot_v3"]:
-            strategies.append(SJUTBotV3Strategy(sym, params={
-                "tf":               "30m",
-                "limit":            500,
-                "ut_mult":          cfg["sjv3_ut_mult"],
-                "ut_len":           cfg["sjv3_ut_len"],
-                "filter_threshold": cfg["sjv3_filter_thr"],
-                "adx_min":          cfg["sjv3_adx_min"],
-                "hma_len":          cfg["sjv3_hma_len"],
-                "sync_window":      cfg["sjv3_sync_window"],
-                "sl_mult":          cfg["sjv3_sl_mult"],
-                "rr":               cfg["sjv3_rr"],
-                "allow_long":       cfg["sjv3_allow_long"],
-                "allow_short":      cfg["sjv3_allow_short"],
-            }))
-
-        _grisk = {
-            "sl_atr":      cfg["g_sl_atr"],
-            "tp1_atr":     cfg["g_tp1_atr"],
-            "tp2_atr":     cfg["g_tp2_atr"],
-            "partial_pct": cfg["g_partial"],
-            "risk_pct":    cfg["risk_per_trade"],
-        }
-
-        # ── Mean Reversion (1H entry / 4H MTF) ────────────────────────────────
-        if cfg["strategy_mean_reversion"]:
-            strategies.append(MeanReversionStrategy(sym, params={
-                "name":           "MeanReversion",
-                "tf":             "1h",
-                "limit":          300,
-                "rsi_oversold":   cfg["mr_rsi_oversold"],
-                "rsi_overbought": cfg["mr_rsi_overbought"],
-                "min_conditions": cfg["mr_min_conditions"],
-                "adx_cap":        cfg["mr_adx_cap"],
-                **_grisk,
-            }))
-
-        # ── Trend Continuation (15m entry / 1H+4H MTF) ────────────────────────
-        if cfg["strategy_trend_cont"]:
-            strategies.append(TrendContinuationStrategy(sym, params={
-                "name":         "TrendCont",
-                "tf":           "15m",
-                "limit":        300,
-                "rsi_min":      cfg["tc_rsi_min"],
-                "rsi_max":      cfg["tc_rsi_max"],
-                "pullback_atr": cfg["tc_pullback_atr"],
-                "vol_mult":     cfg["tc_vol_mult"],
-                "bias_gate":    cfg["tc_bias_gate"],
-                "st_period":    cfg["tc_st_period"],
-                "st_mult":      cfg["tc_st_mult"],
-                **_grisk,
-            }))
-
-        # ── Smart Money (15m entry / 1H+4H MTF) ───────────────────────────────
-        if cfg["strategy_smart_money"]:
-            strategies.append(SmartMoneyStrategy(sym, params={
-                "name":           "SmartMoney",
+        # ── TrendCont Improved (15m + 1h + 4h MTF) ───────────────────────────
+        if cfg["strategy_tci"]:
+            strategies.append(TrendContImprovedStrategy(sym, params={
+                "name":           "TrendContImproved",
                 "tf":             "15m",
-                "limit":          300,
-                "bias_threshold": cfg["sm_bias_threshold"],
-                "obv_ema":        cfg["sm_obv_ema"],
-                **_grisk,
+                "limit":          500,
+                "bias_gate":      cfg["tci_bias_gate"],
+                "adx_min":        cfg["tci_adx_min"],
+                "sl_mult":        cfg["tci_sl_mult"],
+                "sl_min_pct":     cfg["tci_sl_min_pct"],
+                "sl_max_pct":     cfg["tci_sl_max_pct"],
+                "tp1_r":          cfg["tci_tp1_r"],
+                "tp1_fraction":   cfg["tci_tp1_fraction"],
+                "tp2_r":          cfg["tci_tp2_r"],
+                "min_entry_cond": cfg["tci_min_entry_cond"],
+                "vol_mult":       cfg["tci_vol_mult"],
             }))
 
     if not strategies:
         raise RuntimeError(
-            "No strategies enabled — set STRATEGY_SJUTBOT_V4, STRATEGY_MEAN_REVERSION, "
-            "STRATEGY_TREND_CONT, STRATEGY_SMART_MONEY, or STRATEGY_SJUTBOT_V3 to true"
+            "No strategies enabled — set STRATEGY_SJUTBOT_V4=true or STRATEGY_TCI=true"
         )
 
     logger.info("Strategies loaded: %s", [s.name for s in strategies])
@@ -393,27 +293,17 @@ async def main():
 
     # ── Backtest function (called by /backtest Telegram command) ─────────────
     async def _run_backtest() -> str:
-        from trading.backtester import backtest_strategy_mtf, backtest_strategy_mtf_v2, summarise
-        from trading.strategies.sjutbot_v3_strategy          import SJUTBotV3Strategy
-        from trading.strategies.mean_reversion_strategy      import MeanReversionStrategy
-        from trading.strategies.trend_continuation_strategy  import TrendContinuationStrategy
-        from trading.strategies.smart_money_strategy         import SmartMoneyStrategy
+        from trading.backtester import backtest_strategy_mtf_v2, summarise
+        from trading.strategies.sjutbot_v4_strategy          import SJUTBotV4Strategy
+        from trading.strategies.trend_cont_improved_strategy import TrendContImprovedStrategy
 
         syms     = cfg["symbols"]
-        sl_pct   = cfg["stop_loss_pct"]
-        tp_pct   = cfg["take_profit_pct"]
         notional = cfg["fixed_trade_usdt"] * cfg["leverage"]
-        _grisk = {
-            "sl_atr":  cfg["g_sl_atr"],  "tp1_atr": cfg["g_tp1_atr"],
-            "tp2_atr": cfg["g_tp2_atr"], "partial_pct": cfg["g_partial"],
-            "risk_pct": cfg["risk_per_trade"],
-        }
-
         cache: dict = {}
         results: dict[str, dict] = {}
 
         for sym in syms:
-            for tf, lim in [("15m", 2000), ("1h", 700), ("4h", 180), ("30m", 1000)]:
+            for tf, lim in [("15m", 2000), ("1h", 500), ("4h", 200), ("30m", 1500)]:
                 k = (sym, tf)
                 logger.info("[BT] Fetching %s %s %d bars...", sym, tf, lim)
                 try:
@@ -426,47 +316,42 @@ async def main():
             c1h  = cache.get((sym, "1h"),  [])
             c4h  = cache.get((sym, "4h"),  [])
             c30m = cache.get((sym, "30m"), [])
-            tag  = sym.split('/')[0]
+            tag  = sym.split("/")[0]
 
-            if c1h and c4h:
-                mr = MeanReversionStrategy(sym, params={
-                    "name": "MeanReversion", "rsi_oversold": cfg["mr_rsi_oversold"],
-                    "rsi_overbought": cfg["mr_rsi_overbought"], "min_conditions": cfg["mr_min_conditions"],
-                    "adx_cap": cfg["mr_adx_cap"], **_grisk,
+            if c30m and c1h and c4h:
+                sv4 = SJUTBotV4Strategy(sym, params={
+                    "name": "SJUTBotV4", "tf": "30m", "limit": 500,
+                    "ut_mult": cfg["sjv4_ut_mult"], "ut_len": cfg["sjv4_ut_len"],
+                    "adx_min": cfg["sjv4_adx_min"], "min_score": cfg["sjv4_min_score"],
+                    "sl_mult": cfg["sjv4_sl_mult"], "tp1_r": cfg["sjv4_tp1_r"],
+                    "tp1_fraction": cfg["sjv4_tp1_fraction"],
+                    "tp2_strong": cfg["sjv4_tp2_strong"], "tp2_weak": cfg["sjv4_tp2_weak"],
+                    "tp2_break": cfg["sjv4_tp2_break"], "tp2_range": cfg["sjv4_tp2_range"],
+                    "tp2_chop": cfg["sjv4_tp2_chop"],
                 })
-                trades, _ = await backtest_strategy_mtf_v2(mr, c1h, {"4h": c4h}, notional, primary_window=200)
-                results[f"MeanRev/{tag}"] = summarise(trades)
+                trades, _ = await backtest_strategy_mtf_v2(
+                    sv4, c30m, {"1h": c1h, "4h": c4h}, notional,
+                    warmup=400, primary_window=400, mtf_windows={"1h": 200, "4h": 120},
+                )
+                results[f"SJUTBotV4/{tag}"] = summarise(trades)
 
             if c15m and c1h and c4h:
-                tc = TrendContinuationStrategy(sym, params={
-                    "name": "TrendCont", "rsi_min": cfg["tc_rsi_min"], "rsi_max": cfg["tc_rsi_max"],
-                    "pullback_atr": cfg["tc_pullback_atr"], "vol_mult": cfg["tc_vol_mult"],
-                    "bias_gate": cfg["tc_bias_gate"], "st_period": cfg["tc_st_period"],
-                    "st_mult": cfg["tc_st_mult"], **_grisk,
+                tci = TrendContImprovedStrategy(sym, params={
+                    "name": "TrendContImproved", "tf": "15m", "limit": 500,
+                    "bias_gate": cfg["tci_bias_gate"], "adx_min": cfg["tci_adx_min"],
+                    "sl_mult": cfg["tci_sl_mult"], "sl_min_pct": cfg["tci_sl_min_pct"],
+                    "sl_max_pct": cfg["tci_sl_max_pct"],
+                    "tp1_r": cfg["tci_tp1_r"], "tp1_fraction": cfg["tci_tp1_fraction"],
+                    "tp2_r": cfg["tci_tp2_r"], "min_entry_cond": cfg["tci_min_entry_cond"],
+                    "vol_mult": cfg["tci_vol_mult"],
                 })
-                trades, _ = await backtest_strategy_mtf_v2(tc, c15m, {"1h": c1h, "4h": c4h}, notional)
-                results[f"TrendCont/{tag}"] = summarise(trades)
+                trades, _ = await backtest_strategy_mtf_v2(
+                    tci, c15m, {"1h": c1h, "4h": c4h}, notional,
+                    warmup=900, primary_window=500, mtf_windows={"1h": 200, "4h": 120},
+                )
+                results[f"TrendContImproved/{tag}"] = summarise(trades)
 
-            if c15m and c1h and c4h:
-                sm = SmartMoneyStrategy(sym, params={
-                    "name": "SmartMoney", "bias_threshold": cfg["sm_bias_threshold"],
-                    "obv_ema": cfg["sm_obv_ema"], **_grisk,
-                })
-                trades, _ = await backtest_strategy_mtf_v2(sm, c15m, {"1h": c1h, "4h": c4h}, notional)
-                results[f"SmartMoney/{tag}"] = summarise(trades)
-
-            if c30m:
-                sv3 = SJUTBotV3Strategy(sym, params={
-                    "tf": "30m", "limit": 500, "ut_mult": cfg["sjv3_ut_mult"], "ut_len": cfg["sjv3_ut_len"],
-                    "filter_threshold": cfg["sjv3_filter_thr"], "adx_min": cfg["sjv3_adx_min"],
-                    "hma_len": cfg["sjv3_hma_len"], "sync_window": cfg["sjv3_sync_window"],
-                    "sl_mult": cfg["sjv3_sl_mult"], "rr": cfg["sjv3_rr"],
-                    "allow_long": cfg["sjv3_allow_long"], "allow_short": cfg["sjv3_allow_short"],
-                })
-                trades = await backtest_strategy_mtf(sv3, c30m, {}, notional, sl_pct, tp_pct)
-                results[f"SJUTBotV3/{tag}"] = summarise(trades)
-
-        lines = [f"📊 *Backtest — 4 Strategies* (${cfg['fixed_trade_usdt']}×{cfg['leverage']}x=${notional:.0f})"]
+        lines = [f"📊 *Backtest — 2 Strategies* (${cfg['fixed_trade_usdt']}×{cfg['leverage']}x=${notional:.0f})"]
         total_net = 0.0
         for label, s in results.items():
             if s.get("trades", 0) == 0:
@@ -485,7 +370,7 @@ async def main():
 
     # ── Wire Telegram callbacks ───────────────────────────────────────────────
     if telegram:
-        stop_event_ref: list = []  # forward reference
+        stop_event_ref: list = []
 
         def _tg_stop():
             if stop_event_ref:
