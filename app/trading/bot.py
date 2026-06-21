@@ -20,6 +20,7 @@ from .strategies.base import BaseStrategy, Signal, SignalType
 from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
 from .signal_state import SignalState
+from .position_health import PositionHealthMonitor
 
 logger = logging.getLogger("trading_bot")
 
@@ -327,9 +328,25 @@ class TradingBot:
             order_side = "buy" if side == "long" else "sell"
             pos_side   = side if self.futures_mode else ""
 
+            # Exchange-side TP backstop is placed at the health ladder's MAX
+            # (3.0R) rather than the strategy's starting TP2 (2.5R). The bot
+            # closes the runner at the *current* pos.tp2 via market order each
+            # tick (and the health monitor can raise pos.tp2 up the ladder toward
+            # 3.0R). Anchoring the exchange algo TP at the ladder max means the
+            # exchange only auto-closes if the bot is offline AND price runs all
+            # the way to 3.0R — so BULL TP2-extensions take real effect on live
+            # instead of being pre-empted by an exchange TP at 2.5R.
+            one_r = float(meta.get("one_r", 0) or 0)
+            if one_r > 0:
+                max_r = PositionHealthMonitor.TP_LADDER[-1]
+                exchange_tp = (round(price + max_r * one_r, 8) if side == "long"
+                               else round(price - max_r * one_r, 8))
+            else:
+                exchange_tp = tp_p  # no 1R info → keep strategy TP as the backstop
+
             order = await self.connector.create_order(
                 sym, order_side, amount,
-                tp_price=tp_p, sl_price=sl_p,
+                tp_price=exchange_tp, sl_price=sl_p,
                 pos_side=pos_side,
             )
             self.risk.open_position(
@@ -338,7 +355,7 @@ class TradingBot:
                 tp1=tp1_val, tp2=meta.get("tp2", tp_p),
                 partial_pct=meta.get("partial_pct", 0.5),
                 contract_size=ct,
-                one_r=float(meta.get("one_r", 0)),
+                one_r=one_r,
             )
             self._record_trade(TradeRecord(
                 timestamp=int(time.time() * 1000),
@@ -384,79 +401,89 @@ class TradingBot:
         pos_side   = ("long" if is_long else "short") if self.futures_mode else ""
         pnl_mult   = 1 if is_long else -1
 
-        # ── TP1: partial close + move stop to breakeven, keep the runner open ──
-        if trigger == "tp1":
-            # Close a whole number of contracts (≈partial_pct of the position).
-            ct = pos.contract_size or 1.0
-            full_contracts  = int(round(pos.full_amount / ct)) if ct > 0 else 0
-            close_contracts = int(full_contracts * pos.partial_pct)
-            close_amt = round(close_contracts * ct, 8)
-            if close_amt <= 0 or close_amt >= pos.amount:
-                # Can't split into whole contracts → keep position, treat as single-TP:
-                # disable TP1 so the runner exits at TP2 / SL only (no phantom state).
-                pos.tp1 = None
-                logger.info("[%s] %s TP1 hit but not splittable (%d contracts) → single-TP",
-                            strategy_name, sym, full_contracts)
+        # Claim the close-lock for the whole trigger handling so the health
+        # monitor can't send a concurrent close for the same position (which
+        # would double-count PnL). Re-check here because we awaited fetch_ticker
+        # after the top guard. The check-and-add below has no await between, so
+        # it is atomic under the single-threaded event loop.
+        if close_key in self._closing_positions:
+            return  # monitor grabbed it while we were fetching the ticker
+        self._closing_positions.add(close_key)
+        try:
+            # ── TP1: partial close + move stop to breakeven, keep the runner open ──
+            if trigger == "tp1":
+                # Close a whole number of contracts (≈partial_pct of the position).
+                ct = pos.contract_size or 1.0
+                full_contracts  = int(round(pos.full_amount / ct)) if ct > 0 else 0
+                close_contracts = int(full_contracts * pos.partial_pct)
+                close_amt = round(close_contracts * ct, 8)
+                if close_amt <= 0 or close_amt >= pos.amount:
+                    # Can't split into whole contracts → keep position, treat as single-TP:
+                    # disable TP1 so the runner exits at TP2 / SL only (no phantom state).
+                    pos.tp1 = None
+                    logger.info("[%s] %s TP1 hit but not splittable (%d contracts) → single-TP",
+                                strategy_name, sym, full_contracts)
+                    return
+                try:
+                    await self.connector.create_order(
+                        sym, close_side, close_amt, pos_side=pos_side, reduce_only=True)
+                except Exception as e:
+                    logger.warning("[%s] TP1 partial close failed: %s", strategy_name, e)
+                pnl = pnl_mult * (price - pos.entry_price) * close_amt
+                self.risk.register_pnl(pnl)
+                pos.amount     = round(pos.amount - close_amt, 6)
+                pos.tp1_hit    = True
+                pos.stop_loss  = pos.entry_price          # runner is now risk-free
+                self._record_trade(TradeRecord(
+                    timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
+                    price=price, amount=close_amt, pnl=pnl,
+                    strategy=strategy_name, reason="take_profit1", paper=self.paper,
+                ))
+                logger.info("[%s] TP1 %s @ %.4f closed %.6f (%.0f%%) → SL→BE %.4f  pnl≈%.2f",
+                            strategy_name, sym, price, close_amt, pos.partial_pct * 100,
+                            pos.entry_price, pnl)
+                if self.telegram:
+                    self.telegram.notify_trade_closed(
+                        sym, "take_profit1", price, pos.entry_price,
+                        pos.stop_loss, pos.tp1, self._sig.summary())
                 return
+
+            # ── Terminal: stop_loss / breakeven / take_profit2 → close remainder ──
+            amount = pos.amount
+            pnl    = pnl_mult * (price - pos.entry_price) * amount
             try:
                 await self.connector.create_order(
-                    sym, close_side, close_amt, pos_side=pos_side, reduce_only=True)
+                    sym, close_side, amount, pos_side=pos_side, reduce_only=True)
             except Exception as e:
-                logger.warning("[%s] TP1 partial close failed: %s", strategy_name, e)
-            pnl = pnl_mult * (price - pos.entry_price) * close_amt
+                logger.warning("[%s] Close failed (OKX may have closed already): %s", strategy_name, e)
+
             self.risk.register_pnl(pnl)
-            pos.amount     = round(pos.amount - close_amt, 6)
-            pos.tp1_hit    = True
-            pos.stop_loss  = pos.entry_price          # runner is now risk-free
+            self._sig.record_outcome(
+                symbol=sym, side=pos.side,
+                entry=pos.entry_price, exit_price=price,
+                sl=pos.stop_loss, tp=pos.take_profit,
+                reason=trigger, strategy=strategy_name,
+            )
+            self._sig.unlock_strategy(sym, strategy_name)
+            self.risk.close_position(sym, strategy=strategy_name)
             self._record_trade(TradeRecord(
                 timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
-                price=price, amount=close_amt, pnl=pnl,
-                strategy=strategy_name, reason="take_profit1", paper=self.paper,
+                price=price, amount=amount, pnl=pnl,
+                strategy=strategy_name, reason=trigger, paper=self.paper,
             ))
-            logger.info("[%s] TP1 %s @ %.4f closed %.6f (%.0f%%) → SL→BE %.4f  pnl≈%.2f",
-                        strategy_name, sym, price, close_amt, pos.partial_pct * 100,
-                        pos.entry_price, pnl)
+            logger.info("[%s] CLOSED %s @ %.4f via %s  pnl≈%.2f USDT",
+                        strategy_name, sym, price, trigger, pnl)
             if self.telegram:
                 self.telegram.notify_trade_closed(
-                    sym, "take_profit1", price, pos.entry_price,
-                    pos.stop_loss, pos.tp1, self._sig.summary())
-            return
-
-        # ── Terminal: stop_loss / breakeven / take_profit2 → close remainder ──
-        amount = pos.amount
-        pnl    = pnl_mult * (price - pos.entry_price) * amount
-        try:
-            await self.connector.create_order(
-                sym, close_side, amount, pos_side=pos_side, reduce_only=True)
-        except Exception as e:
-            logger.warning("[%s] Close failed (OKX may have closed already): %s", strategy_name, e)
-
-        self.risk.register_pnl(pnl)
-        self._sig.record_outcome(
-            symbol=sym, side=pos.side,
-            entry=pos.entry_price, exit_price=price,
-            sl=pos.stop_loss, tp=pos.take_profit,
-            reason=trigger, strategy=strategy_name,
-        )
-        self._sig.unlock_strategy(sym, strategy_name)
-        self.risk.close_position(sym, strategy=strategy_name)
-        self._record_trade(TradeRecord(
-            timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
-            price=price, amount=amount, pnl=pnl,
-            strategy=strategy_name, reason=trigger, paper=self.paper,
-        ))
-        logger.info("[%s] CLOSED %s @ %.4f via %s  pnl≈%.2f USDT",
-                    strategy_name, sym, price, trigger, pnl)
-        if self.telegram:
-            self.telegram.notify_trade_closed(
-                sym, trigger, price, pos.entry_price,
-                pos.stop_loss, pos.take_profit, self._sig.summary())
+                    sym, trigger, price, pos.entry_price,
+                    pos.stop_loss, pos.take_profit, self._sig.summary())
+        finally:
+            self._closing_positions.discard(close_key)
 
     # ── Position health monitor ───────────────────────────────────────────
 
     async def _monitor_loop(self):
         """Background task: re-evaluates every open position on a short interval."""
-        from .position_health import PositionHealthMonitor
         monitor = PositionHealthMonitor(self.connector)
 
         # Stagger first run by half the interval so it doesn't fire at the same time as _tick.
@@ -534,7 +561,7 @@ class TradingBot:
                     if self.telegram:
                         self.telegram.send_message(
                             f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(pre-TP1)_\n"
-                            f"Score {result.score:.0f}%  TP1 raised: `{old_tp1:.2f}` → `{new_tp1:.2f}` _(max 1.5R)_\n"
+                            f"Score {result.score:.0f}%  TP1 raised: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _(max 1.5R)_\n"
                             f"Indicators: {_fmt_details(result.details)}"
                         )
             else:
@@ -549,7 +576,7 @@ class TradingBot:
                     if self.telegram:
                         self.telegram.send_message(
                             f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(runner)_\n"
-                            f"Score {result.score:.0f}%  TP2 extended: `{old_tp:.2f}` → `{new_tp:.2f}`\n"
+                            f"Score {result.score:.0f}%  TP2 extended: `{old_tp or 0:.2f}` → `{new_tp:.2f}`\n"
                             f"Indicators: {_fmt_details(result.details)}"
                         )
             return
@@ -560,47 +587,56 @@ class TradingBot:
             if close_key in self._closing_positions:
                 return  # already being closed by _check_stop or prior health check
             self._closing_positions.add(close_key)
+            # try/finally guarantees the lock is released on EVERY exit path —
+            # without it, a failed close order would leave the key set forever,
+            # permanently blocking _check_stop and future health checks for this
+            # position (stuck, unmanaged position).
             try:
-                ticker = await self.connector.fetch_ticker(sym)
-                price  = float(ticker["last"])
-            except Exception as e:
-                logger.warning("[MONITOR] %s ticker failed during health-close: %s", sym, e)
+                try:
+                    ticker = await self.connector.fetch_ticker(sym)
+                    price  = float(ticker["last"])
+                except Exception as e:
+                    logger.warning("[MONITOR] %s ticker failed during health-close: %s", sym, e)
+                    return
+
+                is_long    = pos.side == "long"
+                close_side = "sell" if is_long else "buy"
+                pos_side   = (pos.side if self.futures_mode else "")
+                amount     = pos.amount
+
+                logger.warning("[MONITOR] %s %s WEAK (score=%.0f) → force-closing %.6f @ %.4f",
+                               strategy, sym, result.score, amount, price)
+                try:
+                    order = await self.connector.create_order(sym, close_side, amount,
+                                                              pos_side=pos_side, reduce_only=True)
+                except Exception as e:
+                    logger.error("[MONITOR] %s health-close order failed: %s — will retry next cycle", sym, e)
+                    return  # finally releases the lock so the next cycle can retry
+
+                # Book PnL from the actual fill price when the connector provides it,
+                # falling back to the ticker. Closing `amount` (whole runner) via
+                # reduce_only is exact, so size is reliable.
+                fill_price = float(getattr(order, "price", 0.0) or price)
+                pnl = (1 if is_long else -1) * (fill_price - pos.entry_price) * amount
+                self.risk.register_pnl(pnl)
+                self._sig.record_outcome(sym, pos.side, pos.entry_price, fill_price,
+                                         pos.stop_loss, pos.take_profit,
+                                         reason="health_weak", strategy=strategy)
+                self._sig.unlock_strategy(sym, strategy)
+                self.risk.close_position(sym, strategy=strategy)
+                self._record_trade(TradeRecord(
+                    timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
+                    price=fill_price, amount=amount, pnl=pnl,
+                    strategy=strategy, reason="health_weak", paper=self.paper,
+                ))
+                if self.telegram:
+                    self.telegram.send_message(
+                        f"⚠️ *Health WEAK* `{sym}` {pos.side.upper()} → closed early\n"
+                        f"Score {result.score:.0f}%  PnL≈`{pnl:+.2f}$`\n"
+                        f"Indicators: {_fmt_details(result.details)}"
+                    )
+            finally:
                 self._closing_positions.discard(close_key)
-                return
-
-            is_long    = pos.side == "long"
-            close_side = "sell" if is_long else "buy"
-            pos_side   = (pos.side if self.futures_mode else "")
-            amount     = pos.amount
-
-            logger.warning("[MONITOR] %s %s WEAK (score=%.0f) → force-closing %.6f @ %.4f",
-                           strategy, sym, result.score, amount, price)
-            try:
-                await self.connector.create_order(sym, close_side, amount,
-                                                  pos_side=pos_side, reduce_only=True)
-            except Exception as e:
-                logger.error("[MONITOR] %s health-close order failed: %s", sym, e)
-                return
-
-            pnl = (1 if is_long else -1) * (price - pos.entry_price) * amount
-            self.risk.register_pnl(pnl)
-            self._sig.record_outcome(sym, pos.side, pos.entry_price, price,
-                                     pos.stop_loss, pos.take_profit,
-                                     reason="health_weak", strategy=strategy)
-            self._sig.unlock_strategy(sym, strategy)
-            self.risk.close_position(sym, strategy=strategy)
-            self._closing_positions.discard(f"{sym}||{strategy}")
-            self._record_trade(TradeRecord(
-                timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
-                price=price, amount=amount, pnl=pnl,
-                strategy=strategy, reason="health_weak", paper=self.paper,
-            ))
-            if self.telegram:
-                self.telegram.send_message(
-                    f"⚠️ *Health WEAK* `{sym}` {pos.side.upper()} → closed early\n"
-                    f"Score {result.score:.0f}%  PnL≈`{pnl:+.2f}$`\n"
-                    f"Indicators: {_fmt_details(result.details)}"
-                )
 
     # ── SL/TP calculation ─────────────────────────────────────────────────
 
