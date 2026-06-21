@@ -1,5 +1,5 @@
 """
-TrendContinuation Improved — companion to SJUTBotV4.
+TrendContinuation Improved — 15m primary + 1h/4h MTF.
 
 Primary: 15m candles. MTF: 1h + 4h.
 Key change: ADX(14, 15m) > 30 gate. Re-tuned exit: TP1=0.5R (40%), SL→BE, TP2=2.5R (60%).

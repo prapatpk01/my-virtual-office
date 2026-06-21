@@ -141,8 +141,7 @@ def build_config() -> dict:
         "dynamic_sizing":   _env_bool("DYNAMIC_SIZING", False),
 
         # ── Timing ────────────────────────────────────────────────────────────
-        # 60s tick: fast enough for 15m candles (TrendContImproved),
-        # and fine for 30m (SJUTBotV4 — checks closed bar once per tick, no rush).
+        # 60s tick: fast enough for 15m candles (TrendContImproved).
         "interval": _env_int("INTERVAL_SECONDS", 60),
 
         # ── Telegram ──────────────────────────────────────────────────────────

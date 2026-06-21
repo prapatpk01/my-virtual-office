@@ -44,7 +44,7 @@ class Position:
           None
         """
         long = self.side == "long"
-        # Single-TP mode (legacy strategies / SJUTBotV3 / partial disabled): no TP1 set.
+        # Single-TP mode (partial close disabled): no TP1 set.
         if not self.tp1:
             if self.stop_loss and ((price <= self.stop_loss) if long else (price >= self.stop_loss)):
                 return "stop_loss"
