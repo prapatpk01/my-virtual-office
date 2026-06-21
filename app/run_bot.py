@@ -1,15 +1,23 @@
 """
 OKX Perpetual Futures trading bot runner.
 
-Active strategies (2):
-  SJUTBotV4        — 30m entry / 1H+4H MTF — 8/9 confirmation, 70% TP1, regime TP2
-                     Backtest Jan-May 2026: 22 trades, WR 68.2%, +$23.37, MaxDD -2.28%
+Active strategy (1):
   TrendContImproved — 15m entry / 1H+4H MTF — trend pullback + ADX(15m)>30 gate
-                     Backtest Jan-May 2026: 142 trades, WR 77.5%, +$212.94, MaxDD -6.07%
+                      TP1=0.5R (40%), SL→BE, TP2=2.5R (60% runner)
+                      Backtest Jan-May 2026 BTC: 142 trades, WR 77.5%, +$184.54, MaxDD -6.3%
+                      Backtest Jan-May 2026 XAU:  99 trades, WR 69.7%, +$48.39,  MaxDD -16.2%
 
-Symbols     : BTC/USDT:USDT  (configurable via SYMBOLS)
-Exchange    : OKX, swap market, isolated margin, hedge mode
-Max positions: 2 (1 per strategy per symbol)
+Symbols      : BTC/USDT:USDT, XAU/USDT:USDT  (configurable via SYMBOLS)
+Exchange     : OKX, swap market, isolated margin, hedge mode
+Max positions: 2 (one per symbol at a time)
+
+Position Health Monitor (NEW):
+  Re-evaluates every open position every MONITOR_INTERVAL seconds (default 180 = 3 min).
+  Uses 5m + 1h + 4h candles with RELAXED indicator thresholds:
+    BULL    (score ≥ 85%): TP2 ladder extended (1.2→1.5→2.0→2.5→3.0R)
+    NEUTRAL (score 50–84%): hold position unchanged
+    CAUTION (score 40–49%): hold, watch closely
+    WEAK    (score < 40%): close position immediately — better than SL
 
 Config via Railway environment variables.
 """
@@ -83,40 +91,32 @@ def build_config() -> dict:
         "leverage":    _env_int("LEVERAGE", 20),
 
         # ── Symbols ───────────────────────────────────────────────────────────
-        "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT"),
-
-        # ── SJUTBot v4 (30m primary + 1h + 4h MTF) ───────────────────────────
-        # 8/9 confirmation gate, TP1=1.2R (70%), SL→breakeven, TP2=regime-aware (1.5-3.0R).
-        # Backtest Jan-May 2026: 22 trades, WR 68.2%, Net +$23.37, MaxDD -2.28%, 0 liquidations.
-        "strategy_sjutbot_v4":  _env_bool("STRATEGY_SJUTBOT_V4", True),
-        "sjv4_ut_mult":         _env_float("SJV4_UT_MULT",       0.30),  # UTBot TSL sensitivity
-        "sjv4_ut_len":          _env_int("SJV4_UT_LEN",          14),    # UTBot ATR period
-        "sjv4_adx_min":         _env_int("SJV4_ADX_MIN",         35),    # ADX strength gate
-        "sjv4_min_score":       _env_int("SJV4_MIN_SCORE",        8),    # out of 9 confirmations
-        "sjv4_sl_mult":         _env_float("SJV4_SL_MULT",       1.0),   # SL = 1.0 × ATR
-        "sjv4_tp1_r":           _env_float("SJV4_TP1_R",         1.2),   # TP1 = 1.2R (close 70%)
-        "sjv4_tp1_fraction":    _env_float("SJV4_TP1_FRACTION",  0.70),  # close 70% at TP1
-        "sjv4_tp2_strong":      _env_float("SJV4_TP2_STRONG",    3.0),   # TP2 in strong trend
-        "sjv4_tp2_weak":        _env_float("SJV4_TP2_WEAK",      2.0),   # TP2 in weak trend
-        "sjv4_tp2_break":       _env_float("SJV4_TP2_BREAK",     2.5),   # TP2 in breakout
-        "sjv4_tp2_range":       _env_float("SJV4_TP2_RANGE",     1.5),   # TP2 in range
-        "sjv4_tp2_chop":        _env_float("SJV4_TP2_CHOP",      1.5),   # TP2 in chop
+        # Both BTC and XAU active by default.
+        # OKX minimums: BTC 0.01 contract (~$800 notional), XAU 1 oz contract (~$4,300).
+        "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
 
         # ── TrendCont Improved (15m primary + 1h + 4h MTF) ───────────────────
         # Trend-pullback to 1H EMA20 + 4H macro trend + ADX(15m)>30 filter.
-        # TP1=0.5R (close 40%), SL→breakeven, TP2=2.5R (runner 60%).
-        # Backtest Jan-May 2026: 142 trades, WR 77.5%, Net +$212.94, MaxDD -6.07%.
-        "strategy_tci":         _env_bool("STRATEGY_TCI", True),
-        "tci_bias_gate":        _env_float("TCI_BIAS_GATE",      70.0),  # MTF bias gate (strict)
-        "tci_adx_min":          _env_int("TCI_ADX_MIN",          30),    # 15m ADX filter (key)
-        "tci_sl_mult":          _env_float("TCI_SL_MULT",        1.2),   # SL = 1.2 × ATR
-        "tci_sl_min_pct":       _env_float("TCI_SL_MIN_PCT",     0.012), # floor: 1.2% SL
-        "tci_sl_max_pct":       _env_float("TCI_SL_MAX_PCT",     0.035), # cap:   3.5% SL
-        "tci_tp1_r":            _env_float("TCI_TP1_R",          0.5),   # TP1 = 0.5R
-        "tci_tp1_fraction":     _env_float("TCI_TP1_FRACTION",   0.40),  # close 40% at TP1
-        "tci_tp2_r":            _env_float("TCI_TP2_R",          2.5),   # TP2 = 2.5R
-        "tci_min_entry_cond":   _env_int("TCI_MIN_ENTRY_COND",   4),     # all 4 micro conditions
-        "tci_vol_mult":         _env_float("TCI_VOL_MULT",       1.0),   # volume ≥ MA20 × mult
+        # TP1=0.5R (close 40%), SL→BE, TP2=2.5R (runner 60%).
+        # BTC Jan-May 2026: 142 trades WR77.5% Net+$184.54 MaxDD-6.3%
+        # XAU Jan-May 2026:  99 trades WR69.7% Net+$48.39  MaxDD-16.2%
+        "tci_bias_gate":      _env_float("TCI_BIAS_GATE",    70.0),  # MTF composite bias gate
+        "tci_adx_min":        _env_int("TCI_ADX_MIN",        30),    # 15m ADX filter
+        "tci_sl_mult":        _env_float("TCI_SL_MULT",      1.2),   # SL = 1.2 × ATR
+        "tci_sl_min_pct":     _env_float("TCI_SL_MIN_PCT",   0.012), # floor SL: 1.2%
+        "tci_sl_max_pct":     _env_float("TCI_SL_MAX_PCT",   0.035), # cap SL:   3.5%
+        "tci_tp1_r":          _env_float("TCI_TP1_R",        0.5),   # TP1 = 0.5R (40% close)
+        "tci_tp1_fraction":   _env_float("TCI_TP1_FRACTION", 0.40),  # close 40% at TP1
+        "tci_tp2_r":          _env_float("TCI_TP2_R",        2.5),   # TP2 = 2.5R (starting)
+        "tci_min_entry_cond": _env_int("TCI_MIN_ENTRY_COND", 4),     # need all 4 micro conds
+        "tci_vol_mult":       _env_float("TCI_VOL_MULT",     1.0),   # vol ≥ MA × mult
+
+        # ── Position health monitor ───────────────────────────────────────────
+        # Re-checks every open position using 5m+1h+4h candles (relaxed thresholds).
+        # BULL≥85%: extend TP2 up ladder (1.2→1.5→2.0→2.5→3.0R)
+        # NEUTRAL 50–84%: hold
+        # WEAK<40%: close immediately (better than SL)
+        "monitor_interval":   _env_int("MONITOR_INTERVAL",   180),  # seconds between checks
 
         # ── Risk / sizing ─────────────────────────────────────────────────────
         # FIXED_TRADE_USDT: margin per trade (before leverage).
@@ -155,56 +155,27 @@ def build_config() -> dict:
 # ── Strategy builder ─────────────────────────────────────────────────────────
 
 def build_strategies(symbols: list[str], cfg: dict) -> list:
-    from trading.strategies.sjutbot_v4_strategy           import SJUTBotV4Strategy
-    from trading.strategies.trend_cont_improved_strategy  import TrendContImprovedStrategy
+    from trading.strategies.trend_cont_improved_strategy import TrendContImprovedStrategy
 
     strategies = []
     for sym in symbols:
+        strategies.append(TrendContImprovedStrategy(sym, params={
+            "name":           "TrendContImproved",
+            "tf":             "15m",
+            "limit":          500,
+            "bias_gate":      cfg["tci_bias_gate"],
+            "adx_min":        cfg["tci_adx_min"],
+            "sl_mult":        cfg["tci_sl_mult"],
+            "sl_min_pct":     cfg["tci_sl_min_pct"],
+            "sl_max_pct":     cfg["tci_sl_max_pct"],
+            "tp1_r":          cfg["tci_tp1_r"],
+            "tp1_fraction":   cfg["tci_tp1_fraction"],
+            "tp2_r":          cfg["tci_tp2_r"],
+            "min_entry_cond": cfg["tci_min_entry_cond"],
+            "vol_mult":       cfg["tci_vol_mult"],
+        }))
 
-        # ── SJUTBot v4 (30m + 1h + 4h MTF) ──────────────────────────────────
-        if cfg["strategy_sjutbot_v4"]:
-            strategies.append(SJUTBotV4Strategy(sym, params={
-                "name":         "SJUTBotV4",
-                "tf":           "30m",
-                "limit":        500,
-                "ut_mult":      cfg["sjv4_ut_mult"],
-                "ut_len":       cfg["sjv4_ut_len"],
-                "adx_min":      cfg["sjv4_adx_min"],
-                "min_score":    cfg["sjv4_min_score"],
-                "sl_mult":      cfg["sjv4_sl_mult"],
-                "tp1_r":        cfg["sjv4_tp1_r"],
-                "tp1_fraction": cfg["sjv4_tp1_fraction"],
-                "tp2_strong":   cfg["sjv4_tp2_strong"],
-                "tp2_weak":     cfg["sjv4_tp2_weak"],
-                "tp2_break":    cfg["sjv4_tp2_break"],
-                "tp2_range":    cfg["sjv4_tp2_range"],
-                "tp2_chop":     cfg["sjv4_tp2_chop"],
-            }))
-
-        # ── TrendCont Improved (15m + 1h + 4h MTF) ───────────────────────────
-        if cfg["strategy_tci"]:
-            strategies.append(TrendContImprovedStrategy(sym, params={
-                "name":           "TrendContImproved",
-                "tf":             "15m",
-                "limit":          500,
-                "bias_gate":      cfg["tci_bias_gate"],
-                "adx_min":        cfg["tci_adx_min"],
-                "sl_mult":        cfg["tci_sl_mult"],
-                "sl_min_pct":     cfg["tci_sl_min_pct"],
-                "sl_max_pct":     cfg["tci_sl_max_pct"],
-                "tp1_r":          cfg["tci_tp1_r"],
-                "tp1_fraction":   cfg["tci_tp1_fraction"],
-                "tp2_r":          cfg["tci_tp2_r"],
-                "min_entry_cond": cfg["tci_min_entry_cond"],
-                "vol_mult":       cfg["tci_vol_mult"],
-            }))
-
-    if not strategies:
-        raise RuntimeError(
-            "No strategies enabled — set STRATEGY_SJUTBOT_V4=true or STRATEGY_TCI=true"
-        )
-
-    logger.info("Strategies loaded: %s", [s.name for s in strategies])
+    logger.info("Strategies loaded: %s for symbols %s", [s.name for s in strategies], symbols)
     return strategies
 
 
@@ -289,51 +260,32 @@ async def main():
         fixed_sl_pct=cfg["stop_loss_pct"],
         fixed_tp_pct=cfg["take_profit_pct"],
         dynamic_sizing=cfg["dynamic_sizing"],
+        monitor_interval=cfg["monitor_interval"],
     )
 
     # ── Backtest function (called by /backtest Telegram command) ─────────────
     async def _run_backtest() -> str:
         from trading.backtester import backtest_strategy_mtf_v2, summarise
-        from trading.strategies.sjutbot_v4_strategy          import SJUTBotV4Strategy
         from trading.strategies.trend_cont_improved_strategy import TrendContImprovedStrategy
 
         syms     = cfg["symbols"]
         notional = cfg["fixed_trade_usdt"] * cfg["leverage"]
-        cache: dict = {}
         results: dict[str, dict] = {}
 
         for sym in syms:
-            for tf, lim in [("15m", 2000), ("1h", 500), ("4h", 200), ("30m", 1500)]:
-                k = (sym, tf)
+            cache: dict = {}
+            for tf, lim in [("15m", 2000), ("1h", 500), ("4h", 200)]:
                 logger.info("[BT] Fetching %s %s %d bars...", sym, tf, lim)
                 try:
-                    cache[k] = await connector.fetch_ohlcv(sym, timeframe=tf, limit=lim)
+                    cache[(sym, tf)] = await connector.fetch_ohlcv(sym, timeframe=tf, limit=lim)
                 except Exception as e:
                     logger.error("[BT] fetch %s %s failed: %s", sym, tf, e)
-                    cache[k] = []
+                    cache[(sym, tf)] = []
 
             c15m = cache.get((sym, "15m"), [])
             c1h  = cache.get((sym, "1h"),  [])
             c4h  = cache.get((sym, "4h"),  [])
-            c30m = cache.get((sym, "30m"), [])
             tag  = sym.split("/")[0]
-
-            if c30m and c1h and c4h:
-                sv4 = SJUTBotV4Strategy(sym, params={
-                    "name": "SJUTBotV4", "tf": "30m", "limit": 500,
-                    "ut_mult": cfg["sjv4_ut_mult"], "ut_len": cfg["sjv4_ut_len"],
-                    "adx_min": cfg["sjv4_adx_min"], "min_score": cfg["sjv4_min_score"],
-                    "sl_mult": cfg["sjv4_sl_mult"], "tp1_r": cfg["sjv4_tp1_r"],
-                    "tp1_fraction": cfg["sjv4_tp1_fraction"],
-                    "tp2_strong": cfg["sjv4_tp2_strong"], "tp2_weak": cfg["sjv4_tp2_weak"],
-                    "tp2_break": cfg["sjv4_tp2_break"], "tp2_range": cfg["sjv4_tp2_range"],
-                    "tp2_chop": cfg["sjv4_tp2_chop"],
-                })
-                trades, _ = await backtest_strategy_mtf_v2(
-                    sv4, c30m, {"1h": c1h, "4h": c4h}, notional,
-                    warmup=400, primary_window=400, mtf_windows={"1h": 200, "4h": 120},
-                )
-                results[f"SJUTBotV4/{tag}"] = summarise(trades)
 
             if c15m and c1h and c4h:
                 tci = TrendContImprovedStrategy(sym, params={
@@ -349,9 +301,9 @@ async def main():
                     tci, c15m, {"1h": c1h, "4h": c4h}, notional,
                     warmup=900, primary_window=500, mtf_windows={"1h": 200, "4h": 120},
                 )
-                results[f"TrendContImproved/{tag}"] = summarise(trades)
+                results[f"TCI/{tag}"] = summarise(trades)
 
-        lines = [f"📊 *Backtest — 2 Strategies* (${cfg['fixed_trade_usdt']}×{cfg['leverage']}x=${notional:.0f})"]
+        lines = [f"📊 *Backtest — TrendContImproved* (${cfg['fixed_trade_usdt']}×{cfg['leverage']}x=${notional:.0f})"]
         total_net = 0.0
         for label, s in results.items():
             if s.get("trades", 0) == 0:

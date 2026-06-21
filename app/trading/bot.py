@@ -24,6 +24,22 @@ from .signal_state import SignalState
 logger = logging.getLogger("trading_bot")
 
 
+def _fmt_details(d: dict) -> str:
+    """Format health indicator dict into a compact string for Telegram."""
+    skip = {k for k in d if k.startswith("_")}
+    vals = {k for k in d if k.startswith("_")}
+    parts = []
+    for k, v in d.items():
+        if k.startswith("_"):
+            continue
+        icon = "✓" if v else "✗"
+        # find companion value key
+        vkey = f"_{k.lower().split('>')[0].split('<')[0]}_val"
+        val_str = f"={d[vkey]:.1f}" if vkey in d else ""
+        parts.append(f"{icon}{k}{val_str}")
+    return "  ".join(parts)
+
+
 @dataclass
 class TradeRecord:
     timestamp: int
@@ -50,6 +66,7 @@ class TradingBot:
         fixed_sl_pct: float = 0.0,
         fixed_tp_pct: float = 0.0,
         dynamic_sizing: bool = True,
+        monitor_interval: int = 180,   # health-check every 3 min
     ):
         self.connector = connector
         self.strategies = strategies
@@ -60,12 +77,11 @@ class TradingBot:
         self.paper = connector.paper
         self.fixed_sl_pct = fixed_sl_pct
         self.fixed_tp_pct = fixed_tp_pct
-        # When False, ignore per-trade risk sizing and use fixed FIXED_TRADE_USDT
-        # margin for every order (needed for small accounts where 2%-risk sizing
-        # falls below the exchange's minimum 1-contract order).
         self._dynamic_sizing = dynamic_sizing
+        self._monitor_interval = monitor_interval
 
         self._task: Optional[asyncio.Task] = None
+        self._monitor_task: Optional[asyncio.Task] = None
         self._running = False
         self._balance = 0.0
         self._start_balance = 0.0
@@ -97,16 +113,19 @@ class TradingBot:
             symbols = sorted({s.symbol for s in self.strategies})
             self.telegram.notify_bot_started(self.paper, names, symbols)
         self._task = asyncio.create_task(self._run_loop())
-        logger.info("[BOT] Started — strategies: %s", [s.name for s in self.strategies])
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        logger.info("[BOT] Started — strategies: %s  health-monitor: every %ds",
+                    [s.name for s in self.strategies], self._monitor_interval)
 
     async def stop(self):
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for t in (self._task, self._monitor_task):
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
         if self.telegram:
             self.telegram.stop_polling()
             self.telegram.notify_bot_stopped()
@@ -316,6 +335,7 @@ class TradingBot:
                 tp1=tp1_val, tp2=meta.get("tp2", tp_p),
                 partial_pct=meta.get("partial_pct", 0.5),
                 contract_size=ct,
+                one_r=float(meta.get("one_r", 0)),
             )
             self._record_trade(TradeRecord(
                 timestamp=int(time.time() * 1000),
@@ -425,6 +445,129 @@ class TradingBot:
             self.telegram.notify_trade_closed(
                 sym, trigger, price, pos.entry_price,
                 pos.stop_loss, pos.take_profit, self._sig.summary())
+
+    # ── Position health monitor ───────────────────────────────────────────
+
+    async def _monitor_loop(self):
+        """Background task: re-evaluates every open position on a short interval."""
+        from .position_health import PositionHealthMonitor
+        monitor = PositionHealthMonitor(self.connector)
+
+        # Stagger first run by half the interval so it doesn't fire at the same time as _tick.
+        await asyncio.sleep(self._monitor_interval // 2)
+
+        while self._running:
+            try:
+                await self._run_health_checks(monitor)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("[MONITOR] Unexpected error: %s", e, exc_info=True)
+            await asyncio.sleep(self._monitor_interval)
+
+    async def _run_health_checks(self, monitor):
+        positions = self.risk.get_positions()
+        if not positions:
+            return
+
+        candle_cache: dict[tuple, list] = {}
+
+        for pos_info in positions:
+            sym      = pos_info["symbol"]
+            strategy = pos_info.get("strategy", "")
+            pos      = self.risk.get_position_obj(sym, strategy)
+            if pos is None:
+                continue
+
+            # Pre-fetch once per symbol across all TFs
+            for tf in ("5m", "1h", "4h"):
+                key = (sym, tf)
+                if key not in candle_cache:
+                    try:
+                        candle_cache[key] = await self.connector.fetch_ohlcv(sym, tf, limit=120)
+                    except Exception as e:
+                        logger.warning("[MONITOR] %s %s fetch failed: %s", sym, tf, e)
+                        candle_cache[key] = []
+
+            result = await monitor.check(
+                symbol=sym,
+                side=pos.side,
+                entry_price=pos.entry_price,
+                oneR=pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price)),
+                current_tp2=pos.tp2 or pos.take_profit or 0.0,
+                candles_5m=candle_cache.get((sym, "5m")),
+                candles_1h=candle_cache.get((sym, "1h")),
+                candles_4h=candle_cache.get((sym, "4h")),
+            )
+            pos.health_label  = result.label
+            pos.health_checks += 1
+
+            await self._health_action(pos, pos_info, strategy, result, monitor)
+
+    async def _health_action(self, pos, pos_info: dict, strategy: str,
+                             result, monitor):
+        """Act on a health check result: extend TP or close early."""
+        sym = pos.symbol
+
+        # ── BULL: try to advance TP2 one rung up the ladder ──────────────────
+        if result.action == "EXTEND_TP" and pos.tp1_hit:
+            one_r = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
+            new_tp = monitor.next_tp_level(pos.entry_price, one_r,
+                                           pos.tp2 or pos.take_profit or 0.0, pos.side)
+            if new_tp and new_tp != pos.tp2:
+                old_tp = pos.tp2
+                pos.tp2 = new_tp
+                logger.info("[MONITOR] %s %s BULL → TP2 extended %.4f → %.4f",
+                            strategy, sym, old_tp or 0, new_tp)
+                if self.telegram:
+                    self.telegram.send_message(
+                        f"📈 *Health BULL* `{sym}` {pos.side.upper()}\n"
+                        f"Score {result.score:.0f}%  TP2 extended: `{old_tp:.2f}` → `{new_tp:.2f}`\n"
+                        f"Indicators: {_fmt_details(result.details)}"
+                    )
+            return
+
+        # ── WEAK: force-close position ────────────────────────────────────────
+        if result.action == "CLOSE":
+            try:
+                ticker = await self.connector.fetch_ticker(sym)
+                price  = float(ticker["last"])
+            except Exception as e:
+                logger.warning("[MONITOR] %s ticker failed during health-close: %s", sym, e)
+                return
+
+            is_long    = pos.side == "long"
+            close_side = "sell" if is_long else "buy"
+            pos_side   = (pos.side if self.futures_mode else "")
+            amount     = pos.amount
+
+            logger.warning("[MONITOR] %s %s WEAK (score=%.0f) → force-closing %.6f @ %.4f",
+                           strategy, sym, result.score, amount, price)
+            try:
+                await self.connector.create_order(sym, close_side, amount,
+                                                  pos_side=pos_side, reduce_only=True)
+            except Exception as e:
+                logger.error("[MONITOR] %s health-close order failed: %s", sym, e)
+                return
+
+            pnl = (1 if is_long else -1) * (price - pos.entry_price) * amount
+            self.risk.register_pnl(pnl)
+            self._sig.record_outcome(sym, pos.side, pos.entry_price, price,
+                                     pos.stop_loss, pos.take_profit,
+                                     reason="health_weak", strategy=strategy)
+            self._sig.unlock_strategy(sym, strategy)
+            self.risk.close_position(sym, strategy=strategy)
+            self._record_trade(TradeRecord(
+                timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
+                price=price, amount=amount, pnl=pnl,
+                strategy=strategy, reason="health_weak", paper=self.paper,
+            ))
+            if self.telegram:
+                self.telegram.send_message(
+                    f"⚠️ *Health WEAK* `{sym}` {pos.side.upper()} → closed early\n"
+                    f"Score {result.score:.0f}%  PnL≈`{pnl:+.2f}$`\n"
+                    f"Indicators: {_fmt_details(result.details)}"
+                )
 
     # ── SL/TP calculation ─────────────────────────────────────────────────
 

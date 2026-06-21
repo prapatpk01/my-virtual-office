@@ -1,6 +1,6 @@
 """Risk management: position sizing, stop-loss, and max drawdown guard."""
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 import time
 
 
@@ -25,6 +25,10 @@ class Position:
     tp1_hit: bool = False
     full_amount: float = 0.0     # original size at open (for partial math)
     contract_size: float = 1.0   # base-asset units per contract (for whole-contract partials)
+    # Health monitor fields
+    one_r: float = 0.0           # original 1R distance (SL size at entry)
+    health_label: str = "NEUTRAL"
+    health_checks: int = 0       # number of health checks done
 
     @property
     def pnl_pct(self) -> float:
@@ -205,7 +209,7 @@ class RiskManager:
     def open_position(self, symbol: str, side: str, entry_price: float, amount: float,
                       strategy: str = "", stop_loss: float = None, take_profit: float = None,
                       tp1: float = None, tp2: float = None, partial_pct: float = 0.5,
-                      contract_size: float = 1.0) -> Position:
+                      contract_size: float = 1.0, one_r: float = 0.0) -> Position:
         if stop_loss is None or take_profit is None:
             sl_default, tp_default = self.compute_stops(side, entry_price)
             stop_loss   = stop_loss   if stop_loss   is not None else sl_default
@@ -213,7 +217,7 @@ class RiskManager:
         pos = Position(symbol=symbol, side=side, entry_price=entry_price, amount=amount,
                        stop_loss=stop_loss, take_profit=take_profit,
                        tp1=tp1, tp2=tp2, partial_pct=partial_pct, full_amount=amount,
-                       contract_size=contract_size)
+                       contract_size=contract_size, one_r=one_r)
         self._positions[f"{symbol}||{strategy}"] = pos
         return pos
 

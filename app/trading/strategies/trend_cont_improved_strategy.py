@@ -241,6 +241,7 @@ class TrendContImprovedStrategy(BaseStrategy):
                 "breakeven":   current_price,
                 "rr_tp1":      p["tp1_r"],
                 "rr_tp2":      p["tp2_r"],
+                "one_r":       dist,
             }
 
         adx_v = float(last.get("adx15", 0) or 0)
