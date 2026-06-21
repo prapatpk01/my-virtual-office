@@ -95,21 +95,25 @@ def build_config() -> dict:
         # OKX minimums: BTC 0.01 contract (~$800 notional), XAU 1 oz contract (~$4,300).
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
 
-        # ── TrendCont Improved (15m primary + 1h + 4h MTF) ───────────────────
+        # ── TrendCont Improved v2 (15m primary + 1h + 4h MTF) ───────────────────
         # Trend-pullback to 1H EMA20 + 4H macro trend + ADX(15m)>30 filter.
         # TP1=0.5R (close 40%), SL→BE, TP2=2.5R (runner 60%).
-        # BTC Jan-May 2026: 142 trades WR77.5% Net+$184.54 MaxDD-6.3%
-        # XAU Jan-May 2026:  99 trades WR69.7% Net+$48.39  MaxDD-16.2%
-        "tci_bias_gate":      _env_float("TCI_BIAS_GATE",    70.0),  # MTF composite bias gate
-        "tci_adx_min":        _env_int("TCI_ADX_MIN",        30),    # 15m ADX filter
-        "tci_sl_mult":        _env_float("TCI_SL_MULT",      1.2),   # SL = 1.2 × ATR
-        "tci_sl_min_pct":     _env_float("TCI_SL_MIN_PCT",   0.012), # floor SL: 1.2%
-        "tci_sl_max_pct":     _env_float("TCI_SL_MAX_PCT",   0.035), # cap SL:   3.5%
-        "tci_tp1_r":          _env_float("TCI_TP1_R",        0.5),   # TP1 = 0.5R (40% close)
-        "tci_tp1_fraction":   _env_float("TCI_TP1_FRACTION", 0.40),  # close 40% at TP1
-        "tci_tp2_r":          _env_float("TCI_TP2_R",        2.5),   # TP2 = 2.5R (starting)
-        "tci_min_entry_cond": _env_int("TCI_MIN_ENTRY_COND", 4),     # need all 4 micro conds
-        "tci_vol_mult":       _env_float("TCI_VOL_MULT",     1.0),   # vol ≥ MA × mult
+        "tci_bias_gate":        _env_float("TCI_BIAS_GATE",        70.0),
+        "tci_adx_min":          _env_int("TCI_ADX_MIN",            30),
+        "tci_sl_mult":          _env_float("TCI_SL_MULT",          1.2),
+        "tci_sl_min_pct":       _env_float("TCI_SL_MIN_PCT",       0.012),
+        "tci_sl_max_pct":       _env_float("TCI_SL_MAX_PCT",       0.035),
+        "tci_tp1_r":            _env_float("TCI_TP1_R",            0.5),
+        "tci_tp1_fraction":     _env_float("TCI_TP1_FRACTION",     0.40),
+        "tci_tp2_r":            _env_float("TCI_TP2_R",            2.5),
+        "tci_min_score":        _env_float("TCI_MIN_SCORE",        4.0),   # sum of enabled indicator weights
+        "tci_vol_mult":         _env_float("TCI_VOL_MULT",         1.0),
+        # v2: fast mode (looser ADX+pullback — lower WR, more signals; default OFF)
+        "tci_fast_mode":        _env_bool("TCI_FAST_MODE",         False),
+        # v2: crash-guard (close when ≥0.7R underwater + 5m momentum reversed)
+        "tci_health_guard":     _env_bool("TCI_HEALTH_GUARD",      True),
+        "tci_health_uw_frac":   _env_float("TCI_HEALTH_UW_FRAC",  0.7),   # R underwater to trigger
+        "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # MTF bias threshold
 
         # ── Position health monitor ───────────────────────────────────────────
         # Re-checks every open position using 5m+1h+4h candles (relaxed thresholds).
@@ -159,19 +163,23 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
     strategies = []
     for sym in symbols:
         strategies.append(TrendContImprovedStrategy(sym, params={
-            "name":           "TrendContImproved",
-            "tf":             "15m",
-            "limit":          500,
-            "bias_gate":      cfg["tci_bias_gate"],
-            "adx_min":        cfg["tci_adx_min"],
-            "sl_mult":        cfg["tci_sl_mult"],
-            "sl_min_pct":     cfg["tci_sl_min_pct"],
-            "sl_max_pct":     cfg["tci_sl_max_pct"],
-            "tp1_r":          cfg["tci_tp1_r"],
-            "tp1_fraction":   cfg["tci_tp1_fraction"],
-            "tp2_r":          cfg["tci_tp2_r"],
-            "min_entry_cond": cfg["tci_min_entry_cond"],
-            "vol_mult":       cfg["tci_vol_mult"],
+            "name":                 "TrendContImproved",
+            "tf":                   "15m",
+            "limit":                500,
+            "bias_gate":            cfg["tci_bias_gate"],
+            "adx_min":              cfg["tci_adx_min"],
+            "sl_mult":              cfg["tci_sl_mult"],
+            "sl_min_pct":           cfg["tci_sl_min_pct"],
+            "sl_max_pct":           cfg["tci_sl_max_pct"],
+            "tp1_r":                cfg["tci_tp1_r"],
+            "tp1_fraction":         cfg["tci_tp1_fraction"],
+            "tp2_r":                cfg["tci_tp2_r"],
+            "min_score":            cfg["tci_min_score"],
+            "vol_mult":             cfg["tci_vol_mult"],
+            "fast_mode":            cfg["tci_fast_mode"],
+            "health_guard_enabled": cfg["tci_health_guard"],
+            "health_underwater_frac": cfg["tci_health_uw_frac"],
+            "health_bias_flip":     cfg["tci_health_bias_flip"],
         }))
 
     if not strategies:

@@ -20,7 +20,7 @@ from .strategies.base import BaseStrategy, Signal, SignalType
 from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
 from .signal_state import SignalState
-from .position_health import PositionHealthMonitor
+from .position_health import PositionHealthMonitor, HealthResult
 
 logger = logging.getLogger("trading_bot")
 
@@ -533,15 +533,37 @@ class TradingBot:
                         logger.warning("[MONITOR] %s %s fetch failed: %s", sym, tf, e)
                         candle_cache[key] = []
 
+            c5m = candle_cache.get((sym, "5m"), [])
+            c1h = candle_cache.get((sym, "1h"), [])
+            c4h = candle_cache.get((sym, "4h"), [])
+
+            # ── Crash-guard (v2 strategy): closes ONLY when deeply underwater + momentum reversed
+            strat_obj = next(
+                (s for s in self.strategies if s.symbol == sym and s.name == strategy), None
+            )
+            if strat_obj and hasattr(strat_obj, "monitor_position"):
+                one_r = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
+                cg_action, cg_reason = strat_obj.monitor_position(
+                    pos.side, pos.entry_price, one_r, pos.tp1_hit, c5m, c1h, c4h
+                )
+                if cg_action == "CLOSE":
+                    cg_result = HealthResult(score=0.0, label="CRASH_GUARD",
+                                             action="CLOSE", details={"reason": cg_reason})
+                    pos.health_label  = cg_result.label
+                    pos.health_checks += 1
+                    await self._health_action(pos, pos_info, strategy, cg_result, monitor)
+                    continue
+
+            # ── Weighted score (BULL → extend TP; WEAK is secondary, crash-guard is primary) ──
             result = await monitor.check(
                 symbol=sym,
                 side=pos.side,
                 entry_price=pos.entry_price,
                 oneR=pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price)),
                 current_tp2=pos.tp2 or pos.take_profit or 0.0,
-                candles_5m=candle_cache.get((sym, "5m")),
-                candles_1h=candle_cache.get((sym, "1h")),
-                candles_4h=candle_cache.get((sym, "4h")),
+                candles_5m=c5m,
+                candles_1h=c1h,
+                candles_4h=c4h,
             )
             pos.health_label  = result.label
             pos.health_checks += 1
@@ -615,8 +637,8 @@ class TradingBot:
                 pos_side   = (pos.side if self.futures_mode else "")
                 amount     = pos.amount
 
-                logger.warning("[MONITOR] %s %s WEAK (score=%.0f) → force-closing %.6f @ %.4f",
-                               strategy, sym, result.score, amount, price)
+                logger.warning("[MONITOR] %s %s %s (score=%.0f) → force-closing %.6f @ %.4f",
+                               strategy, sym, result.label, result.score, amount, price)
                 try:
                     order = await self.connector.create_order(sym, close_side, amount,
                                                               pos_side=pos_side, reduce_only=True)
@@ -640,11 +662,12 @@ class TradingBot:
                     price=fill_price, amount=amount, pnl=pnl,
                     strategy=strategy, reason="health_weak", paper=self.paper,
                 ))
+                reason_str = result.details.get("reason", "") if result.label == "CRASH_GUARD" else ""
                 if self.telegram:
                     self.telegram.notify(
-                        f"⚠️ *Health WEAK* `{sym}` {pos.side.upper()} → closed early\n"
+                        f"⚠️ *Health {result.label}* `{sym}` {pos.side.upper()} → closed early\n"
                         f"Score {result.score:.0f}%  PnL≈`{pnl:+.2f}$`\n"
-                        f"Indicators: {_fmt_details(result.details)}"
+                        + (f"_{reason_str}_" if reason_str else f"Indicators: {_fmt_details(result.details)}")
                     )
             finally:
                 self._closing_positions.discard(close_key)
