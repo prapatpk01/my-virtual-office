@@ -175,6 +175,8 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "vol_mult":       cfg["tci_vol_mult"],
         }))
 
+    if not strategies:
+        raise RuntimeError("No strategies built — check SYMBOLS env var is not empty")
     logger.info("Strategies loaded: %s for symbols %s", [s.name for s in strategies], symbols)
     return strategies
 

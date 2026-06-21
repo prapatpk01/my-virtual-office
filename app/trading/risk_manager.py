@@ -268,6 +268,9 @@ class RiskManager:
                 "tp1_hit": p.tp1_hit,
                 "partial_pct": p.partial_pct,
                 "full_amount": p.full_amount,
+                "one_r": p.one_r,
+                "health_label": p.health_label,
+                "health_checks": p.health_checks,
             })
         return result
 

@@ -84,7 +84,8 @@ class PositionHealthMonitor:
     Designed to be called from the bot's monitor loop.
     """
 
-    TP_LADDER = [1.2, 1.5, 2.0, 2.5, 3.0]   # R-multiples from entry
+    TP1_LADDER = [0.5, 0.8, 1.0, 1.2, 1.5]  # R-multiples for TP1 advance (max 1.5R)
+    TP_LADDER  = [1.2, 1.5, 2.0, 2.5, 3.0]  # R-multiples for TP2 advance (after TP1 hit)
 
     def __init__(self, connector: "BaseConnector"):
         self.connector = connector
@@ -156,19 +157,18 @@ class PositionHealthMonitor:
         if ok_1h: total_score += 20
 
         # ── MTF composite bias (relaxed: ±30) ────────────────────────────────
-        mtf_score = _mtf_bias(df5["close"].iloc[-30:],
-                               df1h["close"].iloc[-30:],
-                               df4h["close"].iloc[-30:])
+        # Pass full series so EMA50 has proper warmup (df5=120 bars, 1h=80, 4h=60)
+        mtf_score = _mtf_bias(df5["close"], df1h["close"], df4h["close"])
         ok_bias = (mtf_score > 30) if is_long else (mtf_score < -30)
         details["MTF_bias"] = bool(ok_bias)
-        details["_mtf_val"] = round(float(mtf_score), 1)
+        details["_mtf_bias_val"] = round(float(mtf_score), 1)
         if ok_bias: total_score += 15
 
         # ── ADX (relaxed: > 20) ──────────────────────────────────────────────
         adx_val = _adx(df5.tail(60), 14)
         ok_adx = adx_val > 20
         details["ADX>20"] = bool(ok_adx)
-        details["_adx_val"] = round(adx_val, 1)
+        details["_adx>20_val"] = round(adx_val, 1)
         if ok_adx: total_score += 15
 
         # ── 5m close vs EMA9 ─────────────────────────────────────────────────
@@ -188,15 +188,29 @@ class PositionHealthMonitor:
         rsi_val = float(_rsi(df5["close"], 14).iloc[-1])
         ok_rsi = (rsi_val < 75) if is_long else (rsi_val > 25)
         details["RSI_ok"] = bool(ok_rsi)
-        details["_rsi_val"] = round(rsi_val, 1)
+        details["_rsi_ok_val"] = round(rsi_val, 1)
         if ok_rsi: total_score += 5
 
         return total_score, details
 
+    def next_tp1_level(self, entry: float, oneR: float, current_tp1: float, side: str) -> Optional[float]:
+        """
+        Before TP1 hit: advance TP1 one rung up TP1_LADDER (max 1.5R).
+        Returns None if already at 1.5R cap or no next level exists.
+        """
+        is_long = side == "long"
+        for r in self.TP1_LADDER:
+            tp = entry + r * oneR if is_long else entry - r * oneR
+            if is_long and tp > current_tp1 + oneR * 0.05:
+                return round(tp, 4)
+            if not is_long and tp < current_tp1 - oneR * 0.05:
+                return round(tp, 4)
+        return None  # already at 1.5R cap
+
     def next_tp_level(self, entry: float, oneR: float, current_tp: float, side: str) -> Optional[float]:
         """
-        Return the next TP level from the BULL ladder, or None if already at max.
-        Ladder is measured in R-multiples from entry (distance = oneR).
+        After TP1 hit: advance TP2 one rung up TP_LADDER (max 3.0R).
+        Returns None if already at max.
         """
         is_long = side == "long"
         for r in self.TP_LADDER:
@@ -205,7 +219,7 @@ class PositionHealthMonitor:
                 return round(tp, 4)
             if not is_long and tp < current_tp - oneR * 0.1:
                 return round(tp, 4)
-        return None   # already at max
+        return None  # already at 3.0R cap
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -222,7 +236,7 @@ def _to_df(candles: list) -> pd.DataFrame:
         rows = candles
     else:
         rows = [{"open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5]}
-                for c in candles]
+                for c in candles if len(c) >= 6]
     df = pd.DataFrame(rows)
     for col in ["open", "high", "low", "close", "volume"]:
         if col in df: df[col] = df[col].astype(float)

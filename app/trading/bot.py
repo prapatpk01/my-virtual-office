@@ -25,16 +25,18 @@ logger = logging.getLogger("trading_bot")
 
 
 def _fmt_details(d: dict) -> str:
-    """Format health indicator dict into a compact string for Telegram."""
-    skip = {k for k in d if k.startswith("_")}
-    vals = {k for k in d if k.startswith("_")}
+    """Format health indicator dict into a compact Telegram string.
+    Bool keys (no leading _) are shown with ✓/✗.
+    Companion numeric keys (leading _) are matched by exact name pattern.
+    """
     parts = []
     for k, v in d.items():
         if k.startswith("_"):
             continue
         icon = "✓" if v else "✗"
-        # find companion value key
-        vkey = f"_{k.lower().split('>')[0].split('<')[0]}_val"
+        # companion key convention: f"_{k.lower()}_val"
+        # e.g. "MTF_bias" → "_mtf_bias_val", "ADX>20" → "_adx>20_val"
+        vkey = f"_{k.lower()}_val"
         val_str = f"={d[vkey]:.1f}" if vkey in d else ""
         parts.append(f"{icon}{k}{val_str}")
     return "  ".join(parts)
@@ -83,6 +85,7 @@ class TradingBot:
         self._task: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._running = False
+        self._closing_positions: set[str] = set()  # keys being closed — prevents double-close
         self._balance = 0.0
         self._start_balance = 0.0
         self._pnl_total = 0.0
@@ -124,7 +127,7 @@ class TradingBot:
                 t.cancel()
                 try:
                     await t
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
                     pass
         if self.telegram:
             self.telegram.stop_polling()
@@ -359,6 +362,9 @@ class TradingBot:
         """Staged exit: TP1 closes part + moves SL→breakeven; TP2/breakeven/SL close the rest."""
         sym           = pos_info["symbol"]
         strategy_name = pos_info.get("strategy", "")
+        close_key     = f"{sym}||{strategy_name}"
+        if close_key in self._closing_positions:
+            return  # health monitor already sent a close order — skip
         pos = self.risk.get_position_obj(sym, strategy_name)
         if pos is None:
             return
@@ -509,31 +515,57 @@ class TradingBot:
         """Act on a health check result: extend TP or close early."""
         sym = pos.symbol
 
-        # ── BULL: try to advance TP2 one rung up the ladder ──────────────────
-        if result.action == "EXTEND_TP" and pos.tp1_hit:
+        # ── BULL: advance TP1 (before hit, max 1.5R) or TP2 (after hit) ────────
+        if result.action == "EXTEND_TP":
             one_r = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
-            new_tp = monitor.next_tp_level(pos.entry_price, one_r,
-                                           pos.tp2 or pos.take_profit or 0.0, pos.side)
-            if new_tp and new_tp != pos.tp2:
-                old_tp = pos.tp2
-                pos.tp2 = new_tp
-                logger.info("[MONITOR] %s %s BULL → TP2 extended %.4f → %.4f",
-                            strategy, sym, old_tp or 0, new_tp)
-                if self.telegram:
-                    self.telegram.send_message(
-                        f"📈 *Health BULL* `{sym}` {pos.side.upper()}\n"
-                        f"Score {result.score:.0f}%  TP2 extended: `{old_tp:.2f}` → `{new_tp:.2f}`\n"
-                        f"Indicators: {_fmt_details(result.details)}"
-                    )
+            if not pos.tp1_hit:
+                # Before TP1: raise TP1 one step (cap 1.5R) so we bank at a better price
+                new_tp1 = monitor.next_tp1_level(pos.entry_price, one_r,
+                                                  pos.tp1 or pos.take_profit or 0.0, pos.side)
+                if new_tp1 and new_tp1 != pos.tp1:
+                    old_tp1 = pos.tp1
+                    pos.tp1 = new_tp1
+                    # NOTE: OKX algo-order for TP1 is not updated on the exchange;
+                    # stage_check() uses pos.tp1 for the bot-side trigger only.
+                    # On live accounts the exchange's original TP order at old_tp1
+                    # will fire first if price reaches it before the new level.
+                    logger.info("[MONITOR] %s %s BULL (pre-TP1) → TP1 raised %.4f → %.4f (max 1.5R)",
+                                strategy, sym, old_tp1 or 0, new_tp1)
+                    if self.telegram:
+                        self.telegram.send_message(
+                            f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(pre-TP1)_\n"
+                            f"Score {result.score:.0f}%  TP1 raised: `{old_tp1:.2f}` → `{new_tp1:.2f}` _(max 1.5R)_\n"
+                            f"Indicators: {_fmt_details(result.details)}"
+                        )
+            else:
+                # After TP1: runner is at BE — extend TP2 up the ladder (max 3.0R)
+                new_tp = monitor.next_tp_level(pos.entry_price, one_r,
+                                               pos.tp2 or pos.take_profit or 0.0, pos.side)
+                if new_tp and new_tp != pos.tp2:
+                    old_tp = pos.tp2
+                    pos.tp2 = new_tp
+                    logger.info("[MONITOR] %s %s BULL (runner) → TP2 extended %.4f → %.4f",
+                                strategy, sym, old_tp or 0, new_tp)
+                    if self.telegram:
+                        self.telegram.send_message(
+                            f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(runner)_\n"
+                            f"Score {result.score:.0f}%  TP2 extended: `{old_tp:.2f}` → `{new_tp:.2f}`\n"
+                            f"Indicators: {_fmt_details(result.details)}"
+                        )
             return
 
         # ── WEAK: force-close position ────────────────────────────────────────
         if result.action == "CLOSE":
+            close_key = f"{sym}||{strategy}"
+            if close_key in self._closing_positions:
+                return  # already being closed by _check_stop or prior health check
+            self._closing_positions.add(close_key)
             try:
                 ticker = await self.connector.fetch_ticker(sym)
                 price  = float(ticker["last"])
             except Exception as e:
                 logger.warning("[MONITOR] %s ticker failed during health-close: %s", sym, e)
+                self._closing_positions.discard(close_key)
                 return
 
             is_long    = pos.side == "long"
@@ -557,6 +589,7 @@ class TradingBot:
                                      reason="health_weak", strategy=strategy)
             self._sig.unlock_strategy(sym, strategy)
             self.risk.close_position(sym, strategy=strategy)
+            self._closing_positions.discard(f"{sym}||{strategy}")
             self._record_trade(TradeRecord(
                 timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
                 price=price, amount=amount, pnl=pnl,
