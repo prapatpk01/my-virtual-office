@@ -447,7 +447,7 @@ class TradingBot:
                 if self.telegram:
                     self.telegram.notify_trade_closed(
                         sym, "take_profit1", price, pos.entry_price,
-                        pos.stop_loss, pos.tp1, self._sig.summary())
+                        pos.stop_loss, pos.tp1, self._sig.summary(), side=pos.side)
                 return
 
             # ── Terminal: stop_loss / breakeven / take_profit2 → close remainder ──
@@ -487,7 +487,7 @@ class TradingBot:
             if self.telegram:
                 self.telegram.notify_trade_closed(
                     sym, trigger, price, pos.entry_price,
-                    pos.stop_loss, pos.take_profit, self._sig.summary())
+                    pos.stop_loss, pos.take_profit, self._sig.summary(), side=pos.side)
         finally:
             self._closing_positions.discard(close_key)
 

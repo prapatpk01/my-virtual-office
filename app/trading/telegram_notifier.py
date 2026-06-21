@@ -149,15 +149,24 @@ class TelegramNotifier:
         )
         self.notify(text)
 
+    # Map close reason → (emoji, label)
+    _CLOSE_LABEL: dict[str, tuple[str, str]] = {
+        "take_profit":  ("✅", "Take-Profit Hit"),
+        "take_profit1": ("✅", "TP1 Hit (partial)"),
+        "take_profit2": ("✅", "TP2 Hit (runner)"),
+        "breakeven":    ("🔵", "Breakeven Exit"),
+        "health_weak":  ("⚠️", "Health WEAK — Early Exit"),
+        "stop_loss":    ("❌", "Stop-Loss Hit"),
+    }
+
     def notify_trade_closed(self, symbol: str, reason: str, exit_price: float,
-                            entry: float, sl, tp, stats: dict):
-        """Called when a position closes via SL or TP. Full detail + running stats."""
-        won   = reason == "take_profit"
-        emoji = "✅" if won else "❌"
-        label = "Take-Profit Hit" if won else "Stop-Loss Hit"
-        risk  = abs(entry - sl) if sl else 1.0
-        pnl_r = abs(exit_price - entry) / risk if won else -1.0
-        sign  = "+" if pnl_r >= 0 else ""
+                            entry: float, sl, tp, stats: dict, side: str = "long"):
+        """Called when a position closes via SL, TP, or health monitor."""
+        emoji, label = self._CLOSE_LABEL.get(reason, ("❌", f"Closed ({reason})"))
+        risk      = abs(entry - sl) if sl and sl != entry else abs(entry * 0.02)
+        direction = 1 if side == "long" else -1
+        pnl_r     = direction * (exit_price - entry) / risk
+        sign      = "+" if pnl_r >= 0 else ""
 
         sl_str = f"`{sl:,.4f}`" if sl else "—"
         tp_str = f"`{tp:,.4f}`" if tp else "—"
@@ -482,10 +491,18 @@ class TelegramNotifier:
             if not recent:
                 lines.append("_(รอ SL/TP hit ครั้งแรก)_")
             else:
+                _reason_short = {
+                    "take_profit":  "TP",
+                    "take_profit1": "TP1",
+                    "take_profit2": "TP2",
+                    "breakeven":    "BE",
+                    "health_weak":  "WEAK",
+                    "stop_loss":    "SL",
+                }
                 for o in reversed(recent):
-                    e     = "✅" if o["pnl_r"] > 0 else "❌"
+                    e     = "✅" if o["pnl_r"] > 0 else ("🔵" if o["pnl_r"] == 0 else "❌")
                     sr    = "+" if o["pnl_r"] >= 0 else ""
-                    label = "TP" if o["reason"] == "take_profit" else "SL"
+                    label = _reason_short.get(o["reason"], o["reason"])
                     strat = o.get("strategy", "")
                     tag   = f" `[{strat}]`" if strat else ""
                     lines.append(
