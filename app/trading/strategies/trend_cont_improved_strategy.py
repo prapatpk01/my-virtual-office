@@ -261,6 +261,17 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out["final_sell"] = (macro_dn  & mid_dn  & at_pull_short & short_bias_ok &
                           (score_short >= p["min_score"]) & adx_ok).fillna(False)
 
+    # Diagnostic columns — each layer's pass/fail for the last bar
+    out["d_macro_up"]  = macro_up.fillna(False)
+    out["d_macro_dn"]  = macro_dn.fillna(False)
+    out["d_mid_up"]    = mid_up.fillna(False)
+    out["d_mid_dn"]    = mid_dn.fillna(False)
+    out["d_pull_l"]    = at_pull_long.fillna(False)
+    out["d_pull_s"]    = at_pull_short.fillna(False)
+    out["d_bias_l"]    = long_bias_ok.fillna(False)
+    out["d_bias_s"]    = short_bias_ok.fillna(False)
+    out["d_adx_ok"]    = adx_ok.fillna(False)
+
     dist = (out["atr"] * p["sl_mult"]).clip(
         lower=out["close"] * p["sl_min_pct"],
         upper=out["close"] * p["sl_max_pct"],
@@ -344,7 +355,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         adx_min_fast=18,          # ADX threshold (was 20/30)
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
         pullback_pct_fast=0.018,  # 1H EMA20 zone ±1.8% (was 1.0%)
-        bias_gate_fast=70.0,      # MTF bias gate — tuned to 70 (grid: best combined PnL + low DD)
+        bias_gate_fast=60.0,      # MTF bias gate — 60 is live-calibrated (grid winner was 70 but too strict for live market phases)
         tp2_r_fast=3.0,           # FAST runner target 3.0R (grid winner; lets trends run further)
         cooldown_bars=5,          # whipsaw cooldown: block N bars after signal
         # crash-guard
@@ -435,9 +446,17 @@ class TrendContImprovedStrategy(BaseStrategy):
         buy  = bool(last["final_buy"])
         sell = bool(last["final_sell"])
         if not buy and not sell:
-            adx_v = float(last.get("adx15", 0) or 0)
+            adx_v  = float(last.get("adx15", 0) or 0)
+            bias_v = float(last.get("comp_pct", 0) or 0)
+            sc_l   = float(last.get("score_long", 0) or 0)
+            sc_s   = float(last.get("score_short", 0) or 0)
+            gate   = p["bias_gate_fast"] if p.get("fast_mode") else p["bias_gate"]
+            _y = lambda k: "✓" if last.get(k) else "✗"
+            long_layers  = f"4H{_y('d_macro_up')} 1H{_y('d_mid_up')} pull{_y('d_pull_l')} bias{_y('d_bias_l')} adx{_y('d_adx_ok')}"
+            short_layers = f"4H{_y('d_macro_dn')} 1H{_y('d_mid_dn')} pull{_y('d_pull_s')} bias{_y('d_bias_s')} adx{_y('d_adx_ok')}"
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                          f"[TCImproved] ADX={adx_v:.0f} no signal")
+                          f"[TCImproved] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f} "
+                          f"score={sc_l:.0f}L/{sc_s:.0f}S | L:{long_layers} | S:{short_layers}")
 
         dist = float(last["dist"])
         if dist <= 0 or np.isnan(dist):

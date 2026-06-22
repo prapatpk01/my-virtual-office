@@ -242,7 +242,7 @@ class TradingBot:
         }
 
         if signal.type == SignalType.HOLD:
-            logger.debug("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:80])
+            logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:120])
             return sig_dict
 
         await self._handle_signal(signal, sig_dict, strategy.name)

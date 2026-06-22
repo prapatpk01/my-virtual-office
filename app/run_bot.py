@@ -122,9 +122,9 @@ def build_config() -> dict:
         # Strict: 15m swing pullback parameters
         "tci_swing_lookback":   _env_int("TCI_SWING_LOOKBACK",     4),     # rolling bars (4×15m = 1h)
         "tci_swing_pct":        _env_float("TCI_SWING_PCT",        0.006), # 0.6% from swing extreme
-        # Fast mode v2 (grid-tuned: bias 70 + TP2 3.0R = best combined PnL, low DD)
+        # Fast mode v2 (grid winner: bias 70 + TP2 3.0R; live default: 60 to avoid signal drought)
         "tci_fast_mode":        _env_bool("TCI_FAST_MODE",         False),
-        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   70.0), # bias gate (tuned 40→70)
+        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   60.0), # live-calibrated (grid=70 too strict)
         "tci_fast_tp2_r":       _env_float("TCI_FAST_TP2_R",       3.0),  # FAST runner target (strict=2.5)
         "tci_adx_rising":       _env_bool("TCI_ADX_RISING",        True),  # require ADX[0]>ADX[1]
         "tci_cooldown_bars":    _env_int("TCI_COOLDOWN_BARS",       5),    # whipsaw cooldown bars
@@ -132,7 +132,7 @@ def build_config() -> dict:
         "tci_health_guard":     _env_bool("TCI_HEALTH_GUARD",      True),
         "tci_health_uw_frac":   _env_float("TCI_HEALTH_UW_FRAC",  0.7),   # R underwater to trigger
         "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # strict mode bias flip
-        # (fast mode uses tci_fast_bias_gate=40 automatically)
+        # (fast mode uses tci_fast_bias_gate automatically)
 
         # ── Position health monitor ───────────────────────────────────────────
         # Re-checks every open position using 5m+1h+4h candles (relaxed thresholds).
