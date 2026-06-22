@@ -528,15 +528,17 @@ class TradingBot:
                 continue
 
             # Pre-fetch once per symbol across all TFs
-            for tf in ("5m", "1h", "4h"):
+            for tf in ("3m", "5m", "1h", "4h"):
                 key = (sym, tf)
                 if key not in candle_cache:
                     try:
-                        candle_cache[key] = await self.connector.fetch_ohlcv(sym, tf, limit=120)
+                        lim = 80 if tf == "3m" else 120
+                        candle_cache[key] = await self.connector.fetch_ohlcv(sym, tf, limit=lim)
                     except Exception as e:
                         logger.warning("[MONITOR] %s %s fetch failed: %s", sym, tf, e)
                         candle_cache[key] = []
 
+            c3m = candle_cache.get((sym, "3m"), [])
             c5m = candle_cache.get((sym, "5m"), [])
             c1h = candle_cache.get((sym, "1h"), [])
             c4h = candle_cache.get((sym, "4h"), [])
@@ -548,7 +550,8 @@ class TradingBot:
             if strat_obj and hasattr(strat_obj, "monitor_position"):
                 one_r = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
                 cg_action, cg_reason = strat_obj.monitor_position(
-                    pos.side, pos.entry_price, one_r, pos.tp1_hit, c5m, c1h, c4h
+                    pos.side, pos.entry_price, one_r, pos.tp1_hit,
+                    c5m, c1h, c4h, candles_3m=c3m,
                 )
                 if cg_action == "CLOSE":
                     cg_result = HealthResult(score=0.0, label="CRASH_GUARD",

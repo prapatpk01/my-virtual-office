@@ -329,6 +329,42 @@ def check_health(side: str, entry: float, one_r: float, tp1_hit: bool,
             f"{uw:.2f}R underwater but momentum not confirmed against — hold for SL/recovery")
 
 
+# ── REVERSAL SPIKE-CUT ────────────────────────────────────────────────────────
+
+def check_spike_cut(side: str, entry: float, one_r: float,
+                    df3m: pd.DataFrame,
+                    spike_atr_mult: float = 1.5,
+                    spike_bars: int = 4) -> tuple[str, str]:
+    """
+    Fast adverse-move detector using 3m candles.
+    Fires when price moves ≥ spike_atr_mult×ATR(3m) against the position
+    within spike_bars×3m (default 4×3m = 12 min). No minimum loss required.
+    """
+    min_bars = spike_bars + 15          # need enough history for ATR(14)
+    if df3m is None or len(df3m) < min_bars:
+        return ("HOLD", "insufficient 3m data for spike-cut")
+
+    atr3 = float(_atr(df3m, 14).iloc[-1])
+    if atr3 <= 0:
+        return ("HOLD", "invalid ATR(3m) — spike-cut skipped")
+
+    px_now  = float(df3m["close"].iloc[-1])
+    px_prev = float(df3m["close"].iloc[-(spike_bars + 1)])
+
+    # Adverse move: down for long, up for short
+    adverse_move = (px_prev - px_now) if side == "long" else (px_now - px_prev)
+    move_r = adverse_move / atr3
+
+    if move_r >= spike_atr_mult:
+        uw = ((entry - px_now) / one_r if side == "long"
+              else (px_now - entry) / one_r)
+        return ("CLOSE",
+                f"SPIKE-CUT: {move_r:.1f}×ATR(3m) adverse in {spike_bars}bars "
+                f"(uw={uw:.2f}R, atr={atr3:.2f})")
+    return ("HOLD",
+            f"spike {move_r:.2f}×ATR < {spike_atr_mult}×ATR — safe")
+
+
 # ── BaseStrategy wrapper ─────────────────────────────────────────────────────
 
 class TrendContImprovedStrategy(BaseStrategy):
@@ -367,6 +403,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         health_guard_enabled=True,
         health_underwater_frac=0.7,
         health_bias_flip=50.0,    # used in strict mode; fast mode uses bias_gate_fast
+        # reversal spike-cut (3m × 4 bars = 12 min window)
+        reversal_spike_enabled=True,
+        reversal_spike_atr=1.5,   # adverse move must be ≥ N×ATR(3m)
+        reversal_spike_bars=4,    # window in 3m bars (4×3m = 12 min)
     )
 
     def __init__(self, symbol: str, params: dict = None):
@@ -391,20 +431,35 @@ class TrendContImprovedStrategy(BaseStrategy):
         return df
 
     def monitor_position(self, side: str, entry: float, one_r: float, tp1_hit: bool,
-                         candles_5m: list, candles_1h: list, candles_4h: list) -> tuple[str, str]:
+                         candles_5m: list, candles_1h: list, candles_4h: list,
+                         candles_3m: list = None) -> tuple[str, str]:
         """
-        Crash-guard health check. Returns ('CLOSE'|'HOLD', reason).
-        Call from bot's monitor loop every ~180s.
-        bias_flip: uses bias_gate_fast (40) in fast mode, health_bias_flip (50) in strict.
+        Guard stack (checked in order, first CLOSE wins):
+          1. Spike-Cut   — fast adverse ≥1.5×ATR(3m) in 12 min (pre-TP1 only)
+          2. Crash-Guard — 0.7R underwater + momentum fully reversed
+        Returns ('CLOSE'|'HOLD', reason).
         """
         if not self._p["health_guard_enabled"]:
             return ("HOLD", "health guard disabled")
         if not candles_5m or not candles_1h or not candles_4h:
             return ("HOLD", "no candle data")
+
+        # ── Layer 1: Spike-Cut (3m, pre-TP1 only) ─────────────────────────────
+        if (self._p.get("reversal_spike_enabled") and not tp1_hit
+                and candles_3m and one_r > 0):
+            df3m = self._to_df(candles_3m)
+            sc_action, sc_reason = check_spike_cut(
+                side, entry, one_r, df3m,
+                spike_atr_mult=self._p["reversal_spike_atr"],
+                spike_bars=self._p["reversal_spike_bars"],
+            )
+            if sc_action == "CLOSE":
+                return ("CLOSE", sc_reason)
+
+        # ── Layer 2: Crash-Guard (0.7R + full reversal) ────────────────────────
         df5  = self._to_df(candles_5m)
         df1h = self._to_df(candles_1h)
         df4h = self._to_df(candles_4h)
-        # Fast mode: crash-guard flip threshold mirrors entry gate (bias_gate_fast)
         bias_flip = (self._p["bias_gate_fast"] if self._p.get("fast_mode")
                      else self._p["health_bias_flip"])
         return check_health(

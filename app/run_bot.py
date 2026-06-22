@@ -135,6 +135,9 @@ def build_config() -> dict:
         # Crash-guard (both modes)
         "tci_health_guard":     _env_bool("TCI_HEALTH_GUARD",      True),
         "tci_health_uw_frac":   _env_float("TCI_HEALTH_UW_FRAC",  0.7),   # R underwater to trigger
+        "reversal_spike_enabled": _env_bool("REVERSAL_SPIKE_ENABLED", True),
+        "reversal_spike_atr":   _env_float("REVERSAL_SPIKE_ATR",   1.5),  # ×ATR(3m) threshold
+        "reversal_spike_bars":  _env_int("REVERSAL_SPIKE_BARS",    4),    # window: 4×3m = 12 min
         "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # strict bias flip (fast uses bias_gate_fast)
 
         # ── Position health monitor ───────────────────────────────────────────
@@ -215,6 +218,9 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "health_guard_enabled":   cfg["tci_health_guard"],
             "health_underwater_frac": cfg["tci_health_uw_frac"],
             "health_bias_flip":       cfg["tci_health_bias_flip"],
+            "reversal_spike_enabled": cfg["reversal_spike_enabled"],
+            "reversal_spike_atr":     cfg["reversal_spike_atr"],
+            "reversal_spike_bars":    cfg["reversal_spike_bars"],
         }))
 
     if not strategies:
