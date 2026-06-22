@@ -91,6 +91,14 @@ def build_config() -> dict:
         "paper":       _env_bool("PAPER_TRADING", False),
         "market_type": os.environ.get("MARKET_TYPE", "swap"),  # "swap" = perpetual futures
         "leverage":    _env_int("LEVERAGE", 20),
+        # Per-symbol leverage override (XAU max gap ~4.6% → recommend ≤10x at 20x global).
+        # Format: "XAU/USDT:USDT=10,BTC/USDT:USDT=20"
+        "symbol_leverage": {
+            k.strip(): int(v.strip())
+            for pair in os.environ.get("SYMBOL_LEVERAGE", "XAU/USDT:USDT=10").split(",")
+            if "=" in pair
+            for k, v in [pair.split("=", 1)]
+        },
 
         # ── Symbols ───────────────────────────────────────────────────────────
         # Both BTC and XAU active by default.
@@ -253,6 +261,7 @@ async def main():
         passphrase=cfg["api_passphrase"],
         market_type=cfg["market_type"],
         leverage=cfg["leverage"],
+        symbol_leverage=cfg["symbol_leverage"],
     )
 
     # ── Strategies ────────────────────────────────────────────────────────────

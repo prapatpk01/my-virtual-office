@@ -31,12 +31,14 @@ class BinanceConnector(BaseConnector):
                  passphrase: str = "",
                  margin_mode: str = "",    # "cross" | "isolated" | "" (spot)
                  market_type: str = "",    # "swap" | "futures" | "" (spot/margin)
-                 leverage: int = 1):
+                 leverage: int = 1,
+                 symbol_leverage: dict | None = None):  # per-symbol override e.g. {"XAU/USDT:USDT": 10}
         super().__init__(api_key, api_secret, paper)
         self._exchange_id  = exchange_id
         self._margin_mode  = margin_mode.lower()
         self._market_type  = market_type.lower()
         self._leverage     = leverage
+        self._symbol_leverage: dict[str, int] = symbol_leverage or {}
         self._futures      = self._market_type in ("swap", "futures")
 
         # defaultType drives which OKX endpoint CCXT hits
@@ -89,19 +91,42 @@ class BinanceConnector(BaseConnector):
     # Leverage / margin setup (called once per symbol on first order)
     # ──────────────────────────────────────────────────────────────────
 
-    async def _ensure_leverage(self, symbol: str):
+    async def ensure_hedge_mode(self) -> None:
+        """
+        Verify OKX account is in long_short_mode (hedge mode). Raises RuntimeError
+        if not — every posSide order will be rejected by OKX error 51000 otherwise.
+        No-op for paper trading or non-OKX exchanges.
+        """
+        if self.paper or self._exchange_id != "okx" or not self._futures:
+            return
+        try:
+            await self._exchange.load_markets()
+            resp = await self._exchange.private_get_account_config()
+            pos_mode = resp.get("data", [{}])[0].get("posMode", "unknown")
+        except Exception as e:
+            logger.warning("[Connector] Could not verify OKX posMode: %s — assuming hedge mode is set", e)
+            return
+        if pos_mode != "long_short_mode":
+            raise RuntimeError(
+                f"OKX account is in '{pos_mode}' mode — must be 'long_short_mode' (hedge mode). "
+                "Go to OKX → Account → Settings → Position Mode → Hedge Mode, then restart the bot."
+            )
+        logger.info("[Connector] OKX posMode=long_short_mode ✓")
+
+    async def _ensure_leverage(self, symbol: str, override_leverage: int = 0):
         """Set leverage on OKX (once per symbol per session)."""
         if self._exchange_id != "okx":
             return
         if symbol in self._leverage_set:
             return
+        lev = override_leverage if override_leverage > 0 else self._leverage
         if self._futures:
             # OKX hedge mode: must set leverage for BOTH sides; fail hard if either fails.
             failed = []
             for ps in ("long", "short"):
                 try:
                     await self._exchange.set_leverage(
-                        self._leverage, symbol,
+                        lev, symbol,
                         params={"mgnMode": "isolated", "posSide": ps},
                     )
                 except Exception as e:
@@ -111,11 +136,11 @@ class BinanceConnector(BaseConnector):
                 raise RuntimeError(
                     f"Could not set leverage for {symbol} side(s) {failed} — cannot place orders safely"
                 )
-            logger.info("OKX futures leverage: %s × %dx (long+short)", symbol, self._leverage)
+            logger.info("OKX futures leverage: %s × %dx (long+short)", symbol, lev)
         elif self._margin_mode:
             try:
                 await self._exchange.set_leverage(
-                    self._leverage, symbol,
+                    lev, symbol,
                     params={"mgnMode": self._margin_mode},
                 )
                 logger.info("OKX margin leverage: %s × %dx %s", symbol, self._leverage, self._margin_mode)
@@ -156,7 +181,7 @@ class BinanceConnector(BaseConnector):
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price, pos_side)
 
-        await self._ensure_leverage(symbol)
+        await self._ensure_leverage(symbol, override_leverage=self._symbol_leverage.get(symbol, 0))
 
         params: dict = {}
         if order_type == "limit" and price:

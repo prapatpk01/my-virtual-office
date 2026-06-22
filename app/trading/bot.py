@@ -109,6 +109,10 @@ class TradingBot:
     async def start(self):
         if self._task and not self._task.done():
             return
+        # Verify OKX account is in hedge mode before starting — raises RuntimeError
+        # if posMode != long_short_mode (every posSide order would fail with 51000).
+        if hasattr(self.connector, "ensure_hedge_mode"):
+            await self.connector.ensure_hedge_mode()
         self._running = True
         loop = asyncio.get_event_loop()
         if self.telegram:
