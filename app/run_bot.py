@@ -2,22 +2,24 @@
 OKX Perpetual Futures trading bot runner.
 
 Active strategy (1):
-  TrendContImproved — 15m entry / 1H+4H MTF — trend pullback + ADX(15m)>30 gate
-                      TP1=0.5R (40%), SL→BE, TP2=2.5R (60% runner)
-                      Backtest Jan-May 2026 BTC: 142 trades, WR 77.5%, +$184.54, MaxDD -6.3%
-                      Backtest Jan-May 2026 XAU:  99 trades, WR 69.7%, +$48.39,  MaxDD -16.2%
+  TrendContImproved v2 — 15m entry / 1H+4H MTF
+  STRICT (default): 15m swing pullback (4-bar low/high ±0.6%) + ADX(15m)>30
+                    TP1=0.5R (40%), SL→BE, TP2=2.5R (60% runner)
+                    Backtest Jan-May 2026 BTC: 142 trades, WR 77.5%, +$212.95, MaxDD 6.4%
+                    Backtest Jan-May 2026 XAU:  99 trades, WR 69.7%, +$67.54,  MaxDD 16.3%
+  FAST v2:         1H EMA20 ±1.8% + bias>40 + ADX>18 rising + 5-bar cooldown
 
 Symbols      : BTC/USDT:USDT, XAU/USDT:USDT  (configurable via SYMBOLS)
 Exchange     : OKX, swap market, isolated margin, hedge mode
 Max positions: 2 (one per symbol at a time)
 
-Position Health Monitor (NEW):
+Position Health Monitor:
   Re-evaluates every open position every MONITOR_INTERVAL seconds (default 180 = 3 min).
   Uses 5m + 1h + 4h candles with RELAXED indicator thresholds:
     BULL    (score ≥ 85%): TP2 ladder extended (1.2→1.5→2.0→2.5→3.0R)
-    NEUTRAL (score 50–84%): hold position unchanged
-    CAUTION (score 40–49%): hold, watch closely
-    WEAK    (score < 40%): close position immediately — better than SL
+    NEUTRAL (score 45–84%): hold position unchanged
+    WEAK    (score < 45%): 2-bar confirm then close — better than SL
+  Crash-guard: closes immediately if ≥0.7R underwater + 5m momentum strongly reversed.
 
 Config via Railway environment variables.
 """
@@ -96,8 +98,9 @@ def build_config() -> dict:
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
 
         # ── TrendCont Improved v2 (15m primary + 1h + 4h MTF) ───────────────────
-        # Trend-pullback to 1H EMA20 + 4H macro trend + ADX(15m)>30 filter.
-        # TP1=0.5R (close 40%), SL→BE, TP2=2.5R (runner 60%).
+        # STRICT: 15m swing pullback (4-bar low/high ±0.6%) + ADX>30.
+        # FAST v2: 1H EMA20 ±1.8% + bias>40 + ADX>18 rising + 5-bar cooldown.
+        # Exit (both modes): TP1=0.5R (40% → SL→BE), TP2=2.5R (60% runner).
         "tci_bias_gate":        _env_float("TCI_BIAS_GATE",        70.0),
         "tci_adx_min":          _env_int("TCI_ADX_MIN",            30),
         "tci_sl_mult":          _env_float("TCI_SL_MULT",          1.2),
@@ -106,14 +109,21 @@ def build_config() -> dict:
         "tci_tp1_r":            _env_float("TCI_TP1_R",            0.5),
         "tci_tp1_fraction":     _env_float("TCI_TP1_FRACTION",     0.40),
         "tci_tp2_r":            _env_float("TCI_TP2_R",            2.5),
-        "tci_min_score":        _env_float("TCI_MIN_SCORE",        4.0),   # sum of enabled indicator weights
+        "tci_min_score":        _env_float("TCI_MIN_SCORE",        4.0),
         "tci_vol_mult":         _env_float("TCI_VOL_MULT",         1.0),
-        # v2: fast mode (looser ADX+pullback — lower WR, more signals; default OFF)
+        # Strict: 15m swing pullback parameters
+        "tci_swing_lookback":   _env_int("TCI_SWING_LOOKBACK",     4),     # rolling bars (4×15m = 1h)
+        "tci_swing_pct":        _env_float("TCI_SWING_PCT",        0.006), # 0.6% from swing extreme
+        # Fast mode v2
         "tci_fast_mode":        _env_bool("TCI_FAST_MODE",         False),
-        # v2: crash-guard (close when ≥0.7R underwater + 5m momentum reversed)
+        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   40.0), # bias gate (strict=70)
+        "tci_adx_rising":       _env_bool("TCI_ADX_RISING",        True),  # require ADX[0]>ADX[1]
+        "tci_cooldown_bars":    _env_int("TCI_COOLDOWN_BARS",       5),    # whipsaw cooldown bars
+        # Crash-guard (both modes)
         "tci_health_guard":     _env_bool("TCI_HEALTH_GUARD",      True),
         "tci_health_uw_frac":   _env_float("TCI_HEALTH_UW_FRAC",  0.7),   # R underwater to trigger
-        "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # MTF bias threshold
+        "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # strict mode bias flip
+        # (fast mode uses tci_fast_bias_gate=40 automatically)
 
         # ── Position health monitor ───────────────────────────────────────────
         # Re-checks every open position using 5m+1h+4h candles (relaxed thresholds).
@@ -163,23 +173,31 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
     strategies = []
     for sym in symbols:
         strategies.append(TrendContImprovedStrategy(sym, params={
-            "name":                 "TrendContImproved",
-            "tf":                   "15m",
-            "limit":                500,
-            "bias_gate":            cfg["tci_bias_gate"],
-            "adx_min":              cfg["tci_adx_min"],
-            "sl_mult":              cfg["tci_sl_mult"],
-            "sl_min_pct":           cfg["tci_sl_min_pct"],
-            "sl_max_pct":           cfg["tci_sl_max_pct"],
-            "tp1_r":                cfg["tci_tp1_r"],
-            "tp1_fraction":         cfg["tci_tp1_fraction"],
-            "tp2_r":                cfg["tci_tp2_r"],
-            "min_score":            cfg["tci_min_score"],
-            "vol_mult":             cfg["tci_vol_mult"],
-            "fast_mode":            cfg["tci_fast_mode"],
-            "health_guard_enabled": cfg["tci_health_guard"],
+            "name":                   "TrendContImproved",
+            "tf":                     "15m",
+            "limit":                  500,
+            "bias_gate":              cfg["tci_bias_gate"],
+            "adx_min":                cfg["tci_adx_min"],
+            "sl_mult":                cfg["tci_sl_mult"],
+            "sl_min_pct":             cfg["tci_sl_min_pct"],
+            "sl_max_pct":             cfg["tci_sl_max_pct"],
+            "tp1_r":                  cfg["tci_tp1_r"],
+            "tp1_fraction":           cfg["tci_tp1_fraction"],
+            "tp2_r":                  cfg["tci_tp2_r"],
+            "min_score":              cfg["tci_min_score"],
+            "vol_mult":               cfg["tci_vol_mult"],
+            # Strict: 15m swing pullback
+            "swing_lookback":         cfg["tci_swing_lookback"],
+            "swing_pct":              cfg["tci_swing_pct"],
+            # Fast mode v2
+            "fast_mode":              cfg["tci_fast_mode"],
+            "bias_gate_fast":         cfg["tci_fast_bias_gate"],
+            "adx_rising_fast":        cfg["tci_adx_rising"],
+            "cooldown_bars":          cfg["tci_cooldown_bars"],
+            # Crash-guard
+            "health_guard_enabled":   cfg["tci_health_guard"],
             "health_underwater_frac": cfg["tci_health_uw_frac"],
-            "health_bias_flip":     cfg["tci_health_bias_flip"],
+            "health_bias_flip":       cfg["tci_health_bias_flip"],
         }))
 
     if not strategies:
@@ -303,8 +321,14 @@ async def main():
                     "sl_mult": cfg["tci_sl_mult"], "sl_min_pct": cfg["tci_sl_min_pct"],
                     "sl_max_pct": cfg["tci_sl_max_pct"],
                     "tp1_r": cfg["tci_tp1_r"], "tp1_fraction": cfg["tci_tp1_fraction"],
-                    "tp2_r": cfg["tci_tp2_r"], "min_entry_cond": cfg["tci_min_entry_cond"],
+                    "tp2_r": cfg["tci_tp2_r"], "min_score": cfg["tci_min_score"],
                     "vol_mult": cfg["tci_vol_mult"],
+                    "swing_lookback": cfg["tci_swing_lookback"],
+                    "swing_pct": cfg["tci_swing_pct"],
+                    "fast_mode": cfg["tci_fast_mode"],
+                    "bias_gate_fast": cfg["tci_fast_bias_gate"],
+                    "adx_rising_fast": cfg["tci_adx_rising"],
+                    "cooldown_bars": cfg["tci_cooldown_bars"],
                 })
                 trades, _ = await backtest_strategy_mtf_v2(
                     tci, c15m, {"1h": c1h, "4h": c4h}, notional,

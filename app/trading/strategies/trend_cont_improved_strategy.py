@@ -2,32 +2,49 @@
 TrendContinuation Improved v2 — 15m primary + 1h/4h MTF.
 
 Primary: 15m candles. MTF: 1h + 4h.
-Core: ADX(14, 15m) > 30 gate. Partial exit: TP1=0.5R (40%), SL→BE, TP2=2.5R (60%).
+Core: ADX(14, 15m) gate. Partial exit: TP1=0.5R (40%), SL→BE, TP2=2.5R (60%).
 
 ═══════════════════════════════════════════════════════════════════════════════
-CHANGES IN v2 vs v1:
+TWO MODES
 
-1. MODULAR INDICATOR SYSTEM (INDICATORS dict + WEIGHTS):
-   Every entry sub-signal is a named, toggleable component with a weight.
-   Set enabled=False to drop one, change weight to reweight. The entry gate
-   requires the SUM of enabled weights that pass >= min_score.
+STRICT (default, fast_mode=False) — Strict + Swing(15m) Fast Pullback
+  Layer 1  4H macro trend   EMA20(4H) vs EMA50(4H)
+  Layer 2  1H mid trend     EMA20(1H) vs EMA50(1H)
+  Layer 3  15m swing pull   close within 0.6% of rolling 4-bar swing low/high
+             Long : (close − low4) / low4  ≤ 0.6%
+             Short: (high4 − close) / high4 ≤ 0.6%
+             (tracks price vs recent 1-hour extreme — faster than 1H EMA20)
+  Layer 4  MTF bias > ±70   vote(15m)+vote(1h)+vote(4h)
+  Layer 5  ADX(14,15m) > 30
+  Layer 6  micro score ≥ 4  EMA9 / EMA20 / RSI-band / Volume
 
-2. OPTIONAL "FAST MODE" (fast_mode param, default False):
-   Loosens ADX 30→20 and pullback 1.0%→1.5% for more signals.
-   WARNING: BTC WR 77.5%→71.4%, XAU goes NEGATIVE. Default stays STRICT.
+FAST MODE v2 (fast_mode=True)
+  Layer 1  4H macro trend   same as Strict
+  Layer 2  1H mid trend     same as Strict
+  Layer 3  1H EMA20 zone    |1H_close − EMA20(1H)| / EMA20(1H) ≤ 1.8%  (was 1.0%)
+             wick_bounce / wick_reject: ±0.3% from EMA20 (same as before)
+  Layer 4  MTF bias > ±40   (Strict = ±70, relaxed to allow more signals)
+  Layer 5  ADX(14,15m) > 18 AND ADX rising (ADX[0] > ADX[1])
+  Layer 6  micro score ≥ 4  same as Strict (not relaxed)
+  Layer 7  Whipsaw cooldown block next 5 bars (75 min) after any signal
 
-3. CRASH-GUARD HEALTH MONITOR (check_health(), call every ~180s):
-   Only fires when position is BOTH:
-     (a) underwater past health_underwater_frac × 1R (default 0.7R), AND
-     (b) 5m momentum strongly against (price beyond both EMAs + MTF bias
-         flipped past ±health_bias_flip + ADX(5m)>20).
-   Never fires on a runner that already banked TP1.
-   Backtest effect (Jan–May 2026, $50/20x/0.04%):
-     XAU: PnL +$67.98 → +$155.43, MaxDD −15.5% → −10.0%  ← clear win
-     BTC: PnL +$212.94 → +$182.58                         ← slight drag
-   Default health_guard_enabled=True (protects XAU gaps/sharp reversals).
-   Consider False for BTC-only setups.
-   ⚠️ XAU liquidated once at 20x on a +4.6% 5m candle — run XAU at ≤10x.
+Exits (both modes): SL=1.2×ATR, TP1=0.5R (40% → SL→BE), TP2=2.5R (60% runner)
+
+═══════════════════════════════════════════════════════════════════════════════
+CRASH-GUARD HEALTH MONITOR (check_health(), call every ~180s)
+  Fires only when BOTH:
+    (a) position ≥ health_underwater_frac × 1R underwater (default 0.7R), AND
+    (b) 5m momentum strongly reversed:
+        price below EMA9 & EMA20 (long) + MTF bias < −flip_threshold + ADX(5m)>20
+  Never fires after TP1 (runner is protected).
+  bias_flip auto-adjusts to mode:
+    Strict   → health_bias_flip param  (default 50.0)
+    Fast v2  → bias_gate_fast         (default 40.0)
+
+Backtest Jan–May 2026 ($50/20x/0.04%):
+  BTC STRICT: 142 trades, WR 77.5%, +$212.95, MaxDD 6.4%
+  XAU STRICT:  99 trades, WR 69.7%, +$67.54,  MaxDD 16.3%  (Liq×1 at 20x)
+  ⚠️  Run XAU at ≤10x leverage to avoid +4.6% gap liquidations.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import numpy as np
@@ -158,35 +175,58 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out = out.join(_merge_htf(df15, df1h, "1h", "h1"))
     out = out.join(_merge_htf(df15, df4h, "4h", "h4"))
 
-    adx_min      = p["adx_min_fast"]      if p.get("fast_mode") else p["adx_min"]
-    pullback_pct = p["pullback_pct_fast"] if p.get("fast_mode") else p["pullback_pct"]
+    fast_mode = p.get("fast_mode", False)
 
+    # ── Layer 1: 4H macro trend ───────────────────────────────────────────────
     ef4, es4 = _ema(out["h4_close"], p["ema_fast"]), _ema(out["h4_close"], p["ema_slow"])
     macro_up, macro_dn = ef4 > es4, ef4 < es4
 
+    # ── Layer 2: 1H mid trend ─────────────────────────────────────────────────
     ef1, es1 = _ema(out["h1_close"], p["ema_fast"]), _ema(out["h1_close"], p["ema_slow"])
     mid_up, mid_dn = ef1 > es1, ef1 < es1
 
-    ema20_1h = ef1
-    near_ema       = (out["h1_close"] - ema20_1h).abs() / ema20_1h <= pullback_pct
-    wick_bounce_l  = (out["h1_low"]  <= ema20_1h * 1.003) & (out["h1_close"] > ema20_1h)
-    wick_reject_s  = (out["h1_high"] >= ema20_1h * 0.997) & (out["h1_close"] < ema20_1h)
-    at_pull_long   = near_ema | wick_bounce_l
-    at_pull_short  = near_ema | wick_reject_s
+    # ── Layer 3: Pullback zone (mode-specific) ────────────────────────────────
+    if fast_mode:
+        # Fast Mode v2: 1H EMA20 zone, wider ±1.8%
+        pullback_pct = p["pullback_pct_fast"]
+        ema20_1h = ef1
+        near_ema      = (out["h1_close"] - ema20_1h).abs() / ema20_1h <= pullback_pct
+        wick_bounce_l = (out["h1_low"]  <= ema20_1h * 1.003) & (out["h1_close"] > ema20_1h)
+        wick_reject_s = (out["h1_high"] >= ema20_1h * 0.997) & (out["h1_close"] < ema20_1h)
+        at_pull_long  = near_ema | wick_bounce_l
+        at_pull_short = near_ema | wick_reject_s
+    else:
+        # Strict: 15m swing low/high of last N bars (rolling window)
+        swing_n   = p["swing_lookback"]
+        swing_pct = p["swing_pct"]
+        swing_low  = out["low"].rolling(swing_n).min()
+        swing_high = out["high"].rolling(swing_n).max()
+        at_pull_long  = (out["close"] - swing_low)  / swing_low  <= swing_pct
+        at_pull_short = (swing_high - out["close"]) / swing_high <= swing_pct
 
+    # ── Layer 4: MTF composite bias (mode-specific gate) ─────────────────────
+    bias_gate = p["bias_gate_fast"] if fast_mode else p["bias_gate"]
     comp_pct = _mtf_bias(out["close"], {"1h": out["h1_close"], "4h": out["h4_close"]})
     out["comp_pct"] = comp_pct
-    long_bias_ok   = comp_pct > p["bias_gate"]
-    short_bias_ok  = comp_pct < -p["bias_gate"]
+    long_bias_ok  = comp_pct > bias_gate
+    short_bias_ok = comp_pct < -bias_gate
 
+    # ── Layer 5: ADX gate (mode-specific) ────────────────────────────────────
+    out["atr"]   = _atr(out, p["atr_period"])
+    out["adx15"] = _adx(out, p["adx_len"])
+    if fast_mode:
+        # ADX > 18 AND ADX rising
+        adx_rising = out["adx15"] > out["adx15"].shift(1).fillna(0)
+        adx_ok = (out["adx15"] > p["adx_min_fast"]) & adx_rising
+    else:
+        adx_ok = out["adx15"] > p["adx_min"]
+
+    # ── Layer 6: Micro score indicators ──────────────────────────────────────
     ema9  = _ema(out["close"], p["ema_micro"])
     ema20 = _ema(out["close"], p["ema_fast"])
     rsi15 = _rsi(out["close"], p["rsi_period"])
     volma = _sma(out["volume"], p["vol_period"])
-    out["atr"]   = _atr(out, p["atr_period"])
-    out["adx15"] = _adx(out, p["adx_len"])
     vol_ok = (volma > 0) & (out["volume"] >= volma * p["vol_mult"])
-    adx_ok = out["adx15"] > adx_min
 
     macd_line = _ema(out["close"], 12) - _ema(out["close"], 26)
     macd_sig  = _ema(macd_line, 9)
@@ -232,6 +272,7 @@ def check_health(side: str, entry: float, one_r: float, tp1_hit: bool,
     """
     Returns ('CLOSE', reason) only when position is BOTH deeply underwater AND
     momentum has strongly reversed. Never acts on a runner after TP1.
+    bias_flip is mode-aware: 50 for strict, 40 for fast mode v2 (passed by caller).
     """
     if tp1_hit:
         return ("HOLD", "post-TP1 runner — guard disabled")
@@ -265,9 +306,9 @@ def check_health(side: str, entry: float, one_r: float, tp1_hit: bool,
 
 class TrendContImprovedStrategy(BaseStrategy):
     """
-    TrendContinuation Improved v2: 15m primary + 1h/4h MTF, ADX(15m)>30 filter.
+    TrendContinuation Improved v2: 15m primary + 1h/4h MTF.
+    STRICT: 15m swing pullback + ADX>30. FAST v2: 1H EMA20 ±1.8% + bias>40 + ADX>18-rising + cooldown.
     Partial-close: TP1=0.5R (close 40%), SL→BE, TP2=2.5R (60% runner).
-    Modular micro-indicators + optional fast mode + crash-guard health monitor.
     """
 
     MTF_TIMEFRAMES = ["1h", "4h"]
@@ -277,19 +318,25 @@ class TrendContImprovedStrategy(BaseStrategy):
         rsi_min_buy=35.0, rsi_max_buy=75.0,
         rsi_min_sell=28.0, rsi_max_sell=65.0,
         bias_gate=70.0,
-        pullback_pct=0.010,
+        # Strict: 15m swing pullback zone
+        swing_lookback=4,    # rolling bars for swing high/low
+        swing_pct=0.006,     # 0.6% max distance from swing extreme
         vol_period=20, vol_mult=1.0,
         atr_period=14, sl_mult=1.2, sl_min_pct=0.012, sl_max_pct=0.035,
         adx_len=14, adx_min=30,
         tp1_r=0.5, tp1_fraction=0.40, tp2_r=2.5,
         min_score=4.0,
-        # fast mode
+        # Fast mode v2
         fast_mode=False,
-        adx_min_fast=20, pullback_pct_fast=0.015,
+        adx_min_fast=18,          # ADX threshold (was 20/30)
+        adx_rising_fast=True,     # also require ADX[0] > ADX[1]
+        pullback_pct_fast=0.018,  # 1H EMA20 zone ±1.8% (was 1.0%)
+        bias_gate_fast=40.0,      # MTF bias gate (was 70)
+        cooldown_bars=5,          # whipsaw cooldown: block N bars after signal
         # crash-guard
         health_guard_enabled=True,
         health_underwater_frac=0.7,
-        health_bias_flip=50.0,
+        health_bias_flip=50.0,    # used in strict mode; fast mode uses bias_gate_fast
     )
 
     def __init__(self, symbol: str, params: dict = None):
@@ -299,6 +346,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
+        self._cooldown_remaining = 0  # bars remaining in whipsaw cooldown (fast mode)
 
     @staticmethod
     def _to_df(candles: list) -> pd.DataFrame:
@@ -317,6 +365,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         """
         Crash-guard health check. Returns ('CLOSE'|'HOLD', reason).
         Call from bot's monitor loop every ~180s.
+        bias_flip: uses bias_gate_fast (40) in fast mode, health_bias_flip (50) in strict.
         """
         if not self._p["health_guard_enabled"]:
             return ("HOLD", "health guard disabled")
@@ -325,10 +374,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         df5  = self._to_df(candles_5m)
         df1h = self._to_df(candles_1h)
         df4h = self._to_df(candles_4h)
+        # Fast mode entered at bias > 40 → reversed when bias < -40
+        bias_flip = (self._p["bias_gate_fast"] if self._p.get("fast_mode")
+                     else self._p["health_bias_flip"])
         return check_health(
             side, entry, one_r, tp1_hit, df5, df1h, df4h,
             underwater_frac=self._p["health_underwater_frac"],
-            bias_flip=self._p["health_bias_flip"],
+            bias_flip=bias_flip,
             ema_fast=self._p["ema_fast"], ema_slow=self._p["ema_slow"],
         )
 
@@ -347,6 +399,12 @@ class TrendContImprovedStrategy(BaseStrategy):
         if len(c4h) < self._min_4h:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[TCImproved] need {self._min_4h} 4h bars, have {len(c4h)}")
+
+        # ── Whipsaw cooldown (fast mode only) ─────────────────────────────────
+        if self._p.get("fast_mode") and self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
+            return Signal(SignalType.HOLD, self.symbol, current_price, 0,
+                          f"[TCImproved] whipsaw cooldown: {self._cooldown_remaining} bars left")
 
         df15 = self._to_df(candles)
         df1h = self._to_df(c1h)
@@ -371,6 +429,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         if dist <= 0 or np.isnan(dist):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           "[TCImproved] invalid dist")
+
+        # Arm whipsaw cooldown for fast mode
+        if self._p.get("fast_mode") and self._p.get("cooldown_bars", 0) > 0:
+            self._cooldown_remaining = self._p["cooldown_bars"]
 
         p = self._p
 
