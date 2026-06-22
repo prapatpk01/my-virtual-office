@@ -7,9 +7,8 @@ computes a weighted health score (0–100) against the position direction.
 
 Score → Label → Action
   ≥ 85  BULL    Hold / extend TP2 one step toward next level (1.2→1.5→2.0→2.5→3.0R)
-  50–84 NEUTRAL Hold — do nothing
-  40–49 CAUTION Monitor more frequently but hold
-  < 40  WEAK    Close position immediately (weakness > 60%)
+  45–84 NEUTRAL Hold — do nothing
+  < 45  WEAK    2-cycle confirm then close — radar says exit and wait for next setup
 
 Indicators used (relaxed thresholds vs entry gates):
   Weight 25  4H EMA20 > EMA50  aligned with position side

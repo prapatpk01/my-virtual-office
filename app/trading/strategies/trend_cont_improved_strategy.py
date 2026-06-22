@@ -93,8 +93,8 @@ def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr_rma   = _rma(_true_range(df), n)
     plus_di  = 100 * _rma(pd.Series(plus_dm,  index=df.index), n) / tr_rma
     minus_di = 100 * _rma(pd.Series(minus_dm, index=df.index), n) / tr_rma
-    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    return _rma(dx, n)
+    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return _rma(dx.fillna(0), n)
 
 
 def _mtf_bias(primary_close: pd.Series, aligned: dict,
@@ -201,8 +201,14 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         swing_pct = p["swing_pct"]
         swing_low  = out["low"].rolling(swing_n).min()
         swing_high = out["high"].rolling(swing_n).max()
-        at_pull_long  = (out["close"] - swing_low)  / swing_low  <= swing_pct
-        at_pull_short = (swing_high - out["close"]) / swing_high <= swing_pct
+        # Require close >= swing_low (pullback to support, NOT breakdown below it).
+        # A negative numerator (close < swing_low) would otherwise satisfy <= swing_pct.
+        at_pull_long  = (out["close"] >= swing_low) & (
+            (out["close"] - swing_low) / swing_low.replace(0, np.nan) <= swing_pct
+        )
+        at_pull_short = (out["close"] <= swing_high) & (
+            (swing_high - out["close"]) / swing_high.replace(0, np.nan) <= swing_pct
+        )
 
     # ── Layer 4: MTF composite bias (mode-specific gate) ─────────────────────
     bias_gate = p["bias_gate_fast"] if fast_mode else p["bias_gate"]
@@ -278,6 +284,8 @@ def check_health(side: str, entry: float, one_r: float, tp1_hit: bool,
         return ("HOLD", "post-TP1 runner — guard disabled")
     if len(df5) < max(ema_slow, 30) or len(df1h) < ema_slow or len(df4h) < ema_slow:
         return ("HOLD", "insufficient data")
+    if one_r <= 0:
+        return ("HOLD", "invalid one_r — guard skipped")
 
     px = float(df5["close"].iloc[-1])
 
@@ -288,7 +296,12 @@ def check_health(side: str, entry: float, one_r: float, tp1_hit: bool,
     e9   = float(_ema(df5["close"], 9).iloc[-1])
     e20  = float(_ema(df5["close"], 20).iloc[-1])
     adx5 = float(_adx(df5, 14).iloc[-1])
-    bias = float(_mtf_bias(df5["close"], {"1h": df1h["close"], "4h": df4h["close"]}).iloc[-1])
+    # Strip DatetimeIndex before combining 5m/1h/4h Series — different timestamps would
+    # cause pandas index-alignment in _mtf_bias to produce mostly-NaN, disabling the guard.
+    bias = float(_mtf_bias(
+        pd.Series(df5["close"].values),
+        {"1h": pd.Series(df1h["close"].values), "4h": pd.Series(df4h["close"].values)},
+    ).iloc[-1])
 
     if side == "long":
         against = (px < e9) and (px < e20) and (bias < -bias_flip) and (adx5 > 20)

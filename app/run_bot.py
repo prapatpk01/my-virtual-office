@@ -17,8 +17,8 @@ Position Health Monitor:
   Re-evaluates every open position every MONITOR_INTERVAL seconds (default 180 = 3 min).
   Uses 5m + 1h + 4h candles with RELAXED indicator thresholds:
     BULL    (score ≥ 85%): TP2 ladder extended (1.2→1.5→2.0→2.5→3.0R)
-    NEUTRAL (score 45–84%): hold position unchanged
-    WEAK    (score < 45%): 2-bar confirm then close — better than SL
+    NEUTRAL (score 45–84%): hold — radar green, stay in trade
+    WEAK    (score < 45%): 2-cycle confirm then close — radar red, exit and wait for next setup
   Crash-guard: closes immediately if ≥0.7R underwater + 5m momentum strongly reversed.
 
 Config via Railway environment variables.
