@@ -245,14 +245,15 @@ class TradingBot:
             logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:120])
             return sig_dict
 
-        await self._handle_signal(signal, sig_dict, strategy.name)
+        await self._handle_signal(signal, sig_dict, strategy)
         return sig_dict
 
     # ── Signal routing ────────────────────────────────────────────────────
 
-    async def _handle_signal(self, signal: Signal, sig_dict: dict, strategy_name: str):
-        sym    = signal.symbol
-        is_buy = signal.type == SignalType.BUY
+    async def _handle_signal(self, signal: Signal, sig_dict: dict, strategy):
+        sym           = signal.symbol
+        strategy_name = strategy.name if hasattr(strategy, "name") else str(strategy)
+        is_buy        = signal.type == SignalType.BUY
 
         if self._entries_paused:
             logger.debug("[%s] entries paused (daily circuit breaker) — %s", strategy_name, sym)
@@ -282,7 +283,12 @@ class TradingBot:
         if self.telegram:
             self.telegram.notify_signal({**sig_dict, "strategy": slot})
 
-        await self._open_position(signal, slot, side)
+        opened = await self._open_position(signal, slot, side)
+
+        # Arm the whipsaw cooldown ONLY after a confirmed fill — a rejected order
+        # (insufficient margin, sub-minimum size) must not strand the symbol.
+        if opened and hasattr(strategy, "arm_cooldown"):
+            strategy.arm_cooldown()
 
     # ── Order execution ───────────────────────────────────────────────────
 
@@ -297,14 +303,34 @@ class TradingBot:
             ticker = await self.connector.fetch_ticker(sym)
             price  = float(ticker["last"])
 
-            sl_p, tp_p = self._calc_sl_tp(signal, price, side)
+            meta = signal.metadata or {}
+            # Re-anchor SL/TP to the ACTUAL entry price using the price-independent
+            # 1R distance, so entry−SL == one_r exactly. The strategy's metadata levels
+            # were anchored to its ticker; price may have drifted before this fill,
+            # which would otherwise break the R-multiple math the protection stack relies on.
+            one_r = float(meta.get("one_r", 0) or 0)
+            if one_r > 0:
+                rr_tp1 = float(meta.get("rr_tp1", 0.5))
+                rr_tp2 = float(meta.get("rr_tp2", 3.0))
+                if side == "long":
+                    sl_p  = round(price - one_r, 8)
+                    tp1_r = round(price + rr_tp1 * one_r, 8)
+                    tp2_r = round(price + rr_tp2 * one_r, 8)
+                else:
+                    sl_p  = round(price + one_r, 8)
+                    tp1_r = round(price - rr_tp1 * one_r, 8)
+                    tp2_r = round(price - rr_tp2 * one_r, 8)
+                tp_p = tp2_r
+                meta = {**meta, "stop_loss": sl_p, "take_profit": tp_p,
+                        "tp1": tp1_r, "tp2": tp2_r}
+            else:
+                sl_p, tp_p = self._calc_sl_tp(signal, price, side)
             if sl_p is None or tp_p is None:
                 logger.error("[%s] No SL/TP available for %s %s — order refused", slot, side, sym)
                 self._sig.unlock_strategy(sym, slot)
-                return
+                return False
 
             # Dynamic sizing: size by SL distance so worst-case loss ≈ risk_pct of port.
-            meta        = signal.metadata or {}
             sl_dist_pct = meta.get("sl_dist_pct")
             risk_pct    = meta.get("risk_pct", 0.02)
             if sl_dist_pct and self._dynamic_sizing:
@@ -314,7 +340,7 @@ class TradingBot:
             if amount <= 0:
                 logger.warning("[%s] Position size=0 for %s — skipping", slot, sym)
                 self._sig.unlock_strategy(sym, slot)
-                return
+                return False
 
             # Align size to whole contracts so partial (50%) closes are tradable.
             # Partial close (TP1) needs ≥2 contracts to split; otherwise the
@@ -340,7 +366,6 @@ class TradingBot:
             # exchange only auto-closes if the bot is offline AND price runs all
             # the way to 3.0R — so BULL TP2-extensions take real effect on live
             # instead of being pre-empted by an exchange TP at 2.5R.
-            one_r = float(meta.get("one_r", 0) or 0)
             if one_r > 0:
                 max_r = PositionHealthMonitor.TP_LADDER[-1]
                 exchange_tp = (round(price + max_r * one_r, 8) if side == "long"
@@ -374,10 +399,12 @@ class TradingBot:
                 label = "buy" if side == "long" else "sell_short"
                 self.telegram.notify_order(sym, label, amount, order.price, slot, self.paper,
                                            sl=sl_p, tp=tp_p)
+            return True
 
         except Exception as e:
             logger.error("[%s] Open %s %s failed: %s", slot, side, sym, e)
             self._sig.unlock_strategy(sym, slot)
+            return False
 
     async def _check_stop(self, pos_info: dict):
         """Staged exit: TP1 closes part + moves SL→breakeven; TP2/breakeven/SL close the rest."""

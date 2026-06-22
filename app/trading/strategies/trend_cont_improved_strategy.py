@@ -68,7 +68,11 @@ def _rsi(s: pd.Series, period: int = 14) -> pd.Series:
     d = s.diff()
     gain = d.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
     loss = (-d.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
-    return 100 - 100 / (1 + gain / loss)
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    # loss==0 & gain>0 → pure up-streak → RSI 100; flat (gain==0 & loss==0) → neutral 50
+    rsi = rsi.where(~((loss == 0) & (gain > 0)), 100.0)
+    return rsi.fillna(50.0)
 
 
 def _true_range(df: pd.DataFrame) -> pd.Series:
@@ -418,6 +422,12 @@ class TrendContImprovedStrategy(BaseStrategy):
         self._min_4h      = self.params.get("min_4h",       55)
         self._cooldown_until = 0.0  # unix timestamp when cooldown expires (time-based, not call-based)
 
+    def arm_cooldown(self) -> None:
+        """Start the whipsaw cooldown. Called by the bot only after a confirmed
+        fill, so a rejected order never blocks future signals."""
+        if self._p.get("fast_mode") and self._p.get("cooldown_bars", 0) > 0:
+            self._cooldown_until = time.time() + self._p["cooldown_bars"] * 15 * 60
+
     @staticmethod
     def _to_df(candles: list) -> pd.DataFrame:
         rows = [
@@ -524,9 +534,9 @@ class TrendContImprovedStrategy(BaseStrategy):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           "[TCImproved] invalid dist")
 
-        # Arm whipsaw cooldown: block for cooldown_bars × 15 minutes
-        if self._p.get("fast_mode") and self._p.get("cooldown_bars", 0) > 0:
-            self._cooldown_until = time.time() + self._p["cooldown_bars"] * 15 * 60
+        # NOTE: whipsaw cooldown is armed by the bot via arm_cooldown() AFTER a
+        # confirmed fill — never here, so a rejected order (e.g. insufficient
+        # margin) cannot strand the symbol in cooldown with no open position.
 
         p = self._p
 
