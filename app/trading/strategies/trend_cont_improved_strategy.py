@@ -320,8 +320,8 @@ def check_health(side: str, entry: float, one_r: float, tp1_hit: bool,
 class TrendContImprovedStrategy(BaseStrategy):
     """
     TrendContinuation Improved v2: 15m primary + 1h/4h MTF.
-    STRICT: 15m swing pullback + ADX>30. FAST v2: 1H EMA20 ±1.8% + bias>40 + ADX>18-rising + cooldown.
-    Partial-close: TP1=0.5R (close 40%), SL→BE, TP2=2.5R (60% runner).
+    STRICT: 15m swing pullback + ADX>30, TP2=2.5R. FAST v2: 1H EMA20 ±1.8% + bias>70 + ADX>18-rising + cooldown, TP2=3.0R.
+    Partial-close: TP1=0.5R (close 40%), SL→BE, runner to TP2.
     """
 
     MTF_TIMEFRAMES = ["1h", "4h"]
@@ -344,7 +344,8 @@ class TrendContImprovedStrategy(BaseStrategy):
         adx_min_fast=18,          # ADX threshold (was 20/30)
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
         pullback_pct_fast=0.018,  # 1H EMA20 zone ±1.8% (was 1.0%)
-        bias_gate_fast=40.0,      # MTF bias gate (was 70)
+        bias_gate_fast=70.0,      # MTF bias gate — tuned to 70 (grid: best combined PnL + low DD)
+        tp2_r_fast=3.0,           # FAST runner target 3.0R (grid winner; lets trends run further)
         cooldown_bars=5,          # whipsaw cooldown: block N bars after signal
         # crash-guard
         health_guard_enabled=True,
@@ -449,10 +450,13 @@ class TrendContImprovedStrategy(BaseStrategy):
 
         p = self._p
 
+        # FAST v2 runs the runner to 3.0R; STRICT keeps 2.5R.
+        tp2_r = p.get("tp2_r_fast", p["tp2_r"]) if p.get("fast_mode") else p["tp2_r"]
+
         def _meta(side: str) -> dict:
             sl  = current_price - dist if side == "long" else current_price + dist
             tp1 = current_price + p["tp1_r"] * dist if side == "long" else current_price - p["tp1_r"] * dist
-            tp2 = current_price + p["tp2_r"] * dist if side == "long" else current_price - p["tp2_r"] * dist
+            tp2 = current_price + tp2_r * dist if side == "long" else current_price - tp2_r * dist
             return {
                 "stop_loss":   sl,
                 "take_profit": tp2,
@@ -465,7 +469,7 @@ class TrendContImprovedStrategy(BaseStrategy):
                 "risk_pct":    0.02,
                 "breakeven":   current_price,
                 "rr_tp1":      p["tp1_r"],
-                "rr_tp2":      p["tp2_r"],
+                "rr_tp2":      tp2_r,
                 "one_r":       dist,
             }
 

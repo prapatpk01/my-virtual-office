@@ -122,9 +122,10 @@ def build_config() -> dict:
         # Strict: 15m swing pullback parameters
         "tci_swing_lookback":   _env_int("TCI_SWING_LOOKBACK",     4),     # rolling bars (4×15m = 1h)
         "tci_swing_pct":        _env_float("TCI_SWING_PCT",        0.006), # 0.6% from swing extreme
-        # Fast mode v2
+        # Fast mode v2 (grid-tuned: bias 70 + TP2 3.0R = best combined PnL, low DD)
         "tci_fast_mode":        _env_bool("TCI_FAST_MODE",         False),
-        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   40.0), # bias gate (strict=70)
+        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   70.0), # bias gate (tuned 40→70)
+        "tci_fast_tp2_r":       _env_float("TCI_FAST_TP2_R",       3.0),  # FAST runner target (strict=2.5)
         "tci_adx_rising":       _env_bool("TCI_ADX_RISING",        True),  # require ADX[0]>ADX[1]
         "tci_cooldown_bars":    _env_int("TCI_COOLDOWN_BARS",       5),    # whipsaw cooldown bars
         # Crash-guard (both modes)
@@ -200,6 +201,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             # Fast mode v2
             "fast_mode":              cfg["tci_fast_mode"],
             "bias_gate_fast":         cfg["tci_fast_bias_gate"],
+            "tp2_r_fast":             cfg["tci_fast_tp2_r"],
             "adx_rising_fast":        cfg["tci_adx_rising"],
             "cooldown_bars":          cfg["tci_cooldown_bars"],
             # Crash-guard
@@ -336,6 +338,7 @@ async def main():
                     "swing_pct": cfg["tci_swing_pct"],
                     "fast_mode": cfg["tci_fast_mode"],
                     "bias_gate_fast": cfg["tci_fast_bias_gate"],
+                    "tp2_r_fast": cfg["tci_fast_tp2_r"],
                     "adx_rising_fast": cfg["tci_adx_rising"],
                     "cooldown_bars": cfg["tci_cooldown_bars"],
                 })
