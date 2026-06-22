@@ -107,10 +107,11 @@ def build_config() -> dict:
 
         # ── TrendCont Improved v2 (15m primary + 1h + 4h MTF) ───────────────────
         # STRICT: 15m swing pullback (4-bar low/high ±0.6%) + ADX>30.
-        # FAST v2: 1H EMA20 ±1.8% + bias>40 + ADX>18 rising + 5-bar cooldown.
-        # Exit (both modes): TP1=0.5R (40% → SL→BE), TP2=2.5R (60% runner).
-        "tci_bias_gate":        _env_float("TCI_BIAS_GATE",        70.0),
-        "tci_adx_min":          _env_int("TCI_ADX_MIN",            30),
+        # FAST v2: 1H EMA20 ±1.8% + bias>60 + ADX>18 rising + 5-bar cooldown.
+        # STRICT: 15m swing pullback + bias>70 + ADX>30.
+        # Exit (both modes): TP1=0.5R (40% → SL→BE), TP2=2.5R/3.0R (60% runner).
+        "tci_bias_gate":        _env_float("TCI_BIAS_GATE",        70.0),  # STRICT only
+        "tci_adx_min":          _env_int("TCI_ADX_MIN",            30),    # STRICT only
         "tci_sl_mult":          _env_float("TCI_SL_MULT",          1.2),
         "tci_sl_min_pct":       _env_float("TCI_SL_MIN_PCT",       0.012),
         "tci_sl_max_pct":       _env_float("TCI_SL_MAX_PCT",       0.035),
@@ -124,15 +125,15 @@ def build_config() -> dict:
         "tci_swing_pct":        _env_float("TCI_SWING_PCT",        0.006), # 0.6% from swing extreme
         # Fast mode v2 (grid winner: bias 70 + TP2 3.0R; live default: 60 to avoid signal drought)
         "tci_fast_mode":        _env_bool("TCI_FAST_MODE",         False),
-        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   60.0), # live-calibrated (grid=70 too strict)
+        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   60.0), # FAST bias gate (live-calibrated)
+        "tci_fast_adx_min":     _env_int("TCI_ADX_MIN_FAST",       18),   # FAST ADX threshold (≠ STRICT 30)
         "tci_fast_tp2_r":       _env_float("TCI_FAST_TP2_R",       3.0),  # FAST runner target (strict=2.5)
         "tci_adx_rising":       _env_bool("TCI_ADX_RISING",        True),  # require ADX[0]>ADX[1]
         "tci_cooldown_bars":    _env_int("TCI_COOLDOWN_BARS",       5),    # whipsaw cooldown bars
         # Crash-guard (both modes)
         "tci_health_guard":     _env_bool("TCI_HEALTH_GUARD",      True),
         "tci_health_uw_frac":   _env_float("TCI_HEALTH_UW_FRAC",  0.7),   # R underwater to trigger
-        "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # strict mode bias flip
-        # (fast mode uses tci_fast_bias_gate automatically)
+        "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # strict bias flip (fast uses bias_gate_fast)
 
         # ── Position health monitor ───────────────────────────────────────────
         # Re-checks every open position using 5m+1h+4h candles (relaxed thresholds).
@@ -201,6 +202,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             # Fast mode v2
             "fast_mode":              cfg["tci_fast_mode"],
             "bias_gate_fast":         cfg["tci_fast_bias_gate"],
+            "adx_min_fast":           cfg["tci_fast_adx_min"],
             "tp2_r_fast":             cfg["tci_fast_tp2_r"],
             "adx_rising_fast":        cfg["tci_adx_rising"],
             "cooldown_bars":          cfg["tci_cooldown_bars"],
@@ -338,6 +340,7 @@ async def main():
                     "swing_pct": cfg["tci_swing_pct"],
                     "fast_mode": cfg["tci_fast_mode"],
                     "bias_gate_fast": cfg["tci_fast_bias_gate"],
+                    "adx_min_fast": cfg["tci_fast_adx_min"],
                     "tp2_r_fast": cfg["tci_fast_tp2_r"],
                     "adx_rising_fast": cfg["tci_adx_rising"],
                     "cooldown_bars": cfg["tci_cooldown_bars"],
