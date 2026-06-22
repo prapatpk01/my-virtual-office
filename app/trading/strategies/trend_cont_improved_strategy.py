@@ -47,6 +47,7 @@ Backtest Jan–May 2026 ($50/20x/0.04%):
   ⚠️  Run XAU at ≤10x leverage to avoid +4.6% gap liquidations.
 ═══════════════════════════════════════════════════════════════════════════════
 """
+import time
 import numpy as np
 import pandas as pd
 
@@ -221,9 +222,11 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out["atr"]   = _atr(out, p["atr_period"])
     out["adx15"] = _adx(out, p["adx_len"])
     if fast_mode:
-        # ADX > 18 AND ADX rising
+        # ADX > 18 AND ADX < 40 (not overheated) AND ADX rising
         adx_rising = out["adx15"] > out["adx15"].shift(1).fillna(0)
-        adx_ok = (out["adx15"] > p["adx_min_fast"]) & adx_rising
+        adx_ok = ((out["adx15"] > p["adx_min_fast"])
+                  & (out["adx15"] <= p["adx_max_fast"])
+                  & adx_rising)
     else:
         adx_ok = out["adx15"] > p["adx_min"]
 
@@ -353,12 +356,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         min_score=4.0,
         # Fast mode v2
         fast_mode=False,
-        adx_min_fast=18,          # ADX threshold (was 20/30)
+        adx_min_fast=18,          # ADX lower bound — trend must be active
+        adx_max_fast=40,          # ADX upper bound — avoid overheated/exhausted trends
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
         pullback_pct_fast=0.025,  # 1H EMA20 zone ±2.5% (widened from 1.8% — XAU runs far from EMA20)
         bias_gate_fast=60.0,      # MTF bias gate — 60 is live-calibrated (grid winner was 70 but too strict for live market phases)
         tp2_r_fast=3.0,           # FAST runner target 3.0R (grid winner; lets trends run further)
-        cooldown_bars=5,          # whipsaw cooldown: block N bars after signal
+        cooldown_bars=5,          # whipsaw cooldown: block N×15m after signal (time-based, not call-based)
         # crash-guard
         health_guard_enabled=True,
         health_underwater_frac=0.7,
@@ -372,7 +376,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
-        self._cooldown_remaining = 0  # bars remaining in whipsaw cooldown (fast mode)
+        self._cooldown_until = 0.0  # unix timestamp when cooldown expires (time-based, not call-based)
 
     @staticmethod
     def _to_df(candles: list) -> pd.DataFrame:
@@ -426,11 +430,11 @@ class TrendContImprovedStrategy(BaseStrategy):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[TCImproved] need {self._min_4h} 4h bars, have {len(c4h)}")
 
-        # ── Whipsaw cooldown (fast mode only) ─────────────────────────────────
-        if self._p.get("fast_mode") and self._cooldown_remaining > 0:
-            self._cooldown_remaining -= 1
+        # ── Whipsaw cooldown (fast mode only, time-based) ─────────────────────
+        if self._p.get("fast_mode") and time.time() < self._cooldown_until:
+            remaining_min = int((self._cooldown_until - time.time()) / 60)
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                          f"[TCImproved] whipsaw cooldown: {self._cooldown_remaining} bars left")
+                          f"[TCImproved] whipsaw cooldown: {remaining_min}min left")
 
         df15 = self._to_df(candles)
         df1h = self._to_df(c1h)
@@ -455,8 +459,9 @@ class TrendContImprovedStrategy(BaseStrategy):
             _y = lambda k: "✓" if last.get(k) else "✗"
             long_layers  = f"4H{_y('d_macro_up')} 1H{_y('d_mid_up')} pull{_y('d_pull_l')} bias{_y('d_bias_l')} adx{_y('d_adx_ok')}"
             short_layers = f"4H{_y('d_macro_dn')} 1H{_y('d_mid_dn')} pull{_y('d_pull_s')} bias{_y('d_bias_s')} adx{_y('d_adx_ok')}"
+            adx_max = self._p.get("adx_max_fast", 40) if self._p.get("fast_mode") else 999
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                          f"[TCImproved] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f} "
+                          f"[TCImproved] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}(18-{adx_max:.0f}) "
                           f"score={sc_l:.0f}L/{sc_s:.0f}S | L:{long_layers} | S:{short_layers}")
 
         dist = float(last["dist"])
@@ -464,9 +469,9 @@ class TrendContImprovedStrategy(BaseStrategy):
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           "[TCImproved] invalid dist")
 
-        # Arm whipsaw cooldown for fast mode
+        # Arm whipsaw cooldown: block for cooldown_bars × 15 minutes
         if self._p.get("fast_mode") and self._p.get("cooldown_bars", 0) > 0:
-            self._cooldown_remaining = self._p["cooldown_bars"]
+            self._cooldown_until = time.time() + self._p["cooldown_bars"] * 15 * 60
 
         p = self._p
 

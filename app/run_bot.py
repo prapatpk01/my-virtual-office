@@ -126,11 +126,12 @@ def build_config() -> dict:
         # Fast mode v2 (grid winner: bias 70 + TP2 3.0R; live default: 60 to avoid signal drought)
         "tci_fast_mode":        _env_bool("TCI_FAST_MODE",         False),
         "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   60.0), # FAST bias gate (live-calibrated)
-        "tci_fast_adx_min":     _env_int("TCI_ADX_MIN_FAST",       18),   # FAST ADX threshold (≠ STRICT 30)
+        "tci_fast_adx_min":     _env_int("TCI_ADX_MIN_FAST",       18),   # FAST ADX lower bound
+        "tci_fast_adx_max":     _env_int("TCI_ADX_MAX_FAST",       40),   # FAST ADX upper bound (avoid overheated trend)
         "tci_fast_tp2_r":       _env_float("TCI_FAST_TP2_R",       3.0),  # FAST runner target (strict=2.5)
         "tci_fast_pullback_pct":_env_float("TCI_PULLBACK_PCT_FAST", 0.025),# 1H EMA20 zone width (2.5% > 1.8% orig)
         "tci_adx_rising":       _env_bool("TCI_ADX_RISING",        True),  # require ADX[0]>ADX[1]
-        "tci_cooldown_bars":    _env_int("TCI_COOLDOWN_BARS",       5),    # whipsaw cooldown bars
+        "tci_cooldown_bars":    _env_int("TCI_COOLDOWN_BARS",       5),    # cooldown N×15min after signal (time-based)
         # Crash-guard (both modes)
         "tci_health_guard":     _env_bool("TCI_HEALTH_GUARD",      True),
         "tci_health_uw_frac":   _env_float("TCI_HEALTH_UW_FRAC",  0.7),   # R underwater to trigger
@@ -205,6 +206,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "fast_mode":              cfg["tci_fast_mode"],
             "bias_gate_fast":         cfg["tci_fast_bias_gate"],
             "adx_min_fast":           cfg["tci_fast_adx_min"],
+            "adx_max_fast":           cfg["tci_fast_adx_max"],
             "tp2_r_fast":             cfg["tci_fast_tp2_r"],
             "pullback_pct_fast":      cfg["tci_fast_pullback_pct"],
             "adx_rising_fast":        cfg["tci_adx_rising"],
@@ -345,6 +347,7 @@ async def main():
                     "fast_mode": cfg["tci_fast_mode"],
                     "bias_gate_fast": cfg["tci_fast_bias_gate"],
                     "adx_min_fast": cfg["tci_fast_adx_min"],
+                    "adx_max_fast": cfg["tci_fast_adx_max"],
                     "tp2_r_fast": cfg["tci_fast_tp2_r"],
                     "pullback_pct_fast": cfg["tci_fast_pullback_pct"],
                     "adx_rising_fast": cfg["tci_adx_rising"],
