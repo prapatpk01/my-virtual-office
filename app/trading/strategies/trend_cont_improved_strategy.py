@@ -21,7 +21,7 @@ STRICT (default, fast_mode=False) — Strict + Swing(15m) Fast Pullback
 FAST MODE v2 (fast_mode=True)
   Layer 1  4H macro trend   same as Strict
   Layer 2  1H mid trend     same as Strict
-  Layer 3  1H EMA20 zone    |1H_close − EMA20(1H)| / EMA20(1H) ≤ 1.8%
+  Layer 3  1H EMA20 zone    |1H_close − EMA20(1H)| / EMA20(1H) ≤ 2.5%  (TCI_PULLBACK_PCT_FAST)
              wick_bounce / wick_reject: low/high within 0.3% of EMA20
   Layer 4  MTF bias > ±60   live-calibrated (grid winner was 70 but caused signal drought)
   Layer 5  ADX(14,15m) > 18 AND ADX rising (ADX[0] > ADX[1])
@@ -355,7 +355,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         fast_mode=False,
         adx_min_fast=18,          # ADX threshold (was 20/30)
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
-        pullback_pct_fast=0.018,  # 1H EMA20 zone ±1.8% (was 1.0%)
+        pullback_pct_fast=0.025,  # 1H EMA20 zone ±2.5% (widened from 1.8% — XAU runs far from EMA20)
         bias_gate_fast=60.0,      # MTF bias gate — 60 is live-calibrated (grid winner was 70 but too strict for live market phases)
         tp2_r_fast=3.0,           # FAST runner target 3.0R (grid winner; lets trends run further)
         cooldown_bars=5,          # whipsaw cooldown: block N bars after signal

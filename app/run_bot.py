@@ -128,6 +128,7 @@ def build_config() -> dict:
         "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   60.0), # FAST bias gate (live-calibrated)
         "tci_fast_adx_min":     _env_int("TCI_ADX_MIN_FAST",       18),   # FAST ADX threshold (≠ STRICT 30)
         "tci_fast_tp2_r":       _env_float("TCI_FAST_TP2_R",       3.0),  # FAST runner target (strict=2.5)
+        "tci_fast_pullback_pct":_env_float("TCI_PULLBACK_PCT_FAST", 0.025),# 1H EMA20 zone width (2.5% > 1.8% orig)
         "tci_adx_rising":       _env_bool("TCI_ADX_RISING",        True),  # require ADX[0]>ADX[1]
         "tci_cooldown_bars":    _env_int("TCI_COOLDOWN_BARS",       5),    # whipsaw cooldown bars
         # Crash-guard (both modes)
@@ -204,6 +205,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "bias_gate_fast":         cfg["tci_fast_bias_gate"],
             "adx_min_fast":           cfg["tci_fast_adx_min"],
             "tp2_r_fast":             cfg["tci_fast_tp2_r"],
+            "pullback_pct_fast":      cfg["tci_fast_pullback_pct"],
             "adx_rising_fast":        cfg["tci_adx_rising"],
             "cooldown_bars":          cfg["tci_cooldown_bars"],
             # Crash-guard
@@ -342,6 +344,7 @@ async def main():
                     "bias_gate_fast": cfg["tci_fast_bias_gate"],
                     "adx_min_fast": cfg["tci_fast_adx_min"],
                     "tp2_r_fast": cfg["tci_fast_tp2_r"],
+                    "pullback_pct_fast": cfg["tci_fast_pullback_pct"],
                     "adx_rising_fast": cfg["tci_adx_rising"],
                     "cooldown_bars": cfg["tci_cooldown_bars"],
                 })
