@@ -21,14 +21,14 @@ STRICT (default, fast_mode=False) — Strict + Swing(15m) Fast Pullback
 FAST MODE v2 (fast_mode=True)
   Layer 1  4H macro trend   same as Strict
   Layer 2  1H mid trend     same as Strict
-  Layer 3  1H EMA20 zone    |1H_close − EMA20(1H)| / EMA20(1H) ≤ 1.8%  (was 1.0%)
-             wick_bounce / wick_reject: ±0.3% from EMA20 (same as before)
-  Layer 4  MTF bias > ±40   (Strict = ±70, relaxed to allow more signals)
+  Layer 3  1H EMA20 zone    |1H_close − EMA20(1H)| / EMA20(1H) ≤ 1.8%
+             wick_bounce / wick_reject: low/high within 0.3% of EMA20
+  Layer 4  MTF bias > ±60   live-calibrated (grid winner was 70 but caused signal drought)
   Layer 5  ADX(14,15m) > 18 AND ADX rising (ADX[0] > ADX[1])
   Layer 6  micro score ≥ 4  same as Strict (not relaxed)
   Layer 7  Whipsaw cooldown block next 5 bars (75 min) after any signal
 
-Exits (both modes): SL=1.2×ATR, TP1=0.5R (40% → SL→BE), TP2=2.5R (60% runner)
+Exits: FAST TP2=3.0R, STRICT TP2=2.5R. Both: SL=1.2×ATR, TP1=0.5R (40%→SL→BE).
 
 ═══════════════════════════════════════════════════════════════════════════════
 CRASH-GUARD HEALTH MONITOR (check_health(), call every ~180s)
@@ -39,7 +39,7 @@ CRASH-GUARD HEALTH MONITOR (check_health(), call every ~180s)
   Never fires after TP1 (runner is protected).
   bias_flip auto-adjusts to mode:
     Strict   → health_bias_flip param  (default 50.0)
-    Fast v2  → bias_gate_fast         (default 40.0)
+    Fast v2  → bias_gate_fast         (default 60.0)
 
 Backtest Jan–May 2026 ($50/20x/0.04%):
   BTC STRICT: 142 trades, WR 77.5%, +$212.95, MaxDD 6.4%
@@ -331,7 +331,8 @@ def check_health(side: str, entry: float, one_r: float, tp1_hit: bool,
 class TrendContImprovedStrategy(BaseStrategy):
     """
     TrendContinuation Improved v2: 15m primary + 1h/4h MTF.
-    STRICT: 15m swing pullback + ADX>30, TP2=2.5R. FAST v2: 1H EMA20 ±1.8% + bias>70 + ADX>18-rising + cooldown, TP2=3.0R.
+    STRICT: 15m swing pullback + ADX>30, TP2=2.5R.
+    FAST v2: 1H EMA20 ±1.8% + bias>60 + ADX>18-rising + cooldown, TP2=3.0R.
     Partial-close: TP1=0.5R (close 40%), SL→BE, runner to TP2.
     """
 
@@ -399,7 +400,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         df5  = self._to_df(candles_5m)
         df1h = self._to_df(candles_1h)
         df4h = self._to_df(candles_4h)
-        # Fast mode entered at bias > 40 → reversed when bias < -40
+        # Fast mode: crash-guard flip threshold mirrors entry gate (bias_gate_fast)
         bias_flip = (self._p["bias_gate_fast"] if self._p.get("fast_mode")
                      else self._p["health_bias_flip"])
         return check_health(
