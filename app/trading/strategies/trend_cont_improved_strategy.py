@@ -451,7 +451,7 @@ class TrendContImprovedStrategy(BaseStrategy):
             bias_v = float(last.get("comp_pct", 0) or 0)
             sc_l   = float(last.get("score_long", 0) or 0)
             sc_s   = float(last.get("score_short", 0) or 0)
-            gate   = p["bias_gate_fast"] if p.get("fast_mode") else p["bias_gate"]
+            gate   = self._p["bias_gate_fast"] if self._p.get("fast_mode") else self._p["bias_gate"]
             _y = lambda k: "✓" if last.get(k) else "✗"
             long_layers  = f"4H{_y('d_macro_up')} 1H{_y('d_mid_up')} pull{_y('d_pull_l')} bias{_y('d_bias_l')} adx{_y('d_adx_ok')}"
             short_layers = f"4H{_y('d_macro_dn')} 1H{_y('d_mid_dn')} pull{_y('d_pull_s')} bias{_y('d_bias_s')} adx{_y('d_adx_ok')}"
