@@ -572,12 +572,14 @@ class TradingBot:
             pos.health_label  = result.label
             pos.health_checks += 1
 
-            # 2-bar confirmation for WEAK: must be WEAK 2 consecutive cycles before closing
+            # WEAK confirmation: must be WEAK N consecutive cycles before closing.
+            # N=3 (9 min) gives more time to recover vs N=2 (6 min).
+            weak_confirm = getattr(self, "_health_weak_confirm", 3)
             if result.label == "WEAK":
                 pos.health_weak_count += 1
-                if pos.health_weak_count < 2:
-                    logger.info("[MONITOR] %s %s WEAK (score=%.0f) — %d/2 confirmation, holding",
-                                strategy, sym, result.score, pos.health_weak_count)
+                if pos.health_weak_count < weak_confirm:
+                    logger.info("[MONITOR] %s %s WEAK (score=%.0f) — %d/%d confirmation, holding",
+                                strategy, sym, result.score, pos.health_weak_count, weak_confirm)
                     continue
             else:
                 pos.health_weak_count = 0  # reset on any non-WEAK cycle

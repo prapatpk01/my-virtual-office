@@ -141,7 +141,8 @@ def build_config() -> dict:
         # BULL≥85%: extend TP2 up ladder (1.2→1.5→2.0→2.5→3.0R)
         # NEUTRAL 50–84%: hold
         # WEAK<40%: close immediately (better than SL)
-        "monitor_interval":   _env_int("MONITOR_INTERVAL",   180),  # seconds between checks
+        "monitor_interval":      _env_int("MONITOR_INTERVAL",      180),  # seconds between checks
+        "health_weak_confirm":   _env_int("HEALTH_WEAK_CONFIRM",   3),    # consecutive WEAK cycles before close
 
         # ── Risk / sizing ─────────────────────────────────────────────────────
         # FIXED_TRADE_USDT: margin per trade (before leverage).
@@ -304,6 +305,7 @@ async def main():
         dynamic_sizing=cfg["dynamic_sizing"],
         monitor_interval=cfg["monitor_interval"],
     )
+    bot._health_weak_confirm = cfg["health_weak_confirm"]
 
     # ── Backtest function (called by /backtest Telegram command) ─────────────
     async def _run_backtest() -> str:
