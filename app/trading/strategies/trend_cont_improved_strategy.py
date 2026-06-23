@@ -397,7 +397,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Fast mode v2
         fast_mode=False,
         adx_min_fast=18,          # ADX lower bound — trend must be active
-        adx_max_fast=40,          # ADX upper bound — avoid overheated/exhausted trends
+        adx_max_fast=50,          # ADX upper bound — caps overheated entries. Backtest
+                                  # (Jan-May 2026) shows 50 beats both 40 (cuts too many
+                                  # strong-trend wins) and no-cap; combined PnL peaks at 50.
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
         pullback_pct_fast=0.025,  # 1H EMA20 zone ±2.5% (widened from 1.8% — XAU runs far from EMA20)
         bias_gate_fast=60.0,      # MTF bias gate — 60 is live-calibrated (grid winner was 70 but too strict for live market phases)
