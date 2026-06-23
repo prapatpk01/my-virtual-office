@@ -176,10 +176,10 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 # Backtest Jan-May 2026 ($50×20x): Classic=+$90 combined; SJ Hybrid=+$103 combined
 # SJ Hybrid improves XAU +134% ($38→$89) while keeping BTC profitable (+$14 vs +$52).
 
-def build_indicator_registry(sj_scoring: bool = False):
+def build_indicator_registry(sj_scoring: bool = False, extended: bool = False):
     if sj_scoring:
         # SJ Hybrid: faster/smarter components from SJ Fast Entry research
-        return {
+        reg = {
             "hma_bull": dict(
                 enabled=True, weight=1.0,
                 long =lambda c: c["close"] > c["hma"],
@@ -211,6 +211,30 @@ def build_indicator_registry(sj_scoring: bool = False):
                 desc="15m close breaks above/below 10-bar high/low (bonus confirm)",
             ),
         }
+        if extended:
+            # SJ Extended (+3 components → 8 total): OBV pressure, market structure,
+            # Fair Value Gap imbalance.  Suggest min_score=5 or 6 out of 8.
+            reg.update({
+                "obv_trend": dict(
+                    enabled=True, weight=1.0,
+                    long =lambda c: c["obv"] > c["obv_ema20"],
+                    short=lambda c: c["obv"] < c["obv_ema20"],
+                    desc="OBV above/below its EMA20 (dominant volume pressure)",
+                ),
+                "market_struct": dict(
+                    enabled=True, weight=1.0,
+                    long =lambda c: c["sma20_rising"] & (c["close"] > c["sma20"]),
+                    short=lambda c: (~c["sma20_rising"]) & (c["close"] < c["sma20"]),
+                    desc="SMA20 rising + close above it (structural bullish/bearish context)",
+                ),
+                "fvg_confirm": dict(
+                    enabled=True, weight=1.0,
+                    long =lambda c: c["fvg_bull"],
+                    short=lambda c: c["fvg_bear"],
+                    desc="Bullish/bearish FVG (3-candle imbalance) formed in last 5 bars",
+                ),
+            })
+        return reg
     # Classic 4-component registry (default)
     return {
         "above_ema9": dict(
@@ -369,6 +393,17 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     else:
         adx_ok = out["adx15"] > p["adx_min"]
 
+    # Optional: require 1h AND 4h ADX to confirm trend is active on higher TFs.
+    if p.get("htf_adx_gate", False):
+        adx_len  = p.get("htf_adx_len", 14)
+        min_1h   = p.get("htf_adx_min_1h", 20)
+        min_4h   = p.get("htf_adx_min_4h", 18)
+        adx1h = _adx(out[["h1_high","h1_low","h1_close"]].rename(
+            columns={"h1_high":"high","h1_low":"low","h1_close":"close"}), adx_len)
+        adx4h = _adx(out[["h4_high","h4_low","h4_close"]].rename(
+            columns={"h4_high":"high","h4_low":"low","h4_close":"close"}), adx_len)
+        adx_ok = adx_ok & (adx1h > min_1h) & (adx4h > min_4h)
+
     # ── Layer 6: Micro score indicators ──────────────────────────────────────
     ema9  = _ema(out["close"], p["ema_micro"])
     ema20 = _ema(out["close"], p["ema_fast"])
@@ -390,12 +425,20 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     obv_dir  = np.sign(out["close"].diff().fillna(0))
     obv      = (obv_dir * out["volume"]).cumsum()
     obv_ema20 = _ema(obv, 20)
+    # SJ Extended extras: market structure + FVG imbalance
+    sma20         = _sma(out["close"], 20)
+    sma20_rising  = sma20 > sma20.shift(3)              # slope over 3 bars (45 min)
+    # FVG: 3-candle imbalance where there's a gap between bar[i-2].high and bar[i].low
+    fvg_bull = (out["low"] > out["high"].shift(2)).rolling(5, min_periods=1).max().astype(bool)
+    fvg_bear = (out["high"] < out["low"].shift(2)).rolling(5, min_periods=1).max().astype(bool)
 
     ctx = dict(
         close=out["close"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
         macd=macd_line, macd_signal=macd_sig,
         ema5=ema5, sma9=sma9, hma=hma, hh10=hh10, ll10=ll10,
         obv=obv, obv_ema20=obv_ema20,
+        sma20=sma20, sma20_rising=sma20_rising,
+        fvg_bull=fvg_bull, fvg_bear=fvg_bear,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
@@ -626,6 +669,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_scoring=True,
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
         macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
+        # SJ Extended scoring: adds OBV trend + Market Structure + FVG (5 → 8 components)
+        sj_extended=False,         # enable 3 extra 15m components (total 8); adjust min_score to 5-6
+        # HTF ADX gate: require 1h AND 4h ADX > threshold alongside 15m ADX
+        htf_adx_gate=False,
+        htf_adx_len=14,
+        htf_adx_min_1h=20,
+        htf_adx_min_4h=18,
         # HTF Momentum Score — 8-component quality gate (replaces binary crossover when enabled)
         htf_mom_score=False,       # off by default; enable to replace binary macro/mid gates
         min_htf_score=6,           # require 6/8 for entry (5 = moderate, 6 = strict)
@@ -640,8 +690,10 @@ class TrendContImprovedStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self._p = {**self.DEFAULTS, **{k: self.params.get(k, v) for k, v in self.DEFAULTS.items()}}
-        sj = bool(self._p.get("sj_scoring", False))
-        self._p["indicators"] = self.params.get("indicators", build_indicator_registry(sj_scoring=sj))
+        sj  = bool(self._p.get("sj_scoring",  False))
+        ext = bool(self._p.get("sj_extended", False))
+        self._p["indicators"] = self.params.get("indicators",
+            build_indicator_registry(sj_scoring=sj, extended=ext))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
