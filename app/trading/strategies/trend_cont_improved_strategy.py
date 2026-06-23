@@ -514,7 +514,8 @@ class TrendContImprovedStrategy(BaseStrategy):
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
         pullback_pct_fast=0.025,  # 1H EMA20 zone ±2.5% (widened from 1.8% — XAU runs far from EMA20)
         bias_gate_fast=60.0,      # MTF bias gate — 60 is live-calibrated (grid winner was 70 but too strict for live market phases)
-        tp2_r_fast=3.0,           # FAST runner target 3.0R (grid winner; lets trends run further)
+        tp2_r_fast=2.5,           # FAST runner target 2.5R (closes faster than 3R; BULL
+                                  # health can still extend toward the 3.0R ladder max)
         cooldown_bars=5,          # whipsaw cooldown: block N×15m after signal (time-based, not call-based)
         # crash-guard
         health_guard_enabled=True,
