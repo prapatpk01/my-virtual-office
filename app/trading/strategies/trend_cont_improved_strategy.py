@@ -266,6 +266,15 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     ef4, es4 = _ema(out["h4_close"], p["ema_fast"]), _ema(out["h4_close"], p["ema_slow"])
     macro_up, macro_dn = ef4 > es4, ef4 < es4
 
+    # Optional: gate on 4h MACD histogram slope — blocks fading crossovers.
+    # Fires when ema_fast/slow are 12/26 (MACD periods) or any config with noise risk.
+    if p.get("macd_slope_gate", False):
+        macd4      = ef4 - es4
+        hist_rising  = macd4 > macd4.shift(1)
+        hist_falling = macd4 < macd4.shift(1)
+        macro_up = macro_up & hist_rising
+        macro_dn = macro_dn & hist_falling
+
     # ── Layer 2: 1H mid trend ─────────────────────────────────────────────────
     ef1, es1 = _ema(out["h1_close"], p["ema_fast"]), _ema(out["h1_close"], p["ema_slow"])
     mid_up, mid_dn = ef1 > es1, ef1 < es1
@@ -571,6 +580,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # min_score stays 4 (out of 5 components instead of 4 → more flexible).
         sj_scoring=True,
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
+        macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
     )
 
     def __init__(self, symbol: str, params: dict = None):
