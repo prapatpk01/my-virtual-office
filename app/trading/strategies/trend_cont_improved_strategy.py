@@ -180,11 +180,11 @@ def build_indicator_registry(sj_scoring: bool = False):
     if sj_scoring:
         # SJ Hybrid: faster/smarter components from SJ Fast Entry research
         return {
-            "hma20_bull": dict(
+            "hma_bull": dict(
                 enabled=True, weight=1.0,
-                long =lambda c: c["close"] > c["hma20"],
-                short=lambda c: c["close"] < c["hma20"],
-                desc="15m close vs HMA20 (Hull MA — faster than EMA20)",
+                long =lambda c: c["close"] > c["hma"],
+                short=lambda c: c["close"] < c["hma"],
+                desc="15m close vs HMA (Hull MA — period set by hma_period param)",
             ),
             "ema5_sma9": dict(
                 enabled=True, weight=1.0,
@@ -326,20 +326,17 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     macd_sig  = _ema(macd_line, 9)
 
     # SJ Hybrid scoring extras (only computed when sj_scoring=True)
-    ema5       = _ema(out["close"], 5)
-    sma9       = _sma(out["close"], 9)
-    hma20      = _hma(out["close"], 20)
-    hh10       = out["high"].rolling(10).max().shift(1)   # prev 10-bar high (no lookahead)
-    ll10       = out["low"].rolling(10).min().shift(1)    # prev 10-bar low
-    st_period  = int(p.get("st_period", 10))
-    st_mult    = float(p.get("st_mult", 3.0))
-    supertrend = _supertrend(out, st_period, st_mult)
+    hma_period = int(p.get("hma_period", 20))
+    ema5  = _ema(out["close"], 5)
+    sma9  = _sma(out["close"], 9)
+    hma   = _hma(out["close"], hma_period)
+    hh10  = out["high"].rolling(10).max().shift(1)   # prev 10-bar high (no lookahead)
+    ll10  = out["low"].rolling(10).min().shift(1)    # prev 10-bar low
 
     ctx = dict(
         close=out["close"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
         macd=macd_line, macd_signal=macd_sig,
-        ema5=ema5, sma9=sma9, hma20=hma20, hh10=hh10, ll10=ll10,
-        supertrend=supertrend,
+        ema5=ema5, sma9=sma9, hma=hma, hh10=hh10, ll10=ll10,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
@@ -565,9 +562,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Backtest Jan-May 2026: Hybrid=+$103 vs Classic=+$90 combined (BTC+XAU);
         # with Trend-Fade guard, SJ Hybrid reaches +$217 vs Classic +$279 — but SJ
         # has the far better risk-adjusted profile (PnL/DD 1.76, MaxDD -$123).
-        # Swaps EMA9/EMA20 → HMA20/EMA5>SMA9 + adds Breakout(10) as 5th component.
+        # Swaps EMA9/EMA20 → HMA/EMA5>SMA9 + adds Breakout(10) as 5th component.
         # min_score stays 4 (out of 5 components instead of 4 → more flexible).
         sj_scoring=True,
+        hma_period=20,   # HMA period — lower = faster signal, backtest before changing
     )
 
     def __init__(self, symbol: str, params: dict = None):
