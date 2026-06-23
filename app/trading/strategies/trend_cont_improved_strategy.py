@@ -170,8 +170,8 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 # ── MODULAR MICRO-INDICATOR REGISTRY ──────────────────────────────────────────
 #
 # CLASSIC mode (4 components, min 4/4):  above_ema9, above_ema20, rsi_band, volume_ok
-# SJ HYBRID mode (6 components, min 4/6): hma20_bull, ema5_sma9, rsi_band, volume_ok,
-#   breakout_hh10, supertrend_bull — adds ATR-band direction as a 6th independent signal
+# SJ HYBRID mode (5 components, min 4/5): hma20_bull, ema5_sma9, rsi_band, volume_ok,
+#   breakout_hh10 — replaces EMA9/EMA20 with faster HMA20/EMA5>SMA9 + breakout
 #
 # Backtest Jan-May 2026 ($50×20x): Classic=+$90 combined; SJ Hybrid=+$103 combined
 # SJ Hybrid improves XAU +134% ($38→$89) while keeping BTC profitable (+$14 vs +$52).
@@ -209,12 +209,6 @@ def build_indicator_registry(sj_scoring: bool = False):
                 long =lambda c: c["close"] > c["hh10"],
                 short=lambda c: c["close"] < c["ll10"],
                 desc="15m close breaks above/below 10-bar high/low (bonus confirm)",
-            ),
-            "supertrend_bull": dict(
-                enabled=True, weight=1.0,
-                long =lambda c: c["supertrend"] > 0,
-                short=lambda c: c["supertrend"] < 0,
-                desc="Supertrend(10,3) ATR-band direction — independent of MA family",
             ),
         }
     # Classic 4-component registry (default)
@@ -571,12 +565,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Backtest Jan-May 2026: Hybrid=+$103 vs Classic=+$90 combined (BTC+XAU);
         # with Trend-Fade guard, SJ Hybrid reaches +$217 vs Classic +$279 — but SJ
         # has the far better risk-adjusted profile (PnL/DD 1.76, MaxDD -$123).
-        # 6 components: HMA20/EMA5>SMA9/RSI/Volume/Breakout(10)/Supertrend(10,3).
-        # min_score=4 out of 6 → more flexible entry than 4/4 classic.
+        # Swaps EMA9/EMA20 → HMA20/EMA5>SMA9 + adds Breakout(10) as 5th component.
+        # min_score stays 4 (out of 5 components instead of 4 → more flexible).
         sj_scoring=True,
-        # Supertrend params (component 6 in SJ Hybrid)
-        st_period=10,
-        st_mult=3.0,
     )
 
     def __init__(self, symbol: str, params: dict = None):
@@ -708,7 +699,7 @@ class TrendContImprovedStrategy(BaseStrategy):
             adx_max  = self._p.get("adx_max_fast", 50) if self._p.get("fast_mode") else 999
             sj_tag   = "[SJ]" if self._p.get("sj_scoring") else ""
             min_sc   = self._p.get("min_score", 4)
-            n_comps  = 6 if self._p.get("sj_scoring") else 4
+            n_comps  = 5 if self._p.get("sj_scoring") else 4
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[TCImproved{sj_tag}] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}(18-{adx_max:.0f}) "
                           f"score={sc_l:.0f}L/{sc_s:.0f}S(need≥{min_sc:.0f}/{n_comps}) "
