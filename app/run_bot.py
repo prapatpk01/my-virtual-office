@@ -138,6 +138,9 @@ def build_config() -> dict:
         "reversal_spike_enabled": _env_bool("REVERSAL_SPIKE_ENABLED", True),
         "reversal_spike_atr":   _env_float("REVERSAL_SPIKE_ATR",   1.5),  # ×ATR(3m) threshold
         "reversal_spike_bars":  _env_int("REVERSAL_SPIKE_BARS",    4),    # window: 4×3m = 12 min
+        # Trend-Fade cut: ≥0.6R underwater + ADX(15m) falling + lost EMA20(5m) → close
+        "trend_fade_enabled":   _env_bool("TREND_FADE_ENABLED",    True),
+        "trend_fade_uw_frac":   _env_float("TREND_FADE_UW_FRAC",   0.6),  # R underwater gate
         "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # strict bias flip (fast uses bias_gate_fast)
         # SJ Hybrid scoring (FAST mode only): HMA20 + EMA5>SMA9 + RSI + Volume + Breakout(10)
         # Backtest: combined BTC+XAU +$103 (SJ) vs +$90 (classic). XAU improves +134%.
@@ -224,6 +227,8 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "reversal_spike_enabled": cfg["reversal_spike_enabled"],
             "reversal_spike_atr":     cfg["reversal_spike_atr"],
             "reversal_spike_bars":    cfg["reversal_spike_bars"],
+            "trend_fade_enabled":     cfg["trend_fade_enabled"],
+            "trend_fade_uw_frac":     cfg["trend_fade_uw_frac"],
             "sj_scoring":             cfg["tci_sj_scoring"],
         }))
 

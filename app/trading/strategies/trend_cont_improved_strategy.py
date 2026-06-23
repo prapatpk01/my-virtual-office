@@ -430,6 +430,53 @@ def check_spike_cut(side: str, entry: float, one_r: float,
             f"spike {move_r:.2f}×ATR < {spike_atr_mult}×ATR — safe")
 
 
+# ── TREND-FADE CUT ─────────────────────────────────────────────────────────────
+
+def check_trend_fade(side: str, entry: float, one_r: float,
+                     df15: pd.DataFrame, df5: pd.DataFrame,
+                     uw_frac: float = 0.6) -> tuple[str, str]:
+    """
+    Early-loss cut for a dying trend. Fires ONLY when ALL three are true:
+      1. ADX(15m) is falling     — trend strength weakening
+      2. price has lost EMA20(5m) against the position — direction turned adverse
+      3. position is ≥ uw_frac×1R underwater — the trade is genuinely losing
+
+    Cuts the loser at ~−0.6R instead of waiting for the full −1R stop. The triple
+    gate is what makes it safe: a quiet winner (not underwater) or a healthy
+    pullback (price still above EMA20, or ADX rising) is never touched — that is
+    why ADX-alone exits failed in backtest while this one improves both PnL and
+    drawdown.
+
+    Backtest Jan-May 2026 ($50×20x), combined BTC+XAU vs current (BE-only):
+      Classic:   $241 → $279 (+16%), MaxDD −$108 → −$105, PnL/DD 2.23 → 2.66
+      SJ Hybrid: $143 → $217 (+52%), MaxDD −$172 → −$123, PnL/DD 0.83 → 1.76
+    """
+    if df15 is None or len(df15) < 30 or df5 is None or len(df5) < 25:
+        return ("HOLD", "insufficient data for trend-fade")
+    if one_r <= 0:
+        return ("HOLD", "invalid one_r — trend-fade skipped")
+
+    px = float(df5["close"].iloc[-1])
+    uw = (entry - px) / one_r if side == "long" else (px - entry) / one_r
+    if uw < uw_frac:
+        return ("HOLD", f"only {uw:.2f}R underwater (< {uw_frac}R) — safe")
+
+    adx15 = _adx(df15, 14)
+    adx_now, adx_prev = float(adx15.iloc[-1]), float(adx15.iloc[-2])
+    adx_falling = adx_now < adx_prev
+
+    ema20_5 = float(_ema(df5["close"], 20).iloc[-1])
+    against = (px < ema20_5) if side == "long" else (px > ema20_5)
+
+    if adx_falling and against:
+        return ("CLOSE",
+                f"TREND-FADE: {uw:.2f}R underwater + ADX(15m) falling "
+                f"({adx_prev:.0f}→{adx_now:.0f}) + lost EMA20(5m)")
+    return ("HOLD",
+            f"{uw:.2f}R underwater but trend not fading "
+            f"(adx {adx_prev:.0f}→{adx_now:.0f}, against={against})")
+
+
 # ── BaseStrategy wrapper ─────────────────────────────────────────────────────
 
 class TrendContImprovedStrategy(BaseStrategy):
@@ -474,6 +521,11 @@ class TrendContImprovedStrategy(BaseStrategy):
         reversal_spike_enabled=True,
         reversal_spike_atr=1.5,   # adverse move must be ≥ N×ATR(3m)
         reversal_spike_bars=4,    # window in 3m bars (4×3m = 12 min)
+        # trend-fade cut: early-loss exit when trend dies AND price turns AND losing
+        # Backtest Jan-May 2026: Classic +16% ($241→$279), SJ +52% ($143→$217),
+        # both with lower MaxDD. Triple gate avoids chopping quiet winners.
+        trend_fade_enabled=True,
+        trend_fade_uw_frac=0.6,   # min R underwater before the cut can fire
         # SJ Hybrid scoring mode (FAST mode only)
         # Backtest Jan-May 2026: Hybrid=+$103 vs Classic=+$90 combined (BTC+XAU).
         # Swaps EMA9/EMA20 → HMA20/EMA5>SMA9 + adds Breakout(10) as 5th component.
@@ -511,11 +563,12 @@ class TrendContImprovedStrategy(BaseStrategy):
 
     def monitor_position(self, side: str, entry: float, one_r: float, tp1_hit: bool,
                          candles_5m: list, candles_1h: list, candles_4h: list,
-                         candles_3m: list = None) -> tuple[str, str]:
+                         candles_3m: list = None, candles_15m: list = None) -> tuple[str, str]:
         """
         Guard stack (checked in order, first CLOSE wins):
           1. Spike-Cut   — fast adverse ≥1.5×ATR(3m) in 12 min (pre-TP1 only)
-          2. Crash-Guard — 0.7R underwater + momentum fully reversed
+          2. Trend-Fade  — ≥0.6R underwater + ADX(15m) falling + lost EMA20(5m) (pre-TP1)
+          3. Crash-Guard — 0.7R underwater + momentum fully reversed
         Returns ('CLOSE'|'HOLD', reason).
         """
         if not self._p["health_guard_enabled"]:
@@ -535,10 +588,23 @@ class TrendContImprovedStrategy(BaseStrategy):
             if sc_action == "CLOSE":
                 return ("CLOSE", sc_reason)
 
-        # ── Layer 2: Crash-Guard (0.7R + full reversal) ────────────────────────
         df5  = self._to_df(candles_5m)
         df1h = self._to_df(candles_1h)
         df4h = self._to_df(candles_4h)
+
+        # ── Layer 2: Trend-Fade Cut (pre-TP1 — after TP1 the BE stop guards) ───
+        # Cuts a dying+turning loser at ~−0.6R instead of the full −1R stop.
+        if (self._p.get("trend_fade_enabled") and not tp1_hit
+                and candles_15m and one_r > 0):
+            df15 = self._to_df(candles_15m)
+            tf_action, tf_reason = check_trend_fade(
+                side, entry, one_r, df15, df5,
+                uw_frac=self._p["trend_fade_uw_frac"],
+            )
+            if tf_action == "CLOSE":
+                return ("CLOSE", tf_reason)
+
+        # ── Layer 3: Crash-Guard (0.7R + full reversal) ────────────────────────
         bias_flip = (self._p["bias_gate_fast"] if self._p.get("fast_mode")
                      else self._p["health_bias_flip"])
         return check_health(
