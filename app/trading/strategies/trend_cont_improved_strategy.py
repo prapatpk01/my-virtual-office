@@ -647,7 +647,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         atr_period=14, sl_mult=1.2, sl_min_pct=0.012, sl_max_pct=0.035,
         adx_len=14, adx_min=30,
         tp1_r=0.5, tp1_fraction=0.40, tp2_r=2.5,
-        min_score=4.0,
+        min_score=5.0,   # 5/6 with sj_roc9=True (was 4/5 baseline)
         # Fast mode v2
         fast_mode=False,
         adx_min_fast=18,          # ADX lower bound — trend must be active
@@ -682,8 +682,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_scoring=True,
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
         macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
-        # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6); adjust min_score to 4-5
-        sj_roc9=False,
+        # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).
+        # Backtest Jan-May 2026: min5/6 → combined +$447 vs baseline +$401 (+11.5% PnL, same MaxDD).
+        sj_roc9=True,
         # SJ Extended scoring: adds OBV trend + Market Structure + FVG (5 → 8 components)
         sj_extended=False,         # enable 3 extra 15m components (total 8); adjust min_score to 5-6
         # HTF ADX gate: require 1h AND 4h ADX > threshold alongside 15m ADX
