@@ -254,12 +254,21 @@ def _mtf_bias(s5: pd.Series, s1h: pd.Series, s4h: pd.Series) -> float:
 
 
 def _classify(score: float) -> str:
+    """
+    4-level health:
+      BULL        85-100  → extend TP (momentum strong)
+      NEUTRAL     50-84   → hold
+      WEAK        40-49   → close after N-cycle confirm (fade, may recover)
+      STRONG_WEAK 0-39    → close NOW, no confirm (sharp reversal / V-shape)
+    """
     if score >= 85: return "BULL"
-    if score >= 45: return "NEUTRAL"
-    return "WEAK"
+    if score >= 50: return "NEUTRAL"
+    if score >= 40: return "WEAK"
+    return "STRONG_WEAK"
 
 
 def _action(label: str, score: float) -> str:
-    if label == "BULL":    return "EXTEND_TP"
-    if label == "WEAK":    return "CLOSE"
+    if label == "BULL":        return "EXTEND_TP"
+    if label == "WEAK":        return "CLOSE"   # bot delays via weak-confirm
+    if label == "STRONG_WEAK": return "CLOSE"   # bot closes immediately
     return "HOLD"

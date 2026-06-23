@@ -446,7 +446,11 @@ class TradingBot:
                 # Close a whole number of contracts (≈partial_pct of the position).
                 ct = pos.contract_size or 1.0
                 full_contracts  = int(round(pos.full_amount / ct)) if ct > 0 else 0
-                close_contracts = int(full_contracts * pos.partial_pct)
+                # Use round (not truncate) so a 2-contract position still splits:
+                # int(2*0.4)=0 silently disabled TP1; round→1 closes one, keeps one.
+                # Always leave at least one runner and always close at least one.
+                close_contracts = max(1, int(round(full_contracts * pos.partial_pct)))
+                close_contracts = min(close_contracts, full_contracts - 1)
                 close_amt = round(close_contracts * ct, 8)
                 if close_amt <= 0 or close_amt >= pos.amount:
                     # Can't split into whole contracts → keep position, treat as single-TP:
@@ -604,10 +608,14 @@ class TradingBot:
             pos.health_label  = result.label
             pos.health_checks += 1
 
-            # WEAK confirmation: must be WEAK N consecutive cycles before closing.
-            # N=3 (9 min) gives more time to recover vs N=2 (6 min).
+            # STRONG_WEAK (score < 40): sharp reversal / V-shape — close NOW, no wait.
+            # WEAK (40-49): soft fade — must persist N consecutive cycles before close.
             weak_confirm = getattr(self, "_health_weak_confirm", 3)
-            if result.label == "WEAK":
+            if result.label == "STRONG_WEAK":
+                pos.health_weak_count = 0
+                logger.info("[MONITOR] %s %s STRONG_WEAK (score=%.0f) — closing immediately",
+                            strategy, sym, result.score)
+            elif result.label == "WEAK":
                 pos.health_weak_count += 1
                 if pos.health_weak_count < weak_confirm:
                     logger.info("[MONITOR] %s %s WEAK (score=%.0f) — %d/%d confirmation, holding",
