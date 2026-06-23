@@ -101,6 +101,33 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return _rma(_true_range(df), period)
 
 
+def _supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.Series:
+    """
+    Supertrend — ATR-band volatility indicator. Returns +1 (bullish) / -1 (bearish).
+    Completely different from MA family: flips only when price breaches the band,
+    so small wicks don't cause noise. Complements HMA/EMA components.
+    """
+    atr   = _atr(df, period).to_numpy()
+    hl2   = ((df["high"] + df["low"]) / 2).to_numpy()
+    close = df["close"].to_numpy()
+    n     = len(close)
+
+    ub = hl2 + multiplier * atr   # basic upper band
+    lb = hl2 - multiplier * atr   # basic lower band
+    fu = ub.copy()                # final upper band
+    fl = lb.copy()                # final lower band
+    st = np.ones(n)               # supertrend direction: +1 bull / -1 bear
+
+    for i in range(1, n):
+        fu[i] = ub[i] if (ub[i] < fu[i-1] or close[i-1] > fu[i-1]) else fu[i-1]
+        fl[i] = lb[i] if (lb[i] > fl[i-1] or close[i-1] < fl[i-1]) else fl[i-1]
+        if   close[i] > fu[i-1]: st[i] =  1
+        elif close[i] < fl[i-1]: st[i] = -1
+        else:                     st[i] =  st[i-1]
+
+    return pd.Series(st, index=df.index)
+
+
 def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     up = df["high"].diff()
     dn = -df["low"].diff()
@@ -143,8 +170,8 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 # ── MODULAR MICRO-INDICATOR REGISTRY ──────────────────────────────────────────
 #
 # CLASSIC mode (4 components, min 4/4):  above_ema9, above_ema20, rsi_band, volume_ok
-# SJ HYBRID mode (5 components, min 4/5): hma20_bull, ema5_sma9, rsi_band, volume_ok,
-#   breakout_hh10 (bonus) — replaces EMA9/EMA20 with faster HMA20/EMA5>SMA9 + breakout
+# SJ HYBRID mode (6 components, min 4/6): hma20_bull, ema5_sma9, rsi_band, volume_ok,
+#   breakout_hh10, supertrend_bull — adds ATR-band direction as a 6th independent signal
 #
 # Backtest Jan-May 2026 ($50×20x): Classic=+$90 combined; SJ Hybrid=+$103 combined
 # SJ Hybrid improves XAU +134% ($38→$89) while keeping BTC profitable (+$14 vs +$52).
@@ -182,6 +209,12 @@ def build_indicator_registry(sj_scoring: bool = False):
                 long =lambda c: c["close"] > c["hh10"],
                 short=lambda c: c["close"] < c["ll10"],
                 desc="15m close breaks above/below 10-bar high/low (bonus confirm)",
+            ),
+            "supertrend_bull": dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["supertrend"] > 0,
+                short=lambda c: c["supertrend"] < 0,
+                desc="Supertrend(10,3) ATR-band direction — independent of MA family",
             ),
         }
     # Classic 4-component registry (default)
@@ -299,16 +332,20 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     macd_sig  = _ema(macd_line, 9)
 
     # SJ Hybrid scoring extras (only computed when sj_scoring=True)
-    ema5  = _ema(out["close"], 5)
-    sma9  = _sma(out["close"], 9)
-    hma20 = _hma(out["close"], 20)
-    hh10  = out["high"].rolling(10).max().shift(1)   # prev 10-bar high (no lookahead)
-    ll10  = out["low"].rolling(10).min().shift(1)    # prev 10-bar low
+    ema5       = _ema(out["close"], 5)
+    sma9       = _sma(out["close"], 9)
+    hma20      = _hma(out["close"], 20)
+    hh10       = out["high"].rolling(10).max().shift(1)   # prev 10-bar high (no lookahead)
+    ll10       = out["low"].rolling(10).min().shift(1)    # prev 10-bar low
+    st_period  = int(p.get("st_period", 10))
+    st_mult    = float(p.get("st_mult", 3.0))
+    supertrend = _supertrend(out, st_period, st_mult)
 
     ctx = dict(
         close=out["close"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
         macd=macd_line, macd_signal=macd_sig,
         ema5=ema5, sma9=sma9, hma20=hma20, hh10=hh10, ll10=ll10,
+        supertrend=supertrend,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
@@ -534,9 +571,12 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Backtest Jan-May 2026: Hybrid=+$103 vs Classic=+$90 combined (BTC+XAU);
         # with Trend-Fade guard, SJ Hybrid reaches +$217 vs Classic +$279 — but SJ
         # has the far better risk-adjusted profile (PnL/DD 1.76, MaxDD -$123).
-        # Swaps EMA9/EMA20 → HMA20/EMA5>SMA9 + adds Breakout(10) as 5th component.
-        # min_score stays 4 (out of 5 components instead of 4 → more flexible).
+        # 6 components: HMA20/EMA5>SMA9/RSI/Volume/Breakout(10)/Supertrend(10,3).
+        # min_score=4 out of 6 → more flexible entry than 4/4 classic.
         sj_scoring=True,
+        # Supertrend params (component 6 in SJ Hybrid)
+        st_period=10,
+        st_mult=3.0,
     )
 
     def __init__(self, symbol: str, params: dict = None):
@@ -668,7 +708,7 @@ class TrendContImprovedStrategy(BaseStrategy):
             adx_max  = self._p.get("adx_max_fast", 50) if self._p.get("fast_mode") else 999
             sj_tag   = "[SJ]" if self._p.get("sj_scoring") else ""
             min_sc   = self._p.get("min_score", 4)
-            n_comps  = 5 if self._p.get("sj_scoring") else 4
+            n_comps  = 6 if self._p.get("sj_scoring") else 4
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[TCImproved{sj_tag}] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}(18-{adx_max:.0f}) "
                           f"score={sc_l:.0f}L/{sc_s:.0f}S(need≥{min_sc:.0f}/{n_comps}) "
