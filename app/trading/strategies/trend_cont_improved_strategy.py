@@ -505,9 +505,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Fast mode v2
         fast_mode=False,
         adx_min_fast=18,          # ADX lower bound — trend must be active
-        adx_max_fast=50,          # ADX upper bound — caps overheated entries. Backtest
-                                  # (Jan-May 2026) shows 50 beats both 40 (cuts too many
-                                  # strong-trend wins) and no-cap; combined PnL peaks at 50.
+        adx_max_fast=44,          # ADX upper bound — caps overheated entries. Backtest
+                                  # peaks at 50, but 44 chosen to avoid entering when the
+                                  # trend is already too hot/extended (risk preference).
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
         pullback_pct_fast=0.025,  # 1H EMA20 zone ±2.5% (widened from 1.8% — XAU runs far from EMA20)
         bias_gate_fast=60.0,      # MTF bias gate — 60 is live-calibrated (grid winner was 70 but too strict for live market phases)
@@ -526,11 +526,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         # both with lower MaxDD. Triple gate avoids chopping quiet winners.
         trend_fade_enabled=True,
         trend_fade_uw_frac=0.6,   # min R underwater before the cut can fire
-        # SJ Hybrid scoring mode (FAST mode only)
-        # Backtest Jan-May 2026: Hybrid=+$103 vs Classic=+$90 combined (BTC+XAU).
+        # SJ Hybrid scoring mode (FAST mode only) — ACTIVE by default.
+        # Backtest Jan-May 2026: Hybrid=+$103 vs Classic=+$90 combined (BTC+XAU);
+        # with Trend-Fade guard, SJ Hybrid reaches +$217 vs Classic +$279 — but SJ
+        # has the far better risk-adjusted profile (PnL/DD 1.76, MaxDD -$123).
         # Swaps EMA9/EMA20 → HMA20/EMA5>SMA9 + adds Breakout(10) as 5th component.
         # min_score stays 4 (out of 5 components instead of 4 → more flexible).
-        sj_scoring=False,
+        sj_scoring=True,
     )
 
     def __init__(self, symbol: str, params: dict = None):
