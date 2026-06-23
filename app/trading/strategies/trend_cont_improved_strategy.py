@@ -570,7 +570,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Swaps EMA9/EMA20 → HMA/EMA5>SMA9 + adds Breakout(10) as 5th component.
         # min_score stays 4 (out of 5 components instead of 4 → more flexible).
         sj_scoring=True,
-        hma_period=20,   # HMA period — lower = faster signal, backtest before changing
+        hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
     )
 
     def __init__(self, symbol: str, params: dict = None):
