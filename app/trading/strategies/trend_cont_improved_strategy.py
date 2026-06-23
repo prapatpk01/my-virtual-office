@@ -140,6 +140,10 @@ def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return _rma(dx.fillna(0), n)
 
 
+def _roc(s: pd.Series, n: int = 9) -> pd.Series:
+    return (s - s.shift(n)) / s.shift(n).replace(0, np.nan) * 100
+
+
 def _mtf_bias(primary_close: pd.Series, aligned: dict,
               ema_fast: int = 20, ema_slow: int = 50,
               rsi_period: int = 14, rsi_bull: float = 55.0, rsi_bear: float = 45.0) -> pd.Series:
@@ -176,7 +180,7 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 # Backtest Jan-May 2026 ($50×20x): Classic=+$90 combined; SJ Hybrid=+$103 combined
 # SJ Hybrid improves XAU +134% ($38→$89) while keeping BTC profitable (+$14 vs +$52).
 
-def build_indicator_registry(sj_scoring: bool = False, extended: bool = False):
+def build_indicator_registry(sj_scoring: bool = False, extended: bool = False, roc9: bool = False):
     if sj_scoring:
         # SJ Hybrid: faster/smarter components from SJ Fast Entry research
         reg = {
@@ -211,6 +215,13 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False):
                 desc="15m close breaks above/below 10-bar high/low (bonus confirm)",
             ),
         }
+        if roc9:
+            reg["roc9"] = dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["roc9"] > 0,
+                short=lambda c: c["roc9"] < 0,
+                desc="ROC(9) positive/negative — confirms price momentum direction",
+            )
         if extended:
             # SJ Extended (+3 components → 8 total): OBV pressure, market structure,
             # Fair Value Gap imbalance.  Suggest min_score=5 or 6 out of 8.
@@ -431,6 +442,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     # FVG: 3-candle imbalance where there's a gap between bar[i-2].high and bar[i].low
     fvg_bull = (out["low"] > out["high"].shift(2)).rolling(5, min_periods=1).max().astype(bool)
     fvg_bear = (out["high"] < out["low"].shift(2)).rolling(5, min_periods=1).max().astype(bool)
+    roc9_val = _roc(out["close"], 9)
 
     ctx = dict(
         close=out["close"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
@@ -439,6 +451,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         obv=obv, obv_ema20=obv_ema20,
         sma20=sma20, sma20_rising=sma20_rising,
         fvg_bull=fvg_bull, fvg_bear=fvg_bear,
+        roc9=roc9_val,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
@@ -669,6 +682,8 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_scoring=True,
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
         macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
+        # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6); adjust min_score to 4-5
+        sj_roc9=False,
         # SJ Extended scoring: adds OBV trend + Market Structure + FVG (5 → 8 components)
         sj_extended=False,         # enable 3 extra 15m components (total 8); adjust min_score to 5-6
         # HTF ADX gate: require 1h AND 4h ADX > threshold alongside 15m ADX
@@ -692,8 +707,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         self._p = {**self.DEFAULTS, **{k: self.params.get(k, v) for k, v in self.DEFAULTS.items()}}
         sj  = bool(self._p.get("sj_scoring",  False))
         ext = bool(self._p.get("sj_extended", False))
+        r9  = bool(self._p.get("sj_roc9",     False))
         self._p["indicators"] = self.params.get("indicators",
-            build_indicator_registry(sj_scoring=sj, extended=ext))
+            build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
