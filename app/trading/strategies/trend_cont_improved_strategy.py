@@ -279,6 +279,51 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     ef1, es1 = _ema(out["h1_close"], p["ema_fast"]), _ema(out["h1_close"], p["ema_slow"])
     mid_up, mid_dn = ef1 > es1, ef1 < es1
 
+    # ── HTF Momentum Score (opt-in; replaces binary Layer 1 + 2 gates) ────────
+    # 8 components: direction + separation + price-confirm + RSI on each of 4h/1h.
+    # Require min_htf_score/8. Default 6/8 filters noise crossovers and weak trends.
+    if p.get("htf_mom_score", False):
+        sep_th4       = p.get("htf_sep_thresh_4h", 0.002)
+        sep_th1       = p.get("htf_sep_thresh_1h", 0.001)
+        rsi_bull_lo   = p.get("htf_rsi_bull_lo",  45.0)
+        rsi_bull_hi   = p.get("htf_rsi_bull_hi",  75.0)
+        rsi_bear_lo   = p.get("htf_rsi_bear_lo",  25.0)
+        rsi_bear_hi   = p.get("htf_rsi_bear_hi",  55.0)
+        min_htf       = p.get("min_htf_score",      6)
+
+        rsi4 = _rsi(out["h4_close"], p["rsi_period"])
+        sep4 = (ef4 - es4).abs() / out["h4_close"].replace(0, np.nan)
+
+        rsi1 = _rsi(out["h1_close"], p["rsi_period"])
+        sep1 = (ef1 - es1).abs() / out["h1_close"].replace(0, np.nan)
+
+        htf_long = (
+            (ef4 > es4).astype(float)                                  # 4h direction
+            + (sep4 >= sep_th4).astype(float)                          # 4h separation
+            + (out["h4_close"] > ef4).astype(float)                    # 4h px confirm
+            + ((rsi4 >= rsi_bull_lo) & (rsi4 <= rsi_bull_hi)).astype(float)   # 4h RSI
+            + (ef1 > es1).astype(float)                                # 1h direction
+            + (sep1 >= sep_th1).astype(float)                          # 1h separation
+            + (out["h1_close"] > ef1).astype(float)                    # 1h px confirm
+            + ((rsi1 >= rsi_bull_lo) & (rsi1 <= rsi_bull_hi)).astype(float)   # 1h RSI
+        )
+        htf_short = (
+            (ef4 < es4).astype(float)
+            + (sep4 >= sep_th4).astype(float)
+            + (out["h4_close"] < ef4).astype(float)
+            + ((rsi4 >= rsi_bear_lo) & (rsi4 <= rsi_bear_hi)).astype(float)
+            + (ef1 < es1).astype(float)
+            + (sep1 >= sep_th1).astype(float)
+            + (out["h1_close"] < ef1).astype(float)
+            + ((rsi1 >= rsi_bear_lo) & (rsi1 <= rsi_bear_hi)).astype(float)
+        )
+        out["htf_score_long"]  = htf_long
+        out["htf_score_short"] = htf_short
+        macro_up = htf_long  >= min_htf
+        macro_dn = htf_short >= min_htf
+        mid_up   = macro_up   # 1h already baked into score; pass AND gate downstream
+        mid_dn   = macro_dn
+
     # ── Layer 3: Pullback zone (mode-specific) ────────────────────────────────
     if fast_mode:
         # Fast Mode v2: 1H EMA20 zone, wider ±1.8%
@@ -581,6 +626,15 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_scoring=True,
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
         macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
+        # HTF Momentum Score — 8-component quality gate (replaces binary crossover when enabled)
+        htf_mom_score=False,       # off by default; enable to replace binary macro/mid gates
+        min_htf_score=6,           # require 6/8 for entry (5 = moderate, 6 = strict)
+        htf_sep_thresh_4h=0.002,   # 4h EMA separation min: 0.20% of price
+        htf_sep_thresh_1h=0.001,   # 1h EMA separation min: 0.10% of price
+        htf_rsi_bull_lo=45.0,      # 4h/1h RSI bull zone lower bound (long entries)
+        htf_rsi_bull_hi=75.0,      # 4h/1h RSI bull zone upper bound
+        htf_rsi_bear_lo=25.0,      # 4h/1h RSI bear zone lower bound (short entries)
+        htf_rsi_bear_hi=55.0,      # 4h/1h RSI bear zone upper bound
     )
 
     def __init__(self, symbol: str, params: dict = None):
