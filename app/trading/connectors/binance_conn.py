@@ -343,6 +343,77 @@ class BinanceConnector(BaseConnector):
         await self._exchange.cancel_order(order_id, symbol)
         return True
 
+    async def move_sl_to_breakeven(
+        self, symbol: str, pos_side: str, entry_price: float, remaining_amount: float
+    ) -> bool:
+        """
+        After TP1, cancel the exchange algo SL and replace it at breakeven price.
+        OKX futures only; no-op for paper/non-OKX (returns True so caller treats it as success).
+        Returns True on success or no-op, False if the attempt fails.
+        """
+        if self.paper or self._exchange_id != "okx" or not self._futures:
+            return True
+
+        try:
+            market  = self._exchange.market(symbol)
+            inst_id = market["id"]   # e.g. "BTC-USDT-SWAP"
+        except Exception as e:
+            logger.warning("[SL→BE] market lookup failed for %s: %s", symbol, e)
+            return False
+
+        try:
+            # 1. Fetch all pending conditional (SL/TP) algo orders for this symbol
+            resp = await self._exchange.privateGetTradeAlgosPending({
+                "instId": inst_id,
+                "ordType": "conditional",
+            })
+            algo_orders = (resp or {}).get("data", [])
+
+            # Identify SL algo orders belonging to our position leg
+            sl_orders = [
+                o for o in algo_orders
+                if (o.get("posSide") == pos_side
+                    and o.get("slTriggerPx") not in (None, "", "0", "0.0"))
+            ]
+
+            if sl_orders:
+                # 2. Cancel each SL algo — failure here is non-fatal; we still place the new one
+                cancel_payload = [{"algoId": o["algoId"], "instId": inst_id} for o in sl_orders]
+                try:
+                    await self._exchange.privatePostTradeCancelAlgos(cancel_payload)
+                    logger.info("[SL→BE] Cancelled %d algo SL(s) for %s %s",
+                                len(sl_orders), symbol, pos_side)
+                except Exception as ce:
+                    logger.warning("[SL→BE] Cancel algo SL failed (proceeding anyway): %s", ce)
+            else:
+                logger.info("[SL→BE] No pending algo SL for %s %s — attaching new one at BE",
+                            symbol, pos_side)
+
+            # 3. Place new SL at breakeven for the remaining runner contracts
+            ct_val    = await self.contract_size(symbol)
+            contracts = max(1, round(remaining_amount / ct_val))
+            close_side = "sell" if pos_side == "long" else "buy"
+
+            await self._exchange.privatePostTradeOrderAlgo({
+                "instId":          inst_id,
+                "tdMode":          "isolated",
+                "side":            close_side,
+                "posSide":         pos_side,
+                "ordType":         "conditional",
+                "sz":              str(contracts),
+                "slTriggerPx":     str(round(entry_price, 2)),
+                "slOrdPx":         "-1",
+                "slTriggerPxType": "last",
+            })
+            logger.info("[SL→BE] Exchange SL moved to BE %.4f for %s %s runner (%d contracts)",
+                        entry_price, symbol, pos_side, contracts)
+            return True
+
+        except Exception as e:
+            logger.warning("[SL→BE] move_sl_to_breakeven failed for %s %s: %s",
+                           symbol, pos_side, e)
+            return False
+
     async def fetch_open_orders(self, symbol: Optional[str] = None) -> list[OrderResult]:
         if self.paper:
             return [o for o in self._paper_open_orders

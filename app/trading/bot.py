@@ -470,7 +470,18 @@ class TradingBot:
                 self.risk.register_pnl(pnl)
                 pos.amount     = round(pos.amount - close_amt, 6)
                 pos.tp1_hit    = True
-                pos.stop_loss  = pos.entry_price          # runner is now risk-free
+                pos.stop_loss  = pos.entry_price          # runner: bot-side BE stop
+                # Move exchange algo SL to breakeven. Non-fatal if it fails —
+                # bot-side BE stop + health monitor protect the runner.
+                sl_ok = await self.connector.move_sl_to_breakeven(
+                    sym, pos_side, pos.entry_price, pos.amount
+                )
+                if not sl_ok:
+                    logger.warning(
+                        "[%s] TP1 %s — exchange SL not moved to BE; "
+                        "bot-side BE stop + health monitor protecting runner",
+                        strategy_name, sym,
+                    )
                 self._record_trade(TradeRecord(
                     timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
                     price=price, amount=close_amt, pnl=pnl,
