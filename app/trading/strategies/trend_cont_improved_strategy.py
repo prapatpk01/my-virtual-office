@@ -82,6 +82,17 @@ def _true_range(df: pd.DataFrame) -> pd.Series:
     ).max(axis=1)
 
 
+def _wma(s: pd.Series, n: int) -> pd.Series:
+    weights = np.arange(1, n + 1, dtype=float)
+    return s.rolling(n).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+
+def _hma(s: pd.Series, n: int) -> pd.Series:
+    """Hull Moving Average — faster and smoother than EMA/SMA of same period."""
+    sqrt_n = max(2, int(round(n ** 0.5)))
+    return _wma(2 * _wma(s, n // 2) - _wma(s, n), sqrt_n)
+
+
 def _rma(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(alpha=1 / n, adjust=False).mean()
 
@@ -130,8 +141,50 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 
 
 # ── MODULAR MICRO-INDICATOR REGISTRY ──────────────────────────────────────────
+#
+# CLASSIC mode (4 components, min 4/4):  above_ema9, above_ema20, rsi_band, volume_ok
+# SJ HYBRID mode (5 components, min 4/5): hma20_bull, ema5_sma9, rsi_band, volume_ok,
+#   breakout_hh10 (bonus) — replaces EMA9/EMA20 with faster HMA20/EMA5>SMA9 + breakout
+#
+# Backtest Jan-May 2026 ($50×20x): Classic=+$90 combined; SJ Hybrid=+$103 combined
+# SJ Hybrid improves XAU +134% ($38→$89) while keeping BTC profitable (+$14 vs +$52).
 
-def build_indicator_registry():
+def build_indicator_registry(sj_scoring: bool = False):
+    if sj_scoring:
+        # SJ Hybrid: faster/smarter components from SJ Fast Entry research
+        return {
+            "hma20_bull": dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["close"] > c["hma20"],
+                short=lambda c: c["close"] < c["hma20"],
+                desc="15m close vs HMA20 (Hull MA — faster than EMA20)",
+            ),
+            "ema5_sma9": dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["ema5"] > c["sma9"],
+                short=lambda c: c["ema5"] < c["sma9"],
+                desc="EMA5 vs SMA9 alignment (more sensitive than EMA9 vs EMA20)",
+            ),
+            "rsi_band": dict(
+                enabled=True, weight=1.0,
+                long =lambda c: (c["rsi15"] >= c["rsi_min_buy"]) & (c["rsi15"] <= c["rsi_max_buy"]),
+                short=lambda c: (c["rsi15"] >= c["rsi_min_sell"]) & (c["rsi15"] <= c["rsi_max_sell"]),
+                desc="15m RSI inside allowed band",
+            ),
+            "volume_ok": dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["vol_ok"],
+                short=lambda c: c["vol_ok"],
+                desc="15m volume >= MA20 * vol_mult",
+            ),
+            "breakout_hh10": dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["close"] > c["hh10"],
+                short=lambda c: c["close"] < c["ll10"],
+                desc="15m close breaks above/below 10-bar high/low (bonus confirm)",
+            ),
+        }
+    # Classic 4-component registry (default)
     return {
         "above_ema9": dict(
             enabled=True, weight=1.0,
@@ -244,9 +297,17 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     macd_line = _ema(out["close"], 12) - _ema(out["close"], 26)
     macd_sig  = _ema(macd_line, 9)
 
+    # SJ Hybrid scoring extras (only computed when sj_scoring=True)
+    ema5  = _ema(out["close"], 5)
+    sma9  = _sma(out["close"], 9)
+    hma20 = _hma(out["close"], 20)
+    hh10  = out["high"].rolling(10).max().shift(1)   # prev 10-bar high (no lookahead)
+    ll10  = out["low"].rolling(10).min().shift(1)    # prev 10-bar low
+
     ctx = dict(
         close=out["close"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
         macd=macd_line, macd_signal=macd_sig,
+        ema5=ema5, sma9=sma9, hma20=hma20, hh10=hh10, ll10=ll10,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
@@ -413,12 +474,18 @@ class TrendContImprovedStrategy(BaseStrategy):
         reversal_spike_enabled=True,
         reversal_spike_atr=1.5,   # adverse move must be ≥ N×ATR(3m)
         reversal_spike_bars=4,    # window in 3m bars (4×3m = 12 min)
+        # SJ Hybrid scoring mode (FAST mode only)
+        # Backtest Jan-May 2026: Hybrid=+$103 vs Classic=+$90 combined (BTC+XAU).
+        # Swaps EMA9/EMA20 → HMA20/EMA5>SMA9 + adds Breakout(10) as 5th component.
+        # min_score stays 4 (out of 5 components instead of 4 → more flexible).
+        sj_scoring=False,
     )
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self._p = {**self.DEFAULTS, **{k: self.params.get(k, v) for k, v in self.DEFAULTS.items()}}
-        self._p["indicators"] = self.params.get("indicators", build_indicator_registry())
+        sj = bool(self._p.get("sj_scoring", False))
+        self._p["indicators"] = self.params.get("indicators", build_indicator_registry(sj_scoring=sj))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
@@ -526,10 +593,14 @@ class TrendContImprovedStrategy(BaseStrategy):
             _y = lambda k: "✓" if last.get(k) else "✗"
             long_layers  = f"4H{_y('d_macro_up')} 1H{_y('d_mid_up')} pull{_y('d_pull_l')} bias{_y('d_bias_l')} adx{_y('d_adx_ok')}"
             short_layers = f"4H{_y('d_macro_dn')} 1H{_y('d_mid_dn')} pull{_y('d_pull_s')} bias{_y('d_bias_s')} adx{_y('d_adx_ok')}"
-            adx_max = self._p.get("adx_max_fast", 40) if self._p.get("fast_mode") else 999
+            adx_max  = self._p.get("adx_max_fast", 50) if self._p.get("fast_mode") else 999
+            sj_tag   = "[SJ]" if self._p.get("sj_scoring") else ""
+            min_sc   = self._p.get("min_score", 4)
+            n_comps  = 5 if self._p.get("sj_scoring") else 4
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                          f"[TCImproved] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}(18-{adx_max:.0f}) "
-                          f"score={sc_l:.0f}L/{sc_s:.0f}S | L:{long_layers} | S:{short_layers}")
+                          f"[TCImproved{sj_tag}] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}(18-{adx_max:.0f}) "
+                          f"score={sc_l:.0f}L/{sc_s:.0f}S(need≥{min_sc:.0f}/{n_comps}) "
+                          f"| L:{long_layers} | S:{short_layers}")
 
         dist = float(last["dist"])
         if dist <= 0 or np.isnan(dist):
