@@ -330,13 +330,18 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     ema5  = _ema(out["close"], 5)
     sma9  = _sma(out["close"], 9)
     hma   = _hma(out["close"], hma_period)
-    hh10  = out["high"].rolling(10).max().shift(1)   # prev 10-bar high (no lookahead)
-    ll10  = out["low"].rolling(10).min().shift(1)    # prev 10-bar low
+    hh10  = out["high"].rolling(10).max().shift(1)
+    ll10  = out["low"].rolling(10).min().shift(1)
+    # OBV trend: cumulative volume flow vs its own EMA20
+    obv_dir  = np.sign(out["close"].diff().fillna(0))
+    obv      = (obv_dir * out["volume"]).cumsum()
+    obv_ema20 = _ema(obv, 20)
 
     ctx = dict(
         close=out["close"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
         macd=macd_line, macd_signal=macd_sig,
         ema5=ema5, sma9=sma9, hma=hma, hh10=hh10, ll10=ll10,
+        obv=obv, obv_ema20=obv_ema20,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
