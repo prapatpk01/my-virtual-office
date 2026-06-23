@@ -367,6 +367,7 @@ async def main():
                     "pullback_pct_fast": cfg["tci_fast_pullback_pct"],
                     "adx_rising_fast": cfg["tci_adx_rising"],
                     "cooldown_bars": cfg["tci_cooldown_bars"],
+                    "sj_scoring": cfg["tci_sj_scoring"],  # match live entry scoring
                 })
                 trades, _ = await backtest_strategy_mtf_v2(
                     tci, c15m, {"1h": c1h, "4h": c4h}, notional,

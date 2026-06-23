@@ -279,11 +279,12 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out["atr"]   = _atr(out, p["atr_period"])
     out["adx15"] = _adx(out, p["adx_len"])
     if fast_mode:
-        # ADX > 18 AND ADX < 40 (not overheated) AND ADX rising
-        adx_rising = out["adx15"] > out["adx15"].shift(1).fillna(0)
+        # ADX in (adx_min_fast, adx_max_fast] — active but not overheated.
         adx_ok = ((out["adx15"] > p["adx_min_fast"])
-                  & (out["adx15"] <= p["adx_max_fast"])
-                  & adx_rising)
+                  & (out["adx15"] <= p["adx_max_fast"]))
+        if p.get("adx_rising_fast", True):   # honor TCI_ADX_RISING toggle
+            adx_rising = out["adx15"] > out["adx15"].shift(1).fillna(0)
+            adx_ok = adx_ok & adx_rising
     else:
         adx_ok = out["adx15"] > p["adx_min"]
 
@@ -461,8 +462,10 @@ def check_trend_fade(side: str, entry: float, one_r: float,
     if uw < uw_frac:
         return ("HOLD", f"only {uw:.2f}R underwater (< {uw_frac}R) — safe")
 
+    # Use the last two CLOSED 15m bars (iloc[-1] is still forming) so the
+    # "ADX falling" read is stable and matches the backtest that validated this.
     adx15 = _adx(df15, 14)
-    adx_now, adx_prev = float(adx15.iloc[-1]), float(adx15.iloc[-2])
+    adx_now, adx_prev = float(adx15.iloc[-2]), float(adx15.iloc[-3])
     adx_falling = adx_now < adx_prev
 
     ema20_5 = float(_ema(df5["close"], 20).iloc[-1])
