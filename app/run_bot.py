@@ -97,11 +97,12 @@ def build_config() -> dict:
         "paper":       _env_bool("PAPER_TRADING", False),
         "market_type": os.environ.get("MARKET_TYPE", "swap"),  # "swap" = perpetual futures
         "leverage":    _env_int("LEVERAGE", 20),
-        # Per-symbol leverage override (XAU max gap ~4.6% → recommend ≤10x at 20x global).
-        # Format: "XAU/USDT:USDT=10,BTC/USDT:USDT=20"
+        # Per-symbol leverage override. Default is EMPTY → both BTC and XAU use the
+        # global LEVERAGE (20x). To cap a symbol, set e.g. "XAU/USDT:USDT=10,BTC/USDT:USDT=20".
+        # (Note: XAU max gap ~4.6% means 20x carries higher liquidation risk than BTC.)
         "symbol_leverage": {
             k.strip(): int(v.strip())
-            for pair in os.environ.get("SYMBOL_LEVERAGE", "XAU/USDT:USDT=10").split(",")
+            for pair in os.environ.get("SYMBOL_LEVERAGE", "").split(",")
             if "=" in pair
             for k, v in [pair.split("=", 1)]
         },
