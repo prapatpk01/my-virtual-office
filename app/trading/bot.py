@@ -100,6 +100,11 @@ class TradingBot:
 
         _mkt = os.getenv("MARKET_TYPE", "").lower()
         self.futures_mode: bool = _mkt in ("swap", "futures")
+
+        # Optional health-score entry gate: require PositionHealthMonitor score >
+        # TCI_HEALTH_ENTRY_MIN at entry (0 = off). Filters low-quality setups.
+        self._health_entry_min = float(os.getenv("TCI_HEALTH_ENTRY_MIN", "0") or 0)
+        self._entry_health = PositionHealthMonitor(self.connector)
         logger.info("[BOT] futures=%s paper=%s interval=%ds SL=%.1f%% TP=%.1f%%",
                     self.futures_mode, self.paper, self.interval,
                     fixed_sl_pct * 100, fixed_tp_pct * 100)
@@ -276,6 +281,21 @@ class TradingBot:
         if not can:
             logger.debug("[%s] %s %s blocked: %s", strategy_name, label_side, sym, reason)
             return
+
+        # Optional health-score entry gate (TCI_HEALTH_ENTRY_MIN > 0). Require a
+        # strong multi-TF health reading for the entry side; fail-open on error so
+        # a transient candle-fetch failure never halts trading.
+        if self._health_entry_min > 0:
+            try:
+                hr = await self._entry_health.evaluate(sym, side)
+                if hr.score <= self._health_entry_min:
+                    logger.info("[%s] %s %s entry gated: health %.0f <= %.0f",
+                                strategy_name, label_side, sym, hr.score, self._health_entry_min)
+                    return
+                logger.info("[%s] %s %s health gate passed: %.0f", strategy_name, label_side, sym, hr.score)
+            except Exception as e:
+                logger.warning("[%s] %s health gate eval failed — allowing entry: %s",
+                               strategy_name, sym, e)
 
         self._sig.lock_strategy(sym, slot, signal.type.value)
         self._sig.record_signal(sym, signal.type.value, signal.price,
