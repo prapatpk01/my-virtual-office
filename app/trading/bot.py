@@ -9,6 +9,7 @@ from typing import Optional
 
 from .claude_analyzer import ClaudeAnalyzer
 from .connectors.base import BaseConnector, to_heikin_ashi
+from .health_monitor import HealthMonitor
 from .risk_manager import RiskManager, Position
 from .strategies.base import BaseStrategy, Signal, SignalType
 from .telegram_notifier import TelegramNotifier
@@ -75,6 +76,9 @@ class TradingBot:
         # Using compound key allows each strategy to hold its own position on the same symbol.
         self._positions: dict[str, Position] = {}
         self._position_lock = asyncio.Lock()
+
+        # Health monitor — checks every 15 min; blocks/closes on weak market
+        self._health = HealthMonitor(weak_bars_confirm=3)
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -263,6 +267,12 @@ class TradingBot:
                 except Exception:
                     pass  # each TF optional — strategies degrade gracefully
 
+            # ── Health monitor (every 15 min) ─────────────────────────────
+            now_ms = int(time.time() * 1000)
+            if self._health.should_check(now_ms) and mtf:
+                hr = self._health.update(mtf, now_ms)
+                await self._handle_health_action(hr, sym, price)
+
             if self._ai_chief:
                 # ── Chief mode: strategy exits first, then Chief decides ───
                 open_syms = {k.split("::")[0] for k in self._positions}
@@ -272,6 +282,47 @@ class TradingBot:
             else:
                 # ── Strategy mode (+ optional gate) ───────────────────────
                 await self._tick_strategies(sym, candles, price, mtf)
+
+    # ------------------------------------------------------------------
+    # Health monitor actions
+    # ------------------------------------------------------------------
+
+    async def _handle_health_action(self, hr: dict, sym: str, price: float):
+        """Act on health monitor result — notify Telegram, close positions if needed."""
+        score  = hr["score"]
+        label  = hr["label"]
+        action = hr["action"]
+        emoji  = HealthMonitor.label_emoji(label)
+
+        if hr.get("changed") or action in ("soft_close", "hard_close"):
+            msg = (f"{emoji} Health Monitor\n"
+                   f"Score: {score}/100  ({label})\n"
+                   f"Action: {action}")
+            if action == "block_buy":
+                msg += f"\nWeak streak: {self._health._weak_count}/{self._health._weak_bars_confirm}"
+            logger.warning("[Health] %s", msg.replace("\n", " | "))
+            if self.telegram:
+                self.telegram.send(msg)
+
+        if action == "hard_close":
+            logger.warning("[Health] HARD CLOSE ALL — score=%d (strong_weak)", score)
+            await self._close_all_positions_health(
+                price, f"Health hard_close score={score}")
+        elif action == "soft_close":
+            logger.warning("[Health] SOFT CLOSE ALL — score=%d weak×%d",
+                           score, self._health._weak_count)
+            await self._close_all_positions_health(
+                price, f"Health soft_close score={score} streak={self._health._weak_count}")
+
+    async def _close_all_positions_health(self, price: float, reason: str):
+        for pos_key in list(self._positions.keys()):
+            sym = pos_key.split("::")[0]
+            try:
+                ticker = await self.connector.fetch_ticker(sym)
+                sym_price = float(ticker["last"])
+            except Exception:
+                sym_price = price
+            await self._execute_sell_early(pos_key, sym_price, reason, "HealthMonitor")
 
     async def _tick_chief(self, sym: str, candles_1h: list, price: float):
         """Chief mode: collect strategy opinions, ask Claude, execute if BUY."""
@@ -372,6 +423,12 @@ class TradingBot:
 
             # Block if this strategy already has an open position, or max total reached
             if pos_key in self._positions or len(self._positions) >= self.max_positions:
+                continue
+
+            # Block new entries when market health is weak or worse
+            if self._health.last_label in ("weak", "strong_weak"):
+                logger.debug("[Health] BUY blocked for %s (label=%s score=%d)",
+                             strategy.name, self._health.last_label, self._health.last_score)
                 continue
 
             meta = signal.metadata or {}
