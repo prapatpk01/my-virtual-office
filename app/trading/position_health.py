@@ -304,12 +304,15 @@ def _classify(score: float) -> str:
     4-level health:
       BULL        85-100  → extend TP (momentum strong)
       NEUTRAL     50-84   → hold
-      WEAK        40-49   → close after N-cycle confirm (fade, may recover)
-      STRONG_WEAK 0-39    → close NOW, no confirm (sharp reversal / V-shape)
+      WEAK        25-49   → close after N-cycle confirm (fade, may recover)
+      STRONG_WEAK 0-24    → close NOW, no confirm (sharp reversal / V-shape)
+    Lowered STRONG_WEAK cutoff 40→25: only a sharper reversal triggers the
+    immediate no-confirm close; scores 25-49 get the WEAK 3-cycle grace so
+    moderate dips aren't cut prematurely.
     """
     if score >= 85: return "BULL"
     if score >= 50: return "NEUTRAL"
-    if score >= 40: return "WEAK"
+    if score >= 25: return "WEAK"
     return "STRONG_WEAK"
 
 
