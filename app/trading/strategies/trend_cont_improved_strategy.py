@@ -400,6 +400,11 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
                   & (out["adx15"] <= p["adx_max_fast"]))
         if p.get("adx_rising_fast", True):   # honor TCI_ADX_RISING toggle
             adx_rising = out["adx15"] > out["adx15"].shift(1).fillna(0)
+            # Optional relax: accept "rising OR already-strong" so a pullback that
+            # keeps ADX high (but flat/dipping) still qualifies — enters 1-2 bars sooner.
+            strong_th = p.get("adx_rising_or_strong", 0)
+            if strong_th and strong_th > 0:
+                adx_rising = adx_rising | (out["adx15"] > strong_th)
             adx_ok = adx_ok & adx_rising
     else:
         adx_ok = out["adx15"] > p["adx_min"]
@@ -430,8 +435,9 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     ema5  = _ema(out["close"], 5)
     sma9  = _sma(out["close"], 9)
     hma   = _hma(out["close"], hma_period)
-    hh10  = out["high"].rolling(10).max().shift(1)
-    ll10  = out["low"].rolling(10).min().shift(1)
+    bk_lb = int(p.get("breakout_lookback", 10))
+    hh10  = out["high"].rolling(bk_lb).max().shift(1)
+    ll10  = out["low"].rolling(bk_lb).min().shift(1)
     # OBV trend: cumulative volume flow vs its own EMA20
     obv_dir  = np.sign(out["close"].diff().fillna(0))
     obv      = (obv_dir * out["volume"]).cumsum()
@@ -682,6 +688,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_scoring=True,
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
         macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
+        # Entry-timing relax knobs (default = legacy behaviour, no change):
+        breakout_lookback=10,      # 10-bar high/low for breakout_hh10; lower → fires sooner
+        adx_rising_or_strong=0,    # 0=off; if >0, ADX gate accepts (rising OR adx>this)
         # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).
         # Backtest Jan-May 2026: min5/6 → combined +$447 vs baseline +$401 (+11.5% PnL, same MaxDD).
         sj_roc9=True,
