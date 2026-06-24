@@ -249,20 +249,19 @@ class TradingBot:
                 logger.warning("Failed to fetch data for %s: %s", sym, e)
                 continue
 
-            # Fetch 4H and 1D candles for SpotMaster multi-TF layers
+            # Fetch multi-TF candles for strategy layers
             mtf: dict = {}
-            try:
-                c4h = await self.connector.fetch_ohlcv(sym, timeframe="4h", limit=250)
-                if c4h and len(c4h) >= 50:
-                    mtf["4h"] = to_heikin_ashi(c4h)
-            except Exception:
-                pass  # 4H optional — strategy degrades gracefully without it
-            try:
-                c1d = await self.connector.fetch_ohlcv(sym, timeframe="1d", limit=250)
-                if c1d and len(c1d) >= 55:
-                    mtf["1d"] = to_heikin_ashi(c1d)
-            except Exception:
-                pass  # 1D optional — strategy skips regime layer without it
+            for tf, min_bars, limit in (
+                ("30m", 60, 300),   # SmartGridHybrid entry TF
+                ("4h",  50, 250),   # SpotMaster L2-L3, SmartGridHybrid regime
+                ("1d",  55, 250),   # SpotMaster L1, SmartGridHybrid macro
+            ):
+                try:
+                    cx = await self.connector.fetch_ohlcv(sym, timeframe=tf, limit=limit)
+                    if cx and len(cx) >= min_bars:
+                        mtf[tf] = to_heikin_ashi(cx)
+                except Exception:
+                    pass  # each TF optional — strategies degrade gracefully
 
             if self._ai_chief:
                 # ── Chief mode: strategy exits first, then Chief decides ───

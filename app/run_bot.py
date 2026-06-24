@@ -96,13 +96,23 @@ def build_config() -> dict:
         "max_drawdown":    _env_float("MAX_DRAWDOWN_PCT", 0.30),
         "risk_per_trade":  _env_float("RISK_PER_TRADE", 0.02),
         "strategies": {
-            "spot_master": _env_bool("STRATEGY_SPOT_MASTER", True),
+            "spot_master":       _env_bool("STRATEGY_SPOT_MASTER",    True),
+            "smart_grid_hybrid": _env_bool("STRATEGY_SMART_GRID",     True),
         },
         "spot_master_params": {
             "sl_atr":        _env_float("SM_SL",     1.5),
             "rr":            _env_float("SM_RR",     2.0),
             "adx_thresh":    _env_float("SM_ADX",   18.0),
             "health_thresh": _env_float("SM_HEALTH", 70.0),
+        },
+        "smart_grid_params": {
+            "sl_atr":          _env_float("SG_SL",       1.8),
+            "health_thresh":   _env_float("SG_HEALTH",  70.0),
+            "adx_swing":       _env_float("SG_ADX_SW",  18.0),
+            "adx_breakout":    _env_float("SG_ADX_BO",  28.0),
+            "adx_grid_kill":   _env_float("SG_ADX_KILL", 22.0),
+            "max_grid_levels": _env_int("SG_GRID_LVLS",   5),
+            "grid_step_atr":   _env_float("SG_STEP",      0.8),
         },
         "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
@@ -116,11 +126,14 @@ def build_config() -> dict:
 def _make_strategies(symbols: list, flags: dict, cfg: dict,
                      connector=None) -> list:
     from trading.strategies.spot_master import SpotMaster1H
+    from trading.strategies.smart_grid_hybrid import SmartGridHybrid
 
     strategies = []
     for sym in symbols:
         if flags.get("spot_master"):
             strategies.append(SpotMaster1H(sym, params=cfg["spot_master_params"]))
+        if flags.get("smart_grid_hybrid"):
+            strategies.append(SmartGridHybrid(sym, params=cfg["smart_grid_params"]))
     return strategies
 
 
