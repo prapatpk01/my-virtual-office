@@ -267,8 +267,27 @@ class TradingBot:
                 except Exception:
                     pass  # each TF optional — strategies degrade gracefully
 
-            # ── Health monitor (every 15 min) ─────────────────────────────
             now_ms = int(time.time() * 1000)
+
+            # ── Spike / whipsaw guard (every tick, 30-min cooldown) ───────
+            c30m = mtf.get("30m") or candles
+            sr   = self._health.check_spike(c30m, price, now_ms)
+            if sr["detected"]:
+                spike_type = sr["type"]
+                reason     = sr["reason"]
+                logger.warning("[%s] %s | %s", spike_type.upper(), sym, reason)
+                if self._positions:
+                    if self.telegram:
+                        icon = "⚡" if spike_type == "spike" else "〰️"
+                        label = "V-Sharp / Spike" if spike_type == "spike" else "Whipsaw"
+                        self.telegram.send(
+                            f"{icon} {label} Alert — {sym}\n"
+                            f"{reason}\n"
+                            f"→ ปิดทุก position ทันที"
+                        )
+                    await self._close_all_positions_health(price, f"{spike_type}: {reason}")
+
+            # ── Health monitor (every 15 min) ─────────────────────────────
             if self._health.should_check(now_ms) and mtf:
                 hr = self._health.update(mtf, now_ms)
                 await self._handle_health_action(hr, sym, price)
