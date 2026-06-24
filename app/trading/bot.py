@@ -477,8 +477,25 @@ class TradingBot:
                 tp_price=exchange_tp, sl_price=sl_p,
                 pos_side=pos_side,
             )
+            # Sync full_amount with the actual OKX position size after fill.
+            # The bot's pre-calculated amount may differ from OKX's actual contracts
+            # (floating-point rounding, pre-existing manual positions, etc.).
+            # Using the wrong full_amount causes TP1 to close the wrong percentage.
+            actual_amount = amount
+            if hasattr(self.connector, "fetch_position_amount"):
+                try:
+                    okx_amount = await self.connector.fetch_position_amount(sym, side)
+                    if okx_amount > 0 and abs(okx_amount - amount) > ct * 0.5:
+                        logger.warning(
+                            "[%s] %s position size mismatch: ordered=%.6f OKX=%.6f — "
+                            "using OKX size for full_amount",
+                            slot, sym, amount, okx_amount,
+                        )
+                        actual_amount = okx_amount
+                except Exception as e:
+                    logger.warning("[%s] fetch_position_amount failed — using ordered amount: %s", slot, e)
             self.risk.open_position(
-                sym, side, price, amount,
+                sym, side, price, actual_amount,
                 strategy=slot, stop_loss=sl_p, take_profit=tp_p,
                 tp1=tp1_val, tp2=meta.get("tp2", tp_p),
                 partial_pct=meta.get("partial_pct", 0.5),
@@ -488,15 +505,15 @@ class TradingBot:
             self._record_trade(TradeRecord(
                 timestamp=int(time.time() * 1000),
                 symbol=sym, side=order_side,
-                price=order.price, amount=amount,
+                price=order.price, amount=actual_amount,
                 pnl=0.0, strategy=slot, reason=signal.reason,
                 paper=self.paper,
             ))
             logger.info("[%s] OPEN %s %s @ %.4f  SL=%.4f  TP=%.4f  amount=%.6f",
-                        slot, side.upper(), sym, price, sl_p, tp_p, amount)
+                        slot, side.upper(), sym, price, sl_p, tp_p, actual_amount)
             if self.telegram:
                 label = "buy" if side == "long" else "sell_short"
-                self.telegram.notify_order(sym, label, amount, order.price, slot, self.paper,
+                self.telegram.notify_order(sym, label, actual_amount, order.price, slot, self.paper,
                                            sl=sl_p, tp=tp_p)
             return True
 

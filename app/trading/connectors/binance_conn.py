@@ -196,7 +196,7 @@ class BinanceConnector(BaseConnector):
                     ct_val = float(market.get("contractSize", 0.01))
                 except Exception:
                     ct_val = 0.01  # OKX BTC/USDT:USDT default
-                contracts = int(amount / ct_val)
+                contracts = int(round(amount / ct_val))  # round avoids float truncation (0.163/0.001=162.999→162)
                 if contracts < 1:
                     raise ValueError(
                         f"Order too small: {amount:.6f} = {amount/ct_val:.3f} contracts. "
@@ -413,6 +413,21 @@ class BinanceConnector(BaseConnector):
             logger.warning("[SL→BE] move_sl_to_breakeven failed for %s %s: %s",
                            symbol, pos_side, e)
             return False
+
+    async def fetch_position_amount(self, symbol: str, side: str) -> float:
+        """Return actual base-asset size of an open OKX futures position (0.0 if none)."""
+        if self.paper or self._exchange_id != "okx" or not self._futures:
+            return 0.0
+        try:
+            positions = await self._exchange.fetch_positions([symbol])
+            pos_side = side  # "long" or "short"
+            for p in positions:
+                if p.get("side") == pos_side and float(p.get("contracts", 0)) > 0:
+                    ct_val = float(p.get("contractSize") or 1.0)
+                    return float(p["contracts"]) * ct_val
+        except Exception as e:
+            logger.warning("[POS] fetch_position_amount failed for %s %s: %s", symbol, side, e)
+        return 0.0
 
     async def fetch_open_orders(self, symbol: Optional[str] = None) -> list[OrderResult]:
         if self.paper:
