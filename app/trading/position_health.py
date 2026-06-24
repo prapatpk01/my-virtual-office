@@ -92,7 +92,7 @@ class PositionHealthMonitor:
     Designed to be called from the bot's monitor loop.
     """
 
-    TP1_LADDER = [0.5, 0.8, 1.0, 1.2, 1.5]  # R-multiples for TP1 advance (max 1.5R)
+    TP1_LADDER = [0.5, 0.8, 1.2]  # R-multiples for TP1 advance (max 2 raises, cap 1.2R)
     TP_LADDER  = [1.2, 1.5, 2.0, 2.5, 3.0]  # R-multiples for TP2 advance (after TP1 hit)
 
     def __init__(self, connector: "BaseConnector"):

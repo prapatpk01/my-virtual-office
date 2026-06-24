@@ -755,12 +755,12 @@ class TradingBot:
                     # stage_check() uses pos.tp1 for the bot-side trigger only.
                     # On live accounts the exchange's original TP order at old_tp1
                     # will fire first if price reaches it before the new level.
-                    logger.info("[MONITOR] %s %s BULL (pre-TP1) → TP1 raised %.4f → %.4f (max 1.5R)",
+                    logger.info("[MONITOR] %s %s BULL (pre-TP1) → TP1 raised %.4f → %.4f (max 1.2R)",
                                 strategy, sym, old_tp1 or 0, new_tp1)
                     if self.telegram:
                         self.telegram.notify(
                             f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(pre-TP1)_\n"
-                            f"Score {result.score:.0f}%  TP1 raised: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _(max 1.5R)_\n"
+                            f"Score {result.score:.0f}%  TP1 raised: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _(max 1.2R)_\n"
                             f"Indicators: {_fmt_details(result.details)}"
                         )
             else:
