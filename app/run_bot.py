@@ -90,9 +90,9 @@ def build_config() -> dict:
         "symbols":         _env_list("SYMBOLS", "BTC/USDT"),
         "candle_tf":       os.environ.get("CANDLE_TF", "1h"),
         "candle_limit":    _env_int("CANDLE_LIMIT", 300),
-        "interval":        _env_int("INTERVAL_SECONDS", 3600),
+        "interval":        _env_int("INTERVAL_SECONDS", 60),
         "trade_amount_usdt": _env_float("TRADE_AMOUNT_USDT", 100.0),
-        "max_positions":   _env_int("MAX_POSITIONS", 3),
+        "max_positions":   _env_int("MAX_POSITIONS", 5),
         "max_drawdown":    _env_float("MAX_DRAWDOWN_PCT", 0.30),
         "risk_per_trade":  _env_float("RISK_PER_TRADE", 0.02),
         "strategies": {
@@ -141,7 +141,9 @@ def _make_strategies(symbols: list, flags: dict, cfg: dict,
         if flags.get("spot_master"):
             strategies.append(SpotMaster1H(sym, params=cfg["spot_master_params"]))
         if flags.get("smart_grid_hybrid"):
-            strategies.append(SmartGridHybrid(sym, params=cfg["smart_grid_params"]))
+            grid_base = cfg["smart_grid_params"]
+            for slot in range(3):
+                strategies.append(SmartGridHybrid(sym, params={**grid_base, "grid_slot": slot}))
         if flags.get("swing_master_30m"):
             strategies.append(SwingMaster30m(sym, params=cfg["swing_master_params"]))
     return strategies

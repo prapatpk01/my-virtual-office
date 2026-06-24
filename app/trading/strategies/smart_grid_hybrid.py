@@ -53,6 +53,11 @@ class SmartGridHybrid(BaseStrategy):
         self.adx_grid_kill = float(self.params.get("adx_grid_kill", 22.0))
         self.max_grid_lvls = int(self.params.get("max_grid_levels",   5))
         self.grid_step_atr = float(self.params.get("grid_step_atr",  0.8))
+        self.grid_slot     = int(self.params.get("grid_slot",        -1))   # -1=auto, 0/1/2=fixed slot
+
+        # In slot mode, give this instance a unique name (L1/L2/L3)
+        if self.grid_slot >= 0:
+            self.name = f"{self.__class__.__name__}_L{self.grid_slot + 1}"
 
         # Grid state — reset when leaving grid mode
         self._grid_anchor: float   = None
@@ -226,6 +231,44 @@ class SmartGridHybrid(BaseStrategy):
 
         step   = max(self._grid_step, atr14 * 0.3)  # never smaller than 30% ATR
         anchor = self._grid_anchor
+
+        # Slot mode: each instance targets exactly one fixed price level
+        if self.grid_slot >= 0:
+            target = anchor - (self.grid_slot + 1) * step
+            if self._grid_last_buy is not None:
+                tp_ref = self._grid_last_buy + step
+                sl_ref = self._grid_last_buy - self.sl_atr * atr14
+                if cp >= tp_ref * 0.995 or cp <= sl_ref * 1.005:
+                    self._grid_last_buy = None
+            if abs(cp - target) > step * 0.25:
+                return Signal(SignalType.HOLD, self.symbol, cp, 0,
+                              f"[{self.name}] Grid: price not at L{self.grid_slot+1}={target:.2f}")
+            if self._grid_last_buy is not None:
+                return Signal(SignalType.HOLD, self.symbol, cp, 0,
+                              f"[{self.name}] Grid: L{self.grid_slot+1} already in position")
+            tp_p = round(target + step, 4)
+            sl_p = round(target - self.sl_atr * atr14, 4)
+            self._grid_last_buy = target
+            return Signal(
+                type=SignalType.BUY,
+                symbol=self.symbol,
+                price=cp,
+                amount=0.0,
+                confidence=0.62,
+                reason=(f"[{self.name}] Grid L{self.grid_slot+1} "
+                        f"target={target:.2f} step={step:.2f} RSI={rsi_v:.1f}"),
+                metadata={
+                    "mode":        "grid",
+                    "stop_loss":   sl_p,
+                    "take_profit": tp_p,
+                    "atr":         round(atr14, 4),
+                    "grid_anchor": round(anchor, 4),
+                    "grid_step":   round(step, 4),
+                    "grid_level":  round(target, 4),
+                    "grid_slot":   self.grid_slot,
+                    "rsi":         round(rsi_v, 1) if not math.isnan(rsi_v) else None,
+                },
+            )
 
         # Infer if previous bot position was closed (price moved back up past TP)
         if self._grid_last_buy is not None:
