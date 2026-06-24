@@ -195,16 +195,87 @@ class TradingBot:
             logger.warning("[BOT] %s", dreason)
             self._error = dreason
 
-        # Run strategies — cache candles per (symbol, timeframe) to avoid duplicate fetches
+        # Run strategies — Phase 1: analyze all symbols, collect signals
         candle_cache: dict[tuple, list] = {}
         new_signals: list[dict] = []
+        action_queue: list[tuple] = []   # (Signal, sig_dict, strategy)
+
         for strategy in self.strategies:
-            sig_dict = await self._run_strategy(strategy, candle_cache)
-            if sig_dict:
-                new_signals.append(sig_dict)
+            result = await self._analyze_only(strategy, candle_cache)
+            if result is None:
+                continue
+            signal, sig_dict = result
+            new_signals.append(sig_dict)
+            if signal.type != SignalType.HOLD:
+                action_queue.append((signal, sig_dict, strategy))
+
+        # Phase 2: score-rank then execute — highest SJ score enters first
+        # Prevents first-in-list bias when multiple symbols signal simultaneously
+        if len(action_queue) > 1:
+            action_queue.sort(
+                key=lambda t: (t[0].metadata or {}).get("sj_score", 0),
+                reverse=True,
+            )
+            scores = [(t[1]["symbol"], (t[0].metadata or {}).get("sj_score", 0))
+                      for t in action_queue]
+            logger.info("[BOT] Score-rank: %s", scores)
+
+        for signal, sig_dict, strategy in action_queue:
+            await self._handle_signal(signal, sig_dict, strategy)
 
         self._signals_cache = (new_signals + self._signals_cache)[:20]
         self._broadcast_state()
+
+    async def _analyze_only(self, strategy: BaseStrategy,
+                            cache: dict) -> Optional[tuple]:
+        """Analyze one strategy and return (Signal, sig_dict) without executing.
+        Used by score-ranked two-phase dispatch in _tick()."""
+        sym   = strategy.symbol
+        tf    = strategy.params.get("tf", "15m")
+        limit = strategy.params.get("limit", 300)
+
+        key = (sym, tf)
+        if key not in cache:
+            cache[key] = await self.connector.fetch_ohlcv(sym, timeframe=tf, limit=limit)
+        candles = cache[key]
+
+        ticker = await self.connector.fetch_ticker(sym)
+        price  = float(ticker["last"])
+
+        mtf_candles: dict = {}
+        for mtf_tf in getattr(strategy, "MTF_TIMEFRAMES", []):
+            if mtf_tf == tf:
+                continue
+            mk = (sym, mtf_tf)
+            if mk not in cache:
+                try:
+                    cache[mk] = await self.connector.fetch_ohlcv(sym, timeframe=mtf_tf, limit=150)
+                except Exception as e:
+                    logger.warning("[BOT] MTF %s/%s fetch failed: %s", sym, mtf_tf, e)
+            if mk in cache:
+                mtf_candles[mtf_tf] = cache[mk]
+
+        try:
+            signal = await strategy.analyze(candles, price, mtf_candles=mtf_candles)
+        except Exception as e:
+            logger.error("[%s] analyze error on %s: %s", strategy.name, sym, e)
+            return None
+
+        sig_dict = {
+            "strategy":   strategy.name,
+            "symbol":     sym,
+            "type":       signal.type.value,
+            "price":      price,
+            "confidence": signal.confidence,
+            "reason":     signal.reason,
+            "ts":         int(time.time() * 1000),
+            "metadata":   signal.metadata,
+        }
+
+        if signal.type == SignalType.HOLD:
+            logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:120])
+
+        return signal, sig_dict
 
     async def _run_strategy(self, strategy: BaseStrategy,
                             cache: dict) -> Optional[dict]:

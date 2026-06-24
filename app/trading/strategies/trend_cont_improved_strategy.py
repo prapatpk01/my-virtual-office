@@ -987,6 +987,7 @@ class TrendContImprovedStrategy(BaseStrategy):
             sl  = current_price - dist if side == "long" else current_price + dist
             tp1 = current_price + p["tp1_r"] * dist if side == "long" else current_price - p["tp1_r"] * dist
             tp2 = current_price + tp2_r * dist if side == "long" else current_price - tp2_r * dist
+            sc  = float(last.get("score_long", 0) if side == "long" else last.get("score_short", 0))
             return {
                 "stop_loss":   sl,
                 "take_profit": tp2,
@@ -1001,6 +1002,8 @@ class TrendContImprovedStrategy(BaseStrategy):
                 "rr_tp1":      p["tp1_r"],
                 "rr_tp2":      tp2_r,
                 "one_r":       dist,
+                "sj_score":    sc,
+                "mtf_bias":    float(last.get("comp_pct", 0)),
             }
 
         if buy:
