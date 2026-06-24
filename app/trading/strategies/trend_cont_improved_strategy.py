@@ -890,7 +890,10 @@ class TrendContImprovedStrategy(BaseStrategy):
             adx_max  = self._p.get("adx_max_fast", 50) if self._p.get("fast_mode") else 999
             sj_tag   = "[SJ]" if self._p.get("sj_scoring") else ""
             min_sc   = self._p.get("min_score", 4)
-            n_comps  = 5 if self._p.get("sj_scoring") else 4
+            # Count actually-enabled scoring components (5 SJ base + ROC9 + 3 extended)
+            _reg     = self._p.get("indicators", {})
+            n_comps  = sum(1 for v in _reg.values() if v.get("enabled", True)) or \
+                       (5 if self._p.get("sj_scoring") else 4)
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[TCImproved{sj_tag}] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}(18-{adx_max:.0f}) "
                           f"score={sc_l:.0f}L/{sc_s:.0f}S(need≥{min_sc:.0f}/{n_comps}) "
