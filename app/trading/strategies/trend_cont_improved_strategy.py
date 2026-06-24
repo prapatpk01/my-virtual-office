@@ -145,7 +145,8 @@ def _roc(s: pd.Series, n: int = 9) -> pd.Series:
 
 
 def _htf_dir(ef: pd.Series, es: pd.Series, close: pd.Series,
-             mode: str = "cross", slope_bars: int = 2, sep_guard: bool = False):
+             mode: str = "cross", slope_bars: int = 2, sep_guard: bool = False,
+             slope_pct: float = 0.0):
     """HTF trend direction (up, dn) for the macro/mid gates.
 
     'cross'  : EMA_fast vs EMA_slow (legacy binary; lags a turn most).
@@ -154,6 +155,10 @@ def _htf_dir(ef: pd.Series, es: pd.Series, close: pd.Series,
     'early'  : full cross OR (fast-EMA turning AND price on that side of it) —
                lets the gate flip before the 20/50 cross completes, with a
                price-confirm guard to cut the worst whipsaw.
+
+    slope_pct: when > 0 in 'early'/'slope' mode, the early flip requires
+               EMA_fast to move at least slope_pct% in one bar (quantified
+               momentum). 0.15 recommended — filters micro-oscillation turns.
 
     sep_guard: when True, the *early/slope* trigger only fires while the
     EMA_fast/EMA_slow gap is WIDENING (trend accelerating, not coiled) —
@@ -166,12 +171,22 @@ def _htf_dir(ef: pd.Series, es: pd.Series, close: pd.Series,
     else:
         sep_ok = True
     if mode == "slope":
-        up = (ef > ef.shift(slope_bars)) & sep_ok
-        dn = (ef < ef.shift(slope_bars)) & sep_ok
+        if slope_pct > 0:
+            sp = (ef - ef.shift(1)) / ef.shift(1).replace(0, np.nan) * 100
+            up = (sp > slope_pct) & sep_ok
+            dn = (sp < -slope_pct) & sep_ok
+        else:
+            up = (ef > ef.shift(slope_bars)) & sep_ok
+            dn = (ef < ef.shift(slope_bars)) & sep_ok
     elif mode == "early":
         cross_up, cross_dn = ef > es, ef < es
-        slope_up = (ef > ef.shift(slope_bars)) & (close > ef) & sep_ok
-        slope_dn = (ef < ef.shift(slope_bars)) & (close < ef) & sep_ok
+        if slope_pct > 0:
+            sp = (ef - ef.shift(1)) / ef.shift(1).replace(0, np.nan) * 100
+            slope_up = (sp > slope_pct) & (close > ef) & sep_ok
+            slope_dn = (sp < -slope_pct) & (close < ef) & sep_ok
+        else:
+            slope_up = (ef > ef.shift(slope_bars)) & (close > ef) & sep_ok
+            slope_dn = (ef < ef.shift(slope_bars)) & (close < ef) & sep_ok
         up = cross_up | slope_up
         dn = cross_dn | slope_dn
     else:  # 'cross' (default — legacy behaviour)
@@ -215,7 +230,8 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 # Backtest Jan-May 2026 ($50×20x): Classic=+$90 combined; SJ Hybrid=+$103 combined
 # SJ Hybrid improves XAU +134% ($38→$89) while keeping BTC profitable (+$14 vs +$52).
 
-def build_indicator_registry(sj_scoring: bool = False, extended: bool = False, roc9: bool = False):
+def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
+                             roc9: bool = False, vol_expansion: bool = False):
     if sj_scoring:
         # SJ Hybrid: faster/smarter components from SJ Fast Entry research
         reg = {
@@ -247,7 +263,7 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False, r
                 enabled=True, weight=1.0,
                 long =lambda c: c["close"] > c["hh10"],
                 short=lambda c: c["close"] < c["ll10"],
-                desc="15m close breaks above/below 10-bar high/low (bonus confirm)",
+                desc="15m close breaks above/below N-bar high/low (breakout_lookback param)",
             ),
         }
         if roc9:
@@ -256,6 +272,13 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False, r
                 long =lambda c: c["roc9"] > 0,
                 short=lambda c: c["roc9"] < 0,
                 desc="ROC(9) positive/negative — confirms price momentum direction",
+            )
+        if vol_expansion:
+            reg["vol_expansion"] = dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["vol_expansion_ok"],
+                short=lambda c: c["vol_expansion_ok"],
+                desc="Volume > MA20 × 1.15 — breakout volume expansion bonus",
             )
         if extended:
             # SJ Extended (+3 components → 8 total): OBV pressure, market structure,
@@ -335,9 +358,10 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     # ── Layer 1: 4H macro trend ───────────────────────────────────────────────
     htf_mode  = p.get("htf_macro_mode", "cross")
     slope_bars = int(p.get("htf_slope_bars", 2))
+    slope_pct  = float(p.get("htf_slope_pct", 0.15))
     sep_guard  = bool(p.get("htf_sep_guard", False))
     ef4, es4 = _ema(out["h4_close"], p["ema_fast"]), _ema(out["h4_close"], p["ema_slow"])
-    macro_up, macro_dn = _htf_dir(ef4, es4, out["h4_close"], htf_mode, slope_bars, sep_guard)
+    macro_up, macro_dn = _htf_dir(ef4, es4, out["h4_close"], htf_mode, slope_bars, sep_guard, slope_pct)
 
     # Optional: gate on 4h MACD histogram slope — blocks fading crossovers.
     # Fires when ema_fast/slow are 12/26 (MACD periods) or any config with noise risk.
@@ -350,7 +374,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
 
     # ── Layer 2: 1H mid trend ─────────────────────────────────────────────────
     ef1, es1 = _ema(out["h1_close"], p["ema_fast"]), _ema(out["h1_close"], p["ema_slow"])
-    mid_up, mid_dn = _htf_dir(ef1, es1, out["h1_close"], htf_mode, slope_bars, sep_guard)
+    mid_up, mid_dn = _htf_dir(ef1, es1, out["h1_close"], htf_mode, slope_bars, sep_guard, slope_pct)
 
     # ── HTF Momentum Score (opt-in; replaces binary Layer 1 + 2 gates) ────────
     # 8 components: direction + separation + price-confirm + RSI on each of 4h/1h.
@@ -399,10 +423,17 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
 
     # ── Layer 3: Pullback zone (mode-specific) ────────────────────────────────
     if fast_mode:
-        # Fast Mode v2: 1H EMA20 zone, wider ±1.8%
-        pullback_pct = p["pullback_pct_fast"]
+        # Fast Mode v2: 1H EMA20 zone
         ema20_1h = ef1
-        near_ema      = (out["h1_close"] - ema20_1h).abs() / ema20_1h <= pullback_pct
+        pullback_atr_mult = float(p.get("pullback_atr_mult_fast", 1.2))
+        if pullback_atr_mult > 0:
+            # ATR-based: adaptive to volatility (BTC 1H ATR ~$600-1k; 1.2× ~ $720-1.2k)
+            h1_atr = _atr(df1h, 14).shift(1)  # shift 1 bar: no-lookahead
+            atr_1h = h1_atr.reindex(out.index, method="ffill").bfill()
+            near_ema = (out["h1_close"] - ema20_1h).abs() <= atr_1h * pullback_atr_mult
+        else:
+            pullback_pct = p["pullback_pct_fast"]
+            near_ema = (out["h1_close"] - ema20_1h).abs() / ema20_1h <= pullback_pct
         wick_bounce_l = (out["h1_low"]  <= ema20_1h * 1.003) & (out["h1_close"] > ema20_1h)
         wick_reject_s = (out["h1_high"] >= ema20_1h * 0.997) & (out["h1_close"] < ema20_1h)
         at_pull_long  = near_ema | wick_bounce_l
@@ -464,6 +495,17 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     rsi15 = _rsi(out["close"], p["rsi_period"])
     volma = _sma(out["volume"], p["vol_period"])
     vol_ok = (volma > 0) & (out["volume"] >= volma * p["vol_mult"])
+    vol_expansion_ok = (volma > 0) & (out["volume"] >= volma * 1.15)
+
+    # ATR compression: ATR14 was tighter than ATR50 (squeeze), now expanding
+    atr50_15m = _rma(_true_range(out), 50)
+    atr_was_compressed = (
+        (out["atr"].shift(1) < atr50_15m.shift(1)) |
+        (out["atr"].shift(2) < atr50_15m.shift(2)) |
+        (out["atr"].shift(3) < atr50_15m.shift(3))
+    )
+    atr_expanding_now = out["atr"] > out["atr"].shift(1)
+    atr_compress_ok = atr_was_compressed & atr_expanding_now
 
     macd_line = _ema(out["close"], 12) - _ema(out["close"], 26)
     macd_sig  = _ema(macd_line, 9)
@@ -496,6 +538,8 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         sma20=sma20, sma20_rising=sma20_rising,
         fvg_bull=fvg_bull, fvg_bear=fvg_bear,
         roc9=roc9_val,
+        vol_expansion_ok=vol_expansion_ok,
+        atr_compress_ok=atr_compress_ok,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
@@ -512,10 +556,26 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out["score_long"]  = score_long
     out["score_short"] = score_short
 
+    # ── ATR compression gate (optional, separate from SJ scoring) ────────────
+    if p.get("atr_compress_gate", False):
+        long_gates  = adx_ok & atr_compress_ok
+        short_gates = adx_ok & atr_compress_ok
+    else:
+        long_gates  = adx_ok
+        short_gates = adx_ok
+
+    # ── Final entry trigger: close must break above previous bar high/low ─────
+    if p.get("final_trigger_enabled", False):
+        trigger_long  = out["close"] > out["high"].shift(1)
+        trigger_short = out["close"] < out["low"].shift(1)
+    else:
+        trigger_long  = pd.Series(True, index=out.index)
+        trigger_short = pd.Series(True, index=out.index)
+
     out["final_buy"]  = (macro_up & mid_up  & at_pull_long  & long_bias_ok  &
-                          (score_long  >= p["min_score"]) & adx_ok).fillna(False)
+                          (score_long  >= p["min_score"]) & long_gates  & trigger_long).fillna(False)
     out["final_sell"] = (macro_dn  & mid_dn  & at_pull_short & short_bias_ok &
-                          (score_short >= p["min_score"]) & adx_ok).fillna(False)
+                          (score_short >= p["min_score"]) & short_gates & trigger_short).fillna(False)
 
     # Diagnostic columns — each layer's pass/fail for the last bar
     out["d_macro_up"]  = macro_up.fillna(False)
@@ -699,7 +759,8 @@ class TrendContImprovedStrategy(BaseStrategy):
                                   # peaks at 50, but 44 chosen to avoid entering when the
                                   # trend is already too hot/extended (risk preference).
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
-        pullback_pct_fast=0.025,  # 1H EMA20 zone ±2.5% (widened from 1.8% — XAU runs far from EMA20)
+        pullback_pct_fast=0.025,  # fallback pct zone (used when pullback_atr_mult_fast=0)
+        pullback_atr_mult_fast=1.2,  # 1H ATR×1.2 adaptive pullback zone (0=use pct fallback)
         bias_gate_fast=60.0,      # MTF bias gate — 60 is live-calibrated (grid winner was 70 but too strict for live market phases)
         tp2_r_fast=2.5,           # FAST runner target 2.5R (closes faster than 3R; BULL
                                   # health can still extend toward the 3.0R ladder max)
@@ -727,7 +788,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
         macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
         # Entry-timing relax knobs (default = legacy behaviour, no change):
-        breakout_lookback=10,      # 10-bar high/low for breakout_hh10; lower → fires sooner
+        breakout_lookback=7,       # 7-bar high/low (was 10); fires sooner while filtering noise
         adx_rising_or_strong=0,    # 0=off; if >0, ADX gate accepts (rising OR adx>this)
         # HTF macro/mid direction mode — 'cross' (legacy 20/50), 'slope', or 'early'.
         # 'slope'/'early' flip the 4h+1h gate before the full crossover → earlier entries.
@@ -735,13 +796,21 @@ class TrendContImprovedStrategy(BaseStrategy):
         # before the full 20/50 cross → fixes late entries. Backtest Jan-May 2026:
         # combined +$488 vs +$447 cross (+9.1% PnL, WR ↑, MaxDD ↓). XAU benefits most.
         htf_macro_mode="early",
-        htf_slope_bars=2,          # bars for EMA-fast slope in 'slope'/'early' modes
+        htf_slope_bars=2,          # bars for EMA-fast slope in 'slope'/'early' modes (legacy fallback)
+        htf_slope_pct=0.15,        # EMA-fast must move ≥0.15% in one bar for early flip (0=legacy slope_bars)
         htf_sep_guard=False,       # gate early/slope flip on widening EMA gap (anti-whipsaw)
         # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).
         # Backtest Jan-May 2026: min5/6 → combined +$447 vs baseline +$401 (+11.5% PnL, same MaxDD).
         sj_roc9=True,
         # SJ Extended scoring: adds OBV trend + Market Structure + FVG (5 → 8 components)
-        sj_extended=False,         # enable 3 extra 15m components (total 8); adjust min_score to 5-6
+        sj_extended=False,         # enable 3 extra 15m components (total 9); adjust min_score to 5-6
+        sj_vol_expansion=True,     # add vol>MA20×1.15 as 7th SJ component (breakout volume bonus)
+        # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
+        # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
+        atr_compress_gate=False,
+        # Final entry trigger: close must exceed previous bar's high (long) / low (short)
+        # Adds precise timing confirmation after all other layers pass
+        final_trigger_enabled=True,
         # HTF ADX gate: require 1h AND 4h ADX > threshold alongside 15m ADX
         htf_adx_gate=False,
         htf_adx_len=14,
@@ -761,11 +830,12 @@ class TrendContImprovedStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self._p = {**self.DEFAULTS, **{k: self.params.get(k, v) for k, v in self.DEFAULTS.items()}}
-        sj  = bool(self._p.get("sj_scoring",  False))
-        ext = bool(self._p.get("sj_extended", False))
-        r9  = bool(self._p.get("sj_roc9",     False))
+        sj  = bool(self._p.get("sj_scoring",     False))
+        ext = bool(self._p.get("sj_extended",    False))
+        r9  = bool(self._p.get("sj_roc9",        False))
+        ve  = bool(self._p.get("sj_vol_expansion", False))
         self._p["indicators"] = self.params.get("indicators",
-            build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9))
+            build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)

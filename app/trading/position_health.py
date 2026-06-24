@@ -13,17 +13,20 @@ Score → Label → Action (4-level)
 
 Indicators (total 100) — split slow-structure / fast-momentum so a sudden
 V-shape (5m collapse before the 4H/1H trend flips) drops the score fast:
-  SLOW (lags, 50)
+  SLOW structure (lags, 54)
     20  4H EMA20 vs EMA50 aligned
     15  1H EMA20 vs EMA50 aligned
      8  MTF composite bias > ±30
      7  ADX(14,5m) > 20
-  FAST (reacts in 1-2 bars, 50)
+     4  1H price above EMA20 (structural support)
+  FAST momentum (reacts in 1-2 bars, 46)
      8  5m close vs EMA9 aligned
      7  5m close vs EMA20 aligned
      5  RSI(14,5m) not at opposite extreme
-    18  ROC(3,5m) velocity favorable          ← V-shape detector
-    12  MACD histogram (5m) favorable          ← leads EMA cross
+    10  ROC(3,5m) velocity favorable          ← V-shape detector (was 18)
+     8  MACD histogram (5m) favorable         ← leads EMA cross (was 12)
+     5  Volume expansion (vol > MA20 × 1.15)  ← breakout momentum
+     3  EMA5 > EMA20 micro-stack on 5m        ← short-term alignment
   −20  PENALTY: accelerating reversal (3 adverse closes + range expanding)
        → a sharp V-shape can pull a 95 score to ~35 (STRONG_WEAK = close now)
 """
@@ -147,7 +150,7 @@ class PositionHealthMonitor:
         details: dict[str, bool] = {}
         total_score = 0.0
 
-        # ── SLOW structure (lags a V-shape) — total 50 ───────────────────────
+        # ── SLOW structure (lags a V-shape) — total 54 ───────────────────────
         # ── 4H trend (EMA20 vs EMA50) ────────────────────────────────────────
         ef4 = _ema(df4h["close"], 20).iloc[-1]
         es4 = _ema(df4h["close"], 50).iloc[-1]
@@ -161,6 +164,12 @@ class PositionHealthMonitor:
         ok_1h = (ef1 > es1) if is_long else (ef1 < es1)
         details["1H_trend"] = bool(ok_1h)
         if ok_1h: total_score += 15
+
+        # ── 1H price above EMA20 (structural support) ────────────────────────
+        price_1h = float(df1h["close"].iloc[-1])
+        ok_1h_price = (price_1h > ef1) if is_long else (price_1h < ef1)
+        details["1H_above_EMA20"] = bool(ok_1h_price)
+        if ok_1h_price: total_score += 4
 
         # ── MTF composite bias (relaxed: ±30) ────────────────────────────────
         mtf_score = _mtf_bias(df5["close"], df1h["close"], df4h["close"])
@@ -197,6 +206,22 @@ class PositionHealthMonitor:
         details["_rsi_ok_val"] = round(rsi_val, 1)
         if ok_rsi: total_score += 5
 
+        # ── EMA5 micro-stack (EMA5 > EMA20 for long = short-term aligned) ─────
+        ema5_5m = float(_ema(df5["close"], 5).iloc[-1])
+        ok_ema5_align = (ema5_5m > ema20) if is_long else (ema5_5m < ema20)
+        details["EMA5_align"] = bool(ok_ema5_align)
+        if ok_ema5_align: total_score += 3
+
+        # ── Volume expansion (vol > MA20 × 1.15 = breakout momentum) ─────────
+        if len(df5) >= 20:
+            vol_ma20 = float(df5["volume"].rolling(20).mean().iloc[-1])
+            vol_now  = float(df5["volume"].iloc[-1])
+            ok_vol_exp = (vol_now > vol_ma20 * 1.15) if vol_ma20 > 0 else False
+        else:
+            ok_vol_exp = False
+        details["Vol_expansion"] = bool(ok_vol_exp)
+        if ok_vol_exp: total_score += 5
+
         # ── V-shape detector 1: ROC(3) on 5m (price velocity over 15 min) ─────
         if len(df5) >= 4:
             c0 = float(df5["close"].iloc[-1]); c3 = float(df5["close"].iloc[-4])
@@ -206,7 +231,7 @@ class PositionHealthMonitor:
         ok_roc = (roc3 > 0) if is_long else (roc3 < 0)
         details["ROC3_favorable"] = bool(ok_roc)
         details["_roc3_val"] = round(roc3, 2)
-        if ok_roc: total_score += 18
+        if ok_roc: total_score += 10
 
         # ── V-shape detector 2: 5m MACD histogram (momentum, leads EMA cross) ─
         macd_line = _ema(df5["close"], 12) - _ema(df5["close"], 26)
@@ -215,7 +240,7 @@ class PositionHealthMonitor:
         ok_macd = (hist > 0) if is_long else (hist < 0)
         details["MACD_hist_favorable"] = bool(ok_macd)
         details["_macd_hist"] = round(hist, 4)
-        if ok_macd: total_score += 12
+        if ok_macd: total_score += 8
 
         # ── V-shape detector 3: accelerating reversal PENALTY ────────────────
         # The V-shape signature: 3 consecutive closes against + last range
