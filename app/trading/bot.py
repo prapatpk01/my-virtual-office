@@ -104,7 +104,8 @@ class TradingBot:
         # Optional health-score entry gate: require PositionHealthMonitor score >
         # TCI_HEALTH_ENTRY_MIN at entry (0 = off). Filters low-quality setups.
         # TCI_HEALTH_ENTRY_SYMBOLS (comma list) restricts the gate to those symbols;
-        # empty = all. Backtest: gate helps BTC, hurts XAU → set "BTC/USDT:USDT".
+        # empty/unset = gate all symbols. Backtest Jan-May 2026 with new health score:
+        # gate>65 helps BOTH BTC and XAU → leave TCI_HEALTH_ENTRY_SYMBOLS unset.
         self._health_entry_min = float(os.getenv("TCI_HEALTH_ENTRY_MIN", "0") or 0)
         self._health_entry_syms = {
             s.strip() for s in os.getenv("TCI_HEALTH_ENTRY_SYMBOLS", "").split(",") if s.strip()
