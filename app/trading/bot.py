@@ -103,7 +103,12 @@ class TradingBot:
 
         # Optional health-score entry gate: require PositionHealthMonitor score >
         # TCI_HEALTH_ENTRY_MIN at entry (0 = off). Filters low-quality setups.
+        # TCI_HEALTH_ENTRY_SYMBOLS (comma list) restricts the gate to those symbols;
+        # empty = all. Backtest: gate helps BTC, hurts XAU → set "BTC/USDT:USDT".
         self._health_entry_min = float(os.getenv("TCI_HEALTH_ENTRY_MIN", "0") or 0)
+        self._health_entry_syms = {
+            s.strip() for s in os.getenv("TCI_HEALTH_ENTRY_SYMBOLS", "").split(",") if s.strip()
+        }
         self._entry_health = PositionHealthMonitor(self.connector)
         logger.info("[BOT] futures=%s paper=%s interval=%ds SL=%.1f%% TP=%.1f%%",
                     self.futures_mode, self.paper, self.interval,
@@ -285,7 +290,9 @@ class TradingBot:
         # Optional health-score entry gate (TCI_HEALTH_ENTRY_MIN > 0). Require a
         # strong multi-TF health reading for the entry side; fail-open on error so
         # a transient candle-fetch failure never halts trading.
-        if self._health_entry_min > 0:
+        gate_this = self._health_entry_min > 0 and (
+            not self._health_entry_syms or sym in self._health_entry_syms)
+        if gate_this:
             try:
                 hr = await self._entry_health.evaluate(sym, side)
                 if hr.score <= self._health_entry_min:
