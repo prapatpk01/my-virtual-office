@@ -288,29 +288,43 @@ class TradingBot:
     # ------------------------------------------------------------------
 
     async def _handle_health_action(self, hr: dict, sym: str, price: float):
-        """Act on health monitor result — notify Telegram, close positions if needed."""
+        """Act on health monitor result.
+
+        Railway log : every check (INFO always; WARNING on close actions)
+        Telegram    : ONLY on soft_close (weak confirmed) or hard_close
+        """
         score  = hr["score"]
         label  = hr["label"]
         action = hr["action"]
-        emoji  = HealthMonitor.label_emoji(label)
 
-        if hr.get("changed") or action in ("soft_close", "hard_close"):
-            msg = (f"{emoji} Health Monitor\n"
-                   f"Score: {score}/100  ({label})\n"
-                   f"Action: {action}")
-            if action == "block_buy":
-                msg += f"\nWeak streak: {self._health._weak_count}/{self._health._weak_bars_confirm}"
-            logger.warning("[Health] %s", msg.replace("\n", " | "))
-            if self.telegram:
-                self.telegram.send(msg)
+        # ── Railway log — always (level depends on severity) ──────────────
+        if action in ("soft_close", "hard_close"):
+            logger.warning("[Health] score=%d (%s) → %s  weak_streak=%d/%d",
+                           score, label, action,
+                           self._health._weak_count, self._health._weak_bars_confirm)
+        else:
+            logger.info("[Health] score=%d (%s) → %s  weak_streak=%d/%d",
+                        score, label, action,
+                        self._health._weak_count, self._health._weak_bars_confirm)
 
+        # ── Close actions ─────────────────────────────────────────────────
         if action == "hard_close":
-            logger.warning("[Health] HARD CLOSE ALL — score=%d (strong_weak)", score)
+            if self._positions and self.telegram:
+                self.telegram.send(
+                    f"🔴 Health Monitor — STRONG WEAK\n"
+                    f"Score: {score}/100\n"
+                    f"→ ปิดทุก position ทันที"
+                )
             await self._close_all_positions_health(
                 price, f"Health hard_close score={score}")
+
         elif action == "soft_close":
-            logger.warning("[Health] SOFT CLOSE ALL — score=%d weak×%d",
-                           score, self._health._weak_count)
+            if self._positions and self.telegram:
+                self.telegram.send(
+                    f"🟠 Health Monitor — WEAK CONFIRMED\n"
+                    f"Score: {score}/100  (weak ×{self._health._weak_count})\n"
+                    f"→ ปิดทุก position"
+                )
             await self._close_all_positions_health(
                 price, f"Health soft_close score={score} streak={self._health._weak_count}")
 
