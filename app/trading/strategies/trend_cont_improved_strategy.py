@@ -690,7 +690,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         vol_period=20, vol_mult=1.0,
         atr_period=14, sl_mult=1.2, sl_min_pct=0.012, sl_max_pct=0.035,
         adx_len=14, adx_min=30,
-        tp1_r=0.5, tp1_fraction=0.40, tp2_r=2.5,
+        tp1_r=0.5, tp1_fraction=0.60, tp2_r=2.5,   # close 60% at TP1 (banks more profit early)
         min_score=5.0,   # 5/6 with sj_roc9=True (was 4/5 baseline)
         # Fast mode v2
         fast_mode=False,
@@ -731,7 +731,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         adx_rising_or_strong=0,    # 0=off; if >0, ADX gate accepts (rising OR adx>this)
         # HTF macro/mid direction mode — 'cross' (legacy 20/50), 'slope', or 'early'.
         # 'slope'/'early' flip the 4h+1h gate before the full crossover → earlier entries.
-        htf_macro_mode="cross",
+        # 'early' is the validated production default: flips the 4h+1h gate one bar
+        # before the full 20/50 cross → fixes late entries. Backtest Jan-May 2026:
+        # combined +$488 vs +$447 cross (+9.1% PnL, WR ↑, MaxDD ↓). XAU benefits most.
+        htf_macro_mode="early",
         htf_slope_bars=2,          # bars for EMA-fast slope in 'slope'/'early' modes
         htf_sep_guard=False,       # gate early/slope flip on widening EMA gap (anti-whipsaw)
         # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).

@@ -123,7 +123,7 @@ def build_config() -> dict:
         "tci_sl_min_pct":       _env_float("TCI_SL_MIN_PCT",       0.012),
         "tci_sl_max_pct":       _env_float("TCI_SL_MAX_PCT",       0.035),
         "tci_tp1_r":            _env_float("TCI_TP1_R",            0.5),
-        "tci_tp1_fraction":     _env_float("TCI_TP1_FRACTION",     0.40),
+        "tci_tp1_fraction":     _env_float("TCI_TP1_FRACTION",     0.60),  # close 60% at TP1
         "tci_tp2_r":            _env_float("TCI_TP2_R",            2.5),
         "tci_min_score":        _env_float("TCI_MIN_SCORE",        _min_default),
         "tci_vol_mult":         _env_float("TCI_VOL_MULT",         1.0),
