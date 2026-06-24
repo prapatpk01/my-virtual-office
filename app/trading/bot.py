@@ -249,14 +249,20 @@ class TradingBot:
                 logger.warning("Failed to fetch data for %s: %s", sym, e)
                 continue
 
-            # Fetch 4H candles for multi-TF strategies (e.g. ProfitableBot 4H guard)
+            # Fetch 4H and 1D candles for SpotMaster multi-TF layers
             mtf: dict = {}
             try:
-                c4h = await self.connector.fetch_ohlcv(sym, timeframe="4h", limit=120)
+                c4h = await self.connector.fetch_ohlcv(sym, timeframe="4h", limit=250)
                 if c4h and len(c4h) >= 50:
                     mtf["4h"] = to_heikin_ashi(c4h)
             except Exception:
-                pass  # 4H optional — strategies degrade gracefully without it
+                pass  # 4H optional — strategy degrades gracefully without it
+            try:
+                c1d = await self.connector.fetch_ohlcv(sym, timeframe="1d", limit=250)
+                if c1d and len(c1d) >= 55:
+                    mtf["1d"] = to_heikin_ashi(c1d)
+            except Exception:
+                pass  # 1D optional — strategy skips regime layer without it
 
             if self._ai_chief:
                 # ── Chief mode: strategy exits first, then Chief decides ───
