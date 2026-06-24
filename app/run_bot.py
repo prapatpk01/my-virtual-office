@@ -80,6 +80,12 @@ def _env_int(key: str, default: int) -> int:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def build_config() -> dict:
+    # SJ scoring: min_score default is COUPLED to the component count so the two
+    # can never desync. 6-comp (SJ Hybrid + ROC9) needs 5/6 (validated best);
+    # classic 4-comp / 5-comp SJ stay at 4/N. An explicit TCI_MIN_SCORE wins.
+    _sj_scoring  = _env_bool("TCI_SJ_SCORING", True)
+    _sj_roc9     = _env_bool("TCI_SJ_ROC9",    True)
+    _min_default = 5.0 if (_sj_scoring and _sj_roc9) else 4.0
     return {
         # ── Exchange credentials ───────────────────────────────────────────────
         "exchange":       os.environ.get("EXCHANGE",            "okx"),
@@ -118,7 +124,7 @@ def build_config() -> dict:
         "tci_tp1_r":            _env_float("TCI_TP1_R",            0.5),
         "tci_tp1_fraction":     _env_float("TCI_TP1_FRACTION",     0.40),
         "tci_tp2_r":            _env_float("TCI_TP2_R",            2.5),
-        "tci_min_score":        _env_float("TCI_MIN_SCORE",        4.0),
+        "tci_min_score":        _env_float("TCI_MIN_SCORE",        _min_default),
         "tci_vol_mult":         _env_float("TCI_VOL_MULT",         1.0),
         # Strict: 15m swing pullback parameters
         "tci_swing_lookback":   _env_int("TCI_SWING_LOOKBACK",     4),     # rolling bars (4×15m = 1h)
@@ -144,7 +150,9 @@ def build_config() -> dict:
         "tci_health_bias_flip": _env_float("TCI_HEALTH_BIAS_FLIP", 50.0), # strict bias flip (fast uses bias_gate_fast)
         # SJ Hybrid scoring (FAST mode only): HMA20 + EMA5>SMA9 + RSI + Volume + Breakout(10)
         # Backtest: combined BTC+XAU +$103 (SJ) vs +$90 (classic). XAU improves +134%.
-        "tci_sj_scoring":       _env_bool("TCI_SJ_SCORING",         True),
+        "tci_sj_scoring":       _sj_scoring,
+        # SJ ROC9 — 6th component (ROC(9) direction). Backtest +11.5% PnL @ min5/6.
+        "tci_sj_roc9":          _sj_roc9,
 
         # ── Position health monitor ───────────────────────────────────────────
         # Re-checks every open position using 5m+1h+4h candles (relaxed thresholds).
@@ -230,6 +238,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "trend_fade_enabled":     cfg["trend_fade_enabled"],
             "trend_fade_uw_frac":     cfg["trend_fade_uw_frac"],
             "sj_scoring":             cfg["tci_sj_scoring"],
+            "sj_roc9":                cfg["tci_sj_roc9"],
         }))
 
     if not strategies:
@@ -368,6 +377,7 @@ async def main():
                     "adx_rising_fast": cfg["tci_adx_rising"],
                     "cooldown_bars": cfg["tci_cooldown_bars"],
                     "sj_scoring": cfg["tci_sj_scoring"],  # match live entry scoring
+                    "sj_roc9": cfg["tci_sj_roc9"],
                 })
                 trades, _ = await backtest_strategy_mtf_v2(
                     tci, c15m, {"1h": c1h, "4h": c4h}, notional,
