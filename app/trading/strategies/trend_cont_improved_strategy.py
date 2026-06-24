@@ -144,6 +144,30 @@ def _roc(s: pd.Series, n: int = 9) -> pd.Series:
     return (s - s.shift(n)) / s.shift(n).replace(0, np.nan) * 100
 
 
+def _htf_dir(ef: pd.Series, es: pd.Series, close: pd.Series,
+             mode: str = "cross", slope_bars: int = 2):
+    """HTF trend direction (up, dn) for the macro/mid gates.
+
+    'cross'  : EMA_fast vs EMA_slow (legacy binary; lags a turn most).
+    'slope'  : EMA_fast direction over slope_bars — flips ~1 fast-EMA length
+               sooner, ignores the slow EMA entirely (more whipsaw).
+    'early'  : full cross OR (fast-EMA turning AND price on that side of it) —
+               lets the gate flip before the 20/50 cross completes, with a
+               price-confirm guard to cut the worst whipsaw.
+    """
+    if mode == "slope":
+        up = ef > ef.shift(slope_bars)
+        dn = ef < ef.shift(slope_bars)
+    elif mode == "early":
+        cross_up, cross_dn = ef > es, ef < es
+        slope_up, slope_dn = ef > ef.shift(slope_bars), ef < ef.shift(slope_bars)
+        up = cross_up | (slope_up & (close > ef))
+        dn = cross_dn | (slope_dn & (close < ef))
+    else:  # 'cross' (default — legacy behaviour)
+        up, dn = ef > es, ef < es
+    return up, dn
+
+
 def _mtf_bias(primary_close: pd.Series, aligned: dict,
               ema_fast: int = 20, ema_slow: int = 50,
               rsi_period: int = 14, rsi_bull: float = 55.0, rsi_bear: float = 45.0) -> pd.Series:
@@ -298,8 +322,10 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     fast_mode = p.get("fast_mode", False)
 
     # ── Layer 1: 4H macro trend ───────────────────────────────────────────────
+    htf_mode  = p.get("htf_macro_mode", "cross")
+    slope_bars = int(p.get("htf_slope_bars", 2))
     ef4, es4 = _ema(out["h4_close"], p["ema_fast"]), _ema(out["h4_close"], p["ema_slow"])
-    macro_up, macro_dn = ef4 > es4, ef4 < es4
+    macro_up, macro_dn = _htf_dir(ef4, es4, out["h4_close"], htf_mode, slope_bars)
 
     # Optional: gate on 4h MACD histogram slope — blocks fading crossovers.
     # Fires when ema_fast/slow are 12/26 (MACD periods) or any config with noise risk.
@@ -312,7 +338,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
 
     # ── Layer 2: 1H mid trend ─────────────────────────────────────────────────
     ef1, es1 = _ema(out["h1_close"], p["ema_fast"]), _ema(out["h1_close"], p["ema_slow"])
-    mid_up, mid_dn = ef1 > es1, ef1 < es1
+    mid_up, mid_dn = _htf_dir(ef1, es1, out["h1_close"], htf_mode, slope_bars)
 
     # ── HTF Momentum Score (opt-in; replaces binary Layer 1 + 2 gates) ────────
     # 8 components: direction + separation + price-confirm + RSI on each of 4h/1h.
@@ -691,6 +717,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Entry-timing relax knobs (default = legacy behaviour, no change):
         breakout_lookback=10,      # 10-bar high/low for breakout_hh10; lower → fires sooner
         adx_rising_or_strong=0,    # 0=off; if >0, ADX gate accepts (rising OR adx>this)
+        # HTF macro/mid direction mode — 'cross' (legacy 20/50), 'slope', or 'early'.
+        # 'slope'/'early' flip the 4h+1h gate before the full crossover → earlier entries.
+        htf_macro_mode="cross",
+        htf_slope_bars=2,          # bars for EMA-fast slope in 'slope'/'early' modes
         # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).
         # Backtest Jan-May 2026: min5/6 → combined +$447 vs baseline +$401 (+11.5% PnL, same MaxDD).
         sj_roc9=True,
