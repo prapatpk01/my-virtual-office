@@ -160,7 +160,7 @@ def build_config() -> dict:
         # BULL≥85%: extend TP2 up ladder (1.2→1.5→2.0→2.5→3.0R)
         # NEUTRAL 50–84%: hold
         # WEAK<40%: close immediately (better than SL)
-        "monitor_interval":      _env_int("MONITOR_INTERVAL",      180),  # seconds between checks
+        "monitor_interval":      _env_int("MONITOR_INTERVAL",       60),  # seconds between checks (spike-cut, health score)
         "health_weak_confirm":   _env_int("HEALTH_WEAK_CONFIRM",   3),    # consecutive WEAK cycles before close
 
         # ── Risk / sizing ─────────────────────────────────────────────────────
@@ -186,8 +186,9 @@ def build_config() -> dict:
         "dynamic_sizing":   _env_bool("DYNAMIC_SIZING", False),
 
         # ── Timing ────────────────────────────────────────────────────────────
-        # 60s tick: fast enough for 15m candles (TrendContImproved).
-        "interval": _env_int("INTERVAL_SECONDS", 60),
+        # 30s tick: SL/TP/BE checked every 30s; signal analysis uses 15m candles so
+        # no extra entries are generated — only position-exit speed improves.
+        "interval": _env_int("INTERVAL_SECONDS", 30),
 
         # ── Telegram ──────────────────────────────────────────────────────────
         "telegram_token":    os.environ.get("TELEGRAM_BOT_TOKEN", ""),
