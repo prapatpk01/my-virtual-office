@@ -44,6 +44,28 @@ def _fmt_details(d: dict) -> str:
     return "  ".join(parts)
 
 
+def _l1_wait_hint(reason: str) -> str:
+    """Parse a strategy HOLD reason string and return what's blocking L1.
+
+    Finds the direction (LONG/SHORT) closest to passing, lists its failing
+    sub-conditions, and returns a compact 'LONG needs: bias+adx' string.
+    """
+    best_dir: str = ""
+    best_fails: list = []
+    for part in reason.split(" | "):
+        if not (part.startswith("L:") or part.startswith("S:")):
+            continue
+        direction = "LONG" if part.startswith("L:") else "SHORT"
+        tokens    = part[2:].split()
+        fails     = [t.replace("✗", "").replace("×", "") for t in tokens if "✗" in t or "×" in t]
+        if not best_dir or len(fails) < len(best_fails):
+            best_dir, best_fails = direction, fails
+    if best_dir and best_fails:
+        return f"{best_dir} needs: {'+'.join(best_fails)}"
+    # Fallback: show the score/bias/ADX summary (first segment before ' | ')
+    return reason.split(" | ")[0] if " | " in reason else reason[:80]
+
+
 @dataclass
 class TradeRecord:
     timestamp: int
@@ -279,8 +301,6 @@ class TradingBot:
         l1_label   = "✗" if is_hold_l1 else (f"✓(sj={sj:.0f})" if isinstance(sj, (int, float)) else "✓")
 
         if is_hold_l1:
-            brief = signal.reason.split(" | ")[0] if " | " in signal.reason else signal.reason[:80]
-            logger.info("[GATE] %s %s → L1:✗ | L2:— | L3:— | %s", strategy.name, sym, brief)
             l3_label = "—"
         else:
             # ── Layer 3 — Pattern gate (checked before L2 so fast-fail avoids health fetch)
@@ -291,8 +311,6 @@ class TradingBot:
                     l3_label = f"✓({pat_names})"
                 else:
                     l3_label = "✗"
-                    logger.info("[GATE] %s %s %s → L1:%s | L2:— | L3:✗ | waiting: pattern gate",
-                                strategy.name, sym, side_hint.upper(), l1_label)
                     signal = Signal(
                         type=SignalType.HOLD, symbol=signal.symbol, price=signal.price,
                         amount=signal.amount, reason="pattern gate: no confirming candle pattern",
@@ -315,7 +333,16 @@ class TradingBot:
         }
 
         if signal.type == SignalType.HOLD:
-            logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:120])
+            # Detail line first (bias / ADX / score)
+            logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:140])
+            # [GATE] summary follows right after — shows which layer is blocking and what to wait for
+            if is_hold_l1:
+                wait = _l1_wait_hint(signal.reason)
+                logger.info("[GATE] %s %s → L1:✗ | L2:— | L3:— | waiting: %s",
+                            strategy.name, sym, wait)
+            else:
+                logger.info("[GATE] %s %s %s → L1:%s | L2:— | L3:✗ | waiting: pattern gate",
+                            strategy.name, sym, side_hint.upper(), l1_label)
 
         return signal, sig_dict
 
