@@ -844,7 +844,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         atr_period=14, sl_mult=1.2, sl_min_pct=0.012, sl_max_pct=0.035,
         adx_len=14, adx_min=30,
         tp1_r=0.5, tp1_fraction=0.60, tp2_r=2.5,   # close 60% at TP1 (banks more profit early)
-        min_score=6.0,   # 6/8 with sj_bos=True (was 5/7; maintains same "miss 2" selectivity)
+        min_score=5.0,   # 5/8 with sj_bos=True — backtest: +$103.94 vs 6/8=$62.64 (5/8 wins by $41)
         # Fast mode v2
         fast_mode=False,
         adx_min_fast=18,          # ADX lower bound — trend must be active
