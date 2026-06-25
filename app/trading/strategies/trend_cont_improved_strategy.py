@@ -363,6 +363,84 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     ef4, es4 = _ema(out["h4_close"], p["ema_fast"]), _ema(out["h4_close"], p["ema_slow"])
     macro_up, macro_dn = _htf_dir(ef4, es4, out["h4_close"], htf_mode, slope_bars, sep_guard, slope_pct)
 
+    # ── 4H Regime Mode: 2/3 score (slope + ADX + price side) ────────────────
+    # When htf_regime_4h=True, replaces EMA20/50 cross with a faster 3-component
+    # regime check. Fires when ≥2 of:
+    #   [1] EMA20(4H) slope: current EMA20 < EMA20 two bars ago (falling)
+    #   [2] ADX(4H) > htf_regime_adx_min (trend exists, filters sideways)
+    #   [3] h4_close < EMA20(4H) (price on bearish side of EMA20)
+    # Advantage: no EMA50 lag; price-side check responds within current bar.
+    if p.get("htf_regime_4h", False):
+        _adx_len4  = int(p.get("htf_regime_adx_len", 14))
+        _adx_min4  = float(p.get("htf_regime_adx_min", 18))
+        adx4h_r    = _adx(
+            out[["h4_high", "h4_low", "h4_close"]].rename(
+                columns={"h4_high": "high", "h4_low": "low", "h4_close": "close"}),
+            _adx_len4)
+        adx4h_ok_r = adx4h_r > _adx_min4
+
+        ef4_slope_up = ef4 > ef4.shift(2)   # EMA20 higher than 2 bars ago
+        ef4_slope_dn = ef4 < ef4.shift(2)   # EMA20 lower than 2 bars ago
+        px_above_ema = out["h4_close"] > ef4
+        px_below_ema = out["h4_close"] < ef4
+
+        score_up_r = (ef4_slope_up.astype(float) + adx4h_ok_r.astype(float)
+                      + px_above_ema.astype(float))
+        score_dn_r = (ef4_slope_dn.astype(float) + adx4h_ok_r.astype(float)
+                      + px_below_ema.astype(float))
+
+        macro_up = (score_up_r >= 2).fillna(False)
+        macro_dn = (score_dn_r >= 2).fillna(False)
+
+    # ── 4H Regime Mode: Weighted Score (slope40 + ADX25 + ATR15 + ER20 → ≥70) ─
+    # Computed on ACTUAL 4H bars then forward-filled to 15m to avoid artifacts.
+    # EMA20(4H) 3-bar slope: direction (±0.15%) + score 40pts (absolute).
+    # ADX buckets: <18→0, 18-25→15, 25-45→25, >45→10 (max 25pts).
+    # ATR14/ATR50 ratio: <0.90→0, 0.90-1.10→5, >1.10→15 (max 15pts).
+    # Efficiency Ratio (20-bar): <0.20→0, 0.20-0.35→10, >0.35→20 (max 20pts).
+    # Max total = 100. Need ≥70 AND slope in matching direction for regime gate.
+    if p.get("htf_regime_4h_mode") == "weighted":
+        _adx_len4w = int(p.get("htf_regime_adx_len", 14))
+
+        # [1] EMA20 slope over 3 actual 4H bars
+        ef4_actual = _ema(df4h["close"], 20)
+        slope3_pct_4h = (ef4_actual - ef4_actual.shift(3)) / ef4_actual.shift(3).abs() * 100
+        slope_score_4h = np.where(slope3_pct_4h.abs() > 0.15, 40.0, 0.0)
+
+        # [2] ADX strength buckets
+        adx4h_w = _adx(df4h, _adx_len4w)
+        adx_score_4h = np.where(adx4h_w < 18, 0.0,
+                       np.where(adx4h_w < 25, 15.0,
+                       np.where(adx4h_w <= 45, 25.0, 10.0)))
+
+        # [3] ATR14/ATR50 expansion (actual 4H bars only)
+        atr14_4h = _atr(df4h, 14)
+        atr50_4h = _atr(df4h, 50)
+        atr_ratio_4h = atr14_4h / atr50_4h.replace(0, np.nan)
+        atr_score_4h = np.where(atr_ratio_4h > 1.10, 15.0,
+                       np.where(atr_ratio_4h >= 0.90, 5.0, 0.0))
+
+        # [4] Efficiency Ratio: directional move / total path (20 4H bars)
+        close_4h = df4h["close"]
+        er_dir_4h = (close_4h - close_4h.shift(20)).abs()
+        er_vol_4h = close_4h.diff().abs().rolling(20).sum()
+        er_4h = er_dir_4h / er_vol_4h.replace(0, np.nan)
+        er_score_4h = np.where(er_4h > 0.35, 20.0,
+                      np.where(er_4h >= 0.20, 10.0, 0.0))
+
+        trend_score_4h = pd.Series(
+            slope_score_4h + adx_score_4h + atr_score_4h + er_score_4h,
+            index=df4h.index).fillna(0)
+
+        bull_4h = pd.Series((slope3_pct_4h > 0.15) & (trend_score_4h >= 70), index=df4h.index)
+        bear_4h = pd.Series((slope3_pct_4h < -0.15) & (trend_score_4h >= 70), index=df4h.index)
+
+        # Forward-fill 4H regime signals to 15m timestamps (no lookahead)
+        regime_4h = pd.DataFrame({"bull": bull_4h, "bear": bear_4h})
+        regime_15m = regime_4h.reindex(out.index, method="ffill")
+        macro_up = regime_15m["bull"].fillna(False)
+        macro_dn = regime_15m["bear"].fillna(False)
+
     # Optional: gate on 4h MACD histogram slope — blocks fading crossovers.
     # Fires when ema_fast/slow are 12/26 (MACD periods) or any config with noise risk.
     if p.get("macd_slope_gate", False):
@@ -799,6 +877,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         htf_slope_bars=2,          # bars for EMA-fast slope in 'slope'/'early' modes (legacy fallback)
         htf_slope_pct=0.15,        # EMA-fast must move ≥0.15% in one bar for early flip (0=legacy slope_bars)
         htf_sep_guard=False,       # gate early/slope flip on widening EMA gap (anti-whipsaw)
+        # 4H Regime Mode: 2/3 score replaces EMA20/50 cross (no EMA50 lag).
+        # Components: [1] EMA20 slope (2-bar lookback) + [2] ADX>18 + [3] price side of EMA20.
+        # Backtest vs 'early' mode: run /backtest to compare before enabling in production.
+        htf_regime_4h=False,       # enable 2/3 regime score for 4H macro gate
+        htf_regime_4h_mode=None,   # "weighted" → 4-component weighted score (40+25+15+20, need ≥70)
+        htf_regime_adx_min=18,     # ADX(4H) minimum for regime component [2]
+        htf_regime_adx_len=14,     # ADX period for regime check
         # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).
         # Backtest Jan-May 2026: min5/6 → combined +$447 vs baseline +$401 (+11.5% PnL, same MaxDD).
         sj_roc9=True,
