@@ -297,6 +297,40 @@ def _pat_squeeze_breakout(candles: list) -> tuple[bool, bool]:
     return (price > ma), (price < ma)
 
 
+# ── Pattern tier classification (used for TP1 upgrade, not entry gate) ────────
+# Tier 1 (TP1→1.2R): high-momentum reversal — WR 67-75% in backtest
+# Tier 2 (TP1→1.0R): reliable confirmation  — WR 57-61%
+# Tier 3 (TP1→0.8R): structure/momentum     — WR 50-53%
+# 0 = no upgrade (WR below 50% in backtest)
+_PATTERN_TIER: dict[str, int] = {
+    "Morning/Eve-Star": 1,
+    "Engulfing":        1,
+    "DoubleTop/Bot":    1,
+    "Tweezer":          2,
+    "Rejection":        2,
+    "Flag":             2,
+    "InsideBarBreak":   2,
+    "Vol-Spike":        2,
+    "BOS-20":           3,
+    "RSI-Div":          3,
+    "3-Soldiers":       0,   # WR 43% — no upgrade
+}
+
+# R-multiples for each tier's TP1 jump target
+TP1_BY_TIER: dict[int, float] = {1: 1.2, 2: 1.0, 3: 0.8}
+
+
+def pattern_best_tier(fired_names: list) -> int:
+    """Return the best (lowest = strongest) tier from a list of fired pattern names.
+    Returns 0 if no pattern qualifies for a TP1 upgrade."""
+    best = 0
+    for name in fired_names:
+        t = _PATTERN_TIER.get(name, 0)
+        if t > 0 and (best == 0 or t < best):
+            best = t
+    return best
+
+
 # ── Gate entry point ──────────────────────────────────────────────────────────
 
 _PATTERNS: list[tuple[str, object]] = [

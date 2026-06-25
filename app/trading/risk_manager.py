@@ -30,6 +30,10 @@ class Position:
     health_label: str = "NEUTRAL"
     health_checks: int = 0       # number of health checks done
     health_weak_count: int = 0   # consecutive WEAK cycles (2 required before close)
+    # Pattern-tier TP1 upgrade fields
+    pattern_tier: int = 0              # best pattern tier at entry (0=none, 1/2/3)
+    tp1_pattern_upgraded: bool = False # True once TP1 was raised by pattern tier+BULL
+    tp1_original: float = 0.0         # original TP1 price at entry (before upgrade)
 
     @property
     def pnl_pct(self) -> float:

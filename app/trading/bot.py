@@ -21,7 +21,7 @@ from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
 from .signal_state import SignalState
 from .position_health import PositionHealthMonitor, HealthResult
-from .patterns import pattern_gate_passes
+from .patterns import pattern_gate_passes, pattern_best_tier, TP1_BY_TIER
 
 logger = logging.getLogger("trading_bot")
 
@@ -303,52 +303,50 @@ class TradingBot:
         sj         = (signal.metadata or {}).get("sj_score")
         l1_label   = "✗" if is_hold_l1 else (f"✓(sj={sj:.0f})" if isinstance(sj, (int, float)) else "✓")
 
+        # ── Layer 3 — Pattern scanner (NO LONGER blocks entry; feeds TP1 optimizer) ──
+        pattern_tier  = 0
+        pattern_names = ""
         if is_hold_l1:
             l3_label = "—"
         else:
-            # ── Layer 3 — Pattern gate (checked before L2 so fast-fail avoids health fetch)
-            l3_label = "—"
-            if self._pattern_gate_enabled:
-                passes, pat_names = pattern_gate_passes(candles, side_hint)
-                if passes:
-                    l3_label = f"✓({pat_names})"
+            try:
+                _, pat_str = pattern_gate_passes(candles, side_hint)
+                fired = [n for n in pat_str.split("+") if n and n != "no_pattern"]
+                pattern_names = "+".join(fired)
+                pattern_tier  = pattern_best_tier(fired)
+                if pattern_tier > 0:
+                    l3_label = f"T{pattern_tier}({pattern_names})"
+                elif fired:
+                    l3_label = f"—({pattern_names})"
                 else:
-                    l3_label = "✗"
-                    signal = Signal(
-                        type=SignalType.HOLD, symbol=signal.symbol, price=signal.price,
-                        amount=signal.amount, reason="pattern gate: no confirming candle pattern",
-                        confidence=0.0, metadata=signal.metadata,
-                    )
-            else:
-                l3_label = "—(off)"
+                    l3_label = "—(no pat)"
+            except Exception as _pe:
+                logger.warning("[%s] Pattern scan error on %s: %s", strategy.name, sym, _pe)
+                l3_label = "—(err)"
 
         sig_dict = {
-            "strategy":   strategy.name,
-            "symbol":     sym,
-            "type":       signal.type.value,
-            "price":      price,
-            "confidence": signal.confidence,
-            "reason":     signal.reason,
-            "ts":         int(time.time() * 1000),
-            "metadata":   signal.metadata,
-            "_l1_label":  l1_label,
-            "_l3_label":  l3_label,
+            "strategy":       strategy.name,
+            "symbol":         sym,
+            "type":           signal.type.value,
+            "price":          price,
+            "confidence":     signal.confidence,
+            "reason":         signal.reason,
+            "ts":             int(time.time() * 1000),
+            "metadata":       signal.metadata,
+            "_l1_label":      l1_label,
+            "_l3_label":      l3_label,
+            "_pattern_tier":  pattern_tier,
+            "_pattern_names": pattern_names,
         }
 
         if signal.type == SignalType.HOLD:
             # Detail line first (bias / ADX / score)
             logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:140])
-            # [GATE] summary follows right after — shows which layer is blocking and what to wait for
-            # Always append L2 threshold so user can see all pending requirements at once
             l2_pending = (f" + L2: health>={self._health_entry_min:.0f}"
                           if self._health_entry_min > 0 else "")
-            if is_hold_l1:
-                wait = _l1_wait_hint(signal.reason)
-                logger.info("[GATE] %s %s → L1:✗ | L2:— | L3:— | waiting: %s%s",
-                            strategy.name, sym, wait, l2_pending)
-            else:
-                logger.info("[GATE] %s %s %s → L1:%s | L2:— | L3:✗ | waiting: pattern gate%s",
-                            strategy.name, sym, side_hint.upper(), l1_label, l2_pending)
+            wait = _l1_wait_hint(signal.reason)
+            logger.info("[GATE] %s %s → L1:✗ | L2:— | L3:%s | waiting: %s%s",
+                        strategy.name, sym, l3_label, wait, l2_pending)
 
         return signal, sig_dict
 
@@ -412,7 +410,8 @@ class TradingBot:
         if self.telegram:
             self.telegram.notify_signal({**sig_dict, "strategy": slot})
 
-        opened = await self._open_position(signal, slot, side)
+        pattern_tier = sig_dict.get("_pattern_tier", 0)
+        opened = await self._open_position(signal, slot, side, pattern_tier=pattern_tier)
 
         # Arm the whipsaw cooldown ONLY after a confirmed fill — a rejected order
         # (insufficient margin, sub-minimum size) must not strand the symbol.
@@ -421,7 +420,7 @@ class TradingBot:
 
     # ── Order execution ───────────────────────────────────────────────────
 
-    async def _open_position(self, signal: Signal, slot: str, side: str):
+    async def _open_position(self, signal: Signal, slot: str, side: str, pattern_tier: int = 0):
         """Open a LONG or SHORT futures position."""
         sym = signal.symbol
         try:
@@ -532,6 +531,11 @@ class TradingBot:
                 contract_size=ct,
                 one_r=one_r,
             )
+            # Store pattern tier for TP1 upgrade logic
+            pos = self.risk.get_position_obj(sym, strategy=slot)
+            if pos is not None:
+                pos.pattern_tier   = pattern_tier
+                pos.tp1_original   = pos.tp1 or 0.0
             self._record_trade(TradeRecord(
                 timestamp=int(time.time() * 1000),
                 symbol=sym, side=order_side,
@@ -774,7 +778,12 @@ class TradingBot:
                             strategy, sym, result.score)
             elif result.label == "WEAK":
                 pos.health_weak_count += 1
-                if pos.health_weak_count < weak_confirm:
+                # Pattern-upgraded TP1: don't wait N confirms — exit now (momentum fading)
+                if pos.tp1_pattern_upgraded and not pos.tp1_hit:
+                    logger.info(
+                        "[PAT-TP1] %s %s WEAK after TP1 upgrade (%.1fR target) — exit immediately",
+                        strategy, sym, TP1_BY_TIER.get(pos.pattern_tier, 0))
+                elif pos.health_weak_count < weak_confirm:
                     logger.info("[MONITOR] %s %s WEAK (score=%.0f) — %d/%d confirmation, holding",
                                 strategy, sym, result.score, pos.health_weak_count, weak_confirm)
                     continue
@@ -792,24 +801,39 @@ class TradingBot:
         if result.action == "EXTEND_TP":
             one_r = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
             if not pos.tp1_hit:
-                # Before TP1: raise TP1 one step (cap 1.5R) so we bank at a better price
-                new_tp1 = monitor.next_tp1_level(pos.entry_price, one_r,
-                                                  pos.tp1 or pos.take_profit or 0.0, pos.side)
-                if new_tp1 and new_tp1 != pos.tp1:
-                    old_tp1 = pos.tp1
-                    pos.tp1 = new_tp1
-                    # NOTE: OKX algo-order for TP1 is not updated on the exchange;
-                    # stage_check() uses pos.tp1 for the bot-side trigger only.
-                    # On live accounts the exchange's original TP order at old_tp1
-                    # will fire first if price reaches it before the new level.
-                    logger.info("[MONITOR] %s %s BULL (pre-TP1) → TP1 raised %.4f → %.4f (max 1.2R)",
-                                strategy, sym, old_tp1 or 0, new_tp1)
+                # Pattern-tier upgrade (once): jump TP1 directly to tier target
+                if pos.pattern_tier > 0 and not pos.tp1_pattern_upgraded:
+                    r_mult   = TP1_BY_TIER.get(pos.pattern_tier, 0.5)
+                    new_tp1  = (round(pos.entry_price + r_mult * one_r, 8) if pos.side == "long"
+                                else round(pos.entry_price - r_mult * one_r, 8))
+                    old_tp1  = pos.tp1
+                    pos.tp1                  = new_tp1
+                    pos.tp1_pattern_upgraded = True
+                    logger.info(
+                        "[PAT-TP1] %s %s tier-%d → TP1 %.4f→%.4f (%.1fR) | WEAK exit armed",
+                        strategy, sym, pos.pattern_tier, old_tp1 or 0, new_tp1, r_mult)
                     if self.telegram:
                         self.telegram.notify(
-                            f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(pre-TP1)_\n"
-                            f"Score {result.score:.0f}%  TP1 raised: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _(max 1.2R)_\n"
-                            f"Indicators: {_fmt_details(result.details)}"
+                            f"🎯 *Pattern TP1 Upgrade* `{sym}` {pos.side.upper()}\n"
+                            f"Tier {pos.pattern_tier} pattern + Health BULL\n"
+                            f"TP1: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _({r_mult}R)_ | early-exit armed on WEAK\n"
+                            f"Score {result.score:.0f}%  Indicators: {_fmt_details(result.details)}"
                         )
+                else:
+                    # No pattern tier (or already upgraded): step TP1 up the ladder
+                    new_tp1 = monitor.next_tp1_level(pos.entry_price, one_r,
+                                                      pos.tp1 or pos.take_profit or 0.0, pos.side)
+                    if new_tp1 and new_tp1 != pos.tp1:
+                        old_tp1 = pos.tp1
+                        pos.tp1 = new_tp1
+                        logger.info("[MONITOR] %s %s BULL (pre-TP1) → TP1 raised %.4f → %.4f (max 1.2R)",
+                                    strategy, sym, old_tp1 or 0, new_tp1)
+                        if self.telegram:
+                            self.telegram.notify(
+                                f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(pre-TP1)_\n"
+                                f"Score {result.score:.0f}%  TP1 raised: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _(max 1.2R)_\n"
+                                f"Indicators: {_fmt_details(result.details)}"
+                            )
             else:
                 # After TP1: runner is at BE — extend TP2 up the ladder (max 3.0R)
                 new_tp = monitor.next_tp_level(pos.entry_price, one_r,
