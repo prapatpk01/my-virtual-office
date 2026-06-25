@@ -256,9 +256,9 @@ class TradingBot:
             # Fetch multi-TF candles for strategy layers
             mtf: dict = {}
             for tf, min_bars, limit in (
-                ("30m", 60, 300),   # SmartGridHybrid entry TF
-                ("4h",  50, 250),   # SpotMaster L2-L3, SmartGridHybrid regime
-                ("1d",  55, 250),   # SpotMaster L1, SmartGridHybrid macro
+                ("15m", 55, 400),   # SwingReversalPro entry TF
+                ("1h",  30, 200),   # SwingReversalPro context TF
+                ("4h",  20, 150),   # SwingReversalPro structure TF
             ):
                 try:
                     cx = await self.connector.fetch_ohlcv(sym, timeframe=tf, limit=limit)
@@ -267,10 +267,13 @@ class TradingBot:
                 except Exception:
                     pass  # each TF optional — strategies degrade gracefully
 
+            # Pass health score into mtf so strategies can use it for early exit
+            mtf["health_score"] = self._health.last_score
+
             now_ms = int(time.time() * 1000)
 
             # ── Spike / whipsaw guard (every tick, 30-min cooldown) ───────
-            c30m = mtf.get("30m") or candles
+            c30m = mtf.get("15m") or candles
             sr   = self._health.check_spike(c30m, price, now_ms)
             if sr["detected"]:
                 spike_type = sr["type"]
@@ -445,30 +448,43 @@ class TradingBot:
                 logger.error("Strategy %s error on %s: %s", strategy.name, sym, e)
                 continue
 
-            # SELL: close this strategy's own position
-            if signal.type == SignalType.SELL:
+            meta    = signal.metadata or {}
+            ps      = meta.get("position_side", "LONG").upper()   # "LONG" | "SHORT"
+            action  = meta.get("action", "")                       # "open" | "close"
+
+            # ── CLOSE signal (strategy wants out) ─────────────────────────
+            if signal.type == SignalType.SELL and action == "close":
                 if pos_key in self._positions:
-                    await self._execute_sell_early(pos_key, price, signal.reason, strategy.name)
+                    await self._execute_sell_early(pos_key, price,
+                                                   signal.reason, strategy.name)
                 continue
 
             if signal.type != SignalType.BUY:
                 continue
 
-            # Block if this strategy already has an open position, or max total reached
+            # ── OPEN signal ───────────────────────────────────────────────
             if pos_key in self._positions or len(self._positions) >= self.max_positions:
                 continue
 
             # Block new entries when market health is weak or worse
             if self._health.last_label in ("weak", "strong_weak"):
-                logger.debug("[Health] BUY blocked for %s (label=%s score=%d)",
+                logger.debug("[Health] entry blocked for %s (label=%s score=%d)",
                              strategy.name, self._health.last_label, self._health.last_score)
                 continue
 
-            meta = signal.metadata or {}
             sl_p = meta.get("stop_loss")
             tp_p = meta.get("take_profit")
-            if sl_p is None or tp_p is None or sl_p <= 0 or tp_p <= 0:
-                logger.warning("[%s] BUY missing/invalid SL/TP — skipping", strategy.name)
+            if sl_p is None or tp_p is None:
+                logger.warning("[%s] BUY missing SL/TP — skipping", strategy.name)
+                continue
+            # For shorts: SL is above entry (sl_p > price) — skip positivity check
+            if ps == "LONG" and (sl_p <= 0 or tp_p <= 0 or sl_p >= price or tp_p <= price):
+                logger.warning("[%s] LONG SL/TP invalid (sl=%.2f tp=%.2f price=%.2f)",
+                               strategy.name, sl_p, tp_p, price)
+                continue
+            if ps == "SHORT" and (sl_p <= price or tp_p >= price):
+                logger.warning("[%s] SHORT SL/TP invalid (sl=%.2f tp=%.2f price=%.2f)",
+                               strategy.name, sl_p, tp_p, price)
                 continue
 
             logger.info("[%s] BUY: %s @ %.2f  SL=%.2f  TP=%.2f",
@@ -540,13 +556,17 @@ class TradingBot:
                 logger.warning("Computed amount=0 for %s — skipping", sym)
                 return
 
+            position_side = (signal.metadata or {}).get("position_side", "LONG").upper()
+            order_side    = "buy" if position_side == "LONG" else "sell"
             try:
                 order = await self.connector.create_order(
-                    sym, "buy", amount, tp=tp_p, sl=sl_p
+                    sym, order_side, amount, tp=tp_p, sl=sl_p,
+                    position_side=position_side,
                 )
                 fill_price = order.price or price
                 pos = Position(
-                    symbol=sym, side="long",
+                    symbol=sym,
+                    side="long" if position_side == "LONG" else "short",
                     entry_price=fill_price, amount=amount,
                     stop_loss=sl_p, take_profit=tp_p,
                 )
@@ -584,15 +604,23 @@ class TradingBot:
 
     async def _execute_sell_early(self, pos_key: str, price: float,
                                    reason: str, strategy_name: str):
-        """Market-sell to close a long position on a strategy SELL signal."""
+        """Close an open position (long or short) on a strategy exit signal."""
         pos = self._positions.get(pos_key)
         if not pos:
             return
         sym = pos_key.split("::")[0]
         try:
-            order = await self.connector.create_order(sym, "sell", pos.amount)
+            is_short = getattr(pos, "side", "long") == "short"
+            close_side = "buy" if is_short else "sell"
+            pos_side = "SHORT" if is_short else "LONG"
+            order = await self.connector.create_order(
+                sym, close_side, pos.amount, position_side=pos_side
+            )
             exit_price = order.price or price
-            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+            if is_short:
+                pnl_pct = (pos.entry_price - exit_price) / pos.entry_price * 100
+            else:
+                pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
             self._positions.pop(pos_key, None)
             self._save_positions()
             logger.info(

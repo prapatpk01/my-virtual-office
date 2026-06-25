@@ -1,12 +1,12 @@
 """
-Backtest: run all 3 strategies on historical BTC/USDT data.
+Backtest: run SwingReversalPro (Long + Short) on historical futures data.
 No real orders — simulates entry/exit from signals + SL/TP on bar high/low.
 
 Usage (from app/ directory):
     python backtest.py
     python backtest.py --days 14
     python backtest.py --symbol BTC/USDT --exchange binance --days 30
-    python backtest.py --amount 200 --fee 0.0008
+    python backtest.py --amount 200 --fee 0.0005
 
 Output: per-strategy breakdown + overall summary (trades, win rate, PnL, drawdown).
 """
@@ -20,7 +20,7 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(__file__))
 
 from trading.connectors.base import OHLCV, to_heikin_ashi
-from trading.strategies import SpotMaster1H, SmartGridHybrid, SwingMaster30m
+from trading.strategies import SwingReversalPro
 from trading.strategies.base import SignalType
 
 
@@ -45,16 +45,18 @@ async def _fetch(exchange_id: str, symbol: str, tf: str, limit: int) -> list[OHL
 # ── Trade record ──────────────────────────────────────────────────────────────
 
 class Trade:
-    __slots__ = ("strategy", "entry_ts", "entry_price",
-                 "sl", "tp", "amount_usdt",
+    __slots__ = ("strategy", "direction", "entry_ts", "entry_price",
+                 "sl", "tp", "tp1", "amount_usdt",
                  "exit_ts", "exit_price", "exit_reason", "pnl_usdt")
 
-    def __init__(self, strategy, entry_ts, entry_price, sl, tp, amount_usdt):
+    def __init__(self, strategy, direction, entry_ts, entry_price, sl, tp, tp1, amount_usdt):
         self.strategy    = strategy
+        self.direction   = direction   # "long" | "short"
         self.entry_ts    = entry_ts
         self.entry_price = entry_price
         self.sl          = sl
         self.tp          = tp
+        self.tp1         = tp1         # TP1 = partial exit at 0.8R
         self.amount_usdt = amount_usdt
         self.exit_ts = self.exit_price = self.exit_reason = self.pnl_usdt = None
 
@@ -62,8 +64,11 @@ class Trade:
         self.exit_ts     = ts
         self.exit_price  = price
         self.exit_reason = reason
-        raw_pnl          = self.amount_usdt * (price - self.entry_price) / self.entry_price
-        self.pnl_usdt    = raw_pnl - fee_pct * self.amount_usdt * 2   # entry + exit fee
+        if self.direction == "short":
+            raw_pnl = self.amount_usdt * (self.entry_price - price) / self.entry_price
+        else:
+            raw_pnl = self.amount_usdt * (price - self.entry_price) / self.entry_price
+        self.pnl_usdt = raw_pnl - fee_pct * self.amount_usdt * 2
 
 
 # ── Core backtest ─────────────────────────────────────────────────────────────
@@ -73,130 +78,133 @@ async def run_backtest(exchange_id: str, symbol: str, days: int,
 
     print(f"\n{'='*62}")
     print(f"  Backtest  {symbol}  |  {exchange_id.upper()}  |  {days} days")
-    print(f"  Amount/trade: ${amount_usdt:.0f}  |  Fee: {fee_pct*100:.2f}% per side")
+    print(f"  Amount/trade: ${amount_usdt:.0f}  |  Fee: {fee_pct*100:.3f}% per side")
+    print(f"  Strategies: SwingReversalPro_L + SwingReversalPro_S")
     print(f"{'='*62}\n")
 
-    # Warmup constants (bars needed before eval starts)
-    WU_30M = 60   # SmartGrid / SwingMaster
-    WU_1H  = 50   # SpotMaster1H internal indicators
-    WU_4H  = 50   # 4H regime
-    WU_1D  = 55   # 1D macro
+    # Warmup bars needed before eval starts
+    WU_15M = 60
+    WU_1H  = 30
+    WU_4H  = 20
 
-    # Bars to fetch (warmup + eval window + buffer)
-    n30m = WU_30M + days * 48 + 20
+    n15m = WU_15M + days * 96 + 20
     n1h  = WU_1H  + days * 24 + 10
     n4h  = WU_4H  + days * 6  + 10
-    n1d  = max(WU_1D + 5, 70)          # always 70 days of daily bars
 
     print("Fetching historical data ...")
     try:
-        raw_30m, raw_1h, raw_4h, raw_1d = await asyncio.gather(
-            _fetch(exchange_id, symbol, "30m", n30m),
+        raw_15m, raw_1h, raw_4h = await asyncio.gather(
+            _fetch(exchange_id, symbol, "15m", n15m),
             _fetch(exchange_id, symbol, "1h",  n1h),
             _fetch(exchange_id, symbol, "4h",  n4h),
-            _fetch(exchange_id, symbol, "1d",  n1d),
         )
     except Exception as exc:
         print(f"ERROR fetching data: {exc}")
         return
 
-    ha_30m = to_heikin_ashi(raw_30m)
+    ha_15m = to_heikin_ashi(raw_15m)
     ha_1h  = to_heikin_ashi(raw_1h)
     ha_4h  = to_heikin_ashi(raw_4h)
-    ha_1d  = to_heikin_ashi(raw_1d)
 
-    print(f"  30m: {len(ha_30m)} bars | 1H: {len(ha_1h)} bars | "
-          f"4H: {len(ha_4h)} bars | 1D: {len(ha_1d)} bars\n")
+    print(f"  15m: {len(ha_15m)} bars | 1H: {len(ha_1h)} bars | "
+          f"4H: {len(ha_4h)} bars\n")
 
-    # Build strategies (fresh instances = clean state)
-    spot_p  = {"sl_atr": 1.5, "rr": 2.0, "adx_thresh": 18.0, "health_thresh": 70.0}
-    grid_p  = {"sl_atr": 1.8, "health_thresh": 70.0, "adx_swing": 18.0,
-                "adx_breakout": 28.0, "adx_grid_kill": 22.0,
-                "max_grid_levels": 5, "grid_step_atr": 0.8}
-    swing_p = {"sl_atr": 1.8, "adx_thresh": 18.0,
-                "health_thresh": 70.0, "allow_short": False}
+    # Default SwingReversalPro params
+    params = {
+        "risk_pct": 0.01, "l1_min_score": 5, "l2_min_pass": 5,
+        "sl_atr_min": 1.0, "adx_4h_max": 35.0, "adx_no_trade": 15.0,
+        "atr_min_ratio": 0.8, "mtf_bias_limit": 50.0,
+    }
 
     strategies = [
-        SpotMaster1H(symbol, params=spot_p),
-        SmartGridHybrid(symbol, params={**grid_p, "grid_slot": 0}),
-        SmartGridHybrid(symbol, params={**grid_p, "grid_slot": 1}),
-        SmartGridHybrid(symbol, params={**grid_p, "grid_slot": 2}),
-        SwingMaster30m(symbol, params=swing_p),
+        SwingReversalPro(symbol, params={**params, "direction": "long"}),
+        SwingReversalPro(symbol, params={**params, "direction": "short"}),
     ]
 
-    # Evaluation window: last `days` × 48 bars (or as many as available after warmup)
-    eval_start = max(WU_30M, len(ha_30m) - days * 48)
+    eval_start = max(WU_15M, len(ha_15m) - days * 96)
 
-    open_pos: dict[str, Trade] = {}   # strategy_name → Trade
+    open_pos: dict[str, Trade] = {}
     closed:   list[Trade]      = []
 
     print(f"Running {len(strategies)} strategies — "
-          f"{len(ha_30m) - eval_start} 30m bars in eval window ...\n")
+          f"{len(ha_15m) - eval_start} 15m bars in eval window ...\n")
 
-    for i in range(WU_30M, len(ha_30m)):
-        bar    = ha_30m[i]
-        ts     = bar.timestamp
-        cp     = float(bar.close)
-        hi     = float(bar.high)
-        lo     = float(bar.low)
+    for i in range(WU_15M, len(ha_15m)):
+        bar = ha_15m[i]
+        ts  = bar.timestamp
+        cp  = float(bar.close)
+        hi  = float(bar.high)
+        lo  = float(bar.low)
 
-        # ── Build MTF slices up to current timestamp ──────────────────────
-        c30m = ha_30m[:i + 1]
+        # Build MTF slices up to current timestamp
+        c15m = ha_15m[:i + 1]
         c1h  = [c for c in ha_1h if c.timestamp <= ts]
         c4h  = [c for c in ha_4h if c.timestamp <= ts]
-        c1d  = [c for c in ha_1d if c.timestamp <= ts]
-        mtf  = {"30m": c30m, "4h": c4h, "1d": c1d}
+        mtf  = {"15m": c15m, "1h": c1h, "4h": c4h, "health_score": 75}
 
-        # ── Check SL/TP on open positions (intra-bar, bar's high/low) ────
+        # Check SL/TP on open positions (intra-bar)
         for name in list(open_pos):
             pos = open_pos[name]
-            if lo <= pos.sl:
-                pos.close(ts, pos.sl, "SL", fee_pct)
-                closed.append(pos)
-                del open_pos[name]
-            elif hi >= pos.tp:
-                pos.close(ts, pos.tp, "TP", fee_pct)
-                closed.append(pos)
-                del open_pos[name]
+            if pos.direction == "long":
+                if lo <= pos.sl:
+                    pos.close(ts, pos.sl, "SL", fee_pct)
+                    closed.append(pos)
+                    del open_pos[name]
+                elif pos.tp1 and hi >= pos.tp1 and pos.exit_reason is None:
+                    # TP1 hit — move SL to breakeven, continue to TP2
+                    pos.sl = pos.entry_price
+                    pos.tp1 = None   # don't re-trigger
+                elif hi >= pos.tp:
+                    pos.close(ts, pos.tp, "TP", fee_pct)
+                    closed.append(pos)
+                    del open_pos[name]
+            else:  # short
+                if hi >= pos.sl:
+                    pos.close(ts, pos.sl, "SL", fee_pct)
+                    closed.append(pos)
+                    del open_pos[name]
+                elif pos.tp1 and lo <= pos.tp1 and pos.exit_reason is None:
+                    pos.sl = pos.entry_price
+                    pos.tp1 = None
+                elif lo <= pos.tp:
+                    pos.close(ts, pos.tp, "TP", fee_pct)
+                    closed.append(pos)
+                    del open_pos[name]
 
-        # ── Only generate signals in the eval window ──────────────────────
         if i < eval_start:
             continue
 
-        # Skip if not enough 4H / 1D bars for reliable signals
-        if len(c4h) < WU_4H or len(c1d) < WU_1D:
+        if len(c1h) < WU_1H or len(c4h) < WU_4H:
             continue
 
         for strat in strategies:
             name = strat.name
-            # SpotMaster1H uses 1H candles; others use 30m
-            primary = c1h if isinstance(strat, SpotMaster1H) else c30m
-            if not primary:
-                continue
+            sig  = await strat.analyze(c15m, cp, mtf_candles=mtf)
+            meta = sig.metadata or {}
+            action = meta.get("action", "")
+            direction = "long" if strat.direction == "long" else "short"
 
-            sig = await strat.analyze(primary, cp, mtf)
-
-            if sig.type == SignalType.BUY and name not in open_pos:
-                sl = sig.metadata.get("stop_loss")  if sig.metadata else None
-                tp = sig.metadata.get("take_profit") if sig.metadata else None
+            if sig.type == SignalType.BUY and action == "open" and name not in open_pos:
+                sl  = meta.get("stop_loss")
+                tp  = meta.get("take_profit")
+                tp1 = meta.get("tp1")
                 if not sl or math.isnan(sl) or sl <= 0:
-                    sl = cp * 0.97
+                    sl = cp * 0.97 if direction == "long" else cp * 1.03
                 if not tp or math.isnan(tp) or tp <= 0:
-                    tp = cp * 1.04
-                open_pos[name] = Trade(name, ts, cp, sl, tp, amount_usdt)
+                    tp = cp * 1.015 if direction == "long" else cp * 0.985
+                open_pos[name] = Trade(name, direction, ts, cp, sl, tp, tp1, amount_usdt)
 
-            elif sig.type == SignalType.SELL and name in open_pos:
+            elif sig.type == SignalType.SELL and action == "close" and name in open_pos:
                 pos = open_pos.pop(name)
                 pos.close(ts, cp, "Signal", fee_pct)
                 closed.append(pos)
 
-    # Close any positions still open at end of data (mark-to-market)
-    last_bar = ha_30m[-1]
+    # Close any still-open positions at end of data (mark-to-market)
+    last_bar = ha_15m[-1]
     for name, pos in open_pos.items():
         pos.close(last_bar.timestamp, float(last_bar.close), "EOT", fee_pct)
         closed.append(pos)
 
-    # ── Report ────────────────────────────────────────────────────────────────
     _print_report(closed, strategies, amount_usdt)
 
 
@@ -214,7 +222,8 @@ def _print_report(closed: list[Trade], strategies, amount_usdt: float) -> None:
         by_strat[t.strategy].append(t)
 
     total_pnl = 0.0
-    for name in [s.name for s in strategies]:
+    for strat in strategies:
+        name   = strat.name
         trades = by_strat.get(name, [])
         if not trades:
             print(f"\n  [{name}]  — no trades")
@@ -227,7 +236,7 @@ def _print_report(closed: list[Trade], strategies, amount_usdt: float) -> None:
         avg    = pnl / len(trades)
         exits  = {r: sum(1 for t in trades if t.exit_reason == r)
                   for r in ("SL", "TP", "Signal", "EOT")}
-        print(f"\n  [{name}]")
+        print(f"\n  [{name}]  ({strat.direction.upper()})")
         print(f"    Trades   : {len(trades)}"
               f"  (W:{len(wins)} L:{len(losses)})  WR: {wr:.1f}%")
         print(f"    PnL      : ${pnl:+.2f}  avg ${avg:+.2f}/trade")
@@ -236,7 +245,7 @@ def _print_report(closed: list[Trade], strategies, amount_usdt: float) -> None:
 
     # Overall equity curve + max drawdown
     sorted_trades = sorted(closed, key=lambda t: t.exit_ts or 0)
-    equity = float(amount_usdt * len([s for s in by_strat]))
+    equity = float(amount_usdt * len(strategies))
     peak   = equity
     max_dd = 0.0
     for t in sorted_trades:
@@ -275,7 +284,7 @@ def _print_report(closed: list[Trade], strategies, amount_usdt: float) -> None:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _parse() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="7-day strategy backtest")
+    p = argparse.ArgumentParser(description="SwingReversalPro backtest")
     p.add_argument("--symbol",   default="BTC/USDT",
                    help="Trading pair (default: BTC/USDT)")
     p.add_argument("--exchange", default="okx",
@@ -284,8 +293,8 @@ def _parse() -> argparse.Namespace:
                    help="Backtest window in days (default: 7)")
     p.add_argument("--amount",   type=float, default=100.0,
                    help="USDT per trade (default: 100)")
-    p.add_argument("--fee",      type=float, default=0.001,
-                   help="Taker fee per side, e.g. 0.001 = 0.1%% (default: 0.001)")
+    p.add_argument("--fee",      type=float, default=0.0005,
+                   help="Taker fee per side, e.g. 0.0005 = 0.05%% futures (default: 0.0005)")
     return p.parse_args()
 
 

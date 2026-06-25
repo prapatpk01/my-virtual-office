@@ -86,40 +86,27 @@ def build_config() -> dict:
         "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
         "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),
         "paper":           _env_bool("PAPER_TRADING", False),
-        "leverage":        _env_int("LEVERAGE", 1),
+        "leverage":        _env_int("LEVERAGE", 10),
         "symbols":         _env_list("SYMBOLS", "BTC/USDT"),
-        "candle_tf":       os.environ.get("CANDLE_TF", "1h"),
-        "candle_limit":    _env_int("CANDLE_LIMIT", 300),
+        "candle_tf":       os.environ.get("CANDLE_TF", "15m"),
+        "candle_limit":    _env_int("CANDLE_LIMIT", 400),
         "interval":        _env_int("INTERVAL_SECONDS", 60),
         "trade_amount_usdt": _env_float("TRADE_AMOUNT_USDT", 100.0),
-        "max_positions":   _env_int("MAX_POSITIONS", 5),
-        "max_drawdown":    _env_float("MAX_DRAWDOWN_PCT", 0.30),
-        "risk_per_trade":  _env_float("RISK_PER_TRADE", 0.02),
+        "max_positions":   _env_int("MAX_POSITIONS", 4),
+        "max_drawdown":    _env_float("MAX_DRAWDOWN_PCT", 0.20),
+        "risk_per_trade":  _env_float("RISK_PER_TRADE", 0.01),
         "strategies": {
-            "spot_master":       _env_bool("STRATEGY_SPOT_MASTER",    True),
-            "smart_grid_hybrid": _env_bool("STRATEGY_SMART_GRID",     True),
-            "swing_master_30m":  _env_bool("STRATEGY_SWING_MASTER",   True),
+            "swing_reversal_pro": _env_bool("STRATEGY_SWING_REVERSAL", True),
         },
-        "spot_master_params": {
-            "sl_atr":        _env_float("SM_SL",     1.5),
-            "rr":            _env_float("SM_RR",     2.0),
-            "adx_thresh":    _env_float("SM_ADX",   18.0),
-            "health_thresh": _env_float("SM_HEALTH", 70.0),
-        },
-        "smart_grid_params": {
-            "sl_atr":          _env_float("SG_SL",        1.8),
-            "health_thresh":   _env_float("SG_HEALTH",   70.0),
-            "adx_swing":       _env_float("SG_ADX_SW",   18.0),
-            "adx_breakout":    _env_float("SG_ADX_BO",   28.0),
-            "adx_grid_kill":   _env_float("SG_ADX_KILL", 22.0),
-            "max_grid_levels": _env_int("SG_GRID_LVLS",    5),
-            "grid_step_atr":   _env_float("SG_STEP",       0.8),
-        },
-        "swing_master_params": {
-            "sl_atr":        _env_float("SW_SL",        1.8),
-            "adx_thresh":    _env_float("SW_ADX",      18.0),
-            "health_thresh": _env_float("SW_HEALTH",   70.0),
-            "allow_short":   _env_bool("SW_SHORT",     False),
+        "swing_reversal_params": {
+            "risk_pct":       _env_float("SR_RISK",      0.01),
+            "l1_min_score":   _env_int("SR_L1",            5),
+            "l2_min_pass":    _env_int("SR_L2",            5),
+            "sl_atr_min":     _env_float("SR_SL",         1.0),
+            "adx_4h_max":     _env_float("SR_ADX4H",     35.0),
+            "adx_no_trade":   _env_float("SR_ADX_MIN",   15.0),
+            "atr_min_ratio":  _env_float("SR_ATR_RATIO",  0.8),
+            "mtf_bias_limit": _env_float("SR_MTF_LIMIT", 50.0),
         },
         "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
@@ -132,20 +119,14 @@ def build_config() -> dict:
 
 def _make_strategies(symbols: list, flags: dict, cfg: dict,
                      connector=None) -> list:
-    from trading.strategies.spot_master import SpotMaster1H
-    from trading.strategies.smart_grid_hybrid import SmartGridHybrid
-    from trading.strategies.swing_master_30m import SwingMaster30m
+    from trading.strategies.swing_reversal_pro import SwingReversalPro
 
     strategies = []
+    p = cfg["swing_reversal_params"]
     for sym in symbols:
-        if flags.get("spot_master"):
-            strategies.append(SpotMaster1H(sym, params=cfg["spot_master_params"]))
-        if flags.get("smart_grid_hybrid"):
-            grid_base = cfg["smart_grid_params"]
-            for slot in range(3):
-                strategies.append(SmartGridHybrid(sym, params={**grid_base, "grid_slot": slot}))
-        if flags.get("swing_master_30m"):
-            strategies.append(SwingMaster30m(sym, params=cfg["swing_master_params"]))
+        if flags.get("swing_reversal_pro"):
+            strategies.append(SwingReversalPro(sym, params={**p, "direction": "long"}))
+            strategies.append(SwingReversalPro(sym, params={**p, "direction": "short"}))
     return strategies
 
 
