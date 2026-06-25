@@ -466,6 +466,29 @@ class TradingBot:
             logger.debug("[MTF] %s 4H not bullish — skipping", sym)
             return
 
+        # ── Real-time SL check (runs every tick / 60 s, no candle needed) ──
+        # Checks current ticker price vs stored SL — catches sudden moves that
+        # haven't yet formed a full candle body (fires up to 14 min before candle close).
+        for pos_key, pos in list(self._positions.items()):
+            if pos_key.split("::")[0] != sym:
+                continue
+            sl = getattr(pos, "stop_loss", None)
+            if sl is None:
+                continue
+            is_short = getattr(pos, "side", "long") == "short"
+            sl_hit = (price <= sl) if not is_short else (price >= sl)
+            if sl_hit:
+                logger.warning("[RT-SL] %s hit SL=%.4f price=%.4f — closing immediately",
+                               pos_key, sl, price)
+                if self.telegram and self._positions:
+                    self.telegram.send(
+                        f"🛑 SL Hit — {sym}\n"
+                        f"Price {price:.2f} {'≤' if not is_short else '≥'} SL {sl:.2f}\n"
+                        f"→ ปิด position ทันที (real-time check)"
+                    )
+                await self._execute_sell_early(pos_key, price, "RT_SL_hit",
+                                               pos_key.split("::")[-1])
+
         for strategy in [s for s in self.strategies if s.symbol == sym]:
             pos_key = f"{sym}::{strategy.name}"
             try:
