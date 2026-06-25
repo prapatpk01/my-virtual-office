@@ -272,21 +272,34 @@ class TradingBot:
             logger.error("[%s] analyze error on %s: %s", strategy.name, sym, e)
             return None
 
-        # Pattern gate (Layer 3): require at least 1 of 8 patterns to confirm direction.
-        if signal.type != SignalType.HOLD and self._pattern_gate_enabled:
-            side = "long" if signal.type == SignalType.BUY else "short"
-            passes, pat_names = pattern_gate_passes(candles, side)
-            if passes:
-                logger.info("[%s] %s %s pattern gate ✓ [%s]",
-                            strategy.name, sym, side, pat_names)
+        # ── Layer 1 result ────────────────────────────────────────────────────
+        is_hold_l1 = signal.type == SignalType.HOLD
+        side_hint  = "long" if signal.type == SignalType.BUY else ("short" if signal.type == SignalType.SELL else "?")
+        sj         = (signal.metadata or {}).get("sj_score")
+        l1_label   = "✗" if is_hold_l1 else (f"✓(sj={sj:.0f})" if isinstance(sj, (int, float)) else "✓")
+
+        if is_hold_l1:
+            brief = signal.reason.split(" | ")[0] if " | " in signal.reason else signal.reason[:80]
+            logger.info("[GATE] %s %s → L1:✗ | L2:— | L3:— | %s", strategy.name, sym, brief)
+            l3_label = "—"
+        else:
+            # ── Layer 3 — Pattern gate (checked before L2 so fast-fail avoids health fetch)
+            l3_label = "—"
+            if self._pattern_gate_enabled:
+                passes, pat_names = pattern_gate_passes(candles, side_hint)
+                if passes:
+                    l3_label = f"✓({pat_names})"
+                else:
+                    l3_label = "✗"
+                    logger.info("[GATE] %s %s %s → L1:%s | L2:— | L3:✗ | waiting: pattern gate",
+                                strategy.name, sym, side_hint.upper(), l1_label)
+                    signal = Signal(
+                        type=SignalType.HOLD, symbol=signal.symbol, price=signal.price,
+                        amount=signal.amount, reason="pattern gate: no confirming candle pattern",
+                        confidence=0.0, metadata=signal.metadata,
+                    )
             else:
-                logger.info("[%s] %s %s pattern gate blocked — no confirming pattern",
-                            strategy.name, sym, side)
-                signal = Signal(
-                    type=SignalType.HOLD, symbol=signal.symbol, price=signal.price,
-                    amount=signal.amount, reason="pattern gate: no confirming candle pattern",
-                    confidence=0.0, metadata=signal.metadata,
-                )
+                l3_label = "—(off)"
 
         sig_dict = {
             "strategy":   strategy.name,
@@ -297,6 +310,8 @@ class TradingBot:
             "reason":     signal.reason,
             "ts":         int(time.time() * 1000),
             "metadata":   signal.metadata,
+            "_l1_label":  l1_label,
+            "_l3_label":  l3_label,
         }
 
         if signal.type == SignalType.HOLD:
@@ -386,22 +401,30 @@ class TradingBot:
             logger.debug("[%s] %s %s blocked: %s", strategy_name, label_side, sym, reason)
             return
 
-        # Optional health-score entry gate (TCI_HEALTH_ENTRY_MIN > 0). Require a
-        # strong multi-TF health reading for the entry side; fail-open on error so
-        # a transient candle-fetch failure never halts trading.
+        # ── Layer 2 — Health-score entry gate (TCI_HEALTH_ENTRY_MIN > 0) ──────
+        l1_label  = sig_dict.get("_l1_label", "✓")
+        l3_label  = sig_dict.get("_l3_label", "—")
         gate_this = self._health_entry_min > 0 and (
             not self._health_entry_syms or sym in self._health_entry_syms)
+        l2_label  = "—(off)"
         if gate_this:
             try:
                 hr = await self._entry_health.check(sym, side, entry_price=0.0, oneR=0.0, current_tp2=0.0)
                 if hr.score < self._health_entry_min:
-                    logger.info("[%s] %s %s entry gated: health %.0f < %.0f",
-                                strategy_name, label_side, sym, hr.score, self._health_entry_min)
+                    l2_label = f"✗(health={hr.score:.0f}<{self._health_entry_min:.0f})"
+                    logger.info("[GATE] %s %s %s → L1:%s | L2:%s | L3:%s | waiting: health>%.0f",
+                                strategy_name, sym, side.upper(),
+                                l1_label, l2_label, l3_label, self._health_entry_min)
                     return
-                logger.info("[%s] %s %s health gate passed: %.0f", strategy_name, label_side, sym, hr.score)
+                l2_label = f"✓(health={hr.score:.0f})"
             except Exception as e:
+                l2_label = "?(err)"
                 logger.warning("[%s] %s health gate eval failed — allowing entry: %s",
                                strategy_name, sym, e)
+
+        # All layers passed — log entry summary then execute
+        logger.info("[GATE] %s %s %s → L1:%s | L2:%s | L3:%s | → ENTRY ✓",
+                    strategy_name, sym, side.upper(), l1_label, l2_label, l3_label)
 
         self._sig.lock_strategy(sym, slot, signal.type.value)
         self._sig.record_signal(sym, signal.type.value, signal.price,
