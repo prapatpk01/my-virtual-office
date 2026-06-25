@@ -252,10 +252,53 @@ def _vol_not_declining(volma: list, n: int, bars: int = 3) -> bool:
         return True
     return v0 >= vb * 0.85   # allow up to -15% drift
 
+def _momentum_reversal(op: list, cl: list, vol: list, rsi: list,
+                       n: int, atr14: float, volma20: float,
+                       direction: str) -> str | None:
+    """
+    Detect genuine momentum flip for 15m TF — close-confirmed body + volume.
+    Designed to react within 1-2 bars (15-30 min).
+    Fires even during spike_guard (real reversal ≠ wick spike).
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Strategy
-# ─────────────────────────────────────────────────────────────────────────────
+    Conditions (any one suffices):
+      A) Single strong opposing candle: body ≥ 0.8×ATR  AND  vol ≥ 1.5×MA20
+      B) Current close breaks 2-bar move ≥ 1.2×ATR (fast sustained pressure)
+      C) Single bar body ≥ 1.5×ATR (extreme candle, no vol required)
+    RSI momentum confirmation applied to A & B (must be moving against position).
+    """
+    if n < 2 or atr14 <= 0 or math.isnan(volma20) or volma20 <= 0:
+        return None
+
+    lng       = direction == "long"
+    body      = abs(cl[n] - op[n])
+    vol_ratio = vol[n] / volma20
+    rsi_v     = float(rsi[n]) if n < len(rsi) and not math.isnan(float(rsi[n])) else 50.0
+    rsi_ok    = (rsi_v < 50) if lng else (rsi_v > 50)  # RSI confirms opposing direction
+
+    # ── A: strong opposing bar + volume (fires in 1 bar / 15 min) ────────
+    if lng and cl[n] < op[n] and body >= atr14 * 0.8 and vol_ratio >= 1.5 and rsi_ok:
+        return f"MomRev↓ body={body:.1f}>{atr14*0.8:.1f}ATR vol×{vol_ratio:.1f}"
+    if not lng and cl[n] > op[n] and body >= atr14 * 0.8 and vol_ratio >= 1.5 and rsi_ok:
+        return f"MomRev↑ body={body:.1f}>{atr14*0.8:.1f}ATR vol×{vol_ratio:.1f}"
+
+    # ── B: fast 2-bar sustained move (fires in 2 bars / 30 min) ─────────
+    drop_2bar = cl[n - 2] - cl[n]
+    rise_2bar = cl[n] - cl[n - 2]
+    if lng  and drop_2bar >= atr14 * 1.2 and rsi_ok:
+        return f"MomRev↓ 2-bar {drop_2bar:.1f}>1.2×ATR"
+    if not lng and rise_2bar >= atr14 * 1.2 and rsi_ok:
+        return f"MomRev↑ 2-bar {rise_2bar:.1f}>1.2×ATR"
+
+    # ── C: extreme single bar (no vol needed — size speaks for itself) ───
+    if lng and cl[n] < op[n] and body >= atr14 * 1.5:
+        return f"MomRev↓ extreme body={body:.1f}>1.5×ATR"
+    if not lng and cl[n] > op[n] and body >= atr14 * 1.5:
+        return f"MomRev↑ extreme body={body:.1f}>1.5×ATR"
+
+    return None
+
+
+
 
 class SwingReversalPro(BaseStrategy):
     """
@@ -390,7 +433,8 @@ class SwingReversalPro(BaseStrategy):
         spike_guard = bool(mtf.get("spike_guard", False))
         if self._in_position:
             exit_reason = self._early_exit(
-                cp, cl, hi, lo, n, rsi14, list(rsi14_arr),
+                cp, cl, hi, lo, op, vol, n, atr14, volma20,
+                rsi14, list(rsi14_arr),
                 health_score, ema20_1h, n1h, spike_guard)
             if exit_reason:
                 self._in_position = False
@@ -626,17 +670,25 @@ class SwingReversalPro(BaseStrategy):
 
     # ── Early exit ────────────────────────────────────────────────────────────
 
-    def _early_exit(self, cp, cl, hi, lo, n, rsi14, rsi14_arr,
+    def _early_exit(self, cp, cl, hi, lo, op, vol, n, atr14, volma20,
+                    rsi14, rsi14_arr,
                     health_score, ema20_1h, n1h,
                     spike_guard: bool = False) -> str | None:
         lng = self.direction == "long"
 
-        # Health score emergency exit — always fires even during spike guard
+        # [1] Health score emergency — always fires, no override
         if health_score < 25:
             return f"health={health_score}<25"
 
-        # During V-spike guard: suppress technical exits so price can recover.
-        # A V-spike is a wick/stop-hunt move; closing here locks in the worst price.
+        # [2] Momentum reversal — body+volume confirmed, fires even during spike guard.
+        #     A real reversal has a large CLOSE-confirmed body; a V-spike only has a wick.
+        mom_rev = _momentum_reversal(op, cl, vol, rsi14_arr, n, atr14, volma20,
+                                     self.direction)
+        if mom_rev:
+            return mom_rev
+
+        # [3] During V-spike guard: suppress remaining technical exits (CHOCH/RSI/div)
+        #     so wick-stop-hunt moves don't force an exit at the worst price.
         if spike_guard:
             return None
 

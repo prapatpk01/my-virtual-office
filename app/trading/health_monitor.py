@@ -35,7 +35,7 @@ _SPIKE_TR_MULT      = 2.5   # TR > N×ATR14 on a single bar → v_spike
 _SPIKE_DROP_2B      = 2.0   # cumulative drop > N×ATR14 over 2 bars → cascade
 _SPIKE_DROP_3B      = 2.8   # cumulative drop > N×ATR14 over 3 bars → cascade
 _SPIKE_COOLDOWN_MS  = 30 * 60 * 1000   # 30-min cooldown after trigger
-_SPIKE_GUARD_MS     = 3 * 15 * 60 * 1000  # 45-min guard after v_spike (3 × 15m bars)
+_SPIKE_GUARD_MS     = 2 * 15 * 60 * 1000  # 30-min guard after v_spike (2 × 15m bars)
 
 
 class HealthMonitor:
@@ -229,7 +229,7 @@ class HealthMonitor:
                           f"TR={tr:.2f} > {_SPIKE_TR_MULT}×ATR({atr_v:.2f})")
                 self._spike_last_ms       = now_ms
                 self._spike_guard_until_ms = now_ms + _SPIKE_GUARD_MS  # 45-min guard
-                logger.warning("[Spike-C1] %s  guard=45min", reason)
+                logger.warning("[Spike-C1] %s  guard=30min", reason)
                 return {"detected": True, "type": "v_spike", "reason": reason}
 
         # ── C2: cascade drop — sustained multi-bar fall ──────────────────
