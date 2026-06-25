@@ -21,6 +21,7 @@ from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
 from .signal_state import SignalState
 from .position_health import PositionHealthMonitor, HealthResult
+from .patterns import pattern_gate_passes
 
 logger = logging.getLogger("trading_bot")
 
@@ -111,6 +112,15 @@ class TradingBot:
             s.strip() for s in os.getenv("TCI_HEALTH_ENTRY_SYMBOLS", "").split(",") if s.strip()
         }
         self._entry_health = PositionHealthMonitor(self.connector)
+
+        # Pattern gate (Layer 3) — TCI_PATTERN_GATE=1 to enable.
+        # Requires at least 1 of 8 candlestick/structure patterns to fire in the
+        # signal direction before opening a position. Improves PnL/DD ~39% in
+        # backtests (BTC+XAU Jan-May 2026: WR 53.4%→55.0%, MaxDD $50→$38).
+        self._pattern_gate_enabled = os.getenv("TCI_PATTERN_GATE", "0").lower() in ("1", "true", "yes")
+        if self._pattern_gate_enabled:
+            logger.info("[BOT] Pattern gate ENABLED (8-pattern Layer-3 confirmation)")
+
         logger.info("[BOT] futures=%s paper=%s interval=%ds SL=%.1f%% TP=%.1f%%",
                     self.futures_mode, self.paper, self.interval,
                     fixed_sl_pct * 100, fixed_tp_pct * 100)
@@ -260,6 +270,22 @@ class TradingBot:
         except Exception as e:
             logger.error("[%s] analyze error on %s: %s", strategy.name, sym, e)
             return None
+
+        # Pattern gate (Layer 3): require at least 1 of 8 patterns to confirm direction.
+        if signal.type != SignalType.HOLD and self._pattern_gate_enabled:
+            side = "long" if signal.type == SignalType.BUY else "short"
+            passes, pat_names = pattern_gate_passes(candles, side)
+            if passes:
+                logger.info("[%s] %s %s pattern gate ✓ [%s]",
+                            strategy.name, sym, side, pat_names)
+            else:
+                logger.info("[%s] %s %s pattern gate blocked — no confirming pattern",
+                            strategy.name, sym, side)
+                signal = Signal(
+                    type=SignalType.HOLD, symbol=signal.symbol, price=signal.price,
+                    amount=signal.amount, reason="pattern gate: no confirming candle pattern",
+                    confidence=0.0, metadata=signal.metadata,
+                )
 
         sig_dict = {
             "strategy":   strategy.name,
