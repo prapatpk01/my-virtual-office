@@ -253,12 +253,13 @@ class TradingBot:
                 logger.warning("Failed to fetch data for %s: %s", sym, e)
                 continue
 
-            # Fetch multi-TF candles for strategy layers
+            # Fetch multi-TF candles for strategy layers + health monitor
             mtf: dict = {}
             for tf, min_bars, limit in (
                 ("15m", 55, 400),   # SwingReversalPro entry TF
                 ("1h",  30, 200),   # SwingReversalPro context TF
-                ("4h",  20, 150),   # SwingReversalPro structure TF
+                ("4h",  20, 150),   # SwingReversalPro structure TF + HealthMonitor
+                ("1d",  30,  70),   # HealthMonitor 1D macro score
             ):
                 try:
                     cx = await self.connector.fetch_ohlcv(sym, timeframe=tf, limit=limit)

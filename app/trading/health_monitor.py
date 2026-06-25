@@ -27,7 +27,7 @@ from .strategies.base import BaseStrategy
 
 logger = logging.getLogger("health_monitor")
 
-_INTERVAL_MS  = 15 * 60 * 1000   # 15 minutes
+_INTERVAL_MS  = 3 * 60 * 1000    # 3 minutes (180 s)
 _DEFAULT_SCORE = 60               # returned when not enough data (neutral-safe)
 
 # Spike detection thresholds
