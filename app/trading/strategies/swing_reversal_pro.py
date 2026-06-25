@@ -387,10 +387,11 @@ class SwingReversalPro(BaseStrategy):
         mtf_bias, _ = self.compute_mtf_bias(c15m, {"1h": c1h, "4h": c4h})
 
         # ── Early exit (if in position) ───────────────────────────────────
+        spike_guard = bool(mtf.get("spike_guard", False))
         if self._in_position:
             exit_reason = self._early_exit(
                 cp, cl, hi, lo, n, rsi14, list(rsi14_arr),
-                health_score, ema20_1h, n1h)
+                health_score, ema20_1h, n1h, spike_guard)
             if exit_reason:
                 self._in_position = False
                 return Signal(
@@ -626,12 +627,18 @@ class SwingReversalPro(BaseStrategy):
     # ── Early exit ────────────────────────────────────────────────────────────
 
     def _early_exit(self, cp, cl, hi, lo, n, rsi14, rsi14_arr,
-                    health_score, ema20_1h, n1h) -> str | None:
+                    health_score, ema20_1h, n1h,
+                    spike_guard: bool = False) -> str | None:
         lng = self.direction == "long"
 
-        # Health score emergency exit
+        # Health score emergency exit — always fires even during spike guard
         if health_score < 25:
             return f"health={health_score}<25"
+
+        # During V-spike guard: suppress technical exits so price can recover.
+        # A V-spike is a wick/stop-hunt move; closing here locks in the worst price.
+        if spike_guard:
+            return None
 
         if lng:
             if not math.isnan(rsi14) and rsi14 > 75:

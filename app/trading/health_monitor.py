@@ -31,10 +31,11 @@ _INTERVAL_MS  = 3 * 60 * 1000    # 3 minutes (180 s)
 _DEFAULT_SCORE = 60               # returned when not enough data (neutral-safe)
 
 # Spike detection thresholds
-_SPIKE_TR_MULT      = 2.5   # TR > N×ATR14 on a single bar → spike
-_SPIKE_DROP_2B      = 2.0   # cumulative drop > N×ATR14 over 2 bars
-_SPIKE_DROP_3B      = 2.8   # cumulative drop > N×ATR14 over 3 bars
+_SPIKE_TR_MULT      = 2.5   # TR > N×ATR14 on a single bar → v_spike
+_SPIKE_DROP_2B      = 2.0   # cumulative drop > N×ATR14 over 2 bars → cascade
+_SPIKE_DROP_3B      = 2.8   # cumulative drop > N×ATR14 over 3 bars → cascade
 _SPIKE_COOLDOWN_MS  = 30 * 60 * 1000   # 30-min cooldown after trigger
+_SPIKE_GUARD_MS     = 3 * 15 * 60 * 1000  # 45-min guard after v_spike (3 × 15m bars)
 
 
 class HealthMonitor:
@@ -44,13 +45,19 @@ class HealthMonitor:
         self._weak_count  = 0
         self._last_ts_ms  = 0
         self._prev_action = "hold"
-        self._spike_last_ms = 0   # cooldown tracker for spike detector
+        self._spike_last_ms       = 0   # cooldown tracker for spike detector
+        self._spike_guard_until_ms = 0  # active guard window after v_spike
 
         self.last_score  = _DEFAULT_SCORE
         self.last_label  = "neutral"
         self.last_action = "hold"
 
     # ── Public ───────────────────────────────────────────────────────────────
+
+    @property
+    def spike_guard_active(self) -> bool:
+        """True for 45 min after a V-spike — strategies hold through the guard."""
+        return self._spike_guard_until_ms > 0
 
     def should_check(self, now_ms: int) -> bool:
         return (now_ms - self._last_ts_ms) >= _INTERVAL_MS
@@ -186,6 +193,11 @@ class HealthMonitor:
             {"detected": bool, "type": str, "reason": str}
         Cooldown: once triggered, silent for 30 minutes.
         """
+        # Expire spike guard if window has passed
+        if self._spike_guard_until_ms > 0 and now_ms > self._spike_guard_until_ms:
+            self._spike_guard_until_ms = 0
+            logger.info("[Spike] v_spike guard expired — normal exits resumed")
+
         # Cooldown guard — only enforced after the first trigger (_spike_last_ms > 0)
         if self._spike_last_ms > 0 and (now_ms - self._spike_last_ms) < _SPIKE_COOLDOWN_MS:
             return {"detected": False, "type": "", "reason": "cooldown"}
@@ -199,7 +211,9 @@ class HealthMonitor:
         if math.isnan(atr_v) or atr_v <= 0:
             return {"detected": False, "type": "", "reason": ""}
 
-        # ── C1: extreme True Range on last 2 bars ────────────────────────
+        # ── C1: V-spike — extreme True Range on last 2 bars ─────────────
+        # Single-candle flash spike (wick-only move, then reversal).
+        # ACTION: activate spike_guard (hold positions), do NOT close.
         for offset in (1, 2):
             if n <= offset:
                 continue
@@ -211,32 +225,35 @@ class HealthMonitor:
                 abs(float(bar.low)  - float(prev.close)),
             )
             if tr > _SPIKE_TR_MULT * atr_v:
-                reason = (f"TR spike bar[-{offset}] "
-                          f"{tr:.2f} > {_SPIKE_TR_MULT}×ATR({atr_v:.2f})")
-                self._spike_last_ms = now_ms
-                logger.warning("[Spike-C1] %s", reason)
-                return {"detected": True, "type": "spike", "reason": reason}
+                reason = (f"V-spike bar[-{offset}] "
+                          f"TR={tr:.2f} > {_SPIKE_TR_MULT}×ATR({atr_v:.2f})")
+                self._spike_last_ms       = now_ms
+                self._spike_guard_until_ms = now_ms + _SPIKE_GUARD_MS  # 45-min guard
+                logger.warning("[Spike-C1] %s  guard=45min", reason)
+                return {"detected": True, "type": "v_spike", "reason": reason}
 
-        # ── C2: rapid cumulative drop (2-bar and 3-bar) ──────────────────
+        # ── C2: cascade drop — sustained multi-bar fall ──────────────────
+        # Real directional move, not a wick.  ACTION: close positions.
         if n >= 3:
             drop_2b = float(c30m[-3].close) - float(c30m[-1].close)
             if drop_2b > _SPIKE_DROP_2B * atr_v:
-                reason = (f"Rapid drop 2-bar {drop_2b:.2f} "
+                reason = (f"Cascade 2-bar drop {drop_2b:.2f} "
                           f"> {_SPIKE_DROP_2B}×ATR({atr_v:.2f})")
                 self._spike_last_ms = now_ms
                 logger.warning("[Spike-C2] %s", reason)
-                return {"detected": True, "type": "spike", "reason": reason}
+                return {"detected": True, "type": "cascade", "reason": reason}
 
         if n >= 4:
             drop_3b = float(c30m[-4].close) - float(c30m[-1].close)
             if drop_3b > _SPIKE_DROP_3B * atr_v:
-                reason = (f"Rapid drop 3-bar {drop_3b:.2f} "
+                reason = (f"Cascade 3-bar drop {drop_3b:.2f} "
                           f"> {_SPIKE_DROP_3B}×ATR({atr_v:.2f})")
                 self._spike_last_ms = now_ms
                 logger.warning("[Spike-C2b] %s", reason)
-                return {"detected": True, "type": "spike", "reason": reason}
+                return {"detected": True, "type": "cascade", "reason": reason}
 
         # ── C3: whipsaw — ≥ 4 direction changes in last 6 bars ──────────
+        # Choppy indecision.  ACTION: block new entries, hold existing.
         if n >= 7:
             recent = [float(c.close) for c in c30m[-7:]]
             dir_changes = 0

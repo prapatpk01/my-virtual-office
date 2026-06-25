@@ -268,28 +268,53 @@ class TradingBot:
                 except Exception:
                     pass  # each TF optional — strategies degrade gracefully
 
-            # Pass health score into mtf so strategies can use it for early exit
+            # Pass health + spike guard into mtf so strategies can use them
             mtf["health_score"] = self._health.last_score
+            mtf["spike_guard"]  = self._health.spike_guard_active
 
             now_ms = int(time.time() * 1000)
 
-            # ── Spike / whipsaw guard (every tick, 30-min cooldown) ───────
+            # ── Spike / whipsaw detection (every tick, 30-min cooldown) ──
             c30m = mtf.get("15m") or candles
             sr   = self._health.check_spike(c30m, price, now_ms)
             if sr["detected"]:
-                spike_type = sr["type"]
+                spike_type = sr["type"]   # "v_spike" | "cascade" | "whipsaw"
                 reason     = sr["reason"]
                 logger.warning("[%s] %s | %s", spike_type.upper(), sym, reason)
-                if self._positions:
-                    if self.telegram:
-                        icon = "⚡" if spike_type == "spike" else "〰️"
-                        label = "V-Sharp / Spike" if spike_type == "spike" else "Whipsaw"
+
+                if spike_type == "v_spike":
+                    # Single-bar wick spike — price likely to recover.
+                    # Spike guard is already active (set in check_spike).
+                    # Do NOT close positions; let them ride through the spike.
+                    if self._positions and self.telegram:
                         self.telegram.send(
-                            f"{icon} {label} Alert — {sym}\n"
+                            f"⚡ V-Spike Alert — {sym}\n"
                             f"{reason}\n"
-                            f"→ ปิดทุก position ทันที"
+                            f"→ spike guard ON (45 min) — ถือ position ต่อ"
                         )
-                    await self._close_all_positions_health(price, f"{spike_type}: {reason}")
+
+                elif spike_type == "cascade":
+                    # Sustained multi-bar drop — real directional move.
+                    # Close all positions to limit damage.
+                    if self._positions:
+                        if self.telegram:
+                            self.telegram.send(
+                                f"📉 Cascade Drop — {sym}\n"
+                                f"{reason}\n"
+                                f"→ ปิดทุก position ทันที"
+                            )
+                        await self._close_all_positions_health(
+                            price, f"cascade: {reason}")
+
+                elif spike_type == "whipsaw":
+                    # Choppy reversals — block new entries (handled by
+                    # health label); do NOT close existing positions.
+                    if self._positions and self.telegram:
+                        self.telegram.send(
+                            f"〰️ Whipsaw — {sym}\n"
+                            f"{reason}\n"
+                            f"→ บล็อก entry ใหม่ ถือ position เดิม"
+                        )
 
             # ── Health monitor (every 15 min) ─────────────────────────────
             if self._health.should_check(now_ms) and mtf:
