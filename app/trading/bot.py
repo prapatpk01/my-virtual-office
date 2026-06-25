@@ -491,6 +491,13 @@ class TradingBot:
 
         for strategy in [s for s in self.strategies if s.symbol == sym]:
             pos_key = f"{sym}::{strategy.name}"
+
+            # Sync strategy's internal position state with bot's authoritative record.
+            # Needed when RT-SL / health-monitor closes a position outside the strategy's
+            # own exit path — prevents the strategy from staying "stuck" in position.
+            if hasattr(strategy, "_in_position"):
+                strategy._in_position = pos_key in self._positions
+
             try:
                 signal = await strategy.analyze(candles, price, mtf_candles=mtf_candles)
             except Exception as e:
