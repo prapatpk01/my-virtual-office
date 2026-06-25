@@ -320,6 +320,8 @@ class SwingReversalPro(BaseStrategy):
         self.sl_atr_mult     = float(self.params.get("sl_atr_mult",      1.5))
         self.tp_mult         = float(self.params.get("tp_mult",           2.0))
         self.adx_no_trade    = float(self.params.get("adx_no_trade",    10.0))
+        self.adx_must_rise   = bool(self.params.get("adx_must_rise",   False))
+        self.adx_rise_bars   = int(self.params.get("adx_rise_bars",        3))
         self.mtf_bias_limit  = float(self.params.get("mtf_bias_limit",  50.0))
         self.max_bars        = int(self.params.get("max_bars",            24))
         self.rsi_entry_long  = float(self.params.get("rsi_entry_long",   35.0))
@@ -379,10 +381,16 @@ class SwingReversalPro(BaseStrategy):
         volma20_arr = self.sma(vol, 20)
         volma20     = float(volma20_arr[n])
 
-        # Minimum momentum (very relaxed — 10, down from 15)
+        # Minimum momentum gate
         if not math.isnan(adx14) and adx14 < self.adx_no_trade:
             return Signal(_HOLD, self.symbol, cp, 0,
                           f"[{self.name}] ADX={adx14:.1f}<{self.adx_no_trade}")
+        # Rising ADX gate (optional)
+        if self.adx_must_rise and not math.isnan(adx14) and n >= self.adx_rise_bars:
+            adx_prev = float(adx_arr[n - self.adx_rise_bars])
+            if not math.isnan(adx_prev) and adx14 <= adx_prev:
+                return Signal(_HOLD, self.symbol, cp, 0,
+                              f"[{self.name}] ADX not rising ({adx14:.1f}<={adx_prev:.1f})")
 
         # ── 1H context ────────────────────────────────────────────────────
         n1h      = len(c1h) - 1

@@ -105,6 +105,8 @@ def build_config() -> dict:
             "sl_atr_mult":     _env_float("SR_SL",            1.5),  # SL = 1.5×ATR
             "tp_mult":         _env_float("SR_TP",            2.0),  # TP = 2.0×SL dist (1:2 R:R)
             "adx_no_trade":    _env_float("SR_ADX_MIN",      10.0),  # 15m ADX min threshold
+            "adx_must_rise":   _env_bool("SR_ADX_RISING",   False),  # require ADX rising over N bars
+            "adx_rise_bars":   _env_int("SR_ADX_RISE_BARS",     3),  # lookback for rising check
             "mtf_bias_limit":  _env_float("SR_MTF_LIMIT",    50.0),
             "max_bars":        _env_int("SR_MAXBARS",           48), # 12h max hold (48×15m bars)
             "rsi_entry_long":  _env_float("SR_RSI_LONG",      42.0), # Mode A RSI gate long
