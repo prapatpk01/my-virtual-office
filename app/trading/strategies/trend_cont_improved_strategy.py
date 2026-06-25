@@ -231,7 +231,8 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 # SJ Hybrid improves XAU +134% ($38→$89) while keeping BTC profitable (+$14 vs +$52).
 
 def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
-                             roc9: bool = False, vol_expansion: bool = False):
+                             roc9: bool = False, vol_expansion: bool = False,
+                             bos: bool = False):
     if sj_scoring:
         # SJ Hybrid: faster/smarter components from SJ Fast Entry research
         reg = {
@@ -303,6 +304,13 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                     desc="Bullish/bearish FVG (3-candle imbalance) formed in last 5 bars",
                 ),
             })
+        if bos:
+            reg["bos"] = dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["bos_bull"],
+                short=lambda c: c["bos_bear"],
+                desc="Break of Structure: 15m close exceeds N-bar swing high/low (bos_lookback param)",
+            )
         return reg
     # Classic 4-component registry (default)
     return {
@@ -363,14 +371,17 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     ef4, es4 = _ema(out["h4_close"], p["ema_fast"]), _ema(out["h4_close"], p["ema_slow"])
     macro_up, macro_dn = _htf_dir(ef4, es4, out["h4_close"], htf_mode, slope_bars, sep_guard, slope_pct)
 
-    # ── 4H Regime Mode: 2/3 score (slope + ADX + price side) ────────────────
-    # When htf_regime_4h=True, replaces EMA20/50 cross with a faster 3-component
-    # regime check. Fires when ≥2 of:
-    #   [1] EMA20(4H) slope: current EMA20 < EMA20 two bars ago (falling)
-    #   [2] ADX(4H) > htf_regime_adx_min (trend exists, filters sideways)
-    #   [3] h4_close < EMA20(4H) (price on bearish side of EMA20)
-    # Advantage: no EMA50 lag; price-side check responds within current bar.
-    if p.get("htf_regime_4h", False):
+    # ── 4H Regime Mode routing ────────────────────────────────────────────────
+    # htf_auto_regime=True: automatically selects regime by mode:
+    #   fast_mode=True  → 2/3 vote (slope + ADX + price side) — fast response
+    #   fast_mode=False → weighted ≥65 (slope40+ADX25+ATR15+ER20) — strict/quality
+    # Explicit flags (htf_regime_4h, htf_regime_4h_mode) still override when set.
+    _auto = p.get("htf_auto_regime", False)
+    _use_23score  = p.get("htf_regime_4h", False) or (_auto and fast_mode)
+    _use_weighted = (p.get("htf_regime_4h_mode") == "weighted") or (_auto and not fast_mode)
+
+    # 2/3 vote: fires when ≥2 of [slope | ADX>18 | price side of EMA20]
+    if _use_23score:
         _adx_len4  = int(p.get("htf_regime_adx_len", 14))
         _adx_min4  = float(p.get("htf_regime_adx_min", 18))
         adx4h_r    = _adx(
@@ -392,14 +403,9 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         macro_up = (score_up_r >= 2).fillna(False)
         macro_dn = (score_dn_r >= 2).fillna(False)
 
-    # ── 4H Regime Mode: Weighted Score (slope40 + ADX25 + ATR15 + ER20 → ≥70) ─
+    # Weighted score: slope40 + ADX25 + ATR15 + ER20 → ≥threshold (default 65)
     # Computed on ACTUAL 4H bars then forward-filled to 15m to avoid artifacts.
-    # EMA20(4H) 3-bar slope: direction (±0.15%) + score 40pts (absolute).
-    # ADX buckets: <18→0, 18-25→15, 25-45→25, >45→10 (max 25pts).
-    # ATR14/ATR50 ratio: <0.90→0, 0.90-1.10→5, >1.10→15 (max 15pts).
-    # Efficiency Ratio (20-bar): <0.20→0, 0.20-0.35→10, >0.35→20 (max 20pts).
-    # Max total = 100. Need ≥70 AND slope in matching direction for regime gate.
-    if p.get("htf_regime_4h_mode") == "weighted":
+    if _use_weighted:
         _adx_len4w = int(p.get("htf_regime_adx_len", 14))
 
         # [1] EMA20 slope over 3 actual 4H bars
@@ -598,6 +604,12 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     bk_lb = int(p.get("breakout_lookback", 10))
     hh10  = out["high"].rolling(bk_lb).max().shift(1)
     ll10  = out["low"].rolling(bk_lb).min().shift(1)
+    # BOS: Break of Structure — close breaks beyond N-bar swing high/low
+    bos_lb   = int(p.get("bos_lookback", 5))
+    bos_hh   = out["high"].rolling(bos_lb).max().shift(1)
+    bos_ll   = out["low"].rolling(bos_lb).min().shift(1)
+    bos_bull = out["close"] > bos_hh   # bullish BOS: break above N-bar high
+    bos_bear = out["close"] < bos_ll   # bearish BOS: break below N-bar low
     # OBV trend: cumulative volume flow vs its own EMA20
     obv_dir  = np.sign(out["close"].diff().fillna(0))
     obv      = (obv_dir * out["volume"]).cumsum()
@@ -620,6 +632,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         roc9=roc9_val,
         vol_expansion_ok=vol_expansion_ok,
         atr_compress_ok=atr_compress_ok,
+        bos_bull=bos_bull, bos_bear=bos_bear,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
@@ -882,17 +895,23 @@ class TrendContImprovedStrategy(BaseStrategy):
         # 4H Regime Mode: 2/3 score replaces EMA20/50 cross (no EMA50 lag).
         # Components: [1] EMA20 slope (2-bar lookback) + [2] ADX>18 + [3] price side of EMA20.
         # Backtest vs 'early' mode: run /backtest to compare before enabling in production.
-        htf_regime_4h=False,       # enable 2/3 regime score for 4H macro gate
-        htf_regime_4h_mode=None,   # "weighted" → 4-component weighted score (40+25+15+20, need ≥70)
-        htf_regime_4h_threshold=70,  # minimum weighted score to allow entry (default 70, try 55-65)
-        htf_regime_adx_min=18,     # ADX(4H) minimum for regime component [2]
-        htf_regime_adx_len=14,     # ADX period for regime check
+        htf_auto_regime=False,       # True: fast_mode→2/3vote, strict→weighted≥65 (auto routing)
+        htf_regime_4h=False,        # explicit 2/3 vote override (ignored when htf_auto_regime=True)
+        htf_regime_4h_mode=None,    # "weighted" → explicit weighted override
+        htf_regime_4h_threshold=65, # weighted score floor (backtest sweep: 65 beats 70 on PnL+WR)
+        htf_regime_adx_min=18,      # ADX(4H) minimum for 2/3 vote component [2]
+        htf_regime_adx_len=14,      # ADX period for regime checks
         # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).
         # Backtest Jan-May 2026: min5/6 → combined +$447 vs baseline +$401 (+11.5% PnL, same MaxDD).
         sj_roc9=True,
         # SJ Extended scoring: adds OBV trend + Market Structure + FVG (5 → 8 components)
         sj_extended=False,         # enable 3 extra 15m components (total 9); adjust min_score to 5-6
         sj_vol_expansion=True,     # add vol>MA20×1.15 as 7th SJ component (breakout volume bonus)
+        # BOS: Break of Structure — close breaks beyond N-bar swing high/low
+        # Soft score: adds +1 point; min_score=5 still gates entry, BOS just helps push borderline
+        # setups over the threshold without being required.
+        sj_bos=False,              # enable BOS as soft score component (disabled by default)
+        bos_lookback=5,            # 5×15m = 75 min swing lookback (try 3-8)
         # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
         # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
         atr_compress_gate=False,
@@ -918,12 +937,13 @@ class TrendContImprovedStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self._p = {**self.DEFAULTS, **{k: self.params.get(k, v) for k, v in self.DEFAULTS.items()}}
-        sj  = bool(self._p.get("sj_scoring",     False))
-        ext = bool(self._p.get("sj_extended",    False))
-        r9  = bool(self._p.get("sj_roc9",        False))
+        sj  = bool(self._p.get("sj_scoring",      False))
+        ext = bool(self._p.get("sj_extended",     False))
+        r9  = bool(self._p.get("sj_roc9",         False))
         ve  = bool(self._p.get("sj_vol_expansion", False))
+        bos = bool(self._p.get("sj_bos",          False))
         self._p["indicators"] = self.params.get("indicators",
-            build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve))
+            build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve, bos=bos))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
