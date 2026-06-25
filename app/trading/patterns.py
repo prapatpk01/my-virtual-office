@@ -30,9 +30,12 @@ Backtest result (BTC+XAU Jan-May 2026, $500 balance):
 """
 from __future__ import annotations
 
+import logging
 import pandas as pd
 
 from .connectors.base import OHLCV
+
+logger = logging.getLogger(__name__)
 
 
 # ── Candlestick patterns ──────────────────────────────────────────────────────
@@ -57,8 +60,8 @@ def _pat_engulfing(candles: list) -> tuple[bool, bool]:
     cur = candles[-1]; prev = candles[-2]
     clo = min(cur.open, cur.close); chi = max(cur.open, cur.close)
     plo = min(prev.open, prev.close); phi = max(prev.open, prev.close)
-    bull = cur.close > cur.open and prev.close < prev.open and clo < plo and chi > phi
-    bear = cur.close < cur.open and prev.close > prev.open and clo < plo and chi > phi
+    bull = cur.close > cur.open and prev.close < prev.open and clo <= plo and chi >= phi
+    bear = cur.close < cur.open and prev.close > prev.open and clo <= plo and chi >= phi
     return bull, bear
 
 
@@ -252,7 +255,6 @@ def _pat_rsi_divergence(candles: list) -> tuple[bool, bool]:
     w      = 20
     rsi_w  = rsi.iloc[-w:].values
     lows_w = [c.low  for c in candles[-w:]]
-    highs_w= [c.high for b in candles[-w:] for c in [b]]   # noqa: simplify below
     highs_w= [c.high for c in candles[-w:]]
     mid    = w // 2
 
@@ -336,8 +338,8 @@ def pattern_gate_passes(candles: list, side: str) -> tuple[bool, str]:
             bl, bs = fn(candles)
             if bl if side == "long" else bs:
                 fired.append(name)
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning("[PatternGate] %s raised %s", name, _e)
     if fired:
         return True, "+".join(fired)
     return False, "no_pattern"

@@ -265,8 +265,8 @@ class PositionHealthMonitor:
 
     def next_tp1_level(self, entry: float, oneR: float, current_tp1: float, side: str) -> Optional[float]:
         """
-        Before TP1 hit: advance TP1 one rung up TP1_LADDER (max 1.5R).
-        Returns None if already at 1.5R cap or no next level exists.
+        Before TP1 hit: advance TP1 one rung up TP1_LADDER (max 1.2R).
+        Returns None if already at 1.2R cap or no next level exists.
         """
         is_long = side == "long"
         for r in self.TP1_LADDER:
@@ -275,7 +275,7 @@ class PositionHealthMonitor:
                 return round(tp, 4)
             if not is_long and tp < current_tp1 - oneR * 0.05:
                 return round(tp, 4)
-        return None  # already at 1.5R cap
+        return None  # already at 1.2R cap
 
     def next_tp_level(self, entry: float, oneR: float, current_tp: float, side: str) -> Optional[float]:
         """

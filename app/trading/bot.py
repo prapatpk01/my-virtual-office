@@ -112,6 +112,7 @@ class TradingBot:
             s.strip() for s in os.getenv("TCI_HEALTH_ENTRY_SYMBOLS", "").split(",") if s.strip()
         }
         self._entry_health = PositionHealthMonitor(self.connector)
+        self._health_weak_confirm = int(os.getenv("TCI_HEALTH_WEAK_CONFIRM", "3"))
 
         # Pattern gate (Layer 3) — TCI_PATTERN_GATE=1 to enable.
         # Requires at least 1 of 8 candlestick/structure patterns to fire in the
@@ -392,9 +393,9 @@ class TradingBot:
             not self._health_entry_syms or sym in self._health_entry_syms)
         if gate_this:
             try:
-                hr = await self._entry_health.evaluate(sym, side)
-                if hr.score <= self._health_entry_min:
-                    logger.info("[%s] %s %s entry gated: health %.0f <= %.0f",
+                hr = await self._entry_health.check(sym, side, entry_price=0.0, oneR=0.0, current_tp2=0.0)
+                if hr.score < self._health_entry_min:
+                    logger.info("[%s] %s %s entry gated: health %.0f < %.0f",
                                 strategy_name, label_side, sym, hr.score, self._health_entry_min)
                     return
                 logger.info("[%s] %s %s health gate passed: %.0f", strategy_name, label_side, sym, hr.score)
@@ -436,7 +437,7 @@ class TradingBot:
             one_r = float(meta.get("one_r", 0) or 0)
             if one_r > 0:
                 rr_tp1 = float(meta.get("rr_tp1", 0.5))
-                rr_tp2 = float(meta.get("rr_tp2", 3.0))
+                rr_tp2 = float(meta.get("rr_tp2", 2.5))
                 if side == "long":
                     sl_p  = round(price - one_r, 8)
                     tp1_r = round(price + rr_tp1 * one_r, 8)
@@ -761,9 +762,9 @@ class TradingBot:
             pos.health_label  = result.label
             pos.health_checks += 1
 
-            # STRONG_WEAK (score < 40): sharp reversal / V-shape — close NOW, no wait.
-            # WEAK (40-49): soft fade — must persist N consecutive cycles before close.
-            weak_confirm = getattr(self, "_health_weak_confirm", 3)
+            # STRONG_WEAK (score < 25): sharp reversal / V-shape — close NOW, no wait.
+            # WEAK (25-49): soft fade — must persist N consecutive cycles before close.
+            weak_confirm = self._health_weak_confirm
             if result.label == "STRONG_WEAK":
                 pos.health_weak_count = 0
                 logger.info("[MONITOR] %s %s STRONG_WEAK (score=%.0f) — closing immediately",

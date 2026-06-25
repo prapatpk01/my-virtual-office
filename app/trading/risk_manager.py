@@ -159,7 +159,7 @@ class RiskManager:
         today = _day_key()
         if today != self._day or self._day_start_balance <= 0:
             self._day = today
-            self._day_start_balance = balance if balance > 0 else self._day_start_balance
+            self._day_start_balance = balance
             self._day_realized_pnl = 0.0
 
     def register_pnl(self, pnl: float):

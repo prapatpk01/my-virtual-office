@@ -980,7 +980,7 @@ class TrendContImprovedStrategy(BaseStrategy):
 
         p = self._p
 
-        # FAST v2 runs the runner to 3.0R; STRICT keeps 2.5R.
+        # FAST v2 targets tp2_r_fast (default 2.5R, health ladder can extend further); STRICT uses tp2_r (2.5R).
         tp2_r = p.get("tp2_r_fast", p["tp2_r"]) if p.get("fast_mode") else p["tp2_r"]
 
         def _meta(side: str) -> dict:
