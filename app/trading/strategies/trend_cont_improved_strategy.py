@@ -844,7 +844,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         atr_period=14, sl_mult=1.2, sl_min_pct=0.012, sl_max_pct=0.035,
         adx_len=14, adx_min=30,
         tp1_r=0.5, tp1_fraction=0.60, tp2_r=2.5,   # close 60% at TP1 (banks more profit early)
-        min_score=5.0,   # 5/6 with sj_roc9=True (was 4/5 baseline)
+        min_score=6.0,   # 6/8 with sj_bos=True (was 5/7; maintains same "miss 2" selectivity)
         # Fast mode v2
         fast_mode=False,
         adx_min_fast=18,          # ADX lower bound — trend must be active
@@ -895,7 +895,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # 4H Regime Mode: 2/3 score replaces EMA20/50 cross (no EMA50 lag).
         # Components: [1] EMA20 slope (2-bar lookback) + [2] ADX>18 + [3] price side of EMA20.
         # Backtest vs 'early' mode: run /backtest to compare before enabling in production.
-        htf_auto_regime=False,       # True: fast_mode→2/3vote, strict→weighted≥65 (auto routing)
+        htf_auto_regime=True,        # fast_mode→2/3vote gate, strict→weighted≥65 gate (auto routing)
         htf_regime_4h=False,        # explicit 2/3 vote override (ignored when htf_auto_regime=True)
         htf_regime_4h_mode=None,    # "weighted" → explicit weighted override
         htf_regime_4h_threshold=65, # weighted score floor (backtest sweep: 65 beats 70 on PnL+WR)
@@ -910,7 +910,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # BOS: Break of Structure — close breaks beyond N-bar swing high/low
         # Soft score: adds +1 point; min_score=5 still gates entry, BOS just helps push borderline
         # setups over the threshold without being required.
-        sj_bos=False,              # enable BOS as soft score component (disabled by default)
+        sj_bos=True,               # BOS as soft score component (8th component, min_score=6/8)
         bos_lookback=5,            # 5×15m = 75 min swing lookback (try 3-8)
         # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
         # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
