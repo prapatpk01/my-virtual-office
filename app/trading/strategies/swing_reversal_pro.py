@@ -252,6 +252,44 @@ def _vol_not_declining(volma: list, n: int, bars: int = 3) -> bool:
         return True
     return v0 >= vb * 0.85   # allow up to -15% drift
 
+def _candle_pressure(op: list, cl: list, hi: list, lo: list,
+                     n: int, atr14: float, direction: str,
+                     bars: int = 2) -> str | None:
+    """
+    Detect gradual momentum build — N consecutive opposing closes.
+    Fires after 2 bars (30 min) to catch 3-4 bar pressure before SL is hit.
+
+    Conditions (both required):
+      1) Last `bars` closes all oppose direction (each bar closes against position)
+      2) Cumulative close-to-close move ≥ 0.5×ATR14  (not just noise)
+      3) Each individual bar's close-to-close move ≥ 0.15×ATR (consistent, not one big bar)
+    """
+    if n < bars + 1 or atr14 <= 0:
+        return None
+    lng = direction == "long"
+
+    # Check each bar closes against our position
+    for i in range(bars):
+        idx = n - i
+        if lng and cl[idx] >= op[idx]:    # bullish bar breaks pressure → reset
+            return None
+        if not lng and cl[idx] <= op[idx]:
+            return None
+        # Each individual move must be at least 0.15×ATR (not random doji)
+        bar_move = abs(cl[idx] - cl[idx - 1])
+        if bar_move < atr14 * 0.15:
+            return None
+
+    # Total cumulative move
+    total = abs(cl[n] - cl[n - bars])
+    if total < atr14 * 0.5:
+        return None
+
+    direction_label = "bear" if lng else "bull"
+    return (f"Pressure: {bars}× {direction_label} closes, "
+            f"total={total:.1f}>{atr14*0.5:.1f}ATR")
+
+
 def _momentum_reversal(op: list, cl: list, vol: list, rsi: list,
                        n: int, atr14: float, volma20: float,
                        direction: str) -> str | None:
@@ -680,14 +718,21 @@ class SwingReversalPro(BaseStrategy):
         if health_score < 25:
             return f"health={health_score}<25"
 
-        # [2] Momentum reversal — body+volume confirmed, fires even during spike guard.
-        #     A real reversal has a large CLOSE-confirmed body; a V-spike only has a wick.
+        # [2] Momentum reversal — strong single candle + volume (1-2 bars / 15-30 min)
+        #     Fires even during spike_guard: large body = real move, not a wick.
         mom_rev = _momentum_reversal(op, cl, vol, rsi14_arr, n, atr14, volma20,
                                      self.direction)
         if mom_rev:
             return mom_rev
 
-        # [3] During V-spike guard: suppress remaining technical exits (CHOCH/RSI/div)
+        # [3] Candle pressure — 2 consecutive opposing closes (30-45 min early warning).
+        #     Catches gradual 3-4 bar builds before they reach SL.
+        #     Fires even during spike_guard (sustained closes ≠ wick).
+        pressure = _candle_pressure(op, cl, hi, lo, n, atr14, self.direction, bars=2)
+        if pressure:
+            return pressure
+
+        # [4] During V-spike guard: suppress remaining technical exits (CHOCH/RSI/div)
         #     so wick-stop-hunt moves don't force an exit at the worst price.
         if spike_guard:
             return None
