@@ -99,14 +99,16 @@ def build_config() -> dict:
             "swing_reversal_pro": _env_bool("STRATEGY_SWING_REVERSAL", True),
         },
         "swing_reversal_params": {
-            "risk_pct":       _env_float("SR_RISK",      0.01),
-            "l1_min_score":   _env_int("SR_L1",            5),
-            "l2_min_pass":    _env_int("SR_L2",            5),
-            "sl_atr_min":     _env_float("SR_SL",         1.0),
-            "adx_4h_max":     _env_float("SR_ADX4H",     35.0),
-            "adx_no_trade":   _env_float("SR_ADX_MIN",   15.0),
-            "atr_min_ratio":  _env_float("SR_ATR_RATIO",  0.8),
-            "mtf_bias_limit": _env_float("SR_MTF_LIMIT", 50.0),
+            "risk_pct":        _env_float("SR_RISK",        0.01),
+            "l1_min_score":    _env_int("SR_L1",               5),   # Mode A quality gate (5/7)
+            "l2_min_pass":     _env_int("SR_L2",               4),   # Mode A context (4/6)
+            "sl_atr_mult":     _env_float("SR_SL",            1.5),  # SL = 1.5×ATR
+            "tp_mult":         _env_float("SR_TP",            2.0),  # TP = 2.0×SL dist (1:2 R:R)
+            "adx_no_trade":    _env_float("SR_ADX_MIN",      10.0),  # 15m ADX min threshold
+            "mtf_bias_limit":  _env_float("SR_MTF_LIMIT",    50.0),
+            "max_bars":        _env_int("SR_MAXBARS",           48), # 12h max hold (48×15m bars)
+            "rsi_entry_long":  _env_float("SR_RSI_LONG",      42.0), # Mode A RSI gate long
+            "rsi_entry_short": _env_float("SR_RSI_SHORT",     58.0), # Mode A RSI gate short
         },
         "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
