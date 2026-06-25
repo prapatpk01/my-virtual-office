@@ -432,14 +432,16 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
             slope_score_4h + adx_score_4h + atr_score_4h + er_score_4h,
             index=df4h.index).fillna(0)
 
-        bull_4h = pd.Series((slope3_pct_4h > 0.15) & (trend_score_4h >= 70), index=df4h.index)
-        bear_4h = pd.Series((slope3_pct_4h < -0.15) & (trend_score_4h >= 70), index=df4h.index)
+        _w_thresh = float(p.get("htf_regime_4h_threshold", 70))
+        bull_4h = pd.Series((slope3_pct_4h > 0.15) & (trend_score_4h >= _w_thresh), index=df4h.index)
+        bear_4h = pd.Series((slope3_pct_4h < -0.15) & (trend_score_4h >= _w_thresh), index=df4h.index)
 
-        # Forward-fill 4H regime signals to 15m timestamps (no lookahead)
-        regime_4h = pd.DataFrame({"bull": bull_4h, "bear": bear_4h})
+        # Forward-fill 4H regime signals + raw score to 15m timestamps (no lookahead)
+        regime_4h = pd.DataFrame({"bull": bull_4h, "bear": bear_4h, "score": trend_score_4h})
         regime_15m = regime_4h.reindex(out.index, method="ffill")
         macro_up = regime_15m["bull"].fillna(False)
         macro_dn = regime_15m["bear"].fillna(False)
+        out["h4_regime_score_w"] = regime_15m["score"].fillna(0)
 
     # Optional: gate on 4h MACD histogram slope — blocks fading crossovers.
     # Fires when ema_fast/slow are 12/26 (MACD periods) or any config with noise risk.
@@ -882,6 +884,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Backtest vs 'early' mode: run /backtest to compare before enabling in production.
         htf_regime_4h=False,       # enable 2/3 regime score for 4H macro gate
         htf_regime_4h_mode=None,   # "weighted" → 4-component weighted score (40+25+15+20, need ≥70)
+        htf_regime_4h_threshold=70,  # minimum weighted score to allow entry (default 70, try 55-65)
         htf_regime_adx_min=18,     # ADX(4H) minimum for regime component [2]
         htf_regime_adx_len=14,     # ADX period for regime check
         # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).
@@ -1089,6 +1092,7 @@ class TrendContImprovedStrategy(BaseStrategy):
                 "one_r":       dist,
                 "sj_score":    sc,
                 "mtf_bias":    float(last.get("comp_pct", 0)),
+                "regime_score_w": float(last.get("h4_regime_score_w", 0)),
             }
 
         if buy:
