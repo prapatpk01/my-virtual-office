@@ -801,7 +801,9 @@ class TradingBot:
         if result.action == "EXTEND_TP":
             one_r = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
             if not pos.tp1_hit:
-                # Pattern-tier upgrade (once): jump TP1 directly to tier target
+                # TP1 upgrade requires BOTH: pattern tier present AND health BULL (this call)
+                # Health BULL alone → no adjustment (TP1 stays at 0.5R)
+                # Pattern alone     → no adjustment (wait for BULL confirmation)
                 if pos.pattern_tier > 0 and not pos.tp1_pattern_upgraded:
                     r_mult   = TP1_BY_TIER.get(pos.pattern_tier, 0.5)
                     new_tp1  = (round(pos.entry_price + r_mult * one_r, 8) if pos.side == "long"
@@ -815,25 +817,9 @@ class TradingBot:
                     if self.telegram:
                         self.telegram.notify(
                             f"🎯 *Pattern TP1 Upgrade* `{sym}` {pos.side.upper()}\n"
-                            f"Tier {pos.pattern_tier} pattern + Health BULL\n"
-                            f"TP1: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _({r_mult}R)_ | early-exit armed on WEAK\n"
-                            f"Score {result.score:.0f}%  Indicators: {_fmt_details(result.details)}"
+                            f"Tier {pos.pattern_tier} + Health BULL → TP1: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _({r_mult}R)_\n"
+                            f"Early-exit armed on WEAK | Score {result.score:.0f}%"
                         )
-                else:
-                    # No pattern tier (or already upgraded): step TP1 up the ladder
-                    new_tp1 = monitor.next_tp1_level(pos.entry_price, one_r,
-                                                      pos.tp1 or pos.take_profit or 0.0, pos.side)
-                    if new_tp1 and new_tp1 != pos.tp1:
-                        old_tp1 = pos.tp1
-                        pos.tp1 = new_tp1
-                        logger.info("[MONITOR] %s %s BULL (pre-TP1) → TP1 raised %.4f → %.4f (max 1.2R)",
-                                    strategy, sym, old_tp1 or 0, new_tp1)
-                        if self.telegram:
-                            self.telegram.notify(
-                                f"📈 *Health BULL* `{sym}` {pos.side.upper()} _(pre-TP1)_\n"
-                                f"Score {result.score:.0f}%  TP1 raised: `{old_tp1 or 0:.2f}` → `{new_tp1:.2f}` _(max 1.2R)_\n"
-                                f"Indicators: {_fmt_details(result.details)}"
-                            )
             else:
                 # After TP1: runner is at BE — extend TP2 up the ladder (max 3.0R)
                 new_tp = monitor.next_tp_level(pos.entry_price, one_r,
