@@ -1,7 +1,7 @@
 """
-Pattern Gate — Layer 3 entry confirmation (13 candlestick/structure patterns).
+Pattern Gate — Layer 3 entry confirmation (11 candlestick/structure patterns).
 
-Any 1 of 13 patterns must fire in the signal direction for the gate to pass.
+Any 1 of 11 patterns must fire in the signal direction for the gate to pass.
 Operates on the primary timeframe (15m) OHLCV list.
 
 Enable via env var:  TCI_PATTERN_GATE=1
@@ -20,13 +20,11 @@ Pattern library (fire rates estimated on BTC+XAU 15m Jan-May 2026):
   Double Top/Bottom    ~ 4%   Two equal peaks/troughs then breakout
   ── Momentum / Indicator ─────────────────────────────────────────────────
   Volume Spike         ~18%   Volume ≥ 1.5× 20-bar avg
-  MACD Fresh Cross     ~15%   MACD histogram sign change (1-2 bars)
   RSI Divergence       ~ 5%   Price extreme not confirmed by RSI
-  Squeeze Breakout     ~ 8%   BB compression → expansion with direction
 
-Backtest result (BTC+XAU Jan-May 2026, $500 balance):
-  Baseline (no gate)   T=219  WR=53.4%  PnL=+$399  MaxDD=$50  PnL/DD=7.97
-  8-pattern gate       T=191  WR=55.0%  PnL=+$417  MaxDD=$38  PnL/DD=11.08
+  Removed (negative expected value in backtest):
+    MACD Fresh Cross — WR 42%, PnL -$63.69
+    Squeeze Breakout — WR 49%, PnL -$65.59
 """
 from __future__ import annotations
 
@@ -315,14 +313,12 @@ _PATTERNS: list[tuple[str, object]] = [
     ("DoubleTop/Bot",    _pat_double_top_bottom),
     # Momentum / Indicator
     ("Vol-Spike",        _pat_volume_spike),
-    ("MACD-Cross",       _pat_macd_cross),
     ("RSI-Div",          _pat_rsi_divergence),
-    ("Squeeze",          _pat_squeeze_breakout),
 ]
 
 
 def pattern_gate_passes(candles: list, side: str) -> tuple[bool, str]:
-    """Check whether any of the 13 patterns fires for the given direction.
+    """Check whether any of the 11 patterns fires for the given direction.
 
     Args:
         candles: List of OHLCV objects (primary timeframe, most-recent last).
