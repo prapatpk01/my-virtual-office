@@ -336,13 +336,16 @@ class TradingBot:
             # Detail line first (bias / ADX / score)
             logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:140])
             # [GATE] summary follows right after — shows which layer is blocking and what to wait for
+            # Always append L2 threshold so user can see all pending requirements at once
+            l2_pending = (f" + L2: health>={self._health_entry_min:.0f}"
+                          if self._health_entry_min > 0 else "")
             if is_hold_l1:
                 wait = _l1_wait_hint(signal.reason)
-                logger.info("[GATE] %s %s → L1:✗ | L2:— | L3:— | waiting: %s",
-                            strategy.name, sym, wait)
+                logger.info("[GATE] %s %s → L1:✗ | L2:— | L3:— | waiting: %s%s",
+                            strategy.name, sym, wait, l2_pending)
             else:
-                logger.info("[GATE] %s %s %s → L1:%s | L2:— | L3:✗ | waiting: pattern gate",
-                            strategy.name, sym, side_hint.upper(), l1_label)
+                logger.info("[GATE] %s %s %s → L1:%s | L2:— | L3:✗ | waiting: pattern gate%s",
+                            strategy.name, sym, side_hint.upper(), l1_label, l2_pending)
 
         return signal, sig_dict
 
