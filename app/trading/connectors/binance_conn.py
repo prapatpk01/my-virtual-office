@@ -377,14 +377,20 @@ class BinanceConnector(BaseConnector):
             ]
 
             if sl_orders:
-                # 2. Cancel each SL algo — failure here is non-fatal; we still place the new one
-                cancel_payload = [{"algoId": o["algoId"], "instId": inst_id} for o in sl_orders]
-                try:
-                    await self._exchange.privatePostTradeCancelAlgos(cancel_payload)
-                    logger.info("[SL→BE] Cancelled %d algo SL(s) for %s %s",
-                                len(sl_orders), symbol, pos_side)
-                except Exception as ce:
-                    logger.warning("[SL→BE] Cancel algo SL failed (proceeding anyway): %s", ce)
+                # 2. Cancel each SL algo individually — OKX cancel-algos expects a JSON
+                # array body; passing the whole list to privatePostTradeCancelAlgos in
+                # one shot can silently fail depending on ccxt version, so we cancel
+                # per-algo to guarantee each gets its own request and error surface.
+                for algo in sl_orders:
+                    try:
+                        await self._exchange.privatePostTradeCancelAlgos(
+                            [{"algoId": algo["algoId"], "instId": inst_id}]
+                        )
+                        logger.info("[SL→BE] Cancelled algo SL %s for %s %s",
+                                    algo["algoId"], symbol, pos_side)
+                    except Exception as ce:
+                        logger.warning("[SL→BE] Cancel algo SL %s failed (proceeding): %s",
+                                       algo["algoId"], ce)
             else:
                 logger.info("[SL→BE] No pending algo SL for %s %s — attaching new one at BE",
                             symbol, pos_side)

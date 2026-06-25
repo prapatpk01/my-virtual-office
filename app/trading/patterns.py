@@ -287,8 +287,9 @@ def _pat_squeeze_breakout(candles: list) -> tuple[bool, bool]:
     w_min  = float(recent.min()); w_max = float(recent.max())
     w_rng  = w_max - w_min + 1e-10
 
-    # Was squeezed (narrow) 3–5 bars ago, now expanding for 2+ bars
-    was_squeezed = float(bb_w.iloc[-4]) < w_min + w_rng * 0.25
+    # Was squeezed (narrow) anywhere in the 3–5 bars ago window, now expanding for 2+ bars
+    squeeze_threshold = w_min + w_rng * 0.25
+    was_squeezed = any(float(bb_w.iloc[i]) < squeeze_threshold for i in (-3, -4, -5))
     expanding    = float(bb_w.iloc[-1]) > float(bb_w.iloc[-2]) > float(bb_w.iloc[-3])
 
     if not (was_squeezed and expanding):
@@ -332,6 +333,8 @@ def pattern_gate_passes(candles: list, side: str) -> tuple[bool, str]:
           passes=True  → at least one pattern confirmed; reason lists which ones fired.
           passes=False → no pattern fired; reason = "no_pattern".
     """
+    if side not in ("long", "short"):
+        raise ValueError(f"pattern_gate_passes: side must be 'long' or 'short', got {side!r}")
     fired: list[str] = []
     for name, fn in _PATTERNS:
         try:

@@ -121,8 +121,11 @@ class TradingBot:
         kwargs = {"path": state_file} if state_file else {}
         self._sig = SignalState(**kwargs)
 
+        # Derive futures_mode from the connector's own flag so bot and connector
+        # always agree on hedge-mode posSide logic. Fall back to MARKET_TYPE env
+        # only when connector doesn't expose _futures (e.g. mock/paper connector).
         _mkt = os.getenv("MARKET_TYPE", "").lower()
-        self.futures_mode: bool = _mkt in ("swap", "futures")
+        self.futures_mode: bool = getattr(connector, '_futures', _mkt in ("swap", "futures"))
 
         # Optional health-score entry gate: require PositionHealthMonitor score >
         # TCI_HEALTH_ENTRY_MIN at entry (0 = off). Filters low-quality setups.
@@ -348,59 +351,6 @@ class TradingBot:
                             strategy.name, sym, side_hint.upper(), l1_label, l2_pending)
 
         return signal, sig_dict
-
-    async def _run_strategy(self, strategy: BaseStrategy,
-                            cache: dict) -> Optional[dict]:
-        sym   = strategy.symbol
-        tf    = strategy.params.get("tf", "15m")
-        limit = strategy.params.get("limit", 300)
-
-        # Fetch primary candles (cached)
-        key = (sym, tf)
-        if key not in cache:
-            cache[key] = await self.connector.fetch_ohlcv(sym, timeframe=tf, limit=limit)
-        candles = cache[key]
-
-        ticker = await self.connector.fetch_ticker(sym)
-        price  = float(ticker["last"])
-
-        # Fetch MTF candles if strategy declares them
-        mtf_candles: dict = {}
-        for mtf_tf in getattr(strategy, "MTF_TIMEFRAMES", []):
-            if mtf_tf == tf:
-                continue
-            mk = (sym, mtf_tf)
-            if mk not in cache:
-                try:
-                    cache[mk] = await self.connector.fetch_ohlcv(sym, timeframe=mtf_tf, limit=150)
-                except Exception as e:
-                    logger.warning("[BOT] MTF %s/%s fetch failed: %s", sym, mtf_tf, e)
-            if mk in cache:
-                mtf_candles[mtf_tf] = cache[mk]
-
-        try:
-            signal = await strategy.analyze(candles, price, mtf_candles=mtf_candles)
-        except Exception as e:
-            logger.error("[%s] analyze error on %s: %s", strategy.name, sym, e)
-            return None
-
-        sig_dict = {
-            "strategy":   strategy.name,
-            "symbol":     sym,
-            "type":       signal.type.value,
-            "price":      price,
-            "confidence": signal.confidence,
-            "reason":     signal.reason,
-            "ts":         int(time.time() * 1000),
-            "metadata":   signal.metadata,
-        }
-
-        if signal.type == SignalType.HOLD:
-            logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:120])
-            return sig_dict
-
-        await self._handle_signal(signal, sig_dict, strategy)
-        return sig_dict
 
     # ── Signal routing ────────────────────────────────────────────────────
 

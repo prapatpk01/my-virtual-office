@@ -50,7 +50,7 @@ class Position:
             if self.stop_loss and ((price <= self.stop_loss) if long else (price >= self.stop_loss)):
                 return "stop_loss"
             if self.take_profit and ((price >= self.take_profit) if long else (price <= self.take_profit)):
-                return "take_profit"
+                return "take_profit2"
             return None
         if not self.tp1_hit:
             if self.stop_loss and ((price <= self.stop_loss) if long else (price >= self.stop_loss)):
