@@ -139,13 +139,9 @@ class TradingBot:
         self._entry_health = PositionHealthMonitor(self.connector)
         self._health_weak_confirm = int(os.getenv("TCI_HEALTH_WEAK_CONFIRM", "3"))
 
-        # Pattern gate (Layer 3) — TCI_PATTERN_GATE=1 to enable.
-        # Requires at least 1 of 8 candlestick/structure patterns to fire in the
-        # signal direction before opening a position. Improves PnL/DD ~39% in
-        # backtests (BTC+XAU Jan-May 2026: WR 53.4%→55.0%, MaxDD $50→$38).
-        self._pattern_gate_enabled = os.getenv("TCI_PATTERN_GATE", "0").lower() in ("1", "true", "yes")
-        if self._pattern_gate_enabled:
-            logger.info("[BOT] Pattern gate ENABLED (8-pattern Layer-3 confirmation)")
+        # Layer 3: pattern scanner feeds TP1 optimizer (no longer an entry gate).
+        # TCI_PATTERN_GATE env var is no longer used — L3 always scans patterns
+        # at entry time and stores the best tier on the position for TP1 upgrade.
 
         logger.info("[BOT] futures=%s paper=%s interval=%ds SL=%.1f%% TP=%.1f%%",
                     self.futures_mode, self.paper, self.interval,
@@ -340,13 +336,7 @@ class TradingBot:
         }
 
         if signal.type == SignalType.HOLD:
-            # Detail line first (bias / ADX / score)
             logger.info("[%s] %s HOLD — %s", strategy.name, sym, signal.reason[:140])
-            l2_pending = (f" + L2: health>={self._health_entry_min:.0f}"
-                          if self._health_entry_min > 0 else "")
-            wait = _l1_wait_hint(signal.reason)
-            logger.info("[GATE] %s %s → L1:✗ | L2:— | L3:%s | waiting: %s%s",
-                        strategy.name, sym, l3_label, wait, l2_pending)
 
         return signal, sig_dict
 
@@ -380,7 +370,6 @@ class TradingBot:
             return
 
         # ── Layer 2 — Health-score entry gate (TCI_HEALTH_ENTRY_MIN > 0) ──────
-        l1_label  = sig_dict.get("_l1_label", "✓")
         l3_label  = sig_dict.get("_l3_label", "—")
         gate_this = self._health_entry_min > 0 and (
             not self._health_entry_syms or sym in self._health_entry_syms)
@@ -390,9 +379,9 @@ class TradingBot:
                 hr = await self._entry_health.check(sym, side, entry_price=0.0, oneR=0.0, current_tp2=0.0)
                 if hr.score < self._health_entry_min:
                     l2_label = f"✗(health={hr.score:.0f}<{self._health_entry_min:.0f})"
-                    logger.info("[GATE] %s %s %s → L1:%s | L2:%s | L3:%s | waiting: health>%.0f",
+                    logger.info("[%s] %s %s L2 blocked — health=%.0f < %.0f",
                                 strategy_name, sym, side.upper(),
-                                l1_label, l2_label, l3_label, self._health_entry_min)
+                                hr.score, self._health_entry_min)
                     return
                 l2_label = f"✓(health={hr.score:.0f})"
             except Exception as e:
@@ -401,8 +390,8 @@ class TradingBot:
                                strategy_name, sym, e)
 
         # All layers passed — log entry summary then execute
-        logger.info("[GATE] %s %s %s → L1:%s | L2:%s | L3:%s | → ENTRY ✓",
-                    strategy_name, sym, side.upper(), l1_label, l2_label, l3_label)
+        logger.info("[%s] %s %s ENTRY ✓ — L2:%s | Pat:%s",
+                    strategy_name, sym, side.upper(), l2_label, l3_label)
 
         self._sig.lock_strategy(sym, slot, signal.type.value)
         self._sig.record_signal(sym, signal.type.value, signal.price,
