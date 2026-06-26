@@ -346,14 +346,16 @@ class TradingBot:
         action = hr["action"]
 
         # ── Railway log — always (level depends on severity) ──────────────
+        open_pos = list(self._positions.keys()) or ["none"]
         if action in ("soft_close", "hard_close"):
-            logger.warning("[Health] score=%d (%s) → %s  weak_streak=%d/%d",
+            logger.warning("[Health] score=%d (%s) → %s  weak_streak=%d/%d  positions=%s",
                            score, label, action,
-                           self._health._weak_count, self._health._weak_bars_confirm)
+                           self._health._weak_count, self._health._weak_bars_confirm,
+                           open_pos)
         else:
-            logger.info("[Health] score=%d (%s) → %s  weak_streak=%d/%d",
+            logger.info("[Health] score=%d (%s) → %s  weak_streak=%d/%d  sym=%s",
                         score, label, action,
-                        self._health._weak_count, self._health._weak_bars_confirm)
+                        self._health._weak_count, self._health._weak_bars_confirm, sym)
 
         # ── Close actions ─────────────────────────────────────────────────
         if action == "hard_close":
@@ -594,14 +596,27 @@ class TradingBot:
                     self.telegram.notify_error(sym, str(e))
                 return
 
-            # Validate SL/TP direction
+            # Validate SL/TP direction (long: sl<price<tp; short: tp<price<sl)
+            position_side = (signal.metadata or {}).get("position_side", "LONG").upper()
             if sl_p and tp_p:
-                if sl_p >= price:
-                    logger.warning("[%s] SL %.2f >= price %.2f — skipping", strategy_name, sl_p, price)
-                    return
-                if tp_p <= price:
-                    logger.warning("[%s] TP %.2f <= price %.2f — skipping", strategy_name, tp_p, price)
-                    return
+                if position_side == "LONG":
+                    if sl_p >= price:
+                        logger.warning("[%s] LONG SL %.2f >= price %.2f — skipping",
+                                       strategy_name, sl_p, price)
+                        return
+                    if tp_p <= price:
+                        logger.warning("[%s] LONG TP %.2f <= price %.2f — skipping",
+                                       strategy_name, tp_p, price)
+                        return
+                else:
+                    if sl_p <= price:
+                        logger.warning("[%s] SHORT SL %.2f <= price %.2f — skipping",
+                                       strategy_name, sl_p, price)
+                        return
+                    if tp_p >= price:
+                        logger.warning("[%s] SHORT TP %.2f >= price %.2f — skipping",
+                                       strategy_name, tp_p, price)
+                        return
 
             if self.trade_amount_usdt > 0:
                 amount = round(self.trade_amount_usdt / price, 6)
@@ -808,20 +823,27 @@ class TradingBot:
                 await self._close_spot_position(pos_key, price, reason)
 
     async def _close_spot_position(self, pos_key: str, exit_price: float, reason: str):
-        """Market sell to close spot position. If OCO already sold, the sell will
-        fail (no balance) — we catch that and clear the in-memory position anyway."""
+        """Market close position (long or short). If exchange algo already closed it,
+        the order may fail — we catch that and clear in-memory state anyway."""
         pos = self._positions.pop(pos_key, None)
         if not pos:
             return
         sym = pos_key.split("::")[0]
         self._save_positions()
+        is_short  = getattr(pos, "side", "long") == "short"
+        close_side = "buy" if is_short else "sell"
+        pos_side   = "SHORT" if is_short else "LONG"
         try:
-            await self.connector.create_order(sym, "sell", pos.amount)
+            await self.connector.create_order(sym, close_side, pos.amount,
+                                              position_side=pos_side)
         except Exception as e:
-            logger.info("[Spot-Exit] Sell skipped (OCO already closed?): %s — %s", pos_key, e)
+            logger.info("[Exit] Close skipped (algo already closed?): %s — %s", pos_key, e)
 
-        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
-        logger.info("[Spot-Exit] %s %s: exit=%.4f entry=%.4f pnl=%.2f%%",
+        if is_short:
+            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price * 100
+        else:
+            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+        logger.info("[Exit] %s %s: exit=%.4f entry=%.4f pnl=%.2f%%",
                     pos_key, reason, exit_price, pos.entry_price, pnl_pct)
         if self.telegram:
             self.telegram.notify_close(sym, pos.entry_price, exit_price, pnl_pct, reason)

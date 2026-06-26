@@ -32,10 +32,9 @@ class BinanceConnector(BaseConnector):
         self._exchange_id = exchange_id
 
         exchange_class = getattr(ccxt, exchange_id)
-        # OKX: use defaultType="margin" so market data (minSz, lotSz, precision) matches
-        # the cross-margin instrument we trade via tdMode=cross. Using "spot" would give
-        # the wrong minSz and cause OKX error 51020 on otherwise valid order sizes.
-        options: dict = {"defaultType": "margin" if exchange_id == "okx" else "spot"}
+        # OKX: defaultType="swap" loads perpetual futures markets so symbols like
+        # BTC/USDT:USDT resolve correctly and minSz/contractSize match the SWAP instrument.
+        options: dict = {"defaultType": "swap" if exchange_id == "okx" else "spot"}
         if exchange_id == "bybit":
             options["fetchCurrencies"] = False
 
@@ -51,6 +50,8 @@ class BinanceConnector(BaseConnector):
         self._exchange = exchange_class(cfg)
         self._paper_balance: dict = {"USDT": 10000.0, "BTC": 0.0, "ETH": 0.0}
         self._paper_open_orders: list[OrderResult] = []
+        self._leverage_set: set = set()   # symbols already configured (leverage + hedge mode)
+        self._pos_mode_set: bool = False  # account-wide hedge mode set flag
 
     # ------------------------------------------------------------------
     # Market data
@@ -73,12 +74,14 @@ class BinanceConnector(BaseConnector):
                            order_type: str = "market",
                            price: Optional[float] = None,
                            tp: Optional[float] = None,
-                           sl: Optional[float] = None) -> OrderResult:
+                           sl: Optional[float] = None,
+                           position_side: str = "LONG") -> OrderResult:
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price)
 
         if self._exchange_id == "okx":
-            return await self._okx_order(symbol, side, amount, order_type, price, tp, sl)
+            return await self._okx_order(symbol, side, amount, order_type, price, tp, sl,
+                                         position_side)
 
         if self._exchange_id == "binance":
             return await self._binance_order(symbol, side, amount, order_type, price, tp, sl)
@@ -97,82 +100,117 @@ class BinanceConnector(BaseConnector):
             status=raw.get("status", "closed"),
         )
 
+    async def _ensure_swap_ready(self, symbol: str) -> None:
+        """Set OKX account to hedge mode and configure leverage (once per symbol)."""
+        if symbol in self._leverage_set:
+            return
+        if not self._pos_mode_set:
+            try:
+                await self._exchange.set_position_mode(hedged=True, symbol=symbol)
+                self._pos_mode_set = True
+                _log.info("OKX position mode → hedge (long_short_mode)")
+            except Exception as e:
+                _log.debug("set_position_mode (non-fatal, may already be set): %s", e)
+                self._pos_mode_set = True  # don't retry
+        for pos_side in ("long", "short"):
+            try:
+                await self._exchange.set_leverage(
+                    self.leverage, symbol,
+                    params={"mgnMode": "cross", "posSide": pos_side},
+                )
+            except Exception as e:
+                _log.warning("set_leverage %dx %s %s (non-fatal): %s",
+                             self.leverage, symbol, pos_side, e)
+        self._leverage_set.add(symbol)
+        _log.info("OKX leverage=%dx set for %s (both sides)", self.leverage, symbol)
+
     async def _okx_order(self, symbol: str, side: str, amount: float,
                          order_type: str, price: Optional[float],
-                         tp: Optional[float], sl: Optional[float]) -> OrderResult:
-        """OKX order via direct API. Uses attachAlgoOrds to attach TP/SL atomically.
+                         tp: Optional[float], sl: Optional[float],
+                         position_side: str = "LONG") -> OrderResult:
+        """OKX perpetual swap order in hedge mode.
 
-        TP/SL are attached to the main order in a single API call — if the order fills,
-        OKX guarantees the algo orders are created. No separate OCO call needed.
+        Uses posSide=long/short so both directions can coexist on the same symbol.
+        TP/SL attached atomically via attachAlgoOrds — OKX creates algo orders on fill.
         """
         await self._exchange.load_markets()
-        mkt = self._exchange.markets.get(symbol) or {}
-        info = mkt.get("info") or {}
-        inst_id = info.get("instId") or symbol.replace("/", "-")
-        sz_str = self._exchange.amount_to_precision(symbol, amount)
+        await self._ensure_swap_ready(symbol)
 
-        # Validate minimum order size
-        min_sz = float(info.get("minSz") or 0)
-        if min_sz > 0 and float(sz_str or 0) < min_sz:
+        mkt  = self._exchange.markets.get(symbol) or {}
+        info = mkt.get("info") or {}
+
+        # instId: prefer the exchange's own field; fallback constructs SWAP id from symbol
+        inst_id = info.get("instId") or (
+            symbol.split(":")[0].replace("/", "-") + "-SWAP"
+            if ":" in symbol else symbol.replace("/", "-")
+        )
+
+        # Convert base-currency amount → contracts (ctVal = base per contract)
+        ct_val    = float(info.get("ctVal") or mkt.get("contractSize") or 1)
+        contracts = max(1, int(amount / ct_val))
+        sz_str    = str(contracts)
+
+        # Minimum contract check
+        min_sz = int(float(info.get("minSz") or 1))
+        if contracts < min_sz:
             px = price
             if not px:
                 try:
                     px = float((await self._exchange.fetch_ticker(symbol)).get("last") or 0)
                 except Exception:
                     px = 0.0
-            needed = int(min_sz * px) + 1 if px else "more"
+            needed = int(min_sz * ct_val * (px or 1)) + 1
             raise ValueError(
-                f"Amount {amount:.6f} below OKX min {min_sz} for {symbol}. "
+                f"Contracts {contracts} < OKX min {min_sz} for {symbol}. "
                 f"Set TRADE_AMOUNT_USDT >= {needed}."
             )
 
-        # Validate SL/TP direction before sending to exchange
-        if side == "buy" and sl and tp and price:
-            if sl >= price:
-                raise ValueError(f"SL {sl:.2f} must be below entry {price:.2f}")
-            if tp <= price:
-                raise ValueError(f"TP {tp:.2f} must be above entry {price:.2f}")
+        # SL/TP direction validation
+        if sl and tp and price:
+            if position_side == "LONG":
+                if sl >= price:
+                    raise ValueError(f"LONG SL {sl:.2f} must be below entry {price:.2f}")
+                if tp <= price:
+                    raise ValueError(f"LONG TP {tp:.2f} must be above entry {price:.2f}")
+            else:
+                if sl <= price:
+                    raise ValueError(f"SHORT SL {sl:.2f} must be above entry {price:.2f}")
+                if tp >= price:
+                    raise ValueError(f"SHORT TP {tp:.2f} must be below entry {price:.2f}")
 
-        # Build main order — tdMode=cross ALWAYS for OKX Unified Account.
-        # tgtCcy=base_ccy: for market BUY, OKX default tgtCcy is quote_ccy (USDT),
-        # so OKX would interpret sz=0.001558 as $0.001558 USDT → error 51020.
+        pos_side = "long" if position_side == "LONG" else "short"
+
         req: dict = {
-            "instId": inst_id,
-            "tdMode": "cross",
-            "side": side,
+            "instId":  inst_id,
+            "tdMode":  "cross",
+            "side":    side,
+            "posSide": pos_side,   # hedge mode — required for both open and close
             "ordType": order_type,
-            "sz": sz_str,
-            "tgtCcy": "base_ccy",
+            "sz":      sz_str,
         }
         if order_type == "limit" and price:
             req["px"] = self._exchange.price_to_precision(symbol, price)
 
-        # A SELL on a spot/cross-margin long must REDUCE the position, never open a short.
-        # reduceOnly prevents OKX from borrowing to open a new short if balance allows it.
-        if side == "sell":
-            req["reduceOnly"] = True
-
-        # Attach TP/SL to the order atomically — OKX creates algo orders when order fills.
-        # Using attachAlgoOrds instead of a separate OCO call eliminates the race condition
-        # where the main order fills but the OCO call fails or times out.
-        if side == "buy" and tp and sl and tp > 0 and sl > 0:
+        # Attach TP/SL atomically on entry orders (opening a new position)
+        is_entry = (side == "buy" and position_side == "LONG") or \
+                   (side == "sell" and position_side == "SHORT")
+        if is_entry and tp and sl and tp > 0 and sl > 0:
             req["attachAlgoOrds"] = [{
                 "attachAlgoClOrdId": str(uuid.uuid4()).replace("-", "")[:32],
-                "tpTriggerPx": self._exchange.price_to_precision(symbol, tp),
-                "tpOrdPx": "-1",          # -1 = market order when TP triggers
+                "tpTriggerPx":     self._exchange.price_to_precision(symbol, tp),
+                "tpOrdPx":         "-1",   # market order when TP triggers
                 "tpTriggerPxType": "last",
-                "slTriggerPx": self._exchange.price_to_precision(symbol, sl),
-                "slOrdPx": "-1",          # -1 = market order when SL triggers
+                "slTriggerPx":     self._exchange.price_to_precision(symbol, sl),
+                "slOrdPx":         "-1",   # market order when SL triggers
                 "slTriggerPxType": "last",
             }]
-            _log.info("Order with attached TP=%.2f SL=%.2f", tp, sl)
+            _log.info("OKX %s %s contracts=%d TP=%.4f SL=%.4f",
+                      pos_side, side, contracts, tp, sl)
 
         resp = await self._exchange.privatePostTradeOrder(req)
         data_row = ((resp or {}).get("data") or [{}])[0]
         ord_id = data_row.get("ordId") or str(uuid.uuid4())
 
-        # Resolve actual fill price. A market order may not be filled the instant the
-        # POST returns, so poll fetch_order briefly. Never accept 0 as a fill price.
         exec_price = await self._resolve_fill_price(ord_id, symbol, price)
 
         return OrderResult(
@@ -278,7 +316,8 @@ class BinanceConnector(BaseConnector):
         ticker = await self.fetch_ticker(symbol)
         exec_price = price if (order_type == "limit" and price) else ticker["last"]
         base = symbol.split("/")[0]
-        quote = symbol.split("/")[1] if "/" in symbol else "USDT"
+        # Strip settlement suffix: "USDT:USDT" → "USDT"
+        quote = (symbol.split("/")[1] if "/" in symbol else "USDT").split(":")[0]
 
         if side == "buy":
             cost = amount * exec_price
@@ -357,12 +396,8 @@ class BinanceConnector(BaseConnector):
         """
         if self.paper or self._exchange_id != "okx":
             return None
-        if self.leverage <= 1:
-            # Spot trading: OKX positions API returns [] because no borrowing occurred.
-            # An empty set would wrongly signal "all positions closed". Return None.
-            return None
         try:
-            raw = await self._exchange.fetch_positions(params={"instType": "MARGIN"})
+            raw = await self._exchange.fetch_positions(params={"instType": "SWAP"})
             syms: set = set()
             for p in raw:
                 notional = p.get("notional") or p.get("initialMargin") or 0

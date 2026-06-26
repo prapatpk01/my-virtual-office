@@ -86,6 +86,7 @@ class BaseConnector(ABC):
     @abstractmethod
     async def create_order(self, symbol: str, side: str, amount: float,
                            order_type: str = "market", price: Optional[float] = None,
+                           tp: Optional[float] = None, sl: Optional[float] = None,
                            position_side: str = "LONG") -> OrderResult:
         """Place an order (or simulate if paper=True).
         position_side: 'LONG' | 'SHORT' — for futures hedge mode (OKX posSide).
