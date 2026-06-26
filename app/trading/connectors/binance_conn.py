@@ -374,4 +374,19 @@ class BinanceConnector(BaseConnector):
             return None
 
     async def close(self):
-        await self._exchange.close()
+        try:
+            await self._exchange.close()
+        except Exception as e:
+            _log.warning("Exchange close error (non-fatal): %s", e)
+        # CCXT's __del__ warns if session is not None — force-null it here so
+        # the warning never fires during Python GC after the event loop exits.
+        try:
+            sess = getattr(self._exchange, "session", None)
+            if sess is not None:
+                try:
+                    await sess.close()
+                except Exception:
+                    pass
+                self._exchange.session = None
+        except Exception:
+            pass

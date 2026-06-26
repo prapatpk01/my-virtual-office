@@ -249,8 +249,14 @@ async def main():
 
     try:
         await connector.close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Connector close error (non-fatal): %s", e)
+
+    # Give aiohttp's connection pool a moment to complete SSL teardown.
+    # Without this sleep the TCPConnector can still have open sockets when
+    # asyncio.run() exits, producing "Unclosed connector" noise in logs.
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.25)
 
     logger.info("Done.")
 
