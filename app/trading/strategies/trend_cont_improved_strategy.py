@@ -843,11 +843,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         vol_period=20, vol_mult=1.0,
         atr_period=14, sl_mult=1.2, sl_min_pct=0.012, sl_max_pct=0.035,
         adx_len=14, adx_min=30,
-        tp1_r=0.5, tp1_fraction=0.60, tp2_r=2.5,   # close 60% at TP1 (banks more profit early)
+        tp1_r=0.5, tp1_fraction=0.50, tp2_r=2.5,   # close 50% at TP1 (keep a bigger runner)
         min_score=5.0,   # 5/8 with sj_bos=True — backtest: +$103.94 vs 6/8=$62.64 (5/8 wins by $41)
         # Fast mode v2
         fast_mode=False,
-        adx_min_fast=18,          # ADX lower bound — trend must be active
+        adx_min_fast=15,          # ADX lower bound — trend must be active. Lowered 18→15
+                                  # (keep adx_rising_fast=True) to enter 1-2 bars earlier on
+                                  # a fresh trend; the "rising" gate still blocks dead chop.
         adx_max_fast=44,          # ADX upper bound — caps overheated entries. Backtest
                                   # peaks at 50, but 44 chosen to avoid entering when the
                                   # trend is already too hot/extended (risk preference).
@@ -1066,6 +1068,7 @@ class TrendContImprovedStrategy(BaseStrategy):
             long_layers  = f"4H{_y('d_macro_up')} 1H{_y('d_mid_up')} pull{_y('d_pull_l')} bias{_y('d_bias_l')} adx{_y('d_adx_ok')}"
             short_layers = f"4H{_y('d_macro_dn')} 1H{_y('d_mid_dn')} pull{_y('d_pull_s')} bias{_y('d_bias_s')} adx{_y('d_adx_ok')}"
             adx_max  = self._p.get("adx_max_fast", 50) if self._p.get("fast_mode") else 999
+            adx_min  = self._p.get("adx_min_fast", 18) if self._p.get("fast_mode") else self._p.get("adx_min", 30)
             sj_tag   = "[SJ]" if self._p.get("sj_scoring") else ""
             min_sc   = self._p.get("min_score", 4)
             # Count actually-enabled scoring components (5 SJ base + ROC9 + 3 extended)
@@ -1073,7 +1076,7 @@ class TrendContImprovedStrategy(BaseStrategy):
             n_comps  = sum(1 for v in _reg.values() if v.get("enabled", True)) or \
                        (5 if self._p.get("sj_scoring") else 4)
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
-                          f"[TCImproved{sj_tag}] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}(18-{adx_max:.0f}) "
+                          f"[TCImproved{sj_tag}] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}({adx_min:.0f}-{adx_max:.0f}) "
                           f"score={sc_l:.0f}L/{sc_s:.0f}S(need≥{min_sc:.0f}/{n_comps}) "
                           f"| L:{long_layers} | S:{short_layers}")
 
