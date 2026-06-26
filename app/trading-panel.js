@@ -55,6 +55,7 @@ class TradingPanel {
           <button class="tp-btn tp-btn-start" id="tp-start-btn">▶ Start</button>
           <button class="tp-btn tp-btn-stop" id="tp-stop-btn" disabled>■ Stop</button>
           <button class="tp-btn tp-btn-config" id="tp-config-btn">⚙ Config</button>
+          <button class="tp-btn tp-btn-logs" id="tp-logs-btn" title="View bot logs">📋 Logs</button>
         </div>
 
         <!-- Error banner -->
@@ -76,6 +77,17 @@ class TradingPanel {
         <div class="tp-section">
           <div class="tp-section-title">Recent Trades</div>
           <div id="tp-trades" class="tp-trades-list"></div>
+        </div>
+
+        <!-- Log viewer -->
+        <div class="tp-section" id="tp-log-section" style="display:none">
+          <div class="tp-section-title tp-log-header">
+            <span>Bot Logs</span>
+            <label class="tp-log-scroll-chk" title="Auto-scroll to bottom">
+              <input type="checkbox" id="tp-log-autoscroll" checked /> auto-scroll
+            </label>
+          </div>
+          <div id="tp-log-box" class="tp-log-box"></div>
         </div>
       </div>
 
@@ -174,6 +186,9 @@ class TradingPanel {
     $id('tp-modal-close').onclick = () => { $id('tp-config-modal').style.display = 'none'; };
     $id('tp-save-config').onclick = () => this._saveConfig();
     $id('tp-tg-test-btn').onclick = () => this._testTelegram();
+
+    // Logs toggle
+    $id('tp-logs-btn').onclick = () => this._toggleLogs();
 
     // Load saved config
     this._loadConfig();
@@ -377,6 +392,63 @@ class TradingPanel {
   }
 
   // -----------------------------------------------------------------------
+  // Log viewer
+  // -----------------------------------------------------------------------
+
+  _toggleLogs() {
+    const sec = document.getElementById('tp-log-section');
+    const btn = document.getElementById('tp-logs-btn');
+    const visible = sec.style.display !== 'none';
+    sec.style.display = visible ? 'none' : '';
+    btn.classList.toggle('tp-btn-logs-active', !visible);
+    if (!visible) {
+      this._fetchLogs();
+      if (!this._logPoll) {
+        this._logPoll = setInterval(() => this._fetchLogs(), 3000);
+      }
+    } else {
+      clearInterval(this._logPoll);
+      this._logPoll = null;
+    }
+  }
+
+  async _fetchLogs() {
+    try {
+      const res = await fetch('/api/trading/logs?limit=80');
+      const data = await res.json();
+      this._renderLogs(data.logs || []);
+    } catch {}
+  }
+
+  _renderLogs(logs) {
+    const box = document.getElementById('tp-log-box');
+    if (!box) return;
+    const autoScroll = document.getElementById('tp-log-autoscroll')?.checked;
+    const wasAtBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 8;
+
+    box.innerHTML = logs.map(entry => {
+      const d = new Date(entry.ts * 1000);
+      const hms = d.toTimeString().slice(0, 8);
+      const ms  = String(d.getMilliseconds()).padStart(3, '0');
+      const tsLabel = `${hms}.${ms}`;
+      const lvl = (entry.level || 'INFO').toUpperCase();
+      const lvlClass = lvl === 'ERROR' ? 'tl-err' : lvl === 'WARNING' ? 'tl-warn' : 'tl-info';
+      // Strip the repeated "YYYY-MM-DD HH:MM:SS [LEVEL] name: " prefix from msg for cleaner display
+      const msg = (entry.msg || '').replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[\w+\] [^:]+: /, '');
+      return `<div class="tl-entry">
+        <div class="tl-ts-row">
+          <span class="tl-ts">${tsLabel}</span>
+          <span class="tl-dot">●</span>
+          <span class="tl-svc">my-virtual-office</span>
+        </div>
+        <div class="tl-msg ${lvlClass}">${_escHtml(msg)}</div>
+      </div>`;
+    }).join('') || '<div class="tl-empty">No logs yet — start the bot to see activity</div>';
+
+    if (autoScroll && wasAtBottom) box.scrollTop = box.scrollHeight;
+  }
+
+  // -----------------------------------------------------------------------
   // Styles
   // -----------------------------------------------------------------------
 
@@ -479,9 +551,56 @@ class TradingPanel {
       .tp-checkboxes label { flex-direction: row; align-items: center; gap: 6px; }
       .tp-key-section { border-top: 1px solid #2d3748; padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
       .tp-modal-footer { padding: 10px 14px; border-top: 1px solid #2d3748; display: flex; justify-content: flex-end; }
+      /* Logs button */
+      .tp-btn-logs { background: #1a2744; color: #90cdf4; flex: none; }
+      .tp-btn-logs-active { background: #2c4a7a; color: #bee3f8; }
+      /* Log section header */
+      .tp-log-header { display: flex; justify-content: space-between; align-items: center; }
+      .tp-log-scroll-chk { font-size: 10px; color: #718096; cursor: pointer; display: flex; align-items: center; gap: 3px; text-transform: none; letter-spacing: 0; }
+      /* Log box — Railway-style dark terminal */
+      .tp-log-box {
+        background: #0d0f17; border: 1px solid #1e2235;
+        border-radius: 6px; height: 260px; overflow-y: auto;
+        padding: 4px 0; font-family: 'Courier New', monospace; font-size: 11px;
+      }
+      .tl-entry { border-bottom: 1px solid #111722; padding: 0; }
+      .tl-entry:last-child { border-bottom: none; }
+      /* Timestamp row — Railway orange/amber header style */
+      .tl-ts-row {
+        display: flex; align-items: center; gap: 5px;
+        padding: 3px 8px 1px;
+        color: #e07040;
+        font-size: 10px; letter-spacing: .2px;
+        background: #111420;
+      }
+      .tl-ts { color: #e07040; font-weight: bold; }
+      .tl-dot { color: #7a3a20; font-size: 8px; }
+      .tl-svc { color: #c05830; }
+      /* Log message */
+      .tl-msg {
+        padding: 2px 8px 4px 18px;
+        color: #c8d0e0; word-break: break-all;
+        white-space: pre-wrap; line-height: 1.45;
+      }
+      .tl-info { color: #c8d0e0; }
+      .tl-warn { color: #f6ad55; }
+      .tl-err  { color: #fc8181; }
+      .tl-empty { color: #4a5568; font-style: italic; padding: 12px 8px; text-align: center; }
+      /* Scrollbar styling for log box */
+      .tp-log-box::-webkit-scrollbar { width: 4px; }
+      .tp-log-box::-webkit-scrollbar-track { background: #0d0f17; }
+      .tp-log-box::-webkit-scrollbar-thumb { background: #2d3748; border-radius: 2px; }
     `;
     document.head.appendChild(style);
   }
+}
+
+function _escHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // Auto-initialise when DOM is ready

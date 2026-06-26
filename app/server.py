@@ -8146,6 +8146,16 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
+        elif self.path.startswith("/api/trading/logs"):
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+            limit = min(int(params.get("limit", 100)), 300)
+            result = trading_api.handle_get_logs(limit)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
         # ── PROJECTS API ────────────────────────────────────────────
         elif self.path == "/api/projects" or self.path.startswith("/api/projects?"):
             qs = self.path.split("?", 1)[1] if "?" in self.path else ""

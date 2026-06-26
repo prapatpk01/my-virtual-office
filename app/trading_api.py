@@ -3,6 +3,7 @@ Trading Bot API handlers.
 Called from server.py's do_GET / do_POST to manage the global bot instance.
 """
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -15,6 +16,39 @@ logger = logging.getLogger("trading_api")
 _bots: dict[str, Any] = {}
 _bot_lock = threading.Lock()
 _loop: Optional[asyncio.AbstractEventLoop] = None
+
+# ── In-memory log buffer ─────────────────────────────────────────────────────
+
+_LOG_BUF: collections.deque = collections.deque(maxlen=300)
+_log_buf_lock = threading.Lock()
+
+
+class _TradingLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            with _log_buf_lock:
+                _LOG_BUF.append({
+                    "ts": record.created,
+                    "level": record.levelname,
+                    "name": record.name,
+                    "msg": msg,
+                })
+        except Exception:
+            pass
+
+
+_log_handler = _TradingLogHandler()
+_log_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+# Capture logs from all trading-related loggers
+for _ln in ("trading_bot", "run_bot", "trading_api", "trading",
+            "trading.bot", "trading.connectors", "trading.strategies"):
+    _l = logging.getLogger(_ln)
+    if _log_handler not in _l.handlers:
+        _l.addHandler(_log_handler)
 
 
 def _get_or_create_loop() -> asyncio.AbstractEventLoop:
@@ -191,6 +225,12 @@ def handle_telegram_test(bot_key: str = "default") -> dict:
         return {"ok": True, "message": "Test message sent"}
     bot.telegram.notify("✅ *Trading Bot* — Telegram test message OK!")
     return {"ok": True, "message": "Test message sent"}
+
+
+def handle_get_logs(limit: int = 100) -> dict:
+    with _log_buf_lock:
+        entries = list(_LOG_BUF)[-limit:]
+    return {"logs": entries}
 
 
 def handle_manual_trade(body: dict, bot_key: str = "default") -> dict:
