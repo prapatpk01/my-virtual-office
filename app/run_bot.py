@@ -241,24 +241,44 @@ async def main():
         except (NotImplementedError, RuntimeError):
             pass
 
-    await bot.start()
-    await stop_event.wait()
-
-    logger.info("Stopping bot...")
-    await bot.stop()
-
     try:
-        await connector.close()
-    except Exception as e:
-        logger.warning("Connector close error (non-fatal): %s", e)
+        await bot.start()
+        await stop_event.wait()
+    finally:
+        logger.info("Stopping bot...")
+        try:
+            await bot.stop()
+        except Exception as e:
+            logger.warning("Bot stop error (non-fatal): %s", e)
 
-    # Give aiohttp's connection pool a moment to complete SSL teardown.
-    # Without this sleep the TCPConnector can still have open sockets when
-    # asyncio.run() exits, producing "Unclosed connector" noise in logs.
-    import asyncio as _asyncio
-    await _asyncio.sleep(0.25)
+        try:
+            await connector.close()
+        except Exception as e:
+            logger.warning("Connector close error (non-fatal): %s", e)
 
-    logger.info("Done.")
+        # Belt-and-suspenders: force-clear CCXT/aiohttp objects so their __del__
+        # never emits "Unclosed connector" or "requires .close()" during GC.
+        # This runs whether the bot exits cleanly OR crashes on startup.
+        _exc = getattr(connector, "_exchange", None)
+        if _exc is not None:
+            try:
+                _sess = getattr(_exc, "session", None)
+                if _sess is not None:
+                    _aio_conn = getattr(_sess, "_connector", None)
+                    if _aio_conn is not None and not getattr(_aio_conn, "_closed", True):
+                        await _aio_conn.close()
+                    _exc.session = None
+                _exc.socks_proxy_sessions = None
+                _tcp = getattr(_exc, "tcp_connector", None)
+                if _tcp is not None:
+                    if not getattr(_tcp, "_closed", True):
+                        await _tcp.close()
+                    _exc.tcp_connector = None
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+        logger.info("Done.")
 
 
 if __name__ == "__main__":

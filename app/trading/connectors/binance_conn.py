@@ -378,15 +378,10 @@ class BinanceConnector(BaseConnector):
             await self._exchange.close()
         except Exception as e:
             _log.warning("Exchange close error (non-fatal): %s", e)
-        # CCXT's __del__ warns if session is not None — force-null it here so
-        # the warning never fires during Python GC after the event loop exits.
+        # CCXT __del__ warns when session or socks_proxy_sessions is not None.
+        # Force-null both so GC never emits warnings if close() above was partial.
         try:
-            sess = getattr(self._exchange, "session", None)
-            if sess is not None:
-                try:
-                    await sess.close()
-                except Exception:
-                    pass
-                self._exchange.session = None
+            self._exchange.session = None
+            self._exchange.socks_proxy_sessions = None
         except Exception:
             pass
