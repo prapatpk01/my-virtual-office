@@ -850,9 +850,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         adx_min_fast=15,          # ADX lower bound — trend must be active. Lowered 18→15
                                   # (keep adx_rising_fast=True) to enter 1-2 bars earlier on
                                   # a fresh trend; the "rising" gate still blocks dead chop.
-        adx_max_fast=44,          # ADX upper bound — caps overheated entries. Backtest
-                                  # peaks at 50, but 44 chosen to avoid entering when the
-                                  # trend is already too hot/extended (risk preference).
+        adx_max_fast=45,          # ADX upper bound — caps overheated entries.
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
         pullback_pct_fast=0.025,  # fallback pct zone (used when pullback_atr_mult_fast=0)
         pullback_atr_mult_fast=1.2,  # 1H ATR×1.2 adaptive pullback zone (0=use pct fallback)
