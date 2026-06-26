@@ -642,13 +642,15 @@ class TradingBot:
                 await self.connector.create_order(
                     sym, close_side, amount, pos_side=pos_side, reduce_only=True)
             except Exception as e:
-                if trigger == "stop_loss":
-                    # OKX algo-SL fires before us at the same price level — safe to clean up state.
-                    logger.info("[%s] Close failed for stop_loss (OKX algo likely closed already): %s",
-                                strategy_name, e)
+                err_str = str(e)
+                # OKX 51169: "you don't have any positions" — exchange-side algo already closed it.
+                okx_no_pos = "51169" in err_str or "don't have any positions" in err_str.lower()
+                if trigger == "stop_loss" or okx_no_pos:
+                    logger.info("[%s] Close failed for %s (OKX already closed via algo order): %s",
+                                strategy_name, trigger, e)
+                    # Fall through — clean up internal state below.
                 else:
-                    # breakeven / take_profit2: OKX hasn't closed the position (its TP is at 3.0R).
-                    # Keep position in state so next tick retries.
+                    # Transient network/exchange error — retry next tick.
                     logger.warning("[%s] Close failed for %s — will retry next tick: %s",
                                    strategy_name, trigger, e)
                     return
@@ -707,6 +709,28 @@ class TradingBot:
             pos      = self.risk.get_position_obj(sym, strategy)
             if pos is None:
                 continue
+
+            # ── OKX position sync: detect positions closed externally (algo TP/SL) ──
+            # fetch_position_amount returns 0 if OKX has no position; clean up stale state.
+            if not self.paper:
+                try:
+                    actual_amt = await self.connector.fetch_position_amount(sym, pos.side)
+                    if actual_amt == 0.0:
+                        logger.warning(
+                            "[MONITOR] %s %s %s — OKX shows NO position (closed externally). "
+                            "Cleaning up internal state.",
+                            strategy, sym, pos.side.upper())
+                        self.risk.close_position(sym, strategy=strategy)
+                        self._sig.unlock_strategy(sym, strategy)
+                        if self.telegram:
+                            self.telegram.notify(
+                                f"⚠️ *Stale Position Cleared* `{sym}` {pos.side.upper()}\n"
+                                f"OKX shows no position — likely closed by exchange algo order.\n"
+                                f"Internal state cleaned up."
+                            )
+                        continue
+                except Exception as e:
+                    logger.warning("[MONITOR] %s %s position sync failed: %s", sym, sym, e)
 
             # Pre-fetch once per symbol across all TFs.
             # 15m is fetched for the Trend-Fade guard (ADX(15m) falling check).
