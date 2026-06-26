@@ -813,11 +813,16 @@ class TradingBot:
                 await self._close_spot_position(pos_key, price, reason)
                 continue
 
-            # Method 2: this position's SL/TP hit — sell its specific amount
+            # Method 2: this position's SL/TP hit — direction-aware
             if not pos.stop_loss and not pos.take_profit:
                 continue
-            hit_tp = bool(pos.take_profit and price >= pos.take_profit)
-            hit_sl = bool(pos.stop_loss  and price <= pos.stop_loss)
+            is_short = getattr(pos, "side", "long") == "short"
+            if is_short:
+                hit_tp = bool(pos.take_profit and price <= pos.take_profit)
+                hit_sl = bool(pos.stop_loss  and price >= pos.stop_loss)
+            else:
+                hit_tp = bool(pos.take_profit and price >= pos.take_profit)
+                hit_sl = bool(pos.stop_loss  and price <= pos.stop_loss)
             if hit_tp or hit_sl:
                 reason = "take_profit" if hit_tp else "stop_loss"
                 await self._close_spot_position(pos_key, price, reason)
