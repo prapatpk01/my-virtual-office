@@ -77,8 +77,11 @@ class TradingBot:
         self._positions: dict[str, Position] = {}
         self._position_lock = asyncio.Lock()
 
-        # Health monitor — checks every 15 min; blocks/closes on weak market
-        self._health = HealthMonitor(weak_bars_confirm=3)
+        # Per-symbol health monitors — each symbol tracked independently
+        _syms = list({s.symbol for s in strategies})
+        self._health: dict[str, HealthMonitor] = {
+            s: HealthMonitor(weak_bars_confirm=3) for s in _syms
+        }
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -269,14 +272,15 @@ class TradingBot:
                     pass  # each TF optional — strategies degrade gracefully
 
             # Pass health + spike guard into mtf so strategies can use them
-            mtf["health_score"] = self._health.last_score
-            mtf["spike_guard"]  = self._health.spike_guard_active
+            _h = self._health.get(sym) or HealthMonitor(weak_bars_confirm=3)
+            mtf["health_score"] = _h.last_score
+            mtf["spike_guard"]  = _h.spike_guard_active
 
             now_ms = int(time.time() * 1000)
 
             # ── Spike / whipsaw detection (every tick, 30-min cooldown) ──
             c30m = mtf.get("15m") or candles
-            sr   = self._health.check_spike(c30m, price, now_ms)
+            sr   = _h.check_spike(c30m, price, now_ms)
             if sr["detected"]:
                 spike_type = sr["type"]   # "v_spike" | "cascade" | "whipsaw"
                 reason     = sr["reason"]
@@ -316,10 +320,10 @@ class TradingBot:
                             f"→ บล็อก entry ใหม่ ถือ position เดิม"
                         )
 
-            # ── Health monitor (every 15 min) ─────────────────────────────
-            if self._health.should_check(now_ms) and mtf:
-                hr = self._health.update(mtf, now_ms)
-                await self._handle_health_action(hr, sym, price)
+            # ── Health monitor (every 15 min, per symbol) ─────────────────
+            if _h.should_check(now_ms) and mtf:
+                hr = _h.update(mtf, now_ms)
+                await self._handle_health_action(hr, sym, price, _h)
 
             if self._ai_chief:
                 # ── Chief mode: strategy exits first, then Chief decides ───
@@ -335,46 +339,50 @@ class TradingBot:
     # Health monitor actions
     # ------------------------------------------------------------------
 
-    async def _handle_health_action(self, hr: dict, sym: str, price: float):
-        """Act on health monitor result.
+    async def _handle_health_action(self, hr: dict, sym: str, price: float,
+                                     hm: "HealthMonitor"):
+        """Act on health monitor result for a specific symbol.
 
-        Railway log : every check (INFO always; WARNING on close actions)
+        Railway log : every check with sym= so each symbol is traceable
         Telegram    : ONLY on soft_close (weak confirmed) or hard_close
         """
         score  = hr["score"]
         label  = hr["label"]
         action = hr["action"]
 
-        # ── Railway log — always include sym so logs are traceable ──────────
-        open_pos = list(self._positions.keys()) or ["none"]
+        # ── Railway log ───────────────────────────────────────────────────
+        sym_positions = [k for k in self._positions if k.startswith(sym + "::")]
         if action in ("soft_close", "hard_close"):
-            logger.warning("[Health] score=%d (%s) → %s  sym=%s  positions=%s",
-                           score, label, action, sym, open_pos)
+            logger.warning("[Health][%s] score=%d (%s) → %s  open=%s",
+                           sym, score, label, action,
+                           sym_positions or ["none"])
         else:
-            logger.info("[Health] score=%d (%s) → %s  sym=%s  weak_streak=%d/%d",
-                        score, label, action, sym,
-                        self._health._weak_count, self._health._weak_bars_confirm)
+            logger.info("[Health][%s] score=%d (%s) → %s  weak_streak=%d/%d",
+                        sym, score, label, action,
+                        hm._weak_count, hm._weak_bars_confirm)
 
-        # ── Close actions ─────────────────────────────────────────────────
-        if action == "hard_close":
-            if self._positions and self.telegram:
+        # ── Close only this symbol's positions ────────────────────────────
+        if action in ("hard_close", "soft_close"):
+            affected = [k for k in list(self._positions.keys())
+                        if k.startswith(sym + "::")]
+            if affected and self.telegram:
+                emoji = "🔴" if action == "hard_close" else "🟠"
+                label_th = "STRONG WEAK" if action == "hard_close" else "WEAK CONFIRMED"
                 self.telegram.send(
-                    f"🔴 Health Monitor — STRONG WEAK\n"
+                    f"{emoji} Health [{sym}] — {label_th}\n"
                     f"Score: {score}/100\n"
-                    f"→ ปิดทุก position ทันที"
+                    f"→ ปิด position ของ {sym}"
                 )
-            await self._close_all_positions_health(
-                price, f"Health hard_close score={score}")
-
-        elif action == "soft_close":
-            if self._positions and self.telegram:
-                self.telegram.send(
-                    f"🟠 Health Monitor — WEAK CONFIRMED\n"
-                    f"Score: {score}/100  (weak ×{self._health._weak_count})\n"
-                    f"→ ปิดทุก position"
+            for pos_key in affected:
+                try:
+                    ticker = await self.connector.fetch_ticker(sym)
+                    sym_price = float(ticker["last"])
+                except Exception:
+                    sym_price = price
+                await self._execute_sell_early(
+                    pos_key, sym_price,
+                    f"Health {action} score={score}", "HealthMonitor"
                 )
-            await self._close_all_positions_health(
-                price, f"Health soft_close score={score} streak={self._health._weak_count}")
 
     async def _close_all_positions_health(self, price: float, reason: str):
         for pos_key in list(self._positions.keys()):
@@ -522,10 +530,11 @@ class TradingBot:
             if pos_key in self._positions or len(self._positions) >= self.max_positions:
                 continue
 
-            # Block new entries when market health is weak or worse
-            if self._health.last_label in ("weak", "strong_weak"):
-                logger.debug("[Health] entry blocked for %s (label=%s score=%d)",
-                             strategy.name, self._health.last_label, self._health.last_score)
+            # Block new entries when this symbol's health is weak or worse
+            _sym_h = self._health.get(strategy.symbol)
+            if _sym_h and _sym_h.last_label in ("weak", "strong_weak"):
+                logger.debug("[Health][%s] entry blocked (label=%s score=%d)",
+                             strategy.symbol, _sym_h.last_label, _sym_h.last_score)
                 continue
 
             sl_p = meta.get("stop_loss")
