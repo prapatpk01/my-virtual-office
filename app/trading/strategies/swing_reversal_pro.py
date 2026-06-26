@@ -329,14 +329,16 @@ class SwingReversalPro(BaseStrategy):
         self.name           = (f"{self.__class__.__name__}_"
                                f"{'L' if self.direction == 'long' else 'S'}")
 
-        self._in_position   = False
-        self._pos_side      = self.direction.upper()
-        self._entry_price   = 0.0
-        self._tp1_price     = 0.0
-        self._tp1_hit       = False
-        self._bars_in_trade = 0
-        self._last_bar_ts   = 0
-        self._last_diag: dict = {}
+        self._in_position       = False
+        self._pos_side          = self.direction.upper()
+        self._entry_price       = 0.0
+        self._tp1_price         = 0.0
+        self._tp1_hit           = False
+        self._bars_in_trade     = 0
+        self._last_bar_ts       = 0
+        self._cooldown_bars_left = 0
+        self._loss_cooldown     = int(self.params.get("loss_cooldown", 3))
+        self._last_diag: dict   = {}
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -529,6 +531,8 @@ class SwingReversalPro(BaseStrategy):
                 self._tp1_hit       = False
                 self._bars_in_trade = 0
                 self._entry_price   = 0.0
+                if "Time" in exit_reason or "health=" in exit_reason:
+                    self._cooldown_bars_left = self._loss_cooldown
                 diag["in_position"]   = False
                 diag["bars_in_trade"] = 0
                 diag["block_reason"]  = f"exit:{exit_reason}"
@@ -547,6 +551,19 @@ class SwingReversalPro(BaseStrategy):
                           f"[{self.name}] Hold {self._pos_side} "
                           f"bars={self._bars_in_trade} "
                           f"tp1={'✓' if self._tp1_hit else '○'}")
+
+        # ── Cooldown tracking (not in position) ──────────────────────────
+        bar_ts_now = int(c15m[n].timestamp)
+        if bar_ts_now != self._last_bar_ts:
+            self._last_bar_ts = bar_ts_now
+            if self._cooldown_bars_left > 0:
+                self._cooldown_bars_left -= 1
+
+        if self._cooldown_bars_left > 0:
+            diag["block_reason"] = f"cooldown {self._cooldown_bars_left}bars"
+            self._last_diag = diag
+            return Signal(_HOLD, self.symbol, cp, 0,
+                          f"[{self.name}] cooldown {self._cooldown_bars_left}bars left")
 
         # ─────────────────────────────────────────────────────────────────
         # Entry Modes  (try A → B → C in order)
@@ -996,6 +1013,14 @@ class SwingReversalPro(BaseStrategy):
         else:
             score += 1; passed.append("EMAslope?")
 
+        # [7] ATR regime: 1H/4H ATR ratio in healthy range (not over-volatile vs structure)
+        if not math.isnan(atr14_1h) and not math.isnan(atr14_4h) and atr14_4h > 0:
+            ratio = atr14_1h / atr14_4h
+            if 0.08 <= ratio <= 0.60:
+                score += 1; passed.append(f"ATRreg={ratio:.2f}")
+        else:
+            score += 1; passed.append("ATRreg?")
+
         return score, passed
 
     # ── Layer 3: Price Action Trigger ─────────────────────────────────────────
@@ -1090,6 +1115,13 @@ class SwingReversalPro(BaseStrategy):
                     return f"RSI>{rsi14:.0f}(post-TP1)"
                 if not lng and rsi14 < 22:
                     return f"RSI<{rsi14:.0f}(post-TP1)"
+            # Breakeven stop: protect TP1 profit if price retreats to entry zone
+            if self._entry_price > 0 and atr14 > 0:
+                be_buf = 0.3 * atr14
+                if lng and cp <= self._entry_price + be_buf:
+                    return f"BEStop(entry={self._entry_price:.2f})"
+                if not lng and cp >= self._entry_price - be_buf:
+                    return f"BEStop(entry={self._entry_price:.2f})"
 
         # [4] Time exit — cut stale trade with no progress
         if not self._tp1_hit and self._bars_in_trade >= self.max_bars:

@@ -374,6 +374,14 @@ class TradingBot:
                     f"→ ปิด position ของ {sym}"
                 )
             for pos_key in affected:
+                pos = self._positions.get(pos_key)
+                if pos is None:
+                    continue
+                if getattr(pos, "side", "long") == "short":
+                    # Keep SHORT positions — bearish health supports short-side PnL
+                    logger.debug("[Health][%s] SHORT pos %s kept (bearish health)",
+                                 sym, pos_key)
+                    continue
                 try:
                     ticker = await self.connector.fetch_ticker(sym)
                     sym_price = float(ticker["last"])
@@ -530,12 +538,14 @@ class TradingBot:
             if pos_key in self._positions or len(self._positions) >= self.max_positions:
                 continue
 
-            # Block new entries when this symbol's health is weak or worse
+            # Block new LONG entries when this symbol's health is weak or worse.
+            # SHORT entries proceed — bearish health supports short-side trades.
             _sym_h = self._health.get(strategy.symbol)
             if _sym_h and _sym_h.last_label in ("weak", "strong_weak"):
-                logger.debug("[Health][%s] entry blocked (label=%s score=%d)",
-                             strategy.symbol, _sym_h.last_label, _sym_h.last_score)
-                continue
+                if ps == "LONG":
+                    logger.debug("[Health][%s] LONG entry blocked (label=%s score=%d)",
+                                 strategy.symbol, _sym_h.last_label, _sym_h.last_score)
+                    continue
 
             sl_p = meta.get("stop_loss")
             tp_p = meta.get("take_profit")
