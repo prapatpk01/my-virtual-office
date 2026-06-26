@@ -227,6 +227,28 @@ def handle_telegram_test(bot_key: str = "default") -> dict:
     return {"ok": True, "message": "Test message sent"}
 
 
+def handle_get_scan(bot_key: str = "default") -> dict:
+    """Return per-strategy scanner diagnostics (latest _last_diag from each strategy)."""
+    with _bot_lock:
+        bot = _bots.get(bot_key)
+    if not bot:
+        return {"ok": False, "error": "Bot not started", "scans": []}
+    scans = []
+    for strategy in bot.strategies:
+        diag = getattr(strategy, "_last_diag", {})
+        if diag:
+            # Convert nan floats to None for JSON serialisation
+            clean = {}
+            for k, v in diag.items():
+                try:
+                    import math
+                    clean[k] = None if isinstance(v, float) and math.isnan(v) else v
+                except Exception:
+                    clean[k] = v
+            scans.append(clean)
+    return {"ok": True, "scans": scans}
+
+
 def handle_get_logs(limit: int = 100) -> dict:
     with _log_buf_lock:
         entries = list(_LOG_BUF)[-limit:]

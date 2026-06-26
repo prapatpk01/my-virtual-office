@@ -336,6 +336,7 @@ class SwingReversalPro(BaseStrategy):
         self._tp1_hit       = False
         self._bars_in_trade = 0
         self._last_bar_ts   = 0
+        self._last_diag: dict = {}
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -349,7 +350,24 @@ class SwingReversalPro(BaseStrategy):
         c4h  = mtf.get("4h",  [])
         n    = len(c15m) - 1
 
+        # Scanner diagnostic — updated as each condition is evaluated
+        diag: dict = {
+            "symbol": self.symbol, "direction": self.direction,
+            "ts": int(c15m[n].timestamp) if n >= 0 else 0,
+            "in_position": self._in_position, "bars_in_trade": self._bars_in_trade,
+            "tp1_hit": self._tp1_hit,
+            "trend_4h": "range", "adx14": float("nan"), "adx_rising": None,
+            "adx_prev": float("nan"), "rsi_15m": float("nan"),
+            "rsi_1h": float("nan"), "rsi_4h": float("nan"),
+            "health": 100, "mtf_bias": 0.0, "is_trending": False,
+            "l1_score": 0, "l1_thresh": self.l1_min_score,
+            "l2_score": 0, "l2_thresh": self.l2_min_pass,
+            "rsi_at_extreme": False, "entry_mode": None, "block_reason": "warmup",
+        }
+
         if n < _WARMUP_15M:
+            diag["block_reason"] = f"warmup {n}/{_WARMUP_15M}"
+            self._last_diag = diag
             return Signal(_HOLD, self.symbol, cp, 0,
                           f"[{self.name}] warmup ({n}/{_WARMUP_15M})")
 
@@ -381,16 +399,26 @@ class SwingReversalPro(BaseStrategy):
         volma20_arr = self.sma(vol, 20)
         volma20     = float(volma20_arr[n])
 
+        diag["adx14"]   = adx14
+        diag["rsi_15m"] = rsi14
+
         # Minimum momentum gate
         if not math.isnan(adx14) and adx14 < self.adx_no_trade:
+            diag["block_reason"] = f"ADX={adx14:.1f}<{self.adx_no_trade}"
+            self._last_diag = diag
             return Signal(_HOLD, self.symbol, cp, 0,
                           f"[{self.name}] ADX={adx14:.1f}<{self.adx_no_trade}")
         # Rising ADX gate (optional)
         if self.adx_must_rise and not math.isnan(adx14) and n >= self.adx_rise_bars:
             adx_prev = float(adx_arr[n - self.adx_rise_bars])
-            if not math.isnan(adx_prev) and adx14 <= adx_prev:
-                return Signal(_HOLD, self.symbol, cp, 0,
-                              f"[{self.name}] ADX not rising ({adx14:.1f}<={adx_prev:.1f})")
+            diag["adx_prev"] = adx_prev
+            if not math.isnan(adx_prev):
+                diag["adx_rising"] = adx14 > adx_prev
+                if adx14 <= adx_prev:
+                    diag["block_reason"] = f"ADX not rising {adx14:.1f}<={adx_prev:.1f}"
+                    self._last_diag = diag
+                    return Signal(_HOLD, self.symbol, cp, 0,
+                                  f"[{self.name}] ADX not rising ({adx14:.1f}<={adx_prev:.1f})")
 
         # ── 1H context ────────────────────────────────────────────────────
         n1h      = len(c1h) - 1
@@ -446,25 +474,37 @@ class SwingReversalPro(BaseStrategy):
                 elif trend_4h == "bear" and rsi14_4h > 55:
                     trend_4h = "range"
 
+        diag["rsi_1h"]   = rsi14_1h
+        diag["rsi_4h"]   = rsi14_4h
+        diag["trend_4h"] = trend_4h
+
         health_score = int(mtf.get("health_score", 100))
         mtf_bias, _  = self.compute_mtf_bias(c15m, {"1h": c1h, "4h": c4h})
         spike_guard  = bool(mtf.get("spike_guard", False))
         lng          = self.direction == "long"
+
+        diag["health"]   = health_score
+        diag["mtf_bias"] = round(mtf_bias, 1)
 
         # ── 4H Trend Gate ─────────────────────────────────────────────────
         # Block new entries that fight the 4H trend.
         # In ranging market: allow reversal (A) and breakout (C) only.
         if lng and trend_4h == "bear":
             if not self._in_position:
+                diag["block_reason"] = "4H=bear LONG blocked"
+                self._last_diag = diag
                 return Signal(_HOLD, self.symbol, cp, 0,
                               f"[{self.name}] 4H=bear — LONG blocked")
         if not lng and trend_4h == "bull":
             if not self._in_position:
+                diag["block_reason"] = "4H=bull SHORT blocked"
+                self._last_diag = diag
                 return Signal(_HOLD, self.symbol, cp, 0,
                               f"[{self.name}] 4H=bull — SHORT blocked")
 
         # ── Early exit (if in position) ───────────────────────────────────
         if self._in_position:
+            diag["in_position"] = True
             # Count bars since entry (via candle timestamp changes)
             bar_ts = int(c15m[n].timestamp)
             if bar_ts != self._last_bar_ts:
@@ -489,12 +529,20 @@ class SwingReversalPro(BaseStrategy):
                 self._tp1_hit       = False
                 self._bars_in_trade = 0
                 self._entry_price   = 0.0
+                diag["in_position"]   = False
+                diag["bars_in_trade"] = 0
+                diag["block_reason"]  = f"exit:{exit_reason}"
+                self._last_diag = diag
                 return Signal(
                     _SELL, self.symbol, cp, 0,
                     reason=f"[{self.name}] Exit: {exit_reason}",
                     metadata={"position_side": self._pos_side,
                               "action": "close", "exit_reason": exit_reason},
                 )
+            diag["bars_in_trade"] = self._bars_in_trade
+            diag["tp1_hit"]       = self._tp1_hit
+            diag["block_reason"]  = f"holding {self._pos_side} {self._bars_in_trade}bars"
+            self._last_diag = diag
             return Signal(_HOLD, self.symbol, cp, 0,
                           f"[{self.name}] Hold {self._pos_side} "
                           f"bars={self._bars_in_trade} "
@@ -514,6 +562,8 @@ class SwingReversalPro(BaseStrategy):
         l1_thresh    = self.l1_min_score
         l2_thresh    = self.l2_min_pass
 
+        diag["is_trending"] = is_trending
+
         # ── Mode A: Reversal (RSI gate → L1 ≥ L1_thresh → L2 ≥ L2_thresh → L3) ──
         # Two-tier gate:
         #   Level: RSI still in extreme zone (< rsi_entry_long / > rsi_entry_short)
@@ -530,6 +580,8 @@ class SwingReversalPro(BaseStrategy):
                        and rsi14 > self.rsi_entry_short - 4)))
         rsi_at_extreme = rsi_level or rsi_cross
 
+        diag["rsi_at_extreme"] = rsi_at_extreme
+
         l1, l1_reasons = (0, [])
         if rsi_at_extreme:
             l1, l1_reasons = self._layer1(
@@ -537,12 +589,17 @@ class SwingReversalPro(BaseStrategy):
                 rsi14, list(rsi14_arr), hma20_arr, adx_arr,
                 ema50, atr14, volma20)
 
+        diag["l1_score"] = l1
+        l2 = 0
+
         if l1 >= l1_thresh:
             l2, l2_reasons = self._layer2(
                 cp, rsi14_1h, adx_4h, atr14_4h,
                 hi4h, lo4h, n4h, has_4h,
                 mtf_bias, ema20_1h, n1h, has_1h,
                 atr14_1h, volma_1h)
+
+            diag["l2_score"] = l2
 
             if l2 >= l2_thresh:
                 trigger, trigger_name, priority = self._layer3(
@@ -581,7 +638,11 @@ class SwingReversalPro(BaseStrategy):
 
         # Mode C (breakout) removed — low WR, adds noise.
 
+        diag["entry_mode"] = entry_mode
+
         if entry_mode is None:
+            diag["block_reason"] = f"no_entry 4H={trend_4h} L1={l1}/{l1_thresh}"
+            self._last_diag = diag
             return Signal(_HOLD, self.symbol, cp, 0,
                           f"[{self.name}] 4H={trend_4h} "
                           f"L1={l1}/{l1_thresh} no_entry")
@@ -595,6 +656,10 @@ class SwingReversalPro(BaseStrategy):
         self._tp1_hit       = False
         self._bars_in_trade = 0
         self._last_bar_ts   = int(c15m[n].timestamp)
+
+        diag["in_position"]  = True
+        diag["block_reason"] = f"entry_mode={entry_mode}"
+        self._last_diag = diag
 
         confidence = {"A": 0.72, "B": 0.78, "C": 0.68}.get(entry_mode, 0.70)
 

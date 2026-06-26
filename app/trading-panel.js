@@ -56,6 +56,7 @@ class TradingPanel {
           <button class="tp-btn tp-btn-stop" id="tp-stop-btn" disabled>■ Stop</button>
           <button class="tp-btn tp-btn-config" id="tp-config-btn">⚙ Config</button>
           <button class="tp-btn tp-btn-logs" id="tp-logs-btn" title="View bot logs">📋 Logs</button>
+          <button class="tp-btn tp-btn-scan" id="tp-scan-btn" title="Symbol scanner">🔍 Scan</button>
         </div>
 
         <!-- Error banner -->
@@ -88,6 +89,12 @@ class TradingPanel {
             </label>
           </div>
           <div id="tp-log-box" class="tp-log-box"></div>
+        </div>
+
+        <!-- Symbol scanner -->
+        <div class="tp-section" id="tp-scan-section" style="display:none">
+          <div class="tp-section-title">Symbol Scan — Condition Checklist</div>
+          <div id="tp-scan-box" class="tp-scan-box"></div>
         </div>
       </div>
 
@@ -189,6 +196,9 @@ class TradingPanel {
 
     // Logs toggle
     $id('tp-logs-btn').onclick = () => this._toggleLogs();
+
+    // Scan toggle
+    $id('tp-scan-btn').onclick = () => this._toggleScan();
 
     // Load saved config
     this._loadConfig();
@@ -449,6 +459,140 @@ class TradingPanel {
   }
 
   // -----------------------------------------------------------------------
+  // Symbol scanner
+  // -----------------------------------------------------------------------
+
+  _toggleScan() {
+    const sec = document.getElementById('tp-scan-section');
+    const btn = document.getElementById('tp-scan-btn');
+    const visible = sec.style.display !== 'none';
+    sec.style.display = visible ? 'none' : '';
+    btn.classList.toggle('tp-btn-scan-active', !visible);
+    if (!visible) {
+      this._fetchScan();
+      if (!this._scanPoll) {
+        this._scanPoll = setInterval(() => this._fetchScan(), 5000);
+      }
+    } else {
+      clearInterval(this._scanPoll);
+      this._scanPoll = null;
+    }
+  }
+
+  async _fetchScan() {
+    try {
+      const res = await fetch('/api/trading/scan');
+      const data = await res.json();
+      this._renderScan(data.scans || [], data.error);
+    } catch {}
+  }
+
+  _renderScan(scans, error) {
+    const box = document.getElementById('tp-scan-box');
+    if (!box) return;
+    if (error || !scans.length) {
+      box.innerHTML = `<div class="tp-empty">${_escHtml(error || 'No scanner data yet — start the bot')}</div>`;
+      return;
+    }
+
+    const fmt = v => (v == null ? '?' : typeof v === 'number' ? v.toFixed(1) : v);
+    const ck = (pass, label) => `<span class="sc-check ${pass ? 'sc-pass' : 'sc-fail'}">${pass ? '✓' : '✗'}</span> <span class="sc-lbl">${label}</span>`;
+    const na = label => `<span class="sc-check sc-na">–</span> <span class="sc-lbl sc-na-lbl">${label}</span>`;
+
+    box.innerHTML = scans.map(d => {
+      const dir  = d.direction === 'long' ? '▲ LONG' : '▼ SHORT';
+      const dirCls = d.direction === 'long' ? 'sc-long' : 'sc-short';
+
+      // Position state
+      let stateHtml = '';
+      if (d.in_position) {
+        const tp1Badge = d.tp1_hit ? '<span class="sc-tp1">TP1✓</span>' : '';
+        stateHtml = `<div class="sc-state sc-state-in">IN POSITION — ${d.bars_in_trade} bars ${tp1Badge}</div>`;
+      } else {
+        stateHtml = `<div class="sc-state sc-state-wait">WAITING FOR ENTRY</div>`;
+      }
+
+      // 4H trend
+      const trendOk = (d.direction === 'long' && d.trend_4h === 'bull') ||
+                      (d.direction === 'short' && d.trend_4h === 'bear') ||
+                      d.trend_4h === 'range';
+      const trendLabel = `4H trend: ${d.trend_4h || '?'}`;
+
+      // ADX
+      const adxVal = d.adx14 != null ? d.adx14.toFixed(1) : '?';
+      const adxOk  = d.adx14 != null && d.adx14 >= (d.adx_thresh || 0);
+      let adxRisingHtml = '';
+      if (d.adx_rising != null) {
+        const prevVal = d.adx_prev != null ? d.adx_prev.toFixed(1) : '?';
+        adxRisingHtml = `<div class="sc-item">${ck(d.adx_rising, `ADX rising (${adxVal}>${prevVal})`)}</div>`;
+      }
+
+      // RSI values
+      const rsi15m = fmt(d.rsi_15m);
+      const rsi1h  = fmt(d.rsi_1h);
+      const rsi4h  = fmt(d.rsi_4h);
+      const rsiExtrOk = !!d.rsi_at_extreme;
+      const rsiGate = d.direction === 'long'
+        ? `RSI 15m=${rsi15m} (need <42)`
+        : `RSI 15m=${rsi15m} (need >58)`;
+
+      // Mode A progress
+      const l1Ok = d.l1_score >= d.l1_thresh;
+      const l2Ok = d.l2_score >= d.l2_thresh;
+      const modeAHtml = d.rsi_at_extreme
+        ? `<div class="sc-item">${ck(l1Ok, `L1 reversal score ${d.l1_score}/${d.l1_thresh}`)}</div>` +
+          (l1Ok ? `<div class="sc-item">${ck(l2Ok, `L2 context score ${d.l2_score}/${d.l2_thresh}`)}</div>` : '') +
+          (l1Ok && l2Ok ? `<div class="sc-item sc-sub"><span class="sc-check sc-wait">◉</span> <span class="sc-lbl">Waiting for L3 trigger (CHOCH/BOS/pattern)</span></div>` : '')
+        : `<div class="sc-item">${ck(false, rsiGate)}</div>`;
+
+      // Mode B (trending only)
+      const modeBHtml = d.is_trending
+        ? `<div class="sc-item sc-sub">${na('Mode B: 1H EMA20 bounce (rsi1h=' + rsi1h + ')')}</div>`
+        : '';
+
+      // Mode D
+      const modeDHtml = `<div class="sc-item sc-sub">${na('Mode D: RSI divergence @ 4H S/R')}</div>`;
+
+      // Block reason
+      const blockRaw = d.block_reason || '';
+      const blockTrimmed = blockRaw.replace(/^(no_entry\s*)?/, '').trim();
+      const blockHtml = d.in_position ? '' :
+        blockTrimmed ? `<div class="sc-block">⊘ ${_escHtml(blockTrimmed)}</div>` : '';
+
+      // Active entry mode badge
+      const modeBadge = d.entry_mode
+        ? `<span class="sc-mode-badge">Mode ${d.entry_mode} TRIGGERED</span>`
+        : '';
+
+      return `<div class="sc-card">
+        <div class="sc-card-header">
+          <span class="sc-sym">${_escHtml(d.symbol)}</span>
+          <span class="sc-dir ${dirCls}">${dir}</span>
+          ${modeBadge}
+        </div>
+        ${stateHtml}
+        <div class="sc-grid">
+          <div class="sc-group">
+            <div class="sc-group-title">Market Conditions</div>
+            <div class="sc-item">${ck(trendOk, trendLabel)}</div>
+            <div class="sc-item">${ck(adxOk, `ADX=${adxVal}`)}</div>
+            ${adxRisingHtml}
+            <div class="sc-item sc-sub">${na(`1H RSI=${rsi1h}  4H RSI=${rsi4h}  Health=${d.health ?? '?'}`)}</div>
+          </div>
+          <div class="sc-group">
+            <div class="sc-group-title">Entry Modes</div>
+            <div class="sc-group-subtitle">Mode A (Reversal)</div>
+            ${modeAHtml}
+            ${modeBHtml}
+            ${modeDHtml}
+          </div>
+        </div>
+        ${blockHtml}
+      </div>`;
+    }).join('');
+  }
+
+  // -----------------------------------------------------------------------
   // Styles
   // -----------------------------------------------------------------------
 
@@ -590,6 +734,39 @@ class TradingPanel {
       .tp-log-box::-webkit-scrollbar { width: 4px; }
       .tp-log-box::-webkit-scrollbar-track { background: #0d0f17; }
       .tp-log-box::-webkit-scrollbar-thumb { background: #2d3748; border-radius: 2px; }
+      /* Scan button */
+      .tp-btn-scan { background: #1a2744; color: #d6bcfa; flex: none; }
+      .tp-btn-scan-active { background: #44337a; color: #e9d8fd; }
+      /* Scanner box */
+      .tp-scan-box { display: flex; flex-direction: column; gap: 6px; }
+      .sc-card {
+        background: #1a1d2e; border: 1px solid #2d3748; border-radius: 7px;
+        padding: 8px 10px; font-size: 11px;
+      }
+      .sc-card-header { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+      .sc-sym { font-weight: bold; color: #f6e05e; font-size: 12px; }
+      .sc-dir { font-weight: bold; font-size: 10px; padding: 1px 5px; border-radius: 3px; }
+      .sc-long  { background: #1c4532; color: #68d391; }
+      .sc-short { background: #4a1e1e; color: #fc8181; }
+      .sc-mode-badge { margin-left: auto; background: #553c9a; color: #e9d8fd; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: bold; }
+      .sc-state { padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-bottom: 6px; }
+      .sc-state-in   { background: #1c4532; color: #68d391; }
+      .sc-state-wait { background: #1a2744; color: #90cdf4; }
+      .sc-tp1 { margin-left: 6px; background: #276749; color: #9ae6b4; padding: 0 4px; border-radius: 3px; font-size: 9px; }
+      .sc-grid { display: flex; flex-direction: column; gap: 6px; }
+      .sc-group { background: #252840; border-radius: 5px; padding: 6px 8px; }
+      .sc-group-title { font-size: 9px; color: #718096; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; font-weight: bold; }
+      .sc-group-subtitle { font-size: 9px; color: #553c9a; text-transform: uppercase; margin: 4px 0 2px; }
+      .sc-item { display: flex; align-items: center; gap: 4px; padding: 1px 0; line-height: 1.4; }
+      .sc-item.sc-sub { padding-left: 10px; opacity: .8; }
+      .sc-check { font-size: 12px; min-width: 14px; text-align: center; }
+      .sc-pass { color: #68d391; }
+      .sc-fail { color: #fc8181; }
+      .sc-wait { color: #f6ad55; }
+      .sc-na   { color: #4a5568; }
+      .sc-lbl { color: #a0aec0; font-size: 10px; }
+      .sc-na-lbl { color: #4a5568; }
+      .sc-block { margin-top: 5px; background: #2d1515; color: #fc8181; padding: 3px 6px; border-radius: 4px; font-size: 10px; }
     `;
     document.head.appendChild(style);
   }
