@@ -345,17 +345,15 @@ class TradingBot:
         label  = hr["label"]
         action = hr["action"]
 
-        # ── Railway log — always (level depends on severity) ──────────────
+        # ── Railway log — always include sym so logs are traceable ──────────
         open_pos = list(self._positions.keys()) or ["none"]
         if action in ("soft_close", "hard_close"):
-            logger.warning("[Health] score=%d (%s) → %s  weak_streak=%d/%d  positions=%s",
-                           score, label, action,
-                           self._health._weak_count, self._health._weak_bars_confirm,
-                           open_pos)
+            logger.warning("[Health] score=%d (%s) → %s  sym=%s  positions=%s",
+                           score, label, action, sym, open_pos)
         else:
-            logger.info("[Health] score=%d (%s) → %s  weak_streak=%d/%d  sym=%s",
-                        score, label, action,
-                        self._health._weak_count, self._health._weak_bars_confirm, sym)
+            logger.info("[Health] score=%d (%s) → %s  sym=%s  weak_streak=%d/%d",
+                        score, label, action, sym,
+                        self._health._weak_count, self._health._weak_bars_confirm)
 
         # ── Close actions ─────────────────────────────────────────────────
         if action == "hard_close":
