@@ -80,7 +80,8 @@ class AlpacaConnector(BaseConnector):
     # ------------------------------------------------------------------
 
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: Optional[float] = None) -> OrderResult:
+                           order_type: str = "market", price: Optional[float] = None,
+                           tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> OrderResult:
         payload: dict = {
             "symbol": symbol,
             "qty": str(amount),

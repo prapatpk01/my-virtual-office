@@ -55,8 +55,15 @@ class BaseConnector(ABC):
 
     @abstractmethod
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: Optional[float] = None) -> OrderResult:
-        """Place an order (or simulate if paper=True)."""
+                           order_type: str = "market", price: Optional[float] = None,
+                           tp_price: Optional[float] = None,
+                           sl_price: Optional[float] = None,
+                           pos_side: str = "") -> OrderResult:
+        """Place an order (or simulate if paper=True).
+
+        tp_price / sl_price — attach TP/SL inline (OKX keeps them active offline).
+        pos_side — "long" | "short" | "" (OKX futures hedge mode only).
+        """
 
     @abstractmethod
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
@@ -69,6 +76,10 @@ class BaseConnector(ABC):
     @abstractmethod
     async def fetch_balance(self) -> list[Balance]:
         """Get account balances."""
+
+    async def contract_size(self, symbol: str) -> float:
+        """Base-asset units per contract (1.0 for spot / non-contract venues)."""
+        return 1.0
 
     @property
     def name(self) -> str:

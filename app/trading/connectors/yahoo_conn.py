@@ -6,6 +6,7 @@ Supported symbols:
   XAUUSD, EURUSD, USDJPY, GBPUSD, USDCHF, AUDUSD, USDCAD, NZDUSD
 """
 import asyncio
+import os
 import time
 from typing import List
 import numpy as np
@@ -63,7 +64,8 @@ class YahooConnector(BaseConnector):
     def __init__(self, **kwargs):
         super().__init__(api_key="", api_secret="", paper=True)
         self._price_cache: dict = {}
-        self._paper_balance = {"USDT": 10000.0}
+        _bal = float(os.environ.get("PAPER_BALANCE", "10000"))
+        self._paper_balance = {"USDT": _bal}
         self._paper_open_orders: list[OrderResult] = []
 
     def _yf_symbol(self, symbol: str) -> str:
@@ -113,7 +115,9 @@ class YahooConnector(BaseConnector):
         return {"last": price, "symbol": symbol}
 
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: float = None) -> OrderResult:
+                           order_type: str = "market", price: float = None,
+                           tp_price: float = None, sl_price: float = None,
+                           pos_side: str = "") -> OrderResult:
         exec_price = self._price_cache.get(symbol, price or 0.0)
         quote = symbol.split("/")[1] if "/" in symbol else "USDT"
         import uuid as _uuid

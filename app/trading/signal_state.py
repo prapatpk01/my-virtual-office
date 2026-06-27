@@ -96,6 +96,25 @@ class SignalState:
     def count_active(self, symbol: str) -> int:
         return sum(1 for k in self._active if k.startswith(f"{symbol}||"))
 
+    def clear_stale_strategy_locks(self, max_age_hours: int = 24) -> list[str]:
+        """Remove strategy locks older than max_age_hours.
+        Called on bot startup so a crash mid-trade doesn't permanently block a slot.
+        OKX's own algo SL/TP orders protect the position even when bot is offline.
+        WARNING: Clearing a lock does NOT close the position on OKX — always check
+        OKX for open positions after an unplanned restart.
+        """
+        cutoff = int(time.time() * 1000) - max_age_hours * 3_600_000
+        stale = [k for k, v in self._active.items()
+                 if "||" in k and v.get("ts", 0) < cutoff]
+        for k in stale:
+            del self._active[k]
+            logger.warning(
+                "Cleared stale strategy lock on startup: %s — "
+                "CHECK OKX for any open positions that may still be live!", k)
+        if stale:
+            self._save()
+        return stale
+
     # ------------------------------------------------------------------
     # Virtual outcome tracking (forex signal-only + paper/0-balance crypto)
     # ------------------------------------------------------------------
@@ -191,7 +210,8 @@ class SignalState:
     def record_outcome(self, symbol: str, side: str, entry: float,
                        exit_price: float, sl, tp, reason: str, strategy: str = ""):
         risk  = abs(entry - sl) if sl else abs(entry - exit_price) or 1.0
-        pnl_r = abs(exit_price - entry) / risk if reason == "take_profit" else -1.0
+        direction = 1 if side == "long" else -1
+        pnl_r = direction * (exit_price - entry) / risk
         self._outcomes.append({
             "symbol":   symbol,
             "side":     side,
@@ -262,6 +282,7 @@ class SignalState:
                 "pending": len(self._pending),
                 "total_signals": total_fired,
                 "signals_per_day": self.signals_per_day(),
+                "weekly": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0},
             }
 
         wins       = [o for o in out if o["pnl_r"] > 0]
@@ -280,6 +301,13 @@ class SignalState:
                 else:
                     break
 
+        # 7-day slice
+        cutoff_7d  = int(time.time() * 1000) - 7 * 86_400_000
+        out_7d     = [o for o in out if o["ts"] >= cutoff_7d]
+        wins_7d    = [o for o in out_7d if o["pnl_r"] > 0]
+        losses_7d  = [o for o in out_7d if o["pnl_r"] <= 0]
+        wr_7d      = round(len(wins_7d) / len(out_7d) * 100, 1) if out_7d else 0.0
+
         return {
             "trades":             len(out),
             "wins":               len(wins),
@@ -292,5 +320,11 @@ class SignalState:
             "total_signals":      total_fired,
             "signals_per_day":    self.signals_per_day(),
             "strategy_breakdown": self.strategy_stats(days=7),
-            "recent":             out[-10:],
+            "recent":             out[-5:],
+            "weekly": {
+                "trades":   len(out_7d),
+                "wins":     len(wins_7d),
+                "losses":   len(losses_7d),
+                "win_rate": wr_7d,
+            },
         }

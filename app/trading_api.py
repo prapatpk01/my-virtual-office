@@ -144,7 +144,7 @@ def handle_get_state(bot_key: str = "default") -> dict:
 def handle_start(config: dict, broadcast_fn: Callable, bot_key: str = "default") -> dict:
     with _bot_lock:
         existing = _bots.get(bot_key)
-        if existing and existing.state.running:
+        if existing and existing._running:
             return {"ok": False, "error": "Bot is already running"}
 
         try:

@@ -39,12 +39,14 @@ class TelegramNotifier:
         get_stats_fn: Optional[Callable] = None,
         start_bot_fn: Optional[Callable] = None,
         stop_bot_fn: Optional[Callable] = None,
+        backtest_fn: Optional[Callable] = None,
         min_confidence: float = 0.5,
     ):
         self.token = token.strip()
         self.chat_id = str(chat_id).strip()
         self.get_state_fn = get_state_fn
         self.get_stats_fn = get_stats_fn
+        self.backtest_fn  = backtest_fn
         self.start_bot_fn = start_bot_fn
         self.stop_bot_fn = stop_bot_fn
         self.min_confidence = min_confidence
@@ -90,6 +92,11 @@ class TelegramNotifier:
             except Exception:
                 pass
 
+    @staticmethod
+    def _md_escape(s: str) -> str:
+        """Escape characters that break Telegram Markdown v1 entity parsing."""
+        return s.replace("[", "\\[").replace("]", "\\]").replace("_", "\\_").replace("*", "\\*")
+
     def notify_signal(self, signal_dict: dict):
         sig_type = signal_dict.get("type", "hold")
         if sig_type == "hold":
@@ -101,7 +108,7 @@ class TelegramNotifier:
         sym    = signal_dict.get("symbol", "")
         strat  = signal_dict.get("strategy", "")
         price  = signal_dict.get("price", 0)
-        reason = signal_dict.get("reason", "")
+        reason = self._md_escape(signal_dict.get("reason", ""))
         meta   = signal_dict.get("metadata", {})
 
         sl  = meta.get("stop_loss")
@@ -109,11 +116,12 @@ class TelegramNotifier:
         rr  = meta.get("rr")
 
         sl_tp_line = ""
-        if sl and tp and rr:
+        if sl and tp:
+            rr_line = f"\n📐 R:R `1:{rr:.1f}`" if rr else ""
             sl_tp_line = (
-                f"\n🛑 SL: `{sl:,.4f}`\n"
-                f"🎯 TP: `{tp:,.4f}`\n"
-                f"📐 R:R `1:{rr:.1f}`"
+                f"\n🛑 SL: `{sl:,.4f}`"
+                f"\n🎯 TP: `{tp:,.4f}`"
+                f"{rr_line}"
             )
         text = (
             f"{emoji} *{sig_type.upper()} Signal*\n"
@@ -125,26 +133,40 @@ class TelegramNotifier:
         self.notify(text)
 
     def notify_order(self, symbol: str, side: str, amount: float,
-                     price: float, strategy: str, paper: bool):
+                     price: float, strategy: str, paper: bool,
+                     sl: float = None, tp: float = None):
         emoji = "✅" if side == "buy" else "🏁"
         mode = "📄 PAPER" if paper else "💰 LIVE"
+        sl_tp_line = ""
+        if sl and tp:
+            sl_tp_line = f"\n🛑 SL: `{sl:,.4f}` | 🎯 TP: `{tp:,.4f}`"
         text = (
             f"{emoji} *Order Executed* {mode}\n"
             f"`{symbol}` — *{side.upper()}*\n"
             f"Amount: `{amount}` @ `{price:,.4f}`\n"
             f"Strategy: {strategy}"
+            f"{sl_tp_line}"
         )
         self.notify(text)
 
+    # Map close reason → (emoji, label)
+    _CLOSE_LABEL: dict[str, tuple[str, str]] = {
+        "take_profit":  ("✅", "Take-Profit Hit"),
+        "take_profit1": ("✅", "TP1 Hit (partial)"),
+        "take_profit2": ("✅", "TP2 Hit (runner)"),
+        "breakeven":    ("🔵", "Breakeven Exit"),
+        "health_weak":  ("⚠️", "Health WEAK — Early Exit"),
+        "stop_loss":    ("❌", "Stop-Loss Hit"),
+    }
+
     def notify_trade_closed(self, symbol: str, reason: str, exit_price: float,
-                            entry: float, sl, tp, stats: dict):
-        """Called when a position closes via SL or TP. Full detail + running stats."""
-        won   = reason == "take_profit"
-        emoji = "✅" if won else "❌"
-        label = "Take-Profit Hit" if won else "Stop-Loss Hit"
-        risk  = abs(entry - sl) if sl else 1.0
-        pnl_r = abs(exit_price - entry) / risk if won else -1.0
-        sign  = "+" if pnl_r >= 0 else ""
+                            entry: float, sl, tp, stats: dict, side: str = "long"):
+        """Called when a position closes via SL, TP, or health monitor."""
+        emoji, label = self._CLOSE_LABEL.get(reason, ("❌", f"Closed ({reason})"))
+        risk      = abs(entry - sl) if sl and sl != entry else abs(entry * 0.02)
+        direction = 1 if side == "long" else -1
+        pnl_r     = direction * (exit_price - entry) / risk
+        sign      = "+" if pnl_r >= 0 else ""
 
         sl_str = f"`{sl:,.4f}`" if sl else "—"
         tp_str = f"`{tp:,.4f}`" if tp else "—"
@@ -244,6 +266,16 @@ class TelegramNotifier:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 400 and parse_mode:
+                        # Markdown parse error — retry as plain text
+                        plain = {"chat_id": self.chat_id, "text": text}
+                        async with session.post(url, json=plain,
+                                                timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                            if r2.status != 200:
+                                body = await r2.text()
+                                logger.warning("Telegram send (plain) failed %s: %s", r2.status, body[:200])
+                                return False
+                            return True
                     if r.status != 200:
                         body = await r.text()
                         logger.warning("Telegram send failed %s: %s", r.status, body[:200])
@@ -305,10 +337,22 @@ class TelegramNotifier:
                 "/trades — last 5 trades\n"
                 "/balance — balance & P\\&L\n"
                 "/stats — win rate & signal statistics\n"
+                "/backtest — run historical backtest (takes 1-2 min)\n"
                 "/start\\_bot — start the bot\n"
                 "/stop\\_bot — stop the bot\n"
                 "/help — this message"
             )
+
+        elif cmd == "backtest":
+            if not self.backtest_fn:
+                await self._send("⚠️ Backtest not configured")
+                return
+            await self._send("⏳ Running backtest... (1-2 minutes)")
+            try:
+                result_text = await self.backtest_fn()
+                await self._send(result_text)
+            except Exception as e:
+                await self._send(f"❌ Backtest failed: {e}")
 
         elif cmd == "status":
             state = self.get_state_fn() if self.get_state_fn else {}
@@ -389,14 +433,6 @@ class TelegramNotifier:
         elif cmd == "stats":
             s       = self.get_stats_fn() if self.get_stats_fn else {}
             total   = s.get("trades",          0)
-            sig_all = s.get("total_signals",   0)
-            sig_day = s.get("signals_per_day", 0)
-            pending = s.get("pending",         0)
-
-            if sig_all == 0:
-                await self._send("📭 No signals fired yet.")
-                return
-
             wins    = s.get("wins",            0)
             losses  = s.get("losses",          0)
             wr      = s.get("win_rate",        0.0)
@@ -404,52 +440,74 @@ class TelegramNotifier:
             total_r = s.get("total_r",         0.0)
             streak  = s.get("streak",          0)
             recent  = s.get("recent",          [])
-            breakdown = s.get("strategy_breakdown", {})
+            weekly  = s.get("weekly",          {})
+            sig_all = s.get("total_signals",   0)
+            sig_day = s.get("signals_per_day", 0)
+            pending = s.get("pending",         0)
 
+            if total == 0 and sig_all == 0:
+                await self._send("📭 ยังไม่มีเทรดเลย — รอ signal แรก")
+                return
+
+            sign_r     = "+" if total_r >= 0 else ""
             streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
-            sign_r = "+" if total_r >= 0 else ""
 
-            lines = [f"📊 *Signal Stats — ย้อนหลัง 7 วัน*\n"]
+            lines = []
 
-            # ── Per-strategy table ───────────────────────────────────
-            if breakdown:
-                lines.append("*Strategy        Signals    WR*")
-                for strat, d in breakdown.items():
-                    sigs = d["signals"]
-                    wr_s = f"{d['win_rate']:.1f}%" if d["win_rate"] is not None else "—"
-                    cl   = d["wins"] + d["losses"]
-                    cl_s = f"({d['wins']}W/{d['losses']}L)" if cl else ""
-                    lines.append(f"`{strat:<16}` `{sigs:>3}` signals  `{wr_s:>6}` {cl_s}")
-                lines.append("")
-
-            # ── Overall ──────────────────────────────────────────────
-            lines += [
-                f"รวม signals: `{sig_all}` (avg `{sig_day}/day`)",
-                f"ปิด trades: `{total}` (`{wins}W` / `{losses}L`)",
-            ]
+            # ── ทั้งหมด ──────────────────────────────────────────────
+            lines.append("📊 *Stats ทั้งหมด*")
             if total > 0:
-                lines += [
-                    f"Win Rate: `{wr:.1f}%`",
-                    f"Profit Factor: `{pf:.2f}`",
-                    f"Total R: `{sign_r}{total_r:.1f}R`",
-                    f"Streak: `{streak_str}`",
-                ]
-            if pending:
-                lines.append(f"Tracking open: `{pending}` virtual trades")
-
-            lines.append("\n_Last closed trades:_")
-            if not recent:
-                lines.append("_(waiting for SL/TP to be hit)_")
+                lines.append(
+                    f"Trades: `{total}`  Win: `{wins}`  Loss: `{losses}`  "
+                    f"WR: `{wr:.1f}%`"
+                )
+                lines.append(
+                    f"PF: `{pf:.2f}`  Total R: `{sign_r}{total_r:.1f}R`  "
+                    f"Streak: `{streak_str}`"
+                )
             else:
-                for o in reversed(recent[-10:]):
-                    e     = "✅" if o["pnl_r"] > 0 else "❌"
+                lines.append(f"_Signals fired: {sig_all} — รอ SL/TP_")
+
+            # ── 7 วันล่าสุด ──────────────────────────────────────────
+            lines.append("")
+            lines.append("📅 *7 วันล่าสุด*")
+            w7  = weekly.get("trades",   0)
+            ww  = weekly.get("wins",     0)
+            wl  = weekly.get("losses",   0)
+            wwr = weekly.get("win_rate", 0.0)
+            if w7 > 0:
+                lines.append(
+                    f"Trades: `{w7}`  Win: `{ww}`  Loss: `{wl}`  WR: `{wwr:.1f}%`"
+                )
+            else:
+                lines.append("_ยังไม่มีเทรดใน 7 วันนี้_")
+            lines.append(f"Avg signals/day: `{sig_day}`")
+            if pending:
+                lines.append(f"Open virtual: `{pending}`")
+
+            # ── 5 เทรดล่าสุด ─────────────────────────────────────────
+            lines.append("")
+            lines.append("🕐 *5 เทรดล่าสุด*")
+            if not recent:
+                lines.append("_(รอ SL/TP hit ครั้งแรก)_")
+            else:
+                _reason_short = {
+                    "take_profit":  "TP",
+                    "take_profit1": "TP1",
+                    "take_profit2": "TP2",
+                    "breakeven":    "BE",
+                    "health_weak":  "WEAK",
+                    "stop_loss":    "SL",
+                }
+                for o in reversed(recent):
+                    e     = "✅" if o["pnl_r"] > 0 else ("🔵" if o["pnl_r"] == 0 else "❌")
                     sr    = "+" if o["pnl_r"] >= 0 else ""
-                    label = "TP" if o["reason"] == "take_profit" else "SL"
+                    label = _reason_short.get(o["reason"], o["reason"])
                     strat = o.get("strategy", "")
-                    strat_tag = f" [{strat}]" if strat else ""
+                    tag   = f" `[{strat}]`" if strat else ""
                     lines.append(
                         f"{e} `{o['symbol']}` {o['side'].upper()} "
-                        f"`{sr}{o['pnl_r']:.1f}R` [{label}]{strat_tag}"
+                        f"`{sr}{o['pnl_r']:.1f}R` \\[{label}]{tag}"
                     )
 
             await self._send("\n".join(lines))

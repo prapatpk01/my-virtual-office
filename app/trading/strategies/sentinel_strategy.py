@@ -23,10 +23,14 @@ class SentinelStrategy(BaseStrategy):
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.min_conf      = self.params.get("min_conf", 60.0)
-        self.min_rr        = self.params.get("min_rr", 1.5)
-        self.swing_len     = self.params.get("swing_len", 10)
-        self.position_pct  = self.params.get("position_pct", 0.08)
+        self.min_conf        = self.params.get("min_conf", 55.0)    # BOS + MTF + DWCS alignment
+        self.min_rr          = self.params.get("min_rr", 1.5)
+        self.swing_len       = self.params.get("swing_len", 10)
+        self.position_pct    = self.params.get("position_pct", 0.08)
+        self.dwcs_bull_min   = self.params.get("dwcs_bull_min", 50.0)   # neutral floor; BOS is primary signal
+        self.dwcs_bear_max   = self.params.get("dwcs_bear_max", 50.0)   # symmetric
+        self.fresh_bos_bars  = self.params.get("fresh_bos_bars", 25)    # bars since last BOS (fresh entry)
+        self.retest_zone     = self.params.get("retest_zone", 0.008)    # HMA retest tolerance (0.8%)
 
     # ------------------------------------------------------------------ #
     # HMA (Hull Moving Average) — [F1] correct formula
@@ -187,14 +191,10 @@ class SentinelStrategy(BaseStrategy):
         last_sw_lo = np.nan
 
         for i in range(1, n):
-            if not np.isnan(sw_hi[i]):
-                last_sw_hi = sw_hi[i]
-            if not np.isnan(sw_lo[i]):
-                last_sw_lo = sw_lo[i]
-
             body_pct = (abs(closes[i] - closes[i-1])
                         / max(highs[i] - lows[i], 1e-8))
 
+            # Check BOS using PRIOR last_sw_hi/lo (before updating with current bar)
             if (not np.isnan(last_sw_hi)
                     and closes[i] > last_sw_hi
                     and closes[i] > closes[i-1]
@@ -211,6 +211,12 @@ class SentinelStrategy(BaseStrategy):
                 bos_bear[i] = True
                 ms_trend = -1
 
+            # Update swing highs/lows AFTER checking (so current bar doesn't block itself)
+            if not np.isnan(sw_hi[i]):
+                last_sw_hi = sw_hi[i]
+            if not np.isnan(sw_lo[i]):
+                last_sw_lo = sw_lo[i]
+
         return bos_bull, bos_bear, ms_trend
 
     # ------------------------------------------------------------------ #
@@ -219,35 +225,33 @@ class SentinelStrategy(BaseStrategy):
 
     def _mtf_score(self, closes):
         """
-        Approximate MTF by using 3 different MA length pairs to simulate
-        short / medium / long timeframe trend alignment.
+        Approximate MTF using 3 MA-pair tiers scaled to work within a 250-bar context.
+        Short: EMA9/EMA21, Medium: EMA21/EMA50, Long: EMA50/EMA100.
         """
         closes = np.array(closes)
         e9   = self.ema(closes.tolist(), 9)
         e21  = self.ema(closes.tolist(), 21)
         e50  = self.ema(closes.tolist(), 50)
-        e125 = self.ema(closes.tolist(), 125)
-        s200 = self.sma(closes.tolist(), 200)
+        e100 = self.ema(closes.tolist(), 100)
 
-        # Short-term: EMA9 vs EMA21
+        # Short-term: EMA9 vs EMA21 (weight 0.30)
         sc_s = np.where(
             np.nan_to_num(e9) > np.nan_to_num(e21),
             np.where(np.nan_to_num(e21) > np.nan_to_num(e50), 2.0, 1.0),
             np.where(np.nan_to_num(e21) < np.nan_to_num(e50), -2.0, -1.0),
         )
-        # Medium-term: EMA21 vs EMA50
+        # Medium-term: EMA21 vs EMA50 (weight 0.35)
         sc_m = np.where(
             np.nan_to_num(e21) > np.nan_to_num(e50),
-            np.where(np.nan_to_num(e50) > np.nan_to_num(e125), 2.5, 1.0),
-            np.where(np.nan_to_num(e50) < np.nan_to_num(e125), -2.5, -1.0),
+            np.where(np.nan_to_num(e50) > np.nan_to_num(e100), 2.5, 1.0),
+            np.where(np.nan_to_num(e50) < np.nan_to_num(e100), -2.5, -1.0),
         )
-        # Long-term: EMA125 vs SMA200
+        # Long-term: EMA50 vs EMA100 (weight 0.35, shorter window fits 250-bar context)
         sc_l = np.where(
-            np.nan_to_num(e125) > np.nan_to_num(s200), 3.0, -3.0
+            np.nan_to_num(e50) > np.nan_to_num(e100), 3.0, -3.0
         )
 
-        raw = sc_s * 0.25 + sc_m * 0.35 + sc_l * 0.40
-        # Scale to -100 to 100
+        raw = sc_s * 0.30 + sc_m * 0.35 + sc_l * 0.35
         mtf_sc = np.clip(raw / 7. * 100, -100, 100)
         return mtf_sc
 
@@ -312,6 +316,7 @@ class SentinelStrategy(BaseStrategy):
         hma  = self._hma(closes, 21)
         e9   = self.ema(closes, 9)
         e21  = self.ema(closes, 21)
+        e50  = self.ema(closes, 50)
 
         # RSI, MACD, ADX
         rsi_arr = self.rsi(closes, 14)
@@ -375,6 +380,9 @@ class SentinelStrategy(BaseStrategy):
         curr_dwcs = float(dwcs[i])
         curr_hma  = float(hma[i]) if not np.isnan(hma[i]) else current_price
         curr_atr  = float(atr14[i])
+        curr_e50  = float(np.nan_to_num(e50[i], nan=current_price))
+        # Momentum gate: strong positive momentum confirms active uptrend (filters idle oscillation)
+        mom_positive = curr_mom > 25
 
         # Phases
         mom_str    = abs(curr_mom)
@@ -388,9 +396,9 @@ class SentinelStrategy(BaseStrategy):
         sc_s = float(np.nan_to_num(e9[i]) - np.nan_to_num(e21[i]))
         sc_m = float(np.nan_to_num(e21[i]))  # already captured in mtf_sc
 
-        # Simplified all-3-aligned conditions
-        elong  = curr_mtf >= 30 and ms_trend >= 0
-        eshort = curr_mtf <= -30 and ms_trend <= 0
+        # BOS state drives eligibility; MTF alignment captured in confidence scoring
+        elong  = ms_trend >= 0
+        eshort = ms_trend <= 0
 
         # Entry score
         esc = curr_mtf  # -100..100
@@ -421,18 +429,35 @@ class SentinelStrategy(BaseStrategy):
 
         conf_norm = econf / 100.0
 
-        # Signal Gate
-        sig_long  = (elong and econf >= self.min_conf and rr_L >= self.min_rr
-                     and not mom_peak and not mom_fade
-                     and current_price > curr_hma
-                     and curr_mtf > -50
-                     and curr_rsi < 75)
+        # Freshness gate — only enter within N bars of a confirmed BOS
+        fw = self.fresh_bos_bars
+        recent_bull_bos = bool(bos_bull_arr[-fw:].any())
+        recent_bear_bos = bool(bos_bear_arr[-fw:].any())
 
-        sig_short = (eshort and econf >= self.min_conf and rr_S >= self.min_rr
-                     and not mom_peak and not mom_fade_S
-                     and current_price < curr_hma
-                     and curr_mtf < 50
-                     and curr_rsi > 25)
+        # Signal Gate — fresh BOS + MTF alignment + quality filters
+        sig_long = (
+            elong and
+            ms_trend == 1 and              # confirmed bullish BOS
+            recent_bull_bos and            # fresh BOS within last N bars
+            econf >= self.min_conf and
+            rr_L >= self.min_rr and
+            not mom_peak and not mom_fade and
+            curr_rsi < 68 and
+            curr_dwcs >= self.dwcs_bull_min and
+            mom_positive                   # positive momentum: confirms active trend, not oscillation
+        )
+
+        sig_short = (
+            eshort and
+            ms_trend == -1 and             # confirmed bearish BOS
+            recent_bear_bos and            # fresh BOS within last N bars
+            econf >= self.min_conf and
+            rr_S >= self.min_rr and
+            not mom_peak and not mom_fade_S and
+            current_price < curr_hma and
+            curr_rsi > 43 and
+            curr_dwcs <= self.dwcs_bear_max
+        )
 
         if sig_long:
             phase = ("ACCEL" if (mom_str >= 55 and mom_rising) else
