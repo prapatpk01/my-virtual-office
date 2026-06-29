@@ -1,5 +1,5 @@
 """
-Backtest comparison: MACDEMAStrategy vs MomentumScoreStrategy vs WTADXStrategy
+Backtest: MCDXStrategy (Adaptive Trading Bot)
 Uses synthetic BTC-like candle data (GBM + trend regimes) — 5 760 bars ≈ 60 days 15m.
 """
 import asyncio
@@ -10,9 +10,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 from app.trading.connectors.base import OHLCV
-from app.trading.strategies.macd_ema_strategy import MACDEMAStrategy
-from app.trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-from app.trading.strategies.wt_adx_strategy import WTADXStrategy
+from app.trading.strategies.mcdx_strategy import MCDXStrategy
 
 
 def generate_candles(n: int = 5760, start: float = 65_000.0, seed: int = 42) -> list[OHLCV]:
@@ -53,24 +51,21 @@ def generate_candles(n: int = 5760, start: float = 65_000.0, seed: int = 42) -> 
     return candles
 
 
-def print_stats(name: str, stats: dict, best: tuple):
-    W = 60
-    print(f"{'─'*W}")
-    print(f"  {name}")
-    print(f"{'─'*W}")
-    if not stats:
-        print("  (not enough data)\n")
-        return
-    for key, s in stats.items():
-        is_best = best and best[0] == float(key.split("=")[1].split("x")[0])
-        marker = "  ◀ best" if is_best else ""
-        print(f"  {key}{marker}")
-        print(f"    trades={s['trades']:3d}  {s['wins']}W/{s['losses']}L  "
-              f"WR={s['win_rate']:5.1f}%  PF={s['profit_factor']:.2f}  "
-              f"totalR={s['total_r']:+.1f}R")
-    if best:
-        print(f"\n  Best: SL={best[0]}×ATR  RR=1:{best[1]}")
-    print()
+async def run_mcdx_backtest(candles: list[OHLCV], warmup: int = 120) -> dict:
+    """Run a simple signal-count backtest on MCDXStrategy."""
+    strat = MCDXStrategy("BTCUSD")
+    buys = sells = holds = 0
+    for i in range(warmup, len(candles)):
+        window = candles[:i + 1]
+        sig = await strat.analyze(window, window[-1].close)
+        if sig.type.value == "buy":
+            buys += 1
+        elif sig.type.value == "sell":
+            sells += 1
+        else:
+            holds += 1
+    total = buys + sells + holds
+    return {"buys": buys, "sells": sells, "holds": holds, "total": total}
 
 
 async def main():
@@ -78,23 +73,19 @@ async def main():
     print(f"\nSynthetic BTC-like data: {len(candles)} bars (≈60 days 15m)")
     print(f"Price range: ${min(c.low for c in candles):,.0f} – ${max(c.high for c in candles):,.0f}\n")
 
-    strategies = [
-        ("MACDEMAStrategy",       MACDEMAStrategy("BTCUSD")),
-        ("MomentumScore",         MomentumScoreStrategy("BTCUSD")),
-        ("WaveTrend (new rules)", WTADXStrategy("BTCUSD")),
-    ]
+    print("═" * 60)
+    print("  BACKTEST — MCDXStrategy (Adaptive Trading Bot) — synthetic BTC/USD 15m")
+    print("═" * 60 + "\n")
 
-    print("═"*60)
-    print("  BACKTEST COMPARISON — synthetic BTC/USD 15m")
-    print("═"*60 + "\n")
+    stats = await run_mcdx_backtest(candles)
+    total = stats["total"] or 1
+    print(f"  Bars analysed : {total}")
+    print(f"  BUY  signals  : {stats['buys']}  ({stats['buys']/total*100:.1f}%)")
+    print(f"  SELL signals  : {stats['sells']}  ({stats['sells']/total*100:.1f}%)")
+    print(f"  HOLD signals  : {stats['holds']}  ({stats['holds']/total*100:.1f}%)")
 
-    for name, strat in strategies:
-        stats, best = await strat.backtest(candles)
-        print_stats(name, stats, best)
-
-    print("═"*60)
+    print("\n" + "═" * 60)
     print("\nหมายเหตุ: ใช้ synthetic data (GBM + trend regimes) ไม่ใช่ราคาจริง")
-    print("ผลเปรียบเทียบ relative ระหว่าง strategy ยังสะท้อนคุณภาพ logic ได้")
 
 
 if __name__ == "__main__":

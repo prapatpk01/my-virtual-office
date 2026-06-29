@@ -75,10 +75,7 @@ def build_config() -> dict:
         "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
         "strategies": {
-            "wt_adx":         _env_bool("STRATEGY_WT_ADX",          True),
-            "macd_ema":       _env_bool("STRATEGY_MACD_EMA",         True),
-            "momentum_score": _env_bool("STRATEGY_MOMENTUM_SCORE",   True),
-            "ut_bot":         _env_bool("STRATEGY_UT_BOT",           True),
+            "mcdx": _env_bool("STRATEGY_MCDX", True),
         },
         "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
         "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
@@ -99,16 +96,11 @@ def build_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def _make_strategies(symbols: list, flags: dict):
-    from trading.strategies.wt_adx_strategy import WTADXStrategy
-    from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-    from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-    from trading.strategies.ut_bot_strategy import UTBotStrategy
+    from trading.strategies.mcdx_strategy import MCDXStrategy
     strategies = []
     for sym in symbols:
-        if flags.get("wt_adx"):          strategies.append(WTADXStrategy(sym))
-        if flags.get("macd_ema"):        strategies.append(MACDEMAStrategy(sym))
-        if flags.get("momentum_score"):  strategies.append(MomentumScoreStrategy(sym))
-        if flags.get("ut_bot"):          strategies.append(UTBotStrategy(sym))
+        if flags.get("mcdx", True):
+            strategies.append(MCDXStrategy(sym))
     return strategies
 
 
@@ -164,8 +156,8 @@ def build_crypto_bot(config: dict, telegram):
 
     strategies = _make_strategies(config["symbols"], config["strategies"])
     if not strategies:
-        from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-        strategies = [MACDEMAStrategy(config["symbols"][0])]
+        from trading.strategies.mcdx_strategy import MCDXStrategy
+        strategies = [MCDXStrategy(config["symbols"][0])]
 
     risk = RiskManager(
         max_risk_per_trade_pct=config["risk_per_trade"],
@@ -190,8 +182,8 @@ def build_forex_bot(config: dict, telegram):
     connector = YahooConnector()
     strategies = _make_strategies(config["forex_symbols"], config["strategies"])
     if not strategies:
-        from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-        strategies = [MACDEMAStrategy(config["forex_symbols"][0])]
+        from trading.strategies.mcdx_strategy import MCDXStrategy
+        strategies = [MCDXStrategy(config["forex_symbols"][0])]
 
     # max_open_positions=0 → strategies run + Telegram alerts sent, but no real orders
     risk = RiskManager(max_open_positions=0)
@@ -213,13 +205,7 @@ _stop_signal = asyncio.Event()
 
 async def _run_backtest(crypto_bot, config: dict, telegram):
     """Fetch candles on first symbol, run backtest, apply best SL/TP to each strategy."""
-    from trading.strategies.macd_ema_strategy import MACDEMAStrategy
-    from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-    from trading.strategies.ut_bot_strategy import UTBotStrategy
-    from trading.strategies.wt_adx_strategy import WTADXStrategy
-    backtestable = [s for s in crypto_bot.strategies
-                    if isinstance(s, (MACDEMAStrategy, MomentumScoreStrategy,
-                                      UTBotStrategy, WTADXStrategy))]
+    backtestable = [s for s in crypto_bot.strategies if hasattr(s, "backtest")]
     if not backtestable:
         return
     strat = backtestable[0]
