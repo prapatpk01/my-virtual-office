@@ -45,7 +45,7 @@ def _load_dotenv():
 
 _load_dotenv()
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ─────────────────────────────────────────────────────────────[...]
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -55,7 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger("run_bot")
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────[...]
 
 def _env_list(key: str, default: str) -> list[str]:
     return [s.strip() for s in os.environ.get(key, default).split(",") if s.strip()]
@@ -77,7 +77,7 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────[...]
 
 def build_config() -> dict:
     # SJ scoring: min_score default is COUPLED to the component count so the two
@@ -107,7 +107,7 @@ def build_config() -> dict:
             for k, v in [pair.split("=", 1)]
         },
 
-        # ── Symbols ───────────────────────────────────────────────────────────
+        # ── Symbols ────────────────────────────────────────────────────────[...]
         # Both BTC and XAU active by default.
         # OKX minimums: BTC 0.01 contract (~$800 notional), XAU 1 oz contract (~$4,300).
         "symbols": _env_list("SYMBOLS", "BTC/USDT:USDT,XAU/USDT:USDT"),
@@ -115,7 +115,6 @@ def build_config() -> dict:
         # ── TrendCont Improved v2 (15m primary + 1h + 4h MTF) ───────────────────
         # STRICT: 15m swing pullback (4-bar low/high ±0.6%) + ADX>30.
         # FAST v2: 1H EMA20 ±1.8% + bias>60 + ADX>18 rising + 5-bar cooldown.
-        # STRICT: 15m swing pullback + bias>70 + ADX>30.
         # Exit (both modes): TP1=0.5R (40% → SL→BE), TP2=2.5R/3.0R (60% runner).
         "tci_bias_gate":        _env_float("TCI_BIAS_GATE",        70.0),  # STRICT only
         "tci_adx_min":          _env_int("TCI_ADX_MIN",            30),    # STRICT only
@@ -173,31 +172,25 @@ def build_config() -> dict:
         "stop_loss_pct":   _env_float("STOP_LOSS_PCT",   0.015),  # 1.5%
         "take_profit_pct": _env_float("TAKE_PROFIT_PCT", 0.025),  # 2.5%
 
-        # Max simultaneous open positions (2 strategies × 2 sides = 4 theoretical max).
-        # Set to 2 for conservative exposure — one trade per strategy at a time.
+        # Max simultaneous open positions (one per symbol at a time).
         "max_positions":  _env_int("MAX_POSITIONS", 2),
         "max_drawdown":   _env_float("MAX_DRAWDOWN_PCT", 0.20),   # 20% drawdown halt
         # Daily circuit breaker: block new entries if day PnL ≤ -X% of account.
         "daily_loss_limit": _env_float("DAILY_LOSS_LIMIT_PCT", 0.05),  # -5%
-        # Per-trade risk budget. Overridden to fixed sizing when DYNAMIC_SIZING=false.
-        "risk_per_trade":   _env_float("RISK_PER_TRADE_PCT", 0.02),    # 2%
-        # DYNAMIC_SIZING=false → use fixed FIXED_TRADE_USDT regardless of account size.
-        # Required for small accounts where 2%-risk sizing < 1-contract minimum.
-        "dynamic_sizing":   _env_bool("DYNAMIC_SIZING", False),
 
-        # ── Timing ────────────────────────────────────────────────────────────
+        # ── Timing ──────────────────────────────────────────────────────────[...]
         # 30s tick: SL/TP/BE checked every 30s; signal analysis uses 15m candles so
         # no extra entries are generated — only position-exit speed improves.
         "interval": _env_int("INTERVAL_SECONDS", 30),
 
-        # ── Telegram ──────────────────────────────────────────────────────────
+        # ── Telegram ────────────────────────────────────────────────────────
         "telegram_token":    os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id":  os.environ.get("TELEGRAM_CHAT_ID",   ""),
         "tg_min_confidence": _env_float("TG_MIN_CONFIDENCE", 0.5),
     }
 
 
-# ── Strategy builder ─────────────────────────────────────────────────────────
+# ── Strategy builder ────────────────────────────────────────────────────────
 
 def build_strategies(symbols: list[str], cfg: dict) -> list:
     from trading.strategies.trend_cont_improved_strategy import TrendContImprovedStrategy
@@ -249,7 +242,7 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
     return strategies
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────[...]
 
 async def main():
     cfg = build_config()
@@ -273,7 +266,7 @@ async def main():
     logger.info("=== Bot starting [%s] exchange=%s symbols=%s ===",
                 mode, cfg["exchange"], cfg["symbols"])
 
-    # ── Telegram ──────────────────────────────────────────────────────────────
+    # ── Telegram ────────────────────────────────────────────────────────────
     telegram = None
     if cfg["telegram_token"] and cfg["telegram_chat_id"]:
         from trading.telegram_notifier import TelegramNotifier
@@ -299,10 +292,10 @@ async def main():
         symbol_leverage=cfg["symbol_leverage"],
     )
 
-    # ── Strategies ────────────────────────────────────────────────────────────
+    # ── Strategies ──────────────────────────────────────────────────────────
     strategies = build_strategies(cfg["symbols"], cfg)
 
-    # ── Risk manager ─────────────────────────────────────────────────────────
+    # ── Risk manager ────────────────────────────────────────────────────────
     from trading.risk_manager import RiskManager
     risk = RiskManager(
         stop_loss_pct=cfg["stop_loss_pct"],
@@ -320,7 +313,7 @@ async def main():
         cfg["max_positions"], cfg["max_drawdown"] * 100, cfg["daily_loss_limit"] * 100,
     )
 
-    # ── Trading bot ───────────────────────────────────────────────────────────
+    # ── Trading bot ─────────────────────────────────────────────────────────
     from trading.bot import TradingBot
     bot = TradingBot(
         connector=connector,
@@ -330,7 +323,7 @@ async def main():
         telegram=telegram,
         fixed_sl_pct=cfg["stop_loss_pct"],
         fixed_tp_pct=cfg["take_profit_pct"],
-        dynamic_sizing=cfg["dynamic_sizing"],
+        dynamic_sizing=False,
         monitor_interval=cfg["monitor_interval"],
     )
     bot._health_weak_confirm = cfg["health_weak_confirm"]
@@ -431,7 +424,7 @@ async def main():
         except (NotImplementedError, RuntimeError):
             pass
 
-    # ── Run ───────────────────────────────────────────────────────────────────
+    # ── Run ─────────────────────────────────────────────────────────────[...]
     await bot.start()
     await stop_signal.wait()
 
