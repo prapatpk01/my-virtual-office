@@ -72,6 +72,18 @@ class OANDAConnector(BaseConnector):
                     raise RuntimeError(f"OANDA GET {path} → {r.status}: {body[:200]}")
                 return await r.json()
 
+    async def _put(self, path: str, body: dict = None) -> dict:
+        url = f"{self._base_url}{path}"
+        kwargs = {"json": body} if body is not None else {}
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, headers=self._headers,
+                                   timeout=aiohttp.ClientTimeout(total=15),
+                                   **kwargs) as r:
+                data = await r.json()
+                if r.status != 200:
+                    raise RuntimeError(f"OANDA PUT {path} → {r.status}: {data}")
+                return data
+
     async def _post(self, path: str, body: dict) -> dict:
         url = f"{self._base_url}{path}"
         async with aiohttp.ClientSession() as session:
@@ -175,7 +187,7 @@ class OANDAConnector(BaseConnector):
         if self.paper:
             return True
         instrument = _to_oanda_symbol(symbol)
-        await self._get(f"/v3/accounts/{self.account_id}/orders/{order_id}/cancel")
+        await self._put(f"/v3/accounts/{self.account_id}/orders/{order_id}/cancel")
         return True
 
     async def fetch_open_orders(self, symbol: Optional[str] = None) -> list[OrderResult]:
