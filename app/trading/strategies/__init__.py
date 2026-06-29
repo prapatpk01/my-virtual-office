@@ -15,8 +15,11 @@ from .sentinel_strategy import SentinelStrategy
 from .rvol_strategy import RVolStrategy
 
 __all__ = [
+    # Base classes
     "BaseStrategy", "Signal", "SignalType",
+    # Primary strategies
     "WTADXStrategy", "MACDEMAStrategy", "UTBotStrategy", "MomentumScoreStrategy",
+    # Legacy / optional strategies
     "MomentumStrategy", "MACrossoverStrategy", "RSIMACDStrategy",
     "GridTradingStrategy", "AISignalStrategy",
     "MCDXStrategy", "SentinelStrategy", "RVolStrategy",
