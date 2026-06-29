@@ -40,13 +40,7 @@ def _run_async(coro):
 def _build_bot(config: dict, broadcast_fn: Callable):
     from trading.connectors.binance_conn import BinanceConnector
     from trading.connectors.alpaca_conn import AlpacaConnector
-    from trading.strategies.ma_crossover import MACrossoverStrategy
-    from trading.strategies.rsi_macd import RSIMACDStrategy
-    from trading.strategies.grid_trading import GridTradingStrategy
-    from trading.strategies.ai_signal import AISignalStrategy
     from trading.strategies.mcdx_strategy import MCDXStrategy
-    from trading.strategies.sentinel_strategy import SentinelStrategy
-    from trading.strategies.rvol_strategy import RVolStrategy
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
     from trading.telegram_notifier import TelegramNotifier
@@ -70,26 +64,14 @@ def _build_bot(config: dict, broadcast_fn: Callable):
     else:
         connector = AlpacaConnector(api_key=api_key, api_secret=api_secret, paper=paper)
 
-    # Strategies — one instance per symbol per enabled strategy
+    # Strategies — MCDXStrategy (adaptive) per symbol
     strategies = []
     for symbol in symbols:
-        if strategy_flags.get("ma_crossover", True):
-            strategies.append(MACrossoverStrategy(symbol))
-        if strategy_flags.get("rsi_macd", True):
-            strategies.append(RSIMACDStrategy(symbol))
-        if strategy_flags.get("grid_trading", False):
-            strategies.append(GridTradingStrategy(symbol))
-        if strategy_flags.get("ai_signal", False):
-            strategies.append(AISignalStrategy(symbol))
-        if strategy_flags.get("mcdx", False):
+        if strategy_flags.get("mcdx", True):
             strategies.append(MCDXStrategy(symbol))
-        if strategy_flags.get("sentinel", False):
-            strategies.append(SentinelStrategy(symbol))
-        if strategy_flags.get("rvol", True):
-            strategies.append(RVolStrategy(symbol))
 
     if not strategies:
-        strategies.append(MACrossoverStrategy(symbols[0]))
+        strategies.append(MCDXStrategy(symbols[0]))
 
     risk = RiskManager(
         max_risk_per_trade_pct=float(config.get("risk_per_trade", 0.02)),

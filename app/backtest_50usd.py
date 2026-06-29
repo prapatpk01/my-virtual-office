@@ -19,10 +19,8 @@ TF_CFG = {
 cfg = TF_CFG[TF]
 
 from dataclasses import dataclass
-from trading.strategies.ut_bot_strategy      import UTBotStrategy
-from trading.strategies.wt_adx_strategy      import WTADXStrategy
-from trading.strategies.momentum_score_strategy import MomentumScoreStrategy
-from trading.strategies.macd_ema_strategy    import MACDEMAStrategy
+from trading.strategies.mcdx_strategy import MCDXStrategy
+from trading.strategies.base import SignalType
 
 # ── synthetic BTC OHLCV (GBM) ──────────────────────────────────────────────
 
@@ -59,157 +57,56 @@ SL_USD    = 5.0      # fixed stop-loss in USD
 async def run_strategy_backtest(strategy, candles: list, bars: int) -> dict:
     subset = candles[-bars:]
     n = len(subset)
+    warmup = min(120, n // 4)
 
-    buy_sigs, sell_sigs = [], []
-
-    # Call _build_signals if available (UT Bot, Momentum, MACD/EMA)
-    # WaveTrend uses its own internal method
-    name = type(strategy).__name__
-
-    if name == "UTBotStrategy":
-        buy_arr, sell_arr, _, atr_a = strategy._build_signals(subset)
-        min_len = strategy.ut_atr_len + 14 + 5
-        for i in range(min_len, n - 1):
-            if np.isnan(atr_a[i]) or atr_a[i] <= 0:
-                continue
-            if buy_arr[i]:
-                buy_sigs.append((i, float(atr_a[i]),
-                                 strategy.sl_atr_mult, strategy.rr_ratio))
-            elif sell_arr[i]:
-                sell_sigs.append((i, "sell"))
-
-    elif name == "MomentumScoreStrategy":
-        buy_arr, sell_arr, _, _, atr_a = strategy._build_signals(subset)
-        min_len = strategy.macd_slow + strategy.macd_sig + strategy.ema_len + 5
-        for i in range(min_len, n - 1):
-            if np.isnan(atr_a[i]) or atr_a[i] <= 0:
-                continue
-            if buy_arr[i]:
-                buy_sigs.append((i, float(atr_a[i]),
-                                 strategy.sl_atr_mult, strategy.rr_ratio))
-            elif sell_arr[i]:
-                sell_sigs.append((i, "sell"))
-
-    elif name == "MACDEMAStrategy":
-        (ha_o, ha_c, ha_highs, ha_lows,
-         hma, ema, sma, ml, sl_line, hist, atr_a) = strategy._build_arrays(subset)
-        min_len = strategy.macd_slow + strategy.macd_sig + strategy.hma_period + 5
-        for i in range(min_len, n - 1):
-            if np.isnan(atr_a[i]) or atr_a[i] <= 0:
-                continue
-            d = strategy._signal_at(i, ha_o, ha_c, ha_highs, ha_lows,
-                                    hma, ema, sma, ml, sl_line)
-            if d == 1:
-                buy_sigs.append((i, float(atr_a[i]),
-                                 strategy.sl_atr_mult, strategy.rr_ratio))
-            elif d == -1:
-                sell_sigs.append((i, "sell"))
-
-    elif name == "WTADXStrategy":
-        # WaveTrend uses wt1/wt2; get signals via analyze on rolling window
-        # Simplified: use internal _wt_signals helper
-        # Build arrays manually
-        closes = np.array([c.close for c in subset], dtype=float)
-        highs  = np.array([c.high  for c in subset], dtype=float)
-        lows   = np.array([c.low   for c in subset], dtype=float)
-        atr_a  = np.array(strategy.atr(subset, 14), dtype=float)
-
-        # Compute WT1
-        def ema_arr(arr, p):
-            k = 2/(p+1); r = np.full(len(arr), np.nan)
-            first = np.where(~np.isnan(arr))[0]
-            if len(first) == 0: return r
-            s = first[0] + p - 1
-            if s >= len(arr): return r
-            r[s] = float(np.nanmean(arr[first[0]:first[0]+p]))
-            for i in range(s+1, len(arr)):
-                r[i] = arr[i]*k + r[i-1]*(1-k)
-            return r
-
-        n_s = 9; avg_mult = 0.015
-        hlc3 = (highs + lows + closes) / 3
-        esa  = ema_arr(hlc3, n_s)
-        diff = np.abs(hlc3 - esa)
-        de   = ema_arr(diff, n_s)
-        ci   = np.where(de > 0, (hlc3 - esa) / (0.015 * de), 0.0)
-        wt1  = ema_arr(ci, 3)
-        wt2  = np.array([np.nanmean(wt1[max(0,i-3):i+1]) if not np.isnan(wt1[i]) else np.nan
-                         for i in range(len(wt1))])
-
-        ob = strategy.params.get("ob_level", 53)
-        os_ = strategy.params.get("os_level", -53)
-        min_len = 30
-        for i in range(min_len, n - 1):
-            if np.isnan(wt1[i]) or np.isnan(atr_a[i]) or atr_a[i] <= 0:
-                continue
-            # Buy: wt1 crosses above wt2 from oversold
-            if (wt1[i-1] <= wt2[i-1] and wt1[i] > wt2[i] and wt2[i] < os_):
-                buy_sigs.append((i, float(atr_a[i]), 1.5, 1.2))
-            elif (wt1[i-1] >= wt2[i-1] and wt1[i] < wt2[i] and wt2[i] > ob):
-                sell_sigs.append((i, "sell"))
-
-    # ── Simulate trades (BUY-only, exit on SELL signal or SL/TP hit) ─────────
     closes_all = np.array([c.close for c in subset], dtype=float)
     highs_all  = np.array([c.high  for c in subset], dtype=float)
     lows_all   = np.array([c.low   for c in subset], dtype=float)
 
-    # Build sell signal set for quick lookup
-    sell_set = {i for i, _ in sell_sigs}
-
     results = []
-    prev_buy_i = -999
+    locked_until = -1
 
-    for (bi, atr_val, sl_m, rr) in buy_sigs:
-        if bi <= prev_buy_i:
-            continue  # same bar (shouldn't happen but guard)
+    for i in range(warmup, n - 1):
+        if i <= locked_until:
+            continue
+        window = subset[:i + 1]
+        sig = await strategy.analyze(window, window[-1].close)
 
-        entry = float(closes_all[bi])
-        amount_btc = POSITION / entry
+        if sig.type == SignalType.BUY:
+            entry = float(closes_all[i])
+            amount = POSITION / entry
+            tp_p   = entry + TP_USD / amount
+            sl_p   = entry - SL_USD / amount
+            win_usd  =  TP_USD - POSITION * FEE_RT
+            loss_usd = -SL_USD - POSITION * FEE_RT
 
-        # Fixed-dollar TP/SL: convert $ → price level
-        tp_p  = entry + TP_USD / amount_btc   # = entry × (1 + TP_USD/POSITION)
-        sl_p  = entry - SL_USD / amount_btc   # = entry × (1 - SL_USD/POSITION)
+            for j in range(i + 1, min(i + LOOKFWD, n)):
+                if lows_all[j] <= sl_p:
+                    results.append(loss_usd)
+                    locked_until = j
+                    break
+                if highs_all[j] >= tp_p:
+                    results.append(win_usd)
+                    locked_until = j
+                    break
+            else:
+                exit_price = float(closes_all[min(i + LOOKFWD, n) - 1])
+                pnl = amount * (exit_price - entry) - POSITION * FEE_RT
+                results.append(pnl)
+                locked_until = i + LOOKFWD
 
-        win_usd  =  TP_USD - POSITION * FEE_RT   # = $7 - $0.10
-        loss_usd = -SL_USD - POSITION * FEE_RT   # = -$5 - $0.10
+    if not results:
+        return {"trades": 0, "wins": 0, "losses": 0, "wr": 0, "pf": 0,
+                "total$": 0, "avg$": 0, "t/day": 0}
 
-        outcome = 0
-        exit_reason = "timeout"
-        for j in range(bi + 1, min(bi + LOOKFWD, n)):
-            # Check sell signal first (exit before TP/SL)
-            if j in sell_set:
-                exit_price = float(closes_all[j])
-                pnl_usd = amount_btc * (exit_price - entry) - POSITION * FEE_RT
-                results.append(("sell_sig", pnl_usd))
-                prev_buy_i = bi
-                exit_reason = "sell_sig"
-                break
-            if lows_all[j] <= sl_p:
-                results.append(("loss", loss_usd))
-                prev_buy_i = bi
-                exit_reason = "sl"
-                break
-            if highs_all[j] >= tp_p:
-                results.append(("win", win_usd))
-                prev_buy_i = bi
-                exit_reason = "tp"
-                break
-        else:
-            # Timeout — close at last bar close
-            exit_price = float(closes_all[min(bi + LOOKFWD, n) - 1])
-            pnl_usd = amount_btc * (exit_price - entry) - POSITION * FEE_RT
-            results.append(("timeout", pnl_usd))
-            prev_buy_i = bi
-
-    # ── Stats ──────────────────────────────────────────────────────────────────
-    wins   = [p for r,p in results if p > 0]
-    losses = [p for r,p in results if p <= 0]
+    wins   = [p for p in results if p > 0]
+    losses = [p for p in results if p <= 0]
     total  = len(results)
     wr     = len(wins)/total*100 if total else 0
     gross_win  = sum(wins)
     gross_loss = abs(sum(losses))
     pf   = gross_win/gross_loss if gross_loss > 0 else float("inf")
-    total_usd  = sum(p for _,p in results)
+    total_usd  = sum(results)
     avg_usd    = total_usd/total if total else 0
     bars_per_day = cfg["bars_per_day"]
     trades_per_day = total / (bars / bars_per_day)
@@ -231,10 +128,7 @@ async def main():
     candles_max = gbm_candles(1100, seed=99)
 
     strategies = [
-        ("UT Bot",    UTBotStrategy("BTC/USDT")),
-        ("Momentum",  MomentumScoreStrategy("BTC/USDT")),
-        ("MACD/EMA",  MACDEMAStrategy("BTC/USDT")),
-        ("WaveTrend", WTADXStrategy("BTC/USDT")),
+        ("MCDX (Adaptive)", MCDXStrategy("BTC/USDT")),
     ]
 
     print(f"\n{'='*80}")
@@ -254,21 +148,19 @@ async def main():
                   f"{sign}{r['total$']:>8.2f} │ {r['avg$']:>+8.3f} │ {r['t/day']:>6.1f}")
             all_rows.append({"strategy": sname, "bars": bars, **r})
 
-    # ── summary table ────────────────────────────────────────────────
     print(f"\n{'='*80}")
     print("  SUMMARY — avg across 250/500/1000 bars")
-    print(f"  {'Strategy':12} │ {'Avg WR%':>8} │ {'Avg PF':>7} │ {'Total$ 1k':>10} │ {'Avg$/T':>8}")
-    print(f"  {'─'*12}─┼─{'─'*8}─┼─{'─'*7}─┼─{'─'*10}─┼─{'─'*8}")
+    print(f"  {'Strategy':18} │ {'Avg WR%':>8} │ {'Avg PF':>7} │ {'Total$ 1k':>10} │ {'Avg$/T':>8}")
+    print(f"  {'─'*18}─┼─{'─'*8}─┼─{'─'*7}─┼─{'─'*10}─┼─{'─'*8}")
     for sname, _ in strategies:
         rows = [r for r in all_rows if r["strategy"] == sname]
         avg_wr  = sum(r["wr"]     for r in rows) / len(rows)
         avg_pf  = sum(r["pf"]     for r in rows) / len(rows)
         tot_1k  = next((r["total$"] for r in rows if r["bars"]==1000), 0)
         avg_per = sum(r["avg$"]   for r in rows) / len(rows)
-        print(f"  {sname:12} │ {avg_wr:>7.1f}% │ {avg_pf:>7.2f} │ "
+        print(f"  {sname:18} │ {avg_wr:>7.1f}% │ {avg_pf:>7.2f} │ "
               f"{tot_1k:>+10.2f} │ {avg_per:>+8.3f}")
 
-    print(f"\n  Note: fee = $0.10/trade ($50 × 0.20%). ATR-based SL/TP.")
-    print(f"  SL/TP size dictates actual $/trade — see avg$ column.")
+    print(f"\n  Note: fee = $0.10/trade ($50 × 0.20%). Fixed TP/SL.")
 
 asyncio.run(main())
