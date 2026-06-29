@@ -2,6 +2,7 @@ from .base import BaseStrategy, Signal, SignalType
 from .wt_adx_strategy import WTADXStrategy
 from .macd_ema_strategy import MACDEMAStrategy
 from .ut_bot_strategy import UTBotStrategy
+from .momentum_score_strategy import MomentumScoreStrategy
 
 # Legacy strategies (kept, disabled by default)
 from .momentum_strategy import MomentumStrategy
@@ -15,7 +16,7 @@ from .rvol_strategy import RVolStrategy
 
 __all__ = [
     "BaseStrategy", "Signal", "SignalType",
-    "WTADXStrategy", "MACDEMAStrategy",
+    "WTADXStrategy", "MACDEMAStrategy", "UTBotStrategy", "MomentumScoreStrategy",
     "MomentumStrategy", "MACrossoverStrategy", "RSIMACDStrategy",
     "GridTradingStrategy", "AISignalStrategy",
     "MCDXStrategy", "SentinelStrategy", "RVolStrategy",
