@@ -114,6 +114,13 @@ def build_config() -> dict:
         },
         "telegram_token":      os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
+        "use_adaptive": _env_bool("USE_ADAPTIVE", False),
+        "adaptive_balance": _env_float("ADAPTIVE_BALANCE", 10000.0),
+        "adaptive_risk_pct": _env_float("ADAPTIVE_RISK_PCT", 0.01),
+        "adaptive_daily_loss": _env_float("ADAPTIVE_DAILY_LOSS_PCT", -3.0),
+        "adaptive_daily_profit": _env_float("ADAPTIVE_DAILY_PROFIT_PCT", 8.0),
+        "adaptive_cooldown_min": _env_int("ADAPTIVE_COOLDOWN_MIN", 30),
+        "adaptive_max_loss_streak": _env_int("ADAPTIVE_MAX_LOSS_STREAK", 3),
     }
 
 
@@ -168,6 +175,133 @@ def _make_telegram(cfg: dict):
 
 
 # ---------------------------------------------------------------------------
+# Adaptive mode runner
+# ---------------------------------------------------------------------------
+
+async def _run_adaptive(cfg, connector, telegram, stop_event):
+    from trading.adaptive_trading_bot import TradingBot as AdaptiveBot
+    from trading.indicator_engine import IndicatorEngine
+    from trading.connectors.okx_adapter import OKXAdapter
+
+    symbols = cfg["symbols"]
+    logger.info("=== ADAPTIVE MODE: %d symbols ===", len(symbols))
+
+    # Sync OKX adapter for order execution
+    okx = OKXAdapter(
+        api_key=cfg["api_key"],
+        api_secret=cfg["api_secret"],
+        api_passphrase=cfg.get("api_passphrase", ""),
+        paper=cfg["paper"],
+    )
+
+    ind_engine = IndicatorEngine()
+
+    # One adaptive bot per symbol
+    bots: dict = {}
+    last_bar_ts: dict = {}  # symbol → last processed 15m bar timestamp
+
+    for sym in symbols:
+        safe_sym = sym.replace("/", "_").replace(":", "_")
+        state_file = f"/tmp/adaptive_{safe_sym}.json"
+
+        def _make_callback(s, t):
+            def cb(order_type, trade_info):
+                result = t.execute(order_type, {**trade_info, "symbol": s})
+                if telegram:
+                    try:
+                        telegram.send(
+                            f"{'🟢' if 'OPEN' in order_type else '🔴'} "
+                            f"[Adaptive] {order_type} {s}\n"
+                            f"entry={trade_info.get('entry', '?')} "
+                            f"sl={trade_info.get('sl', '?')} "
+                            f"size={trade_info.get('size', '?'):.4f}"
+                        )
+                    except Exception:
+                        pass
+                return result
+            return cb
+
+        bot = AdaptiveBot(
+            account_balance=cfg["adaptive_balance"],
+            base_risk_pct=cfg["adaptive_risk_pct"],
+            daily_loss_limit_pct=cfg["adaptive_daily_loss"],
+            daily_profit_limit_pct=cfg["adaptive_daily_profit"],
+            cooldown_minutes=cfg["adaptive_cooldown_min"],
+            max_loss_streak=cfg["adaptive_max_loss_streak"],
+            state_file=state_file,
+            execution_callback=_make_callback(sym, okx),
+        )
+        bot.load_state(state_file)
+        bot.reconcile_with_exchange(sym, okx)
+        bots[sym] = (bot, state_file)
+        last_bar_ts[sym] = 0
+
+    if telegram:
+        telegram.send(
+            f"🤖 Adaptive Bot Started\n"
+            f"Symbols: {', '.join(symbols)}\n"
+            f"Mode: {'PAPER' if cfg['paper'] else 'LIVE'}"
+        )
+
+    loop = asyncio.get_event_loop()
+
+    while not stop_event.is_set():
+        for sym in symbols:
+            try:
+                # Fetch candles for all 3 timeframes
+                c15m = await connector.fetch_ohlcv(sym, "15m", 300)
+                c1h  = await connector.fetch_ohlcv(sym, "1h",  200)
+                c4h  = await connector.fetch_ohlcv(sym, "4h",  200)
+
+                if not c15m or not c1h or not c4h:
+                    logger.warning("[Adaptive][%s] Empty candles — skipping", sym)
+                    continue
+
+                # Only tick on new 15m bar
+                latest_ts = c15m[-1].timestamp if c15m else 0
+                if latest_ts <= last_bar_ts[sym]:
+                    continue
+                last_bar_ts[sym] = latest_ts
+
+                # Compute indicators
+                candle_15m, candle_1h, candle_4h, ind_15m, ind_1h, ind_4h = \
+                    ind_engine.compute(c15m, c1h, c4h)
+
+                price = candle_15m.get("close", 0.0)
+                bot, state_file = bots[sym]
+
+                extras = {"symbol": sym, "session": "", "funding_rate": 0.0, "oi": 0}
+
+                # Run on_tick in thread (sync order execution inside)
+                await loop.run_in_executor(
+                    None,
+                    lambda b=bot, sf=state_file: b.on_tick(
+                        candle_15m, candle_1h, candle_4h,
+                        ind_15m, ind_1h, ind_4h,
+                        extras, price,
+                    )
+                )
+
+                # Log state every tick
+                status = bot.get_status()
+                logger.info(
+                    "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f",
+                    sym, status["state"], status["position_open"],
+                    status["market_state"], status["regime_score"],
+                )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("[Adaptive][%s] tick error: %s", sym, e, exc_info=True)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=cfg["interval"])
+        except asyncio.TimeoutError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -194,42 +328,9 @@ async def main():
     )
 
     connector = _make_connector(cfg)
-    strategies = _make_strategies(cfg["symbols"], cfg["strategies"], cfg,
-                                  connector=connector)
-    if not strategies:
-        logger.error("No strategies enabled — exiting")
-        sys.exit(1)
-
-    from trading.risk_manager import RiskManager
-    from trading.bot import TradingBot
-
-    risk = RiskManager(
-        max_risk_per_trade_pct=cfg["risk_per_trade"],
-        max_open_positions=cfg["max_positions"],
-        max_drawdown_pct=cfg["max_drawdown"],
-    )
-
-    telegram = _make_telegram(cfg)
-
-    bot = TradingBot(
-        connector=connector,
-        strategies=strategies,
-        risk_manager=risk,
-        interval_seconds=cfg["interval"],
-        telegram=telegram,
-        trade_amount_usdt=cfg["trade_amount_usdt"],
-        max_positions=cfg["max_positions"],
-        candle_tf=cfg["candle_tf"],
-        candle_limit=cfg["candle_limit"],
-        mtf_gate=False,
-    )
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-
-    if telegram:
-        telegram.bot = bot
-        telegram.stop_bot_fn = lambda: stop_event.set()
 
     def _handle_signal():
         logger.info("Shutdown signal received")
@@ -241,16 +342,10 @@ async def main():
         except (NotImplementedError, RuntimeError):
             pass
 
-    try:
-        await bot.start()
-        await stop_event.wait()
-    finally:
-        logger.info("Stopping bot...")
-        try:
-            await bot.stop()
-        except Exception as e:
-            logger.warning("Bot stop error (non-fatal): %s", e)
+    telegram = _make_telegram(cfg)
 
+    async def _cleanup_connector():
+        logger.info("Stopping bot...")
         try:
             await connector.close()
         except Exception as e:
@@ -279,6 +374,58 @@ async def main():
 
         await asyncio.sleep(0.5)
         logger.info("Done.")
+
+    if cfg.get("use_adaptive"):
+        logger.info("Starting ADAPTIVE trading mode")
+        try:
+            await _run_adaptive(cfg, connector, telegram, stop_event)
+        finally:
+            await _cleanup_connector()
+        return
+
+    strategies = _make_strategies(cfg["symbols"], cfg["strategies"], cfg,
+                                  connector=connector)
+    if not strategies:
+        logger.error("No strategies enabled — exiting")
+        sys.exit(1)
+
+    from trading.risk_manager import RiskManager
+    from trading.bot import TradingBot
+
+    risk = RiskManager(
+        max_risk_per_trade_pct=cfg["risk_per_trade"],
+        max_open_positions=cfg["max_positions"],
+        max_drawdown_pct=cfg["max_drawdown"],
+    )
+
+    if telegram:
+        telegram.stop_bot_fn = lambda: stop_event.set()
+
+    bot = TradingBot(
+        connector=connector,
+        strategies=strategies,
+        risk_manager=risk,
+        interval_seconds=cfg["interval"],
+        telegram=telegram,
+        trade_amount_usdt=cfg["trade_amount_usdt"],
+        max_positions=cfg["max_positions"],
+        candle_tf=cfg["candle_tf"],
+        candle_limit=cfg["candle_limit"],
+        mtf_gate=False,
+    )
+
+    if telegram:
+        telegram.bot = bot
+
+    try:
+        await bot.start()
+        await stop_event.wait()
+    finally:
+        try:
+            await bot.stop()
+        except Exception as e:
+            logger.warning("Bot stop error (non-fatal): %s", e)
+        await _cleanup_connector()
 
 
 if __name__ == "__main__":
