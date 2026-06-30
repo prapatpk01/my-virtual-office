@@ -71,10 +71,11 @@ REGIME_THRESHOLDS: Dict[str, Dict] = {
         "adx_1h_min": 20, "rsi_long": (40, 65), "rsi_short": (35, 58),
         "allow_long": True,  "allow_short": False, "l1_delta": -5,
     },
-    # Normal trend — LONG only; shorting against primary uptrend is consistently losing
+    # Normal trend — LONG only; dip-buy on RSI pullback, higher ADX confirmation
+    # l1_delta +6: filters low-quality UPTREND entries (BTC/ETH WR 35-40% → improve)
     "UPTREND": {
-        "adx_1h_min": 15, "rsi_long": (35, 62), "rsi_short": (38, 65),
-        "allow_long": True,  "allow_short": False, "l1_delta": 0,
+        "adx_1h_min": 18, "rsi_long": (30, 55), "rsi_short": (45, 65),
+        "allow_long": True,  "allow_short": False, "l1_delta": +6,
     },
     # Ranging market — mean-reversion RSI gates, higher quality bar
     "RANGE": {
@@ -96,15 +97,17 @@ REGIME_THRESHOLDS: Dict[str, Dict] = {
         "adx_1h_min": 15, "rsi_long": (28, 45), "rsi_short": (52, 72),
         "allow_long": False, "allow_short": True,  "l1_delta": +3,
     },
-    # Bottoming/accumulation — LONG bias, shorts blocked; raised bar to filter weak signals
+    # Bottoming/accumulation — LONG bias only; very high bar after SOL WR=29% with l1=+12
+    # adx_1h_min=20: require clear 1H momentum; l1_delta=+18: only strongest reversal signals
     "ACCUMULATION": {
-        "adx_1h_min": 18, "rsi_long": (35, 55), "rsi_short": (48, 68),
-        "allow_long": True,  "allow_short": False, "l1_delta": +12,
+        "adx_1h_min": 20, "rsi_long": (35, 52), "rsi_short": (48, 68),
+        "allow_long": True,  "allow_short": False, "l1_delta": +18,
     },
-    # Extended trend losing momentum — very high quality bar required
+    # Extended trend losing momentum — very high quality bar; tightened from +15 after
+    # SOL EXHAUSTION LONG WR=40%; RSI gate tighter so only deep oversold longs enter
     "EXHAUSTION": {
-        "adx_1h_min": 18, "rsi_long": (30, 48), "rsi_short": (52, 70),
-        "allow_long": True,  "allow_short": True,  "l1_delta": +15,
+        "adx_1h_min": 18, "rsi_long": (28, 44), "rsi_short": (56, 72),
+        "allow_long": True,  "allow_short": True,  "l1_delta": +18,
     },
 }
 
