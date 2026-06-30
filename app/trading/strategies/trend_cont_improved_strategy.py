@@ -298,57 +298,82 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                              roc9: bool = False, vol_expansion: bool = False,
                              bos: bool = False, zlema: bool = False,
                              price_action: bool = False, rsi_div: bool = False,
-                             rel_vol: bool = False, obv: bool = False):
+                             rel_vol: bool = False, obv: bool = False,
+                             ema_slope: bool = False, adx_rising_score: bool = False,
+                             atr_expansion: bool = False):
     if sj_scoring:
-        # SJ Hybrid 8-component set — no triple-counting volume.
-        # Base (4): hma_bull, ema5_sma9, rsi_band, breakout_hh10
-        # Optional: roc9, bos, rel_vol, obv_trend → default total = 8, min_score=5 (62.5%)
+        # Weighted Confidence Score (0-100 scale), min_score=70.
+        # Base (4 components, max 40 pts): hma_bull(15) ema5_sma9(5) rsi_band(10) breakout_hh10(10)
+        # Optional default-on (7 more, max 60 pts): roc9(10) obv(5) bos(15) rel_vol(10)
+        #   ema_slope(10) adx_rising(5) atr_expansion(5)
+        # Total max = 100 | thresholds: ≥90 strong, ≥80 normal, ≥70 small, <70 skip
         reg = {
             "hma_bull": dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=15.0,
                 long =lambda c: c["close"] > c["hma"],
                 short=lambda c: c["close"] < c["hma"],
-                desc="15m close vs HMA (Hull MA — period set by hma_period param)",
+                desc="HMA16 trend direction — primary trend gate (15 pts)",
             ),
             "ema5_sma9": dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=5.0,
                 long =lambda c: c["ema5"] > c["sma9"],
                 short=lambda c: c["ema5"] < c["sma9"],
-                desc="EMA5 vs SMA9 alignment (more sensitive than EMA9 vs EMA20)",
+                desc="EMA5 vs SMA9 momentum bonus — fast crossover (5 pts)",
             ),
             "rsi_band": dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=10.0,
                 long =lambda c: (c["rsi15"] >= c["rsi_min_buy"]) & (c["rsi15"] <= c["rsi_max_buy"]),
                 short=lambda c: (c["rsi15"] >= c["rsi_min_sell"]) & (c["rsi15"] <= c["rsi_max_sell"]),
-                desc="15m RSI inside allowed band",
+                desc="RSI inside non-overbought/oversold band (10 pts)",
             ),
             "breakout_hh10": dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=10.0,
                 long =lambda c: c["close"] > c["hh10"],
                 short=lambda c: c["close"] < c["ll10"],
-                desc="15m close breaks above/below N-bar high/low (breakout_lookback param)",
+                desc="Close breaks N-bar high/low — fast entry timing (10 pts)",
             ),
         }
         if roc9:
             reg["roc9"] = dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=10.0,
                 long =lambda c: c["roc9"] > 0,
                 short=lambda c: c["roc9"] < 0,
-                desc="ROC(9) positive/negative — confirms price momentum direction",
+                desc="ROC(9) price momentum direction (10 pts)",
             )
         if vol_expansion:
             reg["vol_expansion"] = dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=5.0,
                 long =lambda c: c["vol_expansion_ok"],
                 short=lambda c: c["vol_expansion_ok"],
-                desc="Volume > MA20 × 1.15 — breakout volume expansion bonus",
+                desc="Volume > MA20 × 1.15 (5 pts)",
             )
         if obv:
             reg["obv_trend"] = dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=5.0,
                 long =lambda c: c["obv"] > c["obv_ema20"],
                 short=lambda c: c["obv"] < c["obv_ema20"],
-                desc="OBV above/below its EMA20 — smart money flow, not raw volume spike",
+                desc="OBV above EMA20 — smart money flow direction (5 pts)",
+            )
+        if ema_slope:
+            reg["ema_slope"] = dict(
+                enabled=True, weight=10.0,
+                long =lambda c: c["ema_slope_ok"],
+                short=lambda c: ~c["ema_slope_ok"],
+                desc="EMA20 & EMA50 both rising — structural trend quality (10 pts)",
+            )
+        if adx_rising_score:
+            reg["adx_rising"] = dict(
+                enabled=True, weight=5.0,
+                long =lambda c: c["adx_rising_ok"],
+                short=lambda c: c["adx_rising_ok"],
+                desc="ADX rising over 2 bars — trend is strengthening (5 pts)",
+            )
+        if atr_expansion:
+            reg["atr_expansion"] = dict(
+                enabled=True, weight=5.0,
+                long =lambda c: c["atr_expand_ok"],
+                short=lambda c: c["atr_expand_ok"],
+                desc="ATR14 above ATR_MA20 — volatility expanding, not consolidating (5 pts)",
             )
         if extended:
             # SJ Extended: market structure + FVG (suggest min_score=5-6 out of 9+)
@@ -368,38 +393,38 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
             })
         if bos:
             reg["bos"] = dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=15.0,
                 long =lambda c: c["bos_bull"],
                 short=lambda c: c["bos_bear"],
-                desc="Break of Structure: 15m close exceeds N-bar swing high/low (bos_lookback param)",
+                desc="Break of Structure: close exceeds N-bar swing high/low (15 pts)",
             )
         if zlema:
             reg["zlema_dir"] = dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=5.0,
                 long =lambda c: c["zlema9"] > c["zlema20"],
                 short=lambda c: c["zlema9"] < c["zlema20"],
-                desc="ZLEMA9 vs ZLEMA20 alignment (zero-lag EMA, faster than EMA5>SMA9)",
+                desc="ZLEMA9 vs ZLEMA20 — zero-lag trend alignment (5 pts)",
             )
         if price_action:
             reg["price_action"] = dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=5.0,
                 long =lambda c: c["pa_bull"],
                 short=lambda c: c["pa_bear"],
-                desc="Pin bar or engulfing candle confirmation on 15m",
+                desc="Pin bar / engulfing candle confirmation (5 pts)",
             )
         if rsi_div:
             reg["rsi_div"] = dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=5.0,
                 long =lambda c: c["hidden_bull_div"],
                 short=lambda c: c["hidden_bear_div"],
-                desc="Hidden RSI divergence: price higher/lower but RSI diverges (no lookahead)",
+                desc="Hidden RSI divergence — continuation signal (5 pts)",
             )
         if rel_vol:
             reg["rel_vol"] = dict(
-                enabled=True, weight=1.0,
+                enabled=True, weight=10.0,
                 long =lambda c: c["rel_vol"] >= c["rel_vol_min"],
                 short=lambda c: c["rel_vol"] >= c["rel_vol_min"],
-                desc="Relative volume ≥ rel_vol_min — entry bar has elevated interest vs MA20",
+                desc="Relative volume ≥ rel_vol_min — the single volume quality gate (10 pts)",
             )
         return reg
     # Classic 4-component registry (default)
@@ -774,6 +799,16 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     fvg_bear = (out["high"] < out["low"].shift(2)).rolling(5, min_periods=1).max().astype(bool)
     roc9_val = _roc(out["close"], 9)
 
+    # Confidence Score extras — EMA slope, ATR expansion, ADX rising (score components)
+    ema50         = _ema(out["close"], 50)
+    # EMA slope: both EMA20 AND EMA50 rising over 2 bars → structural trend confirmed
+    ema_slope_ok  = (ema20 > ema20.shift(2)) & (ema50 > ema50.shift(2))
+    # ATR expansion: ATR14 above its 20-bar MA → market is moving, not in quiet consolidation
+    atr_ma20      = _sma(out["atr"], 20)
+    atr_expand_ok = out["atr"] > atr_ma20
+    # ADX rising (2-bar lookback): trend is strengthening steadily, not one-bar spike
+    adx_rising_ok = out["adx15"] > out["adx15"].shift(2).fillna(0)
+
     ctx = dict(
         close=out["close"], open=out["open"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
         macd=macd_line, macd_signal=macd_sig,
@@ -792,6 +827,9 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         hidden_bull_div=hidden_bull_div, hidden_bear_div=hidden_bear_div,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
+        ema_slope_ok=ema_slope_ok,
+        atr_expand_ok=atr_expand_ok,
+        adx_rising_ok=adx_rising_ok,
     )
 
     registry = p["indicators"]
@@ -1055,7 +1093,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         atr_period=14, sl_mult=1.2, sl_min_pct=0.012, sl_max_pct=0.035,
         adx_len=14, adx_min=30,
         tp1_r=0.5, tp1_fraction=0.50, tp2_r=2.5,   # close 50% at TP1 (keep a bigger runner)
-        min_score=5.0,   # 5/8 with sj_bos=True — backtest: +$103.94 vs 6/8=$62.64 (5/8 wins by $41)
+        min_score=70.0,  # 100-point confidence scale: ≥70 small, ≥80 normal, ≥90 strong
         # Fast mode v2
         fast_mode=False,
         adx_min_fast=15,          # ADX lower bound — trend must be active. Lowered 18→15
@@ -1129,10 +1167,14 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_vol_expansion=False,    # DISABLED: redundant with rel_vol (both measure volume elevation)
         # OBV trend: smart money flow direction (replaces vol_ok + vol_expansion duo)
         # OBV measures cumulative buy/sell pressure — far less noisy than raw volume spikes.
-        sj_obv=True,               # OBV above/below its EMA20 as SJ scoring component
+        sj_obv=True,               # OBV above/below its EMA20 as SJ scoring component (5 pts)
         # BOS: Break of Structure — close breaks beyond N-bar swing high/low
-        sj_bos=True,               # BOS as SJ scoring component
+        sj_bos=True,               # BOS as SJ scoring component (15 pts)
         bos_lookback=3,            # 3×15m = 45 min swing — 2 bars faster than previous 5-bar
+        # Confidence Score extras — structural quality filter
+        sj_ema_slope=True,         # EMA20 + EMA50 both rising = structural trend (10 pts)
+        sj_adx_rising=True,        # ADX rising over 2 bars = trend strengthening (5 pts)
+        sj_atr_expansion=True,     # ATR14 > ATR_MA20 = volatility expanding, not quiet (5 pts)
         # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
         # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
         atr_compress_gate=False,
@@ -1192,20 +1234,24 @@ class TrendContImprovedStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self._p = {**self.DEFAULTS, **{k: self.params.get(k, v) for k, v in self.DEFAULTS.items()}}
-        sj   = bool(self._p.get("sj_scoring",      False))
-        ext  = bool(self._p.get("sj_extended",     False))
-        r9   = bool(self._p.get("sj_roc9",         False))
-        ve   = bool(self._p.get("sj_vol_expansion", False))
-        bos  = bool(self._p.get("sj_bos",          False))
-        zl   = bool(self._p.get("sj_zlema",        False))
-        pa   = bool(self._p.get("sj_price_action", False))
-        rdiv = bool(self._p.get("sj_rsi_div",      False))
-        rv   = bool(self._p.get("sj_rel_vol",      False))
-        obv  = bool(self._p.get("sj_obv",          False))
+        sj   = bool(self._p.get("sj_scoring",        False))
+        ext  = bool(self._p.get("sj_extended",       False))
+        r9   = bool(self._p.get("sj_roc9",           False))
+        ve   = bool(self._p.get("sj_vol_expansion",  False))
+        bos  = bool(self._p.get("sj_bos",            False))
+        zl   = bool(self._p.get("sj_zlema",          False))
+        pa   = bool(self._p.get("sj_price_action",   False))
+        rdiv = bool(self._p.get("sj_rsi_div",        False))
+        rv   = bool(self._p.get("sj_rel_vol",        False))
+        obv  = bool(self._p.get("sj_obv",            False))
+        esl  = bool(self._p.get("sj_ema_slope",      False))
+        adr  = bool(self._p.get("sj_adx_rising",     False))
+        atrx = bool(self._p.get("sj_atr_expansion",  False))
         self._p["indicators"] = self.params.get("indicators",
             build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve,
                                      bos=bos, zlema=zl, price_action=pa, rsi_div=rdiv,
-                                     rel_vol=rv, obv=obv))
+                                     rel_vol=rv, obv=obv, ema_slope=esl,
+                                     adx_rising_score=adr, atr_expansion=atrx))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
@@ -1384,6 +1430,8 @@ class TrendContImprovedStrategy(BaseStrategy):
                 "rr_tp2":      tp2_r,
                 "one_r":       dist,
                 "sj_score":    sc,
+                "confidence_score": sc,
+                "confidence_level": "strong" if sc >= 90 else "normal" if sc >= 80 else "small",
                 "mtf_bias":    float(last.get("comp_pct", 0)),
                 "regime_score_w": float(last.get("h4_regime_score_w", 0)),
             }

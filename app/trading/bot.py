@@ -465,6 +465,11 @@ class TradingBot:
                 amount = self.risk.size_by_risk(usdt_free, price, sl_dist_pct, risk_pct)
             else:
                 amount = self.risk.size_position(usdt_free, price)
+            # Confidence-based sizing: scale down "small" confidence entries
+            _conf = meta.get("confidence_level", "normal")
+            if _conf == "small":
+                amount *= 0.5
+                logger.info("[%s] %s confidence=small → half size (%.4f)", slot, sym, amount)
             if amount <= 0:
                 logger.warning("[%s] Position size=0 for %s — skipping", slot, sym)
                 self._sig.unlock_strategy(sym, slot)
