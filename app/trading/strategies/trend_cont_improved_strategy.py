@@ -298,9 +298,11 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                              roc9: bool = False, vol_expansion: bool = False,
                              bos: bool = False, zlema: bool = False,
                              price_action: bool = False, rsi_div: bool = False,
-                             rel_vol: bool = False):
+                             rel_vol: bool = False, obv: bool = False):
     if sj_scoring:
-        # SJ Hybrid: faster/smarter components from SJ Fast Entry research
+        # SJ Hybrid 8-component set — no triple-counting volume.
+        # Base (4): hma_bull, ema5_sma9, rsi_band, breakout_hh10
+        # Optional: roc9, bos, rel_vol, obv_trend → default total = 8, min_score=5 (62.5%)
         reg = {
             "hma_bull": dict(
                 enabled=True, weight=1.0,
@@ -319,12 +321,6 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                 long =lambda c: (c["rsi15"] >= c["rsi_min_buy"]) & (c["rsi15"] <= c["rsi_max_buy"]),
                 short=lambda c: (c["rsi15"] >= c["rsi_min_sell"]) & (c["rsi15"] <= c["rsi_max_sell"]),
                 desc="15m RSI inside allowed band",
-            ),
-            "volume_ok": dict(
-                enabled=True, weight=1.0,
-                long =lambda c: c["vol_ok"],
-                short=lambda c: c["vol_ok"],
-                desc="15m volume >= MA20 * vol_mult",
             ),
             "breakout_hh10": dict(
                 enabled=True, weight=1.0,
@@ -347,16 +343,16 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                 short=lambda c: c["vol_expansion_ok"],
                 desc="Volume > MA20 × 1.15 — breakout volume expansion bonus",
             )
+        if obv:
+            reg["obv_trend"] = dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["obv"] > c["obv_ema20"],
+                short=lambda c: c["obv"] < c["obv_ema20"],
+                desc="OBV above/below its EMA20 — smart money flow, not raw volume spike",
+            )
         if extended:
-            # SJ Extended (+3 components → 8 total): OBV pressure, market structure,
-            # Fair Value Gap imbalance.  Suggest min_score=5 or 6 out of 8.
+            # SJ Extended: market structure + FVG (suggest min_score=5-6 out of 9+)
             reg.update({
-                "obv_trend": dict(
-                    enabled=True, weight=1.0,
-                    long =lambda c: c["obv"] > c["obv_ema20"],
-                    short=lambda c: c["obv"] < c["obv_ema20"],
-                    desc="OBV above/below its EMA20 (dominant volume pressure)",
-                ),
                 "market_struct": dict(
                     enabled=True, weight=1.0,
                     long =lambda c: c["sma20_rising"] & (c["close"] > c["sma20"]),
@@ -1128,14 +1124,15 @@ class TrendContImprovedStrategy(BaseStrategy):
         # SJ ROC9: adds ROC(9) direction as 6th component (5 → 6).
         # Backtest Jan-May 2026: min5/6 → combined +$447 vs baseline +$401 (+11.5% PnL, same MaxDD).
         sj_roc9=True,
-        # SJ Extended scoring: adds OBV trend + Market Structure + FVG (5 → 8 components)
-        sj_extended=False,         # enable 3 extra 15m components (total 9); adjust min_score to 5-6
-        sj_vol_expansion=True,     # add vol>MA20×1.15 as 7th SJ component (breakout volume bonus)
+        # SJ Extended scoring: Market Structure + FVG (obv_trend moved to sj_obv)
+        sj_extended=False,         # enable 2 extra 15m components; adjust min_score to 6+
+        sj_vol_expansion=False,    # DISABLED: redundant with rel_vol (both measure volume elevation)
+        # OBV trend: smart money flow direction (replaces vol_ok + vol_expansion duo)
+        # OBV measures cumulative buy/sell pressure — far less noisy than raw volume spikes.
+        sj_obv=True,               # OBV above/below its EMA20 as SJ scoring component
         # BOS: Break of Structure — close breaks beyond N-bar swing high/low
-        # Soft score: adds +1 point; min_score=5 still gates entry, BOS just helps push borderline
-        # setups over the threshold without being required.
-        sj_bos=True,               # BOS as soft score component (8th component, min_score=6/8)
-        bos_lookback=5,            # 5×15m = 75 min swing lookback (try 3-8)
+        sj_bos=True,               # BOS as SJ scoring component
+        bos_lookback=3,            # 3×15m = 45 min swing — 2 bars faster than previous 5-bar
         # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
         # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
         atr_compress_gate=False,
@@ -1179,7 +1176,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         regime_sl_high_vol=1.5,     # SL multiplier in HIGH_VOL (×1.5 wider)
         # ── Relative Volume (SJ scoring component) ─────────────────────────────
         # Entry bar volume relative to MA20(volume). Filters fake/low-interest breakouts.
-        sj_rel_vol=True,            # rel_vol SJ component — volume/MA20 ≥1.2x confirms entry interest
+        sj_rel_vol=True,            # rel_vol: volume/MA20 ≥1.2x — the single volume quality gate
         rel_vol_min=1.2,            # entry bar must have ≥1.2× average volume
         # HTF Momentum Score — 8-component quality gate (replaces binary crossover when enabled)
         htf_mom_score=False,       # off by default; enable to replace binary macro/mid gates
@@ -1204,10 +1201,11 @@ class TrendContImprovedStrategy(BaseStrategy):
         pa   = bool(self._p.get("sj_price_action", False))
         rdiv = bool(self._p.get("sj_rsi_div",      False))
         rv   = bool(self._p.get("sj_rel_vol",      False))
+        obv  = bool(self._p.get("sj_obv",          False))
         self._p["indicators"] = self.params.get("indicators",
             build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve,
                                      bos=bos, zlema=zl, price_action=pa, rsi_div=rdiv,
-                                     rel_vol=rv))
+                                     rel_vol=rv, obv=obv))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
