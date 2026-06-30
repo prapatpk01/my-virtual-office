@@ -54,8 +54,8 @@ class BacktestConfig:
     # Risk limits
     daily_loss_pct:   float = -3.0
     daily_profit_pct: float = 8.0
-    cooldown_min:     int   = 30
-    max_loss_streak:  int   = 3
+    cooldown_min:     int   = 20
+    max_loss_streak:  int   = 4
 
     # Indicator warmup bars (before first signal allowed)
     warmup_15m:  int = 60    # ~15 hours
@@ -235,15 +235,16 @@ class SymbolBacktest:
         ind_engine = IndicatorEngine()
 
         bot = TradingBot(
-            account_balance    = self.cfg.initial_balance,
-            base_risk_pct      = self.cfg.risk_pct,
+            account_balance       = self.cfg.initial_balance,
+            base_risk_pct         = self.cfg.risk_pct,
             daily_loss_limit_pct  = self.cfg.daily_loss_pct,
             daily_profit_limit_pct= self.cfg.daily_profit_pct,
-            cooldown_minutes   = self.cfg.cooldown_min,
-            max_loss_streak    = self.cfg.max_loss_streak,
-            tp1_close_pct      = self.cfg.tp1_close_pct,
-            state_file         = os.devnull,   # no disk I/O during backtest
-            execution_callback = executor.execute,
+            cooldown_minutes      = self.cfg.cooldown_min,
+            max_loss_streak       = self.cfg.max_loss_streak,
+            tp1_close_pct         = self.cfg.tp1_close_pct,
+            state_file            = os.devnull,   # no disk I/O during backtest
+            execution_callback    = executor.execute,
+            startup_warmup_minutes= 0,            # backtest has no warmup — instant start
         )
 
         trade_records: List[TradeRecord] = []

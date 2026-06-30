@@ -233,7 +233,7 @@ class AdaptiveEngine:
 
     def get_layer_thresholds(self, vol_state: str, market_state: str = "UPTREND") -> Dict[str, float]:
         """ATR-adaptive + regime-adaptive entry threshold"""
-        l1, l2 = 65.0, 60.0
+        l1, l2 = 60.0, 55.0  # base lowered 65→60 for better trade frequency
         vol_adj = {
             "Extreme":  (+8, +5),
             "High":     (+4, +2),
@@ -429,8 +429,8 @@ class TradingBot:
                  base_risk_pct: float = 0.01,
                  daily_loss_limit_pct: float = -3.0,
                  daily_profit_limit_pct: float = 8.0,
-                 cooldown_minutes: int = 30,
-                 max_loss_streak: int = 3,
+                 cooldown_minutes: int = 20,
+                 max_loss_streak: int = 4,
                  tp1_close_pct: float = 0.50,
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
@@ -578,23 +578,23 @@ class TradingBot:
             return "LOW_VOL"
 
         # Exhaustion: was trending but efficiency collapsed
-        if adx > 20 and eff < 0.35:
+        if adx > 18 and eff < 0.30:
             return "EXHAUSTION"
 
-        # Strong uptrend: price moving efficiently with strong ADX + bulls dominate
-        if adx > 25 and eff > 0.6 and pdi > mdi + 5:
+        # Strong uptrend: efficient trend with bulls clearly dominating
+        if adx > 22 and eff > 0.55 and pdi > mdi + 3:
             return "STRONG_UPTREND"
 
-        # Uptrend: bulls leading + some directional efficiency
-        if adx > 18 and eff > 0.4 and pdi > mdi:
+        # Uptrend: bulls leading with some directional efficiency
+        if adx > 16 and eff > 0.35 and pdi > mdi:
             return "UPTREND"
 
-        # Distribution: above EMA20 but slope fading + RSI extended
-        if ema5 > ema20 and slope < 45 and rsi > 52 and adx < 25:
+        # Distribution: above EMA20 but momentum fading + RSI extended
+        if ema5 > ema20 and slope < 47 and rsi > 50 and adx < 22:
             return "DISTRIBUTION"
 
-        # Accumulation: below EMA20 + RSI oversold/neutral + low ADX
-        if ema5 < ema20 and rsi < 48 and adx < 20:
+        # Accumulation: below EMA20 + RSI neutral/oversold + low ADX
+        if ema5 < ema20 and rsi < 50 and adx < 22:
             return "ACCUMULATION"
 
         return "RANGE"
@@ -706,10 +706,12 @@ class TradingBot:
         if adx_1h < adx_min or ema5_1h is None or ema20_1h is None:
             return False
 
+        # Allow EMA5 within 0.3% of EMA20 — catches turning points before full crossover
+        tolerance = ema20_1h * 0.003
         if direction == "LONG":
-            return ema5_1h >= ema20_1h
+            return ema5_1h >= ema20_1h - tolerance
         else:
-            return ema5_1h <= ema20_1h
+            return ema5_1h <= ema20_1h + tolerance
 
     # ── Step 5: Risk engine + sizing ─────────────────────────────────────────
 
@@ -1143,30 +1145,39 @@ class TradingBot:
             # [FIX 17] scoring ใช้ ind_15m (entry timeframe) แต่ต้องผ่าน 1H trend
             # filter ก่อน ไม่ใช่แค่ดู 15M เพียวๆ — กันสัญญาณสวนเทรนด์ใหญ่
             elif self.state == "FILTERING":
-                triggered = False
+                # Score both directions, pick the highest-scoring one that passes all filters
+                best_dir: Optional[str] = None
+                best_score: float = -1.0
+                weights = self.adaptive_engine.get_dynamic_weights(self.current_market_state)
+                thresholds = self.adaptive_engine.get_layer_thresholds(vol_state, self.current_market_state)
                 for direction in ("LONG", "SHORT"):
                     if not self._check_htf_trend_filter(direction, ind_1h):
                         continue
-                    if self._layer_filtering(
-                        direction, ind_15m, self.current_market_state, vol_state
-                    ):
-                        self.direction_focus   = direction
-                        self.state             = "WAIT_CONFIRM"
-                        self.bars_since_trigger = 0
-                        self._log_event(
-                            f"Signal found: {direction} in {self.current_market_state} "
-                            f"(1H trend filter ผ่าน)"
-                        )
-                        state_changed = True
-                        triggered = True
-                        break
-                # ถ้าไม่พบ signal ก็อยู่ที่ SCANNING ต่อไป
-                if not triggered:
+                    # Compute raw layer score for comparison
+                    multiplier = self.adaptive_engine.get_regime_multiplier(self.regime_score)
+                    raw_score = sum(
+                        self._scale_score(ind_15m.get(f"{k}_score", 0), weights.get(k, 0))
+                        for k in weights
+                    ) * multiplier
+                    if raw_score >= thresholds["L1_PASS"] and raw_score > best_score:
+                        best_score = raw_score
+                        best_dir = direction
+
+                if best_dir is not None:
+                    self.direction_focus   = best_dir
+                    self.state             = "WAIT_CONFIRM"
+                    self.bars_since_trigger = 0
+                    self._log_event(
+                        f"Signal found: {best_dir} in {self.current_market_state} "
+                        f"score={best_score:.1f} (1H trend filter ผ่าน)"
+                    )
+                    state_changed = True
+                else:
                     self.state = "SCANNING"
 
             # ── WAIT_CONFIRM ───────────────────────────────────────────────
             elif self.state == "WAIT_CONFIRM":
-                if self.bars_since_trigger > 5:  # 5 bars = 75 min บน 15M
+                if self.bars_since_trigger > 3:  # 3 bars = 45 min บน 15M (ลด miss window)
                     self._log_event("WAIT_CONFIRM timeout → back to SCANNING")
                     self.state    = "SCANNING"
                     state_changed = True
