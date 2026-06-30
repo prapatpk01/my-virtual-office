@@ -158,6 +158,56 @@ def _chop_index(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return ci.fillna(50.0)
 
 
+def _atr_percentile(atr_series: pd.Series, window: int = 100) -> pd.Series:
+    """Rolling percentile rank of ATR14 (0–100). <20 = quiet market, >80 = volatile."""
+    return atr_series.rolling(window).rank(pct=True).fillna(0.5) * 100
+
+
+def _market_regime(
+    adx: pd.Series, chop_1h: pd.Series, atr_pct: pd.Series,
+    ema20: pd.Series, rsi15: pd.Series, close: pd.Series, p: dict,
+) -> tuple:
+    """
+    Classify each 15m bar into a market regime.
+
+    Regimes (priority HIGH → LOW, last written wins):
+      TREND        ADX > 18 AND Chop(1H) < 50      — normal trending
+      STRONG_TREND ADX > 30 AND Chop(1H) < 38      — best conditions
+      HIGH_VOL     ATR > 80th pct                  — volatile, allow but widen SL
+      EXHAUSTION   ADX fading + RSI extreme + chop rising — trend dying, skip
+      LOW_VOL      ATR < 20th pct                  — dead market, skip
+      RANGE        (default)                        — skip
+
+    Returns (regime_series, entry_ok_bool, sl_mult_float_series).
+    """
+    strong_adx  = float(p.get("regime_strong_adx",   30))
+    trend_adx   = float(p.get("regime_trend_adx",    18))
+    low_pct     = float(p.get("regime_low_vol_pct",  20))
+    high_pct    = float(p.get("regime_high_vol_pct", 80))
+    strong_chop = float(p.get("regime_strong_chop",  38))
+    trend_chop  = float(p.get("chop_threshold",      50.0))
+    sl_hv       = float(p.get("regime_sl_high_vol",  1.5))
+
+    adx_peak   = adx.rolling(10).max().shift(1)
+    adx_fading = adx < adx_peak * 0.85            # ADX dropped >15% from recent 10-bar peak
+    rsi_ext    = (rsi15 > 75) | (rsi15 < 25)
+    ema20_flat = (ema20 - ema20.shift(3)).abs() / close.replace(0, np.nan) < 0.0008
+    chop_up    = chop_1h > chop_1h.shift(3)       # chop worsening (trending → ranging)
+
+    regime = pd.Series("RANGE", index=close.index, dtype=object)
+    regime[(adx > trend_adx)  & (chop_1h < trend_chop)]   = "TREND"
+    regime[(adx > strong_adx) & (chop_1h < strong_chop)]  = "STRONG_TREND"
+    regime[atr_pct > high_pct]                             = "HIGH_VOL"
+    regime[adx_fading & rsi_ext & (ema20_flat | chop_up)]  = "EXHAUSTION"
+    regime[atr_pct < low_pct]                              = "LOW_VOL"
+
+    entry_ok = regime.isin(["TREND", "STRONG_TREND", "HIGH_VOL"])
+    sl_mult  = pd.Series(1.0, index=close.index)
+    sl_mult[regime == "HIGH_VOL"] = sl_hv
+
+    return regime, entry_ok, sl_mult
+
+
 def _htf_dir(ef: pd.Series, es: pd.Series, close: pd.Series,
              mode: str = "cross", slope_bars: int = 2, sep_guard: bool = False,
              slope_pct: float = 0.0):
@@ -247,7 +297,8 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                              roc9: bool = False, vol_expansion: bool = False,
                              bos: bool = False, zlema: bool = False,
-                             price_action: bool = False, rsi_div: bool = False):
+                             price_action: bool = False, rsi_div: bool = False,
+                             rel_vol: bool = False):
     if sj_scoring:
         # SJ Hybrid: faster/smarter components from SJ Fast Entry research
         reg = {
@@ -346,6 +397,13 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                 long =lambda c: c["hidden_bull_div"],
                 short=lambda c: c["hidden_bear_div"],
                 desc="Hidden RSI divergence: price higher/lower but RSI diverges (no lookahead)",
+            )
+        if rel_vol:
+            reg["rel_vol"] = dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["rel_vol"] >= c["rel_vol_min"],
+                short=lambda c: c["rel_vol"] >= c["rel_vol_min"],
+                desc="Relative volume ≥ rel_vol_min — entry bar has elevated interest vs MA20",
             )
         return reg
     # Classic 4-component registry (default)
@@ -615,6 +673,16 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
             columns={"h4_high":"high","h4_low":"low","h4_close":"close"}), adx_len)
         adx_ok = adx_ok & (adx1h > min_1h) & (adx4h > min_4h)
 
+    # ATR Percentile — rolling rank (0–100); <20=quiet, >80=volatile.
+    # Computed unconditionally: used by regime + exposed as monitoring metric.
+    _atr_pct_win = int(p.get("regime_atr_pct_window", 100))
+    atr_pct = _atr_percentile(out["atr"], _atr_pct_win)
+    out["atr_pct"] = atr_pct
+
+    # Chop Index on 1H — always computed (used by regime + optional chop gate).
+    _chop_1h = _chop_index(df1h, 14).reindex(out.index, method="ffill").fillna(50.0)
+    out["chop_1h"] = _chop_1h
+
     # ── Layer 6: Micro score indicators ──────────────────────────────────────
     ema9  = _ema(out["close"], p["ema_micro"])
     ema20 = _ema(out["close"], p["ema_fast"])
@@ -622,6 +690,8 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     volma = _sma(out["volume"], p["vol_period"])
     vol_ok = (volma > 0) & (out["volume"] >= volma * p["vol_mult"])
     vol_expansion_ok = (volma > 0) & (out["volume"] >= volma * 1.15)
+    rel_vol = (out["volume"] / volma.replace(0, np.nan)).fillna(1.0)
+    out["rel_vol"] = rel_vol
 
     # ATR compression: ATR14 was tighter than ATR50 (squeeze), now expanding
     atr50_15m = _rma(_true_range(out), 50)
@@ -701,6 +771,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     ctx = dict(
         close=out["close"], open=out["open"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
         macd=macd_line, macd_signal=macd_sig,
+        rel_vol=rel_vol, rel_vol_min=float(p.get("rel_vol_min", 1.2)),
         ema5=ema5, sma9=sma9, hma=hma, hh10=hh10, ll10=ll10,
         obv=obv, obv_ema20=obv_ema20,
         sma20=sma20, sma20_rising=sma20_rising,
@@ -729,6 +800,15 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out["score_long"]  = score_long
     out["score_short"] = score_short
 
+    # ── Market Regime classification ──────────────────────────────────────────
+    _regime_sl_mult = pd.Series(1.0, index=out.index)
+    if p.get("market_regime_enabled", True):
+        _regime, _regime_entry_ok, _regime_sl_mult = _market_regime(
+            out["adx15"], _chop_1h, atr_pct, ema20, rsi15, out["close"], p
+        )
+        out["regime"] = _regime
+        out["regime_sl_mult"] = _regime_sl_mult
+
     # ── ATR compression gate (optional, separate from SJ scoring) ────────────
     if p.get("atr_compress_gate", False):
         long_gates  = adx_ok & atr_compress_ok
@@ -737,11 +817,14 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         long_gates  = adx_ok
         short_gates = adx_ok
 
+    # ── Market Regime gate: block RANGE / LOW_VOL / EXHAUSTION entries ────────
+    if p.get("market_regime_enabled", True):
+        long_gates  = long_gates  & _regime_entry_ok
+        short_gates = short_gates & _regime_entry_ok
+
     # ── Chop Index gate: block entries in ranging/sideways 1H market ─────────
     if p.get("chop_filter_enabled", False):
         _chop_thresh = float(p.get("chop_threshold", 50.0))
-        _chop_1h = _chop_index(df1h, 14).reindex(out.index, method="ffill").fillna(50.0)
-        out["chop_1h"] = _chop_1h
         _chop_ok = _chop_1h < _chop_thresh   # LOW = trending; HIGH = choppy
         long_gates  = long_gates  & _chop_ok
         short_gates = short_gates & _chop_ok
@@ -783,20 +866,20 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         _atr_ratio  = (out["atr"] / _atr50_sl.replace(0, np.nan)).fillna(1.0)
         _dyn_hi     = float(p.get("dynamic_sl_high_mult", 1.3))
         _dyn_lo     = float(p.get("dynamic_sl_low_mult",  0.8))
-        _sl_mult_v  = pd.Series(
+        _base_mult  = pd.Series(
             np.where(_atr_ratio > 1.3, p["sl_mult"] * _dyn_hi,
             np.where(_atr_ratio < 0.8, p["sl_mult"] * _dyn_lo,
                      p["sl_mult"])),
             index=out.index)
-        dist = (out["atr"] * _sl_mult_v).clip(
-            lower=out["close"] * p["sl_min_pct"],
-            upper=out["close"] * p["sl_max_pct"],
-        )
     else:
-        dist = (out["atr"] * p["sl_mult"]).clip(
-            lower=out["close"] * p["sl_min_pct"],
-            upper=out["close"] * p["sl_max_pct"],
-        )
+        _base_mult = pd.Series(p["sl_mult"], index=out.index)
+
+    # Regime SL adjustment: HIGH_VOL widens stop to avoid premature shake-out.
+    _final_mult = _base_mult * _regime_sl_mult
+    dist = (out["atr"] * _final_mult).clip(
+        lower=out["close"] * p["sl_min_pct"],
+        upper=out["close"] * p["sl_max_pct"],
+    )
     out["dist"] = dist
     return out
 
@@ -1054,6 +1137,21 @@ class TrendContImprovedStrategy(BaseStrategy):
         # TP1 breakeven buffer: after partial close, set runner SL to entry + N×R instead of exact BE.
         # Backtest Jan-May 2026 E:tp25_be25 winner: PnL +$121 vs +$88 baseline (+38%), PF 1.62 vs 1.45.
         tp1_be_buffer_r=0.25,       # 0.25R buffer above entry for runner stop (0=exact breakeven)
+        # ── Market Regime ──────────────────────────────────────────────────────
+        # Classifies each bar: STRONG_TREND / TREND / HIGH_VOL / RANGE / LOW_VOL / EXHAUSTION.
+        # Blocks RANGE/LOW_VOL/EXHAUSTION entries; widens SL in HIGH_VOL.
+        market_regime_enabled=True,
+        regime_atr_pct_window=100,  # rolling window for ATR percentile rank
+        regime_low_vol_pct=20,      # ATR percentile < 20 → LOW_VOL (skip)
+        regime_high_vol_pct=80,     # ATR percentile > 80 → HIGH_VOL (enter, wider SL)
+        regime_strong_adx=30,       # ADX threshold for STRONG_TREND
+        regime_trend_adx=18,        # ADX threshold for TREND (below = RANGE)
+        regime_strong_chop=38,      # Chop(1H) ceiling for STRONG_TREND
+        regime_sl_high_vol=1.5,     # SL multiplier in HIGH_VOL (×1.5 wider)
+        # ── Relative Volume (SJ scoring component) ─────────────────────────────
+        # Entry bar volume relative to MA20(volume). Filters fake/low-interest breakouts.
+        sj_rel_vol=True,            # add rel_vol as SJ scoring component
+        rel_vol_min=1.2,            # entry bar must have ≥1.2× average volume
         # HTF Momentum Score — 8-component quality gate (replaces binary crossover when enabled)
         htf_mom_score=False,       # off by default; enable to replace binary macro/mid gates
         min_htf_score=6,           # require 6/8 for entry (5 = moderate, 6 = strict)
@@ -1068,17 +1166,19 @@ class TrendContImprovedStrategy(BaseStrategy):
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self._p = {**self.DEFAULTS, **{k: self.params.get(k, v) for k, v in self.DEFAULTS.items()}}
-        sj  = bool(self._p.get("sj_scoring",      False))
-        ext = bool(self._p.get("sj_extended",     False))
-        r9  = bool(self._p.get("sj_roc9",         False))
-        ve  = bool(self._p.get("sj_vol_expansion", False))
+        sj   = bool(self._p.get("sj_scoring",      False))
+        ext  = bool(self._p.get("sj_extended",     False))
+        r9   = bool(self._p.get("sj_roc9",         False))
+        ve   = bool(self._p.get("sj_vol_expansion", False))
         bos  = bool(self._p.get("sj_bos",          False))
         zl   = bool(self._p.get("sj_zlema",        False))
         pa   = bool(self._p.get("sj_price_action", False))
         rdiv = bool(self._p.get("sj_rsi_div",      False))
+        rv   = bool(self._p.get("sj_rel_vol",      False))
         self._p["indicators"] = self.params.get("indicators",
             build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve,
-                                     bos=bos, zlema=zl, price_action=pa, rsi_div=rdiv))
+                                     bos=bos, zlema=zl, price_action=pa, rsi_div=rdiv,
+                                     rel_vol=rv))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
