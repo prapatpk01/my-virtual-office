@@ -993,7 +993,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
         macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
         # Entry-timing relax knobs (default = legacy behaviour, no change):
-        breakout_lookback=7,       # 7-bar high/low (was 10); fires sooner while filtering noise
+        breakout_lookback=3,       # 3-bar high/low — enters 1-2 bars earlier at pullback; backtest +$19 vs 7-bar
         adx_rising_or_strong=0,    # 0=off; if >0, ADX gate accepts (rising OR adx>this)
         # HTF macro/mid direction mode — 'cross' (legacy 20/50), 'slope', or 'early'.
         # 'slope'/'early' flip the 4h+1h gate before the full crossover → earlier entries.
