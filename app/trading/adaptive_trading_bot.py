@@ -61,6 +61,69 @@ logger = logging.getLogger("adaptive_trading_bot")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MODULE 2: REGIME-SPECIFIC ADAPTIVE THRESHOLDS
+# ADX, RSI, direction bias, and L1 delta per 8-state market regime
+# ──────────────────────────────────────────────────────────────────────────────
+
+REGIME_THRESHOLDS: Dict[str, Dict] = {
+    # Strong directional trend — LONG only, dip-buy, lower bar to enter
+    "STRONG_UPTREND": {
+        "adx_1h_min": 20, "rsi_long": (40, 65), "rsi_short": (35, 58),
+        "allow_long": True,  "allow_short": False, "l1_delta": -5,
+    },
+    # Normal trend — both directions, standard RSI dip gates
+    "UPTREND": {
+        "adx_1h_min": 15, "rsi_long": (35, 62), "rsi_short": (38, 65),
+        "allow_long": True,  "allow_short": True,  "l1_delta": 0,
+    },
+    # Ranging market — mean-reversion RSI gates, higher quality bar
+    "RANGE": {
+        "adx_1h_min": 12, "rsi_long": (28, 48), "rsi_short": (52, 72),
+        "allow_long": True,  "allow_short": True,  "l1_delta": +5,
+    },
+    # Volatility squeeze — wait for breakout quality, tight RSI
+    "LOW_VOL": {
+        "adx_1h_min": 10, "rsi_long": (45, 60), "rsi_short": (40, 55),
+        "allow_long": True,  "allow_short": True,  "l1_delta": +10,
+    },
+    # High volatility expansion — very strict ADX + tight RSI + high bar
+    "HIGH_VOL": {
+        "adx_1h_min": 22, "rsi_long": (42, 58), "rsi_short": (42, 58),
+        "allow_long": True,  "allow_short": True,  "l1_delta": +8,
+    },
+    # Topping/distribution — SHORT bias, longs blocked
+    "DISTRIBUTION": {
+        "adx_1h_min": 15, "rsi_long": (28, 45), "rsi_short": (52, 72),
+        "allow_long": False, "allow_short": True,  "l1_delta": +3,
+    },
+    # Bottoming/accumulation — LONG bias, shorts blocked
+    "ACCUMULATION": {
+        "adx_1h_min": 12, "rsi_long": (35, 55), "rsi_short": (48, 68),
+        "allow_long": True,  "allow_short": False, "l1_delta": +3,
+    },
+    # Extended trend losing momentum — very high quality bar required
+    "EXHAUSTION": {
+        "adx_1h_min": 25, "rsi_long": (30, 48), "rsi_short": (52, 70),
+        "allow_long": True,  "allow_short": True,  "l1_delta": +15,
+    },
+}
+
+_TRADEABLE_STATES: frozenset = frozenset(REGIME_THRESHOLDS.keys())
+
+# Entry type label per regime (for learning database enrichment)
+_REGIME_ENTRY_TYPE: Dict[str, str] = {
+    "STRONG_UPTREND": "trend_follow",
+    "UPTREND":        "trend_follow",
+    "RANGE":          "mean_revert",
+    "LOW_VOL":        "breakout",
+    "HIGH_VOL":       "momentum",
+    "DISTRIBUTION":   "reversal",
+    "ACCUMULATION":   "reversal",
+    "EXHAUSTION":     "counter_trend",
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # ADAPTIVE ENGINE
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -77,41 +140,62 @@ class AdaptiveEngine:
         self.atr_percentile_points = [10, 25, 50, 75, 90]
         self.atr_vol_labels = ["Very Low", "Low", "Normal", "High", "Extreme"]
 
-        # Base weights per market state (sum = 100 ต่อ state)
-        # [FIX 10] แยกเป็น per-condition เพื่อ learning อิสระ
+        # MODULE 1 base weights — 8 regimes, sum = 100 per state
         self.base_weights: Dict[str, Dict[str, float]] = {
-            "Trending": {
+            "STRONG_UPTREND": {
+                "trend": 25, "momentum": 20, "volume": 10, "pattern": 8,
+                "structure": 12, "atr": 5, "rsi": 5, "sweep": 0,
+                "divergence": 5, "ema": 5, "vwap": 5, "macd": 0,
+            },
+            "UPTREND": {
                 "trend": 20, "momentum": 15, "volume": 10, "pattern": 10,
                 "structure": 10, "atr": 5, "rsi": 5, "sweep": 5,
-                "divergence": 5, "ema": 5, "vwap": 5, "macd": 5
+                "divergence": 5, "ema": 5, "vwap": 5, "macd": 5,
             },
-            "Expansion": {
-                "trend": 15, "momentum": 15, "volume": 20, "pattern": 10,
-                "structure": 5, "atr": 15, "rsi": 5, "sweep": 0,
-                "divergence": 5, "ema": 5, "vwap": 5, "macd": 0
-            },
-            "Compression": {
-                "trend": 5, "momentum": 5, "volume": 10, "pattern": 20,
-                "structure": 10, "atr": 5, "rsi": 10, "sweep": 15,
-                "divergence": 10, "ema": 5, "vwap": 5, "macd": 0
-            },
-            "Sideway": {
+            "RANGE": {
                 "trend": 5, "momentum": 10, "volume": 10, "pattern": 15,
-                "structure": 10, "atr": 5, "rsi": 15, "sweep": 15,
-                "divergence": 10, "ema": 0, "vwap": 5, "macd": 0
+                "structure": 10, "atr": 5, "rsi": 20, "sweep": 10,
+                "divergence": 10, "ema": 0, "vwap": 5, "macd": 0,
             },
-            "Exhaustion": {
+            "LOW_VOL": {
+                "trend": 10, "momentum": 5, "volume": 5, "pattern": 20,
+                "structure": 10, "atr": 20, "rsi": 5, "sweep": 10,
+                "divergence": 5, "ema": 5, "vwap": 5, "macd": 0,
+            },
+            "HIGH_VOL": {
+                "trend": 10, "momentum": 15, "volume": 20, "pattern": 10,
+                "structure": 5, "atr": 15, "rsi": 5, "sweep": 5,
+                "divergence": 5, "ema": 5, "vwap": 5, "macd": 0,
+            },
+            "DISTRIBUTION": {
+                "trend": 5, "momentum": 15, "volume": 15, "pattern": 10,
+                "structure": 10, "atr": 5, "rsi": 10, "sweep": 5,
+                "divergence": 15, "ema": 5, "vwap": 5, "macd": 0,
+            },
+            "ACCUMULATION": {
+                "trend": 5, "momentum": 10, "volume": 15, "pattern": 10,
+                "structure": 10, "atr": 5, "rsi": 15, "sweep": 5,
+                "divergence": 15, "ema": 5, "vwap": 5, "macd": 0,
+            },
+            "EXHAUSTION": {
                 "trend": 5, "momentum": 10, "volume": 15, "pattern": 10,
                 "structure": 10, "atr": 5, "rsi": 10, "sweep": 5,
-                "divergence": 20, "ema": 5, "vwap": 0, "macd": 5
+                "divergence": 20, "ema": 5, "vwap": 0, "macd": 5,
             },
         }
 
-        # [FIX 10] track learning stats per state สำหรับ per-condition adjustment
+        # MODULE 3 learning stats — tracks win/loss R-multiples per condition per state
+        def _init_stats(w: Dict) -> Dict:
+            return {
+                "win_count": 0, "loss_count": 0,
+                "sum_win_r": 0.0, "sum_loss_r": 0.0,
+                "condition_wins":   {k: 0   for k in w},
+                "condition_total":  {k: 0   for k in w},
+                "condition_win_r":  {k: 0.0 for k in w},
+                "condition_loss_r": {k: 0.0 for k in w},
+            }
         self._learning_stats: Dict[str, Dict] = {
-            state: {"win_count": 0, "loss_count": 0, "condition_wins": {k: 0 for k in w},
-                    "condition_total": {k: 0 for k in w}}
-            for state, w in self.base_weights.items()
+            state: _init_stats(w) for state, w in self.base_weights.items()
         }
 
     # ── Regime / Volatility helpers ──────────────────────────────────────────
@@ -132,86 +216,106 @@ class AdaptiveEngine:
                 return self.atr_vol_labels[min(i, len(self.atr_vol_labels) - 1)]
         return "Very Low"
 
-    def get_layer_thresholds(self, vol_state: str) -> Dict[str, float]:
-        """ATR-adaptive entry threshold — ยิ่ง volatile ยิ่งต้องการ score สูงกว่า"""
-        l1, l2 = 65.0, 60.0   # คุณภาพสูง — bug fixes (SHORT + bar_dt) เพิ่ม trade count แล้ว
-        adjustments = {
+    def get_dynamic_weights(self, market_state: str) -> Dict[str, float]:
+        return self.base_weights.get(market_state, self.base_weights["UPTREND"])
+
+    def get_regime_thresholds(self, market_state: str) -> Dict:
+        return REGIME_THRESHOLDS.get(market_state, REGIME_THRESHOLDS["UPTREND"])
+
+    def get_layer_thresholds(self, vol_state: str, market_state: str = "UPTREND") -> Dict[str, float]:
+        """ATR-adaptive + regime-adaptive entry threshold"""
+        l1, l2 = 65.0, 60.0
+        vol_adj = {
             "Extreme":  (+8, +5),
             "High":     (+4, +2),
             "Normal":   ( 0,  0),
             "Low":      (-4, -2),
             "Very Low": (-6, -4),
         }
-        delta1, delta2 = adjustments.get(vol_state, (0, 0))
-        return {"L1_PASS": l1 + delta1, "L2_PASS": l2 + delta2}
+        d1, d2 = vol_adj.get(vol_state, (0, 0))
+        regime_delta = REGIME_THRESHOLDS.get(market_state, {}).get("l1_delta", 0)
+        return {
+            "L1_PASS": l1 + d1 + regime_delta,
+            "L2_PASS": l2 + d2 + max(0, regime_delta // 2),
+        }
 
-    def get_dynamic_weights(self, market_state: str) -> Dict[str, float]:
-        return self.base_weights.get(market_state, self.base_weights["Sideway"])
-
-    # ── [FIX 10] Learning Engine — per market_state, per condition ───────────
+    # ── MODULE 3: Expectancy-based Learning Engine ───────────────────────────
 
     def record_trade_result(self, market_state: str, win: bool,
-                            active_conditions: Dict[str, bool]):
-        """
-        บันทึกผล trade พร้อม conditions ที่ active ณ เวลา entry
-        ใช้สำหรับ per-condition weight learning
-        """
+                            active_conditions: Dict[str, bool],
+                            win_r: float = 1.0, loss_r: float = 1.0):
+        """บันทึกผล trade + R-multiple ต่อ condition สำหรับ expectancy learning"""
         if market_state not in self._learning_stats:
             return
         stats = self._learning_stats[market_state]
         if win:
             stats["win_count"] += 1
+            stats["sum_win_r"] += abs(win_r)
         else:
             stats["loss_count"] += 1
+            stats["sum_loss_r"] += abs(loss_r)
 
         for cond, is_active in active_conditions.items():
             if cond not in stats["condition_total"]:
                 continue
             stats["condition_total"][cond] += 1
-            if is_active and win:
-                stats["condition_wins"][cond] += 1
+            if is_active:
+                if win:
+                    stats["condition_wins"][cond] += 1
+                    stats["condition_win_r"][cond] += abs(win_r)
+                else:
+                    stats["condition_loss_r"][cond] += abs(loss_r)
 
     def adjust_weights_from_learning(self, journal_data: List[Dict]):
         """
-        [FIX 3] ปรับ weight แยกต่อ market_state และ per-condition
-        ไม่ใช่ global winrate
-
-        Logic:
-        - condition ที่มี conditional_winrate > global_winrate → +weight
-        - condition ที่มี conditional_winrate < global_winrate → -weight
-        - clamp ไว้ที่ [3, 40] เพื่อไม่ให้ weight ตายหรือ dominate
+        MODULE 3: Expectancy-based weight adjustment
+        Expectancy = WR × avg_win_R − (1−WR) × avg_loss_R
+        ปรับ weight ตาม expectancy ของแต่ละ condition เทียบกับ global expectancy
+        แทนที่จะดู win rate อย่างเดียว
         """
         if not journal_data:
             return
 
-        # แยก journal ตาม market_state
         by_state: Dict[str, List[Dict]] = {}
         for entry in journal_data:
-            state = entry.get("market_state", "Sideway")
+            state = entry.get("market_state", "UPTREND")
             by_state.setdefault(state, []).append(entry)
 
         for state, entries in by_state.items():
             if state not in self.base_weights or len(entries) < 10:
-                continue  # ต้องการ sample อย่างน้อย 10 trades ต่อ state
+                continue
 
-            wins = [e for e in entries if e.get("win_loss") == "WIN"]
-            total = len(entries)
+            wins   = [e for e in entries if e.get("win_loss") == "WIN"]
+            losses = [e for e in entries if e.get("win_loss") != "WIN"]
+            total  = len(entries)
             global_wr = len(wins) / total
 
+            avg_win_r_g  = sum(e.get("win_r",  1.0) for e in wins)   / max(len(wins),   1)
+            avg_loss_r_g = sum(e.get("loss_r", 1.0) for e in losses)  / max(len(losses), 1)
+            global_exp   = global_wr * avg_win_r_g - (1 - global_wr) * avg_loss_r_g
+
             stats = self._learning_stats.get(state, {})
-            cond_wins = stats.get("condition_wins", {})
-            cond_total = stats.get("condition_total", {})
+            cond_wins_m   = stats.get("condition_wins",   {})
+            cond_total_m  = stats.get("condition_total",  {})
+            cond_win_r_m  = stats.get("condition_win_r",  {})
+            cond_loss_r_m = stats.get("condition_loss_r", {})
 
             weights = self.base_weights[state]
             for cond in weights:
-                ct = cond_total.get(cond, 0)
+                ct = cond_total_m.get(cond, 0)
                 if ct < 5:
-                    continue  # ข้อมูลน้อยเกินไป ไม่ปรับ
-                cond_wr = cond_wins.get(cond, 0) / ct
-                delta = (cond_wr - global_wr) * 10  # scale เป็น weight unit
+                    continue
+                cw = cond_wins_m.get(cond, 0)
+                cl = ct - cw
+                cond_wr      = cw / ct
+                avg_win_r_c  = cond_win_r_m.get(cond,  0.0) / max(cw, 1)
+                avg_loss_r_c = cond_loss_r_m.get(cond, 0.0) / max(cl, 1)
+                cond_exp     = cond_wr * avg_win_r_c - (1 - cond_wr) * avg_loss_r_c
+
+                # Scale by expectancy delta — positive = condition predicts good trades
+                delta = (cond_exp - global_exp) * 5
                 weights[cond] = float(np.clip(weights[cond] + delta, 3, 40))
 
-            # normalize ให้ sum ≈ 100
             total_w = sum(weights.values())
             if total_w > 0:
                 factor = 100 / total_w
@@ -382,6 +486,10 @@ class TradingBot:
         self._tick_depth: int = 0
         self._max_tick_depth: int = 6
 
+        # Bar counter for holding_bars tracking
+        self._bar_count: int = 0
+        self._position_entry_bar: int = 0
+
         # Logging
         self._log: List[str] = []
 
@@ -427,23 +535,54 @@ class TradingBot:
         val_clamped = min(float(val), 100.0)
         return min((val_clamped / 100.0) * max_weight, max_weight)
 
-    # ── Step 1: Market state engine ──────────────────────────────────────────
+    # ── MODULE 1: 8-State Market Regime Engine ───────────────────────────────
 
     def _step1_market_state_engine(self, ind: Dict) -> str:
-        adx = ind.get("adx", 0)
-        eff = ind.get("eff_ratio", 0)
+        """
+        8-state regime detection from 4H indicators.
+        Priority order: HIGH_VOL → LOW_VOL → STRONG_UPTREND → UPTREND
+                      → EXHAUSTION → DISTRIBUTION → ACCUMULATION → RANGE
+        """
+        adx     = ind.get("adx", 0)
+        eff     = ind.get("eff_ratio", 0)
         atr_exp = ind.get("atr_exp", 1.0)
-        bb_w = ind.get("bb_width", 0.5)
+        bb_w    = ind.get("bb_width", 0.5)
+        pdi     = ind.get("pdi", 20)
+        mdi     = ind.get("mdi", 20)
+        rsi     = ind.get("rsi", 50)
+        ema5    = ind.get("ema5", 0)
+        ema20   = ind.get("ema20", 0)
+        slope   = ind.get("ema20_slope_score", 50)  # >55 rising, <45 falling
 
-        if adx > 25 and eff > 0.7:
-            return "Trending"
-        if atr_exp > 1.5 and bb_w > 0.8:
-            return "Expansion"
+        # Extreme volatility expansion — must trade cautiously
+        if atr_exp > 1.8 and bb_w > 0.7:
+            return "HIGH_VOL"
+
+        # Volatility squeeze — pre-breakout phase
         if bb_w < 0.2 and atr_exp < 0.8:
-            return "Compression"
-        if adx > 20 and eff < 0.4:
-            return "Exhaustion"
-        return "Sideway"
+            return "LOW_VOL"
+
+        # Exhaustion: was trending but efficiency collapsed
+        if adx > 20 and eff < 0.35:
+            return "EXHAUSTION"
+
+        # Strong uptrend: price moving efficiently with strong ADX + bulls dominate
+        if adx > 25 and eff > 0.6 and pdi > mdi + 5:
+            return "STRONG_UPTREND"
+
+        # Uptrend: bulls leading + some directional efficiency
+        if adx > 18 and eff > 0.4 and pdi > mdi:
+            return "UPTREND"
+
+        # Distribution: above EMA20 but slope fading + RSI extended
+        if ema5 > ema20 and slope < 45 and rsi > 52 and adx < 25:
+            return "DISTRIBUTION"
+
+        # Accumulation: below EMA20 + RSI oversold/neutral + low ADX
+        if ema5 < ema20 and rsi < 48 and adx < 20:
+            return "ACCUMULATION"
+
+        return "RANGE"
 
     # ── Step 2: 4H Regime score ──────────────────────────────────────────────
 
@@ -477,15 +616,29 @@ class TradingBot:
             self._log_event(f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit profit limit", level="warning")
             return False
 
-        # เทรดเฉพาะ Trending/Expansion — WR 67-80%
-        # Sideway (33-45%), Compression (31-51%), Exhaustion (28-53%) ทำให้ WR รวมต่ำ
-        _TRADEABLE_STATES = {"Trending", "Expansion"}
+        # MODULE 2: regime gate — ทุก state เทรดได้ แต่ต้องผ่าน threshold ต่างกัน
         if self.current_market_state not in _TRADEABLE_STATES:
             self._log_event(
-                f"SKIP: market_state={self.current_market_state} — เทรดเฉพาะ Trending/Expansion",
+                f"SKIP: unknown market_state={self.current_market_state}",
                 level="debug",
             )
             return False
+
+        # Direction compatibility with regime (DISTRIBUTION=SHORT only, ACCUMULATION=LONG only)
+        if self.direction_focus is not None:
+            rt = REGIME_THRESHOLDS.get(self.current_market_state, {})
+            if self.direction_focus == "LONG" and not rt.get("allow_long", True):
+                self._log_event(
+                    f"SKIP: {self.current_market_state} blocks LONG entries",
+                    level="debug",
+                )
+                return False
+            if self.direction_focus == "SHORT" and not rt.get("allow_short", True):
+                self._log_event(
+                    f"SKIP: {self.current_market_state} blocks SHORT entries",
+                    level="debug",
+                )
+                return False
 
         return True
 
@@ -505,7 +658,7 @@ class TradingBot:
         multiplier = self.adaptive_engine.get_regime_multiplier(self.regime_score)
         layer_score *= multiplier
 
-        thresholds = self.adaptive_engine.get_layer_thresholds(vol_state)
+        thresholds = self.adaptive_engine.get_layer_thresholds(vol_state, market_state)
         return layer_score >= thresholds["L1_PASS"]
 
     # ── [FIX 17] Step 3.5: 1H trend filter — กรองทิศทางก่อนเข้าไม้จาก 15M ──────
@@ -520,11 +673,15 @@ class TradingBot:
         ต้องสอดคล้องกับทิศทางที่จะเข้า — ถ้า 1H ไม่มีตัวบอกทิศทางชัดเจน ไม่อนุญาตเข้า
         ปรับเกณฑ์นี้ได้ตามสไตล์เทรดของคุณ (เช่น เพิ่มเช็ค trend_score หรือ adx_score ของ 1H)
         """
-        adx_1h = ind_1h.get("adx", 0)
-        ema5_1h = ind_1h.get("ema5")
+        adx_1h  = ind_1h.get("adx", 0)
+        ema5_1h  = ind_1h.get("ema5")
         ema20_1h = ind_1h.get("ema20")
 
-        if adx_1h < 15 or ema5_1h is None or ema20_1h is None:  # ADX ≥ 15 on 1H: กรอง choppy แต่ไม่เข้มเกิน
+        # MODULE 2: regime-adaptive ADX minimum on 1H
+        rt = REGIME_THRESHOLDS.get(self.current_market_state, REGIME_THRESHOLDS["UPTREND"])
+        adx_min = rt["adx_1h_min"]
+
+        if adx_1h < adx_min or ema5_1h is None or ema20_1h is None:
             return False
 
         if direction == "LONG":
@@ -582,6 +739,7 @@ class TradingBot:
             "mfe":                  0.0,   # max favorable excursion
         }
         self.position_open = True
+        self._position_entry_bar = self._bar_count
         self.order_status  = "OPEN"
 
         self._send_order("OPEN_LONG" if direction == "LONG" else "OPEN_SHORT", {
@@ -784,9 +942,23 @@ class TradingBot:
             "macd":       ind.get("macd_score", 0) > 60,
         }
 
+        # MODULE 3: compute R-multiples for expectancy learning
+        _entry  = t.get("entry", current_price)
+        _sl     = t.get("sl", _entry)
+        _exit   = t.get("exit_price", current_price)
+        _sl_d   = max(abs(_entry - _sl), 1e-8)
+        _d_mult = 1 if t.get("direction") == "LONG" else -1
+        _realized_r = _d_mult * (_exit - _entry) / _sl_d
+        _win_r  = max(_realized_r, 0.0)
+        _loss_r = max(-_realized_r, 0.0)
+
+        _vol_state = self.adaptive_engine.get_atr_volatility_state(
+            ind.get("atr", 0), self.atr_history)
+        _holding_bars = self._bar_count - self._position_entry_bar
+
         entry = {
             "symbol":           extras.get("symbol", "BTCUSDT"),
-            "timeframe":        "15M",   # [FIX 17] เข้าออเดอร์จาก 15M (1H/4H เป็นตัวกรองแนวโน้ม)
+            "timeframe":        "15M",
             "direction":        t.get("direction"),
             "entry":            t.get("entry"),
             "exit":             t.get("exit_price"),
@@ -796,8 +968,11 @@ class TradingBot:
             "rr":               t.get("final_rr"),
             "win_loss":         result,
             "pnl":              pnl,
+            "win_r":            round(_win_r, 3),
+            "loss_r":           round(_loss_r, 3),
             "mae":              t.get("mae"),
             "mfe":              t.get("mfe"),
+            "holding_bars":     _holding_bars,
             "hold_time_sec":    (datetime.datetime.now() - t.get("entry_time", datetime.datetime.now())).total_seconds(),
             "atr":              ind.get("atr"),
             "adx":              ind.get("adx"),
@@ -805,8 +980,10 @@ class TradingBot:
             "ema":              ind.get("ema5"),
             "macd":             ind.get("macd"),
             "market_state":     self.current_market_state,
-            "volatility_state": self.adaptive_engine.get_atr_volatility_state(
-                                    ind.get("atr", 0), self.atr_history),
+            "entry_type":       _REGIME_ENTRY_TYPE.get(self.current_market_state, "trend_follow"),
+            "atr_percentile":   _vol_state,
+            "hour_utc":         (self._bar_now or datetime.datetime.now()).hour,
+            "volatility_state": _vol_state,
             "regime_score":     self.regime_score,
             "session":          extras.get("session"),
             "funding":          extras.get("funding_rate"),
@@ -818,11 +995,13 @@ class TradingBot:
         }
         self.trade_journal.append(entry)
 
-        # [FIX 10] record to learning engine
+        # MODULE 3: record to learning engine with R-multiples
         self.adaptive_engine.record_trade_result(
             self.current_market_state,
             win=(result == "WIN"),
             active_conditions=active_conditions,
+            win_r=_win_r,
+            loss_r=_loss_r,
         )
 
         # Update streaks + daily PnL
@@ -885,6 +1064,7 @@ class TradingBot:
         """
         now = bar_dt or datetime.datetime.now()
         self._bar_now = now  # shared across all sub-methods this tick
+        self._bar_count += 1
         self._check_daily_reset(bar_dt)
 
         # อัปเดต ATR history — ใช้ 4H เพื่อความนิ่งของ volatility regime classification
@@ -1018,15 +1198,18 @@ class TradingBot:
         if direction is None:
             return False
 
-        rsi = ind.get("rsi", 50)
+        rsi      = ind.get("rsi", 50)
         momentum = ind.get("momentum_score", 50)
 
+        # MODULE 2: regime-specific RSI entry gates
+        rt = REGIME_THRESHOLDS.get(self.current_market_state, REGIME_THRESHOLDS["UPTREND"])
+
         if direction == "LONG":
-            # ซื้อ dip ใน uptrend: RSI ดึงกลับ (ไม่ overbought) + momentum ยังเป็นบวก
-            return rsi > 35 and rsi < 60 and momentum > 50
+            lo, hi = rt["rsi_long"]
+            return lo < rsi < hi and momentum > 50
         else:
-            # SHORT: ขาย rally ใน downtrend: RSI ดีดขึ้น (ไม่ oversold) + momentum ยังเป็นลบ
-            return rsi > 40 and rsi < 65 and momentum < 50
+            lo, hi = rt["rsi_short"]
+            return lo < rsi < hi and momentum < 50
 
     def _enter_recovery_trade(self, candle: Dict, ind: Dict, ind_1h: Dict, vol_state: str):
         """[FIX 8] เปิด trade ด้วย risk 50% ใน recovery mode (ยังผ่าน 1H trend filter เหมือนปกติ)"""
