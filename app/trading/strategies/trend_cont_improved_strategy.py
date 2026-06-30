@@ -650,6 +650,9 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     bos_ll   = out["low"].rolling(bos_lb).min().shift(1)
     bos_bull = out["close"] > bos_hh   # bullish BOS: break above N-bar high
     bos_bear = out["close"] < bos_ll   # bearish BOS: break below N-bar low
+    # Prior BOS: structural break happened 1-20 bars ago — trend established before current pullback
+    prior_bos_bull = bos_bull.shift(1).rolling(20).max().fillna(0).astype(bool)
+    prior_bos_bear = bos_bear.shift(1).rolling(20).max().fillna(0).astype(bool)
 
     # ZLEMA: zero-lag EMA (always computed — cheap, used by sj_zlema component)
     zlema9_15m  = _zlema(out["close"], 9)
@@ -696,7 +699,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     roc9_val = _roc(out["close"], 9)
 
     ctx = dict(
-        close=out["close"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
+        close=out["close"], open=out["open"], ema9=ema9, ema20=ema20, rsi15=rsi15, vol_ok=vol_ok,
         macd=macd_line, macd_signal=macd_sig,
         ema5=ema5, sma9=sma9, hma=hma, hh10=hh10, ll10=ll10,
         obv=obv, obv_ema20=obv_ema20,
@@ -706,6 +709,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         vol_expansion_ok=vol_expansion_ok,
         atr_compress_ok=atr_compress_ok,
         bos_bull=bos_bull, bos_bear=bos_bear,
+        prior_bos_bull=prior_bos_bull, prior_bos_bear=prior_bos_bear,
         zlema9=zlema9_15m, zlema20=zlema20_15m,
         pa_bull=pa_bull, pa_bear=pa_bear,
         hidden_bull_div=hidden_bull_div, hidden_bear_div=hidden_bear_div,
