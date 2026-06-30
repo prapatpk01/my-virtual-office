@@ -134,7 +134,7 @@ class AdaptiveEngine:
 
     def get_layer_thresholds(self, vol_state: str) -> Dict[str, float]:
         """ATR-adaptive entry threshold — ยิ่ง volatile ยิ่งต้องการ score สูงกว่า"""
-        l1, l2 = 65.0, 60.0
+        l1, l2 = 55.0, 50.0   # ลดจาก 65/60 → 55/50 เพิ่ม trade frequency
         adjustments = {
             "Extreme":  (+8, +5),
             "High":     (+4, +2),
@@ -474,6 +474,11 @@ class TradingBot:
             self._log_event(f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit profit limit", level="warning")
             return False
 
+        # บล็อก Exhaustion state — WR ต่ำมาก (0-20%) ไม่คุ้มความเสี่ยง
+        if self.current_market_state == "Exhaustion":
+            self._log_event("SKIP: market_state=Exhaustion — ไม่เทรดใน Exhaustion", level="debug")
+            return False
+
         return True
 
     # ── Step 4: Layer filtering ──────────────────────────────────────────────
@@ -511,7 +516,7 @@ class TradingBot:
         ema5_1h = ind_1h.get("ema5")
         ema20_1h = ind_1h.get("ema20")
 
-        if adx_1h < 15 or ema5_1h is None or ema20_1h is None:
+        if adx_1h < 12 or ema5_1h is None or ema20_1h is None:  # ลดจาก 15 → 12
             return False
 
         if direction == "LONG":
@@ -634,19 +639,23 @@ class TradingBot:
             return "EXITING"
 
         # ── [FIX 1] Health-based position management ──────────────────────
+        # Before TP1: health actions gated — TP1 must be hit first.
+        # In Compression/Sideway states ADX is low by design, which systematically
+        # pulls health to 40-60 and triggers premature break-even before the trade
+        # has any chance to reach TP1. Let the original SL do its job pre-TP1.
+        # After TP1: full health management watches the remaining 50% position.
+        tp1_hit = t.get("tp1_hit", False)
         health = self.health_calc.calculate(ind, t, current_price)
 
         if health >= 80:
-            # Health สูงมาก — ตัดสินใจ "ไม่แทรกแซง SL" คือ logic จริง (ไม่ใช่ unimplemented)
-            # log ไว้เป็น telemetry ว่าทำไมไม่ trail ในรอบนี้ เพื่อ debug ได้ง่ายขึ้นตอนรันจริง
             self._log_event(
-                f"Health {health:.0f} (≥80) → HOLD: ปล่อย position วิ่งต่อโดยไม่ขยับ SL "
+                f"Health {health:.0f} (≥80) → HOLD: ปล่อย position วิ่งต่อ "
                 f"(current_r={current_r:.2f})",
                 level="debug",
             )
 
         elif health >= 60 or t["break_even_triggered"]:
-            # ATR trailing stop
+            # ATR trailing stop (runs both pre and post TP1 — only tightens SL)
             atr = ind.get("atr", sl_dist)
             atr_trail = atr * 2
             if direction == "LONG":
@@ -657,17 +666,21 @@ class TradingBot:
                 t["sl"] = min(t["sl"], new_sl)
 
         elif health >= 40:
-            if not t["break_even_triggered"]:
+            # Force break-even only AFTER TP1 has been hit — prevents Compression-state
+            # false-positive health drops from cutting trades before they develop
+            if not t["break_even_triggered"] and tp1_hit:
                 t["sl"] = t["entry"]
                 t["break_even_triggered"] = True
-                self._log_event(f"Health {health:.0f} → forced break-even")
+                self._log_event(f"Health {health:.0f} → forced break-even (post-TP1)")
 
         elif health >= 20:
-            if t["remaining_size"] > 0:
+            # Reduce position size — only act on the remaining portion post-TP1
+            if t["remaining_size"] > 0 and tp1_hit:
                 self._close_position("HEALTH_REDUCE", current_price, 0.50, ind)
                 self.state = "PARTIAL_EXIT"
 
         else:
+            # Emergency exit regardless of TP1 state — health is critically low
             self._close_position("POOR_HEALTH_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
@@ -940,7 +953,7 @@ class TradingBot:
 
             # ── WAIT_CONFIRM ───────────────────────────────────────────────
             elif self.state == "WAIT_CONFIRM":
-                if self.bars_since_trigger > 3:
+                if self.bars_since_trigger > 5:  # 5 bars = 75 min บน 15M
                     self._log_event("WAIT_CONFIRM timeout → back to SCANNING")
                     self.state    = "SCANNING"
                     state_changed = True
@@ -999,21 +1012,20 @@ class TradingBot:
     def _check_entry_trigger(self, ind: Dict) -> bool:
         """
         ตรวจสอบ entry trigger condition จาก indicator 15M (entry timeframe)
-
-        Override method นี้ใน subclass หรือ inject logic ของคุณ
-        Default: ตรวจ RSI confirmation + candle close momentum
+        momentum_score: 50 + direction * strength  (>50 = bullish, <50 = bearish)
         """
         direction = self.direction_focus
         if direction is None:
             return False
 
         rsi = ind.get("rsi", 50)
-        momentum = ind.get("momentum_score", 0)
+        momentum = ind.get("momentum_score", 50)
 
         if direction == "LONG":
-            return rsi > 45 and rsi < 70 and momentum > 50
+            return rsi > 42 and rsi < 72 and momentum > 48
         else:
-            return rsi < 55 and rsi > 30 and momentum > 50
+            # SHORT: ต้องการ bearish momentum (<50) ไม่ใช่ bullish
+            return rsi < 58 and rsi > 28 and momentum < 52
 
     def _enter_recovery_trade(self, candle: Dict, ind: Dict, ind_1h: Dict, vol_state: str):
         """[FIX 8] เปิด trade ด้วย risk 50% ใน recovery mode (ยังผ่าน 1H trend filter เหมือนปกติ)"""
@@ -1103,6 +1115,9 @@ class TradingBot:
 
     def save_state(self, path: str = DEFAULT_STATE_FILE):
         """บันทึก state ปัจจุบันลงไฟล์ JSON (เรียกทุกครั้งที่ state สำคัญเปลี่ยน)"""
+        import os as _os
+        if not path or path == _os.devnull:
+            return  # backtest mode — ไม่ต้องเขียน disk
         snapshot = {
             "state":                self.state,
             "position_open":        self.position_open,
