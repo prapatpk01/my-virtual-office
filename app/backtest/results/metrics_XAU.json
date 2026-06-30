@@ -1,0 +1,27 @@
+{
+  "symbol": "XAU",
+  "total_trades": 3,
+  "win_rate": 0.0,
+  "profit_factor": 0.0,
+  "net_pnl": -160.48,
+  "net_pnl_pct": -1.6,
+  "avg_win": 0,
+  "avg_loss": -53.49,
+  "avg_rr": NaN,
+  "max_drawdown_pct": 1.6,
+  "sharpe": -58.655,
+  "final_balance": 9839.52,
+  "avg_bars_held": 0.0,
+  "total_commission": 149.99,
+  "by_market_state": {
+    "Compression": {
+      "wins": 0,
+      "losses": 3,
+      "pnl": -160.48289580932027,
+      "win_rate": 0.0,
+      "total": 3
+    }
+  },
+  "longs": 3,
+  "shorts": 0
+}
