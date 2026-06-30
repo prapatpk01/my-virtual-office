@@ -144,6 +144,20 @@ def _roc(s: pd.Series, n: int = 9) -> pd.Series:
     return (s - s.shift(n)) / s.shift(n).replace(0, np.nan) * 100
 
 
+def _zlema(s: pd.Series, n: int) -> pd.Series:
+    """Zero-Lag EMA: 2×EMA(n) − EMA(EMA(n)) — roughly halves EMA lag."""
+    ema1 = _ema(s, n)
+    return 2 * ema1 - _ema(ema1, n)
+
+
+def _chop_index(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    """Choppiness Index (0–100). LOW <50 = trending; HIGH >61 = choppy/ranging."""
+    tr_sum = _true_range(df).rolling(n).sum()
+    hl_n   = df["high"].rolling(n).max() - df["low"].rolling(n).min()
+    ci     = 100 * np.log10(tr_sum / hl_n.replace(0, np.nan)) / np.log10(n)
+    return ci.fillna(50.0)
+
+
 def _htf_dir(ef: pd.Series, es: pd.Series, close: pd.Series,
              mode: str = "cross", slope_bars: int = 2, sep_guard: bool = False,
              slope_pct: float = 0.0):
@@ -232,7 +246,8 @@ def _merge_htf(df_primary: pd.DataFrame, df_htf: pd.DataFrame,
 
 def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                              roc9: bool = False, vol_expansion: bool = False,
-                             bos: bool = False):
+                             bos: bool = False, zlema: bool = False,
+                             price_action: bool = False, rsi_div: bool = False):
     if sj_scoring:
         # SJ Hybrid: faster/smarter components from SJ Fast Entry research
         reg = {
@@ -310,6 +325,27 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                 long =lambda c: c["bos_bull"],
                 short=lambda c: c["bos_bear"],
                 desc="Break of Structure: 15m close exceeds N-bar swing high/low (bos_lookback param)",
+            )
+        if zlema:
+            reg["zlema_dir"] = dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["zlema9"] > c["zlema20"],
+                short=lambda c: c["zlema9"] < c["zlema20"],
+                desc="ZLEMA9 vs ZLEMA20 alignment (zero-lag EMA, faster than EMA5>SMA9)",
+            )
+        if price_action:
+            reg["price_action"] = dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["pa_bull"],
+                short=lambda c: c["pa_bear"],
+                desc="Pin bar or engulfing candle confirmation on 15m",
+            )
+        if rsi_div:
+            reg["rsi_div"] = dict(
+                enabled=True, weight=1.0,
+                long =lambda c: c["hidden_bull_div"],
+                short=lambda c: c["hidden_bear_div"],
+                desc="Hidden RSI divergence: price higher/lower but RSI diverges (no lookahead)",
             )
         return reg
     # Classic 4-component registry (default)
@@ -509,8 +545,12 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
 
     # ── Layer 3: Pullback zone (mode-specific) ────────────────────────────────
     if fast_mode:
-        # Fast Mode v2: 1H EMA20 zone
-        ema20_1h = ef1
+        # Fast Mode v2: 1H EMA20 zone (or HMA20 if use_hma20_pullback=True)
+        if p.get("use_hma20_pullback", False):
+            # Compute on actual 1H bars then reindex — avoids ffill HMA distortion
+            ema20_1h = _hma(df1h["close"], 20).reindex(out.index, method="ffill")
+        else:
+            ema20_1h = ef1
         pullback_atr_mult = float(p.get("pullback_atr_mult_fast", 1.2))
         if pullback_atr_mult > 0:
             # ATR-based: adaptive to volatility (BTC 1H ATR ~$600-1k; 1.2× ~ $720-1.2k)
@@ -610,6 +650,39 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     bos_ll   = out["low"].rolling(bos_lb).min().shift(1)
     bos_bull = out["close"] > bos_hh   # bullish BOS: break above N-bar high
     bos_bear = out["close"] < bos_ll   # bearish BOS: break below N-bar low
+
+    # ZLEMA: zero-lag EMA (always computed — cheap, used by sj_zlema component)
+    zlema9_15m  = _zlema(out["close"], 9)
+    zlema20_15m = _zlema(out["close"], 20)
+
+    # Price Action: pin bar / engulfing (used by sj_price_action component, no lookahead)
+    _body     = (out["close"] - out["open"]).abs()
+    _wick_bot = (out[["open", "close"]].min(axis=1) - out["low"]).clip(lower=0)
+    _wick_top = (out["high"] - out[["open", "close"]].max(axis=1)).clip(lower=0)
+    _pin_bull = (_wick_bot > _body * 2) & (out["close"] >= out["open"])
+    _pin_bear = (_wick_top > _body * 2) & (out["close"] <= out["open"])
+    _eng_bull = (
+        (out["close"] > out["open"]) &
+        (out["close"] > out["open"].shift(1)) &
+        (out["open"]  < out["close"].shift(1))
+    )
+    _eng_bear = (
+        (out["close"] < out["open"]) &
+        (out["close"] < out["open"].shift(1)) &
+        (out["open"]  > out["close"].shift(1))
+    )
+    pa_bull = (_pin_bull | _eng_bull).fillna(False)
+    pa_bear = (_pin_bear | _eng_bear).fillna(False)
+
+    # RSI Hidden Divergence (shift-based, no lookahead, no center=True)
+    # Hidden bull: price higher than N bars ago but RSI lower → bullish continuation
+    # Hidden bear: price lower than N bars ago but RSI higher → bearish continuation
+    _rdiv_lb        = int(p.get("rsi_div_lookback", 5))
+    _price_chg      = out["close"] - out["close"].shift(_rdiv_lb)
+    _rsi_chg        = rsi15 - rsi15.shift(_rdiv_lb)
+    hidden_bull_div = ((_price_chg > 0) & (_rsi_chg < 0)).fillna(False)
+    hidden_bear_div = ((_price_chg < 0) & (_rsi_chg > 0)).fillna(False)
+
     # OBV trend: cumulative volume flow vs its own EMA20
     obv_dir  = np.sign(out["close"].diff().fillna(0))
     obv      = (obv_dir * out["volume"]).cumsum()
@@ -633,6 +706,9 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         vol_expansion_ok=vol_expansion_ok,
         atr_compress_ok=atr_compress_ok,
         bos_bull=bos_bull, bos_bear=bos_bear,
+        zlema9=zlema9_15m, zlema20=zlema20_15m,
+        pa_bull=pa_bull, pa_bear=pa_bear,
+        hidden_bull_div=hidden_bull_div, hidden_bear_div=hidden_bear_div,
         rsi_min_buy=p["rsi_min_buy"], rsi_max_buy=p["rsi_max_buy"],
         rsi_min_sell=p["rsi_min_sell"], rsi_max_sell=p["rsi_max_sell"],
     )
@@ -656,6 +732,22 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     else:
         long_gates  = adx_ok
         short_gates = adx_ok
+
+    # ── Chop Index gate: block entries in ranging/sideways 1H market ─────────
+    if p.get("chop_filter_enabled", False):
+        _chop_thresh = float(p.get("chop_threshold", 50.0))
+        _chop_1h = _chop_index(df1h, 14).reindex(out.index, method="ffill").fillna(50.0)
+        out["chop_1h"] = _chop_1h
+        _chop_ok = _chop_1h < _chop_thresh   # LOW = trending; HIGH = choppy
+        long_gates  = long_gates  & _chop_ok
+        short_gates = short_gates & _chop_ok
+
+    # ── Volume boost gate: entry bar must have elevated volume ────────────────
+    if p.get("vol_boost_gate", False):
+        _vb_mult = float(p.get("vol_boost_mult", 1.5))
+        _vol_boost_ok = (volma > 0) & (out["volume"] >= volma * _vb_mult)
+        long_gates  = long_gates  & _vol_boost_ok
+        short_gates = short_gates & _vol_boost_ok
 
     # ── Final entry trigger: close must break above previous bar high/low ─────
     if p.get("final_trigger_enabled", False):
@@ -681,10 +773,26 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out["d_bias_s"]    = short_bias_ok.fillna(False)
     out["d_adx_ok"]    = adx_ok.fillna(False)
 
-    dist = (out["atr"] * p["sl_mult"]).clip(
-        lower=out["close"] * p["sl_min_pct"],
-        upper=out["close"] * p["sl_max_pct"],
-    )
+    # ── Dynamic SL: ATR14/ATR50 ratio adjusts sl_mult to market volatility ──────
+    if p.get("dynamic_sl_enabled", False):
+        _atr50_sl   = _rma(_true_range(out), 50)
+        _atr_ratio  = (out["atr"] / _atr50_sl.replace(0, np.nan)).fillna(1.0)
+        _dyn_hi     = float(p.get("dynamic_sl_high_mult", 1.3))
+        _dyn_lo     = float(p.get("dynamic_sl_low_mult",  0.8))
+        _sl_mult_v  = pd.Series(
+            np.where(_atr_ratio > 1.3, p["sl_mult"] * _dyn_hi,
+            np.where(_atr_ratio < 0.8, p["sl_mult"] * _dyn_lo,
+                     p["sl_mult"])),
+            index=out.index)
+        dist = (out["atr"] * _sl_mult_v).clip(
+            lower=out["close"] * p["sl_min_pct"],
+            upper=out["close"] * p["sl_max_pct"],
+        )
+    else:
+        dist = (out["atr"] * p["sl_mult"]).clip(
+            lower=out["close"] * p["sl_min_pct"],
+            upper=out["close"] * p["sl_max_pct"],
+        )
     out["dist"] = dist
     return out
 
@@ -923,6 +1031,22 @@ class TrendContImprovedStrategy(BaseStrategy):
         htf_adx_len=14,
         htf_adx_min_1h=20,
         htf_adx_min_4h=18,
+        # ── V3 Ultra improvements ─────────────────────────────────────────────────
+        # Phase 1: Speed & Precision
+        use_hma20_pullback=False,   # replace EMA20→HMA20 in 1H pullback zone (actual 1H bars)
+        sj_zlema=False,             # ZLEMA9 vs ZLEMA20 alignment as SJ scoring component
+        sj_price_action=False,      # pin bar / engulfing candle as SJ soft score
+        # Phase 2: Accuracy
+        chop_filter_enabled=False,  # 1H Chop Index gate: LOW(<threshold)=trending, block choppy
+        chop_threshold=50.0,        # chop < threshold = trending market (50=neutral, 38=very trending)
+        vol_boost_gate=False,       # require entry bar volume > MA20 × vol_boost_mult
+        vol_boost_mult=1.5,         # volume boost multiplier (1.5x = 50% above MA20)
+        sj_rsi_div=False,           # hidden RSI divergence as SJ soft score (no lookahead)
+        rsi_div_lookback=5,         # lookback bars for divergence comparison
+        # Phase 3: Adaptability
+        dynamic_sl_enabled=False,   # ATR14/ATR50 ratio → widen SL in high-vol, tighten in chop
+        dynamic_sl_high_mult=1.3,   # sl_mult × this when ATR14/ATR50 > 1.3 (volatile)
+        dynamic_sl_low_mult=0.8,    # sl_mult × this when ATR14/ATR50 < 0.8 (quiet/choppy)
         # HTF Momentum Score — 8-component quality gate (replaces binary crossover when enabled)
         htf_mom_score=False,       # off by default; enable to replace binary macro/mid gates
         min_htf_score=6,           # require 6/8 for entry (5 = moderate, 6 = strict)
@@ -941,9 +1065,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         ext = bool(self._p.get("sj_extended",     False))
         r9  = bool(self._p.get("sj_roc9",         False))
         ve  = bool(self._p.get("sj_vol_expansion", False))
-        bos = bool(self._p.get("sj_bos",          False))
+        bos  = bool(self._p.get("sj_bos",          False))
+        zl   = bool(self._p.get("sj_zlema",        False))
+        pa   = bool(self._p.get("sj_price_action", False))
+        rdiv = bool(self._p.get("sj_rsi_div",      False))
         self._p["indicators"] = self.params.get("indicators",
-            build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve, bos=bos))
+            build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve,
+                                     bos=bos, zlema=zl, price_action=pa, rsi_div=rdiv))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
