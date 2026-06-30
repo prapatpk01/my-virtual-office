@@ -154,7 +154,7 @@ def build_config() -> dict:
         # SJ ROC9 — 6th component (ROC(9) direction). Backtest +11.5% PnL @ min5/6.
         "tci_sj_roc9":          _sj_roc9,
         # 1H Chop Index gate — filters out ranging markets (chop<50=trending). Backtest: +$129 vs baseline.
-        "tci_chop_filter":      _env_bool("chop_filter_enabled", True),
+        "tci_chop_filter":      _env_bool("CHOP_FILTER_ENABLED", True),
 
         # ── Position health monitor ───────────────────────────────────────────
         # Re-checks every open position using 5m+1h+4h candles (relaxed thresholds).
