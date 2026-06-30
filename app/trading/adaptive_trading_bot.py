@@ -433,7 +433,8 @@ class TradingBot:
                  max_loss_streak: int = 3,
                  tp1_close_pct: float = 0.50,
                  state_file: Optional[str] = None,
-                 execution_callback: Optional[Callable] = None):
+                 execution_callback: Optional[Callable] = None,
+                 startup_warmup_minutes: int = 45):
         """
         Parameters
         ----------
@@ -498,6 +499,11 @@ class TradingBot:
         # Bar counter for holding_bars tracking
         self._bar_count: int = 0
         self._position_entry_bar: int = 0
+
+        # Post-restart warmup — block signals for N minutes after startup
+        # so ATR history, indicators and market state can stabilize
+        self.startup_warmup_minutes: int = startup_warmup_minutes
+        self._startup_unblock_at: Optional[datetime.datetime] = None
 
         # Logging
         self._log: List[str] = []
@@ -611,6 +617,13 @@ class TradingBot:
 
         # [FIX 9] datetime comparison — use bar time in backtest, wall-clock in live
         _now = self._bar_now or datetime.datetime.now()
+
+        # Post-restart warmup: wait for indicators/ATR history to stabilize
+        if self._startup_unblock_at and _now < self._startup_unblock_at:
+            remaining = int((self._startup_unblock_at - _now).total_seconds() / 60)
+            self._log_event(f"WARMUP: {remaining}m remaining — no new entries", level="debug")
+            return False
+
         if self.cooldown_until and _now < self.cooldown_until:
             self.state = "COOLDOWN"
             return False
@@ -1074,6 +1087,17 @@ class TradingBot:
         now = bar_dt or datetime.datetime.now()
         self._bar_now = now  # shared across all sub-methods this tick
         self._bar_count += 1
+
+        # Set startup warmup window on very first tick
+        if self._startup_unblock_at is None and self.startup_warmup_minutes > 0:
+            self._startup_unblock_at = now + datetime.timedelta(minutes=self.startup_warmup_minutes)
+            self._log_event(
+                f"POST-RESTART WARMUP: blocking new entries until "
+                f"{self._startup_unblock_at.strftime('%H:%M UTC')} "
+                f"({self.startup_warmup_minutes}m)",
+                level="warning",
+            )
+
         self._check_daily_reset(bar_dt)
 
         # อัปเดต ATR history — ใช้ 4H เพื่อความนิ่งของ volatility regime classification
@@ -1240,20 +1264,26 @@ class TradingBot:
 
     def get_status(self) -> Dict:
         """Summary ของ bot state ปัจจุบัน"""
+        _now = self._bar_now or datetime.datetime.now()
+        warmup_remaining = 0
+        if self._startup_unblock_at and _now < self._startup_unblock_at:
+            warmup_remaining = int((self._startup_unblock_at - _now).total_seconds() / 60)
         return {
-            "state":           self.state,
-            "position_open":   self.position_open,
-            "direction":       self.current_trade.get("direction") if self.position_open else None,
-            "entry":           self.current_trade.get("entry") if self.position_open else None,
-            "realized_pnl":    self.current_trade.get("realized_pnl", 0),
-            "account_balance": self.account_balance,
-            "daily_pnl_pct":   self.daily_pnl_pct,
-            "loss_streak":     self.loss_streak,
-            "win_streak":      self.win_streak,
-            "total_trades":    len(self.trade_journal),
-            "market_state":    self.current_market_state,
-            "regime_score":    self.regime_score,
-            "cooldown_until":  self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "state":              self.state,
+            "position_open":      self.position_open,
+            "direction":          self.current_trade.get("direction") if self.position_open else None,
+            "entry":              self.current_trade.get("entry") if self.position_open else None,
+            "realized_pnl":       self.current_trade.get("realized_pnl", 0),
+            "account_balance":    self.account_balance,
+            "daily_pnl_pct":      self.daily_pnl_pct,
+            "loss_streak":        self.loss_streak,
+            "win_streak":         self.win_streak,
+            "total_trades":       len(self.trade_journal),
+            "market_state":       self.current_market_state,
+            "regime_score":       self.regime_score,
+            "cooldown_until":     self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "warmup_remaining_m": warmup_remaining,
+            "recent_log":         list(self._log[-20:]),
         }
 
     def get_performance_summary(self) -> Dict:

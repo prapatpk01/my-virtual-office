@@ -24,7 +24,8 @@ class TelegramNotifier:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Wired by run_bot.py after construction
-        self.bot: object = None          # TradingBot reference
+        self.bot: object = None          # TradingBot reference (legacy/non-adaptive)
+        self.bots_dict: dict = {}        # symbol → AdaptiveTradingBot (adaptive mode)
         self.stop_bot_fn: Optional[Callable] = None
 
     # ------------------------------------------------------------------
@@ -157,6 +158,86 @@ class TelegramNotifier:
         )
 
     # ------------------------------------------------------------------
+    # Command implementations
+    # ------------------------------------------------------------------
+
+    async def _cmd_stats(self):
+        """Per-symbol adaptive bot stats."""
+        bots = self.bots_dict
+        if not bots:
+            if self.bot:
+                state = self.bot.get_state() if hasattr(self.bot, "get_state") else {}
+                await self._send(
+                    f"Bot Stats\n"
+                    f"Balance: ${state.get('balance', 0):,.2f}\n"
+                    f"PnL: ${state.get('pnl_total', 0):+,.2f}\n"
+                    f"Positions: {len(state.get('positions', []))}"
+                )
+            else:
+                await self._send("No bots connected.")
+            return
+
+        lines = ["Adaptive Bot Stats\n"]
+        total_pnl = 0.0
+        for sym, (bot, _) in bots.items():
+            try:
+                st = bot.get_status()
+                perf = bot.get_performance_summary() if hasattr(bot, "get_performance_summary") else {}
+                n = st.get("total_trades", 0)
+                wr = perf.get("win_rate", 0) * 100 if n > 0 else 0.0
+                pnl = perf.get("net_pnl", 0.0)
+                total_pnl += pnl
+                regime = st.get("market_state", "?")
+                pos = "IN_POS" if st.get("position_open") else st.get("state", "?")
+                warmup = st.get("warmup_remaining_m", 0)
+                warmup_str = f" | WARMUP {warmup}m" if warmup > 0 else ""
+                lines.append(
+                    f"{sym}: {pos} | {regime} | "
+                    f"{n}T {wr:.0f}%WR ${pnl:+.0f}{warmup_str}"
+                )
+            except Exception as e:
+                lines.append(f"{sym}: error ({e})")
+
+        lines.append(f"\nTotal PnL: ${total_pnl:+,.2f}")
+        await self._send("\n".join(lines))
+
+    async def _cmd_log(self, n: int = 15):
+        """Last N log lines from all adaptive bots."""
+        bots = self.bots_dict
+        if not bots:
+            await self._send("No adaptive bots connected.")
+            return
+
+        all_lines = []
+        for sym, (bot, _) in bots.items():
+            try:
+                st = bot.get_status()
+                recent = st.get("recent_log", [])
+                for entry in recent:
+                    all_lines.append(f"[{sym.split('/')[0]}] {entry}")
+            except Exception:
+                pass
+
+        if not all_lines:
+            await self._send("No log entries yet.")
+            return
+
+        tail = all_lines[-n:]
+        text = "Recent Log\n" + "\n".join(tail)
+        # Telegram message limit ~4096 chars
+        if len(text) > 3800:
+            text = text[-3800:]
+        await self._send(text)
+
+    def send_periodic_status(self):
+        """Fire-and-forget periodic status — call from run_bot every 5m."""
+        if not self._enabled:
+            return
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._cmd_stats(), loop)
+
+    # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
 
@@ -260,12 +341,20 @@ class TelegramNotifier:
         if cmd == "help":
             await self._send(
                 "Trading Bot Commands\n\n"
+                "/stats - per-symbol P&L, WR, regime, balance\n"
+                "/log [N] - last N log lines (default 15)\n"
                 "/status - running status, positions, balance\n"
                 "/positions - open positions with PnL estimate\n"
-                "/buy [symbol] - manual buy (e.g. /buy BTC/USDT)\n"
                 "/stop - stop the bot\n"
                 "/help - show this message"
             )
+
+        elif cmd in ("stats", "stat"):
+            await self._cmd_stats()
+
+        elif cmd == "log":
+            n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 15
+            await self._cmd_log(n)
 
         elif cmd == "status":
             if not self.bot:

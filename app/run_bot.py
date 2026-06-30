@@ -238,15 +238,34 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         last_bar_ts[sym] = 0
 
     if telegram:
+        # Wire bots dict so /stats and /log commands work
+        telegram.bots_dict = bots
         telegram.send(
-            f"🤖 Adaptive Bot Started\n"
+            f"Adaptive Bot Started\n"
             f"Symbols: {', '.join(symbols)}\n"
-            f"Mode: {'PAPER' if cfg['paper'] else 'LIVE'}"
+            f"Mode: {'PAPER' if cfg['paper'] else 'LIVE'}\n"
+            f"Warmup: 45m — no new entries until indicators stabilize"
         )
 
     loop = asyncio.get_event_loop()
-
     max_pos = cfg.get("adaptive_max_positions", 2)
+
+    # Periodic status to Telegram every 5 minutes
+    async def _periodic_status():
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=300)  # 5m
+            except asyncio.TimeoutError:
+                pass
+            if stop_event.is_set():
+                break
+            if telegram:
+                try:
+                    await telegram._cmd_stats()
+                except Exception as e:
+                    logger.debug("Periodic status error: %s", e)
+
+    loop.create_task(_periodic_status())
 
     while not stop_event.is_set():
         for sym in symbols:
