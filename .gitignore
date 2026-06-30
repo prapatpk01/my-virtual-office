@@ -9,3 +9,4 @@ app/vo-config.json
 app/default-office-config.json.bak
 .claude/
 app/.bt_cache_*.json
+app/backtest_results/
