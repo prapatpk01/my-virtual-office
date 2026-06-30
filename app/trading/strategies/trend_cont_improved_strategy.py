@@ -1182,7 +1182,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         regime_sl_high_vol=1.5,     # SL multiplier in HIGH_VOL (×1.5 wider)
         # ── Relative Volume (SJ scoring component) ─────────────────────────────
         # Entry bar volume relative to MA20(volume). Filters fake/low-interest breakouts.
-        sj_rel_vol=False,           # rel_vol SJ component (backtest showed no effect vs vol_expansion)
+        sj_rel_vol=True,            # rel_vol SJ component — volume/MA20 ≥1.2x confirms entry interest
         rel_vol_min=1.2,            # entry bar must have ≥1.2× average volume
         # HTF Momentum Score — 8-component quality gate (replaces binary crossover when enabled)
         htf_mom_score=False,       # off by default; enable to replace binary macro/mid gates
