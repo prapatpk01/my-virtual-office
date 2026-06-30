@@ -524,7 +524,7 @@ class TradingBot:
         ema5_1h = ind_1h.get("ema5")
         ema20_1h = ind_1h.get("ema20")
 
-        if adx_1h < 18 or ema5_1h is None or ema20_1h is None:  # 15→18: ต้องการ trend ที่แรงขึ้นบน 1H
+        if adx_1h < 15 or ema5_1h is None or ema20_1h is None:  # ADX ≥ 15 on 1H: กรอง choppy แต่ไม่เข้มเกิน
             return False
 
         if direction == "LONG":
