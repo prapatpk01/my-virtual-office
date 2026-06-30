@@ -270,35 +270,32 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         "CRITICAL": "🔴",
     }
 
+    # Track which symbols had a position open on the previous health-log cycle,
+    # so we can reset the timer when a new position opens (fires the first
+    # health log immediately rather than waiting up to 5 min).
+    _had_position: dict = {sym: False for sym in symbols}
+
     def _log_health(sym: str, bot, price: float, ind_15m: dict):
-        """Emit a 5-minute health log for one symbol."""
-        if bot.position_open and ind_15m:
-            report = bot.get_position_health_report(price, ind_15m)
-            level  = report.get("health_level", "?")
-            emoji  = _HEALTH_EMOJI.get(level, "?")
-            rev    = report.get("reversal_signals", {})
-            rev_str = f" | REVERSAL={','.join(rev)}" if rev else ""
-            tp1_str = " TP1✓" if report.get("tp1_hit") else ""
-            logger.info(
-                "[Health][%s] %s %s(%.0f)%s | dir=%s entry=%.2f cur=%.2f"
-                " pnl=%+.2f R=%.2f | SL=%.2f TP1=%.2f TP2=%.2f"
-                " | ADX=%.1f RSI=%.1f bars=%d%s",
-                sym, emoji, level, report["health_score"], tp1_str,
-                report["direction"], report["entry"], price,
-                report["pnl"], report["current_r"],
-                report["sl"], report["tp1"], report["tp2"],
-                report["adx"], report["rsi"], report["holding_bars"],
-                rev_str,
-            )
-        else:
-            status = bot.get_status()
-            warmup = status.get("warmup_remaining_m", 0)
-            warmup_str = f" warmup={warmup}m" if warmup else ""
-            logger.info(
-                "[Health][%s] NO_POS | state=%s market=%s regime=%.0f%s",
-                sym, status["state"], status["market_state"],
-                status["regime_score"], warmup_str,
-            )
+        """Emit a 5-minute health log — only when a position is open."""
+        if not bot.position_open or not ind_15m:
+            return   # no position → nothing to report
+        report = bot.get_position_health_report(price, ind_15m)
+        level   = report.get("health_level", "?")
+        emoji   = _HEALTH_EMOJI.get(level, "?")
+        rev     = report.get("reversal_signals", {})
+        rev_str = f" | REVERSAL={','.join(rev)}" if rev else ""
+        tp1_str = " TP1✓" if report.get("tp1_hit") else ""
+        logger.info(
+            "[Health][%s] %s %s(%.0f)%s | dir=%s entry=%.2f cur=%.2f"
+            " pnl=%+.2f R=%.2f | SL=%.2f TP1=%.2f TP2=%.2f"
+            " | ADX=%.1f RSI=%.1f bars=%d%s",
+            sym, emoji, level, report["health_score"], tp1_str,
+            report["direction"], report["entry"], price,
+            report["pnl"], report["current_r"],
+            report["sl"], report["tp1"], report["tp2"],
+            report["adx"], report["rsi"], report["holding_bars"],
+            rev_str,
+        )
 
     # Note: periodic Telegram stats removed — too noisy.
     # Use /stats command to check on demand. Railway logs show state every tick.
@@ -373,13 +370,24 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             status["market_state"], status["regime_score"],
                         )
 
-                # 5-minute health log — runs even when no new bar
+                # 5-minute health log — only fires when a position is open.
+                # Timer resets the moment a new position opens so the first
+                # health report fires immediately (not after 5 min).
                 _ts = _time.time()
-                if (_ts - last_health_log.get(sym, 0) >= HEALTH_LOG_SECS
+                pos_now = bot.position_open
+                if pos_now and not _had_position[sym]:
+                    # Position just opened — fire immediately and start timer
+                    last_health_log[sym] = _ts
+                    if last_ind_cache.get(sym):
+                        _log_health(sym, bot, last_price_cache.get(sym, 0.0),
+                                    last_ind_cache[sym])
+                elif (pos_now
+                        and _ts - last_health_log.get(sym, 0) >= HEALTH_LOG_SECS
                         and last_ind_cache.get(sym)):
                     last_health_log[sym] = _ts
                     _log_health(sym, bot, last_price_cache.get(sym, 0.0),
                                 last_ind_cache[sym])
+                _had_position[sym] = pos_now
 
             except asyncio.CancelledError:
                 raise
