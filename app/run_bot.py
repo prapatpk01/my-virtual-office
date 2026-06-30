@@ -121,6 +121,7 @@ def build_config() -> dict:
         "adaptive_daily_profit": _env_float("ADAPTIVE_DAILY_PROFIT_PCT", 8.0),
         "adaptive_cooldown_min": _env_int("ADAPTIVE_COOLDOWN_MIN", 30),
         "adaptive_max_loss_streak": _env_int("ADAPTIVE_MAX_LOSS_STREAK", 3),
+        "adaptive_max_positions": _env_int("ADAPTIVE_MAX_POSITIONS", 2),
     }
 
 
@@ -245,6 +246,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
     loop = asyncio.get_event_loop()
 
+    max_pos = cfg.get("adaptive_max_positions", 2)
+
     while not stop_event.is_set():
         for sym in symbols:
             try:
@@ -263,12 +266,28 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     continue
                 last_bar_ts[sym] = latest_ts
 
+                bot, state_file = bots[sym]
+
+                # Global position cap — count open positions across ALL symbols.
+                # If this bot has no open position and we're already at the limit,
+                # skip the tick entirely (no scanning, no new entry).
+                # Bots that already hold a position always run (SL/TP management).
+                if not bot.position_open:
+                    open_count = sum(
+                        1 for b, _ in bots.values() if b.position_open
+                    )
+                    if open_count >= max_pos:
+                        logger.debug(
+                            "[Adaptive][%s] SKIP — global positions %d/%d full",
+                            sym, open_count, max_pos,
+                        )
+                        continue
+
                 # Compute indicators
                 candle_15m, candle_1h, candle_4h, ind_15m, ind_1h, ind_4h = \
                     ind_engine.compute(c15m, c1h, c4h)
 
                 price = candle_15m.get("close", 0.0)
-                bot, state_file = bots[sym]
 
                 extras = {"symbol": sym, "session": "", "funding_rate": 0.0, "oi": 0}
 
