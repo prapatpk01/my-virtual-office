@@ -609,15 +609,22 @@ class TradingBot:
                 self.risk.register_pnl(pnl)
                 pos.amount     = round(pos.amount - close_amt, 6)
                 pos.tp1_hit    = True
-                pos.stop_loss  = pos.entry_price          # runner: bot-side BE stop
-                # Move exchange algo SL to breakeven. Non-fatal if it fails —
+                # Runner SL: entry + 0.25R buffer locks minimum profit instead of exact BE.
+                _one_r   = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
+                _strat   = next((s for s in self.strategies
+                                 if s.symbol == sym and s.name == strategy_name), None)
+                _be_buf  = float((getattr(_strat, "_p", None) or {}).get("tp1_be_buffer_r", 0.25))
+                be_price = (pos.entry_price + _be_buf * _one_r if pos.side == "long"
+                            else pos.entry_price - _be_buf * _one_r)
+                pos.stop_loss  = be_price
+                # Move exchange algo SL to BE+buffer. Non-fatal if it fails —
                 # bot-side BE stop + health monitor protect the runner.
                 sl_ok = await self.connector.move_sl_to_breakeven(
-                    sym, pos_side, pos.entry_price, pos.amount
+                    sym, pos_side, be_price, pos.amount
                 )
                 if not sl_ok:
                     logger.warning(
-                        "[%s] TP1 %s — exchange SL not moved to BE; "
+                        "[%s] TP1 %s — exchange SL not moved to BE+buf; "
                         "bot-side BE stop + health monitor protecting runner",
                         strategy_name, sym,
                     )
@@ -626,9 +633,9 @@ class TradingBot:
                     price=price, amount=close_amt, pnl=pnl,
                     strategy=strategy_name, reason="take_profit1", paper=self.paper,
                 ))
-                logger.info("[%s] TP1 %s @ %.4f closed %.6f (%.0f%%) → SL→BE %.4f  pnl≈%.2f",
+                logger.info("[%s] TP1 %s @ %.4f closed %.6f (%.0f%%) → SL→BE+buf %.4f  pnl≈%.2f",
                             strategy_name, sym, price, close_amt, pos.partial_pct * 100,
-                            pos.entry_price, pnl)
+                            be_price, pnl)
                 if self.telegram:
                     self.telegram.notify_trade_closed(
                         sym, "take_profit1", price, pos.entry_price,

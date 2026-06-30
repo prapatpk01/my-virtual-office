@@ -1051,6 +1051,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         dynamic_sl_enabled=False,   # ATR14/ATR50 ratio → widen SL in high-vol, tighten in chop
         dynamic_sl_high_mult=1.3,   # sl_mult × this when ATR14/ATR50 > 1.3 (volatile)
         dynamic_sl_low_mult=0.8,    # sl_mult × this when ATR14/ATR50 < 0.8 (quiet/choppy)
+        # TP1 breakeven buffer: after partial close, set runner SL to entry + N×R instead of exact BE.
+        # Backtest Jan-May 2026 E:tp25_be25 winner: PnL +$121 vs +$88 baseline (+38%), PF 1.62 vs 1.45.
+        tp1_be_buffer_r=0.25,       # 0.25R buffer above entry for runner stop (0=exact breakeven)
         # HTF Momentum Score — 8-component quality gate (replaces binary crossover when enabled)
         htf_mom_score=False,       # off by default; enable to replace binary macro/mid gates
         min_htf_score=6,           # require 6/8 for entry (5 = moderate, 6 = strict)
