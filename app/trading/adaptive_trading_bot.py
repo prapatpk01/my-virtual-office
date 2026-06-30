@@ -108,7 +108,16 @@ REGIME_THRESHOLDS: Dict[str, Dict] = {
     },
 }
 
-_TRADEABLE_STATES: frozenset = frozenset(REGIME_THRESHOLDS.keys())
+_TRADEABLE_STATES: frozenset = frozenset({
+    "STRONG_UPTREND",  # trend-follow LONG — highest WR
+    "UPTREND",         # trend-follow both directions
+    "DISTRIBUTION",    # SHORT-bias reversal (topping pattern)
+    "ACCUMULATION",    # LONG-bias reversal (bottoming pattern)
+    "HIGH_VOL",        # expansion — high bar (l1_delta +8) protects quality
+    # RANGE: blocked — catch-all Sideway equivalent, WR 33-45%
+    # LOW_VOL: blocked — wait for breakout, no directional edge yet
+    # EXHAUSTION: blocked — extended trend, sharp reversal risk
+})
 
 # Entry type label per regime (for learning database enrichment)
 _REGIME_ENTRY_TYPE: Dict[str, str] = {
