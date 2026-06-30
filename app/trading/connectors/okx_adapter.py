@@ -108,6 +108,7 @@ class OKXAdapter(BaseConnector):
         max_retries:    int            = MAX_RETRIES,
         base_delay:     float          = BASE_DELAY,
         max_delay:      float          = MAX_DELAY,
+        leverage:       int            = 10,
     ):
         super().__init__(
             api_key    = api_key    or os.environ.get("OKX_API_KEY",        ""),
@@ -120,6 +121,8 @@ class OKXAdapter(BaseConnector):
         self.max_retries = max_retries
         self.base_delay  = base_delay
         self.max_delay   = max_delay
+        self.leverage    = leverage
+        self._swap_ready_symbols: set = set()  # symbols that have had leverage/mode set
 
         cfg = {
             "apiKey":          self.api_key,
@@ -373,11 +376,60 @@ class OKXAdapter(BaseConnector):
 
     # ── Sync internals ───────────────────────────────────────────────────────
 
+    def _ensure_swap_ready(self, sym: str) -> None:
+        """Set hedge mode + leverage for sym before first order. Cached per symbol.
+        Mirrors BinanceConnector._ensure_swap_ready for the synchronous path."""
+        if sym in self._swap_ready_symbols:
+            return
+        try:
+            self._call(self._ex.set_position_mode, True,
+                       label=f"set_position_mode(hedge)")
+        except ccxt.ExchangeError as e:
+            # OKX returns an error if already in hedge mode — not fatal
+            logger.debug("[OKX] set_position_mode (already set?): %s", e)
+        try:
+            lev = self.leverage
+            self._call(
+                self._ex.set_leverage, lev, sym,
+                {"mgnMode": self.td_mode, "posSide": "long"},
+                label=f"set_leverage({lev}, {sym}, long)",
+            )
+            self._call(
+                self._ex.set_leverage, lev, sym,
+                {"mgnMode": self.td_mode, "posSide": "short"},
+                label=f"set_leverage({lev}, {sym}, short)",
+            )
+        except Exception as e:
+            logger.warning("[OKX] set_leverage warning for %s: %s", sym, e)
+        self._swap_ready_symbols.add(sym)
+        logger.info("[OKX] Swap ready: %s (hedge mode + %dx leverage set)", sym, self.leverage)
+
+    def _get_ct_val(self, sym: str) -> float:
+        """Return contract size (ctVal) for a SWAP symbol — 1 contract = ctVal base coin.
+        E.g. BTC/USDT:USDT → ctVal=0.01, so 1 contract = 0.01 BTC."""
+        try:
+            if not self._ex.markets:
+                self._ex.load_markets()
+            mkt  = self._ex.markets.get(sym, {})
+            info = mkt.get("info", {})
+            val  = float(info.get("ctVal") or mkt.get("contractSize") or 1)
+            return val if val > 0 else 1.0
+        except Exception as e:
+            logger.warning("[OKX] _get_ct_val(%s) failed, defaulting to 1: %s", sym, e)
+            return 1.0
+
     def _sync_open(self, order_type: str, trade_info: Dict[str, Any]) -> Dict:
         sym      = self.symbol or trade_info.get("symbol", "")
         side     = "buy"  if order_type == "OPEN_LONG" else "sell"
         pos_side = "long" if order_type == "OPEN_LONG" else "short"
-        amount   = float(self._ex.amount_to_precision(sym, trade_info["size"]))
+
+        # Ensure hedge mode and leverage are configured before first order per symbol
+        self._ensure_swap_ready(sym)
+
+        # Convert base-currency coin quantity → OKX contracts (bot computes size in coins)
+        ct_val    = self._get_ct_val(sym)
+        contracts = max(1, int(float(trade_info["size"]) / ct_val))
+        amount    = float(self._ex.amount_to_precision(sym, contracts))
 
         params: Dict[str, Any] = {
             "tdMode":  self.td_mode,
@@ -406,7 +458,14 @@ class OKXAdapter(BaseConnector):
         direction = trade_info.get("direction", "LONG")
         side      = "sell" if direction == "LONG" else "buy"
         pos_side  = "long" if direction == "LONG" else "short"
-        amount    = float(self._ex.amount_to_precision(sym, trade_info["size"]))
+
+        # Ensure hedge mode/leverage set (idempotent) before close
+        self._ensure_swap_ready(sym)
+
+        # Convert coin quantity → OKX contracts (same logic as _sync_open)
+        ct_val    = self._get_ct_val(sym)
+        contracts = max(1, int(float(trade_info["size"]) / ct_val))
+        amount    = float(self._ex.amount_to_precision(sym, contracts))
 
         params = {"tdMode": self.td_mode, "posSide": pos_side, "reduceOnly": True}
 

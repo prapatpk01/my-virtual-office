@@ -869,9 +869,6 @@ class TradingBot:
             "mae":                  0.0,   # max adverse excursion
             "mfe":                  0.0,   # max favorable excursion
         }
-        self.position_open = True
-        self._position_entry_bar = self._bar_count
-        self.order_status  = "OPEN"
 
         self._send_order("OPEN_LONG" if direction == "LONG" else "OPEN_SHORT", {
             "entry":     entry_price,
@@ -879,6 +876,13 @@ class TradingBot:
             "tp1":       tp1, "tp2": tp2,
             "size":      position_size,
         })
+
+        # Only mark position open after order is sent — if _send_order raises,
+        # position_open stays False and on_tick won't enter IN_POSITION for a
+        # trade that never filled.
+        self.position_open = True
+        self._position_entry_bar = self._bar_count
+        self.order_status  = "OPEN"
 
     # ── Step 6: Position management ──────────────────────────────────────────
 
@@ -943,24 +947,30 @@ class TradingBot:
             tp1_hit_cond = current_price <= t["tp1"]
             tp2_hit_cond = current_price <= t["tp2"]
 
+        # TP2 checked first: if a gap candle clears both TP1 and TP2 on the same tick,
+        # skip the partial TP1 close and exit the full position at TP2 immediately.
+        if tp2_hit_cond and not t["tp2_hit"]:
+            self._close_position("FULL_TP2", t["tp2"], 1.0, ind)
+            t["tp1_hit"] = True
+            t["tp2_hit"] = True
+            return "EXITING"
+
         # TP1 — close ตาม tp1_close_pct + [FIX 16] ขยับ SL ไป breakeven ทันที
         if tp1_hit_cond and not t["tp1_hit"]:
             self._close_position("PARTIAL_TP1", t["tp1"], self.tp1_close_pct, ind)
             t["tp1_hit"] = True
             if not t["break_even_triggered"]:
-                t["sl"] = t["entry"]
+                # Direction-aware break-even: only tighten, never widen the SL
+                if direction == "LONG":
+                    t["sl"] = max(t["sl"], t["entry"])
+                else:
+                    t["sl"] = min(t["sl"], t["entry"])
                 t["break_even_triggered"] = True
                 self._log_event(
                     f"TP1 hit @ {t['tp1']:.2f} → ปิด {self.tp1_close_pct:.0%} "
                     f"+ ขยับ SL ไป breakeven ({t['entry']:.2f})"
                 )
             self.state = "PARTIAL_EXIT"
-
-        # TP2 — ปิดที่เหลือทั้งหมด (full exit)
-        if tp2_hit_cond and not t["tp2_hit"]:
-            self._close_position("FULL_TP2", t["tp2"], 1.0, ind)
-            t["tp2_hit"] = True
-            return "EXITING"
 
         # ── [FIX 1] Health-based position management ──────────────────────
         # Before TP1: health actions gated — TP1 must be hit first.
@@ -1267,6 +1277,7 @@ class TradingBot:
                         (self.cooldown_until is None or
                          now >= self.cooldown_until)):
                     self.state = "SCANNING"
+                    self.loss_streak = 0   # reset so next loss doesn't re-trigger immediately
                     self._log_event("Cooldown expired → SCANNING")
                     state_changed = True
 
@@ -1691,11 +1702,14 @@ class TradingBot:
                 "SL/TP/health logic จะ baseline ใหม่จากราคาปัจจุบัน",
                 level="warning",
             )
+            sl_dist_r = max(entry_price * 0.01, 1e-9)
+            mult_r    = 1 if direction == "LONG" else -1
             self.current_trade = {
                 "direction": direction, "entry": entry_price,
                 "sl": entry_price * (0.99 if direction == "LONG" else 1.01),
-                "sl_dist": max(entry_price * 0.01, 1e-9),
-                "tp1": entry_price, "tp2": entry_price,
+                "sl_dist": sl_dist_r,
+                "tp1": entry_price + sl_dist_r * 0.7 * mult_r,
+                "tp2": entry_price + sl_dist_r * 2.0 * mult_r,
                 "size": abs(live_size), "remaining_size": abs(live_size),
                 "tp1_hit": False, "tp2_hit": False,
                 "break_even_triggered": False, "status": "OPEN",

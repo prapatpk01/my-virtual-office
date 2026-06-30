@@ -87,7 +87,7 @@ def build_config() -> dict:
         "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),
         "paper":           _env_bool("PAPER_TRADING", False),
         "leverage":        _env_int("LEVERAGE", 10),
-        "symbols":         _env_list("SYMBOLS", "BTC/USDT"),
+        "symbols":         _env_list("SYMBOLS", "BTC/USDT:USDT"),
         "candle_tf":       os.environ.get("CANDLE_TF", "15m"),
         "candle_limit":    _env_int("CANDLE_LIMIT", 400),
         "interval":        _env_int("INTERVAL_SECONDS", 60),
@@ -193,6 +193,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         api_secret=cfg["api_secret"],
         api_passphrase=cfg.get("api_passphrase", ""),
         paper=cfg["paper"],
+        leverage=cfg.get("leverage", 10),
     )
 
     ind_engine = IndicatorEngine()
@@ -215,7 +216,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             f"[Adaptive] {order_type} {s}\n"
                             f"entry={trade_info.get('entry', '?')} "
                             f"sl={trade_info.get('sl', '?')} "
-                            f"size={trade_info.get('size', '?'):.4f}"
+                            f"size={float(trade_info.get('size') or 0):.4f}"
                         )
                     except Exception:
                         pass
@@ -240,6 +241,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     if telegram:
         # Wire bots dict so /stats and /log commands work
         telegram.bots_dict = bots
+        # Wire /stop command so it reaches the adaptive runner's stop_event
+        telegram.stop_bot_fn = lambda: stop_event.set()
         telegram.send(
             f"Adaptive Bot Started\n"
             f"Symbols: {', '.join(symbols)}\n"
