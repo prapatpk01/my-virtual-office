@@ -847,17 +847,14 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         short_gates = short_gates & _vol_boost_ok
 
     # ── MACD Histogram rising gate: enter early, not after peak ──────────────
-    # Requires MACD histogram POSITIVE and RISING over 2 bars.
-    # Blocks the XAG-style "throwback after peak" scenario where MACD is declining.
-    # Also causes EARLIER entry — catches when momentum is building, not fading.
+    # Requires MACD histogram RISING over 2 bars (sign-agnostic for earlier entry).
+    # Blocks the XAG-style "throwback after peak" where MACD is declining.
     if p.get("macd_hist_rising_gate", True):
         macd_hist       = macd_line - macd_sig
-        hist_pos_long   = macd_hist > 0
         hist_rising_l   = macd_hist > macd_hist.shift(2)
-        hist_pos_short  = macd_hist < 0
         hist_rising_s   = macd_hist < macd_hist.shift(2)
-        long_gates  = long_gates  & hist_pos_long  & hist_rising_l
-        short_gates = short_gates & hist_pos_short & hist_rising_s
+        long_gates  = long_gates  & hist_rising_l
+        short_gates = short_gates & hist_rising_s
 
     # ── Final entry trigger: close must break above previous bar high/low ─────
     if p.get("final_trigger_enabled", False):
@@ -1099,12 +1096,12 @@ class TrendContImprovedStrategy(BaseStrategy):
         hma_period=16,   # HMA16 — backtest Jan-May 2026 shows +8% PnL vs HMA20, lower MaxDD
         macd_slope_gate=False,  # gate 4h entries on MACD histogram slope (anti-noise for fast EMAs)
         # Entry-timing relax knobs (default = legacy behaviour, no change):
-        breakout_lookback=3,       # 3-bar high/low — enters 1-2 bars earlier at pullback; backtest +$19 vs 7-bar
+        breakout_lookback=2,       # 2-bar high/low — 1 bar faster entry vs 3-bar
         adx_rising_or_strong=0,    # 0=off; if >0, ADX gate accepts (rising OR adx>this)
         # HTF anti-false-flip: N consecutive 15m bars of consistent 4H+1H direction required.
         # 2=30min (default), 4=60min. Prevents early-mode single-bar flips (XAG scenario).
         htf_stability_bars=2,
-        # MACD histogram gate: hist > 0 AND rising over 2 bars → enter early, not after peak.
+        # MACD histogram gate: rising over 2 bars (sign-agnostic) → enter early, not after peak.
         # Caught the XAG 19:47 case: MACD declining at entry = trade already past peak.
         macd_hist_rising_gate=True,
         # Startup warmup: block signals for N min after bot/strategy restart.

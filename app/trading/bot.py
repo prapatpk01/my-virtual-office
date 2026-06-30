@@ -110,6 +110,7 @@ class TradingBot:
         self._monitor_task: Optional[asyncio.Task] = None
         self._running = False
         self._closing_positions: set[str] = set()  # keys being closed — prevents double-close
+        self._maxpos_cooldown: dict[str, float] = {}  # slot → unix ts when 60m cooldown expires
         self._balance = 0.0
         self._start_balance = 0.0
         self._pnl_total = 0.0
@@ -364,9 +365,19 @@ class TradingBot:
             logger.debug("[%s] %s already %s — suppressing", strategy_name, sym, label_side)
             return
 
+        _mp_key = f"{sym}||{slot}"
+        if self._maxpos_cooldown.get(_mp_key, 0) > time.time():
+            _rem = int((self._maxpos_cooldown[_mp_key] - time.time()) / 60)
+            logger.debug("[%s] %s %s maxpos-cooldown: %dmin left", strategy_name, label_side, sym, _rem)
+            return
+
         can, reason = self.risk.can_open(sym, strategy=slot)
         if not can:
-            logger.debug("[%s] %s %s blocked: %s", strategy_name, label_side, sym, reason)
+            if "Max open positions" in reason:
+                self._maxpos_cooldown[_mp_key] = time.time() + 60 * 60
+                logger.info("[%s] %s %s maxpos blocked — cooldown 60m", strategy_name, label_side, sym)
+            else:
+                logger.debug("[%s] %s %s blocked: %s", strategy_name, label_side, sym, reason)
             return
 
         # ── Layer 2 — Health-score entry gate (TCI_HEALTH_ENTRY_MIN > 0) ──────
