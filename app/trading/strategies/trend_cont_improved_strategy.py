@@ -1093,7 +1093,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         atr_period=14, sl_mult=1.2, sl_min_pct=0.012, sl_max_pct=0.035,
         adx_len=14, adx_min=30,
         tp1_r=0.5, tp1_fraction=0.50, tp2_r=2.5,   # close 50% at TP1 (keep a bigger runner)
-        min_score=70.0,  # 100-point confidence scale: ≥70 small, ≥80 normal, ≥90 strong
+        min_score=60.0,  # 100-point confidence scale: entry gate ≥60, sizing: ≥90 strong, ≥70 normal, <70 small(0.5x)
         # Fast mode v2
         fast_mode=False,
         adx_min_fast=15,          # ADX lower bound — trend must be active. Lowered 18→15
@@ -1431,7 +1431,7 @@ class TrendContImprovedStrategy(BaseStrategy):
                 "one_r":       dist,
                 "sj_score":    sc,
                 "confidence_score": sc,
-                "confidence_level": "strong" if sc >= 90 else "normal" if sc >= 80 else "small",
+                "confidence_level": "strong" if sc >= 90 else "normal" if sc >= 70 else "small",
                 "mtf_bias":    float(last.get("comp_pct", 0)),
                 "regime_score_w": float(last.get("h4_regime_score_w", 0)),
             }
