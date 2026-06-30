@@ -606,8 +606,10 @@ class SwingReversalPro(BaseStrategy):
                 rsi14, list(rsi14_arr), hma20_arr, adx_arr,
                 ema50, atr14, volma20)
 
-        diag["l1_score"] = l1
+        diag["l1_score"]   = l1
+        diag["l1_reasons"] = l1_reasons
         l2 = 0
+        l2_reasons: list = []
 
         if l1 >= l1_thresh:
             l2, l2_reasons = self._layer2(
@@ -616,7 +618,8 @@ class SwingReversalPro(BaseStrategy):
                 mtf_bias, ema20_1h, n1h, has_1h,
                 atr14_1h, volma_1h)
 
-            diag["l2_score"] = l2
+            diag["l2_score"]   = l2
+            diag["l2_reasons"] = l2_reasons
 
             if l2 >= l2_thresh:
                 trigger, trigger_name, priority = self._layer3(
@@ -658,11 +661,23 @@ class SwingReversalPro(BaseStrategy):
         diag["entry_mode"] = entry_mode
 
         if entry_mode is None:
-            diag["block_reason"] = f"no_entry 4H={trend_4h} L1={l1}/{l1_thresh}"
+            # Build detailed block reason showing furthest layer reached
+            _rsi_s = f"{rsi14:.0f}" if not math.isnan(rsi14) else "?"
+            if not rsi_at_extreme:
+                _block = (f"RSI={_rsi_s} "
+                          f"(need<{self.rsi_entry_long:.0f}|>{self.rsi_entry_short:.0f})")
+            elif l1 < l1_thresh:
+                _block = (f"L1={l1}/{l1_thresh} "
+                          f"[{'|'.join(l1_reasons) or 'none'}]")
+            elif l2 < l2_thresh:
+                _block = (f"L2={l2}/{l2_thresh} "
+                          f"[{'|'.join(l2_reasons) or 'none'}]")
+            else:
+                _block = f"waiting:L3 L1={l1}/{l1_thresh} L2={l2}/{l2_thresh}"
+            diag["block_reason"] = _block
             self._last_diag = diag
             return Signal(_HOLD, self.symbol, cp, 0,
-                          f"[{self.name}] 4H={trend_4h} "
-                          f"L1={l1}/{l1_thresh} no_entry")
+                          f"[{self.name}] 4H={trend_4h} {_block}")
 
         # ── Build entry signal ─────────────────────────────────────────────
         sl_p, tp1_p, tp_p, sl_dist = self._calc_sltp(cp, hi, lo, n, atr14)

@@ -350,16 +350,18 @@ class TradingBot:
         label  = hr["label"]
         action = hr["action"]
 
-        # ── Railway log ───────────────────────────────────────────────────
+        # ── Railway log — only when positions are open for this symbol ──
+        # Health is used to control open positions; no positions = no useful log.
         sym_positions = [k for k in self._positions if k.startswith(sym + "::")]
-        if action in ("soft_close", "hard_close"):
-            logger.warning("[Health][%s] score=%d (%s) → %s  open=%s",
-                           sym, score, label, action,
-                           sym_positions or ["none"])
-        else:
-            logger.info("[Health][%s] score=%d (%s) → %s  weak_streak=%d/%d",
-                        sym, score, label, action,
-                        hm._weak_count, hm._weak_bars_confirm)
+        if sym_positions or action in ("soft_close", "hard_close"):
+            if action in ("soft_close", "hard_close"):
+                logger.warning("[Health][%s] score=%d (%s) → %s  open=%s",
+                               sym, score, label, action,
+                               sym_positions or ["none"])
+            else:
+                logger.info("[Health][%s] score=%d (%s) → %s  weak_streak=%d/%d",
+                            sym, score, label, action,
+                            hm._weak_count, hm._weak_bars_confirm)
 
         # ── Close only this symbol's positions ────────────────────────────
         if action in ("hard_close", "soft_close"):
@@ -391,6 +393,59 @@ class TradingBot:
                     pos_key, sym_price,
                     f"Health {action} score={score}", "HealthMonitor"
                 )
+
+    def _log_scan_diag(self, strategy, signal):
+        """Log per-strategy signal state every tick — shows layer checks + what's blocking entry."""
+        diag = getattr(strategy, "_last_diag", {})
+        if not diag:
+            return
+
+        sym = diag.get("symbol", strategy.symbol)
+        drn = "L" if diag.get("direction") == "long" else "S"
+
+        if diag.get("in_position"):
+            bars = diag.get("bars_in_trade", 0)
+            tp1  = "✓" if diag.get("tp1_hit") else "○"
+            logger.info("[Scan][%s][%s] IN_POS  bars=%-3d tp1=%s | %s",
+                        sym, drn, bars, tp1,
+                        diag.get("block_reason", "holding"))
+            return
+
+        trend = diag.get("trend_4h", "?")
+        r15   = diag.get("rsi_15m", float("nan"))
+        r1h   = diag.get("rsi_1h",  float("nan"))
+        adx   = diag.get("adx14",   float("nan"))
+        l1    = diag.get("l1_score", 0)
+        l1t   = diag.get("l1_thresh", 5)
+        l2    = diag.get("l2_score", 0)
+        l2t   = diag.get("l2_thresh", 4)
+        l1_r  = diag.get("l1_reasons", [])
+        l2_r  = diag.get("l2_reasons", [])
+        mode  = diag.get("entry_mode")
+        block = diag.get("block_reason", "")
+        ext   = "✓" if diag.get("rsi_at_extreme") else "○"
+
+        def _fmt(v):
+            try:
+                return f"{float(v):.0f}" if not math.isnan(float(v)) else "?"
+            except Exception:
+                return "?"
+
+        l1_tag = ("[" + ",".join(l1_r) + "]") if l1_r else ""
+        l2_tag = ("[" + ",".join(l2_r) + "]") if l2_r else ""
+
+        if mode:
+            logger.info(
+                "[Scan][%s][%s] 4H=%-5s RSI=%s/%s ADX=%s  L1=%d/%d%s  L2=%d/%d%s  ✅ MODE=%s",
+                sym, drn, trend, _fmt(r15), _fmt(r1h),
+                f"{adx:.1f}" if not math.isnan(float(adx)) else "?",
+                l1, l1t, l1_tag, l2, l2t, l2_tag, mode)
+        else:
+            logger.info(
+                "[Scan][%s][%s] 4H=%-5s RSI=%s/%s ADX=%s  L1=%d/%d%s  ext=%s → %s",
+                sym, drn, trend, _fmt(r15), _fmt(r1h),
+                f"{adx:.1f}" if not math.isnan(float(adx)) else "?",
+                l1, l1t, l1_tag, ext, block)
 
     async def _close_all_positions_health(self, price: float, reason: str):
         for pos_key in list(self._positions.keys()):
@@ -519,6 +574,8 @@ class TradingBot:
             except Exception as e:
                 logger.error("Strategy %s error on %s: %s", strategy.name, sym, e)
                 continue
+
+            self._log_scan_diag(strategy, signal)
 
             meta    = signal.metadata or {}
             ps      = meta.get("position_side", "LONG").upper()   # "LONG" | "SHORT"

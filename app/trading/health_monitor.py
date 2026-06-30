@@ -84,7 +84,7 @@ class HealthMonitor:
         self._last_ts_ms = now_ms
         self._prev_action = action
 
-        logger.info(
+        logger.debug(
             "[Health] score=%d  label=%-11s  action=%-10s  weak_streak=%d/%d%s",
             score, label, action,
             self._weak_count, self._weak_bars_confirm,
