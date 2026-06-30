@@ -477,9 +477,14 @@ class TradingBot:
             self._log_event(f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit profit limit", level="warning")
             return False
 
-        # บล็อก Exhaustion state — WR ต่ำมาก (0-20%) ไม่คุ้มความเสี่ยง
-        if self.current_market_state == "Exhaustion":
-            self._log_event("SKIP: market_state=Exhaustion — ไม่เทรดใน Exhaustion", level="debug")
+        # เทรดเฉพาะ Trending/Expansion — WR 67-80%
+        # Sideway (33-45%), Compression (31-51%), Exhaustion (28-53%) ทำให้ WR รวมต่ำ
+        _TRADEABLE_STATES = {"Trending", "Expansion"}
+        if self.current_market_state not in _TRADEABLE_STATES:
+            self._log_event(
+                f"SKIP: market_state={self.current_market_state} — เทรดเฉพาะ Trending/Expansion",
+                level="debug",
+            )
             return False
 
         return True
@@ -519,7 +524,7 @@ class TradingBot:
         ema5_1h = ind_1h.get("ema5")
         ema20_1h = ind_1h.get("ema20")
 
-        if adx_1h < 12 or ema5_1h is None or ema20_1h is None:  # ลดจาก 15 → 12
+        if adx_1h < 18 or ema5_1h is None or ema20_1h is None:  # 15→18: ต้องการ trend ที่แรงขึ้นบน 1H
             return False
 
         if direction == "LONG":
@@ -1017,10 +1022,11 @@ class TradingBot:
         momentum = ind.get("momentum_score", 50)
 
         if direction == "LONG":
-            return rsi > 42 and rsi < 72 and momentum > 48
+            # ซื้อ dip ใน uptrend: RSI ดึงกลับ (ไม่ overbought) + momentum ยังเป็นบวก
+            return rsi > 35 and rsi < 60 and momentum > 50
         else:
-            # SHORT: ต้องการ bearish momentum (<50) ไม่ใช่ bullish
-            return rsi < 58 and rsi > 28 and momentum < 52
+            # SHORT: ขาย rally ใน downtrend: RSI ดีดขึ้น (ไม่ oversold) + momentum ยังเป็นลบ
+            return rsi > 40 and rsi < 65 and momentum < 50
 
     def _enter_recovery_trade(self, candle: Dict, ind: Dict, ind_1h: Dict, vol_state: str):
         """[FIX 8] เปิด trade ด้วย risk 50% ใน recovery mode (ยังผ่าน 1H trend filter เหมือนปกติ)"""
