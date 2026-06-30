@@ -1037,7 +1037,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_zlema=False,             # ZLEMA9 vs ZLEMA20 alignment as SJ scoring component
         sj_price_action=False,      # pin bar / engulfing candle as SJ soft score
         # Phase 2: Accuracy
-        chop_filter_enabled=False,  # 1H Chop Index gate: LOW(<threshold)=trending, block choppy
+        chop_filter_enabled=True,   # 1H Chop Index gate: LOW(<threshold)=trending, block choppy
         chop_threshold=50.0,        # chop < threshold = trending market (50=neutral, 38=very trending)
         vol_boost_gate=False,       # require entry bar volume > MA20 × vol_boost_mult
         vol_boost_mult=1.5,         # volume boost multiplier (1.5x = 50% above MA20)
