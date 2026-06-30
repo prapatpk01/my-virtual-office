@@ -291,13 +291,20 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
                 extras = {"symbol": sym, "session": "", "funding_rate": 0.0, "oi": 0}
 
+                # Pass the closed bar's datetime so cooldown uses bar time (not wall-clock)
+                import datetime as _dt
+                bar_dt = _dt.datetime.fromtimestamp(
+                    latest_ts / 1000, tz=_dt.timezone.utc
+                )
+
                 # Run on_tick in thread (sync order execution inside)
                 await loop.run_in_executor(
                     None,
-                    lambda b=bot, sf=state_file: b.on_tick(
+                    lambda b=bot, sf=state_file, bdt=bar_dt: b.on_tick(
                         candle_15m, candle_1h, candle_4h,
                         ind_15m, ind_1h, ind_4h,
                         extras, price,
+                        bar_dt=bdt,
                     )
                 )
 

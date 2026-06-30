@@ -1,48 +1,48 @@
 {
   "symbol": "BTC",
-  "total_trades": 19,
-  "win_rate": 0.7894736842105263,
-  "profit_factor": 1.327,
-  "net_pnl": 163.47,
-  "net_pnl_pct": 1.63,
-  "avg_win": 44.25,
-  "avg_loss": -125.06,
-  "avg_rr": 0.354,
-  "max_drawdown_pct": 3.1,
-  "sharpe": 1.713,
-  "final_balance": 10163.47,
+  "total_trades": 198,
+  "win_rate": 0.4292929292929293,
+  "profit_factor": 1.075,
+  "net_pnl": 229.46,
+  "net_pnl_pct": 2.29,
+  "avg_win": 38.91,
+  "avg_loss": -27.23,
+  "avg_rr": 1.429,
+  "max_drawdown_pct": 5.36,
+  "sharpe": 0.409,
+  "final_balance": 10229.46,
   "avg_bars_held": 0.0,
-  "total_commission": 670.87,
+  "total_commission": 1048.98,
   "by_market_state": {
     "Compression": {
-      "wins": 3,
-      "losses": 1,
-      "pnl": -125.89022119373868,
-      "win_rate": 0.75,
-      "total": 4
+      "wins": 8,
+      "losses": 15,
+      "pnl": -193.2415820611062,
+      "win_rate": 0.34782608695652173,
+      "total": 23
     },
     "Sideway": {
-      "wins": 9,
-      "losses": 3,
-      "pnl": 97.25753922856376,
-      "win_rate": 0.75,
-      "total": 12
+      "wins": 50,
+      "losses": 76,
+      "pnl": 264.73944273105815,
+      "win_rate": 0.3968253968253968,
+      "total": 126
     },
     "Trending": {
-      "wins": 2,
-      "losses": 0,
-      "pnl": 98.32197418308557,
-      "win_rate": 1.0,
-      "total": 2
+      "wins": 8,
+      "losses": 2,
+      "pnl": 353.27763266331385,
+      "win_rate": 0.8,
+      "total": 10
     },
     "Exhaustion": {
-      "wins": 1,
-      "losses": 0,
-      "pnl": 93.77744237625748,
-      "win_rate": 1.0,
-      "total": 1
+      "wins": 19,
+      "losses": 20,
+      "pnl": -195.3174384730159,
+      "win_rate": 0.48717948717948717,
+      "total": 39
     }
   },
-  "longs": 17,
-  "shorts": 2
+  "longs": 115,
+  "shorts": 83
 }

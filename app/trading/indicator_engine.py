@@ -16,7 +16,7 @@ from .strategies.base import BaseStrategy
 
 logger = logging.getLogger("indicator_engine")
 
-SWING_LOOKBACK = 5   # bars for swing high/low (SL placement)
+SWING_LOOKBACK = 15  # bars for swing high/low (5→15 = 3.75h lookback, wider S/R levels)
 EFF_PERIOD     = 10  # Kaufman efficiency ratio lookback
 ATR_EXP_PERIOD = 20  # ATR expansion window
 BB_PERIOD      = 20  # Bollinger period

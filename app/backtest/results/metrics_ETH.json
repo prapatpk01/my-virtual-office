@@ -1,34 +1,48 @@
 {
   "symbol": "ETH",
-  "total_trades": 7,
-  "win_rate": 0.42857142857142855,
-  "profit_factor": 0.61,
-  "net_pnl": -153.66,
-  "net_pnl_pct": -1.54,
-  "avg_win": 80.03,
-  "avg_loss": -98.44,
-  "avg_rr": 0.813,
-  "max_drawdown_pct": 2.97,
-  "sharpe": -3.841,
-  "final_balance": 9846.34,
+  "total_trades": 201,
+  "win_rate": 0.42786069651741293,
+  "profit_factor": 1.317,
+  "net_pnl": 1389.81,
+  "net_pnl_pct": 13.9,
+  "avg_win": 67.1,
+  "avg_loss": -38.1,
+  "avg_rr": 1.761,
+  "max_drawdown_pct": 4.69,
+  "sharpe": 1.757,
+  "final_balance": 11389.81,
   "avg_bars_held": 0.0,
-  "total_commission": 202.26,
+  "total_commission": 1135.26,
   "by_market_state": {
     "Compression": {
-      "wins": 2,
-      "losses": 1,
-      "pnl": 47.836607128956246,
-      "win_rate": 0.6666666666666666,
-      "total": 3
+      "wins": 7,
+      "losses": 14,
+      "pnl": -113.48542615566592,
+      "win_rate": 0.3333333333333333,
+      "total": 21
     },
     "Sideway": {
-      "wins": 1,
-      "losses": 3,
-      "pnl": -201.49891716836365,
-      "win_rate": 0.25,
-      "total": 4
+      "wins": 57,
+      "losses": 78,
+      "pnl": 764.6459664503393,
+      "win_rate": 0.4222222222222222,
+      "total": 135
+    },
+    "Exhaustion": {
+      "wins": 11,
+      "losses": 18,
+      "pnl": -320.27800415616946,
+      "win_rate": 0.3793103448275862,
+      "total": 29
+    },
+    "Trending": {
+      "wins": 11,
+      "losses": 5,
+      "pnl": 1058.9253541682642,
+      "win_rate": 0.6875,
+      "total": 16
     }
   },
-  "longs": 5,
-  "shorts": 2
+  "longs": 102,
+  "shorts": 99
 }

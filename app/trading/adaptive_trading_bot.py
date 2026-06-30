@@ -134,7 +134,7 @@ class AdaptiveEngine:
 
     def get_layer_thresholds(self, vol_state: str) -> Dict[str, float]:
         """ATR-adaptive entry threshold — ยิ่ง volatile ยิ่งต้องการ score สูงกว่า"""
-        l1, l2 = 55.0, 50.0   # ลดจาก 65/60 → 55/50 เพิ่ม trade frequency
+        l1, l2 = 65.0, 60.0   # คุณภาพสูง — bug fixes (SHORT + bar_dt) เพิ่ม trade count แล้ว
         adjustments = {
             "Extreme":  (+8, +5),
             "High":     (+4, +2),
@@ -369,6 +369,8 @@ class TradingBot:
         # [FIX 9] ใช้ datetime แทน float timestamp
         self.cooldown_until: Optional[datetime.datetime] = None
         self.trading_date: Optional[datetime.date] = None
+        # Tick-scoped "now" — set at top of on_tick() so all sub-methods share same bar time
+        self._bar_now: Optional[datetime.datetime] = None
 
         # Journal
         self.trade_journal: List[Dict] = []
@@ -459,8 +461,9 @@ class TradingBot:
         if self.position_open:
             return False
 
-        # [FIX 9] datetime comparison
-        if self.cooldown_until and datetime.datetime.now() < self.cooldown_until:
+        # [FIX 9] datetime comparison — use bar time in backtest, wall-clock in live
+        _now = self._bar_now or datetime.datetime.now()
+        if self.cooldown_until and _now < self.cooldown_until:
             self.state = "COOLDOWN"
             return False
 
@@ -828,8 +831,9 @@ class TradingBot:
             self.loss_streak += 1
             self.win_streak = 0
             if self.loss_streak >= self.max_loss_streak:
-                # [FIX 9] datetime cooldown
-                self.cooldown_until = (datetime.datetime.now()
+                # [FIX 9] datetime cooldown — bar time in backtest, wall-clock in live
+                _now = self._bar_now or datetime.datetime.now()
+                self.cooldown_until = (_now
                                        + datetime.timedelta(minutes=self.cooldown_minutes))
                 self.state = "COOLDOWN"
                 self._log_event(
@@ -851,8 +855,8 @@ class TradingBot:
 
     # ── Daily reset ───────────────────────────────────────────────────────────
 
-    def _check_daily_reset(self):
-        today = datetime.date.today()
+    def _check_daily_reset(self, bar_dt: Optional[datetime.datetime] = None):
+        today = (bar_dt.date() if bar_dt else datetime.date.today())
         if self.trading_date != today:
             self.trading_date = today
             self.daily_pnl_pct = 0.0
@@ -864,28 +868,19 @@ class TradingBot:
 
     def on_tick(self, candle_15m: Dict, candle_1h: Dict, candle_4h: Dict,
                 ind_15m: Dict, ind_1h: Dict, ind_4h: Dict,
-                extras: Dict, current_price: float):
+                extras: Dict, current_price: float,
+                bar_dt: Optional[datetime.datetime] = None):
         """
         เรียกต่อ closed candle หนึ่งครั้ง (ตาม timeframe เข้าออเดอร์ คือทุกแท่ง 15M ปิด)
 
-        [FIX 17] เปลี่ยน timeframe เข้าออเดอร์เป็น 15M — ใช้ 1H และ 4H เป็นตัวกรอง
-        แนวโน้มเท่านั้น ไม่ใช้เข้าไม้ตรงๆ อีกต่อไป:
-            4H → market_state (Step1) + regime score (Step2): ภาพรวมระดับมาโคร
-            1H → trend filter (_check_htf_trend_filter): ยืนยันทิศทางก่อนอนุญาตเข้า
-            15M → layer scoring (Step4), entry trigger, risk engine, position
-                   management ทั้งหมด — รันทุกครั้งที่แท่ง 15M ปิด
-
-        Parameters
-        ----------
-        candle_15m, candle_1h, candle_4h : {'open','high','low','close','volume',
-                                             'pattern_low','pattern_high'}
-        ind_15m    : indicator values ของ 15M (ตัวที่ใช้ตัดสินใจเข้า/จัดการ position จริง)
-        ind_1h     : indicator values ของ 1H (ใช้แค่กรองแนวโน้มก่อนเข้าไม้)
-        ind_4h     : indicator values ของ 4H (ema20_slope_score, adx_score, ... สำหรับ regime)
-        extras     : {'symbol','session','funding_rate','oi'}
-        current_price : ราคา close ปัจจุบัน (ของแท่ง 15M)
+        bar_dt : datetime ของแท่ง 15M (ส่งมาจาก backtest หรือ live runner)
+                 ถ้า None จะใช้ datetime.now() — ถูกต้องสำหรับ live trading
+                 ส่ง bar_dt จาก backtest เพื่อให้ cooldown/daily-reset อิง bar time
+                 แทน wall-clock time (กันกรณี backtest ประมวลผลเร็วกว่า 30 นาทีจริง)
         """
-        self._check_daily_reset()
+        now = bar_dt or datetime.datetime.now()
+        self._bar_now = now  # shared across all sub-methods this tick
+        self._check_daily_reset(bar_dt)
 
         # อัปเดต ATR history — ใช้ 4H เพื่อความนิ่งของ volatility regime classification
         # (ไม่ใช้ ATR ของ 15M ตรงนี้ เพราะจะ noisy เกินไปสำหรับ threshold ระดับ regime;
@@ -912,10 +907,10 @@ class TradingBot:
 
             # ── BLOCKED / COOLDOWN ─────────────────────────────────────────
             if self.state in ("BLOCKED", "COOLDOWN"):
-                # [FIX 9] datetime comparison
+                # [FIX 9] datetime comparison — use bar time in backtest, wall-clock in live
                 if (self.state == "COOLDOWN" and
                         (self.cooldown_until is None or
-                         datetime.datetime.now() >= self.cooldown_until)):
+                         now >= self.cooldown_until)):
                     self.state = "SCANNING"
                     self._log_event("Cooldown expired → SCANNING")
                     state_changed = True

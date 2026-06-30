@@ -63,8 +63,8 @@ class BacktestConfig:
     warmup_4h:   int = 60
 
     # Position sizing safety
-    min_sl_pct:     float = 0.003    # minimum SL distance = 0.3% of entry price
-    max_position_usd: float = 50_000  # max notional per trade (safety cap)
+    min_sl_pct:     float = 0.020    # minimum SL distance = 2.0% — limits notional to ≤$5000 at 1% risk
+    max_position_usd: float = 10_000  # max notional per trade (safety cap)
 
     # Fees & slippage
     commission_pct: float = 0.0005   # 0.05% taker (OKX SWAP)
@@ -146,9 +146,20 @@ class PaperExecutor:
     """Paper-trading order executor for backtesting."""
 
     def __init__(self, commission_pct: float = 0.0005, slippage_pct: float = 0.0002):
-        self.commission_pct = commission_pct
-        self.slippage_pct   = slippage_pct
+        self.commission_pct  = commission_pct
+        self.slippage_pct    = slippage_pct
         self.orders: List[Dict] = []
+        self._trade_commission: float = 0.0  # running commission for current open trade
+
+    def reset_trade_commission(self):
+        """Call when a new trade opens — resets per-trade commission accumulator."""
+        self._trade_commission = 0.0
+
+    def pop_trade_commission(self) -> float:
+        """Return and reset accumulated commission for the just-closed trade."""
+        c = self._trade_commission
+        self._trade_commission = 0.0
+        return c
 
     def execute(self, order_type: str, trade_info: Dict) -> Dict:
         price = float(trade_info.get("price") or trade_info.get("entry") or 0)
@@ -156,9 +167,11 @@ class PaperExecutor:
         # Apply slippage
         if "OPEN" in order_type or "BUY" in order_type:
             fill_price = price * (1 + self.slippage_pct)
+            self.reset_trade_commission()   # new trade starts
         else:
             fill_price = price * (1 - self.slippage_pct)
         commission = fill_price * size * self.commission_pct
+        self._trade_commission += commission
 
         order = {
             "type":       order_type,
@@ -296,10 +309,12 @@ class SymbolBacktest:
             }
 
             try:
+                bar_dt = datetime.fromtimestamp(current_ts / 1000, tz=timezone.utc)
                 bot.on_tick(
                     candle_15m, candle_1h, candle_4h,
                     ind_15m, ind_1h, ind_4h,
                     extras, float(bar15.close),
+                    bar_dt=bar_dt,
                 )
             except Exception as e:
                 logger.error("[%s] on_tick error bar %d: %s", self.symbol, i, e)
@@ -319,12 +334,8 @@ class SymbolBacktest:
                     exit_p   = float(j_entry.get("exit") or 0)
                     size_est = abs(pnl / (exit_p - entry_p + 1e-12)) if exit_p and entry_p else 0
 
-                    # Total commission from executor orders for this trade
-                    # (last 2-3 orders are from this trade)
-                    comm = sum(
-                        o.get("commission", 0)
-                        for o in executor.orders[-4:]
-                    )
+                    # Use per-trade commission accumulator (accurate — no bleeding from prior trade)
+                    comm = executor.pop_trade_commission()
 
                     rec = TradeRecord(
                         symbol       = self.symbol,
