@@ -943,9 +943,9 @@ class TradingBot:
         }
 
         # MODULE 3: compute R-multiples for expectancy learning
-        _entry  = t.get("entry", current_price)
+        _entry  = t.get("entry", 0.0)
         _sl     = t.get("sl", _entry)
-        _exit   = t.get("exit_price", current_price)
+        _exit   = t.get("exit_price", _entry)
         _sl_d   = max(abs(_entry - _sl), 1e-8)
         _d_mult = 1 if t.get("direction") == "LONG" else -1
         _realized_r = _d_mult * (_exit - _entry) / _sl_d
