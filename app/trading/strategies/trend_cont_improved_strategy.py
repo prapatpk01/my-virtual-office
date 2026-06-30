@@ -601,6 +601,16 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         mid_up   = macro_up   # 1h already baked into score; pass AND gate downstream
         mid_dn   = macro_dn
 
+    # ── HTF Stability: require N×15m of consistent direction (anti-false-flip) ──
+    # Prevents "early" mode from triggering on a single-bar HTF spike.
+    # 2 bars = 30 min; 4 bars = 60 min. Default 2 catches the XAG-style fast reversal.
+    _stab = int(p.get("htf_stability_bars", 2))
+    if _stab > 1:
+        macro_up = macro_up.rolling(_stab, min_periods=_stab).min().fillna(False).astype(bool)
+        macro_dn = macro_dn.rolling(_stab, min_periods=_stab).min().fillna(False).astype(bool)
+        mid_up   = mid_up.rolling(_stab, min_periods=_stab).min().fillna(False).astype(bool)
+        mid_dn   = mid_dn.rolling(_stab, min_periods=_stab).min().fillna(False).astype(bool)
+
     # ── Layer 3: Pullback zone (mode-specific) ────────────────────────────────
     if fast_mode:
         # Fast Mode v2: 1H EMA20 zone (or HMA20 if use_hma20_pullback=True)
@@ -836,6 +846,19 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         long_gates  = long_gates  & _vol_boost_ok
         short_gates = short_gates & _vol_boost_ok
 
+    # ── MACD Histogram rising gate: enter early, not after peak ──────────────
+    # Requires MACD histogram POSITIVE and RISING over 2 bars.
+    # Blocks the XAG-style "throwback after peak" scenario where MACD is declining.
+    # Also causes EARLIER entry — catches when momentum is building, not fading.
+    if p.get("macd_hist_rising_gate", True):
+        macd_hist       = macd_line - macd_sig
+        hist_pos_long   = macd_hist > 0
+        hist_rising_l   = macd_hist > macd_hist.shift(2)
+        hist_pos_short  = macd_hist < 0
+        hist_rising_s   = macd_hist < macd_hist.shift(2)
+        long_gates  = long_gates  & hist_pos_long  & hist_rising_l
+        short_gates = short_gates & hist_pos_short & hist_rising_s
+
     # ── Final entry trigger: close must break above previous bar high/low ─────
     if p.get("final_trigger_enabled", False):
         trigger_long  = out["close"] > out["high"].shift(1)
@@ -1049,7 +1072,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         adx_rising_fast=True,     # also require ADX[0] > ADX[1]
         pullback_pct_fast=0.025,  # fallback pct zone (used when pullback_atr_mult_fast=0)
         pullback_atr_mult_fast=1.2,  # 1H ATR×1.2 adaptive pullback zone (0=use pct fallback)
-        bias_gate_fast=60.0,      # MTF bias gate — 60 is live-calibrated (grid winner was 70 but too strict for live market phases)
+        bias_gate_fast=65.0,      # MTF bias gate — raised 60→65 to cut marginal entries (XAG false-flip fix)
         tp2_r_fast=2.5,           # FAST runner target 2.5R (closes faster than 3R; BULL
                                   # health can still extend toward the 3.0R ladder max)
         cooldown_bars=5,          # whipsaw cooldown: block N×15m after signal (time-based, not call-based)
@@ -1078,6 +1101,15 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Entry-timing relax knobs (default = legacy behaviour, no change):
         breakout_lookback=3,       # 3-bar high/low — enters 1-2 bars earlier at pullback; backtest +$19 vs 7-bar
         adx_rising_or_strong=0,    # 0=off; if >0, ADX gate accepts (rising OR adx>this)
+        # HTF anti-false-flip: N consecutive 15m bars of consistent 4H+1H direction required.
+        # 2=30min (default), 4=60min. Prevents early-mode single-bar flips (XAG scenario).
+        htf_stability_bars=2,
+        # MACD histogram gate: hist > 0 AND rising over 2 bars → enter early, not after peak.
+        # Caught the XAG 19:47 case: MACD declining at entry = trade already past peak.
+        macd_hist_rising_gate=True,
+        # Startup warmup: block signals for N min after bot/strategy restart.
+        # Prevents premature entries before the strategy has enough context.
+        startup_warmup_min=45,
         # HTF macro/mid direction mode — 'cross' (legacy 20/50), 'slope', or 'early'.
         # 'slope'/'early' flip the 4h+1h gate before the full crossover → earlier entries.
         # 'early' is the validated production default: flips the 4h+1h gate one bar
@@ -1150,7 +1182,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         regime_sl_high_vol=1.5,     # SL multiplier in HIGH_VOL (×1.5 wider)
         # ── Relative Volume (SJ scoring component) ─────────────────────────────
         # Entry bar volume relative to MA20(volume). Filters fake/low-interest breakouts.
-        sj_rel_vol=True,            # add rel_vol as SJ scoring component
+        sj_rel_vol=False,           # rel_vol SJ component (backtest showed no effect vs vol_expansion)
         rel_vol_min=1.2,            # entry bar must have ≥1.2× average volume
         # HTF Momentum Score — 8-component quality gate (replaces binary crossover when enabled)
         htf_mom_score=False,       # off by default; enable to replace binary macro/mid gates
@@ -1183,6 +1215,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
         self._cooldown_until = 0.0  # unix timestamp when cooldown expires (time-based, not call-based)
+        self._start_time     = time.time()  # for startup warmup check
 
     def arm_cooldown(self) -> None:
         """Start the whipsaw cooldown. Called by the bot only after a confirmed
@@ -1270,6 +1303,15 @@ class TrendContImprovedStrategy(BaseStrategy):
         if len(c4h) < self._min_4h:
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[TCImproved] need {self._min_4h} 4h bars, have {len(c4h)}")
+
+        # ── Startup warmup: block signals for N min after strategy restart ───────
+        _warmup_min = float(self._p.get("startup_warmup_min", 0))
+        if _warmup_min > 0:
+            _elapsed = time.time() - self._start_time
+            if _elapsed < _warmup_min * 60:
+                _rem = int((_warmup_min * 60 - _elapsed) / 60)
+                return Signal(SignalType.HOLD, self.symbol, current_price, 0,
+                              f"[TCImproved] startup warmup: {_rem}min left")
 
         # ── Whipsaw cooldown (fast mode only, time-based) ─────────────────────
         if self._p.get("fast_mode") and time.time() < self._cooldown_until:
