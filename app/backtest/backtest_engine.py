@@ -301,6 +301,7 @@ class SymbolBacktest:
 
             prev_state = bot.state
             prev_pos   = bot.position_open
+            bars_held_before_tick = bars_held  # snapshot before on_tick may close the trade
 
             extras = {
                 "symbol":       self.symbol,
@@ -338,6 +339,9 @@ class SymbolBacktest:
                     # Use per-trade commission accumulator (accurate — no bleeding from prior trade)
                     comm = executor.pop_trade_commission()
 
+                    # bars_held_before_tick reflects how many bars were held entering this tick;
+                    # +1 accounts for the closing tick itself (position was open going into on_tick).
+                    # Using the post-tick bars_held would always be 0 since it resets on close.
                     rec = TradeRecord(
                         symbol       = self.symbol,
                         direction    = j_entry.get("direction", ""),
@@ -356,7 +360,7 @@ class SymbolBacktest:
                         exit_time    = datetime.fromtimestamp(
                             current_ts / 1000, tz=timezone.utc
                         ).isoformat(),
-                        bars_held    = bars_held,
+                        bars_held    = bars_held_before_tick + 1,
                         commission   = comm,
                     )
                     trade_records.append(rec)

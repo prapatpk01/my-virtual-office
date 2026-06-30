@@ -71,10 +71,10 @@ REGIME_THRESHOLDS: Dict[str, Dict] = {
         "adx_1h_min": 20, "rsi_long": (40, 65), "rsi_short": (35, 58),
         "allow_long": True,  "allow_short": False, "l1_delta": -5,
     },
-    # Normal trend — both directions, standard RSI dip gates
+    # Normal trend — LONG only; shorting against primary uptrend is consistently losing
     "UPTREND": {
         "adx_1h_min": 15, "rsi_long": (35, 62), "rsi_short": (38, 65),
-        "allow_long": True,  "allow_short": True,  "l1_delta": 0,
+        "allow_long": True,  "allow_short": False, "l1_delta": 0,
     },
     # Ranging market — mean-reversion RSI gates, higher quality bar
     "RANGE": {
@@ -96,10 +96,10 @@ REGIME_THRESHOLDS: Dict[str, Dict] = {
         "adx_1h_min": 15, "rsi_long": (28, 45), "rsi_short": (52, 72),
         "allow_long": False, "allow_short": True,  "l1_delta": +3,
     },
-    # Bottoming/accumulation — LONG bias, shorts blocked
+    # Bottoming/accumulation — LONG bias, shorts blocked; raised bar to filter weak signals
     "ACCUMULATION": {
-        "adx_1h_min": 12, "rsi_long": (35, 55), "rsi_short": (48, 68),
-        "allow_long": True,  "allow_short": False, "l1_delta": +3,
+        "adx_1h_min": 18, "rsi_long": (35, 55), "rsi_short": (48, 68),
+        "allow_long": True,  "allow_short": False, "l1_delta": +12,
     },
     # Extended trend losing momentum — very high quality bar required
     "EXHAUSTION": {
