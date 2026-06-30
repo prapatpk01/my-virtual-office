@@ -103,7 +103,7 @@ REGIME_THRESHOLDS: Dict[str, Dict] = {
     },
     # Extended trend losing momentum — very high quality bar required
     "EXHAUSTION": {
-        "adx_1h_min": 25, "rsi_long": (30, 48), "rsi_short": (52, 70),
+        "adx_1h_min": 18, "rsi_long": (30, 48), "rsi_short": (52, 70),
         "allow_long": True,  "allow_short": True,  "l1_delta": +15,
     },
 }
@@ -114,10 +114,17 @@ _TRADEABLE_STATES: frozenset = frozenset({
     "DISTRIBUTION",    # SHORT-bias reversal (topping pattern)
     "ACCUMULATION",    # LONG-bias reversal (bottoming pattern)
     "HIGH_VOL",        # expansion — high bar (l1_delta +8) protects quality
+    "EXHAUSTION",      # elevated ADX + collapsed efficiency — l1_delta +15 ensures
+                       # only very high-confidence setups enter; 1H EMA filter guards direction
     # RANGE: blocked — catch-all Sideway equivalent, WR 33-45%
     # LOW_VOL: blocked — wait for breakout, no directional edge yet
-    # EXHAUSTION: blocked — extended trend, sharp reversal risk
 })
+
+# Scores that are LONG-biased: high value = bullish signal.
+# For SHORT scoring these must be inverted (100 - score) so bearish conditions score high.
+# trend_score is intentionally excluded: it measures directional STRENGTH not bias
+# (both ema_bull and ema_bear get high trend_score, which correctly favours either direction).
+_DIR_INVERT_KEYS: tuple = ("momentum", "structure", "ema", "vwap", "macd")
 
 # Entry type label per regime (for learning database enrichment)
 _REGIME_ENTRY_TYPE: Dict[str, str] = {
@@ -577,11 +584,10 @@ class TradingBot:
         if bb_w < 0.2 and atr_exp < 0.8:
             return "LOW_VOL"
 
-        # Exhaustion: was trending but efficiency collapsed
-        if adx > 18 and eff < 0.30:
-            return "EXHAUSTION"
-
         # Strong uptrend: efficient trend with bulls clearly dominating
+        # [FIX] Checked BEFORE EXHAUSTION — a trending market with somewhat
+        # low efficiency is still an UPTREND, not EXHAUSTION. Previously
+        # ADX>18 + eff<0.30 fired first and blocked valid UPTREND entries.
         if adx > 22 and eff > 0.55 and pdi > mdi + 3:
             return "STRONG_UPTREND"
 
@@ -596,6 +602,12 @@ class TradingBot:
         # Accumulation: below EMA20 + RSI neutral/oversold + low ADX
         if ema5 < ema20 and rsi < 50 and adx < 22:
             return "ACCUMULATION"
+
+        # Exhaustion: elevated ADX but directional efficiency has collapsed
+        # (no longer trending despite historical momentum).
+        # Checked AFTER trend states so genuine uptrends aren't misclassified.
+        if adx > 20 and eff < 0.28:
+            return "EXHAUSTION"
 
         return "RANGE"
 
@@ -706,7 +718,9 @@ class TradingBot:
         if adx_1h < adx_min or ema5_1h is None or ema20_1h is None:
             return False
 
-        # Allow EMA5 within 0.3% of EMA20 — catches turning points before full crossover
+        # Allow EMA5 within 0.3% of EMA20 — catches turning points before full crossover.
+        # Works for both trend-follow and reversal states; tested: strict crossover
+        # for reversals reduced trades AND profits without improving WR.
         tolerance = ema20_1h * 0.003
         if direction == "LONG":
             return ema5_1h >= ema20_1h - tolerance
@@ -727,6 +741,14 @@ class TradingBot:
         if sl_dist < 1e-8:
             sl_dist = entry_price * 0.01
 
+        # min_sl_pct floor (2.0%): widen both SL PRICE and sl_dist when the
+        # pattern stop is too tight.  Prevents noise-stops AND oversized positions.
+        # Matches the 2.0% floor applied by BacktestEngine.cfg.min_sl_pct.
+        min_sl_dist = entry_price * 0.020
+        if sl_dist < min_sl_dist:
+            sl_dist = min_sl_dist
+            pattern_sl = entry_price - sl_dist if direction == "LONG" else entry_price + sl_dist
+
         # [FIX] win streak risk reduction
         risk_pct = self.base_risk_pct
         if self.win_streak >= 5:
@@ -737,9 +759,10 @@ class TradingBot:
         position_size = risk_amount / sl_dist
 
         mult = 1 if direction == "LONG" else -1
-        # [FIX 16] เหลือแค่ TP1/TP2 — TP1 scale-out + ขยับ SL ไป BE, TP2 = full exit
-        tp1 = entry_price + sl_dist * 0.7 * mult   # TP1: 0.7R → ปิด 50% + ขยับ BE
-        tp2 = entry_price + sl_dist * 1.5 * mult   # TP2: 1.5R → ปิดที่เหลือทั้งหมด
+        # TP1: 0.7R → close 50% + move SL to breakeven
+        # TP2: 2.0R → close remaining 50% (raised from 1.5R for better expectancy)
+        tp1 = entry_price + sl_dist * 0.7 * mult
+        tp2 = entry_price + sl_dist * 2.0 * mult
 
         self.current_trade = {
             "direction":            direction,
@@ -1137,6 +1160,13 @@ class TradingBot:
 
             # ── SCANNING ───────────────────────────────────────────────────
             elif self.state == "SCANNING":
+                # [FIX] Reset direction_focus on each SCANNING pass.
+                # direction_focus persists from FILTERING and is never cleared
+                # when a trade exits, a WAIT_CONFIRM times out, or the regime
+                # changes.  If it stays as "LONG" when the new regime is
+                # DISTRIBUTION (allow_long=False), _check_global_gates()
+                # permanently returns False — bot stuck in SCANNING forever.
+                self.direction_focus = None
                 if self._check_global_gates():
                     self.state = "FILTERING"
                     state_changed = True
@@ -1150,13 +1180,32 @@ class TradingBot:
                 best_score: float = -1.0
                 weights = self.adaptive_engine.get_dynamic_weights(self.current_market_state)
                 thresholds = self.adaptive_engine.get_layer_thresholds(vol_state, self.current_market_state)
+                multiplier = self.adaptive_engine.get_regime_multiplier(self.regime_score)
+                rt_current = REGIME_THRESHOLDS.get(self.current_market_state, {})
                 for direction in ("LONG", "SHORT"):
+                    # [FIX] Enforce regime direction gates (allow_long/allow_short)
+                    # These were dead code in _check_global_gates (direction_focus=None there)
+                    if direction == "LONG" and not rt_current.get("allow_long", True):
+                        continue
+                    if direction == "SHORT" and not rt_current.get("allow_short", True):
+                        continue
                     if not self._check_htf_trend_filter(direction, ind_1h):
                         continue
-                    # Compute raw layer score for comparison
-                    multiplier = self.adaptive_engine.get_regime_multiplier(self.regime_score)
+                    # [FIX] Direction-aware scoring: SHORT in bearish market should score HIGH,
+                    # not LOW.  Invert LONG-biased indicator scores for SHORT direction so that
+                    # bearish conditions (structure=15, ema_score<50, momentum<50, etc.) become
+                    # high scores that properly reflect SHORT-favourable conditions.
+                    # Neutral indicators (volume, atr, rsi, sweep, divergence, pattern, trend)
+                    # are unchanged — trend_score is already direction-agnostic (high for any
+                    # strong trend regardless of direction).
+                    if direction == "SHORT":
+                        dir_ind = {**ind_15m,
+                                   **{f"{k}_score": 100.0 - ind_15m.get(f"{k}_score", 50.0)
+                                      for k in _DIR_INVERT_KEYS}}
+                    else:
+                        dir_ind = ind_15m
                     raw_score = sum(
-                        self._scale_score(ind_15m.get(f"{k}_score", 0), weights.get(k, 0))
+                        self._scale_score(dir_ind.get(f"{k}_score", 0), weights.get(k, 0))
                         for k in weights
                     ) * multiplier
                     if raw_score >= thresholds["L1_PASS"] and raw_score > best_score:
