@@ -512,6 +512,9 @@ class TradingBot:
         self.startup_warmup_minutes: int = startup_warmup_minutes
         self._startup_unblock_at: Optional[datetime.datetime] = None
 
+        # Last 15m candle — stored per tick for reversal detection
+        self._last_candle_15m: Dict = {}
+
         # Logging
         self._log: List[str] = []
 
@@ -556,6 +559,87 @@ class TradingBot:
     def _scale_score(val: float, max_weight: float) -> float:
         val_clamped = min(float(val), 100.0)
         return min((val_clamped / 100.0) * max_weight, max_weight)
+
+    @staticmethod
+    def _health_level(score: float) -> str:
+        """Classify numeric health score (0-100) into a named level."""
+        if score >= 80: return "STRONG"
+        if score >= 60: return "GOOD"
+        if score >= 40: return "WARN"
+        if score >= 20: return "POOR"
+        return "CRITICAL"
+
+    def _detect_reversal_signals(self, ind_15m: Dict) -> Dict:
+        """
+        Detect two reversal patterns for open position protection:
+
+        reversal_spike — large wick against position direction on the last candle.
+          LONG: big upper wick (>60% range) + bearish close → rejection at high.
+          SHORT: big lower wick (>60% range) + bullish close → rejection at low.
+
+        trend_fade — trend momentum collapsing while holding (≥4 bars):
+          ADX < 14 AND (EMA5/EMA20 gap < 0.25% OR MACD histogram turned against).
+        """
+        signals: Dict = {}
+        if not self.position_open or not self.current_trade:
+            return signals
+
+        direction = self.current_trade.get("direction", "LONG")
+        c = self._last_candle_15m
+
+        if c:
+            high        = c.get("high",  0.0)
+            low         = c.get("low",   0.0)
+            close       = c.get("close", 0.0)
+            open_price  = c.get("open",  close)
+            total_range = max(high - low, 1e-9)
+            body_top    = max(close, open_price)
+            body_bot    = min(close, open_price)
+            upper_wick  = high - body_top
+            lower_wick  = body_bot - low
+
+            if direction == "LONG":
+                # Bearish rejection: large upper wick + close lower than open
+                if (upper_wick / total_range > 0.60
+                        and close < open_price
+                        and upper_wick > lower_wick * 1.5):
+                    signals["reversal_spike"] = {
+                        "severity":   "HIGH",
+                        "wick_ratio": round(upper_wick / total_range, 2),
+                    }
+            else:
+                # Bullish rejection: large lower wick + close higher than open
+                if (lower_wick / total_range > 0.60
+                        and close > open_price
+                        and lower_wick > upper_wick * 1.5):
+                    signals["reversal_spike"] = {
+                        "severity":   "HIGH",
+                        "wick_ratio": round(lower_wick / total_range, 2),
+                    }
+
+        # Trend fade — only meaningful after position has had time to develop
+        holding_bars = self._bar_count - self._position_entry_bar
+        if holding_bars >= 4:
+            adx       = ind_15m.get("adx", 20)
+            ema5      = ind_15m.get("ema5",  0.0)
+            ema20     = ind_15m.get("ema20", 1.0)
+            macd_hist = ind_15m.get("macd_hist", 0.0)
+            ema_gap_pct = abs(ema5 - ema20) / max(ema20, 1e-9) * 100
+
+            fade_count = sum([
+                adx < 14,
+                ema_gap_pct < 0.25,
+                (direction == "LONG"  and macd_hist < 0),
+                (direction == "SHORT" and macd_hist > 0),
+            ])
+            if fade_count >= 2:
+                signals["trend_fade"] = {
+                    "severity":    "MEDIUM",
+                    "adx":         round(adx, 1),
+                    "ema_gap_pct": round(ema_gap_pct, 3),
+                }
+
+        return signals
 
     # ── MODULE 1: 8-State Market Regime Engine ───────────────────────────────
 
@@ -809,6 +893,33 @@ class TradingBot:
         # Track MAE / MFE
         t["mae"] = min(t["mae"], current_r)
         t["mfe"] = max(t["mfe"], current_r)
+
+        # ── Reversal protection (spike + trend fade) ───────────────────────
+        # Checked before TP/SL so a sudden spike or fading trend can exit
+        # immediately before a standard SL hit eats too much profit.
+        reversal = self._detect_reversal_signals(ind)
+        if reversal.get("reversal_spike"):
+            sig = reversal["reversal_spike"]
+            self._log_event(
+                f"[PROTECT] REVERSAL_SPIKE wick={sig['wick_ratio']:.0%} → exit now",
+                level="warning",
+            )
+            self._close_position("REVERSAL_SPIKE", current_price, 1.0, ind)
+            return "EXITING"
+
+        if reversal.get("trend_fade"):
+            sig = reversal["trend_fade"]
+            atr  = ind.get("atr", t["sl_dist"] * 0.5)
+            mult = 1 if direction == "LONG" else -1
+            tight_sl = current_price - atr * 0.8 * mult
+            if direction == "LONG":
+                t["sl"] = max(t["sl"], tight_sl)
+            else:
+                t["sl"] = min(t["sl"], tight_sl)
+            self._log_event(
+                f"[PROTECT] TREND_FADE ADX={sig['adx']} → SL tightened to {t['sl']:.2f}",
+                level="warning",
+            )
 
         # ── [FIX 7] Emergency exit conditions ─────────────────────────────
         emergency_signals = [
@@ -1112,6 +1223,7 @@ class TradingBot:
         now = bar_dt or datetime.datetime.now()
         self._bar_now = now  # shared across all sub-methods this tick
         self._bar_count += 1
+        self._last_candle_15m = candle_15m  # for reversal spike detection
 
         # Set startup warmup window on very first tick
         if self._startup_unblock_at is None and self.startup_warmup_minutes > 0:
@@ -1344,6 +1456,51 @@ class TradingBot:
             "cooldown_until":     self.cooldown_until.isoformat() if self.cooldown_until else None,
             "warmup_remaining_m": warmup_remaining,
             "recent_log":         list(self._log[-20:]),
+        }
+
+    def get_position_health_report(self, current_price: float, ind_15m: Dict) -> Dict:
+        """
+        Return a structured health report for the current open position.
+        Used by run_bot.py to log 5-minute health updates.
+
+        Returns a dict with:
+          in_position, health_score, health_level (STRONG/GOOD/WARN/POOR/CRITICAL),
+          current_r, pnl, reversal_signals, and key indicator values.
+        """
+        if not self.position_open or not self.current_trade:
+            return {"in_position": False}
+
+        t         = self.current_trade
+        direction = t["direction"]
+        entry     = t["entry"]
+        sl_dist   = max(t["sl_dist"], 1e-9)
+        dir_mult  = 1 if direction == "LONG" else -1
+        current_r = ((current_price - entry) * dir_mult) / sl_dist
+        pnl       = (current_price - entry) * dir_mult * t.get("remaining_size", t["size"])
+
+        health = self.health_calc.calculate(ind_15m, t, current_price)
+        level  = self._health_level(health)
+
+        reversal = self._detect_reversal_signals(ind_15m)
+
+        return {
+            "in_position":     True,
+            "direction":       direction,
+            "entry":           entry,
+            "current_price":   current_price,
+            "sl":              t["sl"],
+            "tp1":             t["tp1"],
+            "tp2":             t["tp2"],
+            "tp1_hit":         t.get("tp1_hit", False),
+            "current_r":       round(current_r, 3),
+            "pnl":             round(pnl, 2),
+            "health_score":    round(health, 1),
+            "health_level":    level,
+            "reversal_signals": reversal,
+            "adx":             round(ind_15m.get("adx",  0), 1),
+            "rsi":             round(ind_15m.get("rsi", 50), 1),
+            "macd_hist":       round(ind_15m.get("macd_hist", 0), 4),
+            "holding_bars":    self._bar_count - self._position_entry_bar,
         }
 
     def get_performance_summary(self) -> Dict:

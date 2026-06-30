@@ -247,11 +247,59 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             f"Warmup: 45m — no new entries until indicators stabilize"
         )
 
+    import time as _time
+    import datetime as _dt
+
     loop = asyncio.get_event_loop()
     max_pos = cfg.get("adaptive_max_positions", 2)
 
+    # 5-minute health log: tracks last log time and cached indicators per symbol
+    HEALTH_LOG_SECS = 300
+    last_health_log: dict = {sym: 0.0 for sym in symbols}
+    last_ind_cache:  dict = {sym: {}  for sym in symbols}
+    last_price_cache: dict = {sym: 0.0 for sym in symbols}
+
+    _HEALTH_EMOJI = {
+        "STRONG":   "✅",
+        "GOOD":     "🟢",
+        "WARN":     "🟡",
+        "POOR":     "🟠",
+        "CRITICAL": "🔴",
+    }
+
+    def _log_health(sym: str, bot, price: float, ind_15m: dict):
+        """Emit a 5-minute health log for one symbol."""
+        if bot.position_open and ind_15m:
+            report = bot.get_position_health_report(price, ind_15m)
+            level  = report.get("health_level", "?")
+            emoji  = _HEALTH_EMOJI.get(level, "?")
+            rev    = report.get("reversal_signals", {})
+            rev_str = f" | REVERSAL={','.join(rev)}" if rev else ""
+            tp1_str = " TP1✓" if report.get("tp1_hit") else ""
+            logger.info(
+                "[Health][%s] %s %s(%.0f)%s | dir=%s entry=%.2f cur=%.2f"
+                " pnl=%+.2f R=%.2f | SL=%.2f TP1=%.2f TP2=%.2f"
+                " | ADX=%.1f RSI=%.1f bars=%d%s",
+                sym, emoji, level, report["health_score"], tp1_str,
+                report["direction"], report["entry"], price,
+                report["pnl"], report["current_r"],
+                report["sl"], report["tp1"], report["tp2"],
+                report["adx"], report["rsi"], report["holding_bars"],
+                rev_str,
+            )
+        else:
+            status = bot.get_status()
+            warmup = status.get("warmup_remaining_m", 0)
+            warmup_str = f" warmup={warmup}m" if warmup else ""
+            logger.info(
+                "[Health][%s] NO_POS | state=%s market=%s regime=%.0f%s",
+                sym, status["state"], status["market_state"],
+                status["regime_score"], warmup_str,
+            )
+
     # Note: periodic Telegram stats removed — too noisy.
     # Use /stats command to check on demand. Railway logs show state every tick.
+    # 5-minute health logs are written to Railway log automatically below.
 
     while not stop_event.is_set():
         for sym in symbols:
@@ -265,61 +313,70 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     logger.warning("[Adaptive][%s] Empty candles — skipping", sym)
                     continue
 
-                # Only tick on new 15m bar
                 latest_ts = c15m[-1].timestamp if c15m else 0
-                if latest_ts <= last_bar_ts[sym]:
-                    continue
-                last_bar_ts[sym] = latest_ts
-
+                is_new_bar = latest_ts > last_bar_ts[sym]
                 bot, state_file = bots[sym]
 
-                # Global position cap — count open positions across ALL symbols.
-                # If this bot has no open position and we're already at the limit,
-                # skip the tick entirely (no scanning, no new entry).
-                # Bots that already hold a position always run (SL/TP management).
-                if not bot.position_open:
-                    open_count = sum(
-                        1 for b, _ in bots.values() if b.position_open
-                    )
-                    if open_count >= max_pos:
-                        logger.debug(
-                            "[Adaptive][%s] SKIP — global positions %d/%d full",
-                            sym, open_count, max_pos,
+                if is_new_bar:
+                    last_bar_ts[sym] = latest_ts
+
+                    # Global position cap — bots without open position skip when full.
+                    # Bots that already hold a position always run (SL/TP management).
+                    should_process = True
+                    if not bot.position_open:
+                        open_count = sum(
+                            1 for b, _ in bots.values() if b.position_open
                         )
-                        continue
+                        if open_count >= max_pos:
+                            logger.debug(
+                                "[Adaptive][%s] SKIP — global positions %d/%d full",
+                                sym, open_count, max_pos,
+                            )
+                            should_process = False
 
-                # Compute indicators
-                candle_15m, candle_1h, candle_4h, ind_15m, ind_1h, ind_4h = \
-                    ind_engine.compute(c15m, c1h, c4h)
+                    if should_process:
+                        # Compute indicators
+                        candle_15m, candle_1h, candle_4h, ind_15m, ind_1h, ind_4h = \
+                            ind_engine.compute(c15m, c1h, c4h)
 
-                price = candle_15m.get("close", 0.0)
+                        price = candle_15m.get("close", 0.0)
 
-                extras = {"symbol": sym, "session": "", "funding_rate": 0.0, "oi": 0}
+                        # Cache for health logs between new bars
+                        last_ind_cache[sym]   = ind_15m
+                        last_price_cache[sym] = price
 
-                # Pass the closed bar's datetime so cooldown uses bar time (not wall-clock)
-                import datetime as _dt
-                bar_dt = _dt.datetime.fromtimestamp(
-                    latest_ts / 1000, tz=_dt.timezone.utc
-                )
+                        extras = {"symbol": sym, "session": "", "funding_rate": 0.0, "oi": 0}
 
-                # Run on_tick in thread (sync order execution inside)
-                await loop.run_in_executor(
-                    None,
-                    lambda b=bot, sf=state_file, bdt=bar_dt: b.on_tick(
-                        candle_15m, candle_1h, candle_4h,
-                        ind_15m, ind_1h, ind_4h,
-                        extras, price,
-                        bar_dt=bdt,
-                    )
-                )
+                        bar_dt = _dt.datetime.fromtimestamp(
+                            latest_ts / 1000, tz=_dt.timezone.utc
+                        )
 
-                # Log state every tick
-                status = bot.get_status()
-                logger.info(
-                    "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f",
-                    sym, status["state"], status["position_open"],
-                    status["market_state"], status["regime_score"],
-                )
+                        # Run on_tick in thread (sync order execution inside)
+                        await loop.run_in_executor(
+                            None,
+                            lambda b=bot, sf=state_file, bdt=bar_dt: b.on_tick(
+                                candle_15m, candle_1h, candle_4h,
+                                ind_15m, ind_1h, ind_4h,
+                                extras, price,
+                                bar_dt=bdt,
+                            )
+                        )
+
+                        # Log state on every new bar
+                        status = bot.get_status()
+                        logger.info(
+                            "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f",
+                            sym, status["state"], status["position_open"],
+                            status["market_state"], status["regime_score"],
+                        )
+
+                # 5-minute health log — runs even when no new bar
+                _ts = _time.time()
+                if (_ts - last_health_log.get(sym, 0) >= HEALTH_LOG_SECS
+                        and last_ind_cache.get(sym)):
+                    last_health_log[sym] = _ts
+                    _log_health(sym, bot, last_price_cache.get(sym, 0.0),
+                                last_ind_cache[sym])
 
             except asyncio.CancelledError:
                 raise
