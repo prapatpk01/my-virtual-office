@@ -544,8 +544,8 @@ class TradingBot:
 
         mult = 1 if direction == "LONG" else -1
         # [FIX 16] เหลือแค่ TP1/TP2 — TP1 scale-out + ขยับ SL ไป BE, TP2 = full exit
-        tp1 = entry_price + sl_dist * 1.0 * mult
-        tp2 = entry_price + sl_dist * 2.0 * mult
+        tp1 = entry_price + sl_dist * 0.7 * mult   # TP1: 0.7R → ปิด 50% + ขยับ BE
+        tp2 = entry_price + sl_dist * 1.5 * mult   # TP2: 1.5R → ปิดที่เหลือทั้งหมด
 
         self.current_trade = {
             "direction":            direction,
