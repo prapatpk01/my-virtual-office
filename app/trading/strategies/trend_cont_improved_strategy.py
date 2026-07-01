@@ -936,6 +936,19 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         trigger_long  = pd.Series(True, index=out.index)
         trigger_short = pd.Series(True, index=out.index)
 
+    # ── Score-Primary Entry (experimental, separate from simple_fast_entry) ──
+    # ADX is the only hard inner gate; direction/momentum/structure fully
+    # delegated to the weighted score ≥ min_score. Kept as a DISTINCT flag from
+    # simple_fast_entry (which stays the safe hard-gate default) so this can be
+    # A/B tested at different min_score thresholds without touching production.
+    if fast_mode and p.get("score_primary_entry", False):
+        long_gates    = adx_ok
+        short_gates   = adx_ok
+        at_pull_long  = pd.Series(True, index=out.index)
+        at_pull_short = pd.Series(True, index=out.index)
+        trigger_long  = pd.Series(True, index=out.index)
+        trigger_short = pd.Series(True, index=out.index)
+
     out["final_buy"]  = (macro_up & mid_up  & at_pull_long  & long_bias_ok  &
                           (score_long  >= p["min_score"]) & long_gates  & trigger_long).fillna(False)
     out["final_sell"] = (macro_dn  & mid_dn  & at_pull_short & short_bias_ok &
@@ -1224,6 +1237,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         # with just: close vs HMA16 + MACD hist sign + ADX > min (fast mode only).
         # Keeps 4H/1H direction, MTF bias, and score gate intact.
         simple_fast_entry=False,
+        # Score-Primary Entry (experimental): ADX-only hard gate, score fully decides
+        # direction/momentum/structure. Distinct from simple_fast_entry — see _compute().
+        score_primary_entry=False,
         # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
         # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
         atr_compress_gate=False,
