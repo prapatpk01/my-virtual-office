@@ -472,6 +472,8 @@ class TradingBot:
                  cooldown_minutes: int = 20,
                  max_loss_streak: int = 4,
                  tp1_close_pct: float = 0.50,
+                 tp1_r: Optional[float] = None,
+                 tp2_r: Optional[float] = None,
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
                  startup_warmup_minutes: int = 45,
@@ -485,6 +487,12 @@ class TradingBot:
         self.bias_engine       = RegimeBiasEngine()
         self.learning_engine   = PatternLearningEngine()
         self.tp1_close_pct     = tp1_close_pct
+        # TP geometry — instance overrides of the class defaults (env-tunable
+        # WR↔profit dial: lower TP1_R = higher win-rate, smaller avg win).
+        if tp1_r is not None:
+            self.TP1_R = tp1_r
+        if tp2_r is not None:
+            self.TP2_R = tp2_r
         self._state_file: str  = state_file or self.DEFAULT_STATE_FILE
 
         self.account_balance       = account_balance
@@ -730,6 +738,12 @@ class TradingBot:
     # [#2] States where entry-location (buy-the-pullback) preference is applied.
     # Efficient trends only — moderate/choppy trends trade better on continuation.
     _LOCATION_STATES: frozenset = frozenset({"STRONG_TREND", "BREAKOUT"})
+
+    # TP geometry in R-multiples. TP1 banks tp1_close_pct and moves SL→BE, so
+    # lowering TP1_R raises win-rate (more trades reach it) at the cost of avg
+    # win size. Swept via backtest.
+    TP1_R: float = 0.7
+    TP2_R: float = 1.5
 
     def _regime_direction(self, ind_4h: Dict) -> float:
         """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
@@ -1029,11 +1043,12 @@ class TradingBot:
         # ── TP levels ────────────────────────────────────────────────────────
         mult = 1 if direction == "LONG" else -1
 
-        # Unified TP: TP1=0.7R/50%, TP2=1.5R/100% for all strategies
-        tp1 = entry_price + sl_dist * 0.7 * mult
-        tp2 = entry_price + sl_dist * 1.5 * mult
+        # Unified TP (tunable): reaching TP1 banks a partial + moves SL→BE, so a
+        # closer TP1 converts more trades into locked wins → higher win-rate.
+        tp1 = entry_price + sl_dist * self.TP1_R * mult
+        tp2 = entry_price + sl_dist * self.TP2_R * mult
         tp3 = None
-        tp1_pct   = self.tp1_close_pct  # 0.50
+        tp1_pct   = self.tp1_close_pct
         tp2_pct   = 1.0
         trail_atr = 2.0
 

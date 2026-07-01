@@ -123,6 +123,10 @@ def build_config() -> dict:
         "adaptive_cooldown_min": _env_int("ADAPTIVE_COOLDOWN_MIN", 30),
         "adaptive_max_loss_streak": _env_int("ADAPTIVE_MAX_LOSS_STREAK", 3),
         "adaptive_max_positions": _env_int("ADAPTIVE_MAX_POSITIONS", 2),
+        # TP geometry dial (None = use bot class defaults 0.7 / 1.5). Lower
+        # ADAPTIVE_TP1_R raises win-rate at the cost of average win size.
+        "adaptive_tp1_r": (_env_float("ADAPTIVE_TP1_R", 0.0) or None),
+        "adaptive_tp2_r": (_env_float("ADAPTIVE_TP2_R", 0.0) or None),
     }
 
 
@@ -265,6 +269,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             execution_callback=_make_callback(sym, okx),
             enable_swing_reversal=cfg["strategies"].get("swing_reversal_pro", True),
             enable_mean_reversion=cfg["strategies"].get("mean_reversion", False),
+            tp1_r=cfg.get("adaptive_tp1_r"),
+            tp2_r=cfg.get("adaptive_tp2_r"),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)
