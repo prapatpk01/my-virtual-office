@@ -1268,7 +1268,15 @@ class TrendContImprovedStrategy(BaseStrategy):
         reversal_spike_enabled=True,
         reversal_spike_atr=1.5,   # adverse move must be ≥ N×ATR(3m)
         reversal_spike_bars=4,    # window in 3m bars (4×3m = 12 min)
-        reversal_spike_uw_frac=0.0,  # min R underwater before spike-cut can fire (0=no floor, legacy)
+        # Underwater floor before spike-cut may fire. Guard-sim sweep Jan-May 2026
+        # (BTC+XAU, entries from the validated production config):
+        #   floor 0.0R: WR 22.3% PnL -$112.91 PF 0.41 — fired 84×, mostly at ~0.1R
+        #     (quiet-market ATR(3m) shrinks → 1.5×ATR trips on ordinary noise)
+        #   floor 0.5R: PF 1.23 | 0.6R: PF 1.35 | 0.7R: PF 1.46 (+$94.10, fires 4×)
+        #   floor 0.8R: PF 1.46 (+$93.89, plateau) | spike-off: PF 1.43 (+$90.04)
+        # 0.7R turns spike-cut into a true emergency brake (4 fires in 5 months) that
+        # BEATS having no spike-cut — it still catches real crashes (SL count 3→1).
+        reversal_spike_uw_frac=0.7,
         # trend-fade cut: early-loss exit when trend dies AND price turns AND losing
         # Backtest Jan-May 2026: Classic +16% ($241→$279), SJ +52% ($143→$217),
         # both with lower MaxDD. Triple gate avoids chopping quiet winners.
