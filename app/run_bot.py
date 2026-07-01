@@ -549,6 +549,15 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         except Exception as e:
             logger.warning("[Adaptive] Could not save state for %s: %s", sym, e)
 
+    # The execution adapter created here (okx) is a SEPARATE ccxt async client
+    # from the outer `connector` — _cleanup_connector() in main() only closes
+    # `connector`, so okx's aiohttp session was never closed, producing the
+    # "Unclosed client session" warning on every shutdown/redeploy.
+    try:
+        await okx.close()
+    except Exception as e:
+        logger.warning("[Adaptive] okx connector close error (non-fatal): %s", e)
+
 
 # ---------------------------------------------------------------------------
 # Main
