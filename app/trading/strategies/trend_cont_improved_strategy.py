@@ -1288,7 +1288,14 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Trigger mode: "strict" (break prior high/low), "relaxed" (rise over prior
         # close — enters ~1 bar sooner), "off" (no confirmation). Must be in DEFAULTS
         # so it flows into _p. None → derive from final_trigger_enabled (legacy).
-        final_trigger_mode=None,
+        # Backtest Jan-May 2026 (BTC+XAG+XAU) — relaxed DOMINATES on every metric:
+        #   strict : T=114 WR=79.8% PnL=+161.49 PF=1.51  (old default)
+        #   relaxed: T=139 WR=80.6% PnL=+259.22 PF=1.70  ← faster AND more accurate
+        #   off    : T=178 WR=78.1% PnL=+235.77 PF=1.45
+        # relaxed enters ~1 bar sooner than strict (the #1 entry bottleneck per the
+        # gate-bottleneck diagnostic — 804 sole-blocks) but still filters bars whose
+        # momentum is ticking against the trade, which is why it beats off too.
+        final_trigger_mode="relaxed",
         # HTF ADX gate: require 1h AND 4h ADX > threshold alongside 15m ADX
         htf_adx_gate=False,
         htf_adx_len=14,
