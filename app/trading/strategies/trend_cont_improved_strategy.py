@@ -929,11 +929,20 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         long_gates  = long_gates  & hist_rising_l
         short_gates = short_gates & hist_rising_s
 
-    # ── Final entry trigger: close must break above previous bar high/low ─────
-    if p.get("final_trigger_enabled", False):
+    # ── Final entry trigger: momentum confirmation before entry ──────────────
+    # Diagnostic (gate_bottleneck): this is the #1 entry blocker (804 otherwise-
+    # complete setups). "strict" waits for a break of the prior bar's high/low —
+    # accurate but enters late at a worse price. "relaxed" only needs the close to
+    # rise over the prior close (a softer momentum tick) — enters ~1 bar sooner.
+    # False disables it entirely (earliest, most trades).
+    _trig_mode = p.get("final_trigger_mode", "strict" if p.get("final_trigger_enabled", False) else "off")
+    if _trig_mode == "strict":
         trigger_long  = out["close"] > out["high"].shift(1)
         trigger_short = out["close"] < out["low"].shift(1)
-    else:
+    elif _trig_mode == "relaxed":
+        trigger_long  = out["close"] > out["close"].shift(1)
+        trigger_short = out["close"] < out["close"].shift(1)
+    else:  # "off"
         trigger_long  = pd.Series(True, index=out.index)
         trigger_short = pd.Series(True, index=out.index)
 
