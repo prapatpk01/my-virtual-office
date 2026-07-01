@@ -439,14 +439,25 @@ class OKXAdapter(BaseConnector):
         if sl is not None:
             params["stopLoss"] = {"triggerPrice": str(sl), "type": "market"}
 
+        # Attach TP2 (the final/full-size target) as a real exchange-side order
+        # so the position is protected even if the bot goes offline. TP1's 50%
+        # partial close stays bot-managed — OKX's attach mechanism only supports
+        # one take-profit leg per order, tied to the full position size, so it
+        # can't express a partial-size leg. reduceOnly semantics mean this TP2
+        # order safely closes whatever remains even after the bot's own TP1
+        # partial close has already reduced the position.
+        tp2 = trade_info.get("tp2")
+        if tp2 is not None:
+            params["takeProfit"] = {"triggerPrice": str(tp2), "type": "market"}
+
         raw = self._call(
             self._ex.create_order,
             sym, "market", side, amount, None, params,
             label=f"OPEN_{pos_side.upper()}({sym})",
         )
         order_id = raw.get("id", "")
-        logger.info("[OKX] OPEN %s %s qty=%.4f SL=%s → order_id=%s",
-                    pos_side.upper(), sym, amount, sl, order_id)
+        logger.info("[OKX] OPEN %s %s qty=%.4f SL=%s TP2=%s → order_id=%s",
+                    pos_side.upper(), sym, amount, sl, tp2, order_id)
 
         filled, fill_price = self._await_fill_sync(sym, order_id)
         raw["_filled"]     = filled
