@@ -918,18 +918,19 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         trigger_long  = pd.Series(True, index=out.index)
         trigger_short = pd.Series(True, index=out.index)
 
-    # ── Simple Fast Entry: score is the primary decider, ADX is the only hard inner gate ──
-    # Replaces: pullback zone / chop / regime / MACD-rising / final-trigger / hard
-    # HMA+MACD AND-gate with just ADX > min. HMA direction (hma_bull, 15pts) and
-    # MACD sign (macd_hist, 5pts) are already scored components — hard-gating on
-    # them too would double-count them and effectively lower the real bar for the
-    # other 9 components. Letting the weighted score ≥ min_score decide means a
-    # bar can qualify on strong BOS+volume+momentum even if HMA/MACD are borderline,
-    # and a bar with perfect HMA/MACD but weak everything-else still gets filtered.
-    # Keeps: 4H macro, 1H mid, MTF bias, ADX (safety guards unchanged).
+    # ── Simple Fast Entry: replace all inner gates with HMA direction + MACD hist sign ──
+    # Replaces: pullback zone / chop / regime / MACD-rising / final-trigger with just:
+    #   long  = close > HMA16  AND  MACD_hist > 0  AND  ADX > min
+    #   short = close < HMA16  AND  MACD_hist < 0  AND  ADX > min
+    # Backtest Jan-May 2026 (BTC+XAG+XAU): letting score alone decide (ADX-only gate)
+    # produced 452 trades but PF 0.72 (losing) — HMA+MACD hard-gate is the real anchor,
+    # not a redundant duplicate of the score; the score is a secondary quality filter
+    # on TOP of the direction/momentum gate, not a replacement for it.
+    # Keeps: 4H macro, 1H mid, MTF bias, score ≥ min_score (safety guards unchanged).
     if fast_mode and p.get("simple_fast_entry", False):
-        long_gates    = adx_ok
-        short_gates   = adx_ok
+        _sf_hist      = macd_line - macd_sig
+        long_gates    = adx_ok & (out["close"] > hma) & (_sf_hist > 0)
+        short_gates   = adx_ok & (out["close"] < hma) & (_sf_hist < 0)
         at_pull_long  = pd.Series(True, index=out.index)
         at_pull_short = pd.Series(True, index=out.index)
         trigger_long  = pd.Series(True, index=out.index)
