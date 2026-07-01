@@ -236,6 +236,10 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "sj_scoring":             cfg["tci_sj_scoring"],
             "sj_roc9":                cfg["tci_sj_roc9"],
             "chop_filter_enabled":    cfg["tci_chop_filter"],
+            # Simple fast entry: replaces pullback/chop/regime/MACD-rising/trigger
+            # with just close vs HMA16 + MACD hist sign + ADX. Much faster entries.
+            "simple_fast_entry":      True,
+            "htf_stability_bars":     1,   # HTF flip recognised after 1 bar (was 2)
         }))
 
     if not strategies:

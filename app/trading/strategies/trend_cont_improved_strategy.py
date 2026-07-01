@@ -905,6 +905,20 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         trigger_long  = pd.Series(True, index=out.index)
         trigger_short = pd.Series(True, index=out.index)
 
+    # ── Simple Fast Entry: replace all inner gates with HMA direction + MACD hist sign ──
+    # Replaces: pullback zone / chop / regime / MACD-rising / final-trigger with just:
+    #   long  = close > HMA16  AND  MACD_hist > 0  AND  ADX > min
+    #   short = close < HMA16  AND  MACD_hist < 0  AND  ADX > min
+    # Keeps: 4H macro, 1H mid, MTF bias, score ≥ min_score (safety guards unchanged).
+    if fast_mode and p.get("simple_fast_entry", False):
+        _sf_hist      = macd_line - macd_sig
+        long_gates    = adx_ok & (out["close"] > hma) & (_sf_hist > 0)
+        short_gates   = adx_ok & (out["close"] < hma) & (_sf_hist < 0)
+        at_pull_long  = pd.Series(True, index=out.index)
+        at_pull_short = pd.Series(True, index=out.index)
+        trigger_long  = pd.Series(True, index=out.index)
+        trigger_short = pd.Series(True, index=out.index)
+
     out["final_buy"]  = (macro_up & mid_up  & at_pull_long  & long_bias_ok  &
                           (score_long  >= p["min_score"]) & long_gates  & trigger_long).fillna(False)
     out["final_sell"] = (macro_dn  & mid_dn  & at_pull_short & short_bias_ok &
@@ -1189,6 +1203,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_ema_slope=True,         # EMA20 + EMA50 both rising = structural trend (10 pts)
         sj_adx_rising=True,        # ADX rising over 2 bars = trend strengthening (5 pts)
         sj_atr_expansion=True,     # ATR14 > ATR_MA20 = volatility expanding, not quiet (5 pts)
+        # Simple Fast Entry: replaces pullback zone / chop / regime / MACD-rising / trigger
+        # with just: close vs HMA16 + MACD hist sign + ADX > min (fast mode only).
+        # Keeps 4H/1H direction, MTF bias, and score gate intact.
+        simple_fast_entry=False,
         # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
         # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
         atr_compress_gate=False,
