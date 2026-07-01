@@ -296,6 +296,13 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     FILTER_STATS_LOG_SECS = _env_int("FILTER_STATS_LOG_SECONDS", 300)
     last_filter_stats_log = _time.time()
 
+    # Real balance sync — bots are constructed with a fixed ADAPTIVE_BALANCE
+    # (default $10k) that never reflected the actual exchange account, so
+    # position sizing could exceed real available margin and get rejected
+    # ("available margin too low"). Refresh from the exchange periodically.
+    BALANCE_SYNC_SECS = _env_int("BALANCE_SYNC_SECONDS", 300)
+    last_balance_sync = 0.0  # force an immediate sync on the first loop tick
+
     _HEALTH_EMOJI = {
         "STRONG":   "✅",
         "GOOD":     "🟢",
@@ -446,6 +453,21 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     sym, fs["checked"], fs["passed"],
                     fs["bias_fail"], fs["health_fail"], fs["confidence_fail"],
                 )
+
+        if _time.time() - last_balance_sync >= BALANCE_SYNC_SECS:
+            last_balance_sync = _time.time()
+            try:
+                balances = await okx.fetch_balance()
+                usdt = next((b for b in balances if b.asset == "USDT"), None)
+                real_balance = usdt.free if usdt else 0.0
+                if real_balance and real_balance > 0:
+                    for _sym, (bot, _sf) in bots.items():
+                        bot.account_balance = real_balance
+                    logger.info("[Balance] synced from exchange: %.2f USDT", real_balance)
+                else:
+                    logger.warning("[Balance] exchange returned %.2f — keeping previous value", real_balance)
+            except Exception as e:
+                logger.warning("[Balance] sync failed (non-fatal): %s", e)
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=cfg["interval"])

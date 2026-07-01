@@ -1624,7 +1624,7 @@ class TradingBot:
         sl_dist   = max(t["sl_dist"], 1e-9)
         dir_mult  = 1 if direction == "LONG" else -1
         current_r = ((current_price - entry) * dir_mult) / sl_dist
-        pnl       = (current_price - entry) * dir_mult * t.get("remaining_size", t["size"])
+        pnl       = (current_price - entry) * dir_mult * t.get("remaining_size", t.get("size", 0.0))
 
         health = self.health_calc.calculate(ind_15m, t, current_price)
         level  = self._health_level(health)
@@ -1820,7 +1820,18 @@ class TradingBot:
                 self.state = "SCANNING"
 
         elif not self.position_open and live_size != 0:
-            direction   = "LONG" if live_size > 0 else "SHORT"
+            # BUG FIX: ccxt's unified `contracts` field is UNSIGNED for both
+            # long and short positions (OKX hedge mode reports size as a
+            # positive magnitude regardless of side) — inferring direction
+            # from its sign always resolved to "LONG". Read the actual side
+            # instead: ccxt unified `side` ('long'/'short'), falling back to
+            # OKX's raw `info.posSide`.
+            raw_side = str(
+                (live_position or {}).get("side")
+                or ((live_position or {}).get("info") or {}).get("posSide")
+                or ""
+            ).lower()
+            direction = "SHORT" if raw_side == "short" else "LONG"
             entry_price = float(
                 live_position.get("entryPrice") or live_position.get("entryPx") or 0
             )
