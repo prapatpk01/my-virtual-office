@@ -194,37 +194,33 @@ class MeanReversionStrategy:
 
     def _step5_structure(self, ind: Dict, direction: str) -> bool:
         """
-        CHOCH proxy: divergence_score high (price moved one way but RSI diverges)
+        CHOCH proxy: divergence_score (price moved one way but RSI diverges)
         + structure_score showing nascent reversal.
+        Loosened: divergence threshold 60→50, sweep threshold 30→20.
         """
         divergence_score = ind.get("divergence_score", 50.0)
         structure_score  = ind.get("structure_score", 50.0)
         sweep_score      = ind.get("sweep_score", 0.0)
 
-        # High divergence = price/RSI disagree → reversal signal
         if direction == "LONG":
-            struct_ok = structure_score > 30   # price was depressed, now trying to rise
+            struct_ok = structure_score > 30
         else:
-            struct_ok = structure_score < 70   # price was elevated, now fading
+            struct_ok = structure_score < 70
 
-        return divergence_score > 60 and sweep_score > 30 and struct_ok
+        return divergence_score > 50 and sweep_score > 20 and struct_ok
 
     # ── STEP 6: Momentum Reversal ───────────────────────────────────────────────
 
     def _step6_momentum(self, ind: Dict, direction: str) -> bool:
-        """MACD hist turning + RSI confirming + EMA5 crossing EMA20 direction."""
+        """MACD hist turning + RSI confirming. EMA cross removed (too strict in MR)."""
         macd_hist = ind.get("macd_hist", 0.0)
         rsi       = ind.get("rsi", 50.0)
-        ema5      = ind.get("ema5", 0.0)
-        ema20     = ind.get("ema20", 1.0)
         adx       = ind.get("adx", 25.0)
 
         if direction == "LONG":
-            return (macd_hist > 0 and rsi > 35 and rsi < 55
-                    and ema5 >= ema20 * 0.998 and adx < 25)
+            return macd_hist > 0 and rsi > 30 and rsi < 58 and adx < 28
         else:
-            return (macd_hist < 0 and rsi < 65 and rsi > 45
-                    and ema5 <= ema20 * 1.002 and adx < 25)
+            return macd_hist < 0 and rsi < 70 and rsi > 42 and adx < 28
 
     # ── STEP 7: Candle Quality ────────────────────────────────────────────────
 
@@ -352,7 +348,7 @@ class MeanReversionStrategy:
                        session_adj: int, funding_adj: int, oi_adj: int) -> float:
         """
         Aggregate Step 1-12 results into 0-100 score.
-        Size gate: ≥85→1.0, 75-84→0.80, 70-74→0.50, <70→None (skip)
+        Size gate: ≥85→1.0, 75-84→0.80, 65-74→0.50, <65→None (skip)
         """
         score = 0.0
         for key, weight in self._HEALTH_WEIGHTS.items():
@@ -367,7 +363,7 @@ class MeanReversionStrategy:
     def _size_from_health(health: float) -> Optional[float]:
         if health >= 85: return 1.00
         if health >= 75: return 0.80
-        if health >= 70: return 0.50
+        if health >= 65: return 0.50
         return None  # skip
 
     # ── STEP 14: Stop-Loss Computation ─────────────────────────────────────────

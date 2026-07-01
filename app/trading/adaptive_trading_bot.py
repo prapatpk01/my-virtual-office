@@ -64,50 +64,47 @@ logger = logging.getLogger("adaptive_trading_bot")
 
 ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
     # Strong directional trend — dip-buy / dip-sell entry, lower RSI bar
-    # Lowered health_min 68→63: top-performing state, capture more setups
     "STRONG_TREND": {
         "rsi_long":  (38, 65), "rsi_short": (35, 62),
         "macd_long": "above_signal", "macd_short": "below_signal",
-        "adx_min": 22, "health_min": 63, "confidence_min": 65,
+        "adx_min": 18, "health_min": 63, "confidence_min": 65,
     },
-    # Normal trend — wait for pullback to RSI<45 (dip-buy zone)
-    # Raised health_min 72→77, confidence_min 65→68: 45% WR drag, filter harder
+    # Normal trend — wait for pullback to RSI<55 (dip-buy zone)
+    # Backtest showed 41% WR at 68; raised to 72 for acceptable quality
     "TRENDING": {
         "rsi_long":  (30, 55), "rsi_short": (45, 65),
         "macd_long": "above_signal", "macd_short": "below_signal",
-        "adx_min": 18, "health_min": 77, "confidence_min": 68,
+        "adx_min": 18, "health_min": 72, "confidence_min": 65,
     },
     # Breakout from compression — momentum entry, RSI expansive
     "BREAKOUT": {
         "rsi_long":  (42, 72), "rsi_short": (28, 58),
         "macd_long": "above_zero", "macd_short": "below_zero",
-        "adx_min": 15, "health_min": 72, "confidence_min": 68,
+        "adx_min": 15, "health_min": 66, "confidence_min": 62,
     },
     # Counter-trend reversal — deep OS/OB required
     "REVERSAL": {
         "rsi_long":  (25, 45), "rsi_short": (55, 75),
         "macd_long": "turning_up", "macd_short": "turning_down",
-        "adx_min": 12, "health_min": 75, "confidence_min": 68,
+        "adx_min": 12, "health_min": 68, "confidence_min": 62,
     },
     # Ranging market — mean-revert gates
-    # Raised health_min 72→77: 45% WR, needs tighter filter
     "SIDEWAY": {
         "rsi_long":  (28, 48), "rsi_short": (52, 72),
         "macd_long": "any", "macd_short": "any",
-        "adx_min": 10, "health_min": 77, "confidence_min": 62,
+        "adx_min": 10, "health_min": 65, "confidence_min": 60,
     },
-    # Volatility expansion — very strict entry
+    # Volatility expansion — strict but not excessive
     "HIGH_VOL": {
         "rsi_long":  (35, 55), "rsi_short": (45, 65),
         "macd_long": "above_signal", "macd_short": "below_signal",
-        "adx_min": 22, "health_min": 80, "confidence_min": 72,
+        "adx_min": 18, "health_min": 72, "confidence_min": 65,
     },
     # Trend losing momentum — deeper OS/OB, MACD must be turning
-    # Lowered health_min 78→75: 53% WR decent, slightly more permissive
     "EXHAUSTION": {
         "rsi_long":  (25, 44), "rsi_short": (56, 75),
         "macd_long": "turning_up", "macd_short": "turning_down",
-        "adx_min": 18, "health_min": 75, "confidence_min": 70,
+        "adx_min": 15, "health_min": 68, "confidence_min": 63,
     },
     # Squeeze phase — skip immediately
     "LOW_VOL": {
@@ -310,11 +307,13 @@ class ConfidenceScorer:
         return "SKIP"
 
     def get_size_multiplier(self, score: float) -> float:
-        """Translate confidence level to position size multiplier."""
+        """Translate confidence level to position size multiplier.
+        Floor aligns with lowest conf_min (60) so _layer_filtering is the sole gate.
+        """
         if score >= 85:   return 1.0
         if score >= 75:   return 1.0
-        if score >= 65:   return 0.65
-        return 0.0  # skip
+        if score >= 60:   return 0.65
+        return 0.0  # skip (below all conf_min values)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -358,7 +357,8 @@ class RegimeBiasEngine:
     def allows_long(self, bias: str, market_state: str) -> bool:
         """
         Long allowed when:
-        - Trend/Breakout/Momentum state  → bias BULL or STRONG_BULL
+        - Trend/Breakout/Momentum state  → bias BULL, STRONG_BULL, or NEUTRAL
+          (4H bullish + 1H neutral combined = NEUTRAL is sufficient to enter long)
         - Counter-trend (REVERSAL/EXHAUSTION) → bias BEAR or STRONG_BEAR (reverting up)
         - Mean-revert (SIDEWAY) → always both directions
         """
@@ -366,14 +366,15 @@ class RegimeBiasEngine:
             return True
         if market_state in _COUNTER_TREND_STATES:
             return bias in ("BEAR", "STRONG_BEAR", "NEUTRAL")
-        return bias in ("BULL", "STRONG_BULL")
+        return bias in ("BULL", "STRONG_BULL", "NEUTRAL")
 
     def allows_short(self, bias: str, market_state: str) -> bool:
+        """Short allowed when bias BEAR/STRONG_BEAR/NEUTRAL for trend states."""
         if market_state == "SIDEWAY":
             return True
         if market_state in _COUNTER_TREND_STATES:
             return bias in ("BULL", "STRONG_BULL", "NEUTRAL")
-        return bias in ("BEAR", "STRONG_BEAR")
+        return bias in ("BEAR", "STRONG_BEAR", "NEUTRAL")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -876,32 +877,88 @@ class TradingBot:
         1. Regime Bias allows this direction
         2. Entry Health Score ≥ health_min for this state
         3. Confidence Score ≥ confidence_min for this state
+        Logs a PASS/FAIL breakdown on every rejection.
         """
         bias = self.current_regime_bias
+        thrs = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
 
         # [V8-5] Bias gate
-        if direction == "LONG" and not self.bias_engine.allows_long(bias, market_state):
-            return False
-        if direction == "SHORT" and not self.bias_engine.allows_short(bias, market_state):
-            return False
+        if direction == "LONG":
+            bias_ok = self.bias_engine.allows_long(bias, market_state)
+        else:
+            bias_ok = self.bias_engine.allows_short(bias, market_state)
+
+        # ADX on 1H (same logic as _check_htf_trend_filter — shown for context)
+        adx_1h  = ind_1h.get("adx", 0.0)
+        adx_min = thrs["adx_min"]
+        adx_ok  = adx_1h >= adx_min
+
+        # RSI in target zone
+        rsi = ind_15m.get("rsi", 50.0)
+        if direction == "LONG":
+            rsi_lo, rsi_hi = thrs["rsi_long"]
+        else:
+            rsi_lo, rsi_hi = thrs["rsi_short"]
+        rsi_ok = rsi_lo <= rsi <= rsi_hi
+
+        # MACD mode check
+        macd_hist = ind_15m.get("macd_hist", 0.0)
+        macd      = ind_15m.get("macd", 0.0)
+        macd_sig  = ind_15m.get("macd_signal", 0.0)
+        macd_mode = thrs[f"macd_{direction.lower()}"]
+        if macd_mode == "any":
+            macd_ok = True
+        elif macd_mode == "above_signal":
+            macd_ok = macd > macd_sig
+        elif macd_mode == "below_signal":
+            macd_ok = macd < macd_sig
+        elif macd_mode == "above_zero":
+            macd_ok = macd > 0
+        elif macd_mode == "below_zero":
+            macd_ok = macd < 0
+        elif macd_mode == "turning_up":
+            macd_ok = macd_hist > 0
+        elif macd_mode == "turning_down":
+            macd_ok = macd_hist < 0
+        else:
+            macd_ok = True
 
         # [V8-3] Entry Health
-        health = self.entry_scorer.compute(ind_15m, direction, market_state)
-        thrs   = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
+        health     = self.entry_scorer.compute(ind_15m, direction, market_state)
         health_min = thrs["health_min"]
-        if health < health_min:
-            return False
+        health_ok  = health >= health_min
 
         # [V8-4] Confidence
-        confidence     = self.conf_scorer.compute(ind_15m, ind_1h, direction)
-        conf_min       = thrs["confidence_min"]
-        conf_level     = self.conf_scorer.get_level(confidence)
-        if confidence < conf_min:
+        confidence = self.conf_scorer.compute(ind_15m, ind_1h, direction)
+        conf_min   = thrs["confidence_min"]
+        conf_level = self.conf_scorer.get_level(confidence)
+        conf_ok    = confidence >= conf_min
+
+        passed = bias_ok and health_ok and conf_ok
+
+        if not passed:
+            reasons = []
+            if not bias_ok:   reasons.append("Bias")
+            if not health_ok: reasons.append("Health")
+            if not conf_ok:   reasons.append("Confidence")
+            self._log_event(
+                f"\n{'='*36}\n"
+                f"  ENTRY CHECK ({direction} | {market_state})\n"
+                f"  Bias       : {'PASS' if bias_ok else 'FAIL'} (bias={bias})\n"
+                f"  ADX 1H     : {'PASS' if adx_ok else 'FAIL'} ({adx_1h:.1f}/{adx_min})\n"
+                f"  RSI        : {'PASS' if rsi_ok else 'FAIL'} ({rsi:.1f} [{rsi_lo}-{rsi_hi}])\n"
+                f"  MACD       : {'PASS' if macd_ok else 'FAIL'} (mode={macd_mode})\n"
+                f"  Health     : {'PASS' if health_ok else 'FAIL'} ({health:.0f}/{health_min})\n"
+                f"  Confidence : {'PASS' if conf_ok else 'FAIL'} ({confidence:.0f}/{conf_min})\n"
+                f"  Result     : NO TRADE  Reason: {' + '.join(reasons)}\n"
+                f"{'='*36}",
+                level="debug",
+            )
             return False
 
         # Store for use in sizing and logging
-        self._last_entry_health    = health
-        self._last_confidence      = confidence
+        self._last_entry_health     = health
+        self._last_confidence       = confidence
         self._last_confidence_level = conf_level
         return True
 
@@ -1512,6 +1569,12 @@ class TradingBot:
                 vol_state = self.adaptive_engine.get_atr_volatility_state(
                     atr_4h, self.atr_history)
                 mr_candidate = None
+
+                # Log current state distribution so user can see which state dominates
+                self._log_event(
+                    f"[STATE] {self.current_market_state} | bias={self.current_regime_bias}",
+                    level="debug",
+                )
 
                 # [MR] Try MeanReversion first if enabled
                 if self.enable_mean_reversion and self._mr_strategy:
