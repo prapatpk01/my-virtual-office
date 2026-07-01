@@ -291,6 +291,11 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     COOLDOWN_CHECK_SECS = _env_int("COOLDOWN_CHECK_SECONDS", 300)
     last_cooldown_check = _time.time()
 
+    # Entry-filter rejection summary — INFO level so it's visible without
+    # LOG_LEVEL=DEBUG. Shows which gate (Bias/Health/Confidence) blocks most.
+    FILTER_STATS_LOG_SECS = _env_int("FILTER_STATS_LOG_SECONDS", 900)
+    last_filter_stats_log = _time.time()
+
     _HEALTH_EMOJI = {
         "STRONG":   "✅",
         "GOOD":     "🟢",
@@ -428,6 +433,19 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             for sym, (bot, _sf) in bots.items():
                 if bot.check_cooldown_expiry():
                     logger.info("[Adaptive][%s] COOLDOWN expired (5-min check) → SCANNING", sym)
+
+        if _time.time() - last_filter_stats_log >= FILTER_STATS_LOG_SECS:
+            last_filter_stats_log = _time.time()
+            for sym, (bot, _sf) in bots.items():
+                fs = bot.get_filter_stats()
+                if fs["checked"] == 0:
+                    continue
+                logger.info(
+                    "[FilterStats][%s] checked=%d passed=%d | "
+                    "bias_fail=%d health_fail=%d confidence_fail=%d",
+                    sym, fs["checked"], fs["passed"],
+                    fs["bias_fail"], fs["health_fail"], fs["confidence_fail"],
+                )
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=cfg["interval"])

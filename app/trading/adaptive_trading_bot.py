@@ -666,6 +666,20 @@ class TradingBot:
         self._last_confidence: float      = 0.0
         self._last_confidence_level: str  = "SKIP"
 
+        # Rejection-reason tally for _layer_filtering (INFO-level periodic summary,
+        # so the dominant blocking gate is visible without needing LOG_LEVEL=DEBUG)
+        self._filter_stats: Dict[str, int] = {
+            "checked": 0, "passed": 0,
+            "bias_fail": 0, "health_fail": 0, "confidence_fail": 0,
+        }
+
+    def get_filter_stats(self) -> Dict[str, int]:
+        """Return and reset the rejection-reason tally since last call."""
+        stats = dict(self._filter_stats)
+        for k in self._filter_stats:
+            self._filter_stats[k] = 0
+        return stats
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _log_event(self, msg: str, level: str = "info"):
@@ -954,6 +968,14 @@ class TradingBot:
         conf_ok    = confidence >= conf_min
 
         passed = bias_ok and health_ok and conf_ok
+
+        self._filter_stats["checked"] += 1
+        if passed:
+            self._filter_stats["passed"] += 1
+        else:
+            if not bias_ok:   self._filter_stats["bias_fail"] += 1
+            if not health_ok: self._filter_stats["health_fail"] += 1
+            if not conf_ok:   self._filter_stats["confidence_fail"] += 1
 
         if not passed:
             reasons = []
