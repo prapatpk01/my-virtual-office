@@ -260,14 +260,22 @@ def _htf_dir(ef: pd.Series, es: pd.Series, close: pd.Series,
 
 def _mtf_bias(primary_close: pd.Series, aligned: dict,
               ema_fast: int = 20, ema_slow: int = 50,
-              rsi_period: int = 14, rsi_bull: float = 55.0, rsi_bear: float = 45.0) -> pd.Series:
-    """Composite MTF bias −100…+100."""
+              rsi_period: int = 14, rsi_bull: float = 55.0, rsi_bear: float = 45.0,
+              include_primary: bool = True) -> pd.Series:
+    """Composite MTF bias −100…+100.
+
+    include_primary=False drops the primary (15m) vote so the bias reflects only
+    the higher timeframes (1h+4h) — a cleaner directional gate without 15m noise
+    (the 15m TF is already filtered separately by the ADX/score/MACD gates).
+    """
     def _vote(s: pd.Series) -> pd.Series:
         ef, es, r = _ema(s, ema_fast), _ema(s, ema_slow), _rsi(s, rsi_period)
         v = (np.where(s > ef, 1, -1) + np.where(ef > es, 1, -1) +
              np.where(r > rsi_bull, 1, np.where(r < rsi_bear, -1, 0)))
         return pd.Series(v, index=s.index)
-    votes = [_vote(primary_close)] + [_vote(c) for c in aligned.values()]
+    votes = [_vote(c) for c in aligned.values()]
+    if include_primary:
+        votes = [_vote(primary_close)] + votes
     return (sum(votes) / len(votes)) / 3.0 * 100.0
 
 
@@ -653,17 +661,27 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
             ema20_1h = _hma(df1h["close"], 20).reindex(out.index, method="ffill")
         else:
             ema20_1h = ef1
+        # Pullback proximity reference. Default uses the last CLOSED 1H bar
+        # (h1_close), which is stale for up to ~1h — an intra-hour dip-and-bounce
+        # to the 1H EMA20 isn't seen until the 1H bar closes near it, so a fresh
+        # pullback entry can lag up to 45 min. pullback_live_15m=True compares the
+        # LIVE 15m close/low/high against the 1H EMA20 instead, re-evaluating the
+        # zone every 15m so intra-hour touches are caught immediately.
+        _live = bool(p.get("pullback_live_15m", False))
+        _px   = out["close"] if _live else out["h1_close"]
+        _lo   = out["low"]   if _live else out["h1_low"]
+        _hi   = out["high"]  if _live else out["h1_high"]
         pullback_atr_mult = float(p.get("pullback_atr_mult_fast", 1.2))
         if pullback_atr_mult > 0:
             # ATR-based: adaptive to volatility (BTC 1H ATR ~$600-1k; 1.2× ~ $720-1.2k)
             h1_atr = _atr(df1h, 14).shift(1)  # shift 1 bar: no-lookahead
             atr_1h = h1_atr.reindex(out.index, method="ffill").bfill()
-            near_ema = (out["h1_close"] - ema20_1h).abs() <= atr_1h * pullback_atr_mult
+            near_ema = (_px - ema20_1h).abs() <= atr_1h * pullback_atr_mult
         else:
             pullback_pct = p["pullback_pct_fast"]
-            near_ema = (out["h1_close"] - ema20_1h).abs() / ema20_1h <= pullback_pct
-        wick_bounce_l = (out["h1_low"]  <= ema20_1h * 1.003) & (out["h1_close"] > ema20_1h)
-        wick_reject_s = (out["h1_high"] >= ema20_1h * 0.997) & (out["h1_close"] < ema20_1h)
+            near_ema = (_px - ema20_1h).abs() / ema20_1h <= pullback_pct
+        wick_bounce_l = (_lo <= ema20_1h * 1.003) & (_px > ema20_1h)
+        wick_reject_s = (_hi >= ema20_1h * 0.997) & (_px < ema20_1h)
         at_pull_long  = near_ema | wick_bounce_l
         at_pull_short = near_ema | wick_reject_s
     else:
@@ -683,7 +701,8 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
 
     # ── Layer 4: MTF composite bias (mode-specific gate) ─────────────────────
     bias_gate = p["bias_gate_fast"] if fast_mode else p["bias_gate"]
-    comp_pct = _mtf_bias(out["close"], {"1h": out["h1_close"], "4h": out["h4_close"]})
+    comp_pct = _mtf_bias(out["close"], {"1h": out["h1_close"], "4h": out["h4_close"]},
+                         include_primary=not bool(p.get("bias_htf_only", False)))
     out["comp_pct"] = comp_pct
     long_bias_ok  = comp_pct > bias_gate
     short_bias_ok = comp_pct < -bias_gate
@@ -1240,6 +1259,12 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Score-Primary Entry (experimental): ADX-only hard gate, score fully decides
         # direction/momentum/structure. Distinct from simple_fast_entry — see _compute().
         score_primary_entry=False,
+        # Pullback timing granularity: compare the LIVE 15m close vs 1H EMA20 instead
+        # of the stale last-closed 1H bar — catches intra-hour dip-and-bounce touches
+        # up to 45 min sooner. Experimental; A/B tested before enabling in production.
+        pullback_live_15m=False,
+        # MTF bias source: exclude the noisy 15m self-vote, use 1h+4h only. Experimental.
+        bias_htf_only=False,
         # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
         # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
         atr_compress_gate=False,
