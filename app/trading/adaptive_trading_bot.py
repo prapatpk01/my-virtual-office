@@ -822,6 +822,25 @@ class TradingBot:
         score += self._scale_score(ind.get("vol_score",         50), 15)
         return float(np.clip(score, 0, 100))
 
+    # ── Lightweight cooldown check — independent of new-candle ticks ─────────
+
+    def check_cooldown_expiry(self, now: Optional[datetime.datetime] = None) -> bool:
+        """
+        Check if COOLDOWN has expired without waiting for the next 15m candle
+        close (on_tick only runs per-bar, so cooldown could sit expired for
+        up to 15 minutes otherwise). Called every 5 min by the runner.
+        Returns True if the state transitioned to SCANNING.
+        """
+        if self.state != "COOLDOWN":
+            return False
+        _now = now or datetime.datetime.now(datetime.timezone.utc)
+        if self.cooldown_until is None or _now >= self.cooldown_until:
+            self.state       = "SCANNING"
+            self.loss_streak = 0
+            self._log_event("Cooldown expired → SCANNING (5-min check)")
+            return True
+        return False
+
     # ── Step 3: Global gates ──────────────────────────────────────────────────
 
     def _check_global_gates(self) -> bool:

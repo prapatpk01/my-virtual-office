@@ -285,6 +285,12 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     last_ind_cache:  dict = {sym: {}  for sym in symbols}
     last_price_cache: dict = {sym: 0.0 for sym in symbols}
 
+    # Cooldown expiry check — independent of new-candle ticks (on_tick only
+    # runs per closed 15m bar, so without this a cooldown could sit expired
+    # for up to 15 min before the bot resumes SCANNING). Default: every 5 min.
+    COOLDOWN_CHECK_SECS = _env_int("COOLDOWN_CHECK_SECONDS", 300)
+    last_cooldown_check = _time.time()
+
     _HEALTH_EMOJI = {
         "STRONG":   "✅",
         "GOOD":     "🟢",
@@ -416,6 +422,12 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 raise
             except Exception as e:
                 logger.error("[Adaptive][%s] tick error: %s", sym, e, exc_info=True)
+
+        if _time.time() - last_cooldown_check >= COOLDOWN_CHECK_SECS:
+            last_cooldown_check = _time.time()
+            for sym, (bot, _sf) in bots.items():
+                if bot.check_cooldown_expiry():
+                    logger.info("[Adaptive][%s] COOLDOWN expired (5-min check) → SCANNING", sym)
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=cfg["interval"])
