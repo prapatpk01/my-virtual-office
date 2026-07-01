@@ -983,28 +983,18 @@ class TradingBot:
         # ── TP levels ────────────────────────────────────────────────────────
         mult = 1 if direction == "LONG" else -1
 
-        if mr_signal is not None:
-            # MeanReversion TP: 1R/2R/3R with configurable close fractions
-            tc    = mr_signal["tp_config"]
-            tp1   = float(tc["tp1"])
-            tp2   = float(tc["tp2"])
-            tp3   = float(tc["tp3"])
-            tp1_pct = float(tc.get("tp1_pct", 0.30))
-            tp2_pct = float(tc.get("tp2_pct", 0.40))
-            trail_atr = float(tc.get("trail_atr_mult", 2.0))
-        else:
-            # SwingReversalPro TP: 0.7R / 2.0R (no TP3)
-            tp1 = entry_price + sl_dist * 0.7 * mult
-            tp2 = entry_price + sl_dist * 2.0 * mult
-            tp3 = None
-            tp1_pct = self.tp1_close_pct   # default 0.50
-            tp2_pct = 1.0
-            trail_atr = 2.0
+        # Unified TP: TP1=0.7R/50%, TP2=1.5R/100% for all strategies
+        tp1 = entry_price + sl_dist * 0.7 * mult
+        tp2 = entry_price + sl_dist * 1.5 * mult
+        tp3 = None
+        tp1_pct   = self.tp1_close_pct  # 0.50
+        tp2_pct   = 1.0
+        trail_atr = 2.0
 
         strategy_tag = "MeanReversion" if mr_signal else "SwingReversal"
         self._log_event(
             f"[{strategy_tag}] OPEN {direction} entry={entry_price:.4f} "
-            f"sl={pattern_sl:.4f} tp1={tp1:.4f} tp2={tp2:.4f} "
+            f"sl={pattern_sl:.4f} tp1={tp1:.4f}(0.7R) tp2={tp2:.4f}(1.5R) "
             f"size×{size_mult:.2f} health={health:.0f}"
         )
 

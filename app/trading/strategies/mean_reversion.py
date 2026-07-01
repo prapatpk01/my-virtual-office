@@ -4,10 +4,9 @@ Mean Reversion Strategy — 18-step signal generator
 Designed for: SIDEWAY / EXHAUSTION / LOW_VOL (Compression) market states.
 Forbidden in: TRENDING / STRONG_TREND / BREAKOUT / HIGH_VOL
 
-TP structure (different from SwingReversalPro):
-  TP1 = 1R  → close 30%  → SL to Break-Even
-  TP2 = 2R  → close 40%
-  TP3 = 3R / EMA20 / VWAP → close remaining 30% (runner, ATR×2 trail)
+TP structure (same as SwingReversalPro):
+  TP1 = 0.7R → close 50% → SL to Break-Even
+  TP2 = 1.5R → close remaining 50%
 
 SL = max(ATR×1.5, sweep_low/high)
 
@@ -505,18 +504,9 @@ class MeanReversionStrategy:
             sl_dist = abs(entry_price - sl_price)
             mult    = 1 if direction == "LONG" else -1
 
-            # TP targets
-            ema20  = ind_15m.get("ema20", entry_price)
-            ema50  = ind_15m.get("ema50", ema20)
-            tp1    = entry_price + sl_dist * 1.0 * mult
-            tp2    = entry_price + sl_dist * 2.0 * mult
-            # TP3: mean reversion target = EMA20 or 3R, whichever is closer
-            tp3_ema = ema20
-            tp3_3r  = entry_price + sl_dist * 3.0 * mult
-            if direction == "LONG":
-                tp3 = min(tp3_ema, tp3_3r) if tp3_ema > tp1 else tp3_3r
-            else:
-                tp3 = max(tp3_ema, tp3_3r) if tp3_ema < tp1 else tp3_3r
+            # TP targets — unified with SwingReversal: TP1=0.7R/50%, TP2=1.5R/100%
+            tp1 = entry_price + sl_dist * 0.7 * mult
+            tp2 = entry_price + sl_dist * 1.5 * mult
 
             step_notes = [
                 f"regime={regime_count}/7({','.join(regime_passed[:3])})",
@@ -539,11 +529,10 @@ class MeanReversionStrategy:
                 "health_score": health,
                 "size_mult":  size_mult,
                 "tp_config": {
-                    "tp1":       tp1, "tp1_pct": 0.30,   # close 30% at TP1
-                    "tp2":       tp2, "tp2_pct": 0.40,   # close 40% at TP2
-                    "tp3":       tp3, "tp3_pct": 1.00,   # close runner at TP3
-                    "tp1_r":     1.0, "tp2_r": 2.0, "tp3_r": 3.0,
-                    "trail_atr_mult": 2.0,                # ATR×2 trail for runner
+                    "tp1":    tp1, "tp1_pct": 0.50,   # close 50% at 0.7R
+                    "tp2":    tp2, "tp2_pct": 1.00,   # close 100% at 1.5R
+                    "tp1_r":  0.7, "tp2_r":   1.5,
+                    "trail_atr_mult": 2.0,
                 },
                 "step_notes": step_notes,
                 # Step 18: Trade Journal metadata
@@ -563,8 +552,8 @@ class MeanReversionStrategy:
                     "entry_health":  health,
                     "bb_upper":      self._bb_bounds(ind_15m)[0],
                     "bb_lower":      self._bb_bounds(ind_15m)[1],
-                    "ema20_dist_atr": abs(entry_price - ema20) / max(ind_15m.get("atr", 1), 1e-9),
-                    "vwap_dist_atr":  abs(entry_price - ema50) / max(ind_15m.get("atr", 1), 1e-9),
+                    "ema20_dist_atr": abs(entry_price - ind_15m.get("ema20", entry_price)) / max(ind_15m.get("atr", 1), 1e-9),
+                    "vwap_dist_atr":  abs(entry_price - ind_15m.get("ema50", entry_price)) / max(ind_15m.get("atr", 1), 1e-9),
                     "rsi":            ind_15m.get("rsi"),
                     "macd_hist":      ind_15m.get("macd_hist"),
                     "adx":            ind_15m.get("adx"),
