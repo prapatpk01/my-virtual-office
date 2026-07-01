@@ -58,60 +58,22 @@ logger = logging.getLogger("adaptive_trading_bot")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# [V8-2] ADAPTIVE THRESHOLDS  — per 8-state market
-# RSI, MACD mode, ADX min, health min  (direction gates applied separately by Regime Bias)
+# [V9] ADAPTIVE THRESHOLDS — per 8-state market
+# rsi_long/rsi_short feed EntryHealthScorer's RSI sub-component.
+# total_min is the SINGLE gate on the unified 0-100 signal score (see
+# TradingBot._generate_signal) — replaces the old stacked
+# bias/adx/health/confidence AND-chain with one composite threshold.
 # ──────────────────────────────────────────────────────────────────────────────
 
 ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
-    # Strong directional trend — dip-buy / dip-sell entry, lower RSI bar
-    "STRONG_TREND": {
-        "rsi_long":  (38, 65), "rsi_short": (35, 62),
-        "macd_long": "above_signal", "macd_short": "below_signal",
-        "adx_min": 18, "health_min": 63, "confidence_min": 65,
-    },
-    # Normal trend — wait for pullback to RSI<55 (dip-buy zone)
-    # Backtest showed 41% WR at 68; raised to 72 for acceptable quality
-    "TRENDING": {
-        "rsi_long":  (30, 55), "rsi_short": (45, 65),
-        "macd_long": "above_signal", "macd_short": "below_signal",
-        "adx_min": 18, "health_min": 72, "confidence_min": 65,
-    },
-    # Breakout from compression — momentum entry, RSI expansive
-    "BREAKOUT": {
-        "rsi_long":  (42, 72), "rsi_short": (28, 58),
-        "macd_long": "above_zero", "macd_short": "below_zero",
-        "adx_min": 15, "health_min": 66, "confidence_min": 62,
-    },
-    # Counter-trend reversal — deep OS/OB required
-    "REVERSAL": {
-        "rsi_long":  (25, 45), "rsi_short": (55, 75),
-        "macd_long": "turning_up", "macd_short": "turning_down",
-        "adx_min": 12, "health_min": 68, "confidence_min": 62,
-    },
-    # Ranging market — mean-revert gates
-    "SIDEWAY": {
-        "rsi_long":  (28, 48), "rsi_short": (52, 72),
-        "macd_long": "any", "macd_short": "any",
-        "adx_min": 10, "health_min": 65, "confidence_min": 60,
-    },
-    # Volatility expansion — strict but not excessive
-    "HIGH_VOL": {
-        "rsi_long":  (35, 55), "rsi_short": (45, 65),
-        "macd_long": "above_signal", "macd_short": "below_signal",
-        "adx_min": 18, "health_min": 72, "confidence_min": 65,
-    },
-    # Trend losing momentum — deeper OS/OB, MACD must be turning
-    "EXHAUSTION": {
-        "rsi_long":  (25, 44), "rsi_short": (56, 75),
-        "macd_long": "turning_up", "macd_short": "turning_down",
-        "adx_min": 15, "health_min": 68, "confidence_min": 63,
-    },
-    # Squeeze phase — skip immediately
-    "LOW_VOL": {
-        "rsi_long": (50, 50), "rsi_short": (50, 50),
-        "macd_long": "any", "macd_short": "any",
-        "adx_min": 999, "health_min": 999, "confidence_min": 999,
-    },
+    "STRONG_TREND": {"rsi_long": (38, 65), "rsi_short": (35, 62), "total_min": 55},
+    "TRENDING":     {"rsi_long": (30, 55), "rsi_short": (45, 65), "total_min": 62},
+    "BREAKOUT":     {"rsi_long": (42, 72), "rsi_short": (28, 58), "total_min": 55},
+    "REVERSAL":     {"rsi_long": (25, 45), "rsi_short": (55, 75), "total_min": 58},
+    "SIDEWAY":      {"rsi_long": (28, 48), "rsi_short": (52, 72), "total_min": 62},
+    "HIGH_VOL":     {"rsi_long": (35, 55), "rsi_short": (45, 65), "total_min": 62},
+    "EXHAUSTION":   {"rsi_long": (25, 44), "rsi_short": (56, 75), "total_min": 58},
+    "LOW_VOL":      {"rsi_long": (50, 50), "rsi_short": (50, 50), "total_min": 999},
 }
 
 # States the bot will trade in — LOW_VOL skipped entirely
@@ -226,16 +188,6 @@ class EntryHealthScorer:
 
         return float(np.clip(score, 0, 100))
 
-    def breakdown(self, ind: Dict, direction: str, market_state: str) -> Dict:
-        """Return per-component breakdown for logging."""
-        return {
-            "health": round(self.compute(ind, direction, market_state), 1),
-            "ema":  round(ind.get("ema5", 0), 2),
-            "adx":  round(ind.get("adx", 0), 1),
-            "rsi":  round(ind.get("rsi", 50), 1),
-            "macd": round(ind.get("macd_hist", 0), 4),
-        }
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # [V8-4] CONFIDENCE SCORER
@@ -244,85 +196,24 @@ class EntryHealthScorer:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ConfidenceScorer:
-    """Compute a 0-100 directional confidence score."""
-
-    LEVELS = [
-        (95, "STRONG_BUY"),
-        (85, "BUY"),
-        (75, "NORMAL"),
-        (65, "WEAK"),
-        (0,  "SKIP"),
-    ]
-
-    def compute(self, ind_15m: Dict, ind_1h: Dict, direction: str) -> float:
-        score = 0.0
-        long = direction == "LONG"
-
-        # — Trend alignment 4H (20 pts) —
-        ema5_1h  = ind_1h.get("ema5",  0.0)
-        ema20_1h = ind_1h.get("ema20", 1.0)
-        slope_1h = ind_1h.get("ema20_slope_score", 50.0)
-        if long:
-            trend_s = 100.0 if ema5_1h > ema20_1h and slope_1h > 52 else \
-                      65.0 if ema5_1h > ema20_1h else 20.0
-        else:
-            trend_s = 100.0 if ema5_1h < ema20_1h and slope_1h < 48 else \
-                      65.0 if ema5_1h < ema20_1h else 20.0
-        score += trend_s * 0.20
-
-        # — Momentum 15M (20 pts) —
-        rsi      = ind_15m.get("rsi", 50.0)
-        mom_s_raw = ind_15m.get("momentum_score", 50.0)
-        if long:
-            rsi_ok   = rsi < 60
-            mom_ok   = mom_s_raw > 50
-        else:
-            rsi_ok   = rsi > 40
-            mom_ok   = mom_s_raw < 50
-        mom_s = 100.0 if (rsi_ok and mom_ok) else 55.0 if (rsi_ok or mom_ok) else 15.0
-        score += mom_s * 0.20
-
-        # — Volume (15 pts) —
-        vol_score = ind_15m.get("volume_score", 50.0)
-        score += float(np.clip(vol_score, 0, 100)) * 0.15
-
-        # — Volatility (15 pts) — ATR in healthy range (not too low, not extreme)
-        atr_score = ind_15m.get("atr_score", 50.0)
-        score += float(np.clip(atr_score, 0, 100)) * 0.15
-
-        # — Structure (15 pts) —
-        struct_score = ind_15m.get("structure_score", 50.0)
-        score += float(np.clip(struct_score, 0, 100)) * 0.15
-
-        # — Pattern (15 pts) —
-        pattern_score = ind_15m.get("pattern_score", 50.0)
-        score += float(np.clip(pattern_score, 0, 100)) * 0.15
-
-        return float(np.clip(score, 0, 100))
-
-    def get_level(self, score: float) -> str:
-        for threshold, label in self.LEVELS:
-            if score >= threshold:
-                return label
-        return "SKIP"
+    """Position-sizing lookup from the unified signal score (0-100)."""
 
     def get_size_multiplier(self, score: float) -> float:
-        """Translate confidence level to position size multiplier.
-        Floor aligns with lowest conf_min (60) so _layer_filtering is the sole gate.
-        """
         if score >= 85:   return 1.0
         if score >= 75:   return 1.0
         if score >= 60:   return 0.65
-        return 0.0  # skip (below all conf_min values)
+        return 0.0  # skip — below all state total_min values
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# [V8-5] REGIME BIAS ENGINE — 5-level macro direction from 4H + 1H
+# [V8-5] REGIME BIAS ENGINE — 5-level macro direction label from 4H + 1H
 # STRONG_BULL / BULL / NEUTRAL / BEAR / STRONG_BEAR
+# Descriptive only (status/logging) — direction compatibility for entries is
+# decided by TradingBot._direction_fit using the continuous regime score.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class RegimeBiasEngine:
-    """5-level directional bias from 4H and 1H trend structure."""
+    """5-level directional bias label from 4H and 1H trend structure."""
 
     def compute(self, ind_4h: Dict, ind_1h: Dict) -> str:
         score = 0
@@ -353,28 +244,6 @@ class RegimeBiasEngine:
         if score >= -1:   return "NEUTRAL"
         if score >= -4:   return "BEAR"
         return "STRONG_BEAR"
-
-    def allows_long(self, bias: str, market_state: str) -> bool:
-        """
-        Long allowed when:
-        - Trend/Breakout/Momentum state  → bias BULL, STRONG_BULL, or NEUTRAL
-          (4H bullish + 1H neutral combined = NEUTRAL is sufficient to enter long)
-        - Counter-trend (REVERSAL/EXHAUSTION) → bias BEAR or STRONG_BEAR (reverting up)
-        - Mean-revert (SIDEWAY) → always both directions
-        """
-        if market_state == "SIDEWAY":
-            return True
-        if market_state in _COUNTER_TREND_STATES:
-            return bias in ("BEAR", "STRONG_BEAR", "NEUTRAL")
-        return bias in ("BULL", "STRONG_BULL", "NEUTRAL")
-
-    def allows_short(self, bias: str, market_state: str) -> bool:
-        """Short allowed when bias BEAR/STRONG_BEAR/NEUTRAL for trend states."""
-        if market_state == "SIDEWAY":
-            return True
-        if market_state in _COUNTER_TREND_STATES:
-            return bias in ("BULL", "STRONG_BULL", "NEUTRAL")
-        return bias in ("BEAR", "STRONG_BEAR", "NEUTRAL")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -655,19 +524,22 @@ class TradingBot:
         self._last_candle_15m: Dict    = {}
         self._log: List[str]           = []
 
-        # Strategy instances
+        # Strategy instances — unified pipeline uses _mr_strategy's step methods
+        # for mean-revert-state entry scoring regardless of either flag; the
+        # flags now only gate whether entries happen at all (legacy on/off knobs).
         self.enable_swing_reversal  = enable_swing_reversal
         self.enable_mean_reversion  = enable_mean_reversion
-        self._mr_strategy           = MeanReversionStrategy() if enable_mean_reversion else None
-        self._pending_signal: Optional[Dict] = None   # signal from MR strategy pending order
+        self._entries_enabled       = enable_swing_reversal or enable_mean_reversion
+        self._mr_strategy           = MeanReversionStrategy()
+        self._pending_signal: Optional[Dict] = None   # signal from unified engine pending order
 
         # Last computed scores (for health report / logging)
         self._last_entry_health: float    = 0.0
         self._last_confidence: float      = 0.0
         self._last_confidence_level: str  = "SKIP"
 
-        # Rejection-reason tally for _layer_filtering (INFO-level periodic summary,
-        # so the dominant blocking gate is visible without needing LOG_LEVEL=DEBUG)
+        # Rejection-reason tally for _generate_signal (INFO-level periodic summary,
+        # so the dominant blocking component is visible without needing LOG_LEVEL=DEBUG)
         self._filter_stats: Dict[str, int] = {
             "checked": 0, "passed": 0,
             "bias_fail": 0, "health_fail": 0, "confidence_fail": 0,
@@ -836,6 +708,160 @@ class TradingBot:
         score += self._scale_score(ind.get("vol_score",         50), 15)
         return float(np.clip(score, 0, 100))
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # [V9] UNIFIED SIGNAL PIPELINE — 4H regime → 1H context → 15M entry
+    # Replaces the old stacked bias/adx/health/confidence AND-gates with one
+    # composite 0-100 score per candidate direction, gated by a single
+    # `total_min` per market state (ADAPTIVE_THRESHOLDS). MeanReversion and
+    # SwingReversal are folded into one path — the market state alone decides
+    # which entry-scoring style applies (mean-revert vs trend-follow), not a
+    # separate strategy toggle.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # States where price is expected to revert to the mean rather than trend
+    _MR_STATES: frozenset = frozenset({"SIDEWAY", "EXHAUSTION", "REVERSAL"})
+
+    def _regime_direction(self, ind_4h: Dict) -> float:
+        """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
+        ema5  = ind_4h.get("ema5", 0.0)
+        ema20 = ind_4h.get("ema20", 1.0)
+        slope = ind_4h.get("ema20_slope_score", 50.0)
+        rsi   = ind_4h.get("rsi", 50.0)
+
+        d  = 40.0 * float(np.clip((ema5 - ema20) / max(abs(ema20), 1e-9) * 200, -1, 1))
+        d += 30.0 * float(np.clip((slope - 50.0) / 25.0, -1, 1))
+        d += 30.0 * float(np.clip((rsi - 50.0) / 25.0, -1, 1))
+        return float(np.clip(d, -100, 100))
+
+    def _context_score(self, ind_1h: Dict, direction: str) -> Dict:
+        """1H context — does the mid timeframe support the candidate direction?"""
+        adx      = ind_1h.get("adx", 0.0)
+        rsi      = ind_1h.get("rsi", 50.0)
+        ema5     = ind_1h.get("ema5", 0.0)
+        ema20    = ind_1h.get("ema20", 1.0)
+        macd     = ind_1h.get("macd", 0.0)
+        macd_sig = ind_1h.get("macd_signal", 0.0)
+
+        h_dir  = 50.0 * float(np.clip((ema5 - ema20) / max(abs(ema20), 1e-9) * 200, -1, 1))
+        h_dir += 50.0 * float(np.clip((rsi - 50.0) / 25.0, -1, 1))
+        h_dir  = float(np.clip(h_dir, -100, 100))
+
+        dir_mult    = 1 if direction == "LONG" else -1
+        support     = h_dir * dir_mult   # positive = 1H leans same way as candidate
+        momentum_ok = (macd > macd_sig) if direction == "LONG" else (macd < macd_sig)
+
+        score  = float(np.clip(50.0 + support / 2.0, 0, 100)) * 0.60
+        score += (100.0 if momentum_ok else 30.0) * 0.20
+        score += float(np.clip(adx / 30.0 * 100, 0, 100)) * 0.20
+        return {"score": float(np.clip(score, 0, 100)), "direction": h_dir}
+
+    def _direction_fit(self, market_state: str, regime_direction: float, direction: str) -> float:
+        """
+        0-100 score for whether the candidate direction fits the 4H regime:
+        trend states want agreement, counter-trend states (REVERSAL/EXHAUSTION)
+        want the opposite (fading an exhausted move), SIDEWAY has no bias.
+        """
+        if market_state == "SIDEWAY":
+            return 70.0
+        dir_mult = 1 if direction == "LONG" else -1
+        agree = regime_direction * dir_mult
+        if market_state in _COUNTER_TREND_STATES:
+            agree = -agree
+        return float(np.clip(50.0 + agree / 2.0, 0, 100))
+
+    def _entry_score(self, ind_15m: Dict, candle_15m: Dict, direction: str,
+                     market_state: str) -> Dict:
+        """15M entry trigger — mean-revert scoring for ranging/exhausted states,
+        trend-follow (EntryHealthScorer) scoring otherwise. Returns {score, sl_price}."""
+        if market_state in self._MR_STATES:
+            mr = self._mr_strategy
+            ext_ok    = mr._step3_overextension(ind_15m, candle_15m, direction)
+            sweep_ok  = mr._step4_sweep(ind_15m, candle_15m, direction)
+            struct_ok = mr._step5_structure(ind_15m, direction)
+            mom_ok    = mr._step6_momentum(ind_15m, direction)
+            candle_ok = mr._step7_candle(candle_15m, direction)
+            vol_ok    = mr._step8_volume(ind_15m)
+            score = (
+                (100.0 if ext_ok    else 0.0) * 0.25 +
+                (100.0 if sweep_ok  else 0.0) * 0.20 +
+                (100.0 if struct_ok else 0.0) * 0.20 +
+                (100.0 if mom_ok    else 0.0) * 0.20 +
+                (100.0 if candle_ok else 0.0) * 0.10 +
+                (100.0 if vol_ok    else 0.0) * 0.05
+            )
+            sl_price, _method = mr._step14_sl(ind_15m, candle_15m, direction)
+            return {"score": float(np.clip(score, 0, 100)), "sl_price": sl_price}
+
+        score = self.entry_scorer.compute(ind_15m, direction, market_state)
+        entry_price = float(candle_15m.get("close", 0.0))
+        if direction == "LONG":
+            sl_price = candle_15m.get("pattern_low", entry_price * 0.99)
+        else:
+            sl_price = candle_15m.get("pattern_high", entry_price * 1.01)
+        return {"score": score, "sl_price": sl_price}
+
+    def _generate_signal(self, direction: str, candle_15m: Dict, ind_15m: Dict,
+                         ind_1h: Dict, ind_4h: Dict, market_state: str,
+                         regime_direction: float) -> Optional[Dict]:
+        """
+        Combine 4H regime fit + 1H context + 15M entry into one 0-100 score,
+        gated by the state's total_min. Tallies rejection reasons for
+        get_filter_stats() diagnostics.
+        """
+        thrs = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
+
+        entry = self._entry_score(ind_15m, candle_15m, direction, market_state)
+        ctx   = self._context_score(ind_1h, direction)
+        fit   = self._direction_fit(market_state, regime_direction, direction)
+
+        total = entry["score"] * 0.40 + ctx["score"] * 0.30 + fit * 0.30
+        total_min = thrs["total_min"]
+
+        self._filter_stats["checked"] += 1
+        if total >= total_min:
+            self._filter_stats["passed"] += 1
+        else:
+            # Attribute the rejection to whichever component is weakest,
+            # keeping the bias/health/confidence tally names for continuity.
+            # Every rejection lands in at least one bucket: if none of the
+            # three components is individually weak enough to trip its own
+            # threshold, the total still failed on aggregate, so attribute
+            # to the single lowest-scoring component instead of dropping it.
+            attributed = False
+            if fit < 40:            self._filter_stats["bias_fail"] += 1;       attributed = True
+            if entry["score"] < 50: self._filter_stats["health_fail"] += 1;     attributed = True
+            if ctx["score"] < 50:   self._filter_stats["confidence_fail"] += 1; attributed = True
+            if not attributed:
+                lowest = min(("bias_fail", fit), ("health_fail", entry["score"]),
+                             ("confidence_fail", ctx["score"]), key=lambda kv: kv[1])
+                self._filter_stats[lowest[0]] += 1
+            self._log_event(
+                f"\n{'='*36}\n"
+                f"  ENTRY CHECK ({direction} | {market_state})\n"
+                f"  Regime Fit : {fit:.0f}/100 (regime_dir={regime_direction:.0f})\n"
+                f"  1H Context : {ctx['score']:.0f}/100\n"
+                f"  15M Entry  : {entry['score']:.0f}/100\n"
+                f"  Total      : {total:.0f} / {total_min}\n"
+                f"  Result     : NO TRADE\n"
+                f"{'='*36}",
+                level="debug",
+            )
+            return None
+
+        entry_type = _STATE_ENTRY_TYPE.get(market_state, "trend_follow")
+        return {
+            "direction":        direction,
+            "sl_price":         entry["sl_price"],
+            "health_score":     entry["score"],
+            "confidence_score": (ctx["score"] + fit) / 2.0,
+            "total_score":      total,
+            "entry_score":      entry["score"],
+            "context_score":    ctx["score"],
+            "direction_fit":    fit,
+            "entry_type":       entry_type,
+            "strategy":         "Adaptive",
+        }
+
     # ── Lightweight cooldown check — independent of new-candle ticks ─────────
 
     def check_cooldown_expiry(self, now: Optional[datetime.datetime] = None) -> bool:
@@ -901,149 +927,23 @@ class TradingBot:
 
         return True
 
-    # ── Step 4: FILTERING — [V8-3/V8-4/V8-5] Entry Health + Confidence + Bias ─
-
-    def _layer_filtering(self, direction: str, ind_15m: Dict,
-                         market_state: str, ind_1h: Dict, ind_4h: Dict) -> bool:
-        """
-        Pass all three gates:
-        1. Regime Bias allows this direction
-        2. Entry Health Score ≥ health_min for this state
-        3. Confidence Score ≥ confidence_min for this state
-        Logs a PASS/FAIL breakdown on every rejection.
-        """
-        bias = self.current_regime_bias
-        thrs = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
-
-        # [V8-5] Bias gate
-        if direction == "LONG":
-            bias_ok = self.bias_engine.allows_long(bias, market_state)
-        else:
-            bias_ok = self.bias_engine.allows_short(bias, market_state)
-
-        # ADX on 1H (same logic as _check_htf_trend_filter — shown for context)
-        adx_1h  = ind_1h.get("adx", 0.0)
-        adx_min = thrs["adx_min"]
-        adx_ok  = adx_1h >= adx_min
-
-        # RSI in target zone
-        rsi = ind_15m.get("rsi", 50.0)
-        if direction == "LONG":
-            rsi_lo, rsi_hi = thrs["rsi_long"]
-        else:
-            rsi_lo, rsi_hi = thrs["rsi_short"]
-        rsi_ok = rsi_lo <= rsi <= rsi_hi
-
-        # MACD mode check
-        macd_hist = ind_15m.get("macd_hist", 0.0)
-        macd      = ind_15m.get("macd", 0.0)
-        macd_sig  = ind_15m.get("macd_signal", 0.0)
-        macd_mode = thrs[f"macd_{direction.lower()}"]
-        if macd_mode == "any":
-            macd_ok = True
-        elif macd_mode == "above_signal":
-            macd_ok = macd > macd_sig
-        elif macd_mode == "below_signal":
-            macd_ok = macd < macd_sig
-        elif macd_mode == "above_zero":
-            macd_ok = macd > 0
-        elif macd_mode == "below_zero":
-            macd_ok = macd < 0
-        elif macd_mode == "turning_up":
-            macd_ok = macd_hist > 0
-        elif macd_mode == "turning_down":
-            macd_ok = macd_hist < 0
-        else:
-            macd_ok = True
-
-        # [V8-3] Entry Health
-        health     = self.entry_scorer.compute(ind_15m, direction, market_state)
-        health_min = thrs["health_min"]
-        health_ok  = health >= health_min
-
-        # [V8-4] Confidence
-        confidence = self.conf_scorer.compute(ind_15m, ind_1h, direction)
-        conf_min   = thrs["confidence_min"]
-        conf_level = self.conf_scorer.get_level(confidence)
-        conf_ok    = confidence >= conf_min
-
-        passed = bias_ok and health_ok and conf_ok
-
-        self._filter_stats["checked"] += 1
-        if passed:
-            self._filter_stats["passed"] += 1
-        else:
-            if not bias_ok:   self._filter_stats["bias_fail"] += 1
-            if not health_ok: self._filter_stats["health_fail"] += 1
-            if not conf_ok:   self._filter_stats["confidence_fail"] += 1
-
-        if not passed:
-            reasons = []
-            if not bias_ok:   reasons.append("Bias")
-            if not health_ok: reasons.append("Health")
-            if not conf_ok:   reasons.append("Confidence")
-            self._log_event(
-                f"\n{'='*36}\n"
-                f"  ENTRY CHECK ({direction} | {market_state})\n"
-                f"  Bias       : {'PASS' if bias_ok else 'FAIL'} (bias={bias})\n"
-                f"  ADX 1H     : {'PASS' if adx_ok else 'FAIL'} ({adx_1h:.1f}/{adx_min})\n"
-                f"  RSI        : {'PASS' if rsi_ok else 'FAIL'} ({rsi:.1f} [{rsi_lo}-{rsi_hi}])\n"
-                f"  MACD       : {'PASS' if macd_ok else 'FAIL'} (mode={macd_mode})\n"
-                f"  Health     : {'PASS' if health_ok else 'FAIL'} ({health:.0f}/{health_min})\n"
-                f"  Confidence : {'PASS' if conf_ok else 'FAIL'} ({confidence:.0f}/{conf_min})\n"
-                f"  Result     : NO TRADE  Reason: {' + '.join(reasons)}\n"
-                f"{'='*36}",
-                level="debug",
-            )
-            return False
-
-        # Store for use in sizing and logging
-        self._last_entry_health     = health
-        self._last_confidence       = confidence
-        self._last_confidence_level = conf_level
-        return True
-
-    # ── Step 3.5: 1H trend alignment check ───────────────────────────────────
-
-    def _check_htf_trend_filter(self, direction: str, ind_1h: Dict) -> bool:
-        """Quick 1H EMA alignment — called from FILTERING as secondary gate."""
-        adx_1h   = ind_1h.get("adx", 0)
-        ema5_1h  = ind_1h.get("ema5")
-        ema20_1h = ind_1h.get("ema20")
-
-        thrs = ADAPTIVE_THRESHOLDS.get(
-            self.current_market_state, ADAPTIVE_THRESHOLDS["TRENDING"]
-        )
-        adx_min = thrs["adx_min"]
-
-        if adx_1h < adx_min or ema5_1h is None or ema20_1h is None:
-            return False
-
-        tolerance = ema20_1h * 0.003
-        if direction == "LONG":
-            return ema5_1h >= ema20_1h - tolerance
-        else:
-            return ema5_1h <= ema20_1h + tolerance
-
-    # ── Step 5: Risk engine + [V8-3/V8-4] adaptive sizing ───────────────────
+    # ── Step 5: Risk engine + adaptive sizing ───────────────────────────────
 
     def _step5_risk_engine(self, candle: Dict, direction: str, ind: Dict,
                            mr_signal: Optional[Dict] = None):
         """
-        Compute SL/TP/size and open position.
-        mr_signal: if provided (from MeanReversionStrategy), use its SL price and
-                   tp_config directly instead of the swing reversal defaults.
+        Compute SL/TP/size and open position from the unified signal dict
+        produced by _generate_signal (sl_price, health_score, confidence_score,
+        entry_type, strategy).
         """
+        signal = mr_signal
+        if signal is None:
+            self._log_event("_step5_risk_engine called with no signal — abort", level="error")
+            return
         entry_price = float(candle.get("close", 0))
 
         # ── SL calculation ──────────────────────────────────────────────────
-        if mr_signal is not None:
-            # MeanReversion: use sweep low/high SL from strategy
-            pattern_sl = mr_signal["sl_price"]
-        elif direction == "LONG":
-            pattern_sl = candle.get("pattern_low", entry_price * 0.99)
-        else:
-            pattern_sl = candle.get("pattern_high", entry_price * 1.01)
+        pattern_sl = signal["sl_price"]
 
         sl_dist = abs(entry_price - float(pattern_sl))
         if sl_dist < 1e-8:
@@ -1061,24 +961,17 @@ class TradingBot:
             risk_pct *= 0.80
             self._log_event(f"Win streak {self.win_streak} → risk {risk_pct:.2%}")
 
-        if mr_signal is not None:
-            # MeanReversion: size from health score (Step 13)
-            size_mult  = mr_signal.get("size_mult", 1.0)
-            health     = mr_signal.get("health_score", 0.0)
-            # FIX-#10: use separate confidence_score; fall back to health_score if absent
-            confidence = mr_signal.get("confidence_score", mr_signal.get("health_score", 0.0))
-            entry_type = "mean_revert"
-        else:
-            health     = self._last_entry_health
-            confidence = self._last_confidence
-            conf_mult  = self.conf_scorer.get_size_multiplier(confidence)
-            if conf_mult == 0.0:
-                self._log_event("Confidence too low → skip order", level="warning")
-                return
-            health_mult = 1.0 if health >= 75 else 0.65
-            entry_type  = _STATE_ENTRY_TYPE.get(self.current_market_state, "trend_follow")
-            learning_mult = self.learning_engine.get_weight(entry_type)
-            size_mult   = conf_mult * health_mult * learning_mult
+        health     = signal.get("health_score", 0.0)
+        confidence = signal.get("confidence_score", health)
+        conf_mult  = self.conf_scorer.get_size_multiplier(confidence)
+        if conf_mult == 0.0:
+            self._log_event("Confidence too low → skip order", level="warning")
+            return
+        health_mult   = 1.0 if health >= 75 else 0.65
+        entry_type    = signal.get("entry_type") or _STATE_ENTRY_TYPE.get(
+            self.current_market_state, "trend_follow")
+        learning_mult = self.learning_engine.get_weight(entry_type)
+        size_mult     = conf_mult * health_mult * learning_mult
 
         risk_amount   = self.account_balance * risk_pct * size_mult
         position_size = risk_amount / max(sl_dist, 1e-9)
@@ -1094,7 +987,7 @@ class TradingBot:
         tp2_pct   = 1.0
         trail_atr = 2.0
 
-        strategy_tag = "MeanReversion" if mr_signal else "SwingReversal"
+        strategy_tag = signal.get("strategy", "Adaptive")
         self._log_event(
             f"[{strategy_tag}] OPEN {direction} entry={entry_price:.4f} "
             f"sl={pattern_sl:.4f} tp1={tp1:.4f}(0.7R) tp2={tp2:.4f}(1.5R) "
@@ -1502,48 +1395,6 @@ class TradingBot:
 
     # ── [V8-2] Entry trigger check (adaptive thresholds) ─────────────────────
 
-    def _check_entry_trigger(self, ind: Dict) -> bool:
-        """
-        Confirm entry from WAIT_CONFIRM using Adaptive Thresholds.
-        RSI gate + MACD mode gate per market state.
-        """
-        direction = self.direction_focus
-        if direction is None:
-            return False
-
-        rsi       = ind.get("rsi", 50)
-        macd      = ind.get("macd", 0.0)
-        macd_sig  = ind.get("macd_signal", 0.0)
-        macd_hist = ind.get("macd_hist", macd - macd_sig)
-        momentum  = ind.get("momentum_score", 50)
-
-        thrs = ADAPTIVE_THRESHOLDS.get(
-            self.current_market_state, ADAPTIVE_THRESHOLDS["TRENDING"]
-        )
-
-        if direction == "LONG":
-            lo, hi = thrs["rsi_long"]
-            if not (lo < rsi < hi):
-                return False
-            if momentum <= 50:
-                return False
-            macd_mode = thrs.get("macd_long", "any")
-            if macd_mode == "above_signal"  and macd <= macd_sig:  return False
-            if macd_mode == "above_zero"    and macd <= 0:          return False
-            if macd_mode == "turning_up"    and macd_hist <= 0:     return False
-        else:
-            lo, hi = thrs["rsi_short"]
-            if not (lo < rsi < hi):
-                return False
-            if momentum >= 50:
-                return False
-            macd_mode = thrs.get("macd_short", "any")
-            if macd_mode == "below_signal"  and macd >= macd_sig:  return False
-            if macd_mode == "below_zero"    and macd >= 0:          return False
-            if macd_mode == "turning_down"  and macd_hist >= 0:     return False
-
-        return True
-
     # ── Core tick engine ──────────────────────────────────────────────────────
 
     def on_tick(self, candle_15m: Dict, candle_1h: Dict, candle_4h: Dict,
@@ -1605,97 +1456,72 @@ class TradingBot:
                     state_changed = True
 
             elif self.state == "FILTERING":
-                best_dir: Optional[str]  = None
-                best_health: float       = -1.0
-                vol_state = self.adaptive_engine.get_atr_volatility_state(
-                    atr_4h, self.atr_history)
-                mr_candidate = None
-
                 # Log current state distribution so user can see which state dominates
                 self._log_event(
                     f"[STATE] {self.current_market_state} | bias={self.current_regime_bias}",
                     level="debug",
                 )
 
-                # [MR] Try MeanReversion first if enabled
-                if self.enable_mean_reversion and self._mr_strategy:
-                    mr_candidate = self._mr_strategy.generate_signal(
-                        candle_15m, ind_15m, ind_1h, ind_4h,
-                        self.current_market_state, extras, bar_dt,
-                    )
-                    if mr_candidate:
-                        self._log_event(
-                            f"[MR] {mr_candidate['direction']} health={mr_candidate['health_score']:.0f} "
-                            f"| {' '.join(mr_candidate['step_notes'][:4])}"
-                        )
-
-                # [SR] Try SwingReversal if enabled
-                if self.enable_swing_reversal:
+                best_signal: Optional[Dict] = None
+                if self._entries_enabled:
+                    regime_direction = self._regime_direction(ind_4h)
                     for direction in ("LONG", "SHORT"):
-                        # Quick 1H structural filter
-                        if not self._check_htf_trend_filter(direction, ind_1h):
-                            continue
+                        sig = self._generate_signal(
+                            direction, candle_15m, ind_15m, ind_1h, ind_4h,
+                            self.current_market_state, regime_direction,
+                        )
+                        if sig and (best_signal is None
+                                    or sig["total_score"] > best_signal["total_score"]):
+                            best_signal = sig
 
-                        # [V8-3/4/5] Full health + confidence + bias gate
-                        if not self._layer_filtering(
-                                direction, ind_15m, self.current_market_state,
-                                ind_1h, ind_4h):
-                            continue
-
-                        if self._last_entry_health > best_health:
-                            best_health = self._last_entry_health
-                            best_dir    = direction
-                            best_health_stored   = self._last_entry_health
-                            best_conf_stored     = self._last_confidence
-                            best_conf_lvl_stored = self._last_confidence_level
-
-                if mr_candidate is not None:
-                    # MeanReversion: all 13 steps already validated — skip WAIT_CONFIRM
-                    self._pending_signal = mr_candidate
-                    self.direction_focus = mr_candidate["direction"]
-                    self.state           = "PENDING_ORDER"
-                    state_changed        = True
-                elif best_dir is not None:
-                    self._pending_signal       = None
-                    self._last_entry_health    = best_health_stored
-                    self._last_confidence      = best_conf_stored
-                    self._last_confidence_level = best_conf_lvl_stored
-                    self.direction_focus        = best_dir
-                    self.state                  = "WAIT_CONFIRM"
-                    self.bars_since_trigger     = 0
+                if best_signal is not None:
+                    # Unified signal already validated across all 3 tiers — skip
+                    # WAIT_CONFIRM's redundant re-check and go straight to order.
+                    self._pending_signal        = best_signal
+                    self.direction_focus         = best_signal["direction"]
+                    self._last_entry_health      = best_signal["health_score"]
+                    self._last_confidence        = best_signal["confidence_score"]
+                    self._last_confidence_level  = "PASS"
+                    self.state                   = "PENDING_ORDER"
+                    state_changed                = True
                     self._log_event(
-                        f"Signal: {best_dir} | {self.current_market_state} "
-                        f"| bias={self.current_regime_bias} "
-                        f"| health={best_health:.0f} conf={best_conf_stored:.0f}({best_conf_lvl_stored})"
+                        f"Signal: {best_signal['direction']} | {self.current_market_state} "
+                        f"| total={best_signal['total_score']:.0f} "
+                        f"(entry={best_signal['entry_score']:.0f} "
+                        f"ctx={best_signal['context_score']:.0f} "
+                        f"fit={best_signal['direction_fit']:.0f})"
                     )
-                    state_changed = True
                 else:
                     self._pending_signal = None
                     self.state = "SCANNING"
 
             elif self.state == "WAIT_CONFIRM":
-                if self.bars_since_trigger > 3:
-                    self._log_event("WAIT_CONFIRM timeout → SCANNING")
-                    self.state    = "SCANNING"
-                    state_changed = True
-                    continue
-
-                if self._check_entry_trigger(ind_15m):
-                    self.state    = "PENDING_ORDER"
-                    state_changed = True
-                else:
-                    self.bars_since_trigger += 1
+                # Legacy state — the unified signal pipeline always produces a
+                # pre-validated signal in FILTERING and skips this state. Kept
+                # only so a state file saved before this rewrite resumes safely
+                # instead of crashing on the old confirmation logic.
+                self.state    = "PENDING_ORDER"
+                state_changed = True
 
             elif self.state == "PENDING_ORDER":
-                self._step5_risk_engine(
-                    candle_15m, self.direction_focus, ind_15m,
-                    mr_signal=self._pending_signal,
-                )
-                self._pending_signal = None  # consumed
-                if self.position_open:
-                    self.state = "IN_POSITION"
+                if self._pending_signal is None:
+                    # Defensive: only reachable if a pre-rewrite state file
+                    # resumed into WAIT_CONFIRM/PENDING_ORDER with no signal.
+                    self._log_event(
+                        "PENDING_ORDER with no signal (stale resumed state) → SCANNING",
+                        level="warning",
+                    )
+                    self.state = "SCANNING"
                 else:
-                    self.state = "SCANNING"   # risk engine skipped (confidence too low etc.)
+                    self._step5_risk_engine(
+                        candle_15m, self.direction_focus, ind_15m,
+                        mr_signal=self._pending_signal,
+                    )
+                    self._pending_signal = None  # consumed
+                    if self.position_open:
+                        self.state = "IN_POSITION"
+                    else:
+                        self.state = "SCANNING"   # risk engine skipped (confidence too low etc.)
                 state_changed = False
 
             elif self.state in ("IN_POSITION", "PARTIAL_EXIT", "TRAILING"):
@@ -1748,12 +1574,12 @@ class TradingBot:
                                ind_4h: Dict, atr_4h: float):
         original_risk = self.base_risk_pct
         self.base_risk_pct *= 0.5
+        regime_direction = self._regime_direction(ind_4h)
         for direction in ("LONG", "SHORT"):
-            if not self._check_htf_trend_filter(direction, ind_1h):
-                continue
-            if self._layer_filtering(direction, ind_15m,
-                                     self.current_market_state, ind_1h, ind_4h):
-                self._step5_risk_engine(candle, direction, ind_15m)
+            sig = self._generate_signal(direction, candle, ind_15m, ind_1h, ind_4h,
+                                        self.current_market_state, regime_direction)
+            if sig:
+                self._step5_risk_engine(candle, direction, ind_15m, mr_signal=sig)
                 self.state = "IN_POSITION"
                 self._log_event(f"RECOVERY trade: {direction} at half-risk")
                 break
