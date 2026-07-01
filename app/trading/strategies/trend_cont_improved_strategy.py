@@ -1260,11 +1260,16 @@ class TrendContImprovedStrategy(BaseStrategy):
         # direction/momentum/structure. Distinct from simple_fast_entry — see _compute().
         score_primary_entry=False,
         # Pullback timing granularity: compare the LIVE 15m close vs 1H EMA20 instead
-        # of the stale last-closed 1H bar — catches intra-hour dip-and-bounce touches
-        # up to 45 min sooner. Experimental; A/B tested before enabling in production.
+        # of the stale last-closed 1H bar. Backtest Jan-May 2026 (BTC+XAG+XAU) proved
+        # this WORSE: T=73 PnL=+$46.80 PF=1.22 vs baseline T=117 PnL=+$158.53 PF=1.50.
+        # The stale h1_close acts as a useful time-filter (1H bar must CLOSE in the
+        # zone) — live 15m is too fast and enters on intra-hour noise. Kept off.
         pullback_live_15m=False,
-        # MTF bias source: exclude the noisy 15m self-vote, use 1h+4h only. Experimental.
-        bias_htf_only=False,
+        # MTF bias source: exclude the noisy 15m self-vote, use 1h+4h only. Backtest
+        # Jan-May 2026 (BTC+XAG+XAU): T=114 PnL=+$161.49 PF=1.51 vs baseline T=117
+        # PnL=+$158.53 PF=1.50 — better on every metric (15m TF is already filtered
+        # by the ADX/score/MACD gates, so its vote just added noise to the HTF gate).
+        bias_htf_only=True,
         # ATR compression gate: requires ATR14 to have recently been < ATR50 then start expanding
         # Catches volatility squeeze → expansion setups (disabled by default pending backtest)
         atr_compress_gate=False,
