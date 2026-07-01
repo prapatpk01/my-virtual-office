@@ -1156,6 +1156,59 @@ def check_trend_fade(side: str, entry: float, one_r: float,
             f"(adx {adx_prev:.0f}→{adx_now:.0f}, against={against})")
 
 
+# ── REVERSAL-CUT (grinding V-reversal, no HTF/ADX-falling required) ──────────
+
+def check_reversal_cut(side: str, entry: float, one_r: float,
+                       df5: pd.DataFrame, uw_frac: float = 0.7) -> tuple[str, str]:
+    """
+    Local-momentum reversal cut. Catches a grinding V-reversal that the other
+    two guards structurally miss:
+      - crash-guard needs HTF (1h/4h) composite bias to fully flip past ±65 —
+        HTF lags a fresh 5m reversal by design.
+      - trend-fade needs ADX(15m) to be FALLING — but a genuine reversal often
+        makes ADX RISE (a new trend is forming against the position), so the
+        gate never fires.
+      - spike-cut needs a fast move (≥1.5×ATR(3m) in 12 min) — misses a
+        slower grind-up/down over 30-60+ min that still crosses ~1R.
+
+    Fires when ALL of:
+      1. position is >= uw_frac R underwater
+      2. price is beyond EMA9(5m) against the position
+      3. EMA9(5m) slope is ACCELERATING against the position (latest 2-bar
+         slope steeper than the prior 2-bar slope) — confirms sustained
+         momentum, not a single noisy tick.
+    """
+    if df5 is None or len(df5) < 10:
+        return ("HOLD", "insufficient 5m data for reversal-cut")
+    if one_r <= 0:
+        return ("HOLD", "invalid one_r — reversal-cut skipped")
+
+    px = float(df5["close"].iloc[-1])
+    uw = (entry - px) / one_r if side == "long" else (px - entry) / one_r
+    if uw < uw_frac:
+        return ("HOLD", f"only {uw:.2f}R underwater (< {uw_frac}R) — safe")
+
+    ema9 = _ema(df5["close"], 9)
+    e9_now     = float(ema9.iloc[-1])
+    slope_now  = float(ema9.iloc[-1] - ema9.iloc[-3])
+    slope_prev = float(ema9.iloc[-3] - ema9.iloc[-5])
+
+    if side == "long":
+        against_px   = px < e9_now
+        accelerating = (slope_now < 0) and (slope_now < slope_prev)
+    else:
+        against_px   = px > e9_now
+        accelerating = (slope_now > 0) and (slope_now > slope_prev)
+
+    if against_px and accelerating:
+        return ("CLOSE",
+                f"REVERSAL-CUT: {uw:.2f}R underwater + EMA9(5m) accelerating against "
+                f"(slope {slope_prev:.2f}→{slope_now:.2f})")
+    return ("HOLD",
+            f"{uw:.2f}R underwater but momentum not confirmed accelerating against "
+            f"(against_px={against_px}, accelerating={accelerating})")
+
+
 # ── BaseStrategy wrapper ─────────────────────────────────────────────────────
 
 class TrendContImprovedStrategy(BaseStrategy):
@@ -1207,6 +1260,12 @@ class TrendContImprovedStrategy(BaseStrategy):
         # both with lower MaxDD. Triple gate avoids chopping quiet winners.
         trend_fade_enabled=True,
         trend_fade_uw_frac=0.6,   # min R underwater before the cut can fire
+        # reversal-cut: catches a grinding V-reversal that crash-guard (needs HTF
+        # flip) and trend-fade (needs ADX falling) both structurally miss because
+        # a fresh reversal often makes ADX RISE and HTF bias lags. Experimental;
+        # off by default pending backtest.
+        reversal_cut_enabled=False,
+        reversal_cut_uw_frac=0.7,
         # SJ Hybrid scoring mode (FAST mode only) — ACTIVE by default.
         # Backtest Jan-May 2026: Hybrid=+$103 vs Classic=+$90 combined (BTC+XAU);
         # with Trend-Fade guard, SJ Hybrid reaches +$217 vs Classic +$279 — but SJ
@@ -1413,9 +1472,10 @@ class TrendContImprovedStrategy(BaseStrategy):
                          candles_3m: list = None, candles_15m: list = None) -> tuple[str, str]:
         """
         Guard stack (checked in order, first CLOSE wins):
-          1. Spike-Cut   — fast adverse ≥1.5×ATR(3m) in 12 min (pre-TP1 only)
-          2. Trend-Fade  — ≥0.6R underwater + ADX(15m) falling + lost EMA20(5m) (pre-TP1)
-          3. Crash-Guard — 0.7R underwater + momentum fully reversed
+          1. Spike-Cut    — fast adverse ≥1.5×ATR(3m) in 12 min (pre-TP1 only)
+          2. Trend-Fade   — ≥0.6R underwater + ADX(15m) falling + lost EMA20(5m) (pre-TP1)
+          3. Reversal-Cut — ≥0.7R underwater + EMA9(5m) accelerating against (pre-TP1)
+          4. Crash-Guard  — 0.7R underwater + momentum fully reversed
         Returns ('CLOSE'|'HOLD', reason).
         """
         if not self._p["health_guard_enabled"]:
@@ -1451,7 +1511,18 @@ class TrendContImprovedStrategy(BaseStrategy):
             if tf_action == "CLOSE":
                 return ("CLOSE", tf_reason)
 
-        # ── Layer 3: Crash-Guard (0.7R + full reversal) ────────────────────────
+        # ── Layer 3: Reversal-Cut (pre-TP1) ────────────────────────────────────
+        # Catches a grinding V-reversal that trend-fade (needs ADX falling) and
+        # crash-guard (needs HTF bias to flip) both structurally miss.
+        if (self._p.get("reversal_cut_enabled") and not tp1_hit and one_r > 0):
+            rc_action, rc_reason = check_reversal_cut(
+                side, entry, one_r, df5,
+                uw_frac=self._p["reversal_cut_uw_frac"],
+            )
+            if rc_action == "CLOSE":
+                return ("CLOSE", rc_reason)
+
+        # ── Layer 4: Crash-Guard (0.7R + full reversal) ────────────────────────
         bias_flip = (self._p["bias_gate_fast"] if self._p.get("fast_mode")
                      else self._p["health_bias_flip"])
         return check_health(
