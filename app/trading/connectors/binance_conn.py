@@ -152,6 +152,7 @@ class BinanceConnector(BaseConnector):
     _OKX_CONTRACT_SIZE: dict[str, float] = {
         "BTC/USDT:USDT": 0.01,
         "XAU/USDT:USDT": 1.0,
+        "XAG/USDT:USDT": 1.0,
         "ETH/USDT:USDT": 0.1,
     }
 

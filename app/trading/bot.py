@@ -467,6 +467,7 @@ class TradingBot:
                 amount = self.risk.size_position(usdt_free, price)
             # Confidence-based sizing: scale down "small" confidence entries
             _conf = meta.get("confidence_level", "normal")
+            _full_amount = amount
             if _conf == "small":
                 amount *= 0.5
                 logger.info("[%s] %s confidence=small → half size (%.4f)", slot, sym, amount)
@@ -480,8 +481,25 @@ class TradingBot:
             # position runs as a single-TP to TP2 (no partial, no breakeven step).
             ct = await self.connector.contract_size(sym)
             contracts = int(round(amount / ct)) if ct > 0 else 0
-            if contracts >= 1:
-                amount = round(contracts * ct, 8)
+            if contracts < 1:
+                # Sub-minimum-lot amount (e.g. confidence=small halving pushed a
+                # borderline size below 1 contract) — sending it would just get
+                # rejected by the exchange. Skip cleanly instead.
+                logger.warning(
+                    "[%s] %s: sizing rounds to 0 contracts (amount=%.6f, contract=%.6f) — skipping entry",
+                    slot, sym, amount, ct,
+                )
+                self._sig.unlock_strategy(sym, slot)
+                return False
+            amount = round(contracts * ct, 8)
+            if _conf == "small" and ct > 0:
+                _full_contracts = int(round(_full_amount / ct))
+                if _full_contracts == contracts:
+                    logger.info(
+                        "[%s] %s: confidence=small halving had no effect — contract size "
+                        "(%.4f) too coarse to reduce below %d contract(s)",
+                        slot, sym, ct, contracts,
+                    )
             partial_ok = (meta.get("tp1") is not None) and contracts >= 2
             tp1_val = meta.get("tp1") if partial_ok else None
             if meta.get("tp1") is not None and not partial_ok:
