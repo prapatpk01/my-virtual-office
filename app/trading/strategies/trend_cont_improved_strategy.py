@@ -300,15 +300,18 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                              price_action: bool = False, rsi_div: bool = False,
                              rel_vol: bool = False, obv: bool = False,
                              ema_slope: bool = False, adx_rising_score: bool = False,
-                             atr_expansion: bool = False, ema5_sma9: bool = True):
+                             atr_expansion: bool = False, ema5_sma9: bool = True,
+                             macd_hist_score: bool = False):
     if sj_scoring:
         # Weighted Confidence Score (0-100 scale), min_score=60.
         # Base (3 components, max 35 pts): hma_bull(15) rsi_band(10) breakout_hh10(10)
-        # Optional default-on (7 more, max 60 pts): roc9(10) obv(5) bos(15) rel_vol(10)
-        #   ema_slope(10) adx_rising(5) atr_expansion(5)
+        # Optional default-on (8 more, max 65 pts): roc9(10) obv(5) bos(15) rel_vol(10)
+        #   ema_slope(10) adx_rising(5) atr_expansion(5) macd_hist(5)
         # ema5_sma9(5) is off by default — overlaps with hma_bull (both measure
         # fast-vs-slow direction) and adds no distinct information.
-        # Total max = 100 (or 95 w/o ema5_sma9) | ≥90 strong, ≥70 normal, ≥60 small, <60 skip
+        # macd_hist(5) gives the confidence score explicit credit for MACD histogram
+        # sign — the same signal simple_fast_entry already gates on for timing.
+        # Total max = 100 | ≥90 strong, ≥70 normal, ≥60 small, <60 skip
         reg = {
             "hma_bull": dict(
                 enabled=True, weight=15.0,
@@ -377,6 +380,13 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                 long =lambda c: c["atr_expand_ok"],
                 short=lambda c: c["atr_expand_ok"],
                 desc="ATR14 above ATR_MA20 — volatility expanding, not consolidating (5 pts)",
+            )
+        if macd_hist_score:
+            reg["macd_hist"] = dict(
+                enabled=True, weight=5.0,
+                long =lambda c: c["macd"] > c["macd_signal"],
+                short=lambda c: c["macd"] < c["macd_signal"],
+                desc="MACD line vs signal (histogram sign) — momentum confirmation (5 pts)",
             )
         if extended:
             # SJ Extended: market structure + FVG (suggest min_score=5-6 out of 9+)
@@ -1267,6 +1277,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         # ema5_sma9: OFF by default — overlaps with hma_bull (both are fast-vs-slow
         # direction checks), adds no distinct signal, just noise on the score total.
         sj_ema5_sma9=False,
+        # macd_hist: MACD line vs signal as an explicit score component (5 pts) —
+        # fills the 5 pts freed by disabling ema5_sma9, keeping max score at 100.
+        # Mirrors the same MACD hist sign already used by simple_fast_entry.
+        sj_macd_hist=True,
     )
 
     def __init__(self, symbol: str, params: dict = None):
@@ -1286,12 +1300,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         adr  = bool(self._p.get("sj_adx_rising",     False))
         atrx = bool(self._p.get("sj_atr_expansion",  False))
         e59  = bool(self._p.get("sj_ema5_sma9",      True))
+        mh   = bool(self._p.get("sj_macd_hist",      False))
         self._p["indicators"] = self.params.get("indicators",
             build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve,
                                      bos=bos, zlema=zl, price_action=pa, rsi_div=rdiv,
                                      rel_vol=rv, obv=obv, ema_slope=esl,
                                      adx_rising_score=adr, atr_expansion=atrx,
-                                     ema5_sma9=e59))
+                                     ema5_sma9=e59, macd_hist_score=mh))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
