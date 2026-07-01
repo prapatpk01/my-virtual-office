@@ -922,8 +922,9 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     _macd_hist_s_diag = pd.Series(True, index=out.index)
     if p.get("macd_hist_rising_gate", True):
         macd_hist       = macd_line - macd_sig
-        hist_rising_l   = macd_hist > macd_hist.shift(2)
-        hist_rising_s   = macd_hist < macd_hist.shift(2)
+        _mh_lb          = int(p.get("macd_hist_lookback", 2))  # bars back for the rising check
+        hist_rising_l   = macd_hist > macd_hist.shift(_mh_lb)
+        hist_rising_s   = macd_hist < macd_hist.shift(_mh_lb)
         _macd_hist_l_diag = hist_rising_l
         _macd_hist_s_diag = hist_rising_s
         long_gates  = long_gates  & hist_rising_l
@@ -1221,9 +1222,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         # HTF anti-false-flip: N consecutive 15m bars of consistent 4H+1H direction required.
         # 2=30min (default), 4=60min. Prevents early-mode single-bar flips (XAG scenario).
         htf_stability_bars=2,
-        # MACD histogram gate: rising over 2 bars (sign-agnostic) → enter early, not after peak.
+        # MACD histogram gate: rising over N bars (sign-agnostic) → enter early, not after peak.
         # Caught the XAG 19:47 case: MACD declining at entry = trade already past peak.
         macd_hist_rising_gate=True,
+        macd_hist_lookback=2,   # bars back for the rising check (1 = softer/sooner, 2 = current)
         # Startup warmup: block signals for N min after bot/strategy restart.
         # Prevents premature entries before the strategy has enough context.
         startup_warmup_min=45,
