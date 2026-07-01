@@ -300,25 +300,21 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                              price_action: bool = False, rsi_div: bool = False,
                              rel_vol: bool = False, obv: bool = False,
                              ema_slope: bool = False, adx_rising_score: bool = False,
-                             atr_expansion: bool = False):
+                             atr_expansion: bool = False, ema5_sma9: bool = True):
     if sj_scoring:
-        # Weighted Confidence Score (0-100 scale), min_score=70.
-        # Base (4 components, max 40 pts): hma_bull(15) ema5_sma9(5) rsi_band(10) breakout_hh10(10)
+        # Weighted Confidence Score (0-100 scale), min_score=60.
+        # Base (3 components, max 35 pts): hma_bull(15) rsi_band(10) breakout_hh10(10)
         # Optional default-on (7 more, max 60 pts): roc9(10) obv(5) bos(15) rel_vol(10)
         #   ema_slope(10) adx_rising(5) atr_expansion(5)
-        # Total max = 100 | thresholds: ≥90 strong, ≥80 normal, ≥70 small, <70 skip
+        # ema5_sma9(5) is off by default — overlaps with hma_bull (both measure
+        # fast-vs-slow direction) and adds no distinct information.
+        # Total max = 100 (or 95 w/o ema5_sma9) | ≥90 strong, ≥70 normal, ≥60 small, <60 skip
         reg = {
             "hma_bull": dict(
                 enabled=True, weight=15.0,
                 long =lambda c: c["close"] > c["hma"],
                 short=lambda c: c["close"] < c["hma"],
                 desc="HMA16 trend direction — primary trend gate (15 pts)",
-            ),
-            "ema5_sma9": dict(
-                enabled=True, weight=5.0,
-                long =lambda c: c["ema5"] > c["sma9"],
-                short=lambda c: c["ema5"] < c["sma9"],
-                desc="EMA5 vs SMA9 momentum bonus — fast crossover (5 pts)",
             ),
             "rsi_band": dict(
                 enabled=True, weight=10.0,
@@ -333,6 +329,13 @@ def build_indicator_registry(sj_scoring: bool = False, extended: bool = False,
                 desc="Close breaks N-bar high/low — fast entry timing (10 pts)",
             ),
         }
+        if ema5_sma9:
+            reg["ema5_sma9"] = dict(
+                enabled=True, weight=5.0,
+                long =lambda c: c["ema5"] > c["sma9"],
+                short=lambda c: c["ema5"] < c["sma9"],
+                desc="EMA5 vs SMA9 momentum bonus — fast crossover (5 pts)",
+            )
         if roc9:
             reg["roc9"] = dict(
                 enabled=True, weight=10.0,
@@ -1198,7 +1201,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         sj_obv=True,               # OBV above/below its EMA20 as SJ scoring component (5 pts)
         # BOS: Break of Structure — close breaks beyond N-bar swing high/low
         sj_bos=True,               # BOS as SJ scoring component (15 pts)
-        bos_lookback=3,            # 3×15m = 45 min swing — 2 bars faster than previous 5-bar
+        bos_lookback=2,            # 2×15m = 30 min swing — 1 bar faster than previous 3-bar
         # Confidence Score extras — structural quality filter
         sj_ema_slope=True,         # EMA20 + EMA50 both rising = structural trend (10 pts)
         sj_adx_rising=True,        # ADX rising over 2 bars = trend strengthening (5 pts)
@@ -1261,6 +1264,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         htf_rsi_bull_hi=75.0,      # 4h/1h RSI bull zone upper bound
         htf_rsi_bear_lo=25.0,      # 4h/1h RSI bear zone lower bound (short entries)
         htf_rsi_bear_hi=55.0,      # 4h/1h RSI bear zone upper bound
+        # ema5_sma9: OFF by default — overlaps with hma_bull (both are fast-vs-slow
+        # direction checks), adds no distinct signal, just noise on the score total.
+        sj_ema5_sma9=False,
     )
 
     def __init__(self, symbol: str, params: dict = None):
@@ -1279,11 +1285,13 @@ class TrendContImprovedStrategy(BaseStrategy):
         esl  = bool(self._p.get("sj_ema_slope",      False))
         adr  = bool(self._p.get("sj_adx_rising",     False))
         atrx = bool(self._p.get("sj_atr_expansion",  False))
+        e59  = bool(self._p.get("sj_ema5_sma9",      True))
         self._p["indicators"] = self.params.get("indicators",
             build_indicator_registry(sj_scoring=sj, extended=ext, roc9=r9, vol_expansion=ve,
                                      bos=bos, zlema=zl, price_action=pa, rsi_div=rdiv,
                                      rel_vol=rv, obv=obv, ema_slope=esl,
-                                     adx_rising_score=adr, atr_expansion=atrx))
+                                     adx_rising_score=adr, atr_expansion=atrx,
+                                     ema5_sma9=e59))
         self._min_primary = self.params.get("min_primary", 100)
         self._min_1h      = self.params.get("min_1h",       60)
         self._min_4h      = self.params.get("min_4h",       55)
