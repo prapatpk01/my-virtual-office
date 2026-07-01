@@ -935,7 +935,7 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     # accurate but enters late at a worse price. "relaxed" only needs the close to
     # rise over the prior close (a softer momentum tick) — enters ~1 bar sooner.
     # False disables it entirely (earliest, most trades).
-    _trig_mode = p.get("final_trigger_mode", "strict" if p.get("final_trigger_enabled", False) else "off")
+    _trig_mode = p.get("final_trigger_mode") or ("strict" if p.get("final_trigger_enabled", False) else "off")
     if _trig_mode == "strict":
         trigger_long  = out["close"] > out["high"].shift(1)
         trigger_short = out["close"] < out["low"].shift(1)
@@ -1285,6 +1285,10 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Final entry trigger: close must exceed previous bar's high (long) / low (short)
         # Adds precise timing confirmation after all other layers pass
         final_trigger_enabled=True,
+        # Trigger mode: "strict" (break prior high/low), "relaxed" (rise over prior
+        # close — enters ~1 bar sooner), "off" (no confirmation). Must be in DEFAULTS
+        # so it flows into _p. None → derive from final_trigger_enabled (legacy).
+        final_trigger_mode=None,
         # HTF ADX gate: require 1h AND 4h ADX > threshold alongside 15m ADX
         htf_adx_gate=False,
         htf_adx_len=14,
