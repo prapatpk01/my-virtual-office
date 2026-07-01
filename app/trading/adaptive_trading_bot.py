@@ -1672,6 +1672,8 @@ class TradingBot:
 
         return {
             "total_trades":  len(self.trade_journal),
+            "wins":          len(wins),
+            "losses":        len(losses),
             "win_rate":      len(wins) / len(self.trade_journal),
             "net_pnl":       sum(pnls),
             "avg_win":       np.mean([t["pnl"] for t in wins])   if wins   else 0,

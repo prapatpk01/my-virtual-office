@@ -162,7 +162,7 @@ class TelegramNotifier:
     # ------------------------------------------------------------------
 
     async def _cmd_stats(self):
-        """Per-symbol adaptive bot stats."""
+        """Per-symbol adaptive bot stats + balance + open positions + totals."""
         bots = self.bots_dict
         if not bots:
             if self.bot:
@@ -177,8 +177,14 @@ class TelegramNotifier:
                 await self._send("No bots connected.")
             return
 
-        lines = ["Adaptive Bot Stats\n"]
-        total_pnl = 0.0
+        lines = ["📊 Adaptive Bot Stats\n"]
+        total_pnl    = 0.0
+        total_trades = 0
+        total_wins   = 0
+        total_losses = 0
+        balance      = 0.0
+        open_lines   = []
+
         for sym, (bot, _) in bots.items():
             try:
                 st = bot.get_status()
@@ -186,7 +192,12 @@ class TelegramNotifier:
                 n = st.get("total_trades", 0)
                 wr = perf.get("win_rate", 0) * 100 if n > 0 else 0.0
                 pnl = perf.get("net_pnl", 0.0)
-                total_pnl += pnl
+                total_pnl    += pnl
+                total_trades += n
+                total_wins   += perf.get("wins", 0)
+                total_losses += perf.get("losses", 0)
+                balance = st.get("account_balance", balance)
+
                 regime = st.get("market_state", "?")
                 pos = "IN_POS" if st.get("position_open") else st.get("state", "?")
                 warmup = st.get("warmup_remaining_m", 0)
@@ -195,10 +206,30 @@ class TelegramNotifier:
                     f"{sym}: {pos} | {regime} | "
                     f"{n}T {wr:.0f}%WR ${pnl:+.0f}{warmup_str}"
                 )
+
+                if st.get("position_open"):
+                    t = getattr(bot, "current_trade", {}) or {}
+                    direction = t.get("direction", "?")
+                    entry     = t.get("entry", 0.0)
+                    sl        = t.get("sl", 0.0)
+                    tp1       = t.get("tp1", 0.0)
+                    tp2       = t.get("tp2", 0.0)
+                    open_lines.append(
+                        f"{sym} {direction} entry={entry:,.4f} "
+                        f"SL={sl:,.4f} TP1={tp1:,.4f} TP2={tp2:,.4f}"
+                    )
             except Exception as e:
                 lines.append(f"{sym}: error ({e})")
 
-        lines.append(f"\nTotal PnL: ${total_pnl:+,.2f}")
+        lines.append(f"\n💰 Balance: ${balance:,.2f}")
+        if open_lines:
+            lines.append("\n📌 Open Positions:\n" + "\n".join(open_lines))
+        else:
+            lines.append("\n📌 No open positions")
+        lines.append(
+            f"\n📈 Total: {total_trades} trades | "
+            f"{total_wins}W/{total_losses}L | Net PnL: ${total_pnl:+,.2f}"
+        )
         await self._send("\n".join(lines))
 
     async def _cmd_log(self, n: int = 15):
@@ -378,6 +409,27 @@ class TelegramNotifier:
             )
 
         elif cmd == "positions":
+            if self.bots_dict:
+                lines = ["📌 Open Positions\n"]
+                found = False
+                for sym, (bot, _) in self.bots_dict.items():
+                    if not getattr(bot, "position_open", False):
+                        continue
+                    found = True
+                    t = getattr(bot, "current_trade", {}) or {}
+                    lines.append(
+                        f"{sym} {t.get('direction', '?')} "
+                        f"entry={t.get('entry', 0):,.4f} "
+                        f"SL={t.get('sl', 0):,.4f} "
+                        f"TP1={t.get('tp1', 0):,.4f} TP2={t.get('tp2', 0):,.4f}\n"
+                        f"  realized_pnl={t.get('realized_pnl', 0):+,.2f}"
+                    )
+                if not found:
+                    await self._send("No open positions.")
+                    return
+                await self._send("\n".join(lines))
+                return
+
             if not self.bot:
                 await self._send("Bot not connected.")
                 return

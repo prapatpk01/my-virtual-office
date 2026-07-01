@@ -229,13 +229,26 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 result = t.execute(order_type, {**trade_info, "symbol": s})
                 if telegram:
                     try:
-                        telegram.send(
-                            f"{'🟢' if 'OPEN' in order_type else '🔴'} "
-                            f"[Adaptive] {order_type} {s}\n"
-                            f"entry={trade_info.get('entry', '?')} "
-                            f"sl={trade_info.get('sl', '?')} "
-                            f"size={float(trade_info.get('size') or 0):.4f}"
-                        )
+                        if "OPEN" in order_type:
+                            msg = (
+                                f"🟢 [Adaptive] {order_type} {s}\n"
+                                f"entry={trade_info.get('entry', '?')} "
+                                f"sl={trade_info.get('sl', '?')}\n"
+                                f"TP1={trade_info.get('tp1', '?')} "
+                                f"TP2={trade_info.get('tp2', '?')} "
+                                f"size={float(trade_info.get('size') or 0):.4f}"
+                            )
+                        else:
+                            pnl = float(trade_info.get("pnl") or 0)
+                            emoji = "✅" if pnl > 0 else ("⚪" if pnl == 0 else "❌")
+                            msg = (
+                                f"{emoji} [Adaptive] {order_type} {s} "
+                                f"({trade_info.get('reason', '')})\n"
+                                f"direction={trade_info.get('direction', '?')} "
+                                f"price={trade_info.get('price', '?')}\n"
+                                f"pnl={pnl:+.2f} size={float(trade_info.get('size') or 0):.4f}"
+                            )
+                        telegram.send(msg)
                     except Exception:
                         pass
                 return result
@@ -302,6 +315,26 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     # ("available margin too low"). Refresh from the exchange periodically.
     BALANCE_SYNC_SECS = _env_int("BALANCE_SYNC_SECONDS", 300)
     last_balance_sync = 0.0  # force an immediate sync on the first loop tick
+
+    # Exchange reconciliation — on_tick only updates position state from bot
+    # logic, so a position closed externally (manually, liquidated, or via an
+    # exchange-side TP/SL) would keep showing as open in the bot until restart.
+    # reconcile_with_exchange already handles "local=open, exchange=flat" —
+    # just needs to run periodically, not only at startup.
+    RECONCILE_SYNC_SECS = _env_int("RECONCILE_SYNC_SECONDS", 300)
+    last_reconcile_sync = _time.time()
+
+    # Adaptive state scan log — the [Adaptive][sym] state=... line otherwise
+    # only fires when a new 15m candle closes (up to 15 min gap). Mirror the
+    # Health log's independent 5-min cadence so state is visible that often
+    # even when no new bar has closed yet.
+    SCAN_LOG_SECS = _env_int("SCAN_LOG_SECONDS", 300)
+    last_scan_log = _time.time()
+
+    # Periodic Telegram digest (balance, open positions, per-symbol + total
+    # stats) — previously only available on-demand via /stats.
+    TELEGRAM_DIGEST_SECS = _env_int("TELEGRAM_DIGEST_SECONDS", 1800)
+    last_telegram_digest = _time.time()
 
     _HEALTH_EMOJI = {
         "STRONG":   "✅",
@@ -468,6 +501,40 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     logger.warning("[Balance] exchange returned %.2f — keeping previous value", real_balance)
             except Exception as e:
                 logger.warning("[Balance] sync failed (non-fatal): %s", e)
+
+        if _time.time() - last_reconcile_sync >= RECONCILE_SYNC_SECS:
+            last_reconcile_sync = _time.time()
+            for sym, (bot, _sf) in bots.items():
+                try:
+                    was_open = bot.position_open
+                    await loop.run_in_executor(None, bot.reconcile_with_exchange, sym, okx)
+                    if was_open and not bot.position_open:
+                        logger.info(
+                            "[Reconcile][%s] position closed externally — local state cleared",
+                            sym,
+                        )
+                except Exception as e:
+                    logger.warning("[Reconcile][%s] periodic sync failed: %s", sym, e)
+
+        if _time.time() - last_scan_log >= SCAN_LOG_SECS:
+            last_scan_log = _time.time()
+            for sym, (bot, _sf) in bots.items():
+                try:
+                    status = bot.get_status()
+                    logger.info(
+                        "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f",
+                        sym, status["state"], status["position_open"],
+                        status["market_state"], status["regime_score"],
+                    )
+                except Exception as e:
+                    logger.warning("[Adaptive][%s] scan log failed: %s", sym, e)
+
+        if telegram and _time.time() - last_telegram_digest >= TELEGRAM_DIGEST_SECS:
+            last_telegram_digest = _time.time()
+            try:
+                telegram.send_periodic_status()
+            except Exception as e:
+                logger.warning("[Telegram] periodic digest failed: %s", e)
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=cfg["interval"])
