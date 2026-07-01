@@ -1,47 +1,47 @@
 """
-Adaptive Trading Bot — v7.0
-============================
-รวม AdaptiveEngine (จาก adaptive_engine_draft.py) + SJUTBotV4 signal engine เข้าด้วยกัน
-แก้ไขทุกจุดที่วิเคราะห์พบ:
+Adaptive Trading Bot — v8.0  SwingReversalPro
+==============================================
+7 major improvements from V7:
 
-[FIX 1] _calculate_health() — คำนวณจริงจาก 5 ตัวชี้วัด (momentum, volume,
-         structure, ATR, divergence) แทนที่ค่าคงที่แบบเดิมที่ไม่ได้คำนวณอะไรจริง
-[FIX 2] _close_position() — บันทึก PnL จริง + อัปเดต current_trade + ส่งผ่าน
-         execution callback ที่ wire ได้จากภายนอก
-[FIX 3] adjust_weights_from_learning() — วิเคราะห์แยก per market_state
-         ไม่ใช่ winrate รวมทั้งหมด
-[FIX 4] Partial TP ครอบคลุมทั้ง LONG และ SHORT
-[FIX 5] on_tick() while-loop มี guard ป้องกัน infinite loop
-[FIX 6] _scale_score() — cap input ที่ 100 ก่อนคำนวณ
-[FIX 7] TP3 hit logic ใน _manage_open_position()
-[FIX 8] Recovery state มี logic ใน on_tick()
-[FIX 9] cooldown_until ใช้ datetime แทน time.time() float
-[FIX 10] Dynamic weight learning ปรับ per-condition ไม่ใช่ global shift
+[V8-1] Market State Engine — 8 states redesigned:
+       STRONG_TREND / TRENDING / SIDEWAY / LOW_VOL / HIGH_VOL
+       EXHAUSTION / BREAKOUT / REVERSAL
+       Using: ADX, ATR%, EMA Slope, BB Width, Volume, RSI
+       Tradeable: STRONG_TREND, TRENDING, BREAKOUT, REVERSAL, HIGH_VOL, EXHAUSTION, SIDEWAY
+       Skip: LOW_VOL immediately
 
---- v6.0: production readiness สำหรับเทรดจริงบน OKX ---
-[FIX 11] Logging module จริง (console + rotating file) แทน print()
-[FIX 12] _send_order() แยก fatal error ออกจาก error ที่ retry แล้วหมดสิทธิ์
-         (retry/backoff จริงอยู่ใน OKXExecutionAdapter — ดู okx_exchange.py)
-[FIX 13] save_state() / load_state() / reconcile_with_exchange() —
-         persist + reload position state ตอนรีสตาร์ตบอท พร้อมเทียบกับ
-         position จริงบน exchange (กันกรณี SL/TP ถูก trigger ระหว่างบอท offline)
+[V8-2] Adaptive Thresholds — RSI/MACD/ADX/ATR gates adapt per market state:
+       TRENDING: RSI<45 (dip-buy)  |  SIDEWAY: RSI<35  |  EXHAUSTION: RSI<50
 
---- v7.0: multi-timeframe entry (15M) + TP structure ---
-[FIX 17] เปลี่ยน timeframe เข้าออเดอร์เป็น 15M ทั้งหมด (layer scoring, entry
-         trigger, risk engine, position management) — 4H ใช้กำหนด market_state/
-         regime เหมือนเดิม, เพิ่ม 1H เป็นตัวกรองแนวโน้มชั้นกลาง
-         (_check_htf_trend_filter) ก่อนอนุญาตให้สัญญาณ 15M เข้าไม้ได้
-         → on_tick() ตอนนี้ต้องรับ candle_15m/ind_15m เพิ่ม (breaking change
-         จาก v6 — ดู signature ใหม่)
-[FIX 16] ตัด TP3 ออก เหลือแค่ TP1 (scale-out ตาม tp1_close_pct, default 50%)
-         และ TP2 (ปิดที่เหลือทั้งหมด = full exit) — พอ TP1 hit จะขยับ SL ไป
-         breakeven ทันที (เดิมต้องรอ current_r >= 0.8 แยกอิสระจาก TP)
+[V8-3] Entry Health Score (0-100) — composite quality gate before entry:
+       EMA Trend:20  MACD:15  ADX:15  Volume:15  ATR:10  RSI:10  Pattern:15  State:10
+       ≥75→full position  65-74→reduced  <65→skip
 
-หมายเหตุ: ข้อมูล indicator ตัวอย่างใน `if __name__ == "__main__":` ด้านล่าง เป็น
-ตัวอย่าง indicator สำหรับรันเดโม/เทสต์เท่านั้น ไม่ใช่ placeholder ของ logic จริง —
-logic ทั้งหมดด้านบนคำนวณจาก indicator ที่ส่งเข้ามาจริงทุกจุดแล้ว
+[V8-4] Confidence Score (0-100) — position conviction level:
+       Trend:20  Momentum:20  Volume:15  Volatility:15  Structure:15  Pattern:15
+       95→Strong, 85→Buy, 75→Normal, 65→Weak, <65→Skip
 
-ต้องการ: numpy, pandas (สำหรับ signal engine), ccxt (สำหรับ okx_exchange.py)
+[V8-5] Regime Bias Engine — 5-level trend bias from 4H+1H:
+       STRONG_BULL / BULL / NEUTRAL / BEAR / STRONG_BEAR
+       Long only: BULL, STRONG_BULL
+       Short only: BEAR, STRONG_BEAR
+       NEUTRAL: mean-revert states only (SIDEWAY, REVERSAL)
+
+[V8-6] Cooldown (tighter):
+       2 consecutive SL hits → 90-min cooldown
+       3 losses in session  → 4-hour cooldown
+
+[V8-7] Pattern Learning Engine (simplified, anti-overfit):
+       Track per entry_type: Wins, Losses, Avg R, Avg Hold, Expectancy
+       WR<45% → reduce weight ×0.85 (min 0.5)
+       WR>65% → increase weight ×1.15 (max 1.5)
+
+All V7 infrastructure preserved:
+- State machine (SCANNING→FILTERING→WAIT_CONFIRM→PENDING_ORDER→IN_POSITION→EXITING)
+- Partial TP (TP1 50% + TP2 full), Break-even, ATR Trailing Stop
+- Position Health Calculator, Reversal Spike/Trend Fade protection
+- save_state/load_state/reconcile_with_exchange
+- Daily PnL limits, win-streak risk reduction
 """
 
 import numpy as np
@@ -52,178 +52,452 @@ import logging
 from typing import Optional, Callable, Dict, List, Any
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# LOGGING SETUP
-# Railway doesn't have persistent disk — use module-level logger only (no file handler)
-# ──────────────────────────────────────────────────────────────────────────────
-
 logger = logging.getLogger("adaptive_trading_bot")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MODULE 2: REGIME-SPECIFIC ADAPTIVE THRESHOLDS
-# ADX, RSI, direction bias, and L1 delta per 8-state market regime
+# [V8-2] ADAPTIVE THRESHOLDS  — per 8-state market
+# RSI, MACD mode, ADX min, health min  (direction gates applied separately by Regime Bias)
 # ──────────────────────────────────────────────────────────────────────────────
 
-REGIME_THRESHOLDS: Dict[str, Dict] = {
-    # Strong directional trend — LONG only, dip-buy, lower bar to enter
-    "STRONG_UPTREND": {
-        "adx_1h_min": 20, "rsi_long": (40, 65), "rsi_short": (35, 58),
-        "allow_long": True,  "allow_short": False, "l1_delta": -5,
+ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
+    # Strong directional trend — dip-buy / dip-sell entry, lower RSI bar
+    "STRONG_TREND": {
+        "rsi_long":  (38, 65), "rsi_short": (35, 62),
+        "macd_long": "above_signal", "macd_short": "below_signal",
+        "adx_min": 22, "health_min": 68, "confidence_min": 65,
     },
-    # Normal trend — LONG only; dip-buy on RSI pullback, higher ADX confirmation
-    # l1_delta +6: filters low-quality UPTREND entries (BTC/ETH WR 35-40% → improve)
-    "UPTREND": {
-        "adx_1h_min": 18, "rsi_long": (30, 55), "rsi_short": (45, 65),
-        "allow_long": True,  "allow_short": False, "l1_delta": +6,
+    # Normal trend — wait for pullback to RSI<45 (dip-buy zone)
+    "TRENDING": {
+        "rsi_long":  (30, 55), "rsi_short": (45, 65),
+        "macd_long": "above_signal", "macd_short": "below_signal",
+        "adx_min": 18, "health_min": 72, "confidence_min": 65,
     },
-    # Ranging market — mean-reversion RSI gates, higher quality bar
-    "RANGE": {
-        "adx_1h_min": 12, "rsi_long": (28, 48), "rsi_short": (52, 72),
-        "allow_long": True,  "allow_short": True,  "l1_delta": +5,
+    # Breakout from compression — momentum entry, RSI expansive
+    "BREAKOUT": {
+        "rsi_long":  (42, 72), "rsi_short": (28, 58),
+        "macd_long": "above_zero", "macd_short": "below_zero",
+        "adx_min": 15, "health_min": 72, "confidence_min": 68,
     },
-    # Volatility squeeze — wait for breakout quality, tight RSI
-    "LOW_VOL": {
-        "adx_1h_min": 10, "rsi_long": (45, 60), "rsi_short": (40, 55),
-        "allow_long": True,  "allow_short": True,  "l1_delta": +10,
+    # Counter-trend reversal — deep OS/OB required
+    "REVERSAL": {
+        "rsi_long":  (25, 45), "rsi_short": (55, 75),
+        "macd_long": "turning_up", "macd_short": "turning_down",
+        "adx_min": 12, "health_min": 75, "confidence_min": 68,
     },
-    # High volatility expansion — very strict ADX + tight RSI + high bar
+    # Ranging market — mean-revert gates
+    "SIDEWAY": {
+        "rsi_long":  (28, 48), "rsi_short": (52, 72),
+        "macd_long": "any", "macd_short": "any",
+        "adx_min": 10, "health_min": 72, "confidence_min": 62,
+    },
+    # Volatility expansion — very strict entry
     "HIGH_VOL": {
-        "adx_1h_min": 22, "rsi_long": (42, 58), "rsi_short": (42, 58),
-        "allow_long": True,  "allow_short": True,  "l1_delta": +8,
+        "rsi_long":  (35, 55), "rsi_short": (45, 65),
+        "macd_long": "above_signal", "macd_short": "below_signal",
+        "adx_min": 22, "health_min": 80, "confidence_min": 72,
     },
-    # Topping/distribution — SHORT bias, longs blocked
-    "DISTRIBUTION": {
-        "adx_1h_min": 15, "rsi_long": (28, 45), "rsi_short": (52, 72),
-        "allow_long": False, "allow_short": True,  "l1_delta": +3,
-    },
-    # Bottoming/accumulation — LONG bias only; very high bar after SOL WR=29% with l1=+12
-    # adx_1h_min=20: require clear 1H momentum; l1_delta=+18: only strongest reversal signals
-    "ACCUMULATION": {
-        "adx_1h_min": 20, "rsi_long": (35, 52), "rsi_short": (48, 68),
-        "allow_long": True,  "allow_short": False, "l1_delta": +18,
-    },
-    # Extended trend losing momentum — very high quality bar; tightened from +15 after
-    # SOL EXHAUSTION LONG WR=40%; RSI gate tighter so only deep oversold longs enter
+    # Trend losing momentum — deeper OS/OB, MACD must be turning
     "EXHAUSTION": {
-        "adx_1h_min": 18, "rsi_long": (28, 44), "rsi_short": (56, 72),
-        "allow_long": True,  "allow_short": True,  "l1_delta": +18,
+        "rsi_long":  (25, 44), "rsi_short": (56, 75),
+        "macd_long": "turning_up", "macd_short": "turning_down",
+        "adx_min": 18, "health_min": 78, "confidence_min": 70,
+    },
+    # Squeeze phase — skip immediately
+    "LOW_VOL": {
+        "rsi_long": (50, 50), "rsi_short": (50, 50),
+        "macd_long": "any", "macd_short": "any",
+        "adx_min": 999, "health_min": 999, "confidence_min": 999,
     },
 }
 
+# States the bot will trade in — LOW_VOL skipped entirely
 _TRADEABLE_STATES: frozenset = frozenset({
-    "STRONG_UPTREND",  # trend-follow LONG — highest WR
-    "UPTREND",         # trend-follow both directions
-    "DISTRIBUTION",    # SHORT-bias reversal (topping pattern)
-    "ACCUMULATION",    # LONG-bias reversal (bottoming pattern)
-    "HIGH_VOL",        # expansion — high bar (l1_delta +8) protects quality
-    "EXHAUSTION",      # elevated ADX + collapsed efficiency — l1_delta +15 ensures
-                       # only very high-confidence setups enter; 1H EMA filter guards direction
-    # RANGE: blocked — catch-all Sideway equivalent, WR 33-45%
-    # LOW_VOL: blocked — wait for breakout, no directional edge yet
+    "STRONG_TREND", "TRENDING", "BREAKOUT", "REVERSAL",
+    "SIDEWAY", "HIGH_VOL", "EXHAUSTION",
 })
 
-# Scores that are LONG-biased: high value = bullish signal.
-# For SHORT scoring these must be inverted (100 - score) so bearish conditions score high.
-# trend_score is intentionally excluded: it measures directional STRENGTH not bias
-# (both ema_bull and ema_bear get high trend_score, which correctly favours either direction).
-_DIR_INVERT_KEYS: tuple = ("momentum", "structure", "ema", "vwap", "macd")
+# Which states trade counter-direction of Regime Bias
+# (reversal states want OPPOSITE of macro trend)
+_COUNTER_TREND_STATES: frozenset = frozenset({"REVERSAL", "EXHAUSTION"})
 
-# Entry type label per regime (for learning database enrichment)
-_REGIME_ENTRY_TYPE: Dict[str, str] = {
-    "STRONG_UPTREND": "trend_follow",
-    "UPTREND":        "trend_follow",
-    "RANGE":          "mean_revert",
-    "LOW_VOL":        "breakout",
-    "HIGH_VOL":       "momentum",
-    "DISTRIBUTION":   "reversal",
-    "ACCUMULATION":   "reversal",
-    "EXHAUSTION":     "counter_trend",
+# Entry type label per state — for learning engine
+_STATE_ENTRY_TYPE: Dict[str, str] = {
+    "STRONG_TREND": "trend_follow",
+    "TRENDING":     "trend_follow",
+    "BREAKOUT":     "breakout",
+    "REVERSAL":     "reversal",
+    "SIDEWAY":      "mean_revert",
+    "HIGH_VOL":     "momentum",
+    "EXHAUSTION":   "counter_trend",
+    "LOW_VOL":      "none",
 }
+
+# Invert-keys for SHORT scoring (same as V7)
+_DIR_INVERT_KEYS: tuple = ("momentum", "structure", "ema", "vwap", "macd")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ADAPTIVE ENGINE
+# [V8-3] ENTRY HEALTH SCORER
+# 100-pt composite: EMA(20) + MACD(15) + ADX(15) + Volume(15) + ATR(10)
+#                    + RSI(10) + Pattern(15) + Market State(10)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class EntryHealthScorer:
+    """Compute a 0-100 entry quality score before opening a position."""
+
+    _STATE_QUALITY = {
+        "STRONG_TREND": 95, "TRENDING": 80, "BREAKOUT": 88,
+        "REVERSAL": 72, "HIGH_VOL": 65, "EXHAUSTION": 68,
+        "SIDEWAY": 60, "LOW_VOL": 5,
+    }
+
+    def compute(self, ind: Dict, direction: str, market_state: str) -> float:
+        score = 0.0
+
+        # — EMA Trend (20 pts) —
+        ema5  = ind.get("ema5",  ind.get("close", 0))
+        ema20 = ind.get("ema20", ind.get("close", 1))
+        price = ind.get("close", ema5)
+        if direction == "LONG":
+            if price > ema20 and ema5 > ema20:  ema_s = 100.0
+            elif price > ema20:                  ema_s = 60.0
+            else:                                ema_s = 15.0
+        else:
+            if price < ema20 and ema5 < ema20:  ema_s = 100.0
+            elif price < ema20:                  ema_s = 60.0
+            else:                                ema_s = 15.0
+        score += ema_s * 0.20
+
+        # — MACD (15 pts) —
+        macd        = ind.get("macd", 0.0)
+        macd_signal = ind.get("macd_signal", 0.0)
+        macd_hist   = ind.get("macd_hist", macd - macd_signal)
+        if direction == "LONG":
+            above_sig = macd > macd_signal
+            hist_pos  = macd_hist > 0
+            macd_s = 100.0 if (above_sig and hist_pos) else 65.0 if above_sig else 20.0
+        else:
+            below_sig = macd < macd_signal
+            hist_neg  = macd_hist < 0
+            macd_s = 100.0 if (below_sig and hist_neg) else 65.0 if below_sig else 20.0
+        score += macd_s * 0.15
+
+        # — ADX (15 pts) —
+        adx = ind.get("adx", 0.0)
+        adx_s = float(np.clip((adx - 10.0) / 30.0 * 100, 0, 100))
+        score += adx_s * 0.15
+
+        # — Volume (15 pts) —
+        volume  = ind.get("volume", 0)
+        vol_avg = ind.get("vol_avg", volume if volume > 0 else 1)
+        vol_ratio = volume / max(vol_avg, 1e-9)
+        vol_s = float(np.clip(vol_ratio / 2.0 * 100, 0, 100))
+        score += vol_s * 0.15
+
+        # — ATR expansion (10 pts) — expanding ATR = momentum
+        atr     = ind.get("atr", 0.0)
+        atr_avg = ind.get("atr_avg", atr if atr > 0 else 1e-9)
+        atr_ratio = atr / max(atr_avg, 1e-9)
+        atr_s = float(np.clip((atr_ratio - 0.5) / 1.5 * 100, 0, 100))
+        score += atr_s * 0.10
+
+        # — RSI pullback zone (10 pts) —
+        rsi = ind.get("rsi", 50.0)
+        thrs = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
+        if direction == "LONG":
+            lo, hi = thrs["rsi_long"]
+            rsi_s = 100.0 if lo <= rsi <= hi else 40.0 if rsi < 50 else 10.0
+        else:
+            lo, hi = thrs["rsi_short"]
+            rsi_s = 100.0 if lo <= rsi <= hi else 40.0 if rsi > 50 else 10.0
+        score += rsi_s * 0.10
+
+        # — Pattern score (15 pts) — from indicator engine
+        pat_s = float(np.clip(ind.get("pattern_score", 50.0), 0, 100))
+        score += pat_s * 0.15
+
+        # — Market State quality (10 pts) —
+        st_s = self._STATE_QUALITY.get(market_state, 50.0)
+        score += st_s * 0.10
+
+        return float(np.clip(score, 0, 100))
+
+    def breakdown(self, ind: Dict, direction: str, market_state: str) -> Dict:
+        """Return per-component breakdown for logging."""
+        return {
+            "health": round(self.compute(ind, direction, market_state), 1),
+            "ema":  round(ind.get("ema5", 0), 2),
+            "adx":  round(ind.get("adx", 0), 1),
+            "rsi":  round(ind.get("rsi", 50), 1),
+            "macd": round(ind.get("macd_hist", 0), 4),
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# [V8-4] CONFIDENCE SCORER
+# 100-pt conviction: Trend(20) + Momentum(20) + Volume(15) + Volatility(15)
+#                    + Structure(15) + Pattern(15)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ConfidenceScorer:
+    """Compute a 0-100 directional confidence score."""
+
+    LEVELS = [
+        (95, "STRONG_BUY"),
+        (85, "BUY"),
+        (75, "NORMAL"),
+        (65, "WEAK"),
+        (0,  "SKIP"),
+    ]
+
+    def compute(self, ind_15m: Dict, ind_1h: Dict, direction: str) -> float:
+        score = 0.0
+        long = direction == "LONG"
+
+        # — Trend alignment 4H (20 pts) —
+        ema5_1h  = ind_1h.get("ema5",  0.0)
+        ema20_1h = ind_1h.get("ema20", 1.0)
+        slope_1h = ind_1h.get("ema20_slope_score", 50.0)
+        if long:
+            trend_s = 100.0 if ema5_1h > ema20_1h and slope_1h > 52 else \
+                      65.0 if ema5_1h > ema20_1h else 20.0
+        else:
+            trend_s = 100.0 if ema5_1h < ema20_1h and slope_1h < 48 else \
+                      65.0 if ema5_1h < ema20_1h else 20.0
+        score += trend_s * 0.20
+
+        # — Momentum 15M (20 pts) —
+        rsi      = ind_15m.get("rsi", 50.0)
+        mom_s_raw = ind_15m.get("momentum_score", 50.0)
+        if long:
+            rsi_ok   = rsi < 60
+            mom_ok   = mom_s_raw > 50
+        else:
+            rsi_ok   = rsi > 40
+            mom_ok   = mom_s_raw < 50
+        mom_s = 100.0 if (rsi_ok and mom_ok) else 55.0 if (rsi_ok or mom_ok) else 15.0
+        score += mom_s * 0.20
+
+        # — Volume (15 pts) —
+        vol_score = ind_15m.get("volume_score", 50.0)
+        score += float(np.clip(vol_score, 0, 100)) * 0.15
+
+        # — Volatility (15 pts) — ATR in healthy range (not too low, not extreme)
+        atr_score = ind_15m.get("atr_score", 50.0)
+        score += float(np.clip(atr_score, 0, 100)) * 0.15
+
+        # — Structure (15 pts) —
+        struct_score = ind_15m.get("structure_score", 50.0)
+        score += float(np.clip(struct_score, 0, 100)) * 0.15
+
+        # — Pattern (15 pts) —
+        pattern_score = ind_15m.get("pattern_score", 50.0)
+        score += float(np.clip(pattern_score, 0, 100)) * 0.15
+
+        return float(np.clip(score, 0, 100))
+
+    def get_level(self, score: float) -> str:
+        for threshold, label in self.LEVELS:
+            if score >= threshold:
+                return label
+        return "SKIP"
+
+    def get_size_multiplier(self, score: float) -> float:
+        """Translate confidence level to position size multiplier."""
+        if score >= 85:   return 1.0
+        if score >= 75:   return 1.0
+        if score >= 65:   return 0.65
+        return 0.0  # skip
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# [V8-5] REGIME BIAS ENGINE — 5-level macro direction from 4H + 1H
+# STRONG_BULL / BULL / NEUTRAL / BEAR / STRONG_BEAR
+# ──────────────────────────────────────────────────────────────────────────────
+
+class RegimeBiasEngine:
+    """5-level directional bias from 4H and 1H trend structure."""
+
+    def compute(self, ind_4h: Dict, ind_1h: Dict) -> str:
+        score = 0
+
+        # 4H signals — weight 3
+        ema5_4h  = ind_4h.get("ema5",  0.0)
+        ema20_4h = ind_4h.get("ema20", 1.0)
+        slope_4h = ind_4h.get("ema20_slope_score", 50.0)
+        rsi_4h   = ind_4h.get("rsi", 50.0)
+        if ema5_4h > ema20_4h: score += 2
+        elif ema5_4h < ema20_4h: score -= 2
+        if slope_4h > 58:   score += 1
+        elif slope_4h < 42: score -= 1
+        if rsi_4h > 58:     score += 1
+        elif rsi_4h < 42:   score -= 1
+
+        # 1H signals — weight 2
+        ema5_1h  = ind_1h.get("ema5",  0.0)
+        ema20_1h = ind_1h.get("ema20", 1.0)
+        rsi_1h   = ind_1h.get("rsi", 50.0)
+        if ema5_1h > ema20_1h: score += 2
+        elif ema5_1h < ema20_1h: score -= 2
+        if rsi_1h > 55:    score += 1
+        elif rsi_1h < 45:  score -= 1
+
+        if score >= 5:    return "STRONG_BULL"
+        if score >= 2:    return "BULL"
+        if score >= -1:   return "NEUTRAL"
+        if score >= -4:   return "BEAR"
+        return "STRONG_BEAR"
+
+    def allows_long(self, bias: str, market_state: str) -> bool:
+        """
+        Long allowed when:
+        - Trend/Breakout/Momentum state  → bias BULL or STRONG_BULL
+        - Counter-trend (REVERSAL/EXHAUSTION) → bias BEAR or STRONG_BEAR (reverting up)
+        - Mean-revert (SIDEWAY) → always both directions
+        """
+        if market_state == "SIDEWAY":
+            return True
+        if market_state in _COUNTER_TREND_STATES:
+            return bias in ("BEAR", "STRONG_BEAR", "NEUTRAL")
+        return bias in ("BULL", "STRONG_BULL")
+
+    def allows_short(self, bias: str, market_state: str) -> bool:
+        if market_state == "SIDEWAY":
+            return True
+        if market_state in _COUNTER_TREND_STATES:
+            return bias in ("BULL", "STRONG_BULL", "NEUTRAL")
+        return bias in ("BEAR", "STRONG_BEAR")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# [V8-7] PATTERN LEARNING ENGINE — simplified, anti-overfit
+# Tracks per entry_type: WR, Avg R, Avg Hold, Expectancy
+# WR<45% → weight ×0.85 (floor 0.5)   WR>65% → weight ×1.15 (ceil 1.5)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PatternLearningEngine:
+    """Simple per-entry-type win-rate learning.  No AI, no overfitting."""
+
+    ENTRY_TYPES = ["trend_follow", "breakout", "reversal", "mean_revert",
+                   "counter_trend", "momentum"]
+    MIN_TRADES = 10          # minimum trades before adjusting weight
+    MIN_WEIGHT = 0.50
+    MAX_WEIGHT = 1.50
+
+    def __init__(self):
+        self.stats: Dict[str, Dict] = {
+            t: {"wins": 0, "losses": 0, "total_r": 0.0, "total_hold": 0}
+            for t in self.ENTRY_TYPES
+        }
+        self.weights: Dict[str, float] = {t: 1.0 for t in self.ENTRY_TYPES}
+
+    def record(self, entry_type: str, win: bool, r_multiple: float, hold_bars: int):
+        if entry_type not in self.stats:
+            return
+        s = self.stats[entry_type]
+        if win:
+            s["wins"] += 1
+        else:
+            s["losses"] += 1
+        s["total_r"]    += r_multiple
+        s["total_hold"] += hold_bars
+
+    def update_weights(self):
+        """Recalculate weights from accumulated stats."""
+        for t, s in self.stats.items():
+            total = s["wins"] + s["losses"]
+            if total < self.MIN_TRADES:
+                continue
+            wr = s["wins"] / total
+            if wr < 0.45:
+                self.weights[t] = max(self.weights[t] * 0.85, self.MIN_WEIGHT)
+            elif wr > 0.65:
+                self.weights[t] = min(self.weights[t] * 1.15, self.MAX_WEIGHT)
+
+    def get_weight(self, entry_type: str) -> float:
+        return self.weights.get(entry_type, 1.0)
+
+    def get_summary(self) -> Dict:
+        out = {}
+        for t, s in self.stats.items():
+            total = s["wins"] + s["losses"]
+            if total == 0:
+                continue
+            out[t] = {
+                "trades":     total,
+                "win_rate":   round(s["wins"] / total, 3),
+                "avg_r":      round(s["total_r"] / total, 3),
+                "avg_hold":   round(s["total_hold"] / total, 1),
+                "expectancy": round((s["wins"] / total * s["total_r"] / max(s["wins"], 1))
+                                    - (s["losses"] / total * abs(s["total_r"] - s["wins"] / total
+                                                                  * s["total_r"] / max(s["wins"], 1))), 3),
+                "weight":     round(self.weights.get(t, 1.0), 3),
+            }
+        return out
+
+    def to_dict(self) -> Dict:
+        return {"stats": self.stats, "weights": self.weights}
+
+    def from_dict(self, data: Dict):
+        self.stats   = data.get("stats",   self.stats)
+        self.weights = data.get("weights", self.weights)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ADAPTIVE ENGINE (V7 base weights — used as fallback scoring only)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AdaptiveEngine:
-    """
-    จัดการ dynamic weights, ATR volatility state, adaptive thresholds
-    และ learning จาก trade journal
-    """
+    """Legacy per-state score weights (used as context multiplier in FILTERING)."""
 
     def __init__(self):
-        self.regime_tiers = [
-            (90, 1.10), (75, 1.05), (50, 1.00), (30, 0.95), (0, 0.90)
-        ]
         self.atr_percentile_points = [10, 25, 50, 75, 90]
         self.atr_vol_labels = ["Very Low", "Low", "Normal", "High", "Extreme"]
 
-        # MODULE 1 base weights — 8 regimes, sum = 100 per state
+        # Base weights per state — sum=100; used to weight indicator sub-scores
         self.base_weights: Dict[str, Dict[str, float]] = {
-            "STRONG_UPTREND": {
+            "STRONG_TREND": {
                 "trend": 25, "momentum": 20, "volume": 10, "pattern": 8,
                 "structure": 12, "atr": 5, "rsi": 5, "sweep": 0,
                 "divergence": 5, "ema": 5, "vwap": 5, "macd": 0,
             },
-            "UPTREND": {
+            "TRENDING": {
                 "trend": 20, "momentum": 15, "volume": 10, "pattern": 10,
                 "structure": 10, "atr": 5, "rsi": 5, "sweep": 5,
                 "divergence": 5, "ema": 5, "vwap": 5, "macd": 5,
             },
-            "RANGE": {
+            "BREAKOUT": {
+                "trend": 15, "momentum": 20, "volume": 20, "pattern": 10,
+                "structure": 5, "atr": 15, "rsi": 5, "sweep": 5,
+                "divergence": 0, "ema": 5, "vwap": 0, "macd": 0,
+            },
+            "REVERSAL": {
+                "trend": 5, "momentum": 10, "volume": 15, "pattern": 10,
+                "structure": 10, "atr": 5, "rsi": 10, "sweep": 5,
+                "divergence": 20, "ema": 5, "vwap": 5, "macd": 0,
+            },
+            "SIDEWAY": {
                 "trend": 5, "momentum": 10, "volume": 10, "pattern": 15,
                 "structure": 10, "atr": 5, "rsi": 20, "sweep": 10,
                 "divergence": 10, "ema": 0, "vwap": 5, "macd": 0,
-            },
-            "LOW_VOL": {
-                "trend": 10, "momentum": 5, "volume": 5, "pattern": 20,
-                "structure": 10, "atr": 20, "rsi": 5, "sweep": 10,
-                "divergence": 5, "ema": 5, "vwap": 5, "macd": 0,
             },
             "HIGH_VOL": {
                 "trend": 10, "momentum": 15, "volume": 20, "pattern": 10,
                 "structure": 5, "atr": 15, "rsi": 5, "sweep": 5,
                 "divergence": 5, "ema": 5, "vwap": 5, "macd": 0,
             },
-            "DISTRIBUTION": {
-                "trend": 5, "momentum": 15, "volume": 15, "pattern": 10,
-                "structure": 10, "atr": 5, "rsi": 10, "sweep": 5,
-                "divergence": 15, "ema": 5, "vwap": 5, "macd": 0,
-            },
-            "ACCUMULATION": {
-                "trend": 5, "momentum": 10, "volume": 15, "pattern": 10,
-                "structure": 10, "atr": 5, "rsi": 15, "sweep": 5,
-                "divergence": 15, "ema": 5, "vwap": 5, "macd": 0,
-            },
             "EXHAUSTION": {
                 "trend": 5, "momentum": 10, "volume": 15, "pattern": 10,
                 "structure": 10, "atr": 5, "rsi": 10, "sweep": 5,
                 "divergence": 20, "ema": 5, "vwap": 0, "macd": 5,
             },
+            "LOW_VOL": {
+                "trend": 10, "momentum": 5, "volume": 5, "pattern": 20,
+                "structure": 10, "atr": 20, "rsi": 5, "sweep": 10,
+                "divergence": 5, "ema": 5, "vwap": 5, "macd": 0,
+            },
         }
-
-        # MODULE 3 learning stats — tracks win/loss R-multiples per condition per state
-        def _init_stats(w: Dict) -> Dict:
-            return {
-                "win_count": 0, "loss_count": 0,
-                "sum_win_r": 0.0, "sum_loss_r": 0.0,
-                "condition_wins":   {k: 0   for k in w},
-                "condition_total":  {k: 0   for k in w},
-                "condition_win_r":  {k: 0.0 for k in w},
-                "condition_loss_r": {k: 0.0 for k in w},
-            }
-        self._learning_stats: Dict[str, Dict] = {
-            state: _init_stats(w) for state, w in self.base_weights.items()
-        }
-
-    # ── Regime / Volatility helpers ──────────────────────────────────────────
-
-    def get_regime_multiplier(self, regime_score: float) -> float:
-        for threshold, multiplier in self.regime_tiers:
-            if regime_score >= threshold:
-                return multiplier
-        return 0.90
 
     def get_atr_volatility_state(self, current_atr: float, atr_history: List[float]) -> str:
         if len(atr_history) < 20:
@@ -236,136 +510,20 @@ class AdaptiveEngine:
         return "Very Low"
 
     def get_dynamic_weights(self, market_state: str) -> Dict[str, float]:
-        return self.base_weights.get(market_state, self.base_weights["UPTREND"])
-
-    def get_regime_thresholds(self, market_state: str) -> Dict:
-        return REGIME_THRESHOLDS.get(market_state, REGIME_THRESHOLDS["UPTREND"])
-
-    def get_layer_thresholds(self, vol_state: str, market_state: str = "UPTREND") -> Dict[str, float]:
-        """ATR-adaptive + regime-adaptive entry threshold"""
-        l1, l2 = 60.0, 55.0  # base lowered 65→60 for better trade frequency
-        vol_adj = {
-            "Extreme":  (+8, +5),
-            "High":     (+4, +2),
-            "Normal":   ( 0,  0),
-            "Low":      (-4, -2),
-            "Very Low": (-6, -4),
-        }
-        d1, d2 = vol_adj.get(vol_state, (0, 0))
-        regime_delta = REGIME_THRESHOLDS.get(market_state, {}).get("l1_delta", 0)
-        return {
-            "L1_PASS": l1 + d1 + regime_delta,
-            "L2_PASS": l2 + d2 + max(0, regime_delta // 2),
-        }
-
-    # ── MODULE 3: Expectancy-based Learning Engine ───────────────────────────
-
-    def record_trade_result(self, market_state: str, win: bool,
-                            active_conditions: Dict[str, bool],
-                            win_r: float = 1.0, loss_r: float = 1.0):
-        """บันทึกผล trade + R-multiple ต่อ condition สำหรับ expectancy learning"""
-        if market_state not in self._learning_stats:
-            return
-        stats = self._learning_stats[market_state]
-        if win:
-            stats["win_count"] += 1
-            stats["sum_win_r"] += abs(win_r)
-        else:
-            stats["loss_count"] += 1
-            stats["sum_loss_r"] += abs(loss_r)
-
-        for cond, is_active in active_conditions.items():
-            if cond not in stats["condition_total"]:
-                continue
-            stats["condition_total"][cond] += 1
-            if is_active:
-                if win:
-                    stats["condition_wins"][cond] += 1
-                    stats["condition_win_r"][cond] += abs(win_r)
-                else:
-                    stats["condition_loss_r"][cond] += abs(loss_r)
-
-    def adjust_weights_from_learning(self, journal_data: List[Dict]):
-        """
-        MODULE 3: Expectancy-based weight adjustment
-        Expectancy = WR × avg_win_R − (1−WR) × avg_loss_R
-        ปรับ weight ตาม expectancy ของแต่ละ condition เทียบกับ global expectancy
-        แทนที่จะดู win rate อย่างเดียว
-        """
-        if not journal_data:
-            return
-
-        by_state: Dict[str, List[Dict]] = {}
-        for entry in journal_data:
-            state = entry.get("market_state", "UPTREND")
-            by_state.setdefault(state, []).append(entry)
-
-        for state, entries in by_state.items():
-            if state not in self.base_weights or len(entries) < 10:
-                continue
-
-            wins   = [e for e in entries if e.get("win_loss") == "WIN"]
-            losses = [e for e in entries if e.get("win_loss") != "WIN"]
-            total  = len(entries)
-            global_wr = len(wins) / total
-
-            avg_win_r_g  = sum(e.get("win_r",  1.0) for e in wins)   / max(len(wins),   1)
-            avg_loss_r_g = sum(e.get("loss_r", 1.0) for e in losses)  / max(len(losses), 1)
-            global_exp   = global_wr * avg_win_r_g - (1 - global_wr) * avg_loss_r_g
-
-            stats = self._learning_stats.get(state, {})
-            cond_wins_m   = stats.get("condition_wins",   {})
-            cond_total_m  = stats.get("condition_total",  {})
-            cond_win_r_m  = stats.get("condition_win_r",  {})
-            cond_loss_r_m = stats.get("condition_loss_r", {})
-
-            weights = self.base_weights[state]
-            for cond in weights:
-                ct = cond_total_m.get(cond, 0)
-                if ct < 5:
-                    continue
-                cw = cond_wins_m.get(cond, 0)
-                cl = ct - cw
-                cond_wr      = cw / ct
-                avg_win_r_c  = cond_win_r_m.get(cond,  0.0) / max(cw, 1)
-                avg_loss_r_c = cond_loss_r_m.get(cond, 0.0) / max(cl, 1)
-                cond_exp     = cond_wr * avg_win_r_c - (1 - cond_wr) * avg_loss_r_c
-
-                # Scale by expectancy delta — positive = condition predicts good trades
-                delta = (cond_exp - global_exp) * 5
-                weights[cond] = float(np.clip(weights[cond] + delta, 3, 40))
-
-            total_w = sum(weights.values())
-            if total_w > 0:
-                factor = 100 / total_w
-                for k in weights:
-                    weights[k] = round(weights[k] * factor, 1)
+        return self.base_weights.get(market_state, self.base_weights["TRENDING"])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# POSITION HEALTH CALCULATOR
+# POSITION HEALTH CALCULATOR (unchanged from V7)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class PositionHealthCalculator:
-    """
-    [FIX 1] คำนวณ position health score 0–100 จาก 5 ตัวชี้วัด
-    แทนที่ค่าคงที่แบบเดิมที่ไม่ได้คำนวณอะไรจริง
-    """
+    """คำนวณ position health score 0–100 จาก 5 ตัวชี้วัด"""
 
     def calculate(self, ind: Dict[str, Any], trade: Dict[str, Any],
                   current_price: float) -> float:
-        """
-        Returns health score 0–100
-        Components:
-          - Momentum health (30%): RSI + MACD alignment
-          - Volume health    (20%): volume vs avg volume
-          - Structure health (20%): price vs key MAs
-          - ATR health       (15%): ATR expansion vs entry ATR
-          - Trend health     (15%): ADX strength
-        """
         scores = []
 
-        # 1. Momentum (RSI + MACD)
         rsi = ind.get("rsi", 50)
         direction = trade.get("direction", "LONG")
         if direction == "LONG":
@@ -379,17 +537,15 @@ class PositionHealthCalculator:
             macd_score = 80.0 if macd > macd_signal else 30.0
         else:
             macd_score = 80.0 if macd < macd_signal else 30.0
-        momentum_score = (rsi_score * 0.6 + macd_score * 0.4)
+        momentum_score = rsi_score * 0.6 + macd_score * 0.4
         scores.append(("momentum", momentum_score, 0.30))
 
-        # 2. Volume
         volume = ind.get("volume", 0)
         vol_avg = ind.get("vol_avg", volume if volume > 0 else 1)
         vol_ratio = volume / max(vol_avg, 1e-9)
         vol_score = float(np.clip(vol_ratio * 60, 0, 100))
         scores.append(("volume", vol_score, 0.20))
 
-        # 3. Structure (price vs EMA)
         ema5 = ind.get("ema5", current_price)
         ema20 = ind.get("ema20", current_price)
         if direction == "LONG":
@@ -400,34 +556,30 @@ class PositionHealthCalculator:
                            60.0 if current_price < ema20 else 20.0
         scores.append(("structure", struct_score, 0.20))
 
-        # 4. ATR health — ถ้า ATR ขยายมากกว่า entry ATR > 1.5x แสดงว่า volatility spike
         entry_atr = trade.get("atr_at_entry", ind.get("atr", 1))
         current_atr = ind.get("atr", entry_atr)
         atr_ratio = current_atr / max(entry_atr, 1e-9)
         atr_score = float(np.clip((2.0 - atr_ratio) / 1.0 * 100, 0, 100))
         scores.append(("atr", atr_score, 0.15))
 
-        # 5. Trend (ADX)
         adx = ind.get("adx", 20)
         adx_score = float(np.clip((adx - 15) / 25 * 100, 0, 100))
         scores.append(("trend", adx_score, 0.15))
 
-        # Weighted average
         total = sum(score * weight for _, score, weight in scores)
         return float(np.clip(total, 0, 100))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TRADING BOT
+# TRADING BOT — V8
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TradingBot:
     """
-    State machine trading bot พร้อมใช้งาน
-    ทุก bug ที่พบได้รับการแก้ไขแล้ว
+    V8 state-machine trading bot.
+    SwingReversalPro with all 7 V8 improvements.
     """
 
-    # State machine states
     STATES = {
         "SCANNING", "FILTERING", "WAIT_CONFIRM", "PENDING_ORDER",
         "IN_POSITION", "PARTIAL_EXIT", "TRAILING", "EXITING",
@@ -445,101 +597,69 @@ class TradingBot:
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
                  startup_warmup_minutes: int = 45):
-        """
-        Parameters
-        ----------
-        tp1_close_pct : สัดส่วนที่ปิดตอน TP1 hit (ที่เหลือเป็น runner ไปจน TP2 ซึ่งปิดทั้งหมด)
-            ค่า default 0.50 = ปิดครึ่งหนึ่งที่ TP1 แล้วขยับ SL ไป breakeven ทันที
-            ปรับได้ตามสไตล์ — ใส่ 0.30 ถ้าอยากปิดน้อยกว่าตอน TP1 และเก็บ runner ไว้มากกว่า
-        execution_callback : callable(order_type, trade_info) → None
-            ฟังก์ชัน callback สำหรับส่งคำสั่งไปยัง exchange จริง
-            order_type: 'OPEN_LONG' | 'OPEN_SHORT' | 'CLOSE_PARTIAL' | 'CLOSE_FULL'
-            trade_info: dict ประกอบด้วย entry, sl, tp1, tp2, size, reason
-            ถ้า None จะ log เท่านั้น (paper trading mode)
-        """
-        # Core state
         self.state: str = "SCANNING"
-        self.adaptive_engine = AdaptiveEngine()
-        self.health_calc = PositionHealthCalculator()
-        self.tp1_close_pct = tp1_close_pct
-        self._state_file: str = state_file or self.DEFAULT_STATE_FILE
+        self.adaptive_engine   = AdaptiveEngine()
+        self.health_calc       = PositionHealthCalculator()
+        self.entry_scorer      = EntryHealthScorer()
+        self.conf_scorer       = ConfidenceScorer()
+        self.bias_engine       = RegimeBiasEngine()
+        self.learning_engine   = PatternLearningEngine()
+        self.tp1_close_pct     = tp1_close_pct
+        self._state_file: str  = state_file or self.DEFAULT_STATE_FILE
 
-        # Account
-        self.account_balance = account_balance
-        self.base_risk_pct = base_risk_pct
-
-        # Risk limits
-        self.daily_loss_limit_pct = daily_loss_limit_pct
+        self.account_balance       = account_balance
+        self.base_risk_pct         = base_risk_pct
+        self.daily_loss_limit_pct  = daily_loss_limit_pct
         self.daily_profit_limit_pct = daily_profit_limit_pct
-        self.cooldown_minutes = cooldown_minutes
-        self.max_loss_streak = max_loss_streak
+        self.cooldown_minutes      = cooldown_minutes
+        self.max_loss_streak       = max_loss_streak
 
-        # Position tracking
-        self.position_open: bool = False
-        self.order_status: str = "CLOSED"
-        self.current_trade: Dict[str, Any] = {}
+        self.position_open: bool     = False
+        self.order_status: str       = "CLOSED"
+        self.current_trade: Dict     = {}
 
-        # Market state
-        self.atr_history: List[float] = []
-        self.current_market_state: str = "Sideway"
-        self.regime_score: float = 0.0
-        self.direction_focus: Optional[str] = None
-        self.bars_since_trigger: int = 0
+        self.atr_history: List[float]               = []
+        self.current_market_state: str              = "SIDEWAY"
+        self.current_regime_bias: str               = "NEUTRAL"
+        self.regime_score: float                    = 0.0
+        self.direction_focus: Optional[str]         = None
+        self.bars_since_trigger: int                = 0
 
-        # Risk tracking
-        self.loss_streak: int = 0
-        self.win_streak: int = 0
-        self.daily_pnl_pct: float = 0.0
-        # [FIX 9] ใช้ datetime แทน float timestamp
+        # [V8-6] Cooldown trackers
+        self.loss_streak: int              = 0
+        self.win_streak: int               = 0
+        self.consecutive_sl_hits: int      = 0    # reset on win or non-SL close
+        self.session_losses: int           = 0    # total losses in current trading day
+        self.daily_pnl_pct: float          = 0.0
         self.cooldown_until: Optional[datetime.datetime] = None
-        self.trading_date: Optional[datetime.date] = None
-        # Tick-scoped "now" — set at top of on_tick() so all sub-methods share same bar time
-        self._bar_now: Optional[datetime.datetime] = None
+        self.trading_date: Optional[datetime.date]       = None
+        self._bar_now: Optional[datetime.datetime]       = None
 
-        # Journal
         self.trade_journal: List[Dict] = []
-
-        # Execution
-        self.execution_callback = execution_callback
-
-        # [FIX 5] infinite loop guard
-        self._tick_depth: int = 0
-        self._max_tick_depth: int = 6
-
-        # Bar counter for holding_bars tracking
-        self._bar_count: int = 0
-        self._position_entry_bar: int = 0
-
-        # Post-restart warmup — block signals for N minutes after startup
-        # so ATR history, indicators and market state can stabilize
-        self.startup_warmup_minutes: int = startup_warmup_minutes
+        self.execution_callback        = execution_callback
+        self._tick_depth: int          = 0
+        self._max_tick_depth: int      = 6
+        self._bar_count: int           = 0
+        self._position_entry_bar: int  = 0
+        self.startup_warmup_minutes    = startup_warmup_minutes
         self._startup_unblock_at: Optional[datetime.datetime] = None
+        self._last_candle_15m: Dict    = {}
+        self._log: List[str]           = []
 
-        # Last 15m candle — stored per tick for reversal detection
-        self._last_candle_15m: Dict = {}
-
-        # Logging
-        self._log: List[str] = []
+        # Last computed scores (for health report / logging)
+        self._last_entry_health: float    = 0.0
+        self._last_confidence: float      = 0.0
+        self._last_confidence_level: str  = "SKIP"
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _log_event(self, msg: str, level: str = "info"):
-        """[FIX 11] log ผ่าน logging module จริง (console only — no file handler on Railway)"""
         log_fn = getattr(logger, level, logger.info)
         log_fn(msg)
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._log.append(f"[{ts}] {msg}")
 
     def _send_order(self, order_type: str, trade_info: Dict):
-        """
-        ส่งคำสั่งผ่าน execution_callback (เช่น OKXExecutionAdapter.execute จาก okx_exchange.py)
-        หรือ log เป็น paper-trading ถ้าไม่มี callback
-
-        [FIX 12] execution_callback รับผิดชอบ retry เอง (network/rate-limit errors)
-        ที่นี่จับเฉพาะ exception ที่ "หลุด" ออกมาหลัง retry หมดแล้ว หรือเป็น fatal error
-        (auth ผิด, fund ไม่พอ, invalid order) แล้วหยุดบอทเข้า ERROR state ทันที
-        เพื่อไม่ให้ trade ต่อไปด้วยสถานะที่ไม่รู้ว่า order จริงสำเร็จหรือไม่
-        """
         if self.execution_callback:
             try:
                 result = self.execution_callback(order_type, trade_info)
@@ -547,8 +667,7 @@ class TradingBot:
                 return result
             except Exception as e:
                 self._log_event(
-                    f"[ERROR] execution_callback failed for {order_type} "
-                    f"(trade_info={trade_info}): {e}",
+                    f"[ERROR] execution_callback failed for {order_type}: {e}",
                     level="error",
                 )
                 self.state = "ERROR"
@@ -557,15 +676,12 @@ class TradingBot:
             self._log_event(f"[PAPER] {order_type}: {trade_info}")
             return None
 
-    # [FIX 6] _scale_score — cap input ที่ 100
     @staticmethod
     def _scale_score(val: float, max_weight: float) -> float:
-        val_clamped = min(float(val), 100.0)
-        return min((val_clamped / 100.0) * max_weight, max_weight)
+        return min((min(float(val), 100.0) / 100.0) * max_weight, max_weight)
 
     @staticmethod
     def _health_level(score: float) -> str:
-        """Classify numeric health score (0-100) into a named level."""
         if score >= 80: return "STRONG"
         if score >= 60: return "GOOD"
         if score >= 40: return "WARN"
@@ -573,16 +689,6 @@ class TradingBot:
         return "CRITICAL"
 
     def _detect_reversal_signals(self, ind_15m: Dict) -> Dict:
-        """
-        Detect two reversal patterns for open position protection:
-
-        reversal_spike — large wick against position direction on the last candle.
-          LONG: big upper wick (>60% range) + bearish close → rejection at high.
-          SHORT: big lower wick (>60% range) + bullish close → rejection at low.
-
-        trend_fade — trend momentum collapsing while holding (≥4 bars):
-          ADX < 14 AND (EMA5/EMA20 gap < 0.25% OR MACD histogram turned against).
-        """
         signals: Dict = {}
         if not self.position_open or not self.current_trade:
             return signals
@@ -591,36 +697,33 @@ class TradingBot:
         c = self._last_candle_15m
 
         if c:
-            high        = c.get("high",  0.0)
-            low         = c.get("low",   0.0)
-            close       = c.get("close", 0.0)
-            open_price  = c.get("open",  close)
+            high       = c.get("high",  0.0)
+            low        = c.get("low",   0.0)
+            close      = c.get("close", 0.0)
+            open_price = c.get("open",  close)
             total_range = max(high - low, 1e-9)
-            body_top    = max(close, open_price)
-            body_bot    = min(close, open_price)
-            upper_wick  = high - body_top
-            lower_wick  = body_bot - low
+            body_top   = max(close, open_price)
+            body_bot   = min(close, open_price)
+            upper_wick = high - body_top
+            lower_wick = body_bot - low
 
             if direction == "LONG":
-                # Bearish rejection: large upper wick + close lower than open
                 if (upper_wick / total_range > 0.60
                         and close < open_price
                         and upper_wick > lower_wick * 1.5):
                     signals["reversal_spike"] = {
-                        "severity":   "HIGH",
+                        "severity": "HIGH",
                         "wick_ratio": round(upper_wick / total_range, 2),
                     }
             else:
-                # Bullish rejection: large lower wick + close higher than open
                 if (lower_wick / total_range > 0.60
                         and close > open_price
                         and lower_wick > upper_wick * 1.5):
                     signals["reversal_spike"] = {
-                        "severity":   "HIGH",
+                        "severity": "HIGH",
                         "wick_ratio": round(lower_wick / total_range, 2),
                     }
 
-        # Trend fade — only meaningful after position has had time to develop
         holding_bars = self._bar_count - self._position_entry_bar
         if holding_bars >= 4:
             adx       = ind_15m.get("adx", 20)
@@ -644,61 +747,57 @@ class TradingBot:
 
         return signals
 
-    # ── MODULE 1: 8-State Market Regime Engine ───────────────────────────────
+    # ── [V8-1] MODULE 1: Market State Engine (8 states) ─────────────────────
 
     def _step1_market_state_engine(self, ind: Dict) -> str:
         """
-        8-state regime detection from 4H indicators.
-        Priority order: HIGH_VOL → LOW_VOL → STRONG_UPTREND → UPTREND
-                      → EXHAUSTION → DISTRIBUTION → ACCUMULATION → RANGE
+        8-state regime from 4H indicators.
+        Priority: HIGH_VOL → LOW_VOL → BREAKOUT → STRONG_TREND
+                → TRENDING → REVERSAL → EXHAUSTION → SIDEWAY
         """
-        adx     = ind.get("adx", 0)
-        eff     = ind.get("eff_ratio", 0)
-        atr_exp = ind.get("atr_exp", 1.0)
-        bb_w    = ind.get("bb_width", 0.5)
-        pdi     = ind.get("pdi", 20)
-        mdi     = ind.get("mdi", 20)
-        rsi     = ind.get("rsi", 50)
-        ema5    = ind.get("ema5", 0)
-        ema20   = ind.get("ema20", 0)
-        slope   = ind.get("ema20_slope_score", 50)  # >55 rising, <45 falling
+        adx      = ind.get("adx", 0)
+        eff      = ind.get("eff_ratio", 0)
+        atr_exp  = ind.get("atr_exp", 1.0)
+        bb_w     = ind.get("bb_width", 0.5)
+        pdi      = ind.get("pdi", 20)
+        mdi      = ind.get("mdi", 20)
+        rsi      = ind.get("rsi", 50)
+        volume   = ind.get("volume", 0)
+        vol_avg  = ind.get("vol_avg", max(volume, 1))
+        vol_ratio = volume / max(vol_avg, 1e-9)
 
-        # Extreme volatility expansion — must trade cautiously
+        # 1. HIGH_VOL — dangerous volatility expansion
         if atr_exp > 1.8 and bb_w > 0.7:
             return "HIGH_VOL"
 
-        # Volatility squeeze — pre-breakout phase
+        # 2. LOW_VOL — squeeze, skip
         if bb_w < 0.2 and atr_exp < 0.8:
             return "LOW_VOL"
 
-        # Strong uptrend: efficient trend with bulls clearly dominating
-        # [FIX] Checked BEFORE EXHAUSTION — a trending market with somewhat
-        # low efficiency is still an UPTREND, not EXHAUSTION. Previously
-        # ADX>18 + eff<0.30 fired first and blocked valid UPTREND entries.
-        if adx > 22 and eff > 0.55 and pdi > mdi + 3:
-            return "STRONG_UPTREND"
+        # 3. BREAKOUT — expanding from compression with volume confirmation
+        if bb_w > 0.3 and atr_exp > 1.2 and vol_ratio > 1.4 and adx < 24:
+            return "BREAKOUT"
 
-        # Uptrend: bulls leading with some directional efficiency
-        if adx > 16 and eff > 0.35 and pdi > mdi:
-            return "UPTREND"
+        # 4. STRONG_TREND — efficient trend, large DI gap
+        if adx > 25 and eff > 0.55 and abs(pdi - mdi) > 8:
+            return "STRONG_TREND"
 
-        # Distribution: above EMA20 but momentum fading + RSI extended
-        if ema5 > ema20 and slope < 47 and rsi > 50 and adx < 22:
-            return "DISTRIBUTION"
+        # 5. TRENDING — moderate trend with directional dominance
+        if adx > 18 and eff > 0.35 and abs(pdi - mdi) > 3:
+            return "TRENDING"
 
-        # Accumulation: below EMA20 + RSI neutral/oversold + low ADX
-        if ema5 < ema20 and rsi < 50 and adx < 22:
-            return "ACCUMULATION"
+        # 6. REVERSAL — extreme RSI with fading efficiency
+        if (rsi > 68 or rsi < 32) and adx > 15 and eff < 0.42:
+            return "REVERSAL"
 
-        # Exhaustion: elevated ADX but directional efficiency has collapsed
-        # (no longer trending despite historical momentum).
-        # Checked AFTER trend states so genuine uptrends aren't misclassified.
+        # 7. EXHAUSTION — elevated ADX but directional efficiency collapsed
         if adx > 20 and eff < 0.28:
             return "EXHAUSTION"
 
-        return "RANGE"
+        # 8. SIDEWAY — default (ranging/no-trend)
+        return "SIDEWAY"
 
-    # ── Step 2: 4H Regime score ──────────────────────────────────────────────
+    # ── Step 2: 4H Regime score ───────────────────────────────────────────────
 
     def _step2_4h_regime(self, ind: Dict) -> float:
         score  = self._scale_score(ind.get("ema20_slope_score", 50), 30)
@@ -708,19 +807,17 @@ class TradingBot:
         score += self._scale_score(ind.get("vol_score",         50), 15)
         return float(np.clip(score, 0, 100))
 
-    # ── Step 3: Global gates ─────────────────────────────────────────────────
+    # ── Step 3: Global gates ──────────────────────────────────────────────────
 
     def _check_global_gates(self) -> bool:
         if self.position_open:
             return False
 
-        # [FIX 9] datetime comparison — use bar time in backtest, wall-clock in live
         _now = self._bar_now or datetime.datetime.now()
 
-        # Post-restart warmup: wait for indicators/ATR history to stabilize
         if self._startup_unblock_at and _now < self._startup_unblock_at:
             remaining = int((self._startup_unblock_at - _now).total_seconds() / 60)
-            self._log_event(f"WARMUP: {remaining}m remaining — no new entries", level="debug")
+            self._log_event(f"WARMUP: {remaining}m remaining", level="debug")
             return False
 
         if self.cooldown_until and _now < self.cooldown_until:
@@ -729,92 +826,94 @@ class TradingBot:
 
         if self.daily_pnl_pct <= self.daily_loss_limit_pct:
             self.state = "BLOCKED"
-            self._log_event(f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit loss limit", level="warning")
+            self._log_event(
+                f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit loss limit",
+                level="warning",
+            )
             return False
 
         if self.daily_pnl_pct >= self.daily_profit_limit_pct:
             self.state = "BLOCKED"
-            self._log_event(f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit profit limit", level="warning")
-            return False
-
-        # MODULE 2: regime gate — ทุก state เทรดได้ แต่ต้องผ่าน threshold ต่างกัน
-        if self.current_market_state not in _TRADEABLE_STATES:
             self._log_event(
-                f"SKIP: unknown market_state={self.current_market_state}",
-                level="debug",
+                f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit profit limit",
+                level="warning",
             )
             return False
 
-        # Direction compatibility with regime (DISTRIBUTION=SHORT only, ACCUMULATION=LONG only)
-        if self.direction_focus is not None:
-            rt = REGIME_THRESHOLDS.get(self.current_market_state, {})
-            if self.direction_focus == "LONG" and not rt.get("allow_long", True):
-                self._log_event(
-                    f"SKIP: {self.current_market_state} blocks LONG entries",
-                    level="debug",
-                )
-                return False
-            if self.direction_focus == "SHORT" and not rt.get("allow_short", True):
-                self._log_event(
-                    f"SKIP: {self.current_market_state} blocks SHORT entries",
-                    level="debug",
-                )
-                return False
+        # [V8-1] LOW_VOL: skip immediately
+        if self.current_market_state == "LOW_VOL":
+            self._log_event("SKIP: LOW_VOL — awaiting breakout", level="debug")
+            return False
+
+        if self.current_market_state not in _TRADEABLE_STATES:
+            self._log_event(
+                f"SKIP: unrecognised state={self.current_market_state}", level="debug"
+            )
+            return False
 
         return True
 
-    # ── Step 4: Layer filtering ──────────────────────────────────────────────
+    # ── Step 4: FILTERING — [V8-3/V8-4/V8-5] Entry Health + Confidence + Bias ─
 
-    def _layer_filtering(self, direction: str, ind: Dict,
-                         market_state: str, vol_state: str) -> bool:
-        weights = self.adaptive_engine.get_dynamic_weights(market_state)
+    def _layer_filtering(self, direction: str, ind_15m: Dict,
+                         market_state: str, ind_1h: Dict, ind_4h: Dict) -> bool:
+        """
+        Pass all three gates:
+        1. Regime Bias allows this direction
+        2. Entry Health Score ≥ health_min for this state
+        3. Confidence Score ≥ confidence_min for this state
+        """
+        bias = self.current_regime_bias
 
-        layer_score = 0.0
-        for key in ["trend", "momentum", "volume", "pattern", "structure",
-                    "atr", "rsi", "sweep", "divergence", "ema", "vwap", "macd"]:
-            layer_score += self._scale_score(
-                ind.get(f"{key}_score", 0), weights.get(key, 0)
-            )
+        # [V8-5] Bias gate
+        if direction == "LONG" and not self.bias_engine.allows_long(bias, market_state):
+            return False
+        if direction == "SHORT" and not self.bias_engine.allows_short(bias, market_state):
+            return False
 
-        multiplier = self.adaptive_engine.get_regime_multiplier(self.regime_score)
-        layer_score *= multiplier
+        # [V8-3] Entry Health
+        health = self.entry_scorer.compute(ind_15m, direction, market_state)
+        thrs   = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
+        health_min = thrs["health_min"]
+        if health < health_min:
+            return False
 
-        thresholds = self.adaptive_engine.get_layer_thresholds(vol_state, market_state)
-        return layer_score >= thresholds["L1_PASS"]
+        # [V8-4] Confidence
+        confidence     = self.conf_scorer.compute(ind_15m, ind_1h, direction)
+        conf_min       = thrs["confidence_min"]
+        conf_level     = self.conf_scorer.get_level(confidence)
+        if confidence < conf_min:
+            return False
 
-    # ── [FIX 17] Step 3.5: 1H trend filter — กรองทิศทางก่อนเข้าไม้จาก 15M ──────
+        # Store for use in sizing and logging
+        self._last_entry_health    = health
+        self._last_confidence      = confidence
+        self._last_confidence_level = conf_level
+        return True
+
+    # ── Step 3.5: 1H trend alignment check ───────────────────────────────────
 
     def _check_htf_trend_filter(self, direction: str, ind_1h: Dict) -> bool:
-        """
-        ยืนยันว่าแนวโน้ม 1H ไปทางเดียวกับสัญญาณที่เจอบน 15M ก่อนอนุญาตเข้าไม้
-        (4H ใช้กำหนด market_state/regime ทั้งระบบอยู่แล้วใน Step1/Step2 — ส่วนนี้
-        เป็นตัวกรองชั้นกลางเพิ่มเติมระหว่าง 4H กับ entry timeframe 15M)
-
-        เกณฑ์: ADX 1H ต้องมีความแรงพอสมควร (>=15) และโครงสร้าง EMA5/EMA20 บน 1H
-        ต้องสอดคล้องกับทิศทางที่จะเข้า — ถ้า 1H ไม่มีตัวบอกทิศทางชัดเจน ไม่อนุญาตเข้า
-        ปรับเกณฑ์นี้ได้ตามสไตล์เทรดของคุณ (เช่น เพิ่มเช็ค trend_score หรือ adx_score ของ 1H)
-        """
-        adx_1h  = ind_1h.get("adx", 0)
+        """Quick 1H EMA alignment — called from FILTERING as secondary gate."""
+        adx_1h   = ind_1h.get("adx", 0)
         ema5_1h  = ind_1h.get("ema5")
         ema20_1h = ind_1h.get("ema20")
 
-        # MODULE 2: regime-adaptive ADX minimum on 1H
-        rt = REGIME_THRESHOLDS.get(self.current_market_state, REGIME_THRESHOLDS["UPTREND"])
-        adx_min = rt["adx_1h_min"]
+        thrs = ADAPTIVE_THRESHOLDS.get(
+            self.current_market_state, ADAPTIVE_THRESHOLDS["TRENDING"]
+        )
+        adx_min = thrs["adx_min"]
 
         if adx_1h < adx_min or ema5_1h is None or ema20_1h is None:
             return False
 
-        # Allow EMA5 within 0.3% of EMA20 — catches turning points before full crossover.
-        # Works for both trend-follow and reversal states; tested: strict crossover
-        # for reversals reduced trades AND profits without improving WR.
         tolerance = ema20_1h * 0.003
         if direction == "LONG":
             return ema5_1h >= ema20_1h - tolerance
         else:
             return ema5_1h <= ema20_1h + tolerance
 
-    # ── Step 5: Risk engine + sizing ─────────────────────────────────────────
+    # ── Step 5: Risk engine + [V8-3/V8-4] adaptive sizing ───────────────────
 
     def _step5_risk_engine(self, candle: Dict, direction: str, ind: Dict):
         entry_price = float(candle.get("close", 0))
@@ -828,28 +927,44 @@ class TradingBot:
         if sl_dist < 1e-8:
             sl_dist = entry_price * 0.01
 
-        # min_sl_pct floor (2.0%): widen both SL PRICE and sl_dist when the
-        # pattern stop is too tight.  Prevents noise-stops AND oversized positions.
-        # Matches the 2.0% floor applied by BacktestEngine.cfg.min_sl_pct.
         min_sl_dist = entry_price * 0.020
         if sl_dist < min_sl_dist:
             sl_dist = min_sl_dist
-            pattern_sl = entry_price - sl_dist if direction == "LONG" else entry_price + sl_dist
+            pattern_sl = (entry_price - sl_dist if direction == "LONG"
+                          else entry_price + sl_dist)
 
-        # [FIX] win streak risk reduction
+        # Base risk: reduce on win streak
         risk_pct = self.base_risk_pct
         if self.win_streak >= 5:
             risk_pct *= 0.80
-            self._log_event(f"Win streak {self.win_streak} → risk reduced to {risk_pct:.2%}")
+            self._log_event(f"Win streak {self.win_streak} → risk {risk_pct:.2%}")
 
-        risk_amount = self.account_balance * risk_pct
+        # [V8-3/V8-4] Size multiplier from Health + Confidence
+        health     = self._last_entry_health
+        confidence = self._last_confidence
+        conf_mult  = self.conf_scorer.get_size_multiplier(confidence)
+        if conf_mult == 0.0:
+            self._log_event("Confidence too low → skip order", level="warning")
+            return
+
+        health_mult = 1.0 if health >= 75 else 0.65  # reduced for 65-74
+
+        # [V8-7] Pattern learning weight
+        entry_type     = _STATE_ENTRY_TYPE.get(self.current_market_state, "trend_follow")
+        learning_mult  = self.learning_engine.get_weight(entry_type)
+
+        size_mult = conf_mult * health_mult * learning_mult
+        risk_amount   = self.account_balance * risk_pct * size_mult
         position_size = risk_amount / sl_dist
 
         mult = 1 if direction == "LONG" else -1
-        # TP1: 0.7R → close 50% + move SL to breakeven
-        # TP2: 2.0R → close remaining 50% (raised from 1.5R for better expectancy)
         tp1 = entry_price + sl_dist * 0.7 * mult
         tp2 = entry_price + sl_dist * 2.0 * mult
+
+        self._log_event(
+            f"SIZING: health={health:.0f} conf={confidence:.0f}({self._last_confidence_level}) "
+            f"learn={learning_mult:.2f} → size×{size_mult:.2f}"
+        )
 
         self.current_trade = {
             "direction":            direction,
@@ -869,53 +984,48 @@ class TradingBot:
             "remaining_size":       position_size,
             "exit_price":           None,
             "final_rr":             None,
-            "mae":                  0.0,   # max adverse excursion
-            "mfe":                  0.0,   # max favorable excursion
+            "mae":                  0.0,
+            "mfe":                  0.0,
+            "entry_health":         health,
+            "entry_confidence":     confidence,
+            "entry_type":           entry_type,
         }
 
         self._send_order("OPEN_LONG" if direction == "LONG" else "OPEN_SHORT", {
-            "entry":     entry_price,
-            "sl":        float(pattern_sl),
-            "tp1":       tp1, "tp2": tp2,
-            "size":      position_size,
+            "entry": entry_price,
+            "sl":    float(pattern_sl),
+            "tp1":   tp1, "tp2": tp2,
+            "size":  position_size,
         })
 
-        # Only mark position open after order is sent — if _send_order raises,
-        # position_open stays False and on_tick won't enter IN_POSITION for a
-        # trade that never filled.
-        self.position_open = True
-        self._position_entry_bar = self._bar_count
-        self.order_status  = "OPEN"
+        self.position_open         = True
+        self._position_entry_bar   = self._bar_count
+        self.order_status          = "OPEN"
 
-    # ── Step 6: Position management ──────────────────────────────────────────
+    # ── Step 6: Position management (V7 logic unchanged) ─────────────────────
 
-    def _manage_open_position(self, current_price: float,
-                              ind: Dict) -> str:
-        t = self.current_trade
+    def _manage_open_position(self, current_price: float, ind: Dict) -> str:
+        t         = self.current_trade
         direction = t["direction"]
-        sl_dist = t["sl_dist"]
-        dir_mult = 1 if direction == "LONG" else -1
+        sl_dist   = t["sl_dist"]
+        dir_mult  = 1 if direction == "LONG" else -1
         current_r = ((current_price - t["entry"]) * dir_mult) / max(sl_dist, 1e-9)
 
-        # Track MAE / MFE
         t["mae"] = min(t["mae"], current_r)
         t["mfe"] = max(t["mfe"], current_r)
 
-        # ── Reversal protection (spike + trend fade) ───────────────────────
-        # Checked before TP/SL so a sudden spike or fading trend can exit
-        # immediately before a standard SL hit eats too much profit.
         reversal = self._detect_reversal_signals(ind)
         if reversal.get("reversal_spike"):
             sig = reversal["reversal_spike"]
             self._log_event(
-                f"[PROTECT] REVERSAL_SPIKE wick={sig['wick_ratio']:.0%} → exit now",
+                f"[PROTECT] REVERSAL_SPIKE wick={sig['wick_ratio']:.0%} → exit",
                 level="warning",
             )
             self._close_position("REVERSAL_SPIKE", current_price, 1.0, ind)
             return "EXITING"
 
         if reversal.get("trend_fade"):
-            sig = reversal["trend_fade"]
+            sig  = reversal["trend_fade"]
             atr  = ind.get("atr", t["sl_dist"] * 0.5)
             mult = 1 if direction == "LONG" else -1
             tight_sl = current_price - atr * 0.8 * mult
@@ -924,11 +1034,10 @@ class TradingBot:
             else:
                 t["sl"] = min(t["sl"], tight_sl)
             self._log_event(
-                f"[PROTECT] TREND_FADE ADX={sig['adx']} → SL tightened to {t['sl']:.2f}",
+                f"[PROTECT] TREND_FADE ADX={sig['adx']} → SL → {t['sl']:.2f}",
                 level="warning",
             )
 
-        # ── [FIX 7] Emergency exit conditions ─────────────────────────────
         emergency_signals = [
             ind.get("opposite_choch"),
             ind.get("atr_collapse"),
@@ -940,9 +1049,6 @@ class TradingBot:
             self._close_position("EMERGENCY_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
-        # ── Partial TP — [FIX 16] เหลือแค่ TP1/TP2 ──────────────────────────
-        # TP1 = scale-out ตาม tp1_close_pct แล้วขยับ SL ไป breakeven ทันที
-        # TP2 = ปิดที่เหลือทั้งหมด (full exit) — ไม่มี TP3/runner เลย R สูงๆ อีกต่อไป
         if direction == "LONG":
             tp1_hit_cond = current_price >= t["tp1"]
             tp2_hit_cond = current_price >= t["tp2"]
@@ -950,78 +1056,57 @@ class TradingBot:
             tp1_hit_cond = current_price <= t["tp1"]
             tp2_hit_cond = current_price <= t["tp2"]
 
-        # TP2 checked first: if a gap candle clears both TP1 and TP2 on the same tick,
-        # skip the partial TP1 close and exit the full position at TP2 immediately.
+        # TP2 first (gap candle)
         if tp2_hit_cond and not t["tp2_hit"]:
             self._close_position("FULL_TP2", t["tp2"], 1.0, ind)
             t["tp1_hit"] = True
             t["tp2_hit"] = True
             return "EXITING"
 
-        # TP1 — close ตาม tp1_close_pct + [FIX 16] ขยับ SL ไป breakeven ทันที
+        # TP1 — close tp1_close_pct + break-even
         if tp1_hit_cond and not t["tp1_hit"]:
             self._close_position("PARTIAL_TP1", t["tp1"], self.tp1_close_pct, ind)
             t["tp1_hit"] = True
             if not t["break_even_triggered"]:
-                # Direction-aware break-even: only tighten, never widen the SL
                 if direction == "LONG":
                     t["sl"] = max(t["sl"], t["entry"])
                 else:
                     t["sl"] = min(t["sl"], t["entry"])
                 t["break_even_triggered"] = True
                 self._log_event(
-                    f"TP1 hit @ {t['tp1']:.2f} → ปิด {self.tp1_close_pct:.0%} "
-                    f"+ ขยับ SL ไป breakeven ({t['entry']:.2f})"
+                    f"TP1 @ {t['tp1']:.2f} → {self.tp1_close_pct:.0%} close "
+                    f"+ SL → breakeven ({t['entry']:.2f})"
                 )
             self.state = "PARTIAL_EXIT"
 
-        # ── [FIX 1] Health-based position management ──────────────────────
-        # Before TP1: health actions gated — TP1 must be hit first.
-        # In Compression/Sideway states ADX is low by design, which systematically
-        # pulls health to 40-60 and triggers premature break-even before the trade
-        # has any chance to reach TP1. Let the original SL do its job pre-TP1.
-        # After TP1: full health management watches the remaining 50% position.
+        # Health-based position management
         tp1_hit = t.get("tp1_hit", False)
-        health = self.health_calc.calculate(ind, t, current_price)
+        health  = self.health_calc.calculate(ind, t, current_price)
 
         if health >= 80:
             self._log_event(
-                f"Health {health:.0f} (≥80) → HOLD: ปล่อย position วิ่งต่อ "
-                f"(current_r={current_r:.2f})",
-                level="debug",
+                f"Health {health:.0f} (≥80) → HOLD (r={current_r:.2f})", level="debug"
             )
-
         elif health >= 60 or t["break_even_triggered"]:
-            # ATR trailing stop (runs both pre and post TP1 — only tightens SL)
-            atr = ind.get("atr", sl_dist)
+            atr      = ind.get("atr", sl_dist)
             atr_trail = atr * 2
             if direction == "LONG":
-                new_sl = current_price - atr_trail
-                t["sl"] = max(t["sl"], new_sl)
+                t["sl"] = max(t["sl"], current_price - atr_trail)
             else:
-                new_sl = current_price + atr_trail
-                t["sl"] = min(t["sl"], new_sl)
-
+                t["sl"] = min(t["sl"], current_price + atr_trail)
         elif health >= 40:
-            # Force break-even only AFTER TP1 has been hit — prevents Compression-state
-            # false-positive health drops from cutting trades before they develop
             if not t["break_even_triggered"] and tp1_hit:
                 t["sl"] = t["entry"]
                 t["break_even_triggered"] = True
-                self._log_event(f"Health {health:.0f} → forced break-even (post-TP1)")
-
+                self._log_event(f"Health {health:.0f} → forced breakeven (post-TP1)")
         elif health >= 20:
-            # Reduce position size — only act on the remaining portion post-TP1
             if t["remaining_size"] > 0 and tp1_hit:
                 self._close_position("HEALTH_REDUCE", current_price, 0.50, ind)
                 self.state = "PARTIAL_EXIT"
-
         else:
-            # Emergency exit regardless of TP1 state — health is critically low
             self._close_position("POOR_HEALTH_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
-        # ── SL hit check ──────────────────────────────────────────────────
         if direction == "LONG" and current_price <= t["sl"]:
             self._close_position("SL_HIT", t["sl"], 1.0, ind)
             return "EXITING"
@@ -1031,29 +1116,19 @@ class TradingBot:
 
         return self.state
 
-    # ── [FIX 2] Close position — คำนวณ PnL จริง ─────────────────────────────
-
-    def _close_position(self, reason: str, price: float,
-                        portion: float, ind: Dict):
-        """
-        [FIX 2] บันทึก PnL จริง อัปเดต current_trade และส่งคำสั่ง
-
-        portion: 0.0–1.0 (1.0 = ปิดทั้งหมด)
-        """
+    def _close_position(self, reason: str, price: float, portion: float, ind: Dict):
         t = self.current_trade
         if not t or t.get("status") != "OPEN":
             return
 
         direction   = t["direction"]
         entry_price = t["entry"]
-        size        = t["size"]
-        remaining   = t.get("remaining_size", size)
+        remaining   = t.get("remaining_size", t["size"])
 
         close_size = remaining * min(max(float(portion), 0.0), 1.0)
         if close_size <= 0:
             return
 
-        # คำนวณ PnL
         if direction == "LONG":
             pnl_per_unit = float(price) - entry_price
         else:
@@ -1061,10 +1136,9 @@ class TradingBot:
 
         pnl = pnl_per_unit * close_size
 
-        # อัปเดต state
-        t["realized_pnl"] = t.get("realized_pnl", 0.0) + pnl
+        t["realized_pnl"]   = t.get("realized_pnl", 0.0) + pnl
         t["remaining_size"] = remaining - close_size
-        t["exit_price"] = float(price)
+        t["exit_price"]     = float(price)
 
         if t["sl_dist"] > 0:
             t["final_rr"] = pnl_per_unit / t["sl_dist"]
@@ -1082,130 +1156,136 @@ class TradingBot:
             f"| size={close_size:.4f} | pnl={pnl:+.2f}"
         )
 
-        # ถ้าปิดหมดแล้ว
         if portion >= 1.0 or t["remaining_size"] <= 1e-9:
-            t["status"] = "CLOSED"
+            t["status"]        = "CLOSED"
             self.position_open = False
             self.order_status  = "CLOSED"
 
-    # ── Step 7: Journal + learning ────────────────────────────────────────────
+    # ── Step 7: Journal + [V8-6/V8-7] learning ───────────────────────────────
 
-    def _log_trade(self, result: str, ind: Dict, extras: Dict):
-        """
-        [FIX 10] บันทึก trade พร้อม active conditions สำหรับ per-condition learning
-        """
-        t = self.current_trade
+    def _log_trade(self, result: str, close_reason: str, ind: Dict, extras: Dict):
+        t   = self.current_trade
         pnl = t.get("realized_pnl", 0.0)
 
-        # Active conditions ณ เวลา entry (จาก indicator snapshot)
-        active_conditions = {
-            "trend":      ind.get("trend_score", 0) > 60,
-            "momentum":   ind.get("momentum_score", 0) > 60,
-            "volume":     ind.get("volume_score", 0) > 60,
-            "pattern":    ind.get("pattern_score", 0) > 60,
-            "structure":  ind.get("structure_score", 0) > 60,
-            "atr":        ind.get("atr_score", 0) > 60,
-            "rsi":        ind.get("rsi_score", 0) > 60,
-            "sweep":      ind.get("sweep_score", 0) > 60,
-            "divergence": ind.get("divergence_score", 0) > 60,
-            "ema":        ind.get("ema_score", 0) > 60,
-            "vwap":       ind.get("vwap_score", 0) > 60,
-            "macd":       ind.get("macd_score", 0) > 60,
-        }
-
-        # MODULE 3: compute R-multiples for expectancy learning
-        _entry  = t.get("entry", 0.0)
-        _sl     = t.get("sl", _entry)
-        _exit   = t.get("exit_price", _entry)
-        _sl_d   = max(abs(_entry - _sl), 1e-8)
-        _d_mult = 1 if t.get("direction") == "LONG" else -1
+        _entry      = t.get("entry", 0.0)
+        _sl         = t.get("sl", _entry)
+        _exit       = t.get("exit_price", _entry)
+        _sl_d       = max(abs(_entry - _sl), 1e-8)
+        _d_mult     = 1 if t.get("direction") == "LONG" else -1
         _realized_r = _d_mult * (_exit - _entry) / _sl_d
-        _win_r  = max(_realized_r, 0.0)
-        _loss_r = max(-_realized_r, 0.0)
+        _win_r      = max(_realized_r, 0.0)
+        _loss_r     = max(-_realized_r, 0.0)
 
-        _vol_state = self.adaptive_engine.get_atr_volatility_state(
-            ind.get("atr", 0), self.atr_history)
         _holding_bars = self._bar_count - self._position_entry_bar
+        _vol_state    = self.adaptive_engine.get_atr_volatility_state(
+            ind.get("atr", 0), self.atr_history)
+
+        entry_type = t.get("entry_type", _STATE_ENTRY_TYPE.get(self.current_market_state, "trend_follow"))
 
         entry = {
-            "symbol":           extras.get("symbol", "BTCUSDT"),
-            "timeframe":        "15M",
-            "direction":        t.get("direction"),
-            "entry":            t.get("entry"),
-            "exit":             t.get("exit_price"),
-            "sl":               t.get("sl"),
-            "tp1":              t.get("tp1"),
-            "tp2":              t.get("tp2"),
-            "rr":               t.get("final_rr"),
-            "win_loss":         result,
-            "pnl":              pnl,
-            "win_r":            round(_win_r, 3),
-            "loss_r":           round(_loss_r, 3),
-            "mae":              t.get("mae"),
-            "mfe":              t.get("mfe"),
-            "holding_bars":     _holding_bars,
-            "hold_time_sec":    (datetime.datetime.now() - t.get("entry_time", datetime.datetime.now())).total_seconds(),
-            "atr":              ind.get("atr"),
-            "adx":              ind.get("adx"),
-            "rsi":              ind.get("rsi"),
-            "ema":              ind.get("ema5"),
-            "macd":             ind.get("macd"),
-            "market_state":     self.current_market_state,
-            "entry_type":       _REGIME_ENTRY_TYPE.get(self.current_market_state, "trend_follow"),
-            "atr_percentile":   _vol_state,
-            "hour_utc":         (self._bar_now or datetime.datetime.now()).hour,
-            "volatility_state": _vol_state,
-            "regime_score":     self.regime_score,
-            "session":          extras.get("session"),
-            "funding":          extras.get("funding_rate"),
-            "open_interest":    extras.get("oi"),
-            "pattern":          ind.get("pattern"),
-            "entry_reason":     "Strategy Trigger",
-            "exit_reason":      result,
-            "active_conditions": active_conditions,
+            "symbol":              extras.get("symbol", "BTCUSDT"),
+            "timeframe":           "15M",
+            "direction":           t.get("direction"),
+            "entry":               t.get("entry"),
+            "exit":                t.get("exit_price"),
+            "sl":                  t.get("sl"),
+            "tp1":                 t.get("tp1"),
+            "tp2":                 t.get("tp2"),
+            "rr":                  t.get("final_rr"),
+            "win_loss":            result,
+            "pnl":                 pnl,
+            "win_r":               round(_win_r, 3),
+            "loss_r":              round(_loss_r, 3),
+            "mae":                 t.get("mae"),
+            "mfe":                 t.get("mfe"),
+            "holding_bars":        _holding_bars,
+            "hold_time_sec":       (datetime.datetime.now() -
+                                    t.get("entry_time", datetime.datetime.now())).total_seconds(),
+            "atr":                 ind.get("atr"),
+            "adx":                 ind.get("adx"),
+            "rsi":                 ind.get("rsi"),
+            "ema":                 ind.get("ema5"),
+            "macd":                ind.get("macd"),
+            "market_state":        self.current_market_state,
+            "regime_bias":         self.current_regime_bias,
+            "entry_type":          entry_type,
+            "entry_health":        t.get("entry_health"),
+            "entry_confidence":    t.get("entry_confidence"),
+            "atr_percentile":      _vol_state,
+            "hour_utc":            (self._bar_now or datetime.datetime.now()).hour,
+            "volatility_state":    _vol_state,
+            "regime_score":        self.regime_score,
+            "session":             extras.get("session"),
+            "funding":             extras.get("funding_rate"),
+            "open_interest":       extras.get("oi"),
+            "exit_reason":         close_reason,
         }
         self.trade_journal.append(entry)
 
-        # MODULE 3: record to learning engine with R-multiples
-        self.adaptive_engine.record_trade_result(
-            self.current_market_state,
+        # [V8-7] Learning engine record
+        self.learning_engine.record(
+            entry_type,
             win=(result == "WIN"),
-            active_conditions=active_conditions,
-            win_r=_win_r,
-            loss_r=_loss_r,
+            r_multiple=_realized_r,
+            hold_bars=_holding_bars,
         )
+        # Update weights every 20 trades
+        if len(self.trade_journal) % 20 == 0:
+            self.learning_engine.update_weights()
+            self._log_event(
+                f"[LEARN] weights updated: {self.learning_engine.get_summary()}"
+            )
 
         # Update streaks + daily PnL
-        self.daily_pnl_pct += (pnl / max(self.account_balance, 1)) * 100
-        self.account_balance += pnl
+        self.daily_pnl_pct     += (pnl / max(self.account_balance, 1)) * 100
+        self.account_balance   += pnl
 
-        if result == "WIN":
-            self.win_streak += 1
-            self.loss_streak = 0
+        win = (result == "WIN")
+        if win:
+            self.win_streak             += 1
+            self.loss_streak             = 0
+            self.consecutive_sl_hits     = 0
         else:
-            self.loss_streak += 1
-            self.win_streak = 0
-            if self.loss_streak >= self.max_loss_streak:
-                # [FIX 9] datetime cooldown — bar time in backtest, wall-clock in live
-                _now = self._bar_now or datetime.datetime.now()
-                self.cooldown_until = (_now
-                                       + datetime.timedelta(minutes=self.cooldown_minutes))
-                self.state = "COOLDOWN"
-                self._log_event(
-                    f"Loss streak {self.loss_streak} → COOLDOWN until "
-                    f"{self.cooldown_until.strftime('%H:%M:%S')}",
-                    level="warning",
-                )
+            self.loss_streak            += 1
+            self.session_losses         += 1
+            self.win_streak              = 0
+            if close_reason == "SL_HIT":
+                self.consecutive_sl_hits += 1
+            else:
+                self.consecutive_sl_hits  = 0
 
-        # Learning every 100 trades
-        if len(self.trade_journal) % 100 == 0:
-            self.adaptive_engine.adjust_weights_from_learning(self.trade_journal[-100:])
-            self._log_event("Learning engine updated weights from last 100 trades")
+        # [V8-6] Tiered cooldown
+        _now = self._bar_now or datetime.datetime.now()
+        cooldown_mins = None
+
+        if self.consecutive_sl_hits >= 2:
+            cooldown_mins = 90
+            self._log_event(
+                f"[V8-6] {self.consecutive_sl_hits} consecutive SL hits → 90-min cooldown",
+                level="warning",
+            )
+            self.consecutive_sl_hits = 0
+        elif self.session_losses >= 3:
+            cooldown_mins = 240
+            self._log_event(
+                f"[V8-6] {self.session_losses} session losses → 4-hour cooldown",
+                level="warning",
+            )
+        elif self.loss_streak >= self.max_loss_streak:
+            cooldown_mins = self.cooldown_minutes
+            self._log_event(
+                f"Loss streak {self.loss_streak} → {cooldown_mins}m cooldown",
+                level="warning",
+            )
+
+        if cooldown_mins is not None:
+            self.cooldown_until = _now + datetime.timedelta(minutes=cooldown_mins)
+            self.state = "COOLDOWN"
 
         self._log_event(
             f"TRADE CLOSED | {result} | PnL={pnl:+.2f} "
             f"| Balance={self.account_balance:.2f} "
-            f"| WinStreak={self.win_streak} LossStreak={self.loss_streak}"
+            f"| WS={self.win_streak} LS={self.loss_streak} SL_hits={self.consecutive_sl_hits}"
         )
 
     # ── Daily reset ───────────────────────────────────────────────────────────
@@ -1213,11 +1293,56 @@ class TradingBot:
     def _check_daily_reset(self, bar_dt: Optional[datetime.datetime] = None):
         today = (bar_dt.date() if bar_dt else datetime.date.today())
         if self.trading_date != today:
-            self.trading_date = today
-            self.daily_pnl_pct = 0.0
+            self.trading_date    = today
+            self.daily_pnl_pct   = 0.0
+            self.session_losses  = 0    # reset daily loss counter
             if self.state == "BLOCKED":
                 self.state = "SCANNING"
                 self._log_event("New trading day — BLOCKED state reset")
+
+    # ── [V8-2] Entry trigger check (adaptive thresholds) ─────────────────────
+
+    def _check_entry_trigger(self, ind: Dict) -> bool:
+        """
+        Confirm entry from WAIT_CONFIRM using Adaptive Thresholds.
+        RSI gate + MACD mode gate per market state.
+        """
+        direction = self.direction_focus
+        if direction is None:
+            return False
+
+        rsi       = ind.get("rsi", 50)
+        macd      = ind.get("macd", 0.0)
+        macd_sig  = ind.get("macd_signal", 0.0)
+        macd_hist = ind.get("macd_hist", macd - macd_sig)
+        momentum  = ind.get("momentum_score", 50)
+
+        thrs = ADAPTIVE_THRESHOLDS.get(
+            self.current_market_state, ADAPTIVE_THRESHOLDS["TRENDING"]
+        )
+
+        if direction == "LONG":
+            lo, hi = thrs["rsi_long"]
+            if not (lo < rsi < hi):
+                return False
+            if momentum <= 50:
+                return False
+            macd_mode = thrs.get("macd_long", "any")
+            if macd_mode == "above_signal"  and macd <= macd_sig:  return False
+            if macd_mode == "above_zero"    and macd <= 0:          return False
+            if macd_mode == "turning_up"    and macd_hist <= 0:     return False
+        else:
+            lo, hi = thrs["rsi_short"]
+            if not (lo < rsi < hi):
+                return False
+            if momentum >= 50:
+                return False
+            macd_mode = thrs.get("macd_short", "any")
+            if macd_mode == "below_signal"  and macd >= macd_sig:  return False
+            if macd_mode == "below_zero"    and macd >= 0:          return False
+            if macd_mode == "turning_down"  and macd_hist >= 0:     return False
+
+        return True
 
     # ── Core tick engine ──────────────────────────────────────────────────────
 
@@ -1226,23 +1351,19 @@ class TradingBot:
                 extras: Dict, current_price: float,
                 bar_dt: Optional[datetime.datetime] = None):
         """
-        เรียกต่อ closed candle หนึ่งครั้ง (ตาม timeframe เข้าออเดอร์ คือทุกแท่ง 15M ปิด)
-
-        bar_dt : datetime ของแท่ง 15M (ส่งมาจาก backtest หรือ live runner)
-                 ถ้า None จะใช้ datetime.now() — ถูกต้องสำหรับ live trading
-                 ส่ง bar_dt จาก backtest เพื่อให้ cooldown/daily-reset อิง bar time
-                 แทน wall-clock time (กันกรณี backtest ประมวลผลเร็วกว่า 30 นาทีจริง)
+        Called once per closed 15M candle.
+        Signature unchanged from V7 — backtest engine compatible.
         """
         now = bar_dt or datetime.datetime.now()
-        self._bar_now = now  # shared across all sub-methods this tick
+        self._bar_now = now
         self._bar_count += 1
-        self._last_candle_15m = candle_15m  # for reversal spike detection
+        self._last_candle_15m = candle_15m
 
-        # Set startup warmup window on very first tick
         if self._startup_unblock_at is None and self.startup_warmup_minutes > 0:
-            self._startup_unblock_at = now + datetime.timedelta(minutes=self.startup_warmup_minutes)
+            self._startup_unblock_at = now + datetime.timedelta(
+                minutes=self.startup_warmup_minutes)
             self._log_event(
-                f"POST-RESTART WARMUP: blocking new entries until "
+                f"WARMUP: blocking entries until "
                 f"{self._startup_unblock_at.strftime('%H:%M UTC')} "
                 f"({self.startup_warmup_minutes}m)",
                 level="warning",
@@ -1250,22 +1371,18 @@ class TradingBot:
 
         self._check_daily_reset(bar_dt)
 
-        # อัปเดต ATR history — ใช้ 4H เพื่อความนิ่งของ volatility regime classification
-        # (ไม่ใช้ ATR ของ 15M ตรงนี้ เพราะจะ noisy เกินไปสำหรับ threshold ระดับ regime;
-        #  ส่วน SL distance/position sizing ใน _step5_risk_engine ใช้ pattern/ATR ของ 15M เอง)
         atr_4h = ind_4h.get("atr", 0)
         if atr_4h > 0:
             self.atr_history.append(atr_4h)
             if len(self.atr_history) > 200:
                 self.atr_history.pop(0)
 
-        # อัปเดต market state จาก 4H (macro regime)
+        # [V8-1] Market state from 4H
         self.current_market_state = self._step1_market_state_engine(ind_4h)
         self.regime_score          = self._step2_4h_regime(ind_4h)
-        vol_state                  = self.adaptive_engine.get_atr_volatility_state(
-                                         atr_4h, self.atr_history)
+        # [V8-5] Regime bias from 4H + 1H
+        self.current_regime_bias   = self.bias_engine.compute(ind_4h, ind_1h)
 
-        # [FIX 5] State machine loop — guard ป้องกัน infinite loop
         self._tick_depth = 0
         state_changed = True
 
@@ -1273,187 +1390,138 @@ class TradingBot:
             state_changed = False
             self._tick_depth += 1
 
-            # ── BLOCKED / COOLDOWN ─────────────────────────────────────────
             if self.state in ("BLOCKED", "COOLDOWN"):
-                # [FIX 9] datetime comparison — use bar time in backtest, wall-clock in live
                 if (self.state == "COOLDOWN" and
-                        (self.cooldown_until is None or
-                         now >= self.cooldown_until)):
-                    self.state = "SCANNING"
-                    self.loss_streak = 0   # reset so next loss doesn't re-trigger immediately
+                        (self.cooldown_until is None or now >= self.cooldown_until)):
+                    self.state       = "SCANNING"
+                    self.loss_streak = 0
                     self._log_event("Cooldown expired → SCANNING")
-                    state_changed = True
+                    state_changed    = True
 
-            # ── SCANNING ───────────────────────────────────────────────────
             elif self.state == "SCANNING":
-                # [FIX] Reset direction_focus on each SCANNING pass.
-                # direction_focus persists from FILTERING and is never cleared
-                # when a trade exits, a WAIT_CONFIRM times out, or the regime
-                # changes.  If it stays as "LONG" when the new regime is
-                # DISTRIBUTION (allow_long=False), _check_global_gates()
-                # permanently returns False — bot stuck in SCANNING forever.
                 self.direction_focus = None
                 if self._check_global_gates():
-                    self.state = "FILTERING"
+                    self.state    = "FILTERING"
                     state_changed = True
 
-            # ── FILTERING ──────────────────────────────────────────────────
-            # [FIX 17] scoring ใช้ ind_15m (entry timeframe) แต่ต้องผ่าน 1H trend
-            # filter ก่อน ไม่ใช่แค่ดู 15M เพียวๆ — กันสัญญาณสวนเทรนด์ใหญ่
             elif self.state == "FILTERING":
-                # Score both directions, pick the highest-scoring one that passes all filters
-                best_dir: Optional[str] = None
-                best_score: float = -1.0
-                weights = self.adaptive_engine.get_dynamic_weights(self.current_market_state)
-                thresholds = self.adaptive_engine.get_layer_thresholds(vol_state, self.current_market_state)
-                multiplier = self.adaptive_engine.get_regime_multiplier(self.regime_score)
-                rt_current = REGIME_THRESHOLDS.get(self.current_market_state, {})
+                best_dir: Optional[str]  = None
+                best_health: float       = -1.0
+                vol_state = self.adaptive_engine.get_atr_volatility_state(
+                    atr_4h, self.atr_history)
+
                 for direction in ("LONG", "SHORT"):
-                    # [FIX] Enforce regime direction gates (allow_long/allow_short)
-                    # These were dead code in _check_global_gates (direction_focus=None there)
-                    if direction == "LONG" and not rt_current.get("allow_long", True):
-                        continue
-                    if direction == "SHORT" and not rt_current.get("allow_short", True):
-                        continue
+                    # Quick 1H structural filter
                     if not self._check_htf_trend_filter(direction, ind_1h):
                         continue
-                    # [FIX] Direction-aware scoring: SHORT in bearish market should score HIGH,
-                    # not LOW.  Invert LONG-biased indicator scores for SHORT direction so that
-                    # bearish conditions (structure=15, ema_score<50, momentum<50, etc.) become
-                    # high scores that properly reflect SHORT-favourable conditions.
-                    # Neutral indicators (volume, atr, rsi, sweep, divergence, pattern, trend)
-                    # are unchanged — trend_score is already direction-agnostic (high for any
-                    # strong trend regardless of direction).
-                    if direction == "SHORT":
-                        dir_ind = {**ind_15m,
-                                   **{f"{k}_score": 100.0 - ind_15m.get(f"{k}_score", 50.0)
-                                      for k in _DIR_INVERT_KEYS}}
-                    else:
-                        dir_ind = ind_15m
-                    raw_score = sum(
-                        self._scale_score(dir_ind.get(f"{k}_score", 0), weights.get(k, 0))
-                        for k in weights
-                    ) * multiplier
-                    if raw_score >= thresholds["L1_PASS"] and raw_score > best_score:
-                        best_score = raw_score
-                        best_dir = direction
+
+                    # [V8-3/4/5] Full health + confidence + bias gate
+                    if not self._layer_filtering(
+                            direction, ind_15m, self.current_market_state,
+                            ind_1h, ind_4h):
+                        continue
+
+                    if self._last_entry_health > best_health:
+                        best_health = self._last_entry_health
+                        best_dir    = direction
+                        best_health_stored   = self._last_entry_health
+                        best_conf_stored     = self._last_confidence
+                        best_conf_lvl_stored = self._last_confidence_level
 
                 if best_dir is not None:
-                    self.direction_focus   = best_dir
-                    self.state             = "WAIT_CONFIRM"
-                    self.bars_since_trigger = 0
+                    self._last_entry_health    = best_health_stored
+                    self._last_confidence      = best_conf_stored
+                    self._last_confidence_level = best_conf_lvl_stored
+                    self.direction_focus        = best_dir
+                    self.state                  = "WAIT_CONFIRM"
+                    self.bars_since_trigger     = 0
                     self._log_event(
-                        f"Signal found: {best_dir} in {self.current_market_state} "
-                        f"score={best_score:.1f} (1H trend filter ผ่าน)"
+                        f"Signal: {best_dir} | {self.current_market_state} "
+                        f"| bias={self.current_regime_bias} "
+                        f"| health={best_health:.0f} conf={best_conf_stored:.0f}({best_conf_lvl_stored})"
                     )
                     state_changed = True
                 else:
                     self.state = "SCANNING"
 
-            # ── WAIT_CONFIRM ───────────────────────────────────────────────
             elif self.state == "WAIT_CONFIRM":
-                if self.bars_since_trigger > 3:  # 3 bars = 45 min บน 15M (ลด miss window)
-                    self._log_event("WAIT_CONFIRM timeout → back to SCANNING")
+                if self.bars_since_trigger > 3:
+                    self._log_event("WAIT_CONFIRM timeout → SCANNING")
                     self.state    = "SCANNING"
                     state_changed = True
                     continue
 
-                # ตรวจสอบ trigger condition จาก indicator 15M (entry timeframe)
-                confirmed = self._check_entry_trigger(ind_15m)
-                if confirmed:
-                    self.state = "PENDING_ORDER"
+                if self._check_entry_trigger(ind_15m):
+                    self.state    = "PENDING_ORDER"
                     state_changed = True
                 else:
                     self.bars_since_trigger += 1
 
-            # ── PENDING_ORDER ──────────────────────────────────────────────
             elif self.state == "PENDING_ORDER":
                 self._step5_risk_engine(candle_15m, self.direction_focus, ind_15m)
                 self.state    = "IN_POSITION"
-                state_changed = False  # หยุด loop — รอ tick ถัดไปตรวจ position
+                state_changed = False
 
-            # ── IN_POSITION / PARTIAL_EXIT / TRAILING ─────────────────────
             elif self.state in ("IN_POSITION", "PARTIAL_EXIT", "TRAILING"):
                 new_state = self._manage_open_position(current_price, ind_15m)
                 if new_state == "EXITING":
-                    self.state = "EXITING"
+                    self.state    = "EXITING"
                     state_changed = True
                 elif new_state != self.state:
                     self.state = new_state
 
-            # ── EXITING ────────────────────────────────────────────────────
             elif self.state == "EXITING":
-                t     = self.current_trade
-                pnl   = t.get("realized_pnl", 0.0)
-                result = "WIN" if pnl > 0 else "LOSS"
-                self._log_trade(result, ind_15m, extras)
+                t           = self.current_trade
+                pnl         = t.get("realized_pnl", 0.0)
+                result      = "WIN" if pnl > 0 else "LOSS"
+                close_reason = t.get("exit_price") and "SL_HIT"  # will be overridden below
+                # Derive close reason from last CLOSE_FULL send
+                close_reason = (
+                    "SL_HIT"        if t.get("exit_price") is not None and pnl < 0 else
+                    "FULL_TP2"      if t.get("tp2_hit") else
+                    "PARTIAL_TP1"   if t.get("tp1_hit") else
+                    "EXIT"
+                )
+                self._log_trade(result, close_reason, ind_15m, extras)
                 if self.state not in ("COOLDOWN", "BLOCKED"):
                     self.state = "SCANNING"
 
-            # ── [FIX 8] RECOVERY ───────────────────────────────────────────
             elif self.state == "RECOVERY":
-                # Recovery mode: รอ 1 trade ที่ risk ลดลง 50% ก่อน resume full risk
                 if not self.position_open:
-                    self._log_event("RECOVERY mode: waiting for next setup with half-risk")
+                    self._log_event("RECOVERY: waiting for half-risk setup")
                     if self._check_global_gates():
-                        self._enter_recovery_trade(candle_15m, ind_15m, ind_1h, vol_state)
+                        self._enter_recovery_trade(candle_15m, ind_15m, ind_1h,
+                                                   ind_4h, atr_4h)
 
-            # ── ERROR ──────────────────────────────────────────────────────
             elif self.state == "ERROR":
-                self._log_event("Bot in ERROR state — manual intervention required", level="error")
+                self._log_event("Bot in ERROR state — manual check required", level="error")
                 break
 
-        # [FIX 13] persist state ทุก tick — กัน crash/restart เสีย state เกิน 1 tick
-        # (เขียนแบบ atomic write ใน save_state แล้ว จึงไม่กระทบ performance loop มากนัก
-        #  ถ้าต้องการลด I/O สามารถปรับให้ save แค่ตอน state เปลี่ยนแทนได้)
         self.save_state(self._state_file)
 
-    def _check_entry_trigger(self, ind: Dict) -> bool:
-        """
-        ตรวจสอบ entry trigger condition จาก indicator 15M (entry timeframe)
-        momentum_score: 50 + direction * strength  (>50 = bullish, <50 = bearish)
-        """
-        direction = self.direction_focus
-        if direction is None:
-            return False
-
-        rsi      = ind.get("rsi", 50)
-        momentum = ind.get("momentum_score", 50)
-
-        # MODULE 2: regime-specific RSI entry gates
-        rt = REGIME_THRESHOLDS.get(self.current_market_state, REGIME_THRESHOLDS["UPTREND"])
-
-        if direction == "LONG":
-            lo, hi = rt["rsi_long"]
-            return lo < rsi < hi and momentum > 50
-        else:
-            lo, hi = rt["rsi_short"]
-            return lo < rsi < hi and momentum < 50
-
-    def _enter_recovery_trade(self, candle: Dict, ind: Dict, ind_1h: Dict, vol_state: str):
-        """[FIX 8] เปิด trade ด้วย risk 50% ใน recovery mode (ยังผ่าน 1H trend filter เหมือนปกติ)"""
+    def _enter_recovery_trade(self, candle: Dict, ind_15m: Dict, ind_1h: Dict,
+                               ind_4h: Dict, atr_4h: float):
         original_risk = self.base_risk_pct
         self.base_risk_pct *= 0.5
-
         for direction in ("LONG", "SHORT"):
             if not self._check_htf_trend_filter(direction, ind_1h):
                 continue
-            if self._layer_filtering(direction, ind, self.current_market_state, vol_state):
-                self._step5_risk_engine(candle, direction, ind)
+            if self._layer_filtering(direction, ind_15m,
+                                     self.current_market_state, ind_1h, ind_4h):
+                self._step5_risk_engine(candle, direction, ind_15m)
                 self.state = "IN_POSITION"
-                self._log_event(f"RECOVERY trade opened: {direction} at half-risk")
+                self._log_event(f"RECOVERY trade: {direction} at half-risk")
                 break
-
         self.base_risk_pct = original_risk
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def get_status(self) -> Dict:
-        """Summary ของ bot state ปัจจุบัน"""
         _now = self._bar_now or datetime.datetime.now()
         warmup_remaining = 0
         if self._startup_unblock_at and _now < self._startup_unblock_at:
-            warmup_remaining = int((self._startup_unblock_at - _now).total_seconds() / 60)
+            warmup_remaining = int(
+                (_now - self._startup_unblock_at).total_seconds() / 60)
         return {
             "state":              self.state,
             "position_open":      self.position_open,
@@ -1464,8 +1532,11 @@ class TradingBot:
             "daily_pnl_pct":      self.daily_pnl_pct,
             "loss_streak":        self.loss_streak,
             "win_streak":         self.win_streak,
+            "consecutive_sl":     self.consecutive_sl_hits,
+            "session_losses":     self.session_losses,
             "total_trades":       len(self.trade_journal),
             "market_state":       self.current_market_state,
+            "regime_bias":        self.current_regime_bias,
             "regime_score":       self.regime_score,
             "cooldown_until":     self.cooldown_until.isoformat() if self.cooldown_until else None,
             "warmup_remaining_m": warmup_remaining,
@@ -1473,14 +1544,6 @@ class TradingBot:
         }
 
     def get_position_health_report(self, current_price: float, ind_15m: Dict) -> Dict:
-        """
-        Return a structured health report for the current open position.
-        Used by run_bot.py to log 5-minute health updates.
-
-        Returns a dict with:
-          in_position, health_score, health_level (STRONG/GOOD/WARN/POOR/CRITICAL),
-          current_r, pnl, reversal_signals, and key indicator values.
-        """
         if not self.position_open or not self.current_trade:
             return {"in_position": False}
 
@@ -1494,31 +1557,32 @@ class TradingBot:
 
         health = self.health_calc.calculate(ind_15m, t, current_price)
         level  = self._health_level(health)
-
         reversal = self._detect_reversal_signals(ind_15m)
 
         return {
-            "in_position":     True,
-            "direction":       direction,
-            "entry":           entry,
-            "current_price":   current_price,
-            "sl":              t["sl"],
-            "tp1":             t["tp1"],
-            "tp2":             t["tp2"],
-            "tp1_hit":         t.get("tp1_hit", False),
-            "current_r":       round(current_r, 3),
-            "pnl":             round(pnl, 2),
-            "health_score":    round(health, 1),
-            "health_level":    level,
-            "reversal_signals": reversal,
-            "adx":             round(ind_15m.get("adx",  0), 1),
-            "rsi":             round(ind_15m.get("rsi", 50), 1),
-            "macd_hist":       round(ind_15m.get("macd_hist", 0), 4),
-            "holding_bars":    self._bar_count - self._position_entry_bar,
+            "in_position":       True,
+            "direction":         direction,
+            "entry":             entry,
+            "current_price":     current_price,
+            "sl":                t["sl"],
+            "tp1":               t["tp1"],
+            "tp2":               t["tp2"],
+            "tp1_hit":           t.get("tp1_hit", False),
+            "current_r":         round(current_r, 3),
+            "pnl":               round(pnl, 2),
+            "health_score":      round(health, 1),
+            "health_level":      level,
+            "entry_health":      t.get("entry_health", 0),
+            "entry_confidence":  t.get("entry_confidence", 0),
+            "regime_bias":       self.current_regime_bias,
+            "reversal_signals":  reversal,
+            "adx":               round(ind_15m.get("adx",  0), 1),
+            "rsi":               round(ind_15m.get("rsi", 50), 1),
+            "macd_hist":         round(ind_15m.get("macd_hist", 0), 4),
+            "holding_bars":      self._bar_count - self._position_entry_bar,
         }
 
     def get_performance_summary(self) -> Dict:
-        """สรุปผลการเทรดจาก journal"""
         if not self.trade_journal:
             return {"message": "No trades yet"}
 
@@ -1526,7 +1590,7 @@ class TradingBot:
         losses = [t for t in self.trade_journal if t["win_loss"] == "LOSS"]
         pnls   = [t["pnl"] for t in self.trade_journal if t.get("pnl") is not None]
 
-        by_state = {}
+        by_state: Dict[str, Dict] = {}
         for t in self.trade_journal:
             s = t.get("market_state", "Unknown")
             by_state.setdefault(s, {"wins": 0, "total": 0, "pnl": 0.0})
@@ -1548,30 +1612,24 @@ class TradingBot:
                 s: {**v, "win_rate": v["wins"] / max(v["total"], 1)}
                 for s, v in by_state.items()
             },
+            "pattern_learning": self.learning_engine.get_summary(),
         }
 
     def force_state(self, new_state: str):
-        """Manual override สำหรับ emergency หรือ testing"""
         if new_state in self.STATES:
             self._log_event(f"Force state: {self.state} → {new_state}")
             self.state = new_state
         else:
-            raise ValueError(f"Unknown state: {new_state}. Valid: {self.STATES}")
+            raise ValueError(f"Unknown state: {new_state}")
 
-    # ── [FIX 13] State persistence — รองรับการรีสตาร์ตบอท ───────────────────
-    #
-    # บอทเทรดจริงต้องรันยาว ๆ บน VPS/server และอาจถูก restart (deploy ใหม่,
-    # crash, server reboot) ระหว่างที่ "มี position เปิดอยู่" ถ้าไม่เก็บ state
-    # บอทจะเริ่มจาก SCANNING ใหม่ทั้งที่ยังมี position ค้างอยู่จริงบน exchange
-    # → เสี่ยงเปิด position ซ้ำ หรือไม่มีใครดูแล SL/TP/trailing ของ position เดิม
+    # ── State persistence ─────────────────────────────────────────────────────
 
     DEFAULT_STATE_FILE = "bot_state.json"
 
     def save_state(self, path: str = DEFAULT_STATE_FILE):
-        """บันทึก state ปัจจุบันลงไฟล์ JSON (เรียกทุกครั้งที่ state สำคัญเปลี่ยน)"""
         import os as _os
         if not path or path == _os.devnull:
-            return  # backtest mode — ไม่ต้องเขียน disk
+            return
         snapshot = {
             "state":                self.state,
             "position_open":        self.position_open,
@@ -1581,29 +1639,29 @@ class TradingBot:
             "daily_pnl_pct":        self.daily_pnl_pct,
             "loss_streak":          self.loss_streak,
             "win_streak":           self.win_streak,
+            "consecutive_sl_hits":  self.consecutive_sl_hits,
+            "session_losses":       self.session_losses,
             "cooldown_until":       self.cooldown_until.isoformat() if self.cooldown_until else None,
             "trading_date":         self.trading_date.isoformat() if self.trading_date else None,
             "current_market_state": self.current_market_state,
+            "current_regime_bias":  self.current_regime_bias,
             "regime_score":         self.regime_score,
             "direction_focus":      self.direction_focus,
             "bars_since_trigger":   self.bars_since_trigger,
             "atr_history":          self.atr_history[-200:],
             "adaptive_weights":     self.adaptive_engine.base_weights,
+            "pattern_learning":     self.learning_engine.to_dict(),
             "saved_at":             datetime.datetime.now().isoformat(),
         }
         tmp_path = f"{path}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2, default=str, ensure_ascii=False)
-            os.replace(tmp_path, path)  # atomic write — กัน state file พังถ้า crash กลางทาง
+            os.replace(tmp_path, path)
         except OSError as e:
             self._log_event(f"[ERROR] save_state failed: {e}", level="error")
 
     def load_state(self, path: str = DEFAULT_STATE_FILE) -> bool:
-        """
-        โหลด state จากไฟล์ JSON ตอนสตาร์ทบอท
-        Return True ถ้าโหลดสำเร็จ, False ถ้าไม่มีไฟล์ (= สตาร์ทใหม่)
-        """
         if not os.path.exists(path):
             self._log_event(f"No saved state at '{path}' — starting fresh")
             return False
@@ -1613,7 +1671,7 @@ class TradingBot:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             self._log_event(
-                f"[ERROR] load_state failed to read '{path}': {e} — starting fresh instead",
+                f"[ERROR] load_state: '{path}': {e} — starting fresh",
                 level="error",
             )
             return False
@@ -1623,7 +1681,6 @@ class TradingBot:
         self.order_status     = data.get("order_status", "CLOSED")
         self.current_trade    = data.get("current_trade") or {}
 
-        # entry_time ถูกเก็บเป็น ISO string ใน JSON ต้องแปลงกลับเป็น datetime
         entry_time = self.current_trade.get("entry_time")
         if isinstance(entry_time, str):
             try:
@@ -1631,50 +1688,48 @@ class TradingBot:
             except ValueError:
                 self.current_trade["entry_time"] = datetime.datetime.now()
 
-        self.account_balance  = data.get("account_balance", self.account_balance)
-        self.daily_pnl_pct     = data.get("daily_pnl_pct", 0.0)
-        self.loss_streak       = data.get("loss_streak", 0)
-        self.win_streak         = data.get("win_streak", 0)
+        self.account_balance      = data.get("account_balance", self.account_balance)
+        self.daily_pnl_pct         = data.get("daily_pnl_pct", 0.0)
+        self.loss_streak           = data.get("loss_streak", 0)
+        self.win_streak            = data.get("win_streak", 0)
+        self.consecutive_sl_hits   = data.get("consecutive_sl_hits", 0)
+        self.session_losses        = data.get("session_losses", 0)
 
         cooldown = data.get("cooldown_until")
-        self.cooldown_until = datetime.datetime.fromisoformat(cooldown) if cooldown else None
+        self.cooldown_until = (datetime.datetime.fromisoformat(cooldown)
+                               if cooldown else None)
 
         trading_date = data.get("trading_date")
-        self.trading_date = datetime.date.fromisoformat(trading_date) if trading_date else None
+        self.trading_date = (datetime.date.fromisoformat(trading_date)
+                             if trading_date else None)
 
-        self.current_market_state = data.get("current_market_state", "Sideway")
+        self.current_market_state  = data.get("current_market_state", "SIDEWAY")
+        self.current_regime_bias   = data.get("current_regime_bias", "NEUTRAL")
         self.regime_score          = data.get("regime_score", 0.0)
-        self.direction_focus        = data.get("direction_focus")
-        self.bars_since_trigger      = data.get("bars_since_trigger", 0)
-        self.atr_history              = data.get("atr_history", [])
+        self.direction_focus       = data.get("direction_focus")
+        self.bars_since_trigger    = data.get("bars_since_trigger", 0)
+        self.atr_history           = data.get("atr_history", [])
 
         weights = data.get("adaptive_weights")
         if weights:
             self.adaptive_engine.base_weights = weights
 
+        pl = data.get("pattern_learning")
+        if pl:
+            self.learning_engine.from_dict(pl)
+
         self._log_event(
-            f"State loaded from '{path}' | state={self.state} "
-            f"| position_open={self.position_open} | balance={self.account_balance:.2f} "
-            f"| saved_at={data.get('saved_at')}"
+            f"State loaded | state={self.state} pos={self.position_open} "
+            f"balance={self.account_balance:.2f} saved_at={data.get('saved_at')}"
         )
         return True
 
     def reconcile_with_exchange(self, symbol: str, exchange_adapter) -> None:
-        """
-        [FIX 13] เทียบ local state (จาก load_state) กับ position จริงบน exchange
-        ต้องเรียกทุกครั้งหลัง restart ก่อนเริ่ม on_tick — เพราะระหว่างบอท offline
-        position อาจถูกปิดไปแล้ว (SL/TP บน exchange โดน trigger) หรือมี position
-        ที่ exchange แต่ไฟล์ state เก่าเกินไป/หาย
-
-        exchange_adapter ต้องมีเมธอด fetch_open_position(symbol) -> dict | None
-        (ดู OKXExecutionAdapter ใน okx_exchange.py)
-        """
         try:
             live_position = exchange_adapter.fetch_open_position(symbol)
         except Exception as e:
             self._log_event(
-                f"[ERROR] reconcile_with_exchange: fetch_open_position failed: {e} "
-                f"— เข้า ERROR state เพื่อให้ตรวจสอบ manual ก่อนเทรดต่อ",
+                f"[ERROR] reconcile: fetch_open_position failed: {e} → ERROR state",
                 level="error",
             )
             self.state = "ERROR"
@@ -1684,8 +1739,8 @@ class TradingBot:
 
         if self.position_open and live_size == 0:
             self._log_event(
-                "[RECONCILE] local state มี position เปิดอยู่ แต่ exchange ไม่มี position จริง "
-                "→ ถือว่าปิดไปแล้วระหว่างบอท offline, เคลียร์ local state และกลับไป SCANNING",
+                "[RECONCILE] local=open but exchange=no position → closed offline; "
+                "clearing local state → SCANNING",
                 level="warning",
             )
             self.position_open = False
@@ -1694,15 +1749,13 @@ class TradingBot:
                 self.state = "SCANNING"
 
         elif not self.position_open and live_size != 0:
-            direction = "LONG" if live_size > 0 else "SHORT"
+            direction   = "LONG" if live_size > 0 else "SHORT"
             entry_price = float(
                 live_position.get("entryPrice") or live_position.get("entryPx") or 0
             )
             self._log_event(
-                f"[RECONCILE] พบ position จริงบน exchange ({direction} size={abs(live_size)}) "
-                "ที่ local state ไม่รู้จัก (อาจเปิดด้วยมือ หรือ state file หาย) "
-                "→ สร้าง trade record ใหม่จากข้อมูล exchange — "
-                "SL/TP/health logic จะ baseline ใหม่จากราคาปัจจุบัน",
+                f"[RECONCILE] exchange has unknown {direction} pos (size={abs(live_size)}) "
+                "→ creating trade record from exchange data",
                 level="warning",
             )
             sl_dist_r = max(entry_price * 0.01, 1e-9)
@@ -1717,12 +1770,9 @@ class TradingBot:
                 "tp1_hit": False, "tp2_hit": False,
                 "break_even_triggered": False, "status": "OPEN",
                 "entry_time": datetime.datetime.now(),
-                "atr_at_entry": 0.0, "realized_pnl": 0.0,
-                "exit_price": None, "final_rr": None, "mae": 0.0, "mfe": 0.0,
-                "reconciled_from_exchange": True,
+                "atr_at_entry": sl_dist_r,
+                "realized_pnl": 0.0, "exit_price": None, "final_rr": None,
+                "mae": 0.0, "mfe": 0.0,
             }
             self.position_open = True
-            self.state = "IN_POSITION"
-
-        else:
-            self._log_event("[RECONCILE] local state ตรงกับ exchange แล้ว — ไม่ต้องแก้ไข")
+            self.state         = "IN_POSITION"
