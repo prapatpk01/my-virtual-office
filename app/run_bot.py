@@ -293,7 +293,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
     # Entry-filter rejection summary — INFO level so it's visible without
     # LOG_LEVEL=DEBUG. Shows which gate (Bias/Health/Confidence) blocks most.
-    FILTER_STATS_LOG_SECS = _env_int("FILTER_STATS_LOG_SECONDS", 900)
+    FILTER_STATS_LOG_SECS = _env_int("FILTER_STATS_LOG_SECONDS", 300)
     last_filter_stats_log = _time.time()
 
     _HEALTH_EMOJI = {
