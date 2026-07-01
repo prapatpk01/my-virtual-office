@@ -70,7 +70,7 @@ ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
     "TRENDING":     {"rsi_long": (30, 55), "rsi_short": (45, 65), "total_min": 62},
     "BREAKOUT":     {"rsi_long": (42, 72), "rsi_short": (28, 58), "total_min": 55},
     "REVERSAL":     {"rsi_long": (25, 45), "rsi_short": (55, 75), "total_min": 62},
-    "SIDEWAY":      {"rsi_long": (28, 48), "rsi_short": (52, 72), "total_min": 62},
+    "SIDEWAY":      {"rsi_long": (28, 48), "rsi_short": (52, 72), "total_min": 68},
     "HIGH_VOL":     {"rsi_long": (35, 55), "rsi_short": (45, 65), "total_min": 62},
     # [#4] EXHAUSTION fades the 4H trend — near-zero edge historically, so make
     # it highly selective: only the strongest aggregate setups pass.
