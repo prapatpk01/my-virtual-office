@@ -845,7 +845,8 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out["score_short"] = score_short
 
     # ── Market Regime classification ──────────────────────────────────────────
-    _regime_sl_mult = pd.Series(1.0, index=out.index)
+    _regime_sl_mult   = pd.Series(1.0, index=out.index)
+    _regime_entry_ok  = pd.Series(True, index=out.index)  # diagnostic default
     if p.get("market_regime_enabled", True):
         _regime, _regime_entry_ok, _regime_sl_mult = _market_regime(
             out["adx15"], _chop_1h, atr_pct, ema20, rsi15, out["close"], p
@@ -867,9 +868,11 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         short_gates = short_gates & _regime_entry_ok
 
     # ── Chop Index gate: block entries in ranging/sideways 1H market ─────────
+    _chop_ok_diag = pd.Series(True, index=out.index)  # diagnostic default
     if p.get("chop_filter_enabled", False):
         _chop_thresh = float(p.get("chop_threshold", 50.0))
         _chop_ok = _chop_1h < _chop_thresh   # LOW = trending; HIGH = choppy
+        _chop_ok_diag = _chop_ok
         long_gates  = long_gates  & _chop_ok
         short_gates = short_gates & _chop_ok
 
@@ -883,10 +886,14 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     # ── MACD Histogram rising gate: enter early, not after peak ──────────────
     # Requires MACD histogram RISING over 2 bars (sign-agnostic for earlier entry).
     # Blocks the XAG-style "throwback after peak" where MACD is declining.
+    _macd_hist_l_diag = pd.Series(True, index=out.index)  # diagnostic default
+    _macd_hist_s_diag = pd.Series(True, index=out.index)
     if p.get("macd_hist_rising_gate", True):
         macd_hist       = macd_line - macd_sig
         hist_rising_l   = macd_hist > macd_hist.shift(2)
         hist_rising_s   = macd_hist < macd_hist.shift(2)
+        _macd_hist_l_diag = hist_rising_l
+        _macd_hist_s_diag = hist_rising_s
         long_gates  = long_gates  & hist_rising_l
         short_gates = short_gates & hist_rising_s
 
@@ -913,6 +920,13 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     out["d_bias_l"]    = long_bias_ok.fillna(False)
     out["d_bias_s"]    = short_bias_ok.fillna(False)
     out["d_adx_ok"]    = adx_ok.fillna(False)
+    # Inner gate diagnostics (regime/chop are symmetric; macd/trigger are directional)
+    out["d_regime_ok"] = _regime_entry_ok.fillna(True)
+    out["d_chop_ok"]   = _chop_ok_diag.fillna(True)
+    out["d_macd_l"]    = _macd_hist_l_diag.fillna(True)
+    out["d_macd_s"]    = _macd_hist_s_diag.fillna(True)
+    out["d_trig_l"]    = trigger_long.fillna(True)
+    out["d_trig_s"]    = trigger_short.fillna(True)
 
     # ── Dynamic SL: ATR14/ATR50 ratio adjusts sl_mult to market volatility ──────
     if p.get("dynamic_sl_enabled", False):
@@ -1384,17 +1398,21 @@ class TrendContImprovedStrategy(BaseStrategy):
             long_layers  = f"4H{_y('d_macro_up')} 1H{_y('d_mid_up')} pull{_y('d_pull_l')} bias{_y('d_bias_l')} adx{_y('d_adx_ok')}"
             short_layers = f"4H{_y('d_macro_dn')} 1H{_y('d_mid_dn')} pull{_y('d_pull_s')} bias{_y('d_bias_s')} adx{_y('d_adx_ok')}"
             adx_max  = self._p.get("adx_max_fast", 50) if self._p.get("fast_mode") else 999
-            adx_min  = self._p.get("adx_min_fast", 18) if self._p.get("fast_mode") else self._p.get("adx_min", 30)
+            adx_min  = self._p.get("adx_min_fast", 15) if self._p.get("fast_mode") else self._p.get("adx_min", 30)
             sj_tag   = "[SJ]" if self._p.get("sj_scoring") else ""
-            min_sc   = self._p.get("min_score", 4)
+            min_sc   = self._p.get("min_score", 60)
             # Count actually-enabled scoring components (5 SJ base + ROC9 + 3 extended)
             _reg     = self._p.get("indicators", {})
             n_comps  = sum(1 for v in _reg.values() if v.get("enabled", True)) or \
                        (5 if self._p.get("sj_scoring") else 4)
+            _yi = lambda k, df=True: "✓" if last.get(k, df) else "✗"
+            # Inner gates (regime/chop symmetric; macd/trigger directional)
+            inner_l = f"reg{_yi('d_regime_ok')} chp{_yi('d_chop_ok')} mac{_yi('d_macd_l')} trg{_yi('d_trig_l')}"
+            inner_s = f"reg{_yi('d_regime_ok')} chp{_yi('d_chop_ok')} mac{_yi('d_macd_s')} trg{_yi('d_trig_s')}"
             return Signal(SignalType.HOLD, self.symbol, current_price, 0,
                           f"[TCImproved{sj_tag}] bias={bias_v:.0f}(gate±{gate:.0f}) ADX={adx_v:.0f}({adx_min:.0f}-{adx_max:.0f}) "
                           f"score={sc_l:.0f}L/{sc_s:.0f}S(need≥{min_sc:.0f}/{n_comps}) "
-                          f"| L:{long_layers} | S:{short_layers}")
+                          f"| L:{long_layers} {inner_l} | S:{short_layers} {inner_s}")
 
         dist = float(last["dist"])
         if dist <= 0 or np.isnan(dist):

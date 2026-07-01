@@ -6,10 +6,10 @@ Fetches 5m candles + 1h/4h MTF for each symbol with an open position, then
 computes a weighted health score (0–100) against the position direction.
 
 Score → Label → Action (4-level)
-  85–100 BULL        Hold / extend TP2 one step toward next level (→3.0R)
-  50–84  NEUTRAL     Hold — do nothing
-  40–49  WEAK        close after 3-cycle confirm (soft fade, may recover)
-  0–39   STRONG_WEAK close NOW, no confirm (sharp reversal / V-shape)
+  81–100 BULL        Hold / extend TP2 one step toward next level (→3.0R)
+  40–80  NEUTRAL     Hold — do nothing
+  20–39  WEAK        close after 3-cycle confirm (soft fade, may recover)
+  0–19   STRONG_WEAK close NOW, no confirm (sharp reversal / V-shape)
 
 Indicators (total 100) — split slow-structure / fast-momentum so a sudden
 V-shape (5m collapse before the 4H/1H trend flips) drops the score fast:
@@ -327,17 +327,16 @@ def _mtf_bias(s5: pd.Series, s1h: pd.Series, s4h: pd.Series) -> float:
 def _classify(score: float) -> str:
     """
     4-level health:
-      BULL        85-100  → extend TP (momentum strong)
-      NEUTRAL     50-84   → hold
-      WEAK        25-49   → close after N-cycle confirm (fade, may recover)
-      STRONG_WEAK 0-24    → close NOW, no confirm (sharp reversal / V-shape)
-    Lowered STRONG_WEAK cutoff 40→25: only a sharper reversal triggers the
-    immediate no-confirm close; scores 25-49 get the WEAK 3-cycle grace so
-    moderate dips aren't cut prematurely.
+      BULL        81-100  → extend TP (momentum strong)
+      NEUTRAL     40-80   → hold
+      WEAK        20-39   → close after N-cycle confirm (fade, may recover)
+      STRONG_WEAK 0-19    → close NOW, no confirm (sharp reversal / V-shape)
+    Wide NEUTRAL band (40-80) prevents premature exits on normal pullbacks;
+    only genuine reversals scoring ≤39 trigger the confirm/close sequence.
     """
-    if score >= 85: return "BULL"
-    if score >= 50: return "NEUTRAL"
-    if score >= 25: return "WEAK"
+    if score >= 81: return "BULL"
+    if score >= 40: return "NEUTRAL"
+    if score >= 20: return "WEAK"
     return "STRONG_WEAK"
 
 

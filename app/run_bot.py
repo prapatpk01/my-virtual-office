@@ -80,12 +80,11 @@ def _env_int(key: str, default: int) -> int:
 # ── Config ────────────────────────────────────────────────────────────[...]
 
 def build_config() -> dict:
-    # SJ scoring: min_score default is COUPLED to the component count so the two
-    # can never desync. 6-comp (SJ Hybrid + ROC9) needs 5/6 (validated best);
-    # classic 4-comp / 5-comp SJ stay at 4/N. An explicit TCI_MIN_SCORE wins.
+    # min_score is on the 100-point Confidence Scale (≥90 strong, 70-89 normal, 60-69 small×0.5).
+    # Default 60 = gate; override via TCI_MIN_SCORE env var. An explicit env var always wins.
     _sj_scoring  = _env_bool("TCI_SJ_SCORING", True)
     _sj_roc9     = _env_bool("TCI_SJ_ROC9",    True)
-    _min_default = 5.0 if (_sj_scoring and _sj_roc9) else 4.0
+    _min_default = 60.0
     return {
         # ── Exchange credentials ───────────────────────────────────────────────
         "exchange":       os.environ.get("EXCHANGE",            "okx"),
@@ -132,7 +131,7 @@ def build_config() -> dict:
         # Fast mode v2 (grid winner: bias 70 + TP2 3.0R; live default: 60 to avoid signal drought)
         "tci_fast_mode":        _env_bool("TCI_FAST_MODE",         False),
         "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",   60.0), # FAST bias gate (live-calibrated)
-        "tci_fast_adx_min":     _env_int("TCI_ADX_MIN_FAST",       18),   # FAST ADX lower bound
+        "tci_fast_adx_min":     _env_int("TCI_ADX_MIN_FAST",       15),   # FAST ADX lower bound
         "tci_fast_adx_max":     _env_int("TCI_ADX_MAX_FAST",       44),   # FAST ADX upper bound (44 = avoid overheated entries)
         "tci_fast_tp2_r":       _env_float("TCI_FAST_TP2_R",       2.5),  # FAST runner target (was 3.0; closes faster)
         "tci_fast_pullback_pct":_env_float("TCI_PULLBACK_PCT_FAST", 0.025),# 1H EMA20 zone width (2.5% > 1.8% orig)
