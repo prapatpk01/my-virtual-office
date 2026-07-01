@@ -223,6 +223,9 @@ class TradeRecord:
     e_ema_dist_atr: float = 0.0
     e_rsi:        float = 0.0
     realized_r:   float = 0.0  # realized R multiple
+    mae:          float = 0.0  # max adverse excursion (R)
+    mfe:          float = 0.0  # max favorable excursion (R)
+    hour_utc:     int   = -1   # entry-tick hour
 
 
 class SymbolBacktest:
@@ -388,6 +391,9 @@ class SymbolBacktest:
                         e_ema_dist_atr = float(j_entry.get("e_ema_dist_atr") or 0),
                         e_rsi        = float(j_entry.get("e_rsi") or 0),
                         realized_r   = float(j_entry.get("realized_r") or 0),
+                        mae          = float(j_entry.get("mae") or 0),
+                        mfe          = float(j_entry.get("mfe") or 0),
+                        hour_utc     = int(j_entry.get("hour_utc") if j_entry.get("hour_utc") is not None else -1),
                     )
                     trade_records.append(rec)
 
