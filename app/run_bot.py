@@ -236,10 +236,15 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "sj_scoring":             cfg["tci_sj_scoring"],
             "sj_roc9":                cfg["tci_sj_roc9"],
             "chop_filter_enabled":    cfg["tci_chop_filter"],
-            # Simple fast entry: replaces pullback/chop/regime/MACD-rising/trigger
-            # with just close vs HMA16 + MACD hist sign + ADX. Much faster entries.
-            "simple_fast_entry":      True,
-            "htf_stability_bars":     1,   # HTF flip recognised after 1 bar (was 2)
+            # simple_fast_entry: DISABLED. Backtest Jan-May 2026 (BTC+XAG+XAU) proved
+            # BOTH variants (hard HMA+MACD+ADX gate, and score-primary ADX-only gate)
+            # are losing systems: PF 0.74 / 0.72 vs full-gate-stack PF 1.45. The
+            # pullback zone / chop filter / market regime / MACD-rising / final-trigger
+            # gates are essential quality filters, not just latency — skipping them
+            # for speed (regardless of what replaces them) triples trade count
+            # (120→390-452) while win rate drops 80%→67% and the system flips
+            # from +$149.56 to a net loss. Left here (default False) for reference.
+            "simple_fast_entry":      False,
         }))
 
     if not strategies:
