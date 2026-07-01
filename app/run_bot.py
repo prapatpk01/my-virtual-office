@@ -97,7 +97,7 @@ def build_config() -> dict:
         "risk_per_trade":  _env_float("RISK_PER_TRADE", 0.01),
         "strategies": {
             "swing_reversal_pro": _env_bool("STRATEGY_SWING_REVERSAL", True),
-            "mean_reversion":     _env_bool("STRATEGY_MEAN_REVERSION", False),
+            "mean_reversion":     _env_bool("STRATEGY_MEAN_REVERSION", True),
         },
         "swing_reversal_params": {
             "risk_pct":        _env_float("SR_RISK",        0.01),
