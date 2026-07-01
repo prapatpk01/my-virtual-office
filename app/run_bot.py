@@ -97,6 +97,7 @@ def build_config() -> dict:
         "risk_per_trade":  _env_float("RISK_PER_TRADE", 0.01),
         "strategies": {
             "swing_reversal_pro": _env_bool("STRATEGY_SWING_REVERSAL", True),
+            "mean_reversion":     _env_bool("STRATEGY_MEAN_REVERSION", False),
         },
         "swing_reversal_params": {
             "risk_pct":        _env_float("SR_RISK",        0.01),
@@ -232,6 +233,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             max_loss_streak=cfg["adaptive_max_loss_streak"],
             state_file=state_file,
             execution_callback=_make_callback(sym, okx),
+            enable_swing_reversal=cfg["strategies"].get("swing_reversal_pro", True),
+            enable_mean_reversion=cfg["strategies"].get("mean_reversion", False),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)

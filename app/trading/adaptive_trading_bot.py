@@ -1,6 +1,6 @@
 """
-Adaptive Trading Bot — v8.0  SwingReversalPro
-==============================================
+Adaptive Trading Bot — v8.0  SwingReversalPro + MeanReversion
+==============================================================
 7 major improvements from V7:
 
 [V8-1] Market State Engine — 8 states redesigned:
@@ -50,6 +50,8 @@ import json
 import os
 import logging
 from typing import Optional, Callable, Dict, List, Any
+
+from .strategies.mean_reversion import MeanReversionStrategy
 
 
 logger = logging.getLogger("adaptive_trading_bot")
@@ -596,7 +598,9 @@ class TradingBot:
                  tp1_close_pct: float = 0.50,
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
-                 startup_warmup_minutes: int = 45):
+                 startup_warmup_minutes: int = 45,
+                 enable_swing_reversal: bool = True,
+                 enable_mean_reversion: bool = False):
         self.state: str = "SCANNING"
         self.adaptive_engine   = AdaptiveEngine()
         self.health_calc       = PositionHealthCalculator()
@@ -645,6 +649,12 @@ class TradingBot:
         self._startup_unblock_at: Optional[datetime.datetime] = None
         self._last_candle_15m: Dict    = {}
         self._log: List[str]           = []
+
+        # Strategy instances
+        self.enable_swing_reversal  = enable_swing_reversal
+        self.enable_mean_reversion  = enable_mean_reversion
+        self._mr_strategy           = MeanReversionStrategy() if enable_mean_reversion else None
+        self._pending_signal: Optional[Dict] = None   # signal from MR strategy pending order
 
         # Last computed scores (for health report / logging)
         self._last_entry_health: float    = 0.0
@@ -915,10 +925,20 @@ class TradingBot:
 
     # ── Step 5: Risk engine + [V8-3/V8-4] adaptive sizing ───────────────────
 
-    def _step5_risk_engine(self, candle: Dict, direction: str, ind: Dict):
+    def _step5_risk_engine(self, candle: Dict, direction: str, ind: Dict,
+                           mr_signal: Optional[Dict] = None):
+        """
+        Compute SL/TP/size and open position.
+        mr_signal: if provided (from MeanReversionStrategy), use its SL price and
+                   tp_config directly instead of the swing reversal defaults.
+        """
         entry_price = float(candle.get("close", 0))
 
-        if direction == "LONG":
+        # ── SL calculation ──────────────────────────────────────────────────
+        if mr_signal is not None:
+            # MeanReversion: use sweep low/high SL from strategy
+            pattern_sl = mr_signal["sl_price"]
+        elif direction == "LONG":
             pattern_sl = candle.get("pattern_low", entry_price * 0.99)
         else:
             pattern_sl = candle.get("pattern_high", entry_price * 1.01)
@@ -933,37 +953,59 @@ class TradingBot:
             pattern_sl = (entry_price - sl_dist if direction == "LONG"
                           else entry_price + sl_dist)
 
-        # Base risk: reduce on win streak
+        # ── Size multiplier ──────────────────────────────────────────────────
         risk_pct = self.base_risk_pct
         if self.win_streak >= 5:
             risk_pct *= 0.80
             self._log_event(f"Win streak {self.win_streak} → risk {risk_pct:.2%}")
 
-        # [V8-3/V8-4] Size multiplier from Health + Confidence
-        health     = self._last_entry_health
-        confidence = self._last_confidence
-        conf_mult  = self.conf_scorer.get_size_multiplier(confidence)
-        if conf_mult == 0.0:
-            self._log_event("Confidence too low → skip order", level="warning")
-            return
+        if mr_signal is not None:
+            # MeanReversion: size from health score (Step 13)
+            size_mult  = mr_signal.get("size_mult", 1.0)
+            health     = mr_signal.get("health_score", 0.0)
+            confidence = mr_signal.get("health_score", 0.0)
+            entry_type = "mean_revert"
+        else:
+            health     = self._last_entry_health
+            confidence = self._last_confidence
+            conf_mult  = self.conf_scorer.get_size_multiplier(confidence)
+            if conf_mult == 0.0:
+                self._log_event("Confidence too low → skip order", level="warning")
+                return
+            health_mult = 1.0 if health >= 75 else 0.65
+            entry_type  = _STATE_ENTRY_TYPE.get(self.current_market_state, "trend_follow")
+            learning_mult = self.learning_engine.get_weight(entry_type)
+            size_mult   = conf_mult * health_mult * learning_mult
 
-        health_mult = 1.0 if health >= 75 else 0.65  # reduced for 65-74
-
-        # [V8-7] Pattern learning weight
-        entry_type     = _STATE_ENTRY_TYPE.get(self.current_market_state, "trend_follow")
-        learning_mult  = self.learning_engine.get_weight(entry_type)
-
-        size_mult = conf_mult * health_mult * learning_mult
         risk_amount   = self.account_balance * risk_pct * size_mult
-        position_size = risk_amount / sl_dist
+        position_size = risk_amount / max(sl_dist, 1e-9)
 
+        # ── TP levels ────────────────────────────────────────────────────────
         mult = 1 if direction == "LONG" else -1
-        tp1 = entry_price + sl_dist * 0.7 * mult
-        tp2 = entry_price + sl_dist * 2.0 * mult
 
+        if mr_signal is not None:
+            # MeanReversion TP: 1R/2R/3R with configurable close fractions
+            tc    = mr_signal["tp_config"]
+            tp1   = float(tc["tp1"])
+            tp2   = float(tc["tp2"])
+            tp3   = float(tc["tp3"])
+            tp1_pct = float(tc.get("tp1_pct", 0.30))
+            tp2_pct = float(tc.get("tp2_pct", 0.40))
+            trail_atr = float(tc.get("trail_atr_mult", 2.0))
+        else:
+            # SwingReversalPro TP: 0.7R / 2.0R (no TP3)
+            tp1 = entry_price + sl_dist * 0.7 * mult
+            tp2 = entry_price + sl_dist * 2.0 * mult
+            tp3 = None
+            tp1_pct = self.tp1_close_pct   # default 0.50
+            tp2_pct = 1.0
+            trail_atr = 2.0
+
+        strategy_tag = "MeanReversion" if mr_signal else "SwingReversal"
         self._log_event(
-            f"SIZING: health={health:.0f} conf={confidence:.0f}({self._last_confidence_level}) "
-            f"learn={learning_mult:.2f} → size×{size_mult:.2f}"
+            f"[{strategy_tag}] OPEN {direction} entry={entry_price:.4f} "
+            f"sl={pattern_sl:.4f} tp1={tp1:.4f} tp2={tp2:.4f} "
+            f"size×{size_mult:.2f} health={health:.0f}"
         )
 
         self.current_trade = {
@@ -973,9 +1015,13 @@ class TradingBot:
             "sl_dist":              sl_dist,
             "tp1":                  tp1,
             "tp2":                  tp2,
-            "size":                 position_size,
+            "tp3":                  tp3,           # None for SwingReversal
+            "tp1_pct":              tp1_pct,
+            "tp2_pct":              tp2_pct,
+            "trail_atr_mult":       trail_atr,
             "tp1_hit":              False,
             "tp2_hit":              False,
+            "tp3_hit":              False,
             "break_even_triggered": False,
             "status":               "OPEN",
             "entry_time":           datetime.datetime.now(),
@@ -989,12 +1035,14 @@ class TradingBot:
             "entry_health":         health,
             "entry_confidence":     confidence,
             "entry_type":           entry_type,
+            "strategy":             strategy_tag,
         }
 
         self._send_order("OPEN_LONG" if direction == "LONG" else "OPEN_SHORT", {
             "entry": entry_price,
             "sl":    float(pattern_sl),
             "tp1":   tp1, "tp2": tp2,
+            "tp3":   tp3,
             "size":  position_size,
         })
 
@@ -1058,14 +1106,30 @@ class TradingBot:
 
         # TP2 first (gap candle)
         if tp2_hit_cond and not t["tp2_hit"]:
-            self._close_position("FULL_TP2", t["tp2"], 1.0, ind)
-            t["tp1_hit"] = True
-            t["tp2_hit"] = True
-            return "EXITING"
+            tp2_close_pct = t.get("tp2_pct", 1.0)
+            if tp2_close_pct < 1.0 and t.get("tp3"):
+                # MeanReversion: partial close — keep runner for TP3
+                self._close_position("PARTIAL_TP2", t["tp2"], tp2_close_pct, ind)
+                t["tp1_hit"] = True
+                t["tp2_hit"] = True
+                if not t["break_even_triggered"]:
+                    t["sl"] = t["entry"]
+                    t["break_even_triggered"] = True
+                    self._log_event(
+                        f"TP2 @ {t['tp2']:.4f} → {tp2_close_pct:.0%} partial + SL → BE"
+                    )
+                self.state = "TRAILING"
+                # continue to TP3 runner check below
+            else:
+                self._close_position("FULL_TP2", t["tp2"], 1.0, ind)
+                t["tp1_hit"] = True
+                t["tp2_hit"] = True
+                return "EXITING"
 
-        # TP1 — close tp1_close_pct + break-even
+        # TP1 — close tp1_pct + break-even
         if tp1_hit_cond and not t["tp1_hit"]:
-            self._close_position("PARTIAL_TP1", t["tp1"], self.tp1_close_pct, ind)
+            tp1_close_pct = t.get("tp1_pct", self.tp1_close_pct)
+            self._close_position("PARTIAL_TP1", t["tp1"], tp1_close_pct, ind)
             t["tp1_hit"] = True
             if not t["break_even_triggered"]:
                 if direction == "LONG":
@@ -1074,10 +1138,34 @@ class TradingBot:
                     t["sl"] = min(t["sl"], t["entry"])
                 t["break_even_triggered"] = True
                 self._log_event(
-                    f"TP1 @ {t['tp1']:.2f} → {self.tp1_close_pct:.0%} close "
-                    f"+ SL → breakeven ({t['entry']:.2f})"
+                    f"TP1 @ {t['tp1']:.4f} → {tp1_close_pct:.0%} close "
+                    f"+ SL → breakeven ({t['entry']:.4f})"
                 )
             self.state = "PARTIAL_EXIT"
+
+        # TP3 runner — MeanReversion only (active once TP2 partial close done)
+        if t.get("tp3") and t.get("tp2_hit") and not t.get("tp3_hit"):
+            atr        = ind.get("atr", t["sl_dist"])
+            trail_mult = t.get("trail_atr_mult", 2.0)
+            if direction == "LONG":
+                t["sl"] = max(t["sl"], current_price - atr * trail_mult)
+                if current_price >= t["tp3"]:
+                    self._close_position("TP3_RUNNER", t["tp3"], 1.0, ind)
+                    t["tp3_hit"] = True
+                    return "EXITING"
+                if current_price <= t["sl"]:
+                    self._close_position("RUNNER_SL", t["sl"], 1.0, ind)
+                    return "EXITING"
+            else:
+                t["sl"] = min(t["sl"], current_price + atr * trail_mult)
+                if current_price <= t["tp3"]:
+                    self._close_position("TP3_RUNNER", t["tp3"], 1.0, ind)
+                    t["tp3_hit"] = True
+                    return "EXITING"
+                if current_price >= t["sl"]:
+                    self._close_position("RUNNER_SL", t["sl"], 1.0, ind)
+                    return "EXITING"
+            return "TRAILING"
 
         # Health-based position management
         tp1_hit = t.get("tp1_hit", False)
@@ -1123,7 +1211,7 @@ class TradingBot:
 
         direction   = t["direction"]
         entry_price = t["entry"]
-        remaining   = t.get("remaining_size", t["size"])
+        remaining   = t.get("remaining_size", t.get("size", 1.0))
 
         close_size = remaining * min(max(float(portion), 0.0), 1.0)
         if close_size <= 0:
@@ -1409,26 +1497,48 @@ class TradingBot:
                 best_health: float       = -1.0
                 vol_state = self.adaptive_engine.get_atr_volatility_state(
                     atr_4h, self.atr_history)
+                mr_candidate = None
 
-                for direction in ("LONG", "SHORT"):
-                    # Quick 1H structural filter
-                    if not self._check_htf_trend_filter(direction, ind_1h):
-                        continue
+                # [MR] Try MeanReversion first if enabled
+                if self.enable_mean_reversion and self._mr_strategy:
+                    mr_candidate = self._mr_strategy.generate_signal(
+                        candle_15m, ind_15m, ind_1h, ind_4h,
+                        self.current_market_state, extras, bar_dt,
+                    )
+                    if mr_candidate:
+                        self._log_event(
+                            f"[MR] {mr_candidate['direction']} health={mr_candidate['health_score']:.0f} "
+                            f"| {' '.join(mr_candidate['step_notes'][:4])}"
+                        )
 
-                    # [V8-3/4/5] Full health + confidence + bias gate
-                    if not self._layer_filtering(
-                            direction, ind_15m, self.current_market_state,
-                            ind_1h, ind_4h):
-                        continue
+                # [SR] Try SwingReversal if enabled
+                if self.enable_swing_reversal:
+                    for direction in ("LONG", "SHORT"):
+                        # Quick 1H structural filter
+                        if not self._check_htf_trend_filter(direction, ind_1h):
+                            continue
 
-                    if self._last_entry_health > best_health:
-                        best_health = self._last_entry_health
-                        best_dir    = direction
-                        best_health_stored   = self._last_entry_health
-                        best_conf_stored     = self._last_confidence
-                        best_conf_lvl_stored = self._last_confidence_level
+                        # [V8-3/4/5] Full health + confidence + bias gate
+                        if not self._layer_filtering(
+                                direction, ind_15m, self.current_market_state,
+                                ind_1h, ind_4h):
+                            continue
 
-                if best_dir is not None:
+                        if self._last_entry_health > best_health:
+                            best_health = self._last_entry_health
+                            best_dir    = direction
+                            best_health_stored   = self._last_entry_health
+                            best_conf_stored     = self._last_confidence
+                            best_conf_lvl_stored = self._last_confidence_level
+
+                if mr_candidate is not None:
+                    # MeanReversion: all 13 steps already validated — skip WAIT_CONFIRM
+                    self._pending_signal = mr_candidate
+                    self.direction_focus = mr_candidate["direction"]
+                    self.state           = "PENDING_ORDER"
+                    state_changed        = True
+                elif best_dir is not None:
+                    self._pending_signal       = None
                     self._last_entry_health    = best_health_stored
                     self._last_confidence      = best_conf_stored
                     self._last_confidence_level = best_conf_lvl_stored
@@ -1442,6 +1552,7 @@ class TradingBot:
                     )
                     state_changed = True
                 else:
+                    self._pending_signal = None
                     self.state = "SCANNING"
 
             elif self.state == "WAIT_CONFIRM":
@@ -1458,7 +1569,11 @@ class TradingBot:
                     self.bars_since_trigger += 1
 
             elif self.state == "PENDING_ORDER":
-                self._step5_risk_engine(candle_15m, self.direction_focus, ind_15m)
+                self._step5_risk_engine(
+                    candle_15m, self.direction_focus, ind_15m,
+                    mr_signal=self._pending_signal,
+                )
+                self._pending_signal = None  # consumed
                 self.state    = "IN_POSITION"
                 state_changed = False
 
@@ -1478,6 +1593,7 @@ class TradingBot:
                 # Derive close reason from last CLOSE_FULL send
                 close_reason = (
                     "SL_HIT"        if t.get("exit_price") is not None and pnl < 0 else
+                    "TP3_RUNNER"    if t.get("tp3_hit") else
                     "FULL_TP2"      if t.get("tp2_hit") else
                     "PARTIAL_TP1"   if t.get("tp1_hit") else
                     "EXIT"
