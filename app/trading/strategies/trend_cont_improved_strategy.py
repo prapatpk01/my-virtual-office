@@ -978,10 +978,34 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         trigger_long  = pd.Series(True, index=out.index)
         trigger_short = pd.Series(True, index=out.index)
 
+    # ── Regime-adaptive min_score (opt-in) ────────────────────────────────────
+    # STRONG_TREND is the highest-WR environment — demanding the same score
+    # there as in marginal TREND wastes speed; HIGH_VOL is the riskiest allowed
+    # regime — demanding more confirmation there cuts false signals.
+    _ms = pd.Series(float(p["min_score"]), index=out.index)
+    if (p.get("regime_adaptive_min_score", False)
+            and p.get("market_regime_enabled", True) and "regime" in out):
+        _ms[out["regime"] == "STRONG_TREND"] = float(p.get("min_score_strong",  50.0))
+        _ms[out["regime"] == "HIGH_VOL"]     = float(p.get("min_score_highvol", 70.0))
+
+    # ── Strong-trend breakout entry (opt-in): second entry path ──────────────
+    # The pullback zone is the only entry path — in a strong trend price often
+    # never returns to the 1H zone and the whole run is missed. In STRONG_TREND
+    # with an exceptionally high score (default ≥80), waive the pullback
+    # requirement only. Unlike score_primary_entry (which waived every gate in
+    # every regime and lost badly), this waives ONE gate in the single best
+    # regime under a much higher score bar; all other gates still apply.
+    if (p.get("strong_trend_entry", False)
+            and p.get("market_regime_enabled", True) and "regime" in out):
+        _st_ok = out["regime"] == "STRONG_TREND"
+        _st_sc = float(p.get("strong_trend_score", 80.0))
+        at_pull_long  = at_pull_long  | (_st_ok & (score_long  >= _st_sc))
+        at_pull_short = at_pull_short | (_st_ok & (score_short >= _st_sc))
+
     out["final_buy"]  = (macro_up & mid_up  & at_pull_long  & long_bias_ok  &
-                          (score_long  >= p["min_score"]) & long_gates  & trigger_long).fillna(False)
+                          (score_long  >= _ms) & long_gates  & trigger_long).fillna(False)
     out["final_sell"] = (macro_dn  & mid_dn  & at_pull_short & short_bias_ok &
-                          (score_short >= p["min_score"]) & short_gates & trigger_short).fillna(False)
+                          (score_short >= _ms) & short_gates & trigger_short).fillna(False)
 
     # Diagnostic columns — each layer's pass/fail for the last bar
     out["d_macro_up"]  = macro_up.fillna(False)
@@ -1419,6 +1443,16 @@ class TrendContImprovedStrategy(BaseStrategy):
         regime_trend_adx=18,        # ADX threshold for TREND (below = RANGE)
         regime_strong_chop=38,      # Chop(1H) ceiling for STRONG_TREND
         regime_sl_high_vol=1.5,     # SL multiplier in HIGH_VOL (×1.5 wider)
+        # Regime-adaptive min_score: relax the bar in STRONG_TREND (fastest, safest
+        # entries), tighten it in HIGH_VOL (riskiest allowed regime). Opt-in.
+        regime_adaptive_min_score=False,
+        min_score_strong=50.0,      # min_score when regime == STRONG_TREND
+        min_score_highvol=70.0,     # min_score when regime == HIGH_VOL
+        # Strong-trend breakout entry: waive ONLY the pullback-zone requirement when
+        # regime == STRONG_TREND and score ≥ strong_trend_score — catches runs that
+        # never pull back to the 1H zone. All other gates still apply. Opt-in.
+        strong_trend_entry=False,
+        strong_trend_score=80.0,
         # ── Relative Volume (SJ scoring component) ─────────────────────────────
         # Entry bar volume relative to MA20(volume). Filters fake/low-interest breakouts.
         sj_rel_vol=True,            # rel_vol: volume/MA20 ≥1.2x — the single volume quality gate
