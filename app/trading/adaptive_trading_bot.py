@@ -474,6 +474,7 @@ class TradingBot:
                  tp1_close_pct: float = 0.50,
                  tp1_r: Optional[float] = None,
                  tp2_r: Optional[float] = None,
+                 min_ema_dist_atr: Optional[float] = None,
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
                  startup_warmup_minutes: int = 45,
@@ -493,6 +494,10 @@ class TradingBot:
             self.TP1_R = tp1_r
         if tp2_r is not None:
             self.TP2_R = tp2_r
+        # Fake-signal chop-zone filter (env-tunable): higher = stricter, more
+        # WR, fewer trades. 0.8 default; ~1.2 pushes WR toward 56%.
+        if min_ema_dist_atr is not None:
+            self.MIN_EMA_DIST_ATR = min_ema_dist_atr
         self._state_file: str  = state_file or self.DEFAULT_STATE_FILE
 
         self.account_balance       = account_balance
@@ -745,6 +750,10 @@ class TradingBot:
     TP1_R: float = 0.7
     TP2_R: float = 1.5
 
+    # [FAKE-FILTER] Minimum price-to-EMA20 distance (in ATR) for a trend-state
+    # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
+    MIN_EMA_DIST_ATR: float = 0.8
+
     def _regime_direction(self, ind_4h: Dict) -> float:
         """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
         ema5  = ind_4h.get("ema5", 0.0)
@@ -864,6 +873,21 @@ class TradingBot:
         get_filter_stats() diagnostics.
         """
         thrs = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
+
+        # [FAKE-FILTER] Chop-zone veto: entries taken while price sits within
+        # MIN_EMA_DIST_ATR of EMA20 have near-zero historical edge (WR ~48.6%,
+        # ~$1/trade) — price has no established direction there and whipsaws
+        # into the SL. Requiring price to have separated from the mean removes
+        # the bulk of straight-to-SL "fake" signals. MR states are exempt (they
+        # deliberately enter at mean extremes, which are already far from EMA).
+        if market_state not in self._MR_STATES:
+            _px  = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
+            _e20 = ind_15m.get("ema20", _px)
+            _atr = max(ind_15m.get("atr", 1e-9), 1e-9)
+            if abs(_px - _e20) / _atr < self.MIN_EMA_DIST_ATR:
+                self._filter_stats["checked"] += 1
+                self._filter_stats["health_fail"] += 1
+                return None
 
         entry = self._entry_score(ind_15m, candle_15m, direction, market_state)
         ctx   = self._context_score(ind_1h, direction)
@@ -1087,6 +1111,18 @@ class TradingBot:
             "entry_confidence":     confidence,
             "entry_type":           entry_type,
             "strategy":             strategy_tag,
+            # Entry-time score breakdown (for fake-signal analysis / tuning)
+            "e_entry":              signal.get("entry_score", health),
+            "e_context":            signal.get("context_score", 0.0),
+            "e_fit":                signal.get("direction_fit", 0.0),
+            "e_total":              signal.get("total_score", 0.0),
+            "e_state":              self.current_market_state,
+            # Entry-time raw features the score ignores (fake-signal hunting)
+            "e_adx":                ind.get("adx", 0.0),
+            "e_atr_exp":            ind.get("atr", 0.0) / max(ind.get("atr_avg", ind.get("atr", 1.0)), 1e-9),
+            "e_vol_ratio":          ind.get("volume", 0.0) / max(ind.get("vol_avg", ind.get("volume", 1.0)), 1e-9),
+            "e_ema_dist_atr":       abs(entry_price - ind.get("ema20", entry_price)) / max(ind.get("atr", 1.0), 1e-9),
+            "e_rsi":                ind.get("rsi", 50.0),
         }
 
         self._send_order("OPEN_LONG" if direction == "LONG" else "OPEN_SHORT", {
@@ -1376,6 +1412,18 @@ class TradingBot:
             "funding":             extras.get("funding_rate"),
             "open_interest":       extras.get("oi"),
             "exit_reason":         close_reason,
+            # Entry-time score breakdown (fake-signal analysis)
+            "e_entry":             t.get("e_entry"),
+            "e_context":           t.get("e_context"),
+            "e_fit":               t.get("e_fit"),
+            "e_total":             t.get("e_total"),
+            "e_state":             t.get("e_state"),
+            "e_adx":               t.get("e_adx"),
+            "e_atr_exp":           t.get("e_atr_exp"),
+            "e_vol_ratio":         t.get("e_vol_ratio"),
+            "e_ema_dist_atr":      t.get("e_ema_dist_atr"),
+            "e_rsi":               t.get("e_rsi"),
+            "realized_r":          round(_realized_r, 3),
         }
         self.trade_journal.append(entry)
 

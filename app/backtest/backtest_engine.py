@@ -213,6 +213,16 @@ class TradeRecord:
     commission:   float
     strategy:     str = ""     # SwingReversal / MeanReversion
     entry_type:   str = ""     # trend_follow / breakout / reversal / mean_revert etc.
+    e_entry:      float = 0.0  # entry-time 15M entry score
+    e_context:    float = 0.0  # entry-time 1H context score
+    e_fit:        float = 0.0  # entry-time 4H direction fit
+    e_total:      float = 0.0  # entry-time composite score
+    e_adx:        float = 0.0
+    e_atr_exp:    float = 0.0
+    e_vol_ratio:  float = 0.0
+    e_ema_dist_atr: float = 0.0
+    e_rsi:        float = 0.0
+    realized_r:   float = 0.0  # realized R multiple
 
 
 class SymbolBacktest:
@@ -368,6 +378,16 @@ class SymbolBacktest:
                         commission   = comm,
                         strategy     = j_entry.get("strategy", ""),
                         entry_type   = j_entry.get("entry_type", ""),
+                        e_entry      = float(j_entry.get("e_entry") or 0),
+                        e_context    = float(j_entry.get("e_context") or 0),
+                        e_fit        = float(j_entry.get("e_fit") or 0),
+                        e_total      = float(j_entry.get("e_total") or 0),
+                        e_adx        = float(j_entry.get("e_adx") or 0),
+                        e_atr_exp    = float(j_entry.get("e_atr_exp") or 0),
+                        e_vol_ratio  = float(j_entry.get("e_vol_ratio") or 0),
+                        e_ema_dist_atr = float(j_entry.get("e_ema_dist_atr") or 0),
+                        e_rsi        = float(j_entry.get("e_rsi") or 0),
+                        realized_r   = float(j_entry.get("realized_r") or 0),
                     )
                     trade_records.append(rec)
 

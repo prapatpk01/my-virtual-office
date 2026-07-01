@@ -127,6 +127,9 @@ def build_config() -> dict:
         # ADAPTIVE_TP1_R raises win-rate at the cost of average win size.
         "adaptive_tp1_r": (_env_float("ADAPTIVE_TP1_R", 0.0) or None),
         "adaptive_tp2_r": (_env_float("ADAPTIVE_TP2_R", 0.0) or None),
+        # Fake-signal chop-zone filter (None = default 0.8). Higher = stricter,
+        # higher WR, fewer trades (~1.2 pushes WR toward 56%).
+        "adaptive_min_ema_dist_atr": (_env_float("ADAPTIVE_MIN_EMA_DIST_ATR", 0.0) or None),
     }
 
 
@@ -271,6 +274,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             enable_mean_reversion=cfg["strategies"].get("mean_reversion", False),
             tp1_r=cfg.get("adaptive_tp1_r"),
             tp2_r=cfg.get("adaptive_tp2_r"),
+            min_ema_dist_atr=cfg.get("adaptive_min_ema_dist_atr"),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)
