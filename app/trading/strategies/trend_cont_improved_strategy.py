@@ -1076,11 +1076,21 @@ def check_health(side: str, entry: float, one_r: float, tp1_hit: bool,
 def check_spike_cut(side: str, entry: float, one_r: float,
                     df3m: pd.DataFrame,
                     spike_atr_mult: float = 1.5,
-                    spike_bars: int = 4) -> tuple[str, str]:
+                    spike_bars: int = 4,
+                    uw_frac: float = 0.0) -> tuple[str, str]:
     """
     Fast adverse-move detector using 3m candles.
     Fires when price moves ≥ spike_atr_mult×ATR(3m) against the position
-    within spike_bars×3m (default 4×3m = 12 min). No minimum loss required.
+    within spike_bars×3m (default 4×3m = 12 min) AND the position is at least
+    uw_frac×R underwater (default 0.0 = no floor, legacy behaviour).
+
+    uw_frac exists because ATR(3m) shrinks in quiet markets, so a fixed
+    ATR-multiple threshold can trip on ordinary 3-minute noise that never
+    puts the position at real risk — backtest Jan-May 2026 (BTC+XAU) showed
+    uw_frac=0.0 cutting 82% of trades at 0.1-0.14R underwater (near noise
+    level), taking a PF-1.81 entry edge to PF-0.41. A floor keeps spike-cut
+    as a genuine fast-bailout for positions already meaningfully underwater,
+    not a rare-event detector, without moving the ATR threshold.
     """
     min_bars = spike_bars + 15          # need enough history for ATR(14)
     if df3m is None or len(df3m) < min_bars:
@@ -1093,13 +1103,16 @@ def check_spike_cut(side: str, entry: float, one_r: float,
     px_now  = float(df3m["close"].iloc[-1])
     px_prev = float(df3m["close"].iloc[-(spike_bars + 1)])
 
+    uw = ((entry - px_now) / one_r if side == "long"
+          else (px_now - entry) / one_r)
+    if uw < uw_frac:
+        return ("HOLD", f"only {uw:.2f}R underwater (< {uw_frac}R) — spike-cut floor not met")
+
     # Adverse move: down for long, up for short
     adverse_move = (px_prev - px_now) if side == "long" else (px_now - px_prev)
     move_r = adverse_move / atr3
 
     if move_r >= spike_atr_mult:
-        uw = ((entry - px_now) / one_r if side == "long"
-              else (px_now - entry) / one_r)
         return ("CLOSE",
                 f"SPIKE-CUT: {move_r:.1f}×ATR(3m) adverse in {spike_bars}bars "
                 f"(uw={uw:.2f}R, atr={atr3:.2f})")
@@ -1255,6 +1268,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         reversal_spike_enabled=True,
         reversal_spike_atr=1.5,   # adverse move must be ≥ N×ATR(3m)
         reversal_spike_bars=4,    # window in 3m bars (4×3m = 12 min)
+        reversal_spike_uw_frac=0.0,  # min R underwater before spike-cut can fire (0=no floor, legacy)
         # trend-fade cut: early-loss exit when trend dies AND price turns AND losing
         # Backtest Jan-May 2026: Classic +16% ($241→$279), SJ +52% ($143→$217),
         # both with lower MaxDD. Triple gate avoids chopping quiet winners.
@@ -1491,6 +1505,7 @@ class TrendContImprovedStrategy(BaseStrategy):
                 side, entry, one_r, df3m,
                 spike_atr_mult=self._p["reversal_spike_atr"],
                 spike_bars=self._p["reversal_spike_bars"],
+                uw_frac=self._p["reversal_spike_uw_frac"],
             )
             if sc_action == "CLOSE":
                 return ("CLOSE", sc_reason)
