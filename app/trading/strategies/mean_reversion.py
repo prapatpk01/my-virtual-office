@@ -147,9 +147,10 @@ class MeanReversionStrategy:
 
     # ── STEP 3: Over-Extension Filter ──────────────────────────────────────────
 
-    def _step3_overextension(self, ind: Dict, direction: str) -> bool:
+    def _step3_overextension(self, ind: Dict, candle: Dict, direction: str) -> bool:
         """Price must be stretched ≥1.5×ATR from EMA20, or at BB/VWAP extreme."""
-        close  = ind.get("close", 0.0)
+        # FIX-#3: 'close' is not in the indicator dict — read from the candle
+        close  = float(candle.get("close", 0.0))
         ema20  = ind.get("ema20", close)
         atr    = ind.get("atr", 1.0)
         bb_up, bb_lo = self._bb_bounds(ind)
@@ -441,7 +442,7 @@ class MeanReversionStrategy:
         for direction in directions:
 
             # Step 3: Over-extension
-            ext_ok = self._step3_overextension(ind_15m, direction)
+            ext_ok = self._step3_overextension(ind_15m, candle_15m, direction)
 
             # SL estimate for distance filter
             sl_price, sl_method = self._step14_sl(ind_15m, candle_15m, direction)
@@ -520,14 +521,23 @@ class MeanReversionStrategy:
                 f"health={health:.0f} size×{size_mult:.2f}",
             ]
 
+            # FIX-#10: separate confidence_score from health_score
+            # Confidence = quality of HTF+structure+momentum alignment (conviction)
+            confidence_score = (
+                (100.0 if struct_ok else 0.0) * 0.40 +
+                (100.0 if mom_ok   else 0.0) * 0.35 +
+                (75.0  if bias is not None else 50.0) * 0.25
+            )
+
             signal = {
-                "strategy":   "MeanReversion",
-                "direction":  direction,
-                "entry":      entry_price,
-                "sl_price":   sl_price,
-                "sl_method":  sl_method,
-                "health_score": health,
-                "size_mult":  size_mult,
+                "strategy":        "MeanReversion",
+                "direction":       direction,
+                "entry":           entry_price,
+                "sl_price":        sl_price,
+                "sl_method":       sl_method,
+                "health_score":    health,
+                "confidence_score": confidence_score,
+                "size_mult":       size_mult,
                 "tp_config": {
                     "tp1":    tp1, "tp1_pct": 0.50,   # close 50% at 0.7R
                     "tp2":    tp2, "tp2_pct": 1.00,   # close 100% at 1.5R

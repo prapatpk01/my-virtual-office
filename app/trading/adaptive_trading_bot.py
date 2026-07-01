@@ -967,7 +967,8 @@ class TradingBot:
             # MeanReversion: size from health score (Step 13)
             size_mult  = mr_signal.get("size_mult", 1.0)
             health     = mr_signal.get("health_score", 0.0)
-            confidence = mr_signal.get("health_score", 0.0)
+            # FIX-#10: use separate confidence_score; fall back to health_score if absent
+            confidence = mr_signal.get("confidence_score", mr_signal.get("health_score", 0.0))
             entry_type = "mean_revert"
         else:
             health     = self._last_entry_health
@@ -1040,6 +1041,11 @@ class TradingBot:
             "size":  position_size,
         })
 
+        # FIX-#1: if execution_callback failed, _send_order sets state=ERROR — abort
+        if self.state == "ERROR":
+            self.current_trade = {}
+            return
+
         self.position_open         = True
         self._position_entry_bar   = self._bar_count
         self.order_status          = "OPEN"
@@ -1107,7 +1113,11 @@ class TradingBot:
                 t["tp1_hit"] = True
                 t["tp2_hit"] = True
                 if not t["break_even_triggered"]:
-                    t["sl"] = t["entry"]
+                    # FIX-#5: direction-aware BE so SHORT trailing SL isn't widened
+                    if direction == "LONG":
+                        t["sl"] = max(t["sl"], t["entry"])
+                    else:
+                        t["sl"] = min(t["sl"], t["entry"])
                     t["break_even_triggered"] = True
                     self._log_event(
                         f"TP2 @ {t['tp2']:.4f} → {tp2_close_pct:.0%} partial + SL → BE"
@@ -1221,6 +1231,7 @@ class TradingBot:
         t["realized_pnl"]   = t.get("realized_pnl", 0.0) + pnl
         t["remaining_size"] = remaining - close_size
         t["exit_price"]     = float(price)
+        t["exit_reason"]    = reason   # stored so EXITING state can read it
 
         if t["sl_dist"] > 0:
             t["final_rr"] = pnl_per_unit / t["sl_dist"]
@@ -1232,6 +1243,13 @@ class TradingBot:
             "pnl":       pnl,
             "direction": direction,
         })
+
+        # FIX-#4: if order failed (state=ERROR), don't mark local position as closed —
+        # exchange still holds the real position.
+        if self.state == "ERROR":
+            t["remaining_size"] = remaining  # undo local accounting
+            t["realized_pnl"]   = t.get("realized_pnl", 0.0) - pnl
+            return
 
         self._log_event(
             f"CLOSE {reason} | {direction} | price={price:.2f} "
@@ -1338,7 +1356,8 @@ class TradingBot:
                 self.consecutive_sl_hits  = 0
 
         # [V8-6] Tiered cooldown
-        _now = self._bar_now or datetime.datetime.now()
+        # FIX-#7: always use timezone-aware UTC so comparison with bar_dt (aware) works
+        _now = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
         cooldown_mins = None
 
         if self.consecutive_sl_hits >= 2:
@@ -1587,15 +1606,23 @@ class TradingBot:
                 t           = self.current_trade
                 pnl         = t.get("realized_pnl", 0.0)
                 result      = "WIN" if pnl > 0 else "LOSS"
-                close_reason = t.get("exit_price") and "SL_HIT"  # will be overridden below
-                # Derive close reason from last CLOSE_FULL send
-                close_reason = (
-                    "SL_HIT"        if t.get("exit_price") is not None and pnl < 0 else
-                    "TP3_RUNNER"    if t.get("tp3_hit") else
-                    "FULL_TP2"      if t.get("tp2_hit") else
-                    "PARTIAL_TP1"   if t.get("tp1_hit") else
-                    "EXIT"
-                )
+                # FIX-#4 (close_reason): use the explicit exit_reason stored by _close_position
+                # via the 'reason' field if available; fall back to heuristic.
+                # Also treat pnl==0 (break-even SL) as SL_HIT so consecutive_sl_hits counts correctly.
+                _exit_reason = t.get("exit_reason", "")
+                if _exit_reason in ("SL_HIT", "RUNNER_SL"):
+                    close_reason = "SL_HIT"
+                elif t.get("tp3_hit"):
+                    close_reason = "TP3_RUNNER"
+                elif t.get("tp2_hit"):
+                    close_reason = "FULL_TP2"
+                elif t.get("tp1_hit"):
+                    close_reason = "PARTIAL_TP1"
+                elif t.get("exit_price") is not None and pnl <= 0:
+                    # break-even or loss exit with no TP hit → SL or emergency exit
+                    close_reason = "SL_HIT"
+                else:
+                    close_reason = "EXIT"
                 self._log_trade(result, close_reason, ind_15m, extras)
                 if self.state not in ("COOLDOWN", "BLOCKED"):
                     self.state = "SCANNING"
@@ -1874,19 +1901,25 @@ class TradingBot:
             )
             sl_dist_r = max(entry_price * 0.01, 1e-9)
             mult_r    = 1 if direction == "LONG" else -1
+            # FIX-#9: include all fields _manage_open_position expects
             self.current_trade = {
                 "direction": direction, "entry": entry_price,
                 "sl": entry_price * (0.99 if direction == "LONG" else 1.01),
                 "sl_dist": sl_dist_r,
                 "tp1": entry_price + sl_dist_r * 0.7 * mult_r,
                 "tp2": entry_price + sl_dist_r * 2.0 * mult_r,
+                "tp3": None,
+                "tp1_pct": 0.50, "tp2_pct": 1.0,
+                "trail_atr_mult": 2.0,
                 "size": abs(live_size), "remaining_size": abs(live_size),
-                "tp1_hit": False, "tp2_hit": False,
+                "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
                 "break_even_triggered": False, "status": "OPEN",
-                "entry_time": datetime.datetime.now(),
+                "entry_time": datetime.datetime.now(datetime.timezone.utc),
                 "atr_at_entry": sl_dist_r,
-                "realized_pnl": 0.0, "exit_price": None, "final_rr": None,
-                "mae": 0.0, "mfe": 0.0,
+                "realized_pnl": 0.0, "exit_price": None, "exit_reason": None,
+                "final_rr": None, "mae": 0.0, "mfe": 0.0,
+                "entry_health": 0.0, "entry_confidence": 0.0,
+                "entry_type": "reconcile", "strategy": "Reconcile",
             }
             self.position_open = True
             self.state         = "IN_POSITION"

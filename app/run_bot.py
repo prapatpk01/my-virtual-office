@@ -183,19 +183,31 @@ def _make_telegram(cfg: dict):
 async def _run_adaptive(cfg, connector, telegram, stop_event):
     from trading.adaptive_trading_bot import TradingBot as AdaptiveBot
     from trading.indicator_engine import IndicatorEngine
-    from trading.connectors.okx_adapter import OKXAdapter
 
     symbols = cfg["symbols"]
     logger.info("=== ADAPTIVE MODE: %d symbols ===", len(symbols))
 
-    # Sync OKX adapter for order execution
-    okx = OKXAdapter(
-        api_key=cfg["api_key"],
-        api_secret=cfg["api_secret"],
-        api_passphrase=cfg.get("api_passphrase", ""),
-        paper=cfg["paper"],
-        leverage=cfg.get("leverage", 10),
-    )
+    # FIX-#2: choose execution adapter based on configured exchange
+    exchange_id = cfg.get("exchange", "okx").lower()
+    if exchange_id == "binance":
+        from trading.connectors.binance_conn import BinanceConnector as _ExecAdapter
+        okx = _ExecAdapter(
+            api_key=cfg["api_key"],
+            api_secret=cfg["api_secret"],
+            paper=cfg["paper"],
+            exchange_id="binance",
+            passphrase="",
+            leverage=cfg.get("leverage", 10),
+        )
+    else:
+        from trading.connectors.okx_adapter import OKXAdapter
+        okx = OKXAdapter(
+            api_key=cfg["api_key"],
+            api_secret=cfg["api_secret"],
+            api_passphrase=cfg.get("api_passphrase", ""),
+            paper=cfg["paper"],
+            leverage=cfg.get("leverage", 10),
+        )
 
     ind_engine = IndicatorEngine()
 
@@ -203,9 +215,14 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     bots: dict = {}
     last_bar_ts: dict = {}  # symbol → last processed 15m bar timestamp
 
+    # FIX-#6: use BOT_STATE_DIR env var so state survives container restarts
+    import os as _os
+    _state_dir = _os.environ.get("BOT_STATE_DIR", "/tmp")
+    _os.makedirs(_state_dir, exist_ok=True)
+
     for sym in symbols:
         safe_sym = sym.replace("/", "_").replace(":", "_")
-        state_file = f"/tmp/adaptive_{safe_sym}.json"
+        state_file = _os.path.join(_state_dir, f"adaptive_{safe_sym}.json")
 
         def _make_callback(s, t):
             def cb(order_type, trade_info):
@@ -246,6 +263,9 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         telegram.bots_dict = bots
         # Wire /stop command so it reaches the adaptive runner's stop_event
         telegram.stop_bot_fn = lambda: stop_event.set()
+        # FIX-#8: start Telegram command polling in adaptive mode
+        loop = asyncio.get_event_loop()
+        telegram.start_polling(loop)
         telegram.send(
             f"Adaptive Bot Started\n"
             f"Symbols: {', '.join(symbols)}\n"
@@ -401,6 +421,14 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             await asyncio.wait_for(stop_event.wait(), timeout=cfg["interval"])
         except asyncio.TimeoutError:
             pass
+
+    # FIX-#6/#8: persist state for all bots on clean shutdown (SIGTERM/stop)
+    for sym, (bot, sf) in bots.items():
+        try:
+            bot.save_state(sf)
+            logger.info("[Adaptive] State saved for %s → %s", sym, sf)
+        except Exception as e:
+            logger.warning("[Adaptive] Could not save state for %s: %s", sym, e)
 
 
 # ---------------------------------------------------------------------------
