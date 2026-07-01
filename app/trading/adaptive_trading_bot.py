@@ -69,17 +69,19 @@ ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
     "STRONG_TREND": {"rsi_long": (38, 65), "rsi_short": (35, 62), "total_min": 55},
     "TRENDING":     {"rsi_long": (30, 55), "rsi_short": (45, 65), "total_min": 62},
     "BREAKOUT":     {"rsi_long": (42, 72), "rsi_short": (28, 58), "total_min": 55},
-    "REVERSAL":     {"rsi_long": (25, 45), "rsi_short": (55, 75), "total_min": 58},
+    "REVERSAL":     {"rsi_long": (25, 45), "rsi_short": (55, 75), "total_min": 62},
     "SIDEWAY":      {"rsi_long": (28, 48), "rsi_short": (52, 72), "total_min": 62},
     "HIGH_VOL":     {"rsi_long": (35, 55), "rsi_short": (45, 65), "total_min": 62},
-    "EXHAUSTION":   {"rsi_long": (25, 44), "rsi_short": (56, 75), "total_min": 58},
+    # [#4] EXHAUSTION fades the 4H trend — near-zero edge historically, so make
+    # it highly selective: only the strongest aggregate setups pass.
+    "EXHAUSTION":   {"rsi_long": (25, 44), "rsi_short": (56, 75), "total_min": 68},
     "LOW_VOL":      {"rsi_long": (50, 50), "rsi_short": (50, 50), "total_min": 999},
 }
 
 # States the bot will trade in — LOW_VOL skipped entirely
 _TRADEABLE_STATES: frozenset = frozenset({
     "STRONG_TREND", "TRENDING", "BREAKOUT", "REVERSAL",
-    "SIDEWAY", "HIGH_VOL", "EXHAUSTION",
+    "SIDEWAY", "HIGH_VOL",
 })
 
 # Which states trade counter-direction of Regime Bias
@@ -721,6 +723,14 @@ class TradingBot:
     # States where price is expected to revert to the mean rather than trend
     _MR_STATES: frozenset = frozenset({"SIDEWAY", "EXHAUSTION", "REVERSAL"})
 
+    # [#3] Minimum standalone 15M entry score — an entry bar below this is
+    # rejected regardless of how strong the 4H/1H alignment is.
+    ENTRY_SCORE_FLOOR: float = 45.0
+
+    # [#2] States where entry-location (buy-the-pullback) preference is applied.
+    # Efficient trends only — moderate/choppy trends trade better on continuation.
+    _LOCATION_STATES: frozenset = frozenset({"STRONG_TREND", "BREAKOUT"})
+
     def _regime_direction(self, ind_4h: Dict) -> float:
         """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
         ema5  = ind_4h.get("ema5", 0.0)
@@ -769,10 +779,28 @@ class TradingBot:
             agree = -agree
         return float(np.clip(50.0 + agree / 2.0, 0, 100))
 
+    def _entry_location_score(self, ind_15m: Dict, candle_15m: Dict,
+                              direction: str) -> float:
+        """
+        [#2] 0-100 score for WHERE price is relative to EMA20, in ATR units.
+        For trend entries we want to buy pullbacks, not chase extensions:
+        at/below EMA20 (LONG) → ~100; the further extended above → the lower.
+        Penalty ~40 pts per ATR of extension.
+        """
+        close = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
+        ema20 = ind_15m.get("ema20", close)
+        atr   = max(ind_15m.get("atr", 1e-9), 1e-9)
+        if direction == "LONG":
+            over = (close - ema20) / atr        # >0 = extended above (chasing)
+        else:
+            over = (ema20 - close) / atr        # >0 = extended below (chasing)
+        return float(np.clip(100.0 - max(0.0, over) * 40.0, 0.0, 100.0))
+
     def _entry_score(self, ind_15m: Dict, candle_15m: Dict, direction: str,
                      market_state: str) -> Dict:
         """15M entry trigger — mean-revert scoring for ranging/exhausted states,
-        trend-follow (EntryHealthScorer) scoring otherwise. Returns {score, sl_price}."""
+        trend-follow (EntryHealthScorer) scoring otherwise.
+        Returns {score, sl_price, struct_ok}."""
         if market_state in self._MR_STATES:
             mr = self._mr_strategy
             ext_ok    = mr._step3_overextension(ind_15m, candle_15m, direction)
@@ -790,15 +818,28 @@ class TradingBot:
                 (100.0 if vol_ok    else 0.0) * 0.05
             )
             sl_price, _method = mr._step14_sl(ind_15m, candle_15m, direction)
-            return {"score": float(np.clip(score, 0, 100)), "sl_price": sl_price}
+            return {"score": float(np.clip(score, 0, 100)),
+                    "sl_price": sl_price, "struct_ok": struct_ok}
 
-        score = self.entry_scorer.compute(ind_15m, direction, market_state)
+        # Trend-follow entry: blend market-health quality with entry LOCATION [#2].
+        # Backtest showed the pullback preference helps EFFICIENT trends
+        # (STRONG_TREND, eff>0.55 — pullbacks reliably resume) but HURTS choppier
+        # moderate trends (TRENDING, eff>0.35 — pullbacks often fail, momentum
+        # continuation is better). So apply the location blend only where it pays.
+        health = self.entry_scorer.compute(ind_15m, direction, market_state)
+        if market_state in self._LOCATION_STATES:
+            location = self._entry_location_score(ind_15m, candle_15m, direction)
+            score    = health * 0.70 + location * 0.30
+        else:
+            score    = health
+
         entry_price = float(candle_15m.get("close", 0.0))
         if direction == "LONG":
             sl_price = candle_15m.get("pattern_low", entry_price * 0.99)
         else:
             sl_price = candle_15m.get("pattern_high", entry_price * 1.01)
-        return {"score": score, "sl_price": sl_price}
+        return {"score": float(np.clip(score, 0, 100)),
+                "sl_price": sl_price, "struct_ok": True}
 
     def _generate_signal(self, direction: str, candle_15m: Dict, ind_15m: Dict,
                          ind_1h: Dict, ind_4h: Dict, market_state: str,
@@ -813,6 +854,15 @@ class TradingBot:
         entry = self._entry_score(ind_15m, candle_15m, direction, market_state)
         ctx   = self._context_score(ind_1h, direction)
         fit   = self._direction_fit(market_state, regime_direction, direction)
+
+        # [#3] Hard floor on the 15M entry itself — a weak entry bar must not
+        # pass on HTF strength alone. Keeps the bot from entering mediocre bars
+        # just because 4H+1H look aligned.
+        if entry["score"] < self.ENTRY_SCORE_FLOOR:
+            self._filter_stats["checked"] += 1
+            self._filter_stats["health_fail"] += 1
+            return None
+
 
         total = entry["score"] * 0.40 + ctx["score"] * 0.30 + fit * 0.30
         total_min = thrs["total_min"]
