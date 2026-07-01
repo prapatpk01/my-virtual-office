@@ -64,16 +64,18 @@ logger = logging.getLogger("adaptive_trading_bot")
 
 ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
     # Strong directional trend — dip-buy / dip-sell entry, lower RSI bar
+    # Lowered health_min 68→63: top-performing state, capture more setups
     "STRONG_TREND": {
         "rsi_long":  (38, 65), "rsi_short": (35, 62),
         "macd_long": "above_signal", "macd_short": "below_signal",
-        "adx_min": 22, "health_min": 68, "confidence_min": 65,
+        "adx_min": 22, "health_min": 63, "confidence_min": 65,
     },
     # Normal trend — wait for pullback to RSI<45 (dip-buy zone)
+    # Raised health_min 72→77, confidence_min 65→68: 45% WR drag, filter harder
     "TRENDING": {
         "rsi_long":  (30, 55), "rsi_short": (45, 65),
         "macd_long": "above_signal", "macd_short": "below_signal",
-        "adx_min": 18, "health_min": 72, "confidence_min": 65,
+        "adx_min": 18, "health_min": 77, "confidence_min": 68,
     },
     # Breakout from compression — momentum entry, RSI expansive
     "BREAKOUT": {
@@ -88,10 +90,11 @@ ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
         "adx_min": 12, "health_min": 75, "confidence_min": 68,
     },
     # Ranging market — mean-revert gates
+    # Raised health_min 72→77: 45% WR, needs tighter filter
     "SIDEWAY": {
         "rsi_long":  (28, 48), "rsi_short": (52, 72),
         "macd_long": "any", "macd_short": "any",
-        "adx_min": 10, "health_min": 72, "confidence_min": 62,
+        "adx_min": 10, "health_min": 77, "confidence_min": 62,
     },
     # Volatility expansion — very strict entry
     "HIGH_VOL": {
@@ -100,10 +103,11 @@ ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
         "adx_min": 22, "health_min": 80, "confidence_min": 72,
     },
     # Trend losing momentum — deeper OS/OB, MACD must be turning
+    # Lowered health_min 78→75: 53% WR decent, slightly more permissive
     "EXHAUSTION": {
         "rsi_long":  (25, 44), "rsi_short": (56, 75),
         "macd_long": "turning_up", "macd_short": "turning_down",
-        "adx_min": 18, "health_min": 78, "confidence_min": 70,
+        "adx_min": 18, "health_min": 75, "confidence_min": 70,
     },
     # Squeeze phase — skip immediately
     "LOW_VOL": {
@@ -1286,6 +1290,7 @@ class TradingBot:
             "macd":                ind.get("macd"),
             "market_state":        self.current_market_state,
             "regime_bias":         self.current_regime_bias,
+            "strategy":            t.get("strategy", "SwingReversal"),
             "entry_type":          entry_type,
             "entry_health":        t.get("entry_health"),
             "entry_confidence":    t.get("entry_confidence"),
@@ -1564,7 +1569,10 @@ class TradingBot:
                     mr_signal=self._pending_signal,
                 )
                 self._pending_signal = None  # consumed
-                self.state    = "IN_POSITION"
+                if self.position_open:
+                    self.state = "IN_POSITION"
+                else:
+                    self.state = "SCANNING"   # risk engine skipped (confidence too low etc.)
                 state_changed = False
 
             elif self.state in ("IN_POSITION", "PARTIAL_EXIT", "TRAILING"):

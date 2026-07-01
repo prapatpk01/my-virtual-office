@@ -211,6 +211,8 @@ class TradeRecord:
     exit_time:    str
     bars_held:    int
     commission:   float
+    strategy:     str = ""     # SwingReversal / MeanReversion
+    entry_type:   str = ""     # trend_follow / breakout / reversal / mean_revert etc.
 
 
 class SymbolBacktest:
@@ -235,16 +237,18 @@ class SymbolBacktest:
         ind_engine = IndicatorEngine()
 
         bot = TradingBot(
-            account_balance       = self.cfg.initial_balance,
-            base_risk_pct         = self.cfg.risk_pct,
-            daily_loss_limit_pct  = self.cfg.daily_loss_pct,
-            daily_profit_limit_pct= self.cfg.daily_profit_pct,
-            cooldown_minutes      = self.cfg.cooldown_min,
-            max_loss_streak       = self.cfg.max_loss_streak,
-            tp1_close_pct         = self.cfg.tp1_close_pct,
-            state_file            = os.devnull,   # no disk I/O during backtest
-            execution_callback    = executor.execute,
-            startup_warmup_minutes= 0,            # backtest has no warmup — instant start
+            account_balance        = self.cfg.initial_balance,
+            base_risk_pct          = self.cfg.risk_pct,
+            daily_loss_limit_pct   = self.cfg.daily_loss_pct,
+            daily_profit_limit_pct = self.cfg.daily_profit_pct,
+            cooldown_minutes       = self.cfg.cooldown_min,
+            max_loss_streak        = self.cfg.max_loss_streak,
+            tp1_close_pct          = self.cfg.tp1_close_pct,
+            state_file             = os.devnull,   # no disk I/O during backtest
+            execution_callback     = executor.execute,
+            startup_warmup_minutes = 0,            # backtest has no warmup — instant start
+            enable_swing_reversal  = True,
+            enable_mean_reversion  = True,
         )
 
         trade_records: List[TradeRecord] = []
@@ -362,6 +366,8 @@ class SymbolBacktest:
                         ).isoformat(),
                         bars_held    = bars_held_before_tick + 1,
                         commission   = comm,
+                        strategy     = j_entry.get("strategy", ""),
+                        entry_type   = j_entry.get("entry_type", ""),
                     )
                     trade_records.append(rec)
 

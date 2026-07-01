@@ -11,7 +11,7 @@ TP structure (same as SwingReversalPro):
 SL = max(ATR×1.5, sweep_low/high)
 
 Steps:
-  1  Market Regime Filter (4H) — need ≥4/7 non-trending conditions
+  1  Market Regime Filter (4H) — need ≥3/7 non-trending conditions
   2  HTF Bias (1H + 4H) — detect long/short lean
   3  Over-Extension Filter — price stretched from mean ≥1.5×ATR or BB/VWAP extreme
   4  Liquidity Sweep — false breakdown/breakout + re-entry
@@ -104,14 +104,14 @@ class MeanReversionStrategy:
             ("adx<20",         adx < 20),
             ("slope_flat",     44 < slope < 56),
             ("eff<0.45",       eff < 0.45),
-            ("atr_stable",     atr_exp < 1.0),
-            ("bb_low",         bb_w < 0.06),           # BB width below typical
+            ("atr_stable",     atr_exp < 1.1),          # loosened from 1.0
+            ("bb_low",         bb_w < 0.08),            # loosened from 0.06
             ("near_ema50",     abs(price - ema50) < atr * 2.0),
             ("no_breakout",    atr_exp < 1.15),         # no strong expansion
         ]
         passed = [name for name, ok in checks if ok]
         count  = len(passed)
-        return count >= 4, count, passed
+        return count >= 3, count, passed  # loosened from >=4 to >=3
 
     # ── STEP 2: Higher-Timeframe Bias ──────────────────────────────────────────
 
