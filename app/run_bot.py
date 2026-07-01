@@ -337,11 +337,6 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     SCAN_LOG_SECS = _env_int("SCAN_LOG_SECONDS", 300)
     last_scan_log = _time.time()
 
-    # Periodic Telegram digest (balance, open positions, per-symbol + total
-    # stats) — previously only available on-demand via /stats.
-    TELEGRAM_DIGEST_SECS = _env_int("TELEGRAM_DIGEST_SECONDS", 1800)
-    last_telegram_digest = _time.time()
-
     _HEALTH_EMOJI = {
         "STRONG":   "✅",
         "GOOD":     "🟢",
@@ -535,12 +530,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 except Exception as e:
                     logger.warning("[Adaptive][%s] scan log failed: %s", sym, e)
 
-        if telegram and _time.time() - last_telegram_digest >= TELEGRAM_DIGEST_SECS:
-            last_telegram_digest = _time.time()
-            try:
-                telegram.send_periodic_status()
-            except Exception as e:
-                logger.warning("[Telegram] periodic digest failed: %s", e)
+        # Stats are on-demand only (via the /stats Telegram command) — no
+        # periodic auto-digest, to avoid spamming the chat.
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=cfg["interval"])
