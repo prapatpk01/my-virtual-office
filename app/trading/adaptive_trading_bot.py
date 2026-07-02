@@ -833,6 +833,9 @@ class TradingBot:
     # win size. Swept via backtest.
     TP1_R: float = 0.5
     TP2_R: float = 1.2
+    # [TP-MODE runner] Trend trades don't split at TP1 — SL locks to
+    # entry + RUNNER_LOCK_R × R instead, full size rides to TP2.
+    RUNNER_LOCK_R: float = 0.3
 
     # [FAKE-FILTER] Minimum price-to-EMA20 distance (in ATR) for a trend-state
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
@@ -1108,6 +1111,19 @@ class TradingBot:
 
         if tp1_hit and not t["tp1_hit"]:
             tp1_close_pct = t.get("tp1_pct", self.tp1_close_pct)
+            # [TP-MODE runner] trend trades: no partial — lock SL at
+            # entry + RUNNER_LOCK_R×R (guaranteed profit), full size to TP2.
+            if t.get("tp_mode") == "runner":
+                lock = t["entry"] + t["sl_dist"] * self.RUNNER_LOCK_R * \
+                       (1 if direction == "LONG" else -1)
+                t["sl"] = max(t["sl"], lock) if direction == "LONG" else min(t["sl"], lock)
+                t["tp1_hit"] = True
+                t["break_even_triggered"] = True
+                self._log_event(
+                    f"TP1 @ {t['tp1']:.4f} → runner: SL locked at "
+                    f"{t['sl']:.4f} (+{self.RUNNER_LOCK_R}R), full size to TP2"
+                )
+                return f"TP1_RUNNER_LOCK @ {t['sl']:.4f} (+{self.RUNNER_LOCK_R}R)"
             # [MIN-LOT TP1] a partial below the exchange's minimum fill size
             # would floor up and close the WHOLE position — convert TP1 into a
             # breakeven-move only and let the full size ride to TP2.
@@ -1263,9 +1279,19 @@ class TradingBot:
         trail_atr = 2.0
 
         strategy_tag = signal.get("strategy", "Adaptive")
+
+        # [TP-MODE] Per-state TP handling (user-designed):
+        # - MR states (SIDEWAY/EXHAUSTION/REVERSAL): "split" — bank 50% at TP1,
+        #   SL→BE, rest to TP2 (classic mean-revert: take the bounce quickly).
+        # - Trend states: "runner" — nothing closed at TP1; instead SL locks to
+        #   entry +RUNNER_LOCK_R×R (guaranteed profit), FULL size rides to TP2.
+        #   Also sidesteps the min-lot split problem for trend trades entirely.
+        tp_mode = "split" if self.current_market_state in self._MR_STATES else "runner"
+
         self._log_event(
             f"[{strategy_tag}] OPEN {direction} entry={entry_price:.4f} "
-            f"sl={pattern_sl:.4f} tp1={tp1:.4f}(0.7R) tp2={tp2:.4f}(1.5R) "
+            f"sl={pattern_sl:.4f} tp1={tp1:.4f}({self.TP1_R}R) "
+            f"tp2={tp2:.4f}({self.TP2_R}R) mode={tp_mode} "
             f"size×{size_mult:.2f} health={health:.0f}"
         )
 
@@ -1277,6 +1303,7 @@ class TradingBot:
             "tp1":                  tp1,
             "tp2":                  tp2,
             "tp3":                  tp3,           # None for SwingReversal
+            "tp_mode":              tp_mode,
             "tp1_pct":              tp1_pct,
             "tp2_pct":              tp2_pct,
             "trail_atr_mult":       trail_atr,
@@ -1422,6 +1449,18 @@ class TradingBot:
         # TP1 — close tp1_pct + break-even
         if tp1_hit_cond and not t["tp1_hit"]:
             tp1_close_pct = t.get("tp1_pct", self.tp1_close_pct)
+            # [TP-MODE runner] trend trades: no partial — lock SL at +RUNNER_LOCK_R.
+            if t.get("tp_mode") == "runner":
+                lock = t["entry"] + t["sl_dist"] * self.RUNNER_LOCK_R * \
+                       (1 if direction == "LONG" else -1)
+                t["sl"] = max(t["sl"], lock) if direction == "LONG" else min(t["sl"], lock)
+                t["tp1_hit"] = True
+                t["break_even_triggered"] = True
+                self._log_event(
+                    f"TP1 @ {t['tp1']:.4f} → runner: SL locked at "
+                    f"{t['sl']:.4f} (+{self.RUNNER_LOCK_R}R), full size to TP2"
+                )
+                return self.state
             # [MIN-LOT TP1] see check_price_protection — unsplittable position
             # converts TP1 to a breakeven-move only; full size rides to TP2.
             remaining = t.get("remaining_size", 0.0)
