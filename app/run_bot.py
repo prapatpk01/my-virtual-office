@@ -432,6 +432,25 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                                 sym, open_count, max_pos,
                             )
                             should_process = False
+                        elif getattr(bot, "margin_usdt", 0) > 0:
+                            # [SHARED-MARGIN GUARD] Each bot's account_balance
+                            # is its own private copy, resynced only every
+                            # ~5 min — it does NOT reflect margin already
+                            # committed by a SIBLING symbol's position opened
+                            # moments ago on the same real account. Reserve
+                            # margin across all currently-open positions
+                            # before letting another symbol attempt one.
+                            reserved = sum(
+                                getattr(b, "margin_usdt", 0)
+                                for b, _ in bots.values() if b.position_open
+                            )
+                            if reserved + bot.margin_usdt > bot.account_balance:
+                                logger.debug(
+                                    "[Adaptive][%s] SKIP — reserved margin "
+                                    "$%.2f + $%.2f > balance $%.2f",
+                                    sym, reserved, bot.margin_usdt, bot.account_balance,
+                                )
+                                should_process = False
 
                     if should_process:
                         # Compute indicators
@@ -580,9 +599,14 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                         status["market_state"], status["regime_score"],
                     )
                     # analysis detail: last per-direction evaluation (scores vs
-                    # threshold, or which veto blocked) so the scan shows WHY
+                    # threshold, or which veto blocked) so the scan shows WHY.
+                    # _scan_info stops being written once the bot enters
+                    # COOLDOWN/BLOCKED (signal generation isn't reached there),
+                    # so without this check the log could show a stale
+                    # snapshot from hours before a since-started cooldown.
                     scan = status.get("scan_info") or {}
-                    if scan and not status["position_open"]:
+                    if scan and not status["position_open"] \
+                            and status["state"] not in ("COOLDOWN", "BLOCKED"):
                         parts = [f"{d}: {v}" for d, v in scan.items()]
                         logger.info("[Scan][%s] %s", sym, " | ".join(parts))
                 except Exception as e:

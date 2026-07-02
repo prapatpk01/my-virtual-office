@@ -1324,27 +1324,39 @@ class TradingBot:
         #   scale size (the low-confidence skip gate above still applies).
         # - margin_usdt == 0 (backtest / opt-in): classic risk-% of balance.
         if self.margin_usdt and self.margin_usdt > 0:
-            # [MARGIN CHECK] Required margin = margin_usdt regardless of
-            # leverage (that's the point of specifying margin directly). If
-            # balance has shrunk below it (losses, or another open position
-            # already using margin), the exchange will reject with
-            # insufficient-margin — abort here with a clear reason instead of
-            # an opaque OKX error.
-            if self.margin_usdt > self.account_balance:
+            notional      = self.margin_usdt * max(self.sizing_leverage, 1)
+            position_size = notional / max(entry_price, 1e-9)
+
+            # [MIN-LOT FLOOR] The exchange fills whole contracts — if the
+            # intended notional is below one contract's real notional
+            # (ct_val × price, known via min_close_size), the actual fill (and
+            # therefore the real required margin) is silently larger than
+            # margin_usdt. Recompute the REAL margin against the floored size
+            # before gating, not the nominal margin_usdt.
+            real_size   = max(position_size, self.min_close_size) \
+                          if self.min_close_size > 0 else position_size
+            real_margin = (real_size * entry_price) / max(self.sizing_leverage, 1)
+            if real_size > position_size:
+                position_size = real_size
+
+            # [MARGIN CHECK] If the (floor-adjusted) required margin exceeds
+            # balance, the exchange will reject with insufficient-margin —
+            # abort here with a clear reason instead of an opaque OKX error.
+            if real_margin > self.account_balance:
                 self._log_event(
-                    f"[SIZING] margin ${self.margin_usdt:.0f} > balance "
-                    f"${self.account_balance:.2f} — skip order (would be rejected "
-                    f"for insufficient margin)",
+                    f"[SIZING] required margin ${real_margin:.2f} "
+                    f"(min-lot floored) > balance ${self.account_balance:.2f} "
+                    f"— skip order (would be rejected for insufficient margin)",
                     level="warning",
                 )
                 return
-            notional      = self.margin_usdt * max(self.sizing_leverage, 1)
-            position_size = notional / max(entry_price, 1e-9)
-            _risk_now     = notional * (sl_dist / max(entry_price, 1e-9))
+
+            _risk_now = position_size * entry_price * (sl_dist / max(entry_price, 1e-9))
             self._log_event(
                 f"[SIZING] fixed-margin ${self.margin_usdt:.0f}×{self.sizing_leverage}x "
-                f"= ${notional:.0f} notional (risk≈${_risk_now:.2f} "
-                f"= {_risk_now / max(self.account_balance, 1e-9) * 100:.1f}% of balance)"
+                f"= ${notional:.0f} notional (real margin≈${real_margin:.2f}, "
+                f"risk≈${_risk_now:.2f} = "
+                f"{_risk_now / max(self.account_balance, 1e-9) * 100:.1f}% of balance)"
             )
         else:
             risk_amount   = self.account_balance * risk_pct * size_mult
@@ -2297,6 +2309,20 @@ class TradingBot:
             return
 
         live_size = float((live_position or {}).get("contracts", 0) or 0)
+
+        # [ERROR RECOVERY] A FAILED OPEN (order rejected/errored before
+        # position_open was ever set True) also lands in ERROR, but neither
+        # branch below fires for it (position_open is already False) — so it
+        # was never cleared and persisted across restarts forever. Any time
+        # the exchange confirms flat, a stale ERROR is safe to clear.
+        if self.state == "ERROR" and live_size == 0 and not self.position_open:
+            self._log_event(
+                "[RECONCILE] ERROR with exchange flat (failed open never "
+                "cleared) → SCANNING",
+                level="warning",
+            )
+            self.state = "SCANNING"
+            return
 
         if self.position_open and live_size == 0:
             self._log_event(
