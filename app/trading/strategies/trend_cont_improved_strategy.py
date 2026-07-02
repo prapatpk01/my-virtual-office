@@ -1443,15 +1443,25 @@ class TrendContImprovedStrategy(BaseStrategy):
         regime_trend_adx=18,        # ADX threshold for TREND (below = RANGE)
         regime_strong_chop=38,      # Chop(1H) ceiling for STRONG_TREND
         regime_sl_high_vol=1.5,     # SL multiplier in HIGH_VOL (×1.5 wider)
-        # Regime-adaptive min_score: relax the bar in STRONG_TREND (fastest, safest
-        # entries), tighten it in HIGH_VOL (riskiest allowed regime). Opt-in.
+        # Regime-adaptive min_score: relax the bar in STRONG_TREND, tighten in HIGH_VOL.
+        # Backtest Jan-May 2026 (BTC+XAG+XAU): T=131 PnL=+202.11 PF=1.57 vs baseline
+        # T=139 PnL=+259.22 PF=1.70 — WORSE. The HIGH_VOL tightening (70) removed
+        # profitable score-60-69 trades, costing more than the STRONG_TREND relaxation
+        # gained. Kept off; 60-69 entries are already good quality.
         regime_adaptive_min_score=False,
         min_score_strong=50.0,      # min_score when regime == STRONG_TREND
         min_score_highvol=70.0,     # min_score when regime == HIGH_VOL
         # Strong-trend breakout entry: waive ONLY the pullback-zone requirement when
         # regime == STRONG_TREND and score ≥ strong_trend_score — catches runs that
-        # never pull back to the 1H zone. All other gates still apply. Opt-in.
-        strong_trend_entry=False,
+        # never pull back to the 1H zone. All other gates still apply.
+        # Backtest Jan-May 2026 (BTC+XAG+XAU): T=140 WR=80.7% PnL=+261.24 PF=1.71 vs
+        # baseline T=139/80.6%/+259.22/1.70 — better on every metric, no trade-off.
+        # Effect is small in this sample but it is the only entry path for trends
+        # that run without ever pulling back to the 1H zone (the classic missed-run
+        # case); in strongly trending months it matters more. Unlike the failed
+        # score_primary_entry (waived every gate everywhere), this waives one gate
+        # in the single best regime under a much higher score bar.
+        strong_trend_entry=True,
         strong_trend_score=80.0,
         # ── Relative Volume (SJ scoring component) ─────────────────────────────
         # Entry bar volume relative to MA20(volume). Filters fake/low-interest breakouts.
