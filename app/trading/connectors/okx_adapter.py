@@ -475,8 +475,9 @@ class OKXAdapter(BaseConnector):
                     pos_side.upper(), sym, amount, sl, tp2, order_id)
 
         filled, fill_price = self._await_fill_sync(sym, order_id)
-        raw["_filled"]     = filled
-        raw["_fill_price"] = fill_price
+        raw["_filled"]       = filled
+        raw["_fill_price"]   = fill_price
+        raw["_filled_coins"] = filled * ct_val   # actual size in coins for bot accounting
         return raw
 
     def _sync_close(self, order_type: str, trade_info: Dict[str, Any]) -> Dict:
@@ -488,10 +489,35 @@ class OKXAdapter(BaseConnector):
         # Ensure hedge mode/leverage set (idempotent) before close
         self._ensure_swap_ready(sym)
 
-        # Convert coin quantity → OKX contracts (same logic as _sync_open)
+        # Convert coin quantity → OKX contracts.
+        # CLOSE_FULL uses the exchange's LIVE contract count, not the local
+        # coin figure — int() truncation at open + partial-close truncation
+        # otherwise drifts (e.g. open int(3.5)=3, TP1 closes int(1.75)=1,
+        # final close int(1.75)=1 → 1 contract orphaned live on the exchange).
+        # Partials use round() (min 1) instead of truncation for the same reason.
         ct_val        = self._get_ct_val(sym)
         raw_contracts = float(trade_info["size"]) / ct_val
-        contracts     = max(1, int(raw_contracts))
+        if order_type == "CLOSE_FULL":
+            live = None
+            try:
+                live = self.fetch_open_position(sym)
+            except Exception as e:
+                logger.warning("[OKX] %s: live-position lookup for CLOSE_FULL failed: %s", sym, e)
+            live_contracts = float((live or {}).get("contracts") or 0)
+            if live_contracts > 0:
+                contracts = live_contracts
+            elif live is not None:
+                # Position already flat — an exchange-side TP/SL beat us to it.
+                logger.warning(
+                    "[OKX] %s: CLOSE_FULL requested but exchange is already flat "
+                    "(exchange-side TP/SL fired first) — skipping duplicate close.",
+                    sym,
+                )
+                return {"id": "", "_filled": 0.0, "_fill_price": 0.0, "_already_flat": True}
+            else:
+                contracts = max(1, round(raw_contracts))
+        else:
+            contracts = max(1, round(raw_contracts))
         amount        = float(self._ex.amount_to_precision(sym, contracts))
 
         # [RISK-FLOOR VISIBILITY] A PARTIAL close (e.g. TP1's 50%) on a
@@ -512,11 +538,26 @@ class OKXAdapter(BaseConnector):
 
         params = {"tdMode": self.td_mode, "posSide": pos_side, "reduceOnly": True}
 
-        raw = self._call(
-            self._ex.create_order,
-            sym, "market", side, amount, None, params,
-            label=f"CLOSE_{pos_side.upper()}({sym})",
-        )
+        try:
+            raw = self._call(
+                self._ex.create_order,
+                sym, "market", side, amount, None, params,
+                label=f"CLOSE_{pos_side.upper()}({sym})",
+            )
+        except ccxt.InvalidOrder as e:
+            # Reduce-only on a flat position → the exchange-attached TP/SL
+            # already closed it between our poll and this order. Not an error:
+            # report already-flat so the bot finalizes its local close instead
+            # of locking itself into ERROR.
+            msg = str(e)
+            if any(code in msg for code in ("51169", "51023", "51000")) \
+                    or "position" in msg.lower():
+                logger.warning(
+                    "[OKX] %s: close rejected — position already flat "
+                    "(exchange-side TP/SL fired first): %s", sym, msg[:180],
+                )
+                return {"id": "", "_filled": 0.0, "_fill_price": 0.0, "_already_flat": True}
+            raise
         order_id = raw.get("id", "")
         logger.info("[OKX] CLOSE(%s) %s %s qty=%.4f → order_id=%s",
                     trade_info.get("reason", ""), pos_side.upper(), sym, amount, order_id)

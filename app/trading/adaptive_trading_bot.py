@@ -604,6 +604,13 @@ class TradingBot:
         j = self.trade_journal
         if len(j) < 3 or len(j) <= self._lesson_alerted_at:
             return
+        # Anti-spam: only re-evaluate on a fresh LOSS, and require at least
+        # 2 new trades since the previous alert (otherwise a lingering
+        # 3-losses-in-window condition would alert on every close).
+        if j[-1].get("win_loss") != "LOSS":
+            return
+        if self._lesson_alerted_at and len(j) - self._lesson_alerted_at < 2:
+            return
 
         streak3 = all(t.get("win_loss") == "LOSS" for t in j[-3:])
         window  = j[-self.LESSON_WINDOW:]
@@ -615,14 +622,17 @@ class TradingBot:
                   f"{len(losses)} losses in last {len(window)} trades"
         lines = [f"📚 LESSON ALERT — {trigger}", ""]
         for t in losses[-3:]:
+            # journal fields exist but may hold None (adopted/legacy trades) —
+            # `t.get(k, 0)` does NOT default those, so coerce with `or 0`.
+            _n = lambda k: float(t.get(k) or 0)
             lines.append(
-                f"• {t.get('direction','?')} {t.get('e_state', t.get('market_state','?'))}"
+                f"• {t.get('direction','?')} {t.get('e_state') or t.get('market_state','?')}"
                 f"/{t.get('entry_type','?')} → exit {t.get('exit_reason','?')} "
-                f"({t.get('realized_r', 0):+.2f}R)\n"
-                f"  entry scores: sig={t.get('e_total',0):.0f} "
-                f"e={t.get('e_entry',0):.0f} ctx={t.get('e_context',0):.0f} "
-                f"fit={t.get('e_fit',0):.0f} | rsi={t.get('e_rsi',0):.0f} "
-                f"adx={t.get('e_adx',0):.0f}"
+                f"({_n('realized_r'):+.2f}R)\n"
+                f"  entry scores: sig={_n('e_total'):.0f} "
+                f"e={_n('e_entry'):.0f} ctx={_n('e_context'):.0f} "
+                f"fit={_n('e_fit'):.0f} | rsi={_n('e_rsi'):.0f} "
+                f"adx={_n('e_adx'):.0f}"
             )
         # exit-reason tally over the window (what's killing us)
         from collections import Counter as _Counter
@@ -647,11 +657,27 @@ class TradingBot:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _safe_hold_secs(entry_time) -> float:
+        """Hold time in seconds, tolerant of naive/aware/None entry_time —
+        a mixed naive/aware subtraction raises TypeError, which previously
+        crash-looped the EXITING state every bar."""
+        if not isinstance(entry_time, datetime.datetime):
+            return 0.0
+        try:
+            now = (datetime.datetime.now(datetime.timezone.utc)
+                   if entry_time.tzinfo else datetime.datetime.now())
+            return (now - entry_time).total_seconds()
+        except Exception:
+            return 0.0
+
     def _log_event(self, msg: str, level: str = "info"):
         log_fn = getattr(logger, level, logger.info)
         log_fn(msg)
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._log.append(f"[{ts}] {msg}")
+        if len(self._log) > 500:          # cap memory: only last 20 are ever shown
+            del self._log[:-250]
 
     def _send_order(self, order_type: str, trade_info: Dict):
         if self.execution_callback:
@@ -1097,6 +1123,7 @@ class TradingBot:
             self._close_position("SL_HIT", t["sl"], 1.0, {})
             if self.state != "ERROR":
                 self.state = "EXITING"
+                self.save_state(self._state_file)
                 return f"SL_HIT @ {t['sl']:.4f}"
             return None
 
@@ -1106,6 +1133,7 @@ class TradingBot:
                 t["tp1_hit"] = True
                 t["tp2_hit"] = True
                 self.state = "EXITING"
+                self.save_state(self._state_file)
                 return f"FULL_TP2 @ {t['tp2']:.4f}"
             return None
 
@@ -1123,6 +1151,7 @@ class TradingBot:
                     f"TP1 @ {t['tp1']:.4f} → runner: SL locked at "
                     f"{t['sl']:.4f} (+{self.RUNNER_LOCK_R}R), full size to TP2"
                 )
+                self.save_state(self._state_file)
                 return f"TP1_RUNNER_LOCK @ {t['sl']:.4f} (+{self.RUNNER_LOCK_R}R)"
             # [MIN-LOT TP1] a partial below the exchange's minimum fill size
             # would floor up and close the WHOLE position — convert TP1 into a
@@ -1141,6 +1170,7 @@ class TradingBot:
                     f"too small to split at min lot {self.min_close_size:.4f}) "
                     f"— full size rides to TP2"
                 )
+                self.save_state(self._state_file)
                 return f"TP1_BE_ONLY @ {t['tp1']:.4f} (min-lot)"
             self._close_position("PARTIAL_TP1", t["tp1"], tp1_close_pct, {})
             if self.state != "ERROR":
@@ -1152,6 +1182,7 @@ class TradingBot:
                         t["sl"] = min(t["sl"], t["entry"])
                     t["break_even_triggered"] = True
                 self.state = "PARTIAL_EXIT"
+                self.save_state(self._state_file)
                 return f"PARTIAL_TP1 @ {t['tp1']:.4f} + SL→BE"
         return None
 
@@ -1312,7 +1343,7 @@ class TradingBot:
             "tp3_hit":              False,
             "break_even_triggered": False,
             "status":               "OPEN",
-            "entry_time":           datetime.datetime.now(),
+            "entry_time":           datetime.datetime.now(datetime.timezone.utc),
             "atr_at_entry":         ind.get("atr", sl_dist),
             "realized_pnl":         0.0,
             "remaining_size":       position_size,
@@ -1338,18 +1369,30 @@ class TradingBot:
             "e_rsi":                ind.get("rsi", 50.0),
         }
 
-        self._send_order("OPEN_LONG" if direction == "LONG" else "OPEN_SHORT", {
-            "entry": entry_price,
-            "sl":    float(pattern_sl),
-            "tp1":   tp1, "tp2": tp2,
-            "tp3":   tp3,
-            "size":  position_size,
-        })
+        _open_result = self._send_order(
+            "OPEN_LONG" if direction == "LONG" else "OPEN_SHORT", {
+                "entry": entry_price,
+                "sl":    float(pattern_sl),
+                "tp1":   tp1, "tp2": tp2,
+                "tp3":   tp3,
+                "size":  position_size,
+            })
 
         # FIX-#1: if execution_callback failed, _send_order sets state=ERROR — abort
         if self.state == "ERROR":
             self.current_trade = {}
             return
+
+        # [FILL SYNC] Exchanges fill whole contracts — the actually-filled size
+        # can differ from the requested coin amount (int/round conversion).
+        # Track the REAL size so partial closes and PnL match the exchange.
+        if isinstance(_open_result, dict):
+            _fc = float(_open_result.get("_filled_coins") or 0)
+            if _fc > 0 and abs(_fc - position_size) / max(position_size, 1e-9) > 0.01:
+                self._log_event(
+                    f"[FILL SYNC] requested {position_size:.6f} → filled {_fc:.6f} coins"
+                )
+                self.current_trade["remaining_size"] = _fc
 
         self.position_open         = True
         self._position_entry_bar   = self._bar_count
@@ -1536,8 +1579,18 @@ class TradingBot:
                 self._log_event(f"Health {health:.0f} → forced breakeven (post-TP1)")
         elif health >= 20:
             if t["remaining_size"] > 0 and tp1_hit:
-                self._close_position("HEALTH_REDUCE", current_price, 0.50, ind)
-                self.state = "PARTIAL_EXIT"
+                # [MIN-LOT] a 50% reduce below one contract would floor up and
+                # close the WHOLE position while local accounting thinks half
+                # remains — skip the reduce (SL is already at BE/+lock here).
+                if (self.min_close_size > 0
+                        and t["remaining_size"] * 0.50 < self.min_close_size):
+                    self._log_event(
+                        f"Health {health:.0f} → reduce skipped (min lot); "
+                        f"SL protection already active"
+                    )
+                else:
+                    self._close_position("HEALTH_REDUCE", current_price, 0.50, ind)
+                    self.state = "PARTIAL_EXIT"
         else:
             self._close_position("POOR_HEALTH_EXIT", current_price, 1.0, ind)
             return "EXITING"
@@ -1642,8 +1695,7 @@ class TradingBot:
             "mae":                 t.get("mae"),
             "mfe":                 t.get("mfe"),
             "holding_bars":        _holding_bars,
-            "hold_time_sec":       (datetime.datetime.now() -
-                                    t.get("entry_time", datetime.datetime.now())).total_seconds(),
+            "hold_time_sec":       self._safe_hold_secs(t.get("entry_time")),
             "atr":                 ind.get("atr"),
             "adx":                 ind.get("adx"),
             "rsi":                 ind.get("rsi"),
@@ -1692,8 +1744,12 @@ class TradingBot:
                 f"[LEARN] weights updated: {self.learning_engine.get_summary()}"
             )
 
-        # [LESSON] loss-cluster detection → alert for the runner to forward
-        self._check_lessons()
+        # [LESSON] loss-cluster detection → alert for the runner to forward.
+        # Never let an alert-formatting problem break trade accounting below.
+        try:
+            self._check_lessons()
+        except Exception as _le:
+            self._log_event(f"[LESSON] alert build failed (non-fatal): {_le}", level="warning")
 
         # Update streaks + daily PnL
         self.daily_pnl_pct     += (pnl / max(self.account_balance, 1)) * 100
@@ -1947,8 +2003,14 @@ class TradingBot:
                                         self.current_market_state, regime_direction)
             if sig:
                 self._step5_risk_engine(candle, direction, ind_15m, mr_signal=sig)
-                self.state = "IN_POSITION"
-                self._log_event(f"RECOVERY trade: {direction} at half-risk")
+                # mirror PENDING_ORDER: the risk engine may skip (low confidence)
+                # or fail (ERROR) — only enter IN_POSITION on a real open, and
+                # never mask an ERROR state.
+                if self.position_open:
+                    self.state = "IN_POSITION"
+                    self._log_event(f"RECOVERY trade: {direction} at half-risk")
+                elif self.state != "ERROR":
+                    self.state = "SCANNING"
                 break
         self.base_risk_pct = original_risk
 
@@ -1959,7 +2021,7 @@ class TradingBot:
         warmup_remaining = 0
         if self._startup_unblock_at and _now < self._startup_unblock_at:
             warmup_remaining = int(
-                (_now - self._startup_unblock_at).total_seconds() / 60)
+                (self._startup_unblock_at - _now).total_seconds() / 60)
         return {
             "state":              self.state,
             "position_open":      self.position_open,
@@ -2190,7 +2252,13 @@ class TradingBot:
             )
             self.position_open = False
             self.current_trade = {}
-            if self.state not in ("BLOCKED", "COOLDOWN", "ERROR"):
+            if self.state == "ERROR":
+                # A close that raced an exchange-side TP/SL fill lands here:
+                # exchange is flat, local cleared — the error is stale, recover.
+                self._log_event("[RECONCILE] exchange flat — clearing stale ERROR → SCANNING",
+                                level="warning")
+                self.state = "SCANNING"
+            elif self.state not in ("BLOCKED", "COOLDOWN"):
                 self.state = "SCANNING"
 
         elif not self.position_open and live_size != 0:
@@ -2225,6 +2293,9 @@ class TradingBot:
                 "tp2": entry_price + sl_dist_r * 2.0 * mult_r,
                 "tp3": None,
                 "tp1_pct": 0.50, "tp2_pct": 1.0,
+                # runner mode: adopted positions never attempt a min-lot split —
+                # TP1 just locks SL to +RUNNER_LOCK_R and rides to TP2
+                "tp_mode": "runner",
                 "trail_atr_mult": 2.0,
                 "size": abs(live_size), "remaining_size": abs(live_size),
                 "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,

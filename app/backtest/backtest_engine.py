@@ -258,6 +258,8 @@ class SymbolBacktest:
             cooldown_minutes       = self.cfg.cooldown_min,
             max_loss_streak        = self.cfg.max_loss_streak,
             tp1_close_pct          = self.cfg.tp1_close_pct,
+            tp1_r                  = self.cfg.tp1_r,   # was a dead config field — now actually applied
+            tp2_r                  = self.cfg.tp2_r,
             state_file             = os.devnull,   # no disk I/O during backtest
             execution_callback     = executor.execute,
             startup_warmup_minutes = 0,            # backtest has no warmup — instant start
