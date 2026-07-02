@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import db, market, governance, auth
+from . import db, market, governance, auth, scanner
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FUND_NAME = os.environ.get("FUND_NAME", "Sentinel Global Fund")
@@ -297,6 +297,31 @@ def calendar_page(request: Request, sess=Depends(get_db)):
         "fund": FUND_NAME, "user": auth.current_user(request),
         "events": events, "asof": market.now_iso(),
     })
+
+
+# ── Scanner (Momentum Swing Scanner v6.1) ─────────────────────────────────
+@app.get("/scanner", response_class=HTMLResponse)
+def scanner_page(request: Request):
+    if (r := auth.require_login(request)):
+        return r
+    return templates.TemplateResponse(request, "scanner.html", {
+        "fund": FUND_NAME, "user": auth.current_user(request),
+        "res": scanner.last_scan(), "universe": scanner.SCAN_UNIVERSE,
+    })
+
+
+@app.post("/scanner/run")
+def scanner_run(request: Request, sess=Depends(get_db)):
+    if (r := auth.require_login(request)):
+        return r
+    res = scanner.run_scan(fetch_info=market.fetch_info)
+    if res.get("picks"):
+        top = ", ".join(f"{p['ticker']} ({p['score']['total']})" for p in res["picks"])
+        sess.add(db.TeamLog(author="Maya Chen (Scanner)", category="note",
+                            title=f"Momentum scan — top {len(res['picks'])}",
+                            body=f"Regime {res['regime'].get('score')}/100 {res['regime'].get('classification')} · {top}"))
+        sess.commit()
+    return RedirectResponse("/scanner", status_code=302)
 
 
 # ── JSON API ──────────────────────────────────────────────────────────────

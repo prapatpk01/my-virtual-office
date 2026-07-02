@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% set active='scanner' %}
+{% block title %} — Scanner{% endblock %}
+{% block content %}
+<h1>🎯 Momentum Swing Scanner <span class="tag">v6.1</span></h1>
+<p class="sub">7-phase institutional framework · swing 7-15 วันทำการ · คำนวณจาก OHLCV จริง (yfinance 6 เดือน)
+  · universe {{ universe.values()|map('length')|sum }} ตัวจาก {{ universe|length }} ธีม
+  · ไม่แสดง Win Probability (Rule #6 — ไม่มี backtest รองรับ)</p>
+
+<form method="post" action="/scanner/run" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='⏳ กำลังสแกน ~20-40 วิ...'">
+  <button>🚀 Run Scan</button>
+</form>
+
+{% if res %}
+{% if res.error %}
+<div class="alert a-TRIM" style="margin-top:18px">{{ res.error }}</div>
+{% endif %}
+
+{% if res.regime.status == 'OK' %}
+<h2>Phase 2 — Market Regime <span class="tag">{{ res.asof[:16].replace('T',' ') }} UTC · {{ res.took_s }}s</span></h2>
+<div class="grid g4">
+  <div class="card stat"><div class="label">Regime Score</div>
+    <div class="value {{ 'pos' if res.regime.score >= 60 else ('warn' if res.regime.score >= 40 else 'neg') }}">{{ res.regime.score }}<span class="small muted" style="font-weight:400">/100</span></div>
+    <div class="delta">{{ res.regime.classification }}</div></div>
+  <div class="card stat"><div class="label">SPY vs 20EMA</div>
+    <div class="value {{ 'pos' if res.regime.spy_above else 'neg' }}">${{ res.regime.spy }}</div>
+    <div class="delta muted">EMA20 ${{ res.regime.spy_e20 }} · {{ 'เหนือ ✓' if res.regime.spy_above else 'ใต้ ✗' }}</div></div>
+  <div class="card stat"><div class="label">QQQ vs 20EMA</div>
+    <div class="value {{ 'pos' if res.regime.qqq_above else 'neg' }}">${{ res.regime.qqq }}</div>
+    <div class="delta muted">EMA20 ${{ res.regime.qqq_e20 }} · {{ 'เหนือ ✓' if res.regime.qqq_above else 'ใต้ ✗' }}</div></div>
+  <div class="card stat"><div class="label">VIX</div>
+    <div class="value {{ 'neg' if res.regime.vix > 25 else ('warn' if res.regime.vix > 20 else 'pos') }}">{{ res.regime.vix }}</div>
+    <div class="delta muted">{{ res.regime.breadth }}</div></div>
+</div>
+{% if res.paused %}
+<div class="alert a-EMERGENCY" style="margin-top:12px">⛔ VIX > 30 — market dislocation: scanner หยุดตาม Phase 2 (ลด sizing 50% ถ้าจะเข้า)</div>
+{% elif res.regime.strict %}
+<div class="alert a-WATCH" style="margin-top:12px">⚠️ Regime เข้ม (ดัชนีใต้ EMA หรือ VIX > 20) — รับเฉพาะ RS outliers ที่ชนะ SPY</div>
+{% endif %}
+{% endif %}
+
+{% if res.picks %}
+<h2>🏆 Top {{ res.picks|length }} Picks</h2>
+{% for p in res.picks %}
+<div class="card" style="margin-bottom:14px">
+  <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+    <span style="font-size:19px;font-weight:800">#{{ loop.index }} {{ p.ticker }}</span>
+    <span class="tag">{{ p.theme }}</span>
+    <span class="badge {{ 'b-base' if p.score.total >= 70 else 'b-watch' }}">Score {{ p.score.total }}/100</span>
+    <span class="muted small" style="margin-left:auto">${{ p.m.price }} · RSI {{ p.m.rsi }} · β {{ p.m.beta if p.m.beta is not none else 'N/A' }} · ATR {{ p.m.atr_pct }}%</span>
+  </div>
+
+  <div class="table-scroll" style="margin-top:10px">
+  <table>
+    <thead><tr><th>Entry Zone</th><th>Stop</th><th>Target (fib 1.618)</th><th>Upside</th><th>R:R</th><th>Earnings</th></tr></thead>
+    <tbody><tr>
+      <td>${{ p.trade.entry_lo }} – ${{ p.trade.entry_hi }}</td>
+      <td class="neg">${{ p.trade.stop }}</td>
+      <td class="pos">${{ p.trade.target }}</td>
+      <td class="pos">+{{ p.trade.upside_pct }}%</td>
+      <td><b>1:{{ p.trade.rr }}</b></td>
+      <td class="muted small">{{ p.earnings_date or 'DATA UNAVAILABLE' }}</td>
+    </tr></tbody>
+  </table>
+  </div>
+
+  <div class="legend" style="margin-top:10px">
+    <span>A Momentum <b>{{ p.score.A_momentum }}</b>/35</span>
+    <span>B Volume <b>{{ p.score.B_volume }}</b>/25</span>
+    <span>C Structure <b>{{ p.score.C_structure }}</b>/15</span>
+    <span>D High-β <b>{{ p.score.D_beta }}</b>/10</span>
+    <span>E Sector <b>{{ p.score.E_sector }}</b>/5</span>
+    <span>F Catalyst <b>{{ p.score.F_catalyst }}</b>/10</span>
+  </div>
+
+  <div class="legend" style="margin-top:8px">
+    <span class="{{ 'pos' if p.m.macd_pos }}">MACD {{ '✓ >0' if p.m.macd_pos else '✗' }}{{ ' expanding' if p.m.hist_expanding }}</span>
+    <span class="{{ 'pos' if p.m.aligned }}">EMA align {{ '✓' if p.m.aligned else '✗' }} (10>{{ '20' }}>50)</span>
+    <span class="{{ 'pos' if p.m.hh_hl }}">HH/HL {{ '✓' if p.m.hh_hl else '✗' }}</span>
+    <span class="{{ 'pos' if p.m.obv_rising }}">OBV {{ '↑' if p.m.obv_rising else '↓' }}</span>
+    <span>Vol {{ p.m.vol_x20d }}×20D</span>
+    <span class="{{ 'pos' if (p.m.vs_spy or 0) > 0 else 'neg' }}">vs SPY {{ '%+.1f'|format(p.m.vs_spy) if p.m.vs_spy is not none else 'N/A' }}%</span>
+    <span class="{{ 'pos' if (p.m.vs_qqq or 0) > 0 else 'neg' }}">vs QQQ {{ '%+.1f'|format(p.m.vs_qqq) if p.m.vs_qqq is not none else 'N/A' }}%</span>
+    <span>$Vol {{ p.m.dollar_vol_m }}M/วัน</span>
+    <span>10EMA ${{ p.m.ema10 }} · 20EMA ${{ p.m.ema20 }} · 50SMA ${{ p.m.sma50 }}</span>
+  </div>
+</div>
+{% endfor %}
+
+<p class="sub">⚠️ ผลสแกน = จุดเริ่มต้นวิจัย ไม่ใช่คำสั่งซื้อ — ต้องผ่าน 9-gate checklist + CIO sign-off ก่อน execute ·
+  Catalyst F ใช้ proxy จาก price/volume event (ไม่มี earnings-surprise feed) — ทีม Research ตรวจ catalyst จริงต่อ</p>
+
+{% elif res.regime.status == 'OK' and not res.paused %}
+<div class="card" style="margin-top:18px"><p class="muted" style="text-align:center;padding:20px">
+  ไม่มีตัวผ่านครบทุก filter รอบนี้ — Accuracy &gt; Completeness (ไม่บังคับให้ครบ 5)</p></div>
+{% endif %}
+
+{% if res.rejected %}
+<h2>เหตุผลที่คัดออก ({{ res.scanned }} ตัวที่สแกน)</h2>
+<div class="card" style="padding:8px 16px">
+{% for reason, n in res.rejected.items() %}
+<div class="cal-row"><span>{{ reason }}</span><span style="margin-left:auto" class="muted">{{ n }} ตัว</span></div>
+{% endfor %}
+</div>
+{% endif %}
+
+{% else %}
+<div class="card" style="margin-top:18px">
+<p class="muted" style="text-align:center;padding:26px">ยังไม่เคยรันสแกน — กด 🚀 Run Scan<br>
+<span class="small">Phase 1-2: regime SPY/QQQ/VIX/RSP → Phase 3: score 6 มิติ → Phase 4-5: extension + earnings filter → Phase 6: entry/stop/target → Phase 7: top 5</span></p>
+</div>
+{% endif %}
+
+<h2>Universe ({{ universe|length }} ธีม)</h2>
+<div class="card table-scroll" style="padding:6px 8px">
+<table>
+<thead><tr><th style="text-align:left">Theme</th><th style="text-align:left">Tickers</th></tr></thead>
+<tbody>
+{% for th, ts in universe.items() %}
+<tr><td style="text-align:left" class="tk">{{ th }}</td>
+    <td style="text-align:left" class="muted">{{ ts|join(', ') }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endblock %}
