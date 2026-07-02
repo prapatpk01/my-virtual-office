@@ -130,6 +130,9 @@ def build_config() -> dict:
         # Fake-signal chop-zone filter (None = default 0.8). Higher = stricter,
         # higher WR, fewer trades (~1.2 pushes WR toward 56%).
         "adaptive_min_ema_dist_atr": (_env_float("ADAPTIVE_MIN_EMA_DIST_ATR", 0.0) or None),
+        # Whipsaw guard: minutes since the last OPEN on a symbol before a new
+        # entry is allowed there (0 = disabled).
+        "adaptive_entry_spacing_min": _env_int("ADAPTIVE_ENTRY_SPACING_MIN", 60),
     }
 
 
@@ -275,9 +278,20 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             tp1_r=cfg.get("adaptive_tp1_r"),
             tp2_r=cfg.get("adaptive_tp2_r"),
             min_ema_dist_atr=cfg.get("adaptive_min_ema_dist_atr"),
+            entry_spacing_min=cfg.get("adaptive_entry_spacing_min", 60),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)
+        # [MIN-LOT TP1] tell the bot the smallest closable size (1 contract in
+        # coins) so an unsplittable TP1 becomes a breakeven-move instead of
+        # accidentally closing the whole position.
+        try:
+            if hasattr(okx, "_get_ct_val"):
+                bot.min_close_size = float(okx._get_ct_val(sym))
+                logger.info("[Adaptive][%s] min close size = %.6f (1 contract)",
+                            sym, bot.min_close_size)
+        except Exception as e:
+            logger.warning("[Adaptive][%s] could not fetch contract size: %s", sym, e)
         bots[sym] = (bot, state_file)
         last_bar_ts[sym] = 0
 

@@ -475,6 +475,7 @@ class TradingBot:
                  tp1_r: Optional[float] = None,
                  tp2_r: Optional[float] = None,
                  min_ema_dist_atr: Optional[float] = None,
+                 entry_spacing_min: int = 60,
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
                  startup_warmup_minutes: int = 45,
@@ -498,6 +499,21 @@ class TradingBot:
         # WR, fewer trades. 0.8 default; ~1.2 pushes WR toward 56%.
         if min_ema_dist_atr is not None:
             self.MIN_EMA_DIST_ATR = min_ema_dist_atr
+
+        # [WHIPSAW GUARD] Per-symbol entry spacing: after opening a position,
+        # no NEW entry on this symbol until entry_spacing_min minutes have
+        # passed since that open — prevents immediate re-entry chasing when
+        # price whips up/down (each bot instance == one symbol).
+        self.entry_spacing_min = entry_spacing_min
+        self._last_entry_at: Optional[datetime.datetime] = None
+
+        # [MIN-LOT TP1] Smallest close size (in coins) the exchange can fill —
+        # set by the runner from the symbol's contract size. When a TP1 partial
+        # would be below this (e.g. a 1-contract position can't close 50%),
+        # TP1 becomes a breakeven-move only: SL -> entry, full size rides to
+        # TP2. 0.0 = disabled (backtest keeps fractional fills).
+        self.min_close_size: float = 0.0
+
         self._state_file: str  = state_file or self.DEFAULT_STATE_FILE
 
         self.account_balance       = account_balance
@@ -1092,6 +1108,24 @@ class TradingBot:
 
         if tp1_hit and not t["tp1_hit"]:
             tp1_close_pct = t.get("tp1_pct", self.tp1_close_pct)
+            # [MIN-LOT TP1] a partial below the exchange's minimum fill size
+            # would floor up and close the WHOLE position — convert TP1 into a
+            # breakeven-move only and let the full size ride to TP2.
+            remaining = t.get("remaining_size", 0.0)
+            if self.min_close_size > 0 and remaining * tp1_close_pct < self.min_close_size:
+                t["tp1_hit"] = True
+                if not t["break_even_triggered"]:
+                    if direction == "LONG":
+                        t["sl"] = max(t["sl"], t["entry"])
+                    else:
+                        t["sl"] = min(t["sl"], t["entry"])
+                    t["break_even_triggered"] = True
+                self._log_event(
+                    f"TP1 @ {t['tp1']:.4f} → BE-only (position {remaining:.4f} "
+                    f"too small to split at min lot {self.min_close_size:.4f}) "
+                    f"— full size rides to TP2"
+                )
+                return f"TP1_BE_ONLY @ {t['tp1']:.4f} (min-lot)"
             self._close_position("PARTIAL_TP1", t["tp1"], tp1_close_pct, {})
             if self.state != "ERROR":
                 t["tp1_hit"] = True
@@ -1121,6 +1155,22 @@ class TradingBot:
         if self.cooldown_until and _now < self.cooldown_until:
             self.state = "COOLDOWN"
             return False
+
+        # [WHIPSAW GUARD] entry spacing — no new entry within N minutes of the
+        # previous OPEN on this symbol (blocks whipsaw re-entry chasing).
+        if self._last_entry_at and self.entry_spacing_min > 0:
+            try:
+                elapsed = (_now - self._last_entry_at).total_seconds() / 60.0
+                if 0 <= elapsed < self.entry_spacing_min:
+                    self._log_event(
+                        f"ENTRY-SPACING: {elapsed:.0f}m since last open "
+                        f"(< {self.entry_spacing_min}m) — waiting",
+                        level="debug",
+                    )
+                    return False
+            except TypeError:
+                # naive/aware mismatch after a state reload — reset rather than block forever
+                self._last_entry_at = None
 
         if self.daily_pnl_pct <= self.daily_loss_limit_pct:
             self.state = "BLOCKED"
@@ -1277,6 +1327,8 @@ class TradingBot:
         self.position_open         = True
         self._position_entry_bar   = self._bar_count
         self.order_status          = "OPEN"
+        # [WHIPSAW GUARD] stamp entry time for the per-symbol spacing gate
+        self._last_entry_at        = self._bar_now or datetime.datetime.now()
 
     # ── Step 6: Position management (V7 logic unchanged) ─────────────────────
 
@@ -1370,19 +1422,34 @@ class TradingBot:
         # TP1 — close tp1_pct + break-even
         if tp1_hit_cond and not t["tp1_hit"]:
             tp1_close_pct = t.get("tp1_pct", self.tp1_close_pct)
-            self._close_position("PARTIAL_TP1", t["tp1"], tp1_close_pct, ind)
-            t["tp1_hit"] = True
-            if not t["break_even_triggered"]:
-                if direction == "LONG":
-                    t["sl"] = max(t["sl"], t["entry"])
-                else:
-                    t["sl"] = min(t["sl"], t["entry"])
-                t["break_even_triggered"] = True
-                self._log_event(
-                    f"TP1 @ {t['tp1']:.4f} → {tp1_close_pct:.0%} close "
-                    f"+ SL → breakeven ({t['entry']:.4f})"
-                )
-            self.state = "PARTIAL_EXIT"
+            # [MIN-LOT TP1] see check_price_protection — unsplittable position
+            # converts TP1 to a breakeven-move only; full size rides to TP2.
+            remaining = t.get("remaining_size", 0.0)
+            if self.min_close_size > 0 and remaining * tp1_close_pct < self.min_close_size:
+                t["tp1_hit"] = True
+                if not t["break_even_triggered"]:
+                    if direction == "LONG":
+                        t["sl"] = max(t["sl"], t["entry"])
+                    else:
+                        t["sl"] = min(t["sl"], t["entry"])
+                    t["break_even_triggered"] = True
+                    self._log_event(
+                        f"TP1 @ {t['tp1']:.4f} → BE-only (min lot) — full size to TP2"
+                    )
+            else:
+                self._close_position("PARTIAL_TP1", t["tp1"], tp1_close_pct, ind)
+                t["tp1_hit"] = True
+                if not t["break_even_triggered"]:
+                    if direction == "LONG":
+                        t["sl"] = max(t["sl"], t["entry"])
+                    else:
+                        t["sl"] = min(t["sl"], t["entry"])
+                    t["break_even_triggered"] = True
+                    self._log_event(
+                        f"TP1 @ {t['tp1']:.4f} → {tp1_close_pct:.0%} close "
+                        f"+ SL → breakeven ({t['entry']:.4f})"
+                    )
+                self.state = "PARTIAL_EXIT"
 
         # TP3 runner — MeanReversion only (active once TP2 partial close done)
         if t.get("tp3") and t.get("tp2_hit") and not t.get("tp3_hit"):
@@ -1976,6 +2043,7 @@ class TradingBot:
             "consecutive_sl_hits":  self.consecutive_sl_hits,
             "session_losses":       self.session_losses,
             "cooldown_until":       self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "last_entry_at":        self._last_entry_at.isoformat() if self._last_entry_at else None,
             "trading_date":         self.trading_date.isoformat() if self.trading_date else None,
             "current_market_state": self.current_market_state,
             "current_regime_bias":  self.current_regime_bias,
@@ -2032,6 +2100,10 @@ class TradingBot:
         cooldown = data.get("cooldown_until")
         self.cooldown_until = (datetime.datetime.fromisoformat(cooldown)
                                if cooldown else None)
+
+        last_entry = data.get("last_entry_at")
+        self._last_entry_at = (datetime.datetime.fromisoformat(last_entry)
+                               if last_entry else None)
 
         trading_date = data.get("trading_date")
         self.trading_date = (datetime.date.fromisoformat(trading_date)
