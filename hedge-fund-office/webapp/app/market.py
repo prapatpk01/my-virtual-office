@@ -178,7 +178,8 @@ def fetch_news(symbols: list[str], per_symbol: int = 5) -> list[dict]:
 
 
 # ── Multi-source market news (RSS ทางการ — Bloomberg/CNN/CNBC/MarketWatch) ──
-_UA = {"User-Agent": "Mozilla/5.0 (SentinelFund/1.0)"}
+_UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
 RSS_SOURCES = [
     ("Bloomberg Markets",   "https://feeds.bloomberg.com/markets/news.rss"),
     ("Bloomberg Economics", "https://feeds.bloomberg.com/economics/news.rss"),
@@ -243,8 +244,10 @@ def fetch_fear_greed() -> dict:
     try:
         import json as _json
         import urllib.request
+        hdrs = dict(_UA, Accept="application/json",
+                    Referer="https://edition.cnn.com/markets/fear-and-greed")
         req = urllib.request.Request(
-            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata", headers=_UA)
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata", headers=hdrs)
         with urllib.request.urlopen(req, timeout=10) as r:
             data = _json.loads(r.read())
         fg = data.get("fear_and_greed", {})

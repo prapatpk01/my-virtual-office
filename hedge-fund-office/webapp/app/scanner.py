@@ -140,10 +140,23 @@ def run_scan(fetch_info=None) -> dict:
         import yfinance as yf
         bench = yf.download(["SPY", "QQQ", "RSP", "^VIX"], period="6mo",
                             group_by="ticker", progress=False, threads=True)
-        spy_c = bench["SPY"]["Close"].dropna()
-        qqq_c = bench["QQQ"]["Close"].dropna()
-        rsp_c = bench["RSP"]["Close"].dropna()
-        vix = float(bench["^VIX"]["Close"].dropna().iloc[-1])
+
+        def _closes(sym):
+            try:
+                s = bench[sym]["Close"].dropna()
+                return s if len(s) >= 22 else None
+            except (KeyError, TypeError):
+                return None
+
+        spy_c, qqq_c, rsp_c = _closes("SPY"), _closes("QQQ"), _closes("RSP")
+        vix_c = _closes("^VIX")
+        if spy_c is None or qqq_c is None or rsp_c is None or vix_c is None:
+            result["error"] = ("ดึงข้อมูล benchmark (SPY/QQQ/RSP/VIX) ไม่ได้ — "
+                               "Yahoo อาจ rate-limit ชั่วคราว ลองใหม่ใน 1-2 นาที")
+            result["took_s"] = round(time.time() - t0, 1)
+            _LAST = result
+            return result
+        vix = float(vix_c.iloc[-1])
 
         spy_p, spy_e20 = float(spy_c.iloc[-1]), float(_ema(spy_c, 20).iloc[-1])
         qqq_p, qqq_e20 = float(qqq_c.iloc[-1]), float(_ema(qqq_c, 20).iloc[-1])
@@ -242,7 +255,8 @@ def run_scan(fetch_info=None) -> dict:
         result["picks"] = finals
         result["rejected"] = rejected
     except Exception as e:
-        result["error"] = f"{type(e).__name__}: scan ไม่สำเร็จ (ต้องการ egress ถึง Yahoo Finance)"
+        result["error"] = (f"scan ไม่สำเร็จ ({type(e).__name__}) — Yahoo อาจ rate-limit "
+                           "หรือ network ขัดข้อง ลองใหม่ใน 1-2 นาที")
     result["took_s"] = round(time.time() - t0, 1)
     _LAST = result
     return result
