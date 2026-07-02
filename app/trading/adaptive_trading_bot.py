@@ -822,6 +822,10 @@ class TradingBot:
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
     MIN_EMA_DIST_ATR: float = 0.6
 
+    # [CLIMAX-VETO] Skip trend entries on bars with range > this × ATR
+    # (vertical blow-off spikes). 99 = disabled.
+    CLIMAX_BAR_ATR: float = 2.0
+
     def _regime_direction(self, ind_4h: Dict) -> float:
         """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
         ema5  = ind_4h.get("ema5", 0.0)
@@ -953,6 +957,16 @@ class TradingBot:
             _e20 = ind_15m.get("ema20", _px)
             _atr = max(ind_15m.get("atr", 1e-9), 1e-9)
             if abs(_px - _e20) / _atr < self.MIN_EMA_DIST_ATR:
+                self._filter_stats["checked"] += 1
+                self._filter_stats["health_fail"] += 1
+                return None
+
+            # [CLIMAX-VETO] Don't enter on a blow-off bar: a single bar whose
+            # range exceeds CLIMAX_BAR_ATR × ATR is a vertical exhaustion spike
+            # — the exact failure seen live (entry at the top of a climax bar,
+            # momentum dies next bar).
+            _rng = float(candle_15m.get("high", _px)) - float(candle_15m.get("low", _px))
+            if _rng > self.CLIMAX_BAR_ATR * _atr:
                 self._filter_stats["checked"] += 1
                 self._filter_stats["health_fail"] += 1
                 return None
