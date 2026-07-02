@@ -815,8 +815,8 @@ class TradingBot:
     # TP geometry in R-multiples. TP1 banks tp1_close_pct and moves SL→BE, so
     # lowering TP1_R raises win-rate (more trades reach it) at the cost of avg
     # win size. Swept via backtest.
-    TP1_R: float = 0.7
-    TP2_R: float = 1.5
+    TP1_R: float = 0.5
+    TP2_R: float = 1.2
 
     # [FAKE-FILTER] Minimum price-to-EMA20 distance (in ATR) for a trend-state
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.

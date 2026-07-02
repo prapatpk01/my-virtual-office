@@ -48,8 +48,8 @@ class BacktestConfig:
     tp1_close_pct:   float = 0.50          # 50% close at TP1
 
     # TP/SL structure (must match live bot)
-    tp1_r:           float = 0.7           # TP1 at 0.7R
-    tp2_r:           float = 1.5           # TP2 at 1.5R
+    tp1_r:           float = 0.5           # TP1 at 0.5R
+    tp2_r:           float = 1.2           # TP2 at 1.2R
 
     # Risk limits
     daily_loss_pct:   float = -3.0
