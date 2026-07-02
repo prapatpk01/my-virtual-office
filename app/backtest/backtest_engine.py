@@ -226,6 +226,7 @@ class TradeRecord:
     mae:          float = 0.0  # max adverse excursion (R)
     mfe:          float = 0.0  # max favorable excursion (R)
     hour_utc:     int   = -1   # entry-tick hour
+    e_state:      str   = ""   # market state AT ENTRY (market_state col is exit-time)
 
 
 class SymbolBacktest:
@@ -394,6 +395,7 @@ class SymbolBacktest:
                         mae          = float(j_entry.get("mae") or 0),
                         mfe          = float(j_entry.get("mfe") or 0),
                         hour_utc     = int(j_entry.get("hour_utc") if j_entry.get("hour_utc") is not None else -1),
+                        e_state      = str(j_entry.get("e_state") or ""),
                     )
                     trade_records.append(rec)
 

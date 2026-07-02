@@ -1189,6 +1189,15 @@ class TradingBot:
             self._close_position("EMERGENCY_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
+        # [STATE-DRIFT TEST] thesis invalidation: the 4H regime that justified
+        # this entry decayed into a non-tradeable regime before TP1.
+        if (not t.get("tp1_hit")
+                and t.get("e_state")
+                and self.current_market_state in ("EXHAUSTION", "LOW_VOL")
+                and t["e_state"] not in ("EXHAUSTION", "LOW_VOL")):
+            self._close_position("STATE_DRIFT_EXIT", current_price, 1.0, ind)
+            return "EXITING"
+
         if direction == "LONG":
             tp1_hit_cond = current_price >= t["tp1"]
             tp2_hit_cond = current_price >= t["tp2"]
