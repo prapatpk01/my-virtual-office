@@ -560,12 +560,74 @@ class TradingBot:
             "bias_fail": 0, "health_fail": 0, "confidence_fail": 0,
         }
 
+        # [LESSON] loss-cluster alerting state
+        self._pending_lesson: Optional[str] = None
+        self._lesson_alerted_at: int = 0   # journal length when last alert fired
+
     def get_filter_stats(self) -> Dict[str, int]:
         """Return and reset the rejection-reason tally since last call."""
         stats = dict(self._filter_stats)
         for k in self._filter_stats:
             self._filter_stats[k] = 0
         return stats
+
+    # ── [LESSON] loss-cluster detection & post-mortem ────────────────────────
+
+    LESSON_WINDOW = 5          # look-back window (trades)
+    LESSON_MIN_LOSSES = 3      # losses within window that trigger an alert
+
+    def _check_lessons(self) -> None:
+        """
+        After every closed trade: if the last 3 trades were all losses, or
+        >=LESSON_MIN_LOSSES of the last LESSON_WINDOW were losses, build a
+        post-mortem (which logic entered, which logic exited, scores, R) and
+        queue it for the runner to push to Telegram. The learning engine's
+        per-entry-type weights (the bot's own self-adjustment) are included
+        so the alert shows what the bot is already doing about it.
+        """
+        j = self.trade_journal
+        if len(j) < 3 or len(j) <= self._lesson_alerted_at:
+            return
+
+        streak3 = all(t.get("win_loss") == "LOSS" for t in j[-3:])
+        window  = j[-self.LESSON_WINDOW:]
+        losses  = [t for t in window if t.get("win_loss") == "LOSS"]
+        if not (streak3 or len(losses) >= self.LESSON_MIN_LOSSES):
+            return
+
+        trigger = "3 losses in a row" if streak3 else \
+                  f"{len(losses)} losses in last {len(window)} trades"
+        lines = [f"📚 LESSON ALERT — {trigger}", ""]
+        for t in losses[-3:]:
+            lines.append(
+                f"• {t.get('direction','?')} {t.get('e_state', t.get('market_state','?'))}"
+                f"/{t.get('entry_type','?')} → exit {t.get('exit_reason','?')} "
+                f"({t.get('realized_r', 0):+.2f}R)\n"
+                f"  entry scores: sig={t.get('e_total',0):.0f} "
+                f"e={t.get('e_entry',0):.0f} ctx={t.get('e_context',0):.0f} "
+                f"fit={t.get('e_fit',0):.0f} | rsi={t.get('e_rsi',0):.0f} "
+                f"adx={t.get('e_adx',0):.0f}"
+            )
+        # exit-reason tally over the window (what's killing us)
+        from collections import Counter as _Counter
+        reasons = _Counter(t.get("exit_reason", "?") for t in losses)
+        lines.append("")
+        lines.append("exit reasons: " + ", ".join(f"{k}×{v}" for k, v in reasons.most_common()))
+        # bot's own self-adjustment (learning engine)
+        try:
+            lines.append(f"auto-adjust weights: {self.learning_engine.get_summary()}")
+        except Exception:
+            pass
+        lines.append("(weights auto-reduce sizing on entry types with WR<45%)")
+
+        self._pending_lesson    = "\n".join(lines)
+        self._lesson_alerted_at = len(j)
+
+    def pop_lesson_alert(self) -> Optional[str]:
+        """Return and clear the queued lesson alert (runner forwards to Telegram)."""
+        msg = self._pending_lesson
+        self._pending_lesson = None
+        return msg
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -690,7 +752,13 @@ class TradingBot:
         if bb_w < 0.2 and atr_exp < 0.8:
             return "LOW_VOL"
 
-        # 3. BREAKOUT — expanding from compression with volume confirmation
+        # 3. BREAKOUT — expanding from compression with volume confirmation.
+        # NOTE: this gate is effectively unreachable on real 4H data (bb_w>0.3
+        # is the ~99.2th percentile jointly with the rest — 0 occurrences in
+        # 5 months × 5 symbols). A recalibrated p75-p90 version (bb_w>0.09,
+        # atr_exp>1.15, vol>1.3) was tested across all 5 symbols and came out
+        # aggregate-neutral-to-negative (-$246 total, XAG -$330), so the state
+        # is intentionally left dormant rather than force-enabled.
         if bb_w > 0.3 and atr_exp > 1.2 and vol_ratio > 1.4 and adx < 24:
             return "BREAKOUT"
 
@@ -752,7 +820,7 @@ class TradingBot:
 
     # [FAKE-FILTER] Minimum price-to-EMA20 distance (in ATR) for a trend-state
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
-    MIN_EMA_DIST_ATR: float = 0.8
+    MIN_EMA_DIST_ATR: float = 0.6
 
     def _regime_direction(self, ind_4h: Dict) -> float:
         """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
@@ -968,6 +1036,60 @@ class TradingBot:
             self._log_event("Cooldown expired → SCANNING (5-min check)")
             return True
         return False
+
+    # ── Intrabar price protection — runs every runner poll between bar closes ─
+
+    def check_price_protection(self, current_price: float) -> Optional[str]:
+        """
+        Lightweight price-level protection (SL / TP1 / TP2 crossings) checked
+        every poll (~30-60s) instead of only on 15m bar close. Full
+        indicator-based management (health tiers, reversal spike, trend fade,
+        state drift) still runs per closed bar in _manage_open_position —
+        those need fresh indicators; price levels don't. Closes/partials use
+        the same _close_position path (real orders + accounting).
+        Returns a short action description, or None if nothing fired.
+        """
+        if not self.position_open or not self.current_trade:
+            return None
+        t = self.current_trade
+        if t.get("status") != "OPEN":
+            return None
+        direction = t["direction"]
+
+        sl_hit  = (current_price <= t["sl"])  if direction == "LONG" else (current_price >= t["sl"])
+        tp2_hit = (current_price >= t["tp2"]) if direction == "LONG" else (current_price <= t["tp2"])
+        tp1_hit = (current_price >= t["tp1"]) if direction == "LONG" else (current_price <= t["tp1"])
+
+        if sl_hit:
+            self._close_position("SL_HIT", t["sl"], 1.0, {})
+            if self.state != "ERROR":
+                self.state = "EXITING"
+                return f"SL_HIT @ {t['sl']:.4f}"
+            return None
+
+        if tp2_hit and not t["tp2_hit"]:
+            self._close_position("FULL_TP2", t["tp2"], 1.0, {})
+            if self.state != "ERROR":
+                t["tp1_hit"] = True
+                t["tp2_hit"] = True
+                self.state = "EXITING"
+                return f"FULL_TP2 @ {t['tp2']:.4f}"
+            return None
+
+        if tp1_hit and not t["tp1_hit"]:
+            tp1_close_pct = t.get("tp1_pct", self.tp1_close_pct)
+            self._close_position("PARTIAL_TP1", t["tp1"], tp1_close_pct, {})
+            if self.state != "ERROR":
+                t["tp1_hit"] = True
+                if not t["break_even_triggered"]:
+                    if direction == "LONG":
+                        t["sl"] = max(t["sl"], t["entry"])
+                    else:
+                        t["sl"] = min(t["sl"], t["entry"])
+                    t["break_even_triggered"] = True
+                self.state = "PARTIAL_EXIT"
+                return f"PARTIAL_TP1 @ {t['tp1']:.4f} + SL→BE"
+        return None
 
     # ── Step 3: Global gates ──────────────────────────────────────────────────
 
@@ -1449,6 +1571,9 @@ class TradingBot:
             self._log_event(
                 f"[LEARN] weights updated: {self.learning_engine.get_summary()}"
             )
+
+        # [LESSON] loss-cluster detection → alert for the runner to forward
+        self._check_lessons()
 
         # Update streaks + daily PnL
         self.daily_pnl_pct     += (pnl / max(self.account_balance, 1)) * 100

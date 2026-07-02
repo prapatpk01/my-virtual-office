@@ -117,7 +117,7 @@ def build_config() -> dict:
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
         "use_adaptive": _env_bool("USE_ADAPTIVE", False),
         "adaptive_balance": _env_float("ADAPTIVE_BALANCE", 10000.0),
-        "adaptive_risk_pct": _env_float("ADAPTIVE_RISK_PCT", 0.01),
+        "adaptive_risk_pct": _env_float("ADAPTIVE_RISK_PCT", 0.025),
         "adaptive_daily_loss": _env_float("ADAPTIVE_DAILY_LOSS_PCT", -3.0),
         "adaptive_daily_profit": _env_float("ADAPTIVE_DAILY_PROFIT_PCT", 8.0),
         "adaptive_cooldown_min": _env_int("ADAPTIVE_COOLDOWN_MIN", 30),
@@ -448,6 +448,34 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             sym, status["state"], status["position_open"],
                             status["market_state"], status["regime_score"],
                         )
+
+                        # [LESSON] forward loss-cluster post-mortem to Telegram
+                        lesson = bot.pop_lesson_alert()
+                        if lesson:
+                            logger.warning("[Lesson][%s]\n%s", sym, lesson)
+                            if telegram:
+                                try:
+                                    telegram.send(f"[{sym}]\n{lesson}")
+                                except Exception:
+                                    pass
+
+                else:
+                    # [INTRABAR PROTECT] Between bar closes, check price-level
+                    # exits (SL/TP1/TP2) against the forming candle's latest
+                    # price every poll (~INTERVAL_SECONDS), instead of leaving
+                    # bot-side protection blind for up to 15 minutes. Full
+                    # indicator-based management still runs on bar close.
+                    if bot.position_open and c15m:
+                        live_px = float(c15m[-1].close)
+                        try:
+                            action = await loop.run_in_executor(
+                                None, bot.check_price_protection, live_px)
+                            if action:
+                                logger.info("[Protect][%s] intrabar %s (px=%.4f)",
+                                            sym, action, live_px)
+                        except Exception as e:
+                            logger.warning("[Protect][%s] intrabar check failed: %s",
+                                           sym, e)
 
                 # 5-minute health log — only fires when a position is open.
                 # Timer resets the moment a new position opens so the first
