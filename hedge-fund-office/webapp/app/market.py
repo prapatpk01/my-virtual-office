@@ -177,6 +177,106 @@ def fetch_news(symbols: list[str], per_symbol: int = 5) -> list[dict]:
     return items
 
 
+# ── Multi-source market news (RSS ทางการ — Bloomberg/CNN/CNBC/MarketWatch) ──
+_UA = {"User-Agent": "Mozilla/5.0 (SentinelFund/1.0)"}
+RSS_SOURCES = [
+    ("Bloomberg Markets",   "https://feeds.bloomberg.com/markets/news.rss"),
+    ("Bloomberg Economics", "https://feeds.bloomberg.com/economics/news.rss"),
+    ("CNN Business",        "http://rss.cnn.com/rss/money_latest.rss"),
+    ("CNBC Markets",        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
+    ("MarketWatch",         "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+]
+_RSS_CACHE: dict[str, tuple[float, list]] = {}
+_RSS_TTL = 900
+
+
+def _fetch_rss(source: str, url: str, limit: int = 8) -> list[dict]:
+    """ดึง+parse RSS ด้วย stdlib — fail เงียบต่อ feed (แหล่งที่ล่มแค่หายไป ไม่พังหน้า)"""
+    now = time.time()
+    if url in _RSS_CACHE and now - _RSS_CACHE[url][0] < _RSS_TTL:
+        return _RSS_CACHE[url][1]
+    items = []
+    try:
+        import urllib.request
+        import xml.etree.ElementTree as ET
+        req = urllib.request.Request(url, headers=_UA)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            root = ET.fromstring(r.read())
+        for it in root.iter("item"):
+            title = (it.findtext("title") or "").strip()
+            if not title:
+                continue
+            pub = (it.findtext("pubDate") or "")[:25]
+            items.append({"source": source, "title": title,
+                          "link": (it.findtext("link") or "").strip(), "published": pub})
+            if len(items) >= limit:
+                break
+    except Exception:
+        pass
+    _RSS_CACHE[url] = (now, items)
+    return items
+
+
+def fetch_market_news() -> list[dict]:
+    """ข่าวตลาดรวมหลายสำนัก — แหล่งไหนล่มก็ข้าม (Rule #5: มีเท่าไหร่แสดงเท่านั้น)"""
+    out, seen = [], set()
+    for source, url in RSS_SOURCES:
+        for a in _fetch_rss(source, url):
+            if a["title"] not in seen:
+                seen.add(a["title"])
+                out.append(a)
+    return out
+
+
+# ── CNN Fear & Greed Index (ใช้ใน contrarian framework §7) ──────────────────
+_FG_CACHE: tuple[float, dict] | None = None
+
+
+def fetch_fear_greed() -> dict:
+    """F&G score 0-100 + rating — พร้อม action ตามกฎกองทุน"""
+    global _FG_CACHE
+    now = time.time()
+    if _FG_CACHE and now - _FG_CACHE[0] < 1800:
+        return _FG_CACHE[1]
+    rec = {"score": None, "rating": None, "action": None,
+           "source": "CNN Fear & Greed", "status": "OK"}
+    try:
+        import json as _json
+        import urllib.request
+        req = urllib.request.Request(
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata", headers=_UA)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = _json.loads(r.read())
+        fg = data.get("fear_and_greed", {})
+        score = fg.get("score")
+        if score is not None:
+            score = round(float(score))
+            rec["score"], rec["rating"] = score, (fg.get("rating") or "").title()
+            rec["action"] = (
+                "🟢 ALL-IN ZONE — extreme fear (รอ stabilize)" if score < 15 else
+                "🟢 เริ่ม scale in 25-30%" if score < 25 else
+                "⚪ Neutral — ถือตามแผน" if score < 65 else
+                "🟡 เริ่ม TRIM ตัวที่กำไร" if score < 75 else
+                "🟠 TRIM 30-50% satellite" if score <= 85 else
+                "🔴 EUPHORIA — take profit เชิงรุก")
+    except Exception as e:
+        rec["status"] = f"ERROR: {type(e).__name__}"
+    _FG_CACHE = (now, rec)
+    return rec
+
+
+# ── Research links ต่อ ticker (แหล่งที่ไม่มี API — ให้ทีมกดเข้าไปค้น) ─────────
+def research_links(symbol: str) -> list[dict]:
+    s = symbol.upper()
+    return [
+        {"name": "StockAnalysis", "url": f"https://stockanalysis.com/stocks/{s}/"},
+        {"name": "TradingView",   "url": f"https://www.tradingview.com/symbols/{s}/"},
+        {"name": "Yahoo Finance", "url": f"https://finance.yahoo.com/quote/{s}"},
+        {"name": "Seeking Alpha", "url": f"https://seekingalpha.com/symbol/{s}"},
+        {"name": "Finviz",        "url": f"https://finviz.com/quote.ashx?t={s}"},
+    ]
+
+
 # ── ปฏิทินเศรษฐกิจ H2-2026 (ตารางประกาศทางการ — static, ระบุแหล่ง) ─────────
 ECON_CALENDAR_2026H2 = [
     {"date": "2026-07-03", "event": "Nonfarm Payrolls (มิ.ย.)", "kind": "NFP",  "source": "BLS schedule"},

@@ -68,8 +68,18 @@ def dashboard(request: Request, sess=Depends(get_db)):
     if (r := auth.require_login(request)):
         return r
     holdings = sess.query(db.Holding).all()
-    prices = market.fetch_many([h.ticker for h in holdings] + ["SPY"]) if holdings else {"SPY": market.fetch("SPY")}
+    prices = market.fetch_many([h.ticker for h in holdings] + ["SPY", "^VIX"])
     pf = governance.build_portfolio(holdings, prices)
+
+    vix = prices.get("^VIX", {})
+    v = vix.get("price")
+    vix_action = None if v is None else (
+        "🔴 Complacent — trim satellite กำไร, ยก stop" if v < 15 else
+        "🟡 Neutral — ถือ, deploy เฉพาะ high RS" if v < 20 else
+        "⚠️ ดีดแรง — ดูทิศทางก่อน ห้าม FOMO" if v < 25 else
+        "🟠 เริ่มมองหาการลงทุน — เตรียม limit" if v < 30 else
+        "🟢 SPECIAL — เข้าซื้อเชิงรุก (ผ่าน guardrail ก่อน)")
+    fg = market.fetch_fear_greed()
 
     peak = float(db.get_meta(sess, "peak_nav", "0") or 0)
     if pf["nav"] > peak:
@@ -87,6 +97,7 @@ def dashboard(request: Request, sess=Depends(get_db)):
         "fund": FUND_NAME, "user": auth.current_user(request),
         "pf": pf, "dd": dd, "spy": prices.get("SPY", {}), "asof": market.now_iso(),
         "nav_history": nav_history,
+        "vix": vix, "vix_action": vix_action, "fg": fg,
     })
 
 
@@ -262,11 +273,14 @@ def news_page(request: Request, sess=Depends(get_db)):
         return r
     holdings = sess.query(db.Holding).all()
     watch = sess.query(db.Watch).all()
-    symbols = [h.ticker for h in holdings] + [w.ticker for w in watch]
+    symbols = list(dict.fromkeys([h.ticker.upper() for h in holdings] + [w.ticker.upper() for w in watch]))
     news = market.fetch_news(symbols) if symbols else []
+    market_news = market.fetch_market_news()
+    links = {s: market.research_links(s) for s in symbols}
     return templates.TemplateResponse(request, "news.html", {
         "fund": FUND_NAME, "user": auth.current_user(request),
-        "news": news, "n_symbols": len(set(symbols)), "asof": market.now_iso(),
+        "news": news, "market_news": market_news, "links": links,
+        "n_symbols": len(symbols), "asof": market.now_iso(),
     })
 
 

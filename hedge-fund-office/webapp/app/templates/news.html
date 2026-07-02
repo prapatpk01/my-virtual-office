@@ -2,9 +2,27 @@
 {% set active='news' %}
 {% block title %} — News{% endblock %}
 {% block content %}
-<h1>Market News</h1>
-<p class="sub">ข่าวจาก holdings + watchlist ({{ n_symbols }} symbols) · yfinance · อัปเดต {{ asof }} · cache 15 นาที</p>
+<h1>Research &amp; News</h1>
+<p class="sub">หลายแหล่ง: Bloomberg · CNN Business · CNBC · MarketWatch (RSS ทางการ) + ข่าวรายตัว yfinance · อัปเดต {{ asof }} · cache 15 นาที</p>
 
+<h2>📡 Market News — Multi-Source</h2>
+<div class="card" style="padding:8px 16px">
+{% for a in market_news %}
+<div class="news-item">
+  <span class="news-sym">{{ a.source }}</span>
+  <div class="nt">
+    {% if a.link %}<a href="{{ a.link }}" target="_blank" rel="noopener">{{ a.title }}</a>
+    {% else %}<span style="font-weight:600">{{ a.title }}</span>{% endif %}
+    <div class="meta">{{ a.published or '—' }}</div>
+  </div>
+</div>
+{% else %}
+<p class="muted" style="text-align:center;padding:26px">ดึง feed ไม่ได้ชั่วคราว — ลอง refresh
+  <span class="small">(แหล่งที่ล่มจะถูกข้าม ไม่กระทบแหล่งอื่น)</span></p>
+{% endfor %}
+</div>
+
+<h2>🎯 ข่าวรายตัว — Holdings + Watchlist ({{ n_symbols }} symbols)</h2>
 <div class="card" style="padding:8px 16px">
 {% for a in news %}
 <div class="news-item">
@@ -16,9 +34,26 @@
   </div>
 </div>
 {% else %}
-<p class="muted" style="text-align:center;padding:30px">
-  ยังไม่มีข่าว — เพิ่ม holdings หรือ watchlist ก่อน แล้วข่าวจะดึงอัตโนมัติ<br>
-  <span class="small">(ถ้ามี holdings แล้วแต่ไม่ขึ้น = yfinance ดึงข่าวไม่ได้ชั่วคราว ลอง refresh)</span></p>
+<p class="muted" style="text-align:center;padding:26px">ยังไม่มีข่าวรายตัว — เพิ่ม holdings หรือ watchlist ก่อน</p>
 {% endfor %}
 </div>
+
+{% if links %}
+<h2>🔎 Research Links ต่อตัว — StockAnalysis / TradingView / Seeking Alpha / Finviz</h2>
+<div class="card table-scroll" style="padding:6px 8px">
+<table>
+<thead><tr><th>Ticker</th><th style="text-align:left">เปิดดูข้อมูลเชิงลึก (แหล่งที่ไม่มี API — ให้ทีมค้นเอง)</th></tr></thead>
+<tbody>
+{% for sym, ls in links.items() %}
+<tr>
+  <td class="tk">{{ sym }}</td>
+  <td style="text-align:left">
+    {% for l in ls %}<a class="tag" style="margin-right:8px" href="{{ l.url }}" target="_blank" rel="noopener">{{ l.name }}</a>{% endfor %}
+  </td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
 {% endblock %}

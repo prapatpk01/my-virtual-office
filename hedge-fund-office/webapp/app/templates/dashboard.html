@@ -25,6 +25,23 @@
 {% for a in pf.alerts %}<div class="alert a-{{ a.level }}">{{ a.msg }}</div>{% endfor %}
 {% endif %}
 
+<h2>Market Sentiment — Contrarian §7</h2>
+<div class="grid g2">
+  <div class="card stat"><div class="label">VIX</div>
+    {% if vix.price %}
+    <div class="value {{ 'neg' if vix.price >= 25 else ('warn' if vix.price >= 20 or vix.price < 15 else 'pos') }}">{{ '%.2f'|format(vix.price) }}</div>
+    <div class="delta">{{ vix_action }}</div>
+    {% else %}<div class="value muted">—</div><div class="delta warn small">{{ vix.status }}</div>{% endif %}
+  </div>
+  <div class="card stat"><div class="label">CNN Fear &amp; Greed</div>
+    {% if fg.score is not none %}
+    <div class="value {{ 'neg' if fg.score > 75 else ('pos' if fg.score < 25 else '') }}">{{ fg.score }} <span class="small muted" style="font-weight:400">/100 · {{ fg.rating }}</span></div>
+    <div class="delta">{{ fg.action }}</div>
+    {% else %}<div class="value muted">—</div><div class="delta warn small">{{ fg.status }}</div>{% endif %}
+  </div>
+</div>
+<p class="sub" style="margin-top:10px">Dual-Signal: ซื้อแข็งสุด = VIX &gt; 30 <b>AND</b> F&amp;G &lt; 15 (+ผ่าน stabilization guardrail) · ขาย/ระวังสุด = VIX &lt; 15 <b>AND</b> F&amp;G &gt; 85</p>
+
 <h2>NAV Growth</h2>
 <div class="card">
 {% if nav_history|length >= 2 %}
