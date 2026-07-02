@@ -6,13 +6,27 @@
 <p class="sub">FOMC / CPI / NFP จากตารางประกาศทางการ (Fed + BLS) · Earnings + XD สดจาก yfinance · อัปเดต {{ asof }}</p>
 
 <div class="legend" style="margin-bottom:14px">
-  <span class="chip chip-FOMC">FOMC</span>
-  <span class="chip chip-CPI">CPI</span>
-  <span class="chip chip-NFP">NFP</span>
-  <span class="chip chip-EARNINGS">EARNINGS</span>
-  <span class="chip chip-XD">XD ปันผล</span>
+  <span><i class="sw" style="background:var(--red)"></i> FOMC</span>
+  <span><i class="sw" style="background:var(--amber)"></i> CPI</span>
+  <span><i class="sw" style="background:var(--cyan)"></i> NFP</span>
+  <span><i class="sw" style="background:var(--s1)"></i> Earnings</span>
+  <span><i class="sw" style="background:var(--green)"></i> XD ปันผล</span>
 </div>
 
+<div class="card">
+  <div class="calhead">
+    <button class="btn-ghost" id="prev" aria-label="เดือนก่อน">‹</button>
+    <b id="mtitle"></b>
+    <button class="btn-ghost" id="next" aria-label="เดือนถัดไป">›</button>
+    <button class="btn-ghost btn-sm" id="tod" style="margin-left:auto">วันนี้</button>
+  </div>
+  <div class="calgrid" id="calgrid"></div>
+  <div class="daypanel" id="daypanel">
+    <p class="none">👆 กดวันที่มีจุดสี เพื่อดูรายละเอียด event</p>
+  </div>
+</div>
+
+<h2>รายการทั้งหมด (เรียงตามวัน)</h2>
 <div class="card" style="padding:8px 16px">
 {% for e in events %}
 <div class="cal-row">
@@ -27,4 +41,74 @@
 </div>
 
 <p class="sub" style="margin-top:14px">⚠️ FOMC blackout rule: ไม่เพิ่ม position ใหม่ 2 วันก่อนประชุม (Governance Rule #2 — stagger 1/3 ก่อน Tier-1 event)</p>
+
+<script>
+(function(){
+  const EVENTS = {{ events|tojson }};
+  const byDay = {};
+  EVENTS.forEach(e => { (byDay[e.date] = byDay[e.date] || []).push(e); });
+
+  const TH_M = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน',
+                'กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+  const DOW = ['อา','จ','อ','พ','พฤ','ศ','ส'];
+  const CHIP = {FOMC:'chip-FOMC', CPI:'chip-CPI', NFP:'chip-NFP', EARNINGS:'chip-EARNINGS', XD:'chip-XD'};
+
+  const grid = document.getElementById('calgrid'),
+        title = document.getElementById('mtitle'),
+        panel = document.getElementById('daypanel');
+  const now = new Date();
+  const todayStr = now.toISOString().slice(0,10);
+  let ym = [now.getFullYear(), now.getMonth()];   // [year, 0-based month]
+  let selected = null;
+
+  function pad(n){ return String(n).padStart(2,'0'); }
+
+  function showDay(ds){
+    selected = ds;
+    const evs = byDay[ds] || [];
+    if (!evs.length) {
+      panel.innerHTML = `<p class="none">📭 ${ds} — ไม่มี event</p>`;
+    } else {
+      panel.innerHTML = `<div class="stat"><div class="label">📌 ${ds} · ${evs.length} event</div></div>` +
+        evs.map(e => `<div class="cal-row">
+          <span class="chip ${CHIP[e.kind]||''}">${e.kind}</span>
+          <span>${e.event}</span>
+          <span class="cal-src">${e.source}</span></div>`).join('');
+    }
+    render();
+  }
+
+  function render(){
+    const [y, m] = ym;
+    title.textContent = `${TH_M[m]} ${y + 543}`;
+    let html = DOW.map(d => `<div class="dow">${d}</div>`).join('');
+    const first = new Date(y, m, 1), start = first.getDay();
+    const days = new Date(y, m + 1, 0).getDate();
+    const prevDays = new Date(y, m, 0).getDate();
+    for (let i = start - 1; i >= 0; i--)
+      html += `<div class="calday out"><span class="n">${prevDays - i}</span></div>`;
+    for (let d = 1; d <= days; d++) {
+      const ds = `${y}-${pad(m+1)}-${pad(d)}`;
+      const evs = byDay[ds] || [];
+      const dots = evs.slice(0,4).map(e => `<i class="dot-${e.kind}"></i>`).join('');
+      const cls = ['calday', ds === todayStr ? 'today' : '', ds === selected ? 'sel' : ''].join(' ');
+      html += `<div class="${cls}" data-d="${ds}"><span class="n">${d}</span><span class="caldots">${dots}</span></div>`;
+    }
+    const cells = start + days, tail = (7 - cells % 7) % 7;
+    for (let d = 1; d <= tail; d++)
+      html += `<div class="calday out"><span class="n">${d}</span></div>`;
+    grid.innerHTML = html;
+    grid.querySelectorAll('.calday[data-d]').forEach(el =>
+      el.addEventListener('click', () => showDay(el.dataset.d)));
+  }
+
+  document.getElementById('prev').onclick = () => { ym[1]--; if (ym[1] < 0) { ym[1] = 11; ym[0]--; } render(); };
+  document.getElementById('next').onclick = () => { ym[1]++; if (ym[1] > 11) { ym[1] = 0; ym[0]++; } render(); };
+  document.getElementById('tod').onclick = () => { ym = [now.getFullYear(), now.getMonth()]; showDay(todayStr); };
+
+  render();
+  // ถ้าวันนี้มี event เปิดให้เลย
+  if (byDay[todayStr]) showDay(todayStr);
+})();
+</script>
 {% endblock %}

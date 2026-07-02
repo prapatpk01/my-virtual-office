@@ -2,7 +2,7 @@
 <html lang="th">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>{{ fund }}{% block title %}{% endblock %}</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -11,13 +11,13 @@
 <nav><div class="wrap">
   <div class="brand">SENTINEL<small>Global Fund</small></div>
   <div class="links">
-    <a href="/" class="{{ 'active' if active=='dash' }}">Dashboard</a>
-    <a href="/holdings" class="{{ 'active' if active=='holdings' }}">Holdings</a>
-    <a href="/income" class="{{ 'active' if active=='income' }}">Income</a>
-    <a href="/news" class="{{ 'active' if active=='news' }}">News</a>
-    <a href="/calendar" class="{{ 'active' if active=='calendar' }}">Calendar</a>
-    <a href="/gates" class="{{ 'active' if active=='gates' }}">Gates</a>
-    <a href="/team" class="{{ 'active' if active=='team' }}">Team</a>
+    <a href="/" class="pglink {{ 'active' if active=='dash' }}">Dashboard</a>
+    <a href="/holdings" class="pglink {{ 'active' if active=='holdings' }}">Holdings</a>
+    <a href="/income" class="pglink {{ 'active' if active=='income' }}">Income</a>
+    <a href="/news" class="pglink {{ 'active' if active=='news' }}">News</a>
+    <a href="/calendar" class="pglink {{ 'active' if active=='calendar' }}">Calendar</a>
+    <a href="/gates" class="pglink {{ 'active' if active=='gates' }}">Gates</a>
+    <a href="/team" class="pglink {{ 'active' if active=='team' }}">Team</a>
     <span class="user">👤 {{ user }}</span>
     <a href="/logout" class="btn-ghost btn-sm" style="padding:5px 11px;border-radius:8px">ออก</a>
   </div>
@@ -26,5 +26,16 @@
 <main><div class="wrap">
 {% block content %}{% endblock %}
 </div></main>
+{% if user %}
+<div class="tabbar">
+  <a href="/" class="{{ 'active' if active=='dash' }}"><span class="ic">📊</span>Dash</a>
+  <a href="/holdings" class="{{ 'active' if active=='holdings' }}"><span class="ic">💼</span>Holdings</a>
+  <a href="/income" class="{{ 'active' if active=='income' }}"><span class="ic">💵</span>Income</a>
+  <a href="/news" class="{{ 'active' if active=='news' }}"><span class="ic">📰</span>News</a>
+  <a href="/calendar" class="{{ 'active' if active=='calendar' }}"><span class="ic">📅</span>Calendar</a>
+  <a href="/gates" class="{{ 'active' if active=='gates' }}"><span class="ic">🛡️</span>Gates</a>
+  <a href="/team" class="{{ 'active' if active=='team' }}"><span class="ic">👥</span>Team</a>
+</div>
+{% endif %}
 </body>
 </html>
