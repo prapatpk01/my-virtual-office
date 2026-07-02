@@ -476,6 +476,8 @@ class TradingBot:
                  tp2_r: Optional[float] = None,
                  min_ema_dist_atr: Optional[float] = None,
                  entry_spacing_min: int = 60,
+                 margin_usdt: float = 0.0,
+                 sizing_leverage: int = 10,
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
                  startup_warmup_minutes: int = 45,
@@ -506,6 +508,15 @@ class TradingBot:
         # price whips up/down (each bot instance == one symbol).
         self.entry_spacing_min = entry_spacing_min
         self._last_entry_at: Optional[datetime.datetime] = None
+
+        # [SIZING] fixed-margin mode (margin × leverage notional per position);
+        # 0.0 = classic risk-% sizing (backtest default)
+        self.margin_usdt     = margin_usdt
+        self.sizing_leverage = sizing_leverage
+
+        # [SCAN-INFO] last per-direction signal evaluation, for the runner's
+        # 5-min scan log (why we are / aren't trading right now)
+        self._scan_info: Dict[str, str] = {}
 
         # [MIN-LOT TP1] Smallest close size (in coins) the exchange can fill —
         # set by the runner from the symbol's contract size. When a TP1 partial
@@ -1004,6 +1015,9 @@ class TradingBot:
             if abs(_px - _e20) / _atr < self.MIN_EMA_DIST_ATR:
                 self._filter_stats["checked"] += 1
                 self._filter_stats["health_fail"] += 1
+                self._scan_info[direction] = (
+                    f"veto:chop-zone (dist {abs(_px - _e20) / _atr:.2f} "
+                    f"< {self.MIN_EMA_DIST_ATR} ATR from EMA20)")
                 return None
 
             # [CLIMAX-VETO] Don't enter on a blow-off bar: a single bar whose
@@ -1014,6 +1028,9 @@ class TradingBot:
             if _rng > self.CLIMAX_BAR_ATR * _atr:
                 self._filter_stats["checked"] += 1
                 self._filter_stats["health_fail"] += 1
+                self._scan_info[direction] = (
+                    f"veto:climax-bar (range {_rng / _atr:.1f} > "
+                    f"{self.CLIMAX_BAR_ATR} ATR)")
                 return None
 
         entry = self._entry_score(ind_15m, candle_15m, direction, market_state)
@@ -1026,6 +1043,9 @@ class TradingBot:
         if entry["score"] < self.ENTRY_SCORE_FLOOR:
             self._filter_stats["checked"] += 1
             self._filter_stats["health_fail"] += 1
+            self._scan_info[direction] = (
+                f"veto:entry-floor (15M score {entry['score']:.0f} "
+                f"< {self.ENTRY_SCORE_FLOOR:.0f})")
             return None
 
 
@@ -1033,6 +1053,10 @@ class TradingBot:
         total_min = thrs["total_min"]
 
         self._filter_stats["checked"] += 1
+        self._scan_info[direction] = (
+            f"total {total:.0f}/{total_min} "
+            f"(15M:{entry['score']:.0f} 1H:{ctx['score']:.0f} 4H-fit:{fit:.0f})"
+            + (" → SIGNAL" if total >= total_min else ""))
         if total >= total_min:
             self._filter_stats["passed"] += 1
         else:
@@ -1294,8 +1318,23 @@ class TradingBot:
         learning_mult = self.learning_engine.get_weight(entry_type)
         size_mult     = conf_mult * health_mult * learning_mult
 
-        risk_amount   = self.account_balance * risk_pct * size_mult
-        position_size = risk_amount / max(sl_dist, 1e-9)
+        # [SIZING] Two modes:
+        # - margin_usdt > 0 (live default): FIXED notional = margin × leverage
+        #   → predictable whole-contract sizes; quality multipliers do not
+        #   scale size (the low-confidence skip gate above still applies).
+        # - margin_usdt == 0 (backtest / opt-in): classic risk-% of balance.
+        if self.margin_usdt and self.margin_usdt > 0:
+            notional      = self.margin_usdt * max(self.sizing_leverage, 1)
+            position_size = notional / max(entry_price, 1e-9)
+            _risk_now     = notional * (sl_dist / max(entry_price, 1e-9))
+            self._log_event(
+                f"[SIZING] fixed-margin ${self.margin_usdt:.0f}×{self.sizing_leverage}x "
+                f"= ${notional:.0f} notional (risk≈${_risk_now:.2f} "
+                f"= {_risk_now / max(self.account_balance, 1e-9) * 100:.1f}% of balance)"
+            )
+        else:
+            risk_amount   = self.account_balance * risk_pct * size_mult
+            position_size = risk_amount / max(sl_dist, 1e-9)
 
         # ── TP levels ────────────────────────────────────────────────────────
         mult = 1 if direction == "LONG" else -1
@@ -2040,6 +2079,7 @@ class TradingBot:
             "regime_score":       self.regime_score,
             "cooldown_until":     self.cooldown_until.isoformat() if self.cooldown_until else None,
             "warmup_remaining_m": warmup_remaining,
+            "scan_info":          dict(self._scan_info),
             "recent_log":         list(self._log[-20:]),
         }
 

@@ -133,6 +133,10 @@ def build_config() -> dict:
         # Whipsaw guard: minutes since the last OPEN on a symbol before a new
         # entry is allowed there (0 = disabled).
         "adaptive_entry_spacing_min": _env_int("ADAPTIVE_ENTRY_SPACING_MIN", 60),
+        # Fixed-margin sizing (live default): notional per position =
+        # ADAPTIVE_MARGIN_USDT × LEVERAGE (e.g. $20 × 20x = $400). Set 0 to
+        # fall back to risk-%-of-balance sizing (ADAPTIVE_RISK_PCT).
+        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 20.0),
     }
 
 
@@ -279,6 +283,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             tp2_r=cfg.get("adaptive_tp2_r"),
             min_ema_dist_atr=cfg.get("adaptive_min_ema_dist_atr"),
             entry_spacing_min=cfg.get("adaptive_entry_spacing_min", 60),
+            margin_usdt=cfg.get("adaptive_margin_usdt", 20.0),
+            sizing_leverage=cfg.get("leverage", 10),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)
@@ -573,6 +579,12 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                         sym, status["state"], status["position_open"],
                         status["market_state"], status["regime_score"],
                     )
+                    # analysis detail: last per-direction evaluation (scores vs
+                    # threshold, or which veto blocked) so the scan shows WHY
+                    scan = status.get("scan_info") or {}
+                    if scan and not status["position_open"]:
+                        parts = [f"{d}: {v}" for d, v in scan.items()]
+                        logger.info("[Scan][%s] %s", sym, " | ".join(parts))
                 except Exception as e:
                     logger.warning("[Adaptive][%s] scan log failed: %s", sym, e)
 
