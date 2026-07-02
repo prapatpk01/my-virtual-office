@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% set active='team' %}
+{% block title %} — Team Log{% endblock %}
+{% block content %}
+<h1>Team Log & Watchlist</h1>
+<p class="sub">บันทึกร่วมของทีม · แชร์ watchlist + catalyst</p>
+
+<div class="grid g2">
+  <div class="card">
+    <h2 style="margin-top:0">โพสต์บันทึกทีม</h2>
+    <form class="stack" method="post" action="/team/log">
+      <div class="row">
+        <div><label>ประเภท</label><select name="category">
+          {% for c in categories %}<option>{{ c }}</option>{% endfor %}</select></div>
+        <div style="grid-column:span 2"><label>หัวข้อ</label><input name="title" required></div>
+      </div>
+      <div><label>รายละเอียด</label><textarea name="body"></textarea></div>
+      <button type="submit">โพสต์</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2 style="margin-top:0">เพิ่ม Watchlist</h2>
+    <form class="stack" method="post" action="/team/watch">
+      <div class="row">
+        <div><label>Ticker</label><input name="ticker" required placeholder="RKLB"></div>
+        <div><label>Theme</label><input name="theme" placeholder="Space"></div>
+      </div>
+      <div><label>Catalyst</label><input name="catalyst" placeholder="Nasdaq-100 inclusion"></div>
+      <div><label>Catalyst Date</label><input name="catalyst_date" placeholder="22 มิ.ย. 2026"></div>
+      <button type="submit">เพิ่ม</button>
+    </form>
+  </div>
+</div>
+
+<h2>Watchlist</h2>
+<div class="card" style="padding:6px 8px">
+<table>
+<thead><tr><th>Ticker</th><th>Theme</th><th>Catalyst</th><th>Date</th><th>By</th><th></th></tr></thead>
+<tbody>
+{% for w in watch %}
+<tr>
+  <td class="tk">{{ w.ticker }}</td><td class="muted small">{{ w.theme }}</td>
+  <td class="small">{{ w.catalyst }}</td><td class="muted small">{{ w.catalyst_date }}</td>
+  <td class="muted small">{{ w.added_by }}</td>
+  <td><form method="post" action="/team/watch/delete"><input type="hidden" name="id" value="{{ w.id }}">
+    <button class="btn-danger btn-sm" type="submit">ลบ</button></form></td>
+</tr>
+{% endfor %}
+{% if not watch %}<tr><td colspan="6" class="muted" style="text-align:center;padding:18px">ยังไม่มี watchlist</td></tr>{% endif %}
+</tbody></table>
+</div>
+
+<h2>บันทึกทีม (ล่าสุด)</h2>
+<div class="card">
+{% for l in logs %}
+<div class="log-item">
+  <span class="tag">{{ l.category }}</span> <b>{{ l.title }}</b>
+  {% if l.body %}<div class="small" style="margin-top:5px;white-space:pre-wrap">{{ l.body }}</div>{% endif %}
+  <div class="meta">{{ l.author }} · {{ l.created_at.strftime('%Y-%m-%d %H:%M UTC') }}</div>
+</div>
+{% endfor %}
+{% if not logs %}<p class="muted small" style="text-align:center;padding:18px">ยังไม่มีบันทึก</p>{% endif %}
+</div>
+{% endblock %}

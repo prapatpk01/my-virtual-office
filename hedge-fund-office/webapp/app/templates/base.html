@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ fund }}{% block title %}{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+{% if user %}
+<nav><div class="wrap">
+  <div class="brand">SENTINEL<small>Global Fund</small></div>
+  <div class="links">
+    <a href="/" class="{{ 'active' if active=='dash' }}">Dashboard</a>
+    <a href="/holdings" class="{{ 'active' if active=='holdings' }}">Holdings</a>
+    <a href="/gates" class="{{ 'active' if active=='gates' }}">Gates</a>
+    <a href="/team" class="{{ 'active' if active=='team' }}">Team Log</a>
+    <span class="user">👤 {{ user }}</span>
+    <a href="/logout" class="btn-ghost btn-sm" style="padding:5px 11px;border-radius:8px">ออก</a>
+  </div>
+</div></nav>
+{% endif %}
+<main><div class="wrap">
+{% block content %}{% endblock %}
+</div></main>
+</body>
+</html>

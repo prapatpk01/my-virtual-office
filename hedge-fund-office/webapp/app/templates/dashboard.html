@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% set active='dash' %}
+{% block title %} — Dashboard{% endblock %}
+{% block content %}
+<h1>Portfolio Dashboard</h1>
+<p class="sub">ราคาสด yfinance · อัปเดต {{ asof }} · benchmark SPY
+  {% if spy.price %}${{ spy.price }} ({{ '%+.2f'|format(spy.change_pct or 0) }}%){% else %}<span class="warn">SPY: {{ spy.status }}</span>{% endif %}
+</p>
+
+<div class="grid g4">
+  <div class="card stat"><div class="label">NAV</div><div class="value">${{ '{:,.2f}'.format(pf.nav) }}</div>
+    <div class="delta {{ 'pos' if pf.pl>=0 else 'neg' }}">{{ '{:+,.2f}'.format(pf.pl) }} ({{ '%+.2f'|format(pf.pl_pct) }}%)</div></div>
+  <div class="card stat"><div class="label">Book Cost</div><div class="value">${{ '{:,.2f}'.format(pf.book) }}</div>
+    <div class="delta muted">{{ pf.rows|length }} positions</div></div>
+  <div class="card stat"><div class="label">Drawdown vs Peak</div>
+    <div class="value {{ 'neg' if dd.dd_pct<0 else 'pos' }}">{{ '%.2f'|format(dd.dd_pct) }}%</div>
+    <div class="delta {{ 'warn' if dd.level not in ['SAFE','—'] else 'muted' }}">{{ dd.level }} · peak ${{ '{:,.0f}'.format(dd.peak) }}</div></div>
+  <div class="card stat"><div class="label">Alerts</div>
+    <div class="value {{ 'neg' if pf.alerts else 'pos' }}">{{ pf.alerts|length }}</div>
+    <div class="delta muted">Rule #3 position zones</div></div>
+</div>
+
+{% if pf.alerts %}
+<h2>⚠️ Governance Alerts</h2>
+{% for a in pf.alerts %}<div class="alert a-{{ a.level }}">{{ a.msg }}</div>{% endfor %}
+{% endif %}
+
+<h2>Sleeve Allocation</h2>
+<div class="grid g3">
+{% for name, s in pf.sleeve.items() %}
+  <div class="card stat"><div class="label">{{ name }}</div>
+    <div class="value">{{ '%.1f'|format(s.pct) }}%</div>
+    <div class="delta muted">target {{ '%.0f'|format(s.target) }}% · drift
+      <span class="{{ 'warn' if s.drift|abs > 5 else 'muted' }}">{{ '%+.1f'|format(s.drift) }}%</span></div></div>
+{% endfor %}
+</div>
+
+<h2>Holdings</h2>
+<div class="card" style="padding:6px 8px">
+<table>
+<thead><tr><th>Ticker</th><th>Sleeve</th><th>Price</th><th>Day%</th><th>Shares</th>
+  <th>Value</th><th>% NAV</th><th>P&L</th><th>RSI</th><th>MACD</th><th>Zone</th></tr></thead>
+<tbody>
+{% for r in pf.rows %}
+<tr>
+  <td class="tk">{{ r.ticker }}</td>
+  <td class="muted small">{{ r.sleeve }}</td>
+  <td>{% if r.price %}${{ r.price }}{% else %}<span class="warn small">{{ r.price_status }}</span>{% endif %}</td>
+  <td class="{{ 'pos' if (r.change_pct or 0)>=0 else 'neg' }}">{{ '%+.2f'|format(r.change_pct) if r.change_pct is not none else '—' }}</td>
+  <td>{{ '%.4f'|format(r.shares) }}</td>
+  <td>${{ '{:,.0f}'.format(r.value) }}</td>
+  <td>{{ '%.2f'|format(r.pct) }}%</td>
+  <td class="{{ 'pos' if r.pl>=0 else 'neg' }}">{{ '%+.1f'|format(r.pl_pct) }}%</td>
+  <td class="muted">{{ r.rsi14 if r.rsi14 is not none else '—' }}</td>
+  <td class="small muted">{{ r.macd or '—' }}</td>
+  <td><span class="badge b-{{ r.zone|lower }}">{{ r.zone }}</span></td>
+</tr>
+{% endfor %}
+{% if not pf.rows %}<tr><td colspan="11" class="muted" style="text-align:center;padding:24px">
+  ยังไม่มี holdings — เพิ่มที่หน้า <a href="/holdings">Holdings</a></td></tr>{% endif %}
+</tbody>
+</table>
+</div>
+{% endblock %}

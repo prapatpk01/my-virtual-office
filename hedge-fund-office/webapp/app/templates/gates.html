@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% set active='gates' %}
+{% block title %} — Gates{% endblock %}
+{% block content %}
+<h1>Pre-Trade Governance</h1>
+<p class="sub">9-Gate checklist + Rule #3 position zones + drawdown monitor</p>
+
+<div class="grid g2">
+  <div class="card">
+    <h2 style="margin-top:0">9-Gate Pre-Trade Checklist</h2>
+    <p class="small muted" style="margin-bottom:8px">ต้องผ่านครบ 9/9 ก่อน Ryan execute (ประเมินด้วยตนเองต่อ trade)</p>
+    {% for key, label in gates %}
+    <label class="gate-item"><input type="checkbox" id="g-{{ key }}" onchange="tally()"> <span>{{ loop.index }}. {{ label }}</span></label>
+    {% endfor %}
+    <div style="margin-top:14px;font-weight:700">สถานะ: <span id="gate-result" class="warn">0 / 9</span></div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2 style="margin-top:0">Drawdown Monitor</h2>
+      <div class="stat"><div class="label">NAV vs Peak</div>
+        <div class="value {{ 'neg' if dd.dd_pct<0 else 'pos' }}">{{ '%.2f'|format(dd.dd_pct) }}%</div>
+        <div class="delta muted">Level: <span class="{{ 'warn' if dd.level not in ['SAFE','—'] }}">{{ dd.level }}</span> · peak ${{ '{:,.0f}'.format(dd.peak) }}</div></div>
+      {% if dd.action %}<div class="alert a-WATCH" style="margin-top:12px">{{ dd.action }}</div>{% endif %}
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h2 style="margin-top:0">Position Zones (Rule #3)</h2>
+      {% for r in pf.rows %}
+      <div class="gate-item" style="justify-content:space-between">
+        <span><b class="tk">{{ r.ticker }}</b> <span class="muted small">{{ '%.2f'|format(r.pct) }}% NAV</span></span>
+        <span class="badge b-{{ r.zone|lower }}">{{ r.zone }}</span>
+      </div>
+      {% endfor %}
+      {% if not pf.rows %}<p class="muted small">ยังไม่มี holdings</p>{% endif %}
+    </div>
+  </div>
+</div>
+<script>
+function tally(){
+  const boxes=document.querySelectorAll('.gate-item input[type=checkbox]');
+  let n=0;boxes.forEach(b=>{if(b.checked)n++});
+  const el=document.getElementById('gate-result');
+  el.textContent=n+' / '+boxes.length;
+  el.className = n===boxes.length ? 'pos' : 'warn';
+}
+</script>
+{% endblock %}

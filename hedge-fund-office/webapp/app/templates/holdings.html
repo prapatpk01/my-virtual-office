@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% set active='holdings' %}
+{% block title %} — Holdings{% endblock %}
+{% block content %}
+<h1>Holdings & Trades</h1>
+<p class="sub">เพิ่ม/แก้ position และบันทึกการซื้อขาย</p>
+
+<div class="grid g2">
+  <div class="card">
+    <h2 style="margin-top:0">เพิ่ม / แก้ Holding</h2>
+    <form class="stack" method="post" action="/holdings/save">
+      <div class="row">
+        <div><label>Ticker</label><input name="ticker" required placeholder="GPIQ"></div>
+        <div><label>Shares</label><input name="shares" type="number" step="any" required></div>
+      </div>
+      <div class="row">
+        <div><label>Cost / Share ($)</label><input name="cost_basis" type="number" step="any" required></div>
+        <div><label>Sleeve</label><select name="sleeve">
+          {% for s in sleeves %}<option>{{ s }}</option>{% endfor %}</select></div>
+      </div>
+      <div><label>Note</label><input name="note" placeholder="optional"></div>
+      <button type="submit">บันทึก Holding</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">บันทึกการซื้อขาย</h2>
+    <form class="stack" method="post" action="/trades/add">
+      <div class="row">
+        <div><label>Ticker</label><input name="ticker" required placeholder="GPIQ"></div>
+        <div><label>Action</label><select name="action">
+          <option>BUY</option><option>SELL</option><option>TRIM</option></select></div>
+      </div>
+      <div class="row">
+        <div><label>Shares</label><input name="shares" type="number" step="any" required></div>
+        <div><label>Price ($)</label><input name="price" type="number" step="any" required></div>
+      </div>
+      <div><label>Notes</label><input name="notes" placeholder="เช่น trim GPIQ ก่อน FOMC"></div>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:2px">
+        <input type="checkbox" name="apply_to_holding" value="1" style="width:auto"> ปรับ holding อัตโนมัติ (BUY เพิ่ม/SELL ลด shares)</label>
+      <button type="submit">บันทึก Trade</button>
+    </form>
+  </div>
+</div>
+
+<h2>Current Holdings</h2>
+<div class="card" style="padding:6px 8px">
+<table>
+<thead><tr><th>Ticker</th><th>Sleeve</th><th>Shares</th><th>Cost/Sh</th><th>Book</th><th>Note</th><th></th></tr></thead>
+<tbody>
+{% for h in holdings %}
+<tr>
+  <td class="tk">{{ h.ticker }}</td><td class="muted small">{{ h.sleeve }}</td>
+  <td>{{ '%.4f'|format(h.shares) }}</td><td>${{ '%.4f'|format(h.cost_basis) }}</td>
+  <td>${{ '{:,.2f}'.format(h.shares*h.cost_basis) }}</td>
+  <td class="muted small">{{ h.note }}</td>
+  <td><form method="post" action="/holdings/delete" onsubmit="return confirm('ลบ {{ h.ticker }}?')">
+    <input type="hidden" name="ticker" value="{{ h.ticker }}">
+    <button class="btn-danger btn-sm" type="submit">ลบ</button></form></td>
+</tr>
+{% endfor %}
+{% if not holdings %}<tr><td colspan="7" class="muted" style="text-align:center;padding:20px">ยังไม่มี holdings</td></tr>{% endif %}
+</tbody></table>
+</div>
+
+<h2>Recent Trades</h2>
+<div class="card" style="padding:6px 8px">
+<table>
+<thead><tr><th>Date</th><th>Ticker</th><th>Action</th><th>Shares</th><th>Price</th><th>By</th><th>Notes</th></tr></thead>
+<tbody>
+{% for t in trades %}
+<tr>
+  <td class="muted small">{{ t.created_at.strftime('%m-%d %H:%M') }}</td>
+  <td class="tk">{{ t.ticker }}</td>
+  <td><span class="badge {{ 'b-base' if t.action=='BUY' else 'b-trim' }}">{{ t.action }}</span></td>
+  <td>{{ '%.4f'|format(t.shares) }}</td><td>${{ '%.2f'|format(t.price) }}</td>
+  <td class="muted small">{{ t.created_by }}</td><td class="muted small">{{ t.notes }}</td>
+</tr>
+{% endfor %}
+{% if not trades %}<tr><td colspan="7" class="muted" style="text-align:center;padding:20px">ยังไม่มี trade</td></tr>{% endif %}
+</tbody></table>
+</div>
+{% endblock %}

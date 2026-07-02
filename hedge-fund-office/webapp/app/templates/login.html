@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ fund }} — Login</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="login-wrap"><div class="card login-card">
+  <div class="brand">SENTINEL<small style="text-align:center">Global Fund</small></div>
+  <p class="sub" style="text-align:center">เข้าสู่ระบบทีมกองทุน</p>
+  {% if err %}<div class="err">{{ err }}</div>{% endif %}
+  <form class="stack" method="post" action="/login">
+    <div><label>ชื่อ (สำหรับ log)</label><input name="name" placeholder="เช่น Victoria, Kai" autofocus></div>
+    <div><label>รหัสผ่านทีม</label><input name="password" type="password" required></div>
+    <button type="submit">เข้าสู่ระบบ</button>
+  </form>
+</div></div>
+</body>
+</html>
