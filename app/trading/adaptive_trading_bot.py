@@ -1324,6 +1324,20 @@ class TradingBot:
         #   scale size (the low-confidence skip gate above still applies).
         # - margin_usdt == 0 (backtest / opt-in): classic risk-% of balance.
         if self.margin_usdt and self.margin_usdt > 0:
+            # [MARGIN CHECK] Required margin = margin_usdt regardless of
+            # leverage (that's the point of specifying margin directly). If
+            # balance has shrunk below it (losses, or another open position
+            # already using margin), the exchange will reject with
+            # insufficient-margin — abort here with a clear reason instead of
+            # an opaque OKX error.
+            if self.margin_usdt > self.account_balance:
+                self._log_event(
+                    f"[SIZING] margin ${self.margin_usdt:.0f} > balance "
+                    f"${self.account_balance:.2f} — skip order (would be rejected "
+                    f"for insufficient margin)",
+                    level="warning",
+                )
+                return
             notional      = self.margin_usdt * max(self.sizing_leverage, 1)
             position_size = notional / max(entry_price, 1e-9)
             _risk_now     = notional * (sl_dist / max(entry_price, 1e-9))
