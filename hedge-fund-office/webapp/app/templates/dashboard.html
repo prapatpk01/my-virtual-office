@@ -25,18 +25,38 @@
 {% for a in pf.alerts %}<div class="alert a-{{ a.level }}">{{ a.msg }}</div>{% endfor %}
 {% endif %}
 
+<h2>NAV Growth</h2>
+<div class="card">
+{% if nav_history|length >= 2 %}
+  <div class="viz" id="navviz"></div>
+  <div class="legend"><span><span class="sw" style="background:var(--s1)"></span>NAV รายวัน (จุดข้อมูล {{ nav_history|length }} วัน)</span></div>
+{% else %}
+  <p class="muted small" style="padding:14px 4px">📈 กำลังสะสมข้อมูล — บันทึก NAV อัตโนมัติทุกวันที่เปิด dashboard
+    (ตอนนี้มี {{ nav_history|length }} วัน · chart แสดงเมื่อมี ≥ 2 วัน)</p>
+{% endif %}
+</div>
+
 <h2>Sleeve Allocation</h2>
-<div class="grid g3">
-{% for name, s in pf.sleeve.items() %}
-  <div class="card stat"><div class="label">{{ name }}</div>
-    <div class="value">{{ '%.1f'|format(s.pct) }}%</div>
-    <div class="delta muted">target {{ '%.0f'|format(s.target) }}% · drift
-      <span class="{{ 'warn' if s.drift|abs > 5 else 'muted' }}">{{ '%+.1f'|format(s.drift) }}%</span></div></div>
-{% endfor %}
+<div class="card">
+  {% set g = pf.sleeve.get('Growth', {'pct':0,'target':55,'drift':0}) %}
+  {% set i = pf.sleeve.get('Income', {'pct':0,'target':30,'drift':0}) %}
+  {% set c = pf.sleeve.get('Cash',   {'pct':0,'target':13,'drift':0}) %}
+  {% if pf.nav > 0 %}
+  <div class="sleeve-bar">
+    {% if g.pct > 0 %}<div class="seg s-growth" style="flex:{{ g.pct }}">Growth {{ '%.1f'|format(g.pct) }}%</div>{% endif %}
+    {% if i.pct > 0 %}<div class="seg s-income" style="flex:{{ i.pct }}">Income {{ '%.1f'|format(i.pct) }}%</div>{% endif %}
+    {% if c.pct > 0 %}<div class="seg s-cash" style="flex:{{ c.pct }}">Cash {{ '%.1f'|format(c.pct) }}%</div>{% endif %}
+  </div>
+  {% endif %}
+  <div class="legend">
+    <span><span class="sw" style="background:var(--s1)"></span>Growth {{ '%.1f'|format(g.pct) }}% · target {{ '%.0f'|format(g.target) }}% · drift <span class="{{ 'warn' if g.drift|abs > 5 }}">{{ '%+.1f'|format(g.drift) }}%</span></span>
+    <span><span class="sw" style="background:var(--s2)"></span>Income {{ '%.1f'|format(i.pct) }}% · target {{ '%.0f'|format(i.target) }}% · drift <span class="{{ 'warn' if i.drift|abs > 5 }}">{{ '%+.1f'|format(i.drift) }}%</span></span>
+    <span><span class="sw" style="background:var(--s3)"></span>Cash {{ '%.1f'|format(c.pct) }}% · target {{ '%.0f'|format(c.target) }}% · drift <span class="{{ 'warn' if c.drift|abs > 5 }}">{{ '%+.1f'|format(c.drift) }}%</span></span>
+  </div>
 </div>
 
 <h2>Holdings</h2>
-<div class="card" style="padding:6px 8px">
+<div class="card table-scroll" style="padding:6px 8px">
 <table>
 <thead><tr><th>Ticker</th><th>Sleeve</th><th>Price</th><th>Day%</th><th>Shares</th>
   <th>Value</th><th>% NAV</th><th>P&L</th><th>RSI</th><th>MACD</th><th>Zone</th></tr></thead>
@@ -61,4 +81,66 @@
 </tbody>
 </table>
 </div>
+
+{% if nav_history|length >= 2 %}
+<script>
+(function(){
+  const data = {{ nav_history|tojson }};
+  const box = document.getElementById('navviz');
+  const W = 920, H = 260, P = {t:14, r:16, b:26, l:58};
+  const xs = data.map((d,i)=>i);
+  const vals = data.map(d=>d.nav);
+  const vmin = Math.min(...vals), vmax = Math.max(...vals);
+  const pad = (vmax - vmin) * 0.08 || vmax * 0.01 || 1;
+  const y0 = vmin - pad, y1 = vmax + pad;
+  const X = i => P.l + (W - P.l - P.r) * (data.length === 1 ? 0.5 : i / (data.length - 1));
+  const Y = v => P.t + (H - P.t - P.b) * (1 - (v - y0) / (y1 - y0));
+  const fmt$ = v => '$' + v.toLocaleString('en-US', {maximumFractionDigits: 0});
+
+  let gl = '', yl = '';
+  for (let k = 0; k <= 4; k++) {
+    const v = y0 + (y1 - y0) * k / 4, y = Y(v);
+    gl += `<line class="grid-line" x1="${P.l}" y1="${y}" x2="${W-P.r}" y2="${y}"/>`;
+    yl += `<text class="axis-label" x="${P.l-8}" y="${y+3}" text-anchor="end">${fmt$(v)}</text>`;
+  }
+  const step = Math.max(1, Math.ceil(data.length / 6));
+  let xl = '';
+  for (let i = 0; i < data.length; i += step)
+    xl += `<text class="axis-label" x="${X(i)}" y="${H-8}" text-anchor="middle">${data[i].day.slice(5)}</text>`;
+
+  const pts = data.map((d,i)=>`${X(i)},${Y(d.nav)}`).join(' ');
+  const area = `${P.l},${Y(y0)} ${pts} ${W-P.r},${Y(y0)}`;
+
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="NAV growth line chart">
+    ${gl}${yl}${xl}
+    <polygon points="${area}" fill="var(--s1)" opacity="0.10"/>
+    <polyline points="${pts}" fill="none" stroke="var(--s1)" stroke-width="2"
+      stroke-linejoin="round" stroke-linecap="round"/>
+    <line id="xh" y1="${P.t}" y2="${H-P.b}" stroke="rgba(255,255,255,.25)" stroke-width="1" opacity="0"/>
+    <circle id="dot" r="4" fill="var(--s1)" stroke="#0b1828" stroke-width="2" opacity="0"/>
+  </svg><div class="viz-tip" id="tip"></div>`;
+
+  const svg = box.querySelector('svg'), tip = box.querySelector('#tip'),
+        xh = box.querySelector('#xh'), dot = box.querySelector('#dot');
+  svg.addEventListener('mousemove', e => {
+    const r = svg.getBoundingClientRect();
+    const mx = (e.clientX - r.left) * W / r.width;
+    let bi = 0, bd = 1e9;
+    for (let i = 0; i < data.length; i++) { const d = Math.abs(X(i)-mx); if (d < bd) { bd = d; bi = i; } }
+    const px = X(bi), py = Y(data[bi].nav);
+    xh.setAttribute('x1', px); xh.setAttribute('x2', px); xh.style.opacity = 1;
+    dot.setAttribute('cx', px); dot.setAttribute('cy', py); dot.style.opacity = 1;
+    const pl = data[bi].book ? data[bi].nav - data[bi].book : null;
+    tip.innerHTML = `<b>${fmt$(data[bi].nav)}</b> <span class="muted">· ${data[bi].day}</span>` +
+      (pl !== null ? `<br><span class="${pl>=0?'pos':'neg'}">P&L ${pl>=0?'+':''}${pl.toLocaleString('en-US',{maximumFractionDigits:0})}</span>` : '');
+    tip.style.opacity = 1;
+    const tw = tip.offsetWidth, bw = box.offsetWidth;
+    let lx = px * r.width / W + 12; if (lx + tw > bw - 6) lx = px * r.width / W - tw - 12;
+    tip.style.left = lx + 'px';
+    tip.style.top = (py * r.height / H - 14) + 'px';
+  });
+  svg.addEventListener('mouseleave', () => { tip.style.opacity = 0; xh.style.opacity = 0; dot.style.opacity = 0; });
+})();
+</script>
+{% endif %}
 {% endblock %}

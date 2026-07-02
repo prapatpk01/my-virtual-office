@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% set active='income' %}
+{% block title %} — Income{% endblock %}
+{% block content %}
+<h1>Dividend Income</h1>
+<p class="sub">ประมาณการจาก dividend rate (yfinance) × จำนวนหุ้น · Income Mandate: blended yield ≥ 5% ของ NAV</p>
+
+<div class="grid g4">
+  <div class="card stat"><div class="label">Est. รายปี</div>
+    <div class="value">${{ '{:,.2f}'.format(inc.annual_total) }}</div>
+    <div class="delta muted">จาก {{ inc.rows|length - inc.missing|length }}/{{ inc.rows|length }} positions</div></div>
+  <div class="card stat"><div class="label">Est. รายเดือน</div>
+    <div class="value">${{ '{:,.2f}'.format(inc.monthly_total) }}</div>
+    <div class="delta muted">เฉลี่ยต่อเดือน</div></div>
+  <div class="card stat"><div class="label">Blended Yield</div>
+    <div class="value {{ 'pos' if inc.blended_yield >= inc.yield_target else 'warn' }}">{{ '%.2f'|format(inc.blended_yield) }}%</div>
+    <div class="delta muted">เป้า ≥ {{ '%.0f'|format(inc.yield_target) }}% ของ NAV ${{ '{:,.0f}'.format(nav) }}</div>
+    <div class="meter {{ 'under' if inc.blended_yield < inc.yield_target }}">
+      <i style="width:{{ [inc.blended_yield / inc.yield_target * 100, 100]|min }}%"></i></div></div>
+  <div class="card stat"><div class="label">รับจริงปีนี้</div>
+    {% set this_year = received.yearly.items()|list %}
+    <div class="value">${{ '{:,.2f}'.format(this_year[0][1]) if this_year else '0.00' }}</div>
+    <div class="delta muted">{{ this_year[0][0] if this_year else '—' }} · จาก dividend log</div></div>
+</div>
+
+{% if inc.missing %}
+<p class="sub" style="margin-top:14px">⚠️ ไม่มีข้อมูล dividend rate: {{ inc.missing|join(', ') }} — ไม่รวมในประมาณการ (Rule #5: ไม่เดา)</p>
+{% endif %}
+
+<h2>ประมาณการต่อ Position</h2>
+<div class="card table-scroll" style="padding:6px 8px">
+<table>
+<thead><tr><th>Ticker</th><th>Sleeve</th><th>Rate $/หุ้น/ปี</th><th>Yield</th>
+  <th>XD ถัดไป</th><th>Est./เดือน</th><th>Est./ปี</th></tr></thead>
+<tbody>
+{% for r in inc.rows %}
+<tr>
+  <td class="tk">{{ r.ticker }}</td>
+  <td class="muted small">{{ r.sleeve }}</td>
+  <td>{{ '$%.4f'|format(r.rate) if r.rate else '—' }}</td>
+  <td>{{ '%.2f%%'|format(r.yield_pct) if r.yield_pct else '—' }}</td>
+  <td class="muted small">{{ r.ex_date or '—' }}</td>
+  <td>{{ '${:,.2f}'.format(r.monthly) if r.monthly else '—' }}</td>
+  <td class="pos">{{ '${:,.2f}'.format(r.annual) if r.annual else '—' }}</td>
+</tr>
+{% endfor %}
+{% if not inc.rows %}<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">
+  ยังไม่มี holdings — เพิ่มที่หน้า <a href="/holdings">Holdings</a></td></tr>{% endif %}
+</tbody>
+</table>
+</div>
+
+<div class="grid g2" style="margin-top:26px">
+<div>
+<h2 style="margin-top:0">บันทึกปันผลที่ได้รับ</h2>
+<div class="card">
+<form class="stack" method="post" action="/income/log">
+  <div class="row">
+    <div><label>Ticker</label><input name="ticker" required placeholder="GPIQ"></div>
+    <div><label>จำนวน (USD)</label><input name="amount" type="number" step="0.01" min="0.01" required placeholder="12.50"></div>
+    <div><label>วันที่รับ</label><input name="pay_date" type="date" required></div>
+  </div>
+  <div><label>Note</label><input name="note" placeholder="ปันผลรายเดือน"></div>
+  <button>บันทึกปันผล</button>
+</form>
+</div>
+
+<h2>สรุปที่รับจริง</h2>
+<div class="grid g2">
+  <div class="card"><div class="stat"><div class="label">รายเดือน</div></div>
+    {% for m, v in received.monthly.items() %}
+    <div class="cal-row"><span class="cal-date">{{ m }}</span><span style="margin-left:auto" class="pos">${{ '{:,.2f}'.format(v) }}</span></div>
+    {% else %}<p class="muted small" style="padding:8px 0">ยังไม่มีบันทึก</p>{% endfor %}
+  </div>
+  <div class="card"><div class="stat"><div class="label">รายปี</div></div>
+    {% for y, v in received.yearly.items() %}
+    <div class="cal-row"><span class="cal-date">{{ y }}</span><span style="margin-left:auto" class="pos">${{ '{:,.2f}'.format(v) }}</span></div>
+    {% else %}<p class="muted small" style="padding:8px 0">ยังไม่มีบันทึก</p>{% endfor %}
+  </div>
+</div>
+</div>
+
+<div>
+<h2 style="margin-top:0">รายการล่าสุด</h2>
+<div class="card table-scroll" style="padding:6px 8px">
+<table>
+<thead><tr><th>วันที่</th><th>Ticker</th><th>จำนวน</th><th>Note</th><th></th></tr></thead>
+<tbody>
+{% for d in logs %}
+<tr>
+  <td class="small">{{ d.pay_date }}</td>
+  <td class="tk">{{ d.ticker }}</td>
+  <td class="pos">${{ '{:,.2f}'.format(d.amount) }}</td>
+  <td class="muted small" style="text-align:left">{{ d.note }}</td>
+  <td><form method="post" action="/income/log/delete" style="display:inline">
+    <input type="hidden" name="id" value="{{ d.id }}">
+    <button class="btn-danger btn-sm" onclick="return confirm('ลบรายการนี้?')">ลบ</button></form></td>
+</tr>
+{% else %}<tr><td colspan="5" class="muted" style="text-align:center;padding:24px">ยังไม่มีบันทึกปันผล</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+</div>
+</div>
+{% endblock %}

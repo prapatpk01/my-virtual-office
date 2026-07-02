@@ -77,9 +77,16 @@ def dashboard(request: Request, sess=Depends(get_db)):
         peak = pf["nav"]
     dd = governance.drawdown_status(pf["nav"], peak)
 
+    # บันทึก NAV เฉพาะวันที่ราคาสดครบทุกตัว — กันค่า fallback (ราคาทุน) ปนใน chart
+    if pf["rows"] and all(r["price"] is not None for r in pf["rows"]):
+        db.record_nav_snapshot(sess, pf["nav"], pf["book"])
+    snaps = sess.query(db.NavSnapshot).order_by(db.NavSnapshot.day).all()
+    nav_history = [{"day": s.day, "nav": s.nav, "book": s.book} for s in snaps]
+
     return templates.TemplateResponse(request, "dashboard.html", {
         "fund": FUND_NAME, "user": auth.current_user(request),
         "pf": pf, "dd": dd, "spy": prices.get("SPY", {}), "asof": market.now_iso(),
+        "nav_history": nav_history,
     })
 
 
@@ -206,6 +213,76 @@ def team_watch_delete(request: Request, id: int = Form(...), sess=Depends(get_db
         sess.delete(w)
         sess.commit()
     return RedirectResponse("/team", status_code=302)
+
+
+# ── Income / Dividends ────────────────────────────────────────────────────
+@app.get("/income", response_class=HTMLResponse)
+def income_page(request: Request, sess=Depends(get_db)):
+    if (r := auth.require_login(request)):
+        return r
+    holdings = sess.query(db.Holding).all()
+    prices = market.fetch_many([h.ticker for h in holdings]) if holdings else {}
+    pf = governance.build_portfolio(holdings, prices)
+    infos = market.fetch_info_many([h.ticker for h in holdings]) if holdings else {}
+    inc = governance.income_summary(holdings, infos, pf["nav"])
+    logs = sess.query(db.DividendLog).order_by(db.DividendLog.pay_date.desc()).limit(60).all()
+    received = governance.dividends_by_month(logs)
+    return templates.TemplateResponse(request, "income.html", {
+        "fund": FUND_NAME, "user": auth.current_user(request),
+        "inc": inc, "logs": logs, "received": received, "nav": pf["nav"],
+    })
+
+
+@app.post("/income/log")
+def income_log(request: Request, ticker: str = Form(...), amount: float = Form(...),
+               pay_date: str = Form(...), note: str = Form(""), sess=Depends(get_db)):
+    if (r := auth.require_login(request)):
+        return r
+    sess.add(db.DividendLog(ticker=ticker.strip().upper(), amount=amount, pay_date=pay_date,
+                            note=note, created_by=auth.current_user(request)))
+    sess.commit()
+    return RedirectResponse("/income", status_code=302)
+
+
+@app.post("/income/log/delete")
+def income_log_delete(request: Request, id: int = Form(...), sess=Depends(get_db)):
+    if (r := auth.require_login(request)):
+        return r
+    row = sess.query(db.DividendLog).get(id)
+    if row:
+        sess.delete(row)
+        sess.commit()
+    return RedirectResponse("/income", status_code=302)
+
+
+# ── News ──────────────────────────────────────────────────────────────────
+@app.get("/news", response_class=HTMLResponse)
+def news_page(request: Request, sess=Depends(get_db)):
+    if (r := auth.require_login(request)):
+        return r
+    holdings = sess.query(db.Holding).all()
+    watch = sess.query(db.Watch).all()
+    symbols = [h.ticker for h in holdings] + [w.ticker for w in watch]
+    news = market.fetch_news(symbols) if symbols else []
+    return templates.TemplateResponse(request, "news.html", {
+        "fund": FUND_NAME, "user": auth.current_user(request),
+        "news": news, "n_symbols": len(set(symbols)), "asof": market.now_iso(),
+    })
+
+
+# ── Calendar ──────────────────────────────────────────────────────────────
+@app.get("/calendar", response_class=HTMLResponse)
+def calendar_page(request: Request, sess=Depends(get_db)):
+    if (r := auth.require_login(request)):
+        return r
+    holdings = sess.query(db.Holding).all()
+    watch = sess.query(db.Watch).all()
+    symbols = [h.ticker for h in holdings] + [w.ticker for w in watch]
+    events = market.build_calendar(symbols)
+    return templates.TemplateResponse(request, "calendar.html", {
+        "fund": FUND_NAME, "user": auth.current_user(request),
+        "events": events, "asof": market.now_iso(),
+    })
 
 
 # ── JSON API ──────────────────────────────────────────────────────────────

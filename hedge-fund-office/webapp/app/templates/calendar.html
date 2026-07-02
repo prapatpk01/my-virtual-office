@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% set active='calendar' %}
+{% block title %} — Calendar{% endblock %}
+{% block content %}
+<h1>Event Calendar</h1>
+<p class="sub">FOMC / CPI / NFP จากตารางประกาศทางการ (Fed + BLS) · Earnings + XD สดจาก yfinance · อัปเดต {{ asof }}</p>
+
+<div class="legend" style="margin-bottom:14px">
+  <span class="chip chip-FOMC">FOMC</span>
+  <span class="chip chip-CPI">CPI</span>
+  <span class="chip chip-NFP">NFP</span>
+  <span class="chip chip-EARNINGS">EARNINGS</span>
+  <span class="chip chip-XD">XD ปันผล</span>
+</div>
+
+<div class="card" style="padding:8px 16px">
+{% for e in events %}
+<div class="cal-row">
+  <span class="cal-date">{{ e.date }}</span>
+  <span class="chip chip-{{ e.kind }}">{{ e.kind }}</span>
+  <span>{{ e.event }}</span>
+  <span class="cal-src">{{ e.source }}</span>
+</div>
+{% else %}
+<p class="muted" style="text-align:center;padding:30px">ไม่มี event ข้างหน้า — เพิ่ม holdings/watchlist เพื่อดู earnings + XD</p>
+{% endfor %}
+</div>
+
+<p class="sub" style="margin-top:14px">⚠️ FOMC blackout rule: ไม่เพิ่ม position ใหม่ 2 วันก่อนประชุม (Governance Rule #2 — stagger 1/3 ก่อน Tier-1 event)</p>
+{% endblock %}

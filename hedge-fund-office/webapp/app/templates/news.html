@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% set active='news' %}
+{% block title %} — News{% endblock %}
+{% block content %}
+<h1>Market News</h1>
+<p class="sub">ข่าวจาก holdings + watchlist ({{ n_symbols }} symbols) · yfinance · อัปเดต {{ asof }} · cache 15 นาที</p>
+
+<div class="card" style="padding:8px 16px">
+{% for a in news %}
+<div class="news-item">
+  <span class="news-sym">{{ a.symbol }}</span>
+  <div class="nt">
+    {% if a.link %}<a href="{{ a.link }}" target="_blank" rel="noopener">{{ a.title }}</a>
+    {% else %}<span style="font-weight:600">{{ a.title }}</span>{% endif %}
+    <div class="meta">{{ a.publisher }} · {{ a.published or '—' }}</div>
+  </div>
+</div>
+{% else %}
+<p class="muted" style="text-align:center;padding:30px">
+  ยังไม่มีข่าว — เพิ่ม holdings หรือ watchlist ก่อน แล้วข่าวจะดึงอัตโนมัติ<br>
+  <span class="small">(ถ้ามี holdings แล้วแต่ไม่ขึ้น = yfinance ดึงข่าวไม่ได้ชั่วคราว ลอง refresh)</span></p>
+{% endfor %}
+</div>
+{% endblock %}

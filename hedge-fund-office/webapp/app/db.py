@@ -94,6 +94,28 @@ class FundMeta(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class NavSnapshot(Base):
+    """NAV รายวัน — สำหรับ growth chart (1 แถว/วัน อัปเดตทับถ้าโหลดซ้ำ)"""
+    __tablename__ = "nav_snapshots"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    day: Mapped[str] = mapped_column(String(10), unique=True, index=True)  # YYYY-MM-DD (UTC)
+    nav: Mapped[float] = mapped_column(Float)
+    book: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class DividendLog(Base):
+    """ปันผลที่ได้รับจริง — user บันทึกเอง ใช้รวมยอดรายเดือน/รายปี"""
+    __tablename__ = "dividend_log"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    amount: Mapped[float] = mapped_column(Float)          # USD ที่ได้รับ
+    pay_date: Mapped[str] = mapped_column(String(10))     # YYYY-MM-DD
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(48), default="team")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)
 
@@ -109,4 +131,17 @@ def set_meta(db, key: str, value: str) -> None:
         row.value = value
     else:
         db.add(FundMeta(key=key, value=value))
+    db.commit()
+
+
+def record_nav_snapshot(db, nav: float, book: float) -> None:
+    """บันทึก NAV วันนี้ (ทับค่าเดิมถ้ามีแล้ว) — เรียกจาก dashboard load"""
+    if nav <= 0:
+        return
+    day = _now().strftime("%Y-%m-%d")
+    row = db.query(NavSnapshot).filter_by(day=day).first()
+    if row:
+        row.nav, row.book = nav, book
+    else:
+        db.add(NavSnapshot(day=day, nav=nav, book=book))
     db.commit()

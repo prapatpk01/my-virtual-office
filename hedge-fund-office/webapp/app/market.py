@@ -88,5 +88,135 @@ def fetch_many(symbols: list[str]) -> dict[str, dict]:
     return {s.upper(): fetch(s) for s in dict.fromkeys(s.upper() for s in symbols)}
 
 
+# ── Dividend / company info (cache 1 ชม.) ──────────────────────────────────
+_INFO_CACHE: dict[str, tuple[float, dict]] = {}
+_INFO_TTL = 3600
+
+
+def _epoch_to_date(v) -> str | None:
+    try:
+        return datetime.fromtimestamp(int(v), tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def fetch_info(symbol: str) -> dict:
+    """dividendRate ($/หุ้น/ปี), yield, ex-div, earnings date — Rule #5: หาไม่ได้ = None"""
+    symbol = symbol.upper()
+    now = time.time()
+    if symbol in _INFO_CACHE and now - _INFO_CACHE[symbol][0] < _INFO_TTL:
+        return _INFO_CACHE[symbol][1]
+
+    rec = {"symbol": symbol, "dividend_rate": None, "dividend_yield": None,
+           "ex_dividend_date": None, "earnings_date": None, "name": None,
+           "source": "yfinance", "status": "OK"}
+    try:
+        import yfinance as yf
+        t = yf.Ticker(symbol)
+        info = t.info or {}
+        rec["name"] = info.get("shortName") or info.get("longName")
+        rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
+        rec["dividend_rate"] = round(float(rate), 4) if rate else None
+        y = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
+        if y:
+            y = float(y)
+            rec["dividend_yield"] = round(y if y > 1 else y * 100, 2)  # normalize เป็น %
+        rec["ex_dividend_date"] = _epoch_to_date(info.get("exDividendDate"))
+        try:
+            ed = t.calendar.get("Earnings Date") if isinstance(t.calendar, dict) else None
+            if ed:
+                rec["earnings_date"] = str(ed[0] if isinstance(ed, (list, tuple)) else ed)[:10]
+        except Exception:
+            pass
+    except Exception as e:
+        rec["status"] = f"ERROR: {type(e).__name__}"
+    _INFO_CACHE[symbol] = (now, rec)
+    return rec
+
+
+def fetch_info_many(symbols: list[str]) -> dict[str, dict]:
+    return {s.upper(): fetch_info(s) for s in dict.fromkeys(s.upper() for s in symbols)}
+
+
+# ── News (cache 15 นาที) ────────────────────────────────────────────────────
+_NEWS_CACHE: dict[str, tuple[float, list]] = {}
+_NEWS_TTL = 900
+
+
+def fetch_news(symbols: list[str], per_symbol: int = 5) -> list[dict]:
+    """ข่าวจาก yfinance ต่อ ticker — รวม, dedupe, เรียงใหม่สุดก่อน"""
+    items, seen = [], set()
+    for symbol in dict.fromkeys(s.upper() for s in symbols):
+        now = time.time()
+        if symbol in _NEWS_CACHE and now - _NEWS_CACHE[symbol][0] < _NEWS_TTL:
+            arts = _NEWS_CACHE[symbol][1]
+        else:
+            arts = []
+            try:
+                import yfinance as yf
+                for a in (yf.Ticker(symbol).news or [])[:per_symbol]:
+                    c = a.get("content", a)  # yfinance >=0.2.5x ห่อใน content
+                    title = c.get("title")
+                    if not title:
+                        continue
+                    link = (c.get("canonicalUrl") or {}).get("url") or c.get("link") or a.get("link")
+                    pub = (c.get("provider") or {}).get("displayName") or a.get("publisher")
+                    ts = c.get("pubDate") or ""
+                    if not ts and a.get("providerPublishTime"):
+                        ts = _epoch_to_date(a["providerPublishTime"]) or ""
+                    arts.append({"symbol": symbol, "title": title, "link": link,
+                                 "publisher": pub or "—", "published": str(ts)[:16].replace("T", " ")})
+            except Exception:
+                pass
+            _NEWS_CACHE[symbol] = (now, arts)
+        for a in arts:
+            if a["title"] not in seen:
+                seen.add(a["title"])
+                items.append(a)
+    items.sort(key=lambda x: x["published"], reverse=True)
+    return items
+
+
+# ── ปฏิทินเศรษฐกิจ H2-2026 (ตารางประกาศทางการ — static, ระบุแหล่ง) ─────────
+ECON_CALENDAR_2026H2 = [
+    {"date": "2026-07-03", "event": "Nonfarm Payrolls (มิ.ย.)", "kind": "NFP",  "source": "BLS schedule"},
+    {"date": "2026-07-14", "event": "CPI (มิ.ย.)",              "kind": "CPI",  "source": "BLS schedule"},
+    {"date": "2026-07-28", "event": "FOMC Meeting วันที่ 1",     "kind": "FOMC", "source": "Federal Reserve calendar"},
+    {"date": "2026-07-29", "event": "FOMC Statement + แถลงข่าว", "kind": "FOMC", "source": "Federal Reserve calendar"},
+    {"date": "2026-08-07", "event": "Nonfarm Payrolls (ก.ค.)",  "kind": "NFP",  "source": "BLS schedule"},
+    {"date": "2026-08-12", "event": "CPI (ก.ค.)",               "kind": "CPI",  "source": "BLS schedule"},
+    {"date": "2026-09-04", "event": "Nonfarm Payrolls (ส.ค.)",  "kind": "NFP",  "source": "BLS schedule"},
+    {"date": "2026-09-11", "event": "CPI (ส.ค.)",               "kind": "CPI",  "source": "BLS schedule"},
+    {"date": "2026-09-15", "event": "FOMC Meeting วันที่ 1",     "kind": "FOMC", "source": "Federal Reserve calendar"},
+    {"date": "2026-09-16", "event": "FOMC Statement + Dot Plot", "kind": "FOMC", "source": "Federal Reserve calendar"},
+    {"date": "2026-10-02", "event": "Nonfarm Payrolls (ก.ย.)",  "kind": "NFP",  "source": "BLS schedule"},
+    {"date": "2026-10-13", "event": "CPI (ก.ย.)",               "kind": "CPI",  "source": "BLS schedule"},
+    {"date": "2026-10-27", "event": "FOMC Meeting วันที่ 1",     "kind": "FOMC", "source": "Federal Reserve calendar"},
+    {"date": "2026-10-28", "event": "FOMC Statement + แถลงข่าว", "kind": "FOMC", "source": "Federal Reserve calendar"},
+    {"date": "2026-11-06", "event": "Nonfarm Payrolls (ต.ค.)",  "kind": "NFP",  "source": "BLS schedule"},
+    {"date": "2026-11-12", "event": "CPI (ต.ค.)",               "kind": "CPI",  "source": "BLS schedule"},
+    {"date": "2026-12-04", "event": "Nonfarm Payrolls (พ.ย.)",  "kind": "NFP",  "source": "BLS schedule"},
+    {"date": "2026-12-10", "event": "CPI (พ.ย.)",               "kind": "CPI",  "source": "BLS schedule"},
+    {"date": "2026-12-08", "event": "FOMC Meeting วันที่ 1",     "kind": "FOMC", "source": "Federal Reserve calendar"},
+    {"date": "2026-12-09", "event": "FOMC Statement + Dot Plot", "kind": "FOMC", "source": "Federal Reserve calendar"},
+]
+
+
+def build_calendar(symbols: list[str]) -> list[dict]:
+    """รวม: econ (static) + earnings + ex-dividend (สดจาก yfinance) เรียงตามวันที่"""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    events = [dict(e, symbol=None) for e in ECON_CALENDAR_2026H2 if e["date"] >= today]
+    for sym in dict.fromkeys(s.upper() for s in symbols):
+        info = fetch_info(sym)
+        if info.get("earnings_date") and info["earnings_date"] >= today:
+            events.append({"date": info["earnings_date"], "event": f"{sym} Earnings",
+                           "kind": "EARNINGS", "symbol": sym, "source": "yfinance"})
+        if info.get("ex_dividend_date") and info["ex_dividend_date"] >= today:
+            events.append({"date": info["ex_dividend_date"], "event": f"{sym} XD วันขึ้นเครื่องหมาย",
+                           "kind": "XD", "symbol": sym, "source": "yfinance"})
+    events.sort(key=lambda e: e["date"])
+    return events
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")

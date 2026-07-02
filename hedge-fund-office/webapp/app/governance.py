@@ -113,6 +113,50 @@ def drawdown_status(nav: float, peak: float) -> dict:
     return {"dd_pct": round(dd, 2), "level": level, "action": action, "peak": round(peak, 2)}
 
 
+def income_summary(holdings, infos: dict, nav: float) -> dict:
+    """
+    ประมาณการปันผล: rate ($/หุ้น/ปี จาก yfinance) × shares
+    rows ต่อ holding + รวม รายเดือน/รายปี + blended yield เทียบ NAV
+    ตัวที่ไม่มีข้อมูล = est ไม่ได้ (Rule #5 — ไม่เดา)
+    """
+    rows, annual_total, missing = [], 0.0, []
+    for h in holdings:
+        info = infos.get(h.ticker.upper(), {})
+        rate = info.get("dividend_rate")
+        annual = round(rate * h.shares, 2) if rate else None
+        if annual:
+            annual_total += annual
+        else:
+            missing.append(h.ticker)
+        rows.append({
+            "ticker": h.ticker, "shares": h.shares, "sleeve": h.sleeve,
+            "rate": rate, "yield_pct": info.get("dividend_yield"),
+            "ex_date": info.get("ex_dividend_date"),
+            "annual": annual, "monthly": round(annual / 12, 2) if annual else None,
+        })
+    rows.sort(key=lambda r: r["annual"] or 0, reverse=True)
+    return {
+        "rows": rows,
+        "annual_total": round(annual_total, 2),
+        "monthly_total": round(annual_total / 12, 2),
+        "blended_yield": round(annual_total / nav * 100, 2) if nav else 0.0,
+        "yield_target": 5.0,
+        "missing": missing,
+    }
+
+
+def dividends_by_month(logs) -> dict:
+    """รวมปันผลรับจริงจาก DividendLog → {'YYYY-MM': total} + รวมรายปี"""
+    monthly: dict[str, float] = {}
+    yearly: dict[str, float] = {}
+    for d in logs:
+        mk, yk = d.pay_date[:7], d.pay_date[:4]
+        monthly[mk] = round(monthly.get(mk, 0) + d.amount, 2)
+        yearly[yk] = round(yearly.get(yk, 0) + d.amount, 2)
+    return {"monthly": dict(sorted(monthly.items(), reverse=True)),
+            "yearly": dict(sorted(yearly.items(), reverse=True))}
+
+
 # 9-Gate pre-trade checklist (Section 8 ของ investment-system)
 GATES = [
     ("regime_ts", "Regime timestamp [V] ≤ 24 ชม."),
