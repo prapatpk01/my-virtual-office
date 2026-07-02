@@ -999,8 +999,14 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
             and p.get("market_regime_enabled", True) and "regime" in out):
         _st_ok = out["regime"] == "STRONG_TREND"
         _st_sc = float(p.get("strong_trend_score", 80.0))
-        at_pull_long  = at_pull_long  | (_st_ok & (score_long  >= _st_sc))
-        at_pull_short = at_pull_short | (_st_ok & (score_short >= _st_sc))
+        # Track when the waiver is the DECIDING factor (pullback itself failed) so
+        # the signal metadata can label the entry path for the lesson tracker.
+        _stw_l = _st_ok & (score_long  >= _st_sc) & ~at_pull_long.fillna(False).astype(bool)
+        _stw_s = _st_ok & (score_short >= _st_sc) & ~at_pull_short.fillna(False).astype(bool)
+        out["d_stw_l"] = _stw_l
+        out["d_stw_s"] = _stw_s
+        at_pull_long  = at_pull_long  | _stw_l
+        at_pull_short = at_pull_short | _stw_s
 
     out["final_buy"]  = (macro_up & mid_up  & at_pull_long  & long_bias_ok  &
                           (score_long  >= _ms) & long_gates  & trigger_long).fillna(False)
@@ -1708,6 +1714,12 @@ class TrendContImprovedStrategy(BaseStrategy):
                 "confidence_level": "strong" if sc >= 90 else "normal" if sc >= 70 else "small",
                 "mtf_bias":    float(last.get("comp_pct", 0)),
                 "regime_score_w": float(last.get("h4_regime_score_w", 0)),
+                # Lesson-tracker context: which entry path fired and market regime at entry
+                "entry_path":  ("strong_trend"
+                                if bool(last.get("d_stw_l" if side == "long" else "d_stw_s", False))
+                                else "pullback"),
+                "regime":      str(last.get("regime", "")),
+                "adx15":       float(last.get("adx15", 0) or 0),
             }
 
         if buy:

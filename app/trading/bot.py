@@ -21,6 +21,7 @@ from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
 from .signal_state import SignalState
 from .position_health import PositionHealthMonitor, HealthResult
+from .lesson_learned import LessonTracker, TERMINAL_REASONS
 from .patterns import pattern_gate_passes, pattern_best_tier, TP1_BY_TIER
 
 logger = logging.getLogger("trading_bot")
@@ -77,6 +78,7 @@ class TradeRecord:
     strategy: str
     reason: str
     paper: bool
+    detail: str = ""   # exit forensics (e.g. which guard fired) for the lesson tracker
 
 
 class TradingBot:
@@ -111,6 +113,11 @@ class TradingBot:
         self._running = False
         self._closing_positions: set[str] = set()  # keys being closed — prevents double-close
         self._maxpos_cooldown: dict[str, float] = {}  # slot → unix ts when 60m cooldown expires
+        # Lesson-learned tracker: per-trade entry/exit forensics, 5-trade round
+        # reviews, loss-pattern alerts to Telegram, optional adaptive caution.
+        self.lessons = LessonTracker(telegram=self.telegram)
+        self._lesson_bump: float = 0.0            # currently applied min_score bump
+        self._lesson_base: dict[int, float] = {}  # id(strategy) → base min_score
         self._balance = 0.0
         self._start_balance = 0.0
         self._pnl_total = 0.0
@@ -553,6 +560,7 @@ class TradingBot:
                 pnl=0.0, strategy=slot, reason=signal.reason,
                 paper=self.paper,
             ))
+            self.lessons.record_open(sym, slot, side, meta)
             logger.info("[%s] OPEN %s %s @ %.4f  SL=%.4f  TP=%.4f  amount=%.6f",
                         slot, side.upper(), sym, price, sl_p, tp_p, actual_amount)
             if self.telegram:
@@ -921,10 +929,14 @@ class TradingBot:
                                          reason="health_weak", strategy=strategy)
                 self._sig.unlock_strategy(sym, strategy)
                 self.risk.close_position(sym, strategy=strategy)
+                _detail = (result.details.get("reason", "")
+                           if result.label == "CRASH_GUARD"
+                           else f"health {result.label} score={result.score:.0f}")
                 self._record_trade(TradeRecord(
                     timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
                     price=fill_price, amount=amount, pnl=pnl,
                     strategy=strategy, reason="health_weak", paper=self.paper,
+                    detail=_detail,
                 ))
                 reason_str = result.details.get("reason", "") if result.label == "CRASH_GUARD" else ""
                 if self.telegram:
@@ -984,6 +996,36 @@ class TradingBot:
 
     def _record_trade(self, trade: TradeRecord):
         self._trade_history.append(trade)
+        # Route to the lesson tracker: TP1 partials accumulate into the pending
+        # trade; terminal reasons close it out (win/loss judged on TOTAL pnl).
+        try:
+            if trade.reason == "take_profit1":
+                self.lessons.record_partial(trade.symbol, trade.strategy, trade.pnl)
+            elif trade.reason in TERMINAL_REASONS:
+                self.lessons.record_close(trade.symbol, trade.strategy, trade.reason,
+                                          trade.pnl, trade.price, trade.detail)
+                self._sync_lesson_caution()
+        except Exception as e:
+            logger.warning("[LESSON] tracking failed: %s", e)
+
+    def _sync_lesson_caution(self):
+        """Apply/remove the adaptive min_score bump requested by the lesson tracker."""
+        bump = self.lessons.score_bump_active()
+        if bump == self._lesson_bump:
+            return
+        for s in self.strategies:
+            p = getattr(s, "_p", None)
+            if not isinstance(p, dict) or "min_score" not in p:
+                continue
+            base = self._lesson_base.setdefault(id(s), float(p["min_score"]))
+            p["min_score"] = base + bump
+        logger.info("[LESSON] caution min_score bump %.0f → %.0f", self._lesson_bump, bump)
+        if bump == 0.0 and self.telegram:
+            try:
+                self.telegram.notify("🛡 *Caution mode OFF* — min_score กลับค่าปกติ")
+            except Exception:
+                pass
+        self._lesson_bump = bump
 
     def _broadcast_state(self):
         try:
