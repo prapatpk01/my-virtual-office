@@ -427,9 +427,24 @@ class OKXAdapter(BaseConnector):
         self._ensure_swap_ready(sym)
 
         # Convert base-currency coin quantity → OKX contracts (bot computes size in coins)
-        ct_val    = self._get_ct_val(sym)
-        contracts = max(1, int(float(trade_info["size"]) / ct_val))
-        amount    = float(self._ex.amount_to_precision(sym, contracts))
+        ct_val         = self._get_ct_val(sym)
+        raw_contracts  = float(trade_info["size"]) / ct_val
+        contracts      = max(1, int(raw_contracts))
+        amount         = float(self._ex.amount_to_precision(sym, contracts))
+
+        # [RISK-FLOOR VISIBILITY] The exchange's 1-contract minimum can force a
+        # position larger than the risk-based calc intended (e.g. small balance
+        # + high-priced symbol → calculated size < 1 contract). When that
+        # happens, actual risk taken exceeds the configured ADAPTIVE_RISK_PCT —
+        # log it so this is visible instead of silently distorting risk.
+        if raw_contracts < 1.0 and raw_contracts > 0:
+            overshoot = (1.0 / raw_contracts - 1.0) * 100
+            logger.warning(
+                "[OKX] %s: risk-calc wanted %.3f contracts, floored to 1 "
+                "(actual risk ≈ +%.0f%% over target — balance may be too small "
+                "for this symbol's minimum lot at the configured risk %%)",
+                sym, raw_contracts, overshoot,
+            )
 
         params: Dict[str, Any] = {
             "tdMode":  self.td_mode,
@@ -474,9 +489,26 @@ class OKXAdapter(BaseConnector):
         self._ensure_swap_ready(sym)
 
         # Convert coin quantity → OKX contracts (same logic as _sync_open)
-        ct_val    = self._get_ct_val(sym)
-        contracts = max(1, int(float(trade_info["size"]) / ct_val))
-        amount    = float(self._ex.amount_to_precision(sym, contracts))
+        ct_val        = self._get_ct_val(sym)
+        raw_contracts = float(trade_info["size"]) / ct_val
+        contracts     = max(1, int(raw_contracts))
+        amount        = float(self._ex.amount_to_precision(sym, contracts))
+
+        # [RISK-FLOOR VISIBILITY] A PARTIAL close (e.g. TP1's 50%) on a
+        # minimum-lot position (1 contract) can't be split at the exchange's
+        # integer-contract resolution — flooring back up to 1 contract closes
+        # the ENTIRE remaining position instead of the intended fraction. The
+        # bot's local accounting (remaining_size, realized_pnl) still reflects
+        # the intended partial until the next periodic reconciliation (every
+        # 5 min) corrects it against the real (now-flat) exchange position.
+        if order_type == "CLOSE_PARTIAL" and raw_contracts < 1.0 and raw_contracts > 0:
+            logger.warning(
+                "[OKX] %s: PARTIAL close wanted %.3f contracts, floored to 1 "
+                "— this closes the FULL remaining position, not the intended "
+                "partial. Local PnL/remaining_size will be corrected by the "
+                "next reconciliation pass.",
+                sym, raw_contracts,
+            )
 
         params = {"tdMode": self.td_mode, "posSide": pos_side, "reduceOnly": True}
 
