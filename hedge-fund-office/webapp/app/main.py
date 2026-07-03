@@ -325,17 +325,134 @@ def scanner_run(request: Request, sess=Depends(get_db)):
 
 
 # ── JSON API ──────────────────────────────────────────────────────────────
+# รองรับ 2 แบบ: session (login แล้ว) หรือ ?key=API_KEY (AI team — GET เท่านั้น)
+def _api_ok(request: Request, key: str | None) -> bool:
+    return bool(auth.current_user(request)) or auth.check_api_key(key)
+
+
+def _deny():
+    return JSONResponse({"error": "unauthorized — ใส่ ?key=API_KEY (ตั้งค่า API_KEY ใน Railway Variables ก่อน)"},
+                        status_code=401)
+
+
 @app.get("/api/portfolio")
-def api_portfolio(request: Request, sess=Depends(get_db)):
-    if not auth.current_user(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+def api_portfolio(request: Request, key: str | None = None, sess=Depends(get_db)):
+    if not _api_ok(request, key):
+        return _deny()
     holdings = sess.query(db.Holding).all()
     prices = market.fetch_many([h.ticker for h in holdings]) if holdings else {}
-    return governance.build_portfolio(holdings, prices)
+    pf = governance.build_portfolio(holdings, prices)
+    pf["fetched_at"] = market.now_iso()
+    return pf
 
 
 @app.get("/api/prices")
-def api_prices(request: Request, symbols: str = "SPY"):
-    if not auth.current_user(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+def api_prices(request: Request, symbols: str = "SPY", key: str | None = None):
+    if not _api_ok(request, key):
+        return _deny()
     return {"fetched_at": market.now_iso(), "data": market.fetch_many(symbols.split(","))}
+
+
+@app.get("/api/summary")
+def api_summary(request: Request, key: str | None = None, sess=Depends(get_db)):
+    """ภาพรวมกองทุนใน 1 call — NAV, sentiment, alerts, drawdown (เหมาะกับ AI team)"""
+    if not _api_ok(request, key):
+        return _deny()
+    holdings = sess.query(db.Holding).all()
+    prices = market.fetch_many([h.ticker for h in holdings] + ["SPY", "^VIX"])
+    pf = governance.build_portfolio(holdings, prices)
+    peak = float(db.get_meta(sess, "peak_nav", "0") or 0)
+    return {
+        "fetched_at": market.now_iso(),
+        "nav": pf["nav"], "book": pf["book"], "pl": pf["pl"], "pl_pct": pf["pl_pct"],
+        "positions": len(pf["rows"]), "sleeve": pf["sleeve"], "alerts": pf["alerts"],
+        "drawdown": governance.drawdown_status(pf["nav"], peak),
+        "spy": prices.get("SPY"), "vix": prices.get("^VIX"),
+        "fear_greed": market.fetch_fear_greed(),
+        "holdings": [{"ticker": r["ticker"], "sleeve": r["sleeve"], "price": r["price"],
+                      "value": r["value"], "pct_nav": r["pct"], "pl_pct": r["pl_pct"],
+                      "zone": r["zone"], "rsi14": r["rsi14"], "macd": r["macd"]} for r in pf["rows"]],
+    }
+
+
+@app.get("/api/income")
+def api_income(request: Request, key: str | None = None, sess=Depends(get_db)):
+    if not _api_ok(request, key):
+        return _deny()
+    holdings = sess.query(db.Holding).all()
+    prices = market.fetch_many([h.ticker for h in holdings]) if holdings else {}
+    pf = governance.build_portfolio(holdings, prices)
+    infos = market.fetch_info_many([h.ticker for h in holdings]) if holdings else {}
+    logs = sess.query(db.DividendLog).order_by(db.DividendLog.pay_date.desc()).limit(120).all()
+    return {"fetched_at": market.now_iso(),
+            "estimate": governance.income_summary(holdings, infos, pf["nav"]),
+            "received": governance.dividends_by_month(logs)}
+
+
+@app.get("/api/calendar")
+def api_calendar(request: Request, key: str | None = None, sess=Depends(get_db)):
+    if not _api_ok(request, key):
+        return _deny()
+    holdings = sess.query(db.Holding).all()
+    watch = sess.query(db.Watch).all()
+    symbols = [h.ticker for h in holdings] + [w.ticker for w in watch]
+    return {"fetched_at": market.now_iso(), "events": market.build_calendar(symbols)}
+
+
+@app.get("/api/news")
+def api_news(request: Request, key: str | None = None, sess=Depends(get_db)):
+    if not _api_ok(request, key):
+        return _deny()
+    holdings = sess.query(db.Holding).all()
+    watch = sess.query(db.Watch).all()
+    symbols = [h.ticker for h in holdings] + [w.ticker for w in watch]
+    return {"fetched_at": market.now_iso(),
+            "market_news": market.fetch_market_news(),
+            "ticker_news": market.fetch_news(symbols) if symbols else []}
+
+
+@app.get("/api/scanner")
+def api_scanner(request: Request, key: str | None = None, run: int = 0, sess=Depends(get_db)):
+    """ผล scan ล่าสุด — ?run=1 เพื่อรันใหม่ (ใช้เวลา 20-40 วิ)"""
+    if not _api_ok(request, key):
+        return _deny()
+    if run:
+        res = scanner.run_scan(fetch_info=market.fetch_info)
+        if res.get("picks"):
+            top = ", ".join(f"{p['ticker']} ({p['score']['total']})" for p in res["picks"])
+            sess.add(db.TeamLog(author="Maya Chen (Scanner)", category="note",
+                                title=f"Momentum scan (API) — top {len(res['picks'])}",
+                                body=f"Regime {res['regime'].get('score')}/100 · {top}"))
+            sess.commit()
+        return res
+    return scanner.last_scan() or {"note": "ยังไม่เคยรัน — เรียก /api/scanner?run=1&key=..."}
+
+
+@app.get("/api/log")
+def api_log(request: Request, title: str = "", body: str = "", author: str = "AI Team",
+            category: str = "note", key: str | None = None, sess=Depends(get_db)):
+    """ให้ AI team เขียน team log ผ่าน GET (ข้อจำกัด: web_fetch ส่ง POST ไม่ได้)"""
+    if not _api_ok(request, key):
+        return _deny()
+    if not title:
+        return JSONResponse({"error": "ต้องมี ?title="}, status_code=400)
+    sess.add(db.TeamLog(author=author[:48], category=category[:24], title=title[:200], body=body))
+    sess.commit()
+    return {"ok": True, "logged": title[:200]}
+
+
+@app.get("/api/help")
+def api_help(request: Request, key: str | None = None):
+    """รายการ endpoints ทั้งหมด (ต้องมี key เพื่อยืนยันว่าตั้งค่าถูก)"""
+    if not _api_ok(request, key):
+        return _deny()
+    return {"endpoints": {
+        "/api/summary":   "ภาพรวม: NAV, P&L, sleeve, alerts, VIX, F&G, holdings",
+        "/api/portfolio": "portfolio เต็ม (rows + zones + trim calc)",
+        "/api/prices?symbols=NVDA,SPY": "ราคา + RSI + MACD ต่อ symbol",
+        "/api/income":    "ประมาณการปันผล + ที่รับจริงรายเดือน/ปี",
+        "/api/calendar":  "FOMC/CPI/NFP + earnings + XD",
+        "/api/news":      "ข่าวตลาดหลายสำนัก + ข่าวรายตัว",
+        "/api/scanner":   "ผล momentum scan ล่าสุด (?run=1 รันใหม่ ~30วิ)",
+        "/api/log?title=..&body=..&author=..": "เขียน team log ผ่าน GET",
+    }, "auth": "ทุก endpoint ต้องมี ?key=API_KEY"}

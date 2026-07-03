@@ -30,6 +30,7 @@ Visit `http://localhost:8000`. No `DATABASE_URL` set → falls back to a local
 4. **Set environment variables** on the service:
    - `APP_PASSWORD` — shared team login password
    - `SECRET_KEY` — long random string (session cookie signing)
+   - `API_KEY` — optional; enables key-based GET API for AI agents (unset = API disabled)
    - `FUND_NAME` — optional, defaults to "Sentinel Global Fund"
 5. Deploy. Railway runs `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
    (see `railway.json` / `Procfile`) and health-checks `/healthz`.
