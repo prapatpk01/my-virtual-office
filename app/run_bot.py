@@ -409,13 +409,17 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     f"Position closed"
                 )
             else:
+                # Arrow reflects the actual SL move direction: tighter-for-LONG
+                # moves the number UP, tighter-for-SHORT moves it DOWN — a
+                # hardcoded "↓" would show the wrong direction for LONG trades.
+                arrow = "↑" if alert["new_sl"] > alert["old_sl"] else "↓"
                 msg = (
                     f"✅ {sym}\n"
                     f"Target {alert['label'][1:]} Hit\n\n"
                     f"Price : {alert['price']:.4f}\n\n"
                     f"SL moved\n"
                     f"{alert['old_sl']:.4f}\n"
-                    f"↓\n"
+                    f"{arrow}\n"
                     f"{alert['new_sl']:.4f}"
                 )
             logger.info("[Target][%s] %s", sym, alert["label"])

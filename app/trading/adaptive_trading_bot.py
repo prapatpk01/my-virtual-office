@@ -883,11 +883,35 @@ class TradingBot:
     def _target_ladder(self) -> List[tuple]:
         """(trigger_R, new_SL_R) pairs. new_SL_R=None on the final entry means
         "close the position here" rather than "move the stop"."""
+        tp1_r, tp2_r = self.TP1_R, self.TP2_R
+        # [SAFETY] TP1_R/TP2_R are env-tunable; T2 (0.7R) and T3 (1.0R) are
+        # fixed. If a tuned endpoint crosses into fixed territory (TP1_R>=0.7
+        # or TP2_R<=1.0) the ladder's strictly-sequential trigger order breaks
+        # — worse, the exchange-attached TP2 order (okx_adapter, fires at
+        # TP2_R independent of local polling) could close the real position
+        # before the bot's local T3 level is ever reached, leaving the bot
+        # thinking the position is still open. Clamp both endpoints to stay
+        # strictly inside their fixed neighbors.
+        if tp1_r >= 0.7:
+            clamped = 0.6
+            self._log_event(
+                f"[LADDER] TP1_R {tp1_r}R >= T2's fixed 0.7R — clamped to "
+                f"{clamped}R (check ADAPTIVE_TP1_R)", level="warning",
+            )
+            tp1_r = clamped
+        if tp2_r <= 1.0:
+            clamped = 1.1
+            self._log_event(
+                f"[LADDER] TP2_R {tp2_r}R <= T3's fixed 1.0R — clamped to "
+                f"{clamped}R (check ADAPTIVE_TP2_R)", level="warning",
+            )
+            tp2_r = clamped
+
         raw = [
-            (self.TP1_R, 0.3),   # T1: +0.5R  -> SL to +0.3R
-            (0.7,        0.5),   # T2: +0.7R  -> SL to +0.5R
-            (1.0,        0.7),   # T3: +1.0R  -> SL to +0.7R
-            (self.TP2_R, None),  # T4: +1.2R  -> full close (exchange TP2)
+            (tp1_r, 0.3),   # T1: +0.5R  -> SL to +0.3R
+            (0.7,   0.5),   # T2: +0.7R  -> SL to +0.5R
+            (1.0,   0.7),   # T3: +1.0R  -> SL to +0.7R
+            (tp2_r, None),  # T4: +1.2R  -> full close (exchange TP2)
         ]
         # [SAFETY] TP1_R/TP2_R are env-tunable (ADAPTIVE_TP1_R/TP2_R). If a
         # tuned trigger R ends up AT OR BELOW its own hardcoded SL-lock (e.g.
@@ -2207,6 +2231,11 @@ class TradingBot:
             "atr_history":          self.atr_history[-200:],
             "adaptive_weights":     self.adaptive_engine.base_weights,
             "pattern_learning":     self.learning_engine.to_dict(),
+            # [TARGET ALERTS] persist queued-but-not-yet-sent alerts so a
+            # crash/restart between this save and the runner popping them
+            # (run_bot.py's _send_target_alerts) doesn't silently drop a
+            # Telegram notification for a ladder level that already fired.
+            "pending_target_alerts": self._pending_target_alerts,
             "saved_at":             datetime.datetime.now().isoformat(),
         }
         tmp_path = f"{path}.tmp"
@@ -2277,6 +2306,8 @@ class TradingBot:
         pl = data.get("pattern_learning")
         if pl:
             self.learning_engine.from_dict(pl)
+
+        self._pending_target_alerts = data.get("pending_target_alerts", [])
 
         self._log_event(
             f"State loaded | state={self.state} pos={self.position_open} "
