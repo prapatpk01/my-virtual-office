@@ -883,12 +883,29 @@ class TradingBot:
     def _target_ladder(self) -> List[tuple]:
         """(trigger_R, new_SL_R) pairs. new_SL_R=None on the final entry means
         "close the position here" rather than "move the stop"."""
-        return [
+        raw = [
             (self.TP1_R, 0.3),   # T1: +0.5R  -> SL to +0.3R
             (0.7,        0.5),   # T2: +0.7R  -> SL to +0.5R
             (1.0,        0.7),   # T3: +1.0R  -> SL to +0.7R
             (self.TP2_R, None),  # T4: +1.2R  -> full close (exchange TP2)
         ]
+        # [SAFETY] TP1_R/TP2_R are env-tunable (ADAPTIVE_TP1_R/TP2_R). If a
+        # tuned trigger R ends up AT OR BELOW its own hardcoded SL-lock (e.g.
+        # ADAPTIVE_TP1_R=0.2 with T1's fixed 0.3R lock), the new SL would land
+        # beyond the price that just triggered it — self-closing the trade
+        # immediately, every time. Clamp defensively to 60% of the trigger.
+        safe = []
+        for r, sl_r in raw:
+            if sl_r is not None and sl_r >= r:
+                clamped = round(r * 0.6, 4)
+                self._log_event(
+                    f"[LADDER] SL-lock {sl_r}R >= trigger {r}R — clamped to "
+                    f"{clamped}R (check ADAPTIVE_TP1_R/ADAPTIVE_TP2_R)",
+                    level="warning",
+                )
+                sl_r = clamped
+            safe.append((r, sl_r))
+        return safe
 
     # [FAKE-FILTER] Minimum price-to-EMA20 distance (in ATR) for a trend-state
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
@@ -1154,7 +1171,7 @@ class TradingBot:
         return alerts
 
     def _check_targets(self, t: Dict, direction: str, current_price: float,
-                       ind: Dict) -> Optional[str]:
+                       ind: Dict, now: Optional[datetime.datetime] = None) -> Optional[str]:
         """
         Walk the 4-level target ladder (T1..T4, see _target_ladder): each
         level tightens the SL; only the final level (sl_r=None) closes the
@@ -1182,8 +1199,12 @@ class TradingBot:
 
             if sl_r is None:
                 # Final level — full close (matches the exchange-attached TP2).
-                self._close_position(f"{label}_HIT", level_price, 1.0, ind)
+                self._close_position(f"{label}_HIT", level_price, 1.0, ind, now=now)
                 if self.state == "ERROR":
+                    # Flush any earlier T1-T3 progress made this same pass even
+                    # though the final close attempt itself failed.
+                    if actions:
+                        self.save_state(self._state_file)
                     return " | ".join(actions) if actions else None
                 t["next_target_idx"] = idx + 1
                 t["tp1_hit"] = True   # legacy flags some downstream logic reads
@@ -1232,17 +1253,21 @@ class TradingBot:
         if t.get("status") != "OPEN":
             return None
         direction = t["direction"]
+        # Intrabar closes happen in real elapsed time, not simulated bar time —
+        # stamp the whipsaw-spacing gate with actual wall-clock now, since
+        # self._bar_now only advances on bar close and would understate the gap.
+        _now = datetime.datetime.now(datetime.timezone.utc)
 
         sl_hit = (current_price <= t["sl"]) if direction == "LONG" else (current_price >= t["sl"])
         if sl_hit:
-            self._close_position("SL_HIT", t["sl"], 1.0, {})
+            self._close_position("SL_HIT", t["sl"], 1.0, {}, now=_now)
             if self.state != "ERROR":
                 self.state = "EXITING"
                 self.save_state(self._state_file)
                 return f"SL_HIT @ {t['sl']:.4f}"
             return None
 
-        return self._check_targets(t, direction, current_price, {})
+        return self._check_targets(t, direction, current_price, {}, now=_now)
 
     # ── Step 3: Global gates ──────────────────────────────────────────────────
 
@@ -1607,7 +1632,8 @@ class TradingBot:
 
         return self.state
 
-    def _close_position(self, reason: str, price: float, portion: float, ind: Dict):
+    def _close_position(self, reason: str, price: float, portion: float, ind: Dict,
+                        now: Optional[datetime.datetime] = None):
         t = self.current_trade
         if not t or t.get("status") != "OPEN":
             return
@@ -1659,8 +1685,11 @@ class TradingBot:
             t["status"]        = "CLOSED"
             self.position_open = False
             self.order_status  = "CLOSED"
-            # [WHIPSAW GUARD] stamp CLOSE time (not open) for the spacing gate
-            self._last_close_at = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
+            # [WHIPSAW GUARD] stamp CLOSE time (not open) for the spacing gate.
+            # Intrabar closes pass real wall-clock `now`; bar-close callers
+            # leave it None so this falls back to simulated bar time (needed
+            # for backtest determinism).
+            self._last_close_at = now or self._bar_now or datetime.datetime.now(datetime.timezone.utc)
 
     # ── Step 7: Journal + [V8-6/V8-7] learning ───────────────────────────────
 
@@ -1971,9 +2000,23 @@ class TradingBot:
                 # FIX-#4 (close_reason): use the explicit exit_reason stored by _close_position
                 # via the 'reason' field if available; fall back to heuristic.
                 # Also treat pnl==0 (break-even SL) as SL_HIT so consecutive_sl_hits counts correctly.
+                #
+                # [LADDER FIX] tp1_hit is now set True by the FIRST ladder level
+                # (a cheap +0.5R SL move, not a real partial close) — any LATER
+                # close via reversal-spike/emergency/state-drift/poor-health was
+                # falling through to the tp-flag heuristic below and getting
+                # mislabeled "PARTIAL_TP1", corrupting the lesson system's
+                # exit-reason diagnosis. Recognize the real reasons explicitly
+                # before ever consulting the (now much less reliable) flags.
                 _exit_reason = t.get("exit_reason", "")
                 if _exit_reason in ("SL_HIT", "RUNNER_SL"):
                     close_reason = "SL_HIT"
+                elif _exit_reason == "T4_HIT":
+                    close_reason = "FULL_TP2"   # keep legacy label for stats continuity
+                elif _exit_reason in ("REVERSAL_SPIKE", "EMERGENCY_EXIT",
+                                      "STATE_DRIFT_EXIT", "POOR_HEALTH_EXIT",
+                                      "HEALTH_REDUCE"):
+                    close_reason = _exit_reason
                 elif t.get("tp3_hit"):
                     close_reason = "TP3_RUNNER"
                 elif t.get("tp2_hit"):
