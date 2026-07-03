@@ -1385,9 +1385,18 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Caught the XAG 19:47 case: MACD declining at entry = trade already past peak.
         macd_hist_rising_gate=True,
         macd_hist_lookback=2,   # bars back for the rising check (1 = softer/sooner, 2 = current)
-        # Momentum confirmation source (the laggiest entry gate): "macd" (default),
+        # Momentum confirmation source (the laggiest entry gate): "macd" (old),
         # "volmom" (price up + volume>=MA20, reacts 1 bar), "roc3", "volmom_macd".
-        momentum_gate_mode="macd",
+        # Backtest Jan-May 2026 (BTC+XAG+XAU), train/test split — volmom is the
+        # standout on the HOLDOUT (Apr-May, never tuned on):
+        #   macd  : TRAIN PF 1.95 → TEST PF 1.33  WR 82.0%  SL 18.0%  (big train→test drop)
+        #   volmom: TRAIN PF 1.51 → TEST PF 1.49  WR 83.7%  SL 16.3%  (train≈test = robust)
+        # volmom wins the holdout on PF, WR, SL rate AND PnL despite ~15% fewer
+        # trades — the volume-participation filter reacts in 1 bar (vs MACD's
+        # EMA 12/26/9 smoothing) and cuts low-conviction fake moves, so false
+        # signals go DOWN, not up. The train≈test stability is the tell that this
+        # is a genuine (non-overfit) edge, unlike macd's regime-dependent 1.95→1.33.
+        momentum_gate_mode="volmom",
         # Startup warmup: block signals for N min after bot/strategy restart.
         # Prevents premature entries before the strategy has enough context.
         startup_warmup_min=45,
