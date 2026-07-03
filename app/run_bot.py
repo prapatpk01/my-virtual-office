@@ -75,6 +75,49 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _fmt_px(v) -> str:
+    """Price for Telegram: thousands separator, ≤4 decimals, no trailing zeros
+    (61770.6 not 61770.6000, and never a raw 61542.753621112424)."""
+    try:
+        return f"{float(v):,.4f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _format_open_msg(order_type: str, sym: str, trade_info: dict) -> str:
+    """OPEN notification: entry / size / SL / full T1-T4 ladder (T4 = the TP
+    actually attached on the exchange). Falls back to the old TP1/TP2 line if
+    the ladder isn't in the payload."""
+    entry    = trade_info.get("entry")
+    size     = float(trade_info.get("size") or 0)
+    notional = size * float(entry or 0)
+    lines = [
+        f"🟢 [Adaptive] {order_type} {sym}",
+        f"Entry : {_fmt_px(entry)}",
+        f"Size : {size:.4f} (≈${notional:,.2f})",
+        f"SL : {_fmt_px(trade_info.get('sl'))}",
+    ]
+    ladder = trade_info.get("ladder") or []
+    for i, (label, price, r) in enumerate(ladder):
+        tag = f"{label} (TP)" if i == len(ladder) - 1 else label
+        lines.append(f"{tag} : {_fmt_px(price)} ({r}R)")
+    if not ladder:
+        lines.append(f"TP1={trade_info.get('tp1', '?')} TP2={trade_info.get('tp2', '?')}")
+    return "\n".join(lines)
+
+
+def _format_close_msg(order_type: str, sym: str, trade_info: dict) -> str:
+    pnl   = float(trade_info.get("pnl") or 0)
+    emoji = "✅" if pnl > 0 else ("⚪" if pnl == 0 else "❌")
+    return (
+        f"{emoji} [Adaptive] {order_type} {sym} "
+        f"({trade_info.get('reason', '')})\n"
+        f"direction={trade_info.get('direction', '?')} "
+        f"price={_fmt_px(trade_info.get('price'))}\n"
+        f"pnl={pnl:+.2f} size={float(trade_info.get('size') or 0):.4f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Build config
 # ---------------------------------------------------------------------------
@@ -248,24 +291,9 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 if telegram and order_type != "AMEND_SL":
                     try:
                         if "OPEN" in order_type:
-                            msg = (
-                                f"🟢 [Adaptive] {order_type} {s}\n"
-                                f"entry={trade_info.get('entry', '?')} "
-                                f"sl={trade_info.get('sl', '?')}\n"
-                                f"TP1={trade_info.get('tp1', '?')} "
-                                f"TP2={trade_info.get('tp2', '?')} "
-                                f"size={float(trade_info.get('size') or 0):.4f}"
-                            )
+                            msg = _format_open_msg(order_type, s, trade_info)
                         else:
-                            pnl = float(trade_info.get("pnl") or 0)
-                            emoji = "✅" if pnl > 0 else ("⚪" if pnl == 0 else "❌")
-                            msg = (
-                                f"{emoji} [Adaptive] {order_type} {s} "
-                                f"({trade_info.get('reason', '')})\n"
-                                f"direction={trade_info.get('direction', '?')} "
-                                f"price={trade_info.get('price', '?')}\n"
-                                f"pnl={pnl:+.2f} size={float(trade_info.get('size') or 0):.4f}"
-                            )
+                            msg = _format_close_msg(order_type, s, trade_info)
                         telegram.send(msg)
                     except Exception:
                         pass

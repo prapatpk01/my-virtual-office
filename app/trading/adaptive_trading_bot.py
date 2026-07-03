@@ -1555,6 +1555,13 @@ class TradingBot:
                 "tp1":   tp1, "tp2": tp2,
                 "tp3":   tp3,
                 "size":  position_size,
+                # Full T1-T4 ladder prices for the runner's OPEN notification
+                # (label, price, trigger_R); extra key is ignored by the
+                # exchange adapters and the backtest executor.
+                "ladder": [
+                    (f"T{i + 1}", entry_price + sl_dist * r * mult, r)
+                    for i, (r, _sl_r) in enumerate(ladder)
+                ],
             })
 
         # FIX-#1: if execution_callback failed, _send_order sets state=ERROR — abort
