@@ -970,6 +970,14 @@ class TradingBot:
     # (vertical blow-off spikes). 99 = disabled.
     CLIMAX_BAR_ATR: float = 2.0
 
+    # [1H CHOP-FILTER] Minimum Kaufman efficiency ratio (0=pure noise,
+    # 1=perfectly smooth trend) the 1H timeframe itself must show. A choppy
+    # 1H means the "confirming" timeframe isn't actually trending, no matter
+    # how the EMA/RSI/momentum snapshot reads at this instant. MR states are
+    # exempt (they deliberately trade mean-reversion in choppy/exhausted
+    # markets). 0 = disabled.
+    MIN_1H_EFFICIENCY: float = 0.20
+
     def _regime_direction(self, ind_4h: Dict) -> float:
         """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
         ema5  = ind_4h.get("ema5", 0.0)
@@ -983,26 +991,44 @@ class TradingBot:
         return float(np.clip(d, -100, 100))
 
     def _context_score(self, ind_1h: Dict, direction: str) -> Dict:
-        """1H context — does the mid timeframe support the candidate direction?"""
-        adx      = ind_1h.get("adx", 0.0)
-        rsi      = ind_1h.get("rsi", 50.0)
-        ema5     = ind_1h.get("ema5", 0.0)
-        ema20    = ind_1h.get("ema20", 1.0)
-        macd     = ind_1h.get("macd", 0.0)
-        macd_sig = ind_1h.get("macd_signal", 0.0)
+        """
+        1H context — does the mid timeframe support the candidate direction?
 
-        h_dir  = 50.0 * float(np.clip((ema5 - ema20) / max(abs(ema20), 1e-9) * 200, -1, 1))
-        h_dir += 50.0 * float(np.clip((rsi - 50.0) / 25.0, -1, 1))
-        h_dir  = float(np.clip(h_dir, -100, 100))
+        Confluence-count design: rather than blending EMA-lean and RSI-lean
+        into one continuous number (where one badly-wrong input can be
+        diluted/hidden by the others averaging it out), count how many of 4
+        independent 1H signals agree with the candidate direction. Momentum
+        and structure use momentum_score/structure_score — condition scores
+        the indicator engine already computes for every timeframe (magnitude
+        -aware MACD read and EMA5/EMA20/EMA50 stack read respectively) —
+        instead of a cruder local MACD-cross boolean or ignoring structure
+        entirely. ADX (not directional) stays a separate strength weight.
+        """
+        adx             = ind_1h.get("adx", 0.0)
+        rsi             = ind_1h.get("rsi", 50.0)
+        ema5            = ind_1h.get("ema5", 0.0)
+        ema20           = ind_1h.get("ema20", 1.0)
+        momentum_score  = ind_1h.get("momentum_score", 50.0)
+        structure_score = ind_1h.get("structure_score", 50.0)
 
-        dir_mult    = 1 if direction == "LONG" else -1
-        support     = h_dir * dir_mult   # positive = 1H leans same way as candidate
-        momentum_ok = (macd > macd_sig) if direction == "LONG" else (macd < macd_sig)
+        h_dir = float(np.clip((ema5 - ema20) / max(abs(ema20), 1e-9) * 200, -1, 1)) * 100.0
 
-        score  = float(np.clip(50.0 + support / 2.0, 0, 100)) * 0.60
-        score += (100.0 if momentum_ok else 30.0) * 0.20
+        dir_mult = 1 if direction == "LONG" else -1
+        votes = [
+            h_dir * dir_mult > 0,                     # EMA5 vs EMA20 trend
+            (rsi - 50.0) * dir_mult > 0,               # RSI lean
+            (momentum_score - 50.0) * dir_mult > 0,    # MACD strength+direction
+            (structure_score - 50.0) * dir_mult > 0,   # EMA-stack structure
+        ]
+        confluence = sum(votes)   # 0-4 signals agreeing with candidate direction
+
+        score  = (confluence / 4.0) * 100.0 * 0.80
         score += float(np.clip(adx / 30.0 * 100, 0, 100)) * 0.20
-        return {"score": float(np.clip(score, 0, 100)), "direction": h_dir}
+        return {
+            "score":      float(np.clip(score, 0, 100)),
+            "direction":  h_dir,
+            "confluence": confluence,
+        }
 
     def _direction_fit(self, market_state: str, regime_direction: float, direction: str) -> float:
         """
@@ -1119,6 +1145,18 @@ class TradingBot:
                 self._scan_info[direction] = (
                     f"veto:climax-bar (range {_rng / _atr:.1f} > "
                     f"{self.CLIMAX_BAR_ATR} ATR)")
+                return None
+
+            # [1H CHOP-FILTER] The "confirming" 1H timeframe must itself show
+            # some directional efficiency — a choppy 1H means the confirmation
+            # is noise, no matter how the EMA/RSI/momentum snapshot reads
+            # right now. MR states are exempt (see class docstring above).
+            _eff_1h = ind_1h.get("eff_ratio", 0.5)
+            if self.MIN_1H_EFFICIENCY > 0 and _eff_1h < self.MIN_1H_EFFICIENCY:
+                self._filter_stats["checked"] += 1
+                self._filter_stats["health_fail"] += 1
+                self._scan_info[direction] = (
+                    f"veto:1h-chop (eff {_eff_1h:.2f} < {self.MIN_1H_EFFICIENCY})")
                 return None
 
         entry = self._entry_score(ind_15m, candle_15m, direction, market_state)
