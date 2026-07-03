@@ -939,25 +939,41 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         pressure_short = ((out["close"] < out["open"]) & (_body_dn >= _pr_ratio)
                           & _expand & _buildup & (out["close"] < out["close"].shift(1))).fillna(False)
 
-    # ── MACD Histogram rising gate: enter early, not after peak ──────────────
-    # Requires MACD histogram RISING over 2 bars (sign-agnostic for earlier entry).
-    # Blocks the XAG-style "throwback after peak" where MACD is declining.
-    # In "pressure" mode a genuine expansion bar is allowed to satisfy this gate
-    # (price expansion leads MACD), so the entry can land on the ignition bar.
+    # ── Momentum confirmation gate: enter early, not after peak ──────────────
+    # Blocks entering after momentum has already peaked. momentum_gate_mode picks
+    # HOW momentum is confirmed — the laggiest piece of the entry stack, so the
+    # choice directly controls entry timing:
+    #   "macd"   MACD histogram rising over N bars (default; laggy — EMA12/26/9)
+    #   "volmom" price up AND volume >= MA20 (participation) — reacts in 1 bar,
+    #            the volume filter replaces MACD's smoothing as the false-move guard
+    #   "roc3"   ROC(3) favorable — fast raw momentum, no volume
+    #   "volmom_macd" volmom OR macd — either confirms (loosest)
+    _mgate = p.get("momentum_gate_mode", "macd")
     _macd_hist_l_diag = pd.Series(True, index=out.index)  # diagnostic default
     _macd_hist_s_diag = pd.Series(True, index=out.index)
     if p.get("macd_hist_rising_gate", True):
         macd_hist       = macd_line - macd_sig
-        _mh_lb          = int(p.get("macd_hist_lookback", 2))  # bars back for the rising check
-        hist_rising_l   = macd_hist > macd_hist.shift(_mh_lb)
-        hist_rising_s   = macd_hist < macd_hist.shift(_mh_lb)
+        _mh_lb          = int(p.get("macd_hist_lookback", 2))
+        _macd_l         = macd_hist > macd_hist.shift(_mh_lb)
+        _macd_s         = macd_hist < macd_hist.shift(_mh_lb)
+        # volume-backed momentum tick: price rises AND the bar carries >= average
+        # volume — genuine participation, not a low-volume drift. Reacts in 1 bar.
+        _vol_ok_g       = out["volume"] >= volma
+        _vm_l           = (out["close"] > out["close"].shift(1)) & _vol_ok_g
+        _vm_s           = (out["close"] < out["close"].shift(1)) & _vol_ok_g
+        _roc3           = _roc(out["close"], 3)
+        _r3_l, _r3_s    = _roc3 > 0, _roc3 < 0
+        if   _mgate == "volmom":      mom_l, mom_s = _vm_l, _vm_s
+        elif _mgate == "roc3":        mom_l, mom_s = _r3_l, _r3_s
+        elif _mgate == "volmom_macd": mom_l, mom_s = (_vm_l | _macd_l), (_vm_s | _macd_s)
+        else:                          mom_l, mom_s = _macd_l, _macd_s   # "macd"
         if _trig_mode == "pressure":
-            hist_rising_l = hist_rising_l | pressure_long
-            hist_rising_s = hist_rising_s | pressure_short
-        _macd_hist_l_diag = hist_rising_l
-        _macd_hist_s_diag = hist_rising_s
-        long_gates  = long_gates  & hist_rising_l
-        short_gates = short_gates & hist_rising_s
+            mom_l = mom_l | pressure_long
+            mom_s = mom_s | pressure_short
+        _macd_hist_l_diag = mom_l
+        _macd_hist_s_diag = mom_s
+        long_gates  = long_gates  & mom_l
+        short_gates = short_gates & mom_s
 
     # ── Final entry trigger: momentum confirmation before entry ──────────────
     # Diagnostic (gate_bottleneck): this is the #1 entry blocker (804 otherwise-
@@ -1369,6 +1385,9 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Caught the XAG 19:47 case: MACD declining at entry = trade already past peak.
         macd_hist_rising_gate=True,
         macd_hist_lookback=2,   # bars back for the rising check (1 = softer/sooner, 2 = current)
+        # Momentum confirmation source (the laggiest entry gate): "macd" (default),
+        # "volmom" (price up + volume>=MA20, reacts 1 bar), "roc3", "volmom_macd".
+        momentum_gate_mode="macd",
         # Startup warmup: block signals for N min after bot/strategy restart.
         # Prevents premature entries before the strategy has enough context.
         startup_warmup_min=45,
