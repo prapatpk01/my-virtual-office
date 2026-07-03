@@ -201,6 +201,44 @@ def _make_strategies(symbols: list, flags: dict, cfg: dict,
 
 
 # ---------------------------------------------------------------------------
+# Shared ccxt-async shutdown helper
+# ---------------------------------------------------------------------------
+
+async def _force_close_ccxt_async(exchange, label: str = "") -> None:
+    """
+    Belt-and-suspenders shutdown for a ccxt.async_support exchange instance.
+    ccxt's own `.close()` doesn't reliably prevent aiohttp's "Unclosed
+    connector" warning on process exit (seen on every Railway redeploy) —
+    force-close the underlying aiohttp session/connector directly so their
+    __del__ never fires against a live socket during interpreter shutdown.
+    Shared by every ccxt-async client this process creates (the market-data
+    connector and each exchange adapter's own async client) so a fix here
+    covers all of them, not just whichever one was noticed first.
+    """
+    if exchange is None:
+        return
+    try:
+        await exchange.close()
+    except Exception as e:
+        logger.warning("[Shutdown] %s ccxt close() error (non-fatal): %s", label, e)
+    try:
+        session = getattr(exchange, "session", None)
+        if session is not None:
+            connector = getattr(session, "_connector", None)
+            if connector is not None and not getattr(connector, "_closed", True):
+                await connector.close()
+            exchange.session = None
+        exchange.socks_proxy_sessions = None
+        tcp = getattr(exchange, "tcp_connector", None)
+        if tcp is not None:
+            if not getattr(tcp, "_closed", True):
+                await tcp.close()
+            exchange.tcp_connector = None
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Build connector
 # ---------------------------------------------------------------------------
 
@@ -699,12 +737,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
     # The execution adapter created here (okx) is a SEPARATE ccxt async client
     # from the outer `connector` — _cleanup_connector() in main() only closes
-    # `connector`, so okx's aiohttp session was never closed, producing the
-    # "Unclosed client session" warning on every shutdown/redeploy.
-    try:
-        await okx.close()
-    except Exception as e:
-        logger.warning("[Adaptive] okx connector close error (non-fatal): %s", e)
+    # `connector`, so okx's own async client needs the same force-close
+    # treatment (see _force_close_ccxt_async) or its aiohttp connector logs
+    # "Unclosed connector" on every shutdown/redeploy.
+    await _force_close_ccxt_async(getattr(okx, "_aex", None), label="okx-adapter")
 
 
 # ---------------------------------------------------------------------------
@@ -752,32 +788,10 @@ async def main():
 
     async def _cleanup_connector():
         logger.info("Stopping bot...")
-        try:
-            await connector.close()
-        except Exception as e:
-            logger.warning("Connector close error (non-fatal): %s", e)
-
-        # Belt-and-suspenders: force-clear CCXT/aiohttp objects so their __del__
-        # never emits "Unclosed connector" or "requires .close()" during GC.
-        # This runs whether the bot exits cleanly OR crashes on startup.
-        _exc = getattr(connector, "_exchange", None)
-        if _exc is not None:
-            try:
-                _sess = getattr(_exc, "session", None)
-                if _sess is not None:
-                    _aio_conn = getattr(_sess, "_connector", None)
-                    if _aio_conn is not None and not getattr(_aio_conn, "_closed", True):
-                        await _aio_conn.close()
-                    _exc.session = None
-                _exc.socks_proxy_sessions = None
-                _tcp = getattr(_exc, "tcp_connector", None)
-                if _tcp is not None:
-                    if not getattr(_tcp, "_closed", True):
-                        await _tcp.close()
-                    _exc.tcp_connector = None
-            except Exception:
-                pass
-
+        # This runs whether the bot exits cleanly OR crashes on startup, so
+        # __del__ never fires "Unclosed connector"/"requires .close()"
+        # warnings against a live socket during interpreter shutdown.
+        await _force_close_ccxt_async(getattr(connector, "_exchange", None), label="market-data")
         await asyncio.sleep(0.5)
         logger.info("Done.")
 
