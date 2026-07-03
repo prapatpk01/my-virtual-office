@@ -731,6 +731,16 @@ class TradingBot:
             return
         algo_id = self.current_trade.get("sl_algo_id")
         if not algo_id:
+            # Visible-but-non-fatal: the Telegram "SL moved" alert still fires
+            # from _queue_target_alert regardless of this — without this log
+            # there is NO signal anywhere that the real exchange SL was never
+            # touched (e.g. after a reconcile-adopted position without a
+            # recovered algo_id).
+            self._log_event(
+                f"[WARN] SL amend SKIPPED (no algo_id known) — local SL moved "
+                f"to {new_sl:.4f} but the exchange stop was NOT amended",
+                level="warning",
+            )
             return
         try:
             self.execution_callback("AMEND_SL", {
@@ -2466,18 +2476,49 @@ class TradingBot:
                 "→ creating trade record from exchange data",
                 level="warning",
             )
-            sl_dist_r = max(entry_price * 0.01, 1e-9)
+            # Recover the REAL attached SL price from the exchange (the same
+            # algo-order lookup used for SL amends) instead of guessing an
+            # arbitrary placeholder — a guessed sl_dist corrupts every ladder
+            # level derived from it (T1-T4 all computed as entry + sl_dist*R)
+            # for the rest of the trade. Falls back to the old 1%-of-price
+            # guess only if the real SL can't be read back (adapter doesn't
+            # support the lookup, or the algo order isn't found).
+            real_stop = None
+            try:
+                pos_side_r = "long" if direction == "LONG" else "short"
+                fetch_fn = getattr(exchange_adapter, "fetch_attached_sl_tp", None)
+                if fetch_fn is not None:
+                    real_stop = fetch_fn(symbol, pos_side_r)
+            except Exception as e:
+                self._log_event(f"[RECONCILE] fetch_attached_sl_tp failed: {e}", level="warning")
+
+            if real_stop and real_stop.get("sl"):
+                sl_price  = float(real_stop["sl"])
+                sl_dist_r = abs(entry_price - sl_price)
+                self._log_event(
+                    f"[RECONCILE] recovered real SL={sl_price:.4f} from exchange "
+                    f"(sl_dist={sl_dist_r:.4f})"
+                )
+            else:
+                sl_price  = entry_price * (0.99 if direction == "LONG" else 1.01)
+                sl_dist_r = max(entry_price * 0.01, 1e-9)
+                self._log_event(
+                    "[RECONCILE] could not recover real SL — falling back to "
+                    f"1% placeholder (sl_dist={sl_dist_r:.4f})",
+                    level="warning",
+                )
             mult_r    = 1 if direction == "LONG" else -1
             ladder_r  = self._target_ladder()
             # FIX-#9: include all fields _manage_open_position expects
             self.current_trade = {
                 "direction": direction, "entry": entry_price,
-                "sl": entry_price * (0.99 if direction == "LONG" else 1.01),
+                "sl": sl_price,
                 "sl_dist": sl_dist_r,
                 "tp1": entry_price + sl_dist_r * ladder_r[0][0] * mult_r,
                 "tp2": entry_price + sl_dist_r * ladder_r[-1][0] * mult_r,
                 "tp3": None,
                 "targets": ladder_r, "next_target_idx": 0, "targets_hit": [],
+                "sl_algo_id": (real_stop or {}).get("algo_id"),
                 "tp1_pct": 0.50, "tp2_pct": 1.0,
                 "trail_atr_mult": 2.0,
                 "size": abs(live_size), "remaining_size": abs(live_size),

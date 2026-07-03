@@ -503,14 +503,14 @@ class OKXAdapter(BaseConnector):
                 )
         return raw
 
-    def _find_attached_sl_algo_id(self, sym: str, pos_side: str) -> Optional[str]:
+    def _find_attached_algo_row(self, sym: str, pos_side: str) -> Optional[Dict[str, Any]]:
         """
-        Find the algoId of the SL/TP algo order OKX creates when a position is
-        opened with attached stopLoss+takeProfit params (attachAlgoOrds) — it
+        Find the raw SL/TP algo order OKX creates when a position is opened
+        with attached stopLoss+takeProfit params (attachAlgoOrds) — it
         becomes a single 'oco'-type algo order once the parent order fills.
-        Needed so a later ladder SL-ratchet (T1-T3) can amend this order's
-        trigger price instead of leaving the exchange-side stop at its
-        original, wider level for the whole trade.
+        Shared by _find_attached_sl_algo_id (amending the SL as the ladder
+        ratchets) and fetch_attached_sl_tp (recovering the real risk distance
+        for reconcile_with_exchange, instead of guessing one).
         """
         try:
             inst_id = self._ex.market(sym)["id"]
@@ -524,13 +524,39 @@ class OKXAdapter(BaseConnector):
             if not matches:
                 return None
             matches.sort(key=lambda r: int(r.get("cTime") or 0), reverse=True)
-            return matches[0].get("algoId")
+            return matches[0]
         except Exception as e:
             logger.warning(
                 "[OKX] could not locate attached SL/TP algo order for %s: %s",
                 sym, e,
             )
             return None
+
+    def _find_attached_sl_algo_id(self, sym: str, pos_side: str) -> Optional[str]:
+        """Needed so a later ladder SL-ratchet (T1-T3) can amend the attached
+        order's trigger price instead of leaving the exchange-side stop at
+        its original, wider level for the whole trade."""
+        row = self._find_attached_algo_row(sym, pos_side)
+        return row.get("algoId") if row else None
+
+    def fetch_attached_sl_tp(self, sym: str, pos_side: str) -> Optional[Dict[str, float]]:
+        """
+        Read back the REAL SL/TP trigger prices currently attached on the
+        exchange for an open position. Used by reconcile_with_exchange to
+        recover the true risk distance for a position adopted after local
+        state was lost (e.g. a restart without persistent state) — without
+        this, reconcile has no way to know the original SL and has to guess
+        an arbitrary placeholder, corrupting every ladder level derived from
+        it for the rest of that trade.
+        """
+        row = self._find_attached_algo_row(sym, pos_side)
+        if not row:
+            return None
+        sl = float(row.get("slTriggerPx") or 0) or None
+        if sl is None:
+            return None
+        tp = float(row.get("tpTriggerPx") or 0) or None
+        return {"sl": sl, "tp": tp, "algo_id": row.get("algoId")}
 
     def _sync_amend_sl(self, trade_info: Dict[str, Any]) -> Dict:
         """
