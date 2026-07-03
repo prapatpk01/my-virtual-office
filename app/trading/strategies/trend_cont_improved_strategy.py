@@ -975,6 +975,25 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         long_gates  = long_gates  & mom_l
         short_gates = short_gates & mom_s
 
+    # ── MACD-histogram peak/exhaustion filter (opt-in) ───────────────────────
+    # Blocks "buying the top": the price bar can tick up with volume (passing
+    # volmom) while the MACD histogram has already PEAKED and is rolling over —
+    # a weak, exhausting bounce (the classic ETH "entered at the top" loss).
+    # Detects a post-peak decline: the histogram fell for `slope_bars` and a
+    # meaningfully higher peak existed within the last `lookback` bars.
+    if p.get("macd_peak_filter", False):
+        _h        = macd_line - macd_sig
+        _pk_lb    = int(p.get("macd_peak_lookback", 6))
+        _pk_sb    = int(p.get("macd_peak_slope_bars", 2))
+        _decl_l   = _h < _h.shift(_pk_sb)                 # histogram sloping down
+        _peak_l   = _h.rolling(_pk_lb).max() > _h         # a higher peak exists behind us
+        _post_peak_l = (_decl_l & _peak_l).fillna(False)  # rolling over from a recent top
+        _incl_s   = _h > _h.shift(_pk_sb)                 # histogram sloping up (short exhausting)
+        _trough_s = _h.rolling(_pk_lb).min() < _h
+        _post_peak_s = (_incl_s & _trough_s).fillna(False)
+        long_gates  = long_gates  & ~_post_peak_l
+        short_gates = short_gates & ~_post_peak_s
+
     # ── Final entry trigger: momentum confirmation before entry ──────────────
     # Diagnostic (gate_bottleneck): this is the #1 entry blocker (804 otherwise-
     # complete setups). "strict" waits for a break of the prior bar's high/low —
@@ -1385,6 +1404,12 @@ class TrendContImprovedStrategy(BaseStrategy):
         # Caught the XAG 19:47 case: MACD declining at entry = trade already past peak.
         macd_hist_rising_gate=True,
         macd_hist_lookback=2,   # bars back for the rising check (1 = softer/sooner, 2 = current)
+        # MACD-histogram peak/exhaustion filter: block entries where the histogram
+        # has already peaked and is rolling over (buying a weak, exhausting bounce).
+        # Opt-in; lagging by nature (peak confirmed slope_bars later). A/B tested.
+        macd_peak_filter=False,
+        macd_peak_lookback=6,       # bars to look back for a higher histogram peak
+        macd_peak_slope_bars=2,     # bars over which the post-peak decline is measured
         # Momentum confirmation source (the laggiest entry gate): "macd" (old),
         # "volmom" (price up + volume>=MA20, reacts 1 bar), "roc3", "volmom_macd".
         # Backtest Jan-May 2026 (BTC+XAG+XAU), train/test split — volmom is the
