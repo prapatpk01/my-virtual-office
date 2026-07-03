@@ -502,12 +502,13 @@ class TradingBot:
         if min_ema_dist_atr is not None:
             self.MIN_EMA_DIST_ATR = min_ema_dist_atr
 
-        # [WHIPSAW GUARD] Per-symbol entry spacing: after opening a position,
+        # [WHIPSAW GUARD] Per-symbol entry spacing: after CLOSING a position,
         # no NEW entry on this symbol until entry_spacing_min minutes have
-        # passed since that open — prevents immediate re-entry chasing when
-        # price whips up/down (each bot instance == one symbol).
+        # passed since that close — prevents immediate re-entry chasing right
+        # after getting stopped/taken out while price whips up/down (each bot
+        # instance == one symbol). Stamped in _close_position, not on open.
         self.entry_spacing_min = entry_spacing_min
-        self._last_entry_at: Optional[datetime.datetime] = None
+        self._last_close_at: Optional[datetime.datetime] = None
 
         # [SIZING] fixed-margin mode (margin × leverage notional per position);
         # 0.0 = classic risk-% sizing (backtest default)
@@ -517,6 +518,10 @@ class TradingBot:
         # [SCAN-INFO] last per-direction signal evaluation, for the runner's
         # 5-min scan log (why we are / aren't trading right now)
         self._scan_info: Dict[str, str] = {}
+
+        # [TARGET ALERTS] queued Telegram-ready dicts for each target hit /
+        # SL ratchet move, popped by the runner after on_tick / intrabar checks
+        self._pending_target_alerts: List[Dict] = []
 
         # [MIN-LOT TP1] Smallest close size (in coins) the exchange can fill —
         # set by the runner from the symbol's contract size. When a TP1 partial
@@ -636,10 +641,12 @@ class TradingBot:
             # journal fields exist but may hold None (adopted/legacy trades) —
             # `t.get(k, 0)` does NOT default those, so coerce with `or 0`.
             _n = lambda k: float(t.get(k) or 0)
+            targets_hit = t.get("targets_hit") or []
+            reached = ",".join(targets_hit) if targets_hit else "none"
             lines.append(
                 f"• {t.get('direction','?')} {t.get('e_state') or t.get('market_state','?')}"
                 f"/{t.get('entry_type','?')} → exit {t.get('exit_reason','?')} "
-                f"({_n('realized_r'):+.2f}R)\n"
+                f"({_n('realized_r'):+.2f}R) | targets reached: {reached}\n"
                 f"  entry scores: sig={_n('e_total'):.0f} "
                 f"e={_n('e_entry'):.0f} ctx={_n('e_context'):.0f} "
                 f"fit={_n('e_fit'):.0f} | rsi={_n('e_rsi'):.0f} "
@@ -865,14 +872,23 @@ class TradingBot:
     # Efficient trends only — moderate/choppy trends trade better on continuation.
     _LOCATION_STATES: frozenset = frozenset({"STRONG_TREND", "BREAKOUT"})
 
-    # TP geometry in R-multiples. TP1 banks tp1_close_pct and moves SL→BE, so
-    # lowering TP1_R raises win-rate (more trades reach it) at the cost of avg
-    # win size. Swept via backtest.
+    # TP geometry in R-multiples — TP1_R/TP2_R remain the env-tunable
+    # endpoints (T1 and the final exchange-attached target). No position
+    # splitting anywhere anymore: every state uses the SAME 4-level SL-ratchet
+    # ladder (user-designed) — each level tightens the stop, only the final
+    # level closes the position (matches the exchange-attached TP2, unchanged).
     TP1_R: float = 0.5
     TP2_R: float = 1.2
-    # [TP-MODE runner] Trend trades don't split at TP1 — SL locks to
-    # entry + RUNNER_LOCK_R × R instead, full size rides to TP2.
-    RUNNER_LOCK_R: float = 0.3
+
+    def _target_ladder(self) -> List[tuple]:
+        """(trigger_R, new_SL_R) pairs. new_SL_R=None on the final entry means
+        "close the position here" rather than "move the stop"."""
+        return [
+            (self.TP1_R, 0.3),   # T1: +0.5R  -> SL to +0.3R
+            (0.7,        0.5),   # T2: +0.7R  -> SL to +0.5R
+            (1.0,        0.7),   # T3: +1.0R  -> SL to +0.7R
+            (self.TP2_R, None),  # T4: +1.2R  -> full close (exchange TP2)
+        ]
 
     # [FAKE-FILTER] Minimum price-to-EMA20 distance (in ATR) for a trend-state
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
@@ -1120,12 +1136,90 @@ class TradingBot:
             return True
         return False
 
+    # ── Unified target ladder — single shared TP/SL-ratchet for all states ───
+
+    def _queue_target_alert(self, label: str, price: float,
+                            old_sl: Optional[float], new_sl: Optional[float],
+                            final: bool = False) -> None:
+        """Queue a Telegram-ready dict for the runner to format/send."""
+        self._pending_target_alerts.append({
+            "label": label, "price": price,
+            "old_sl": old_sl, "new_sl": new_sl, "final": final,
+        })
+
+    def pop_target_alerts(self) -> List[Dict]:
+        """Return and clear queued target-hit alerts (runner forwards to Telegram)."""
+        alerts = self._pending_target_alerts
+        self._pending_target_alerts = []
+        return alerts
+
+    def _check_targets(self, t: Dict, direction: str, current_price: float,
+                       ind: Dict) -> Optional[str]:
+        """
+        Walk the 4-level target ladder (T1..T4, see _target_ladder): each
+        level tightens the SL; only the final level (sl_r=None) closes the
+        position. A single gap candle can cross more than one level — loop so
+        none are skipped and every crossed level still gets its Telegram alert
+        and SL move. Used by both check_price_protection (intrabar) and
+        _manage_open_position (bar close) so behavior is identical either way.
+        Returns a short action description, or None if nothing fired.
+        """
+        targets = t.get("targets")
+        if not targets:
+            return None
+        dir_mult = 1 if direction == "LONG" else -1
+        actions: List[str] = []
+
+        while t.get("next_target_idx", 0) < len(targets):
+            idx = t["next_target_idx"]
+            r, sl_r = targets[idx]
+            level_price = t["entry"] + t["sl_dist"] * r * dir_mult
+            hit = (current_price >= level_price) if direction == "LONG" \
+                  else (current_price <= level_price)
+            if not hit:
+                break
+            label = f"T{idx + 1}"
+
+            if sl_r is None:
+                # Final level — full close (matches the exchange-attached TP2).
+                self._close_position(f"{label}_HIT", level_price, 1.0, ind)
+                if self.state == "ERROR":
+                    return " | ".join(actions) if actions else None
+                t["next_target_idx"] = idx + 1
+                t["tp1_hit"] = True   # legacy flags some downstream logic reads
+                t["tp2_hit"] = True
+                t.setdefault("targets_hit", []).append(label)
+                self.state = "EXITING"
+                self._queue_target_alert(label, level_price, None, None, final=True)
+                actions.append(f"{label}_HIT(close) @ {level_price:.4f}")
+                self.save_state(self._state_file)
+                return " | ".join(actions)
+
+            old_sl = t["sl"]
+            new_sl = t["entry"] + t["sl_dist"] * sl_r * dir_mult
+            t["sl"] = max(t["sl"], new_sl) if direction == "LONG" else min(t["sl"], new_sl)
+            t["next_target_idx"] = idx + 1
+            t["tp1_hit"] = True
+            t["break_even_triggered"] = True
+            t.setdefault("targets_hit", []).append(label)
+            self._log_event(
+                f"{label} hit @ {level_price:.4f} ({r}R) → SL {old_sl:.4f} → "
+                f"{t['sl']:.4f} (+{sl_r}R)"
+            )
+            self._queue_target_alert(label, level_price, old_sl, t["sl"])
+            actions.append(f"{label} @ {level_price:.4f} SL→{t['sl']:.4f}")
+
+        if actions:
+            self.save_state(self._state_file)
+            return " | ".join(actions)
+        return None
+
     # ── Intrabar price protection — runs every runner poll between bar closes ─
 
     def check_price_protection(self, current_price: float) -> Optional[str]:
         """
-        Lightweight price-level protection (SL / TP1 / TP2 crossings) checked
-        every poll (~30-60s) instead of only on 15m bar close. Full
+        Lightweight price-level protection (SL / target-ladder crossings)
+        checked every poll (~30-60s) instead of only on 15m bar close. Full
         indicator-based management (health tiers, reversal spike, trend fade,
         state drift) still runs per closed bar in _manage_open_position —
         those need fresh indicators; price levels don't. Closes/partials use
@@ -1139,10 +1233,7 @@ class TradingBot:
             return None
         direction = t["direction"]
 
-        sl_hit  = (current_price <= t["sl"])  if direction == "LONG" else (current_price >= t["sl"])
-        tp2_hit = (current_price >= t["tp2"]) if direction == "LONG" else (current_price <= t["tp2"])
-        tp1_hit = (current_price >= t["tp1"]) if direction == "LONG" else (current_price <= t["tp1"])
-
+        sl_hit = (current_price <= t["sl"]) if direction == "LONG" else (current_price >= t["sl"])
         if sl_hit:
             self._close_position("SL_HIT", t["sl"], 1.0, {})
             if self.state != "ERROR":
@@ -1151,64 +1242,7 @@ class TradingBot:
                 return f"SL_HIT @ {t['sl']:.4f}"
             return None
 
-        if tp2_hit and not t["tp2_hit"]:
-            self._close_position("FULL_TP2", t["tp2"], 1.0, {})
-            if self.state != "ERROR":
-                t["tp1_hit"] = True
-                t["tp2_hit"] = True
-                self.state = "EXITING"
-                self.save_state(self._state_file)
-                return f"FULL_TP2 @ {t['tp2']:.4f}"
-            return None
-
-        if tp1_hit and not t["tp1_hit"]:
-            tp1_close_pct = t.get("tp1_pct", self.tp1_close_pct)
-            # [TP-MODE runner] trend trades: no partial — lock SL at
-            # entry + RUNNER_LOCK_R×R (guaranteed profit), full size to TP2.
-            if t.get("tp_mode") == "runner":
-                lock = t["entry"] + t["sl_dist"] * self.RUNNER_LOCK_R * \
-                       (1 if direction == "LONG" else -1)
-                t["sl"] = max(t["sl"], lock) if direction == "LONG" else min(t["sl"], lock)
-                t["tp1_hit"] = True
-                t["break_even_triggered"] = True
-                self._log_event(
-                    f"TP1 @ {t['tp1']:.4f} → runner: SL locked at "
-                    f"{t['sl']:.4f} (+{self.RUNNER_LOCK_R}R), full size to TP2"
-                )
-                self.save_state(self._state_file)
-                return f"TP1_RUNNER_LOCK @ {t['sl']:.4f} (+{self.RUNNER_LOCK_R}R)"
-            # [MIN-LOT TP1] a partial below the exchange's minimum fill size
-            # would floor up and close the WHOLE position — convert TP1 into a
-            # breakeven-move only and let the full size ride to TP2.
-            remaining = t.get("remaining_size", 0.0)
-            if self.min_close_size > 0 and remaining * tp1_close_pct < self.min_close_size:
-                t["tp1_hit"] = True
-                if not t["break_even_triggered"]:
-                    if direction == "LONG":
-                        t["sl"] = max(t["sl"], t["entry"])
-                    else:
-                        t["sl"] = min(t["sl"], t["entry"])
-                    t["break_even_triggered"] = True
-                self._log_event(
-                    f"TP1 @ {t['tp1']:.4f} → BE-only (position {remaining:.4f} "
-                    f"too small to split at min lot {self.min_close_size:.4f}) "
-                    f"— full size rides to TP2"
-                )
-                self.save_state(self._state_file)
-                return f"TP1_BE_ONLY @ {t['tp1']:.4f} (min-lot)"
-            self._close_position("PARTIAL_TP1", t["tp1"], tp1_close_pct, {})
-            if self.state != "ERROR":
-                t["tp1_hit"] = True
-                if not t["break_even_triggered"]:
-                    if direction == "LONG":
-                        t["sl"] = max(t["sl"], t["entry"])
-                    else:
-                        t["sl"] = min(t["sl"], t["entry"])
-                    t["break_even_triggered"] = True
-                self.state = "PARTIAL_EXIT"
-                self.save_state(self._state_file)
-                return f"PARTIAL_TP1 @ {t['tp1']:.4f} + SL→BE"
-        return None
+        return self._check_targets(t, direction, current_price, {})
 
     # ── Step 3: Global gates ──────────────────────────────────────────────────
 
@@ -1228,20 +1262,21 @@ class TradingBot:
             return False
 
         # [WHIPSAW GUARD] entry spacing — no new entry within N minutes of the
-        # previous OPEN on this symbol (blocks whipsaw re-entry chasing).
-        if self._last_entry_at and self.entry_spacing_min > 0:
+        # previous CLOSE on this symbol (blocks re-entry chasing right after
+        # getting stopped out while price whips up/down).
+        if self._last_close_at and self.entry_spacing_min > 0:
             try:
-                elapsed = (_now - self._last_entry_at).total_seconds() / 60.0
+                elapsed = (_now - self._last_close_at).total_seconds() / 60.0
                 if 0 <= elapsed < self.entry_spacing_min:
                     self._log_event(
-                        f"ENTRY-SPACING: {elapsed:.0f}m since last open "
+                        f"ENTRY-SPACING: {elapsed:.0f}m since last close "
                         f"(< {self.entry_spacing_min}m) — waiting",
                         level="debug",
                     )
                     return False
             except TypeError:
                 # naive/aware mismatch after a state reload — reset rather than block forever
-                self._last_entry_at = None
+                self._last_close_at = None
 
         if self.daily_pnl_pct <= self.daily_loss_limit_pct:
             self.state = "BLOCKED"
@@ -1365,10 +1400,13 @@ class TradingBot:
         # ── TP levels ────────────────────────────────────────────────────────
         mult = 1 if direction == "LONG" else -1
 
-        # Unified TP (tunable): reaching TP1 banks a partial + moves SL→BE, so a
-        # closer TP1 converts more trades into locked wins → higher win-rate.
-        tp1 = entry_price + sl_dist * self.TP1_R * mult
-        tp2 = entry_price + sl_dist * self.TP2_R * mult
+        # Unified 4-level target ladder (user-designed, same for every state):
+        # T1=+0.5R->SL+0.3R, T2=+0.7R->SL+0.5R, T3=+1.0R->SL+0.7R,
+        # T4=+1.2R->full close. tp1/tp2 fields kept for logging/exchange-attach
+        # (tp2 = T4's price = what's attached as the real OKX TP order).
+        ladder = self._target_ladder()
+        tp1 = entry_price + sl_dist * ladder[0][0] * mult
+        tp2 = entry_price + sl_dist * ladder[-1][0] * mult
         tp3 = None
         tp1_pct   = self.tp1_close_pct
         tp2_pct   = 1.0
@@ -1376,18 +1414,10 @@ class TradingBot:
 
         strategy_tag = signal.get("strategy", "Adaptive")
 
-        # [TP-MODE] Per-state TP handling (user-designed):
-        # - MR states (SIDEWAY/EXHAUSTION/REVERSAL): "split" — bank 50% at TP1,
-        #   SL→BE, rest to TP2 (classic mean-revert: take the bounce quickly).
-        # - Trend states: "runner" — nothing closed at TP1; instead SL locks to
-        #   entry +RUNNER_LOCK_R×R (guaranteed profit), FULL size rides to TP2.
-        #   Also sidesteps the min-lot split problem for trend trades entirely.
-        tp_mode = "split" if self.current_market_state in self._MR_STATES else "runner"
-
         self._log_event(
             f"[{strategy_tag}] OPEN {direction} entry={entry_price:.4f} "
-            f"sl={pattern_sl:.4f} tp1={tp1:.4f}({self.TP1_R}R) "
-            f"tp2={tp2:.4f}({self.TP2_R}R) mode={tp_mode} "
+            f"sl={pattern_sl:.4f} tp1={tp1:.4f}({ladder[0][0]}R) "
+            f"tp2={tp2:.4f}({ladder[-1][0]}R) ladder=T1-T4 "
             f"size×{size_mult:.2f} health={health:.0f}"
         )
 
@@ -1399,7 +1429,9 @@ class TradingBot:
             "tp1":                  tp1,
             "tp2":                  tp2,
             "tp3":                  tp3,           # None for SwingReversal
-            "tp_mode":              tp_mode,
+            "targets":              ladder,        # (trigger_R, new_SL_R) list
+            "next_target_idx":      0,
+            "targets_hit":          [],            # ["T1","T2",...] for stats/lessons
             "tp1_pct":              tp1_pct,
             "tp2_pct":              tp2_pct,
             "trail_atr_mult":       trail_atr,
@@ -1462,8 +1494,6 @@ class TradingBot:
         self.position_open         = True
         self._position_entry_bar   = self._bar_count
         self.order_status          = "OPEN"
-        # [WHIPSAW GUARD] stamp entry time for the per-symbol spacing gate
-        self._last_entry_at        = self._bar_now or datetime.datetime.now()
 
     # ── Step 6: Position management (V7 logic unchanged) ─────────────────────
 
@@ -1521,106 +1551,14 @@ class TradingBot:
             self._close_position("STATE_DRIFT_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
-        if direction == "LONG":
-            tp1_hit_cond = current_price >= t["tp1"]
-            tp2_hit_cond = current_price >= t["tp2"]
-        else:
-            tp1_hit_cond = current_price <= t["tp1"]
-            tp2_hit_cond = current_price <= t["tp2"]
-
-        # TP2 first (gap candle)
-        if tp2_hit_cond and not t["tp2_hit"]:
-            tp2_close_pct = t.get("tp2_pct", 1.0)
-            if tp2_close_pct < 1.0 and t.get("tp3"):
-                # MeanReversion: partial close — keep runner for TP3
-                self._close_position("PARTIAL_TP2", t["tp2"], tp2_close_pct, ind)
-                t["tp1_hit"] = True
-                t["tp2_hit"] = True
-                if not t["break_even_triggered"]:
-                    # FIX-#5: direction-aware BE so SHORT trailing SL isn't widened
-                    if direction == "LONG":
-                        t["sl"] = max(t["sl"], t["entry"])
-                    else:
-                        t["sl"] = min(t["sl"], t["entry"])
-                    t["break_even_triggered"] = True
-                    self._log_event(
-                        f"TP2 @ {t['tp2']:.4f} → {tp2_close_pct:.0%} partial + SL → BE"
-                    )
-                self.state = "TRAILING"
-                # continue to TP3 runner check below
-            else:
-                self._close_position("FULL_TP2", t["tp2"], 1.0, ind)
-                t["tp1_hit"] = True
-                t["tp2_hit"] = True
+        # Unified 4-level target ladder (T1..T4) — same for every state now.
+        # T1-T3 tighten the SL only; T4 (matches the exchange-attached TP2)
+        # closes the position. See _check_targets / _target_ladder.
+        target_action = self._check_targets(t, direction, current_price, ind)
+        if target_action:
+            if self.state == "EXITING":
                 return "EXITING"
-
-        # TP1 — close tp1_pct + break-even
-        if tp1_hit_cond and not t["tp1_hit"]:
-            tp1_close_pct = t.get("tp1_pct", self.tp1_close_pct)
-            # [TP-MODE runner] trend trades: no partial — lock SL at +RUNNER_LOCK_R.
-            if t.get("tp_mode") == "runner":
-                lock = t["entry"] + t["sl_dist"] * self.RUNNER_LOCK_R * \
-                       (1 if direction == "LONG" else -1)
-                t["sl"] = max(t["sl"], lock) if direction == "LONG" else min(t["sl"], lock)
-                t["tp1_hit"] = True
-                t["break_even_triggered"] = True
-                self._log_event(
-                    f"TP1 @ {t['tp1']:.4f} → runner: SL locked at "
-                    f"{t['sl']:.4f} (+{self.RUNNER_LOCK_R}R), full size to TP2"
-                )
-                return self.state
-            # [MIN-LOT TP1] see check_price_protection — unsplittable position
-            # converts TP1 to a breakeven-move only; full size rides to TP2.
-            remaining = t.get("remaining_size", 0.0)
-            if self.min_close_size > 0 and remaining * tp1_close_pct < self.min_close_size:
-                t["tp1_hit"] = True
-                if not t["break_even_triggered"]:
-                    if direction == "LONG":
-                        t["sl"] = max(t["sl"], t["entry"])
-                    else:
-                        t["sl"] = min(t["sl"], t["entry"])
-                    t["break_even_triggered"] = True
-                    self._log_event(
-                        f"TP1 @ {t['tp1']:.4f} → BE-only (min lot) — full size to TP2"
-                    )
-            else:
-                self._close_position("PARTIAL_TP1", t["tp1"], tp1_close_pct, ind)
-                t["tp1_hit"] = True
-                if not t["break_even_triggered"]:
-                    if direction == "LONG":
-                        t["sl"] = max(t["sl"], t["entry"])
-                    else:
-                        t["sl"] = min(t["sl"], t["entry"])
-                    t["break_even_triggered"] = True
-                    self._log_event(
-                        f"TP1 @ {t['tp1']:.4f} → {tp1_close_pct:.0%} close "
-                        f"+ SL → breakeven ({t['entry']:.4f})"
-                    )
-                self.state = "PARTIAL_EXIT"
-
-        # TP3 runner — MeanReversion only (active once TP2 partial close done)
-        if t.get("tp3") and t.get("tp2_hit") and not t.get("tp3_hit"):
-            atr        = ind.get("atr", t["sl_dist"])
-            trail_mult = t.get("trail_atr_mult", 2.0)
-            if direction == "LONG":
-                t["sl"] = max(t["sl"], current_price - atr * trail_mult)
-                if current_price >= t["tp3"]:
-                    self._close_position("TP3_RUNNER", t["tp3"], 1.0, ind)
-                    t["tp3_hit"] = True
-                    return "EXITING"
-                if current_price <= t["sl"]:
-                    self._close_position("RUNNER_SL", t["sl"], 1.0, ind)
-                    return "EXITING"
-            else:
-                t["sl"] = min(t["sl"], current_price + atr * trail_mult)
-                if current_price <= t["tp3"]:
-                    self._close_position("TP3_RUNNER", t["tp3"], 1.0, ind)
-                    t["tp3_hit"] = True
-                    return "EXITING"
-                if current_price >= t["sl"]:
-                    self._close_position("RUNNER_SL", t["sl"], 1.0, ind)
-                    return "EXITING"
-            return "TRAILING"
+            self.state = "TRAILING"
 
         # Health-based position management
         tp1_hit = t.get("tp1_hit", False)
@@ -1721,6 +1659,8 @@ class TradingBot:
             t["status"]        = "CLOSED"
             self.position_open = False
             self.order_status  = "CLOSED"
+            # [WHIPSAW GUARD] stamp CLOSE time (not open) for the spacing gate
+            self._last_close_at = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
 
     # ── Step 7: Journal + [V8-6/V8-7] learning ───────────────────────────────
 
@@ -1792,6 +1732,10 @@ class TradingBot:
             "e_ema_dist_atr":      t.get("e_ema_dist_atr"),
             "e_rsi":               t.get("e_rsi"),
             "realized_r":          round(_realized_r, 3),
+            # [TARGET LADDER] which levels this trade reached before its
+            # final close — direct evidence for fake-vs-real diagnosis
+            # (e.g. "no targets hit -> SL" vs "T1,T2 hit then reversed").
+            "targets_hit":         list(t.get("targets_hit", [])),
         }
         self.trade_journal.append(entry)
 
@@ -2210,7 +2154,7 @@ class TradingBot:
             "consecutive_sl_hits":  self.consecutive_sl_hits,
             "session_losses":       self.session_losses,
             "cooldown_until":       self.cooldown_until.isoformat() if self.cooldown_until else None,
-            "last_entry_at":        self._last_entry_at.isoformat() if self._last_entry_at else None,
+            "last_close_at":        self._last_close_at.isoformat() if self._last_close_at else None,
             "trading_date":         self.trading_date.isoformat() if self.trading_date else None,
             "current_market_state": self.current_market_state,
             "current_regime_bias":  self.current_regime_bias,
@@ -2268,9 +2212,9 @@ class TradingBot:
         self.cooldown_until = (datetime.datetime.fromisoformat(cooldown)
                                if cooldown else None)
 
-        last_entry = data.get("last_entry_at")
-        self._last_entry_at = (datetime.datetime.fromisoformat(last_entry)
-                               if last_entry else None)
+        last_close = data.get("last_close_at", data.get("last_entry_at"))  # tolerate old field name
+        self._last_close_at = (datetime.datetime.fromisoformat(last_close)
+                               if last_close else None)
 
         trading_date = data.get("trading_date")
         self.trading_date = (datetime.date.fromisoformat(trading_date)
@@ -2364,18 +2308,17 @@ class TradingBot:
             )
             sl_dist_r = max(entry_price * 0.01, 1e-9)
             mult_r    = 1 if direction == "LONG" else -1
+            ladder_r  = self._target_ladder()
             # FIX-#9: include all fields _manage_open_position expects
             self.current_trade = {
                 "direction": direction, "entry": entry_price,
                 "sl": entry_price * (0.99 if direction == "LONG" else 1.01),
                 "sl_dist": sl_dist_r,
-                "tp1": entry_price + sl_dist_r * 0.7 * mult_r,
-                "tp2": entry_price + sl_dist_r * 2.0 * mult_r,
+                "tp1": entry_price + sl_dist_r * ladder_r[0][0] * mult_r,
+                "tp2": entry_price + sl_dist_r * ladder_r[-1][0] * mult_r,
                 "tp3": None,
+                "targets": ladder_r, "next_target_idx": 0, "targets_hit": [],
                 "tp1_pct": 0.50, "tp2_pct": 1.0,
-                # runner mode: adopted positions never attempt a min-lot split —
-                # TP1 just locks SL to +RUNNER_LOCK_R and rides to TP2
-                "tp_mode": "runner",
                 "trail_atr_mult": 2.0,
                 "size": abs(live_size), "remaining_size": abs(live_size),
                 "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,

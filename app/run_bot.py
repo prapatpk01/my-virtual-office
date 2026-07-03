@@ -396,6 +396,35 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             rev_str,
         )
 
+    def _send_target_alerts(sym: str, bot):
+        """Pop and forward any queued target-hit alerts (T1..T4) to Telegram,
+        in the exact format requested: symbol / "TargetN Hit" / price / SL
+        move (or "Take Profit" + close for the final level)."""
+        for alert in bot.pop_target_alerts():
+            if alert["final"]:
+                msg = (
+                    f"🎯 {sym}\n"
+                    f"Target {alert['label'][1:]} Hit — Take Profit\n\n"
+                    f"Price : {alert['price']:.4f}\n"
+                    f"Position closed"
+                )
+            else:
+                msg = (
+                    f"✅ {sym}\n"
+                    f"Target {alert['label'][1:]} Hit\n\n"
+                    f"Price : {alert['price']:.4f}\n\n"
+                    f"SL moved\n"
+                    f"{alert['old_sl']:.4f}\n"
+                    f"↓\n"
+                    f"{alert['new_sl']:.4f}"
+                )
+            logger.info("[Target][%s] %s", sym, alert["label"])
+            if telegram:
+                try:
+                    telegram.send(msg)
+                except Exception:
+                    pass
+
     # Note: periodic Telegram stats removed — too noisy.
     # Use /stats command to check on demand. Railway logs show state every tick.
     # 5-minute health logs are written to Railway log automatically below.
@@ -488,6 +517,9 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             status["market_state"], status["regime_score"],
                         )
 
+                        # [TARGET LADDER] forward T1..T4 hit alerts to Telegram
+                        _send_target_alerts(sym, bot)
+
                         # [LESSON] forward loss-cluster post-mortem to Telegram
                         lesson = bot.pop_lesson_alert()
                         if lesson:
@@ -512,6 +544,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             if action:
                                 logger.info("[Protect][%s] intrabar %s (px=%.4f)",
                                             sym, action, live_px)
+                            _send_target_alerts(sym, bot)
                         except Exception as e:
                             logger.warning("[Protect][%s] intrabar check failed: %s",
                                            sym, e)
