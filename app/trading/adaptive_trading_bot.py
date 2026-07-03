@@ -714,6 +714,37 @@ class TradingBot:
             self._log_event(f"[PAPER] {order_type}: {trade_info}")
             return None
 
+    def _send_amend_sl(self, new_sl: float) -> None:
+        """
+        Push a ladder SL-ratchet (T1-T3) to the real exchange-attached stop
+        order (OKX AMEND_SL), so the live SL tracks the bot's local one
+        instead of staying at the original wider level for the whole trade.
+        Deliberately NOT routed through _send_order: a failed amend is
+        non-fatal here (the position stays protected by whichever SL is
+        currently live on the exchange either way, and local
+        check_price_protection/_manage_open_position remain the fallback) —
+        unlike a failed OPEN/CLOSE, it must never flip the bot to ERROR.
+        No-ops silently when there's no known algo_id (paper/backtest mode,
+        or the id lookup failed at entry).
+        """
+        if not self.execution_callback or not self.current_trade:
+            return
+        algo_id = self.current_trade.get("sl_algo_id")
+        if not algo_id:
+            return
+        try:
+            self.execution_callback("AMEND_SL", {
+                "sl_algo_id": algo_id,
+                "new_sl":     new_sl,
+            })
+            self._log_event(f"[OKX] SL amend requested → {new_sl:.4f}")
+        except Exception as e:
+            self._log_event(
+                f"[WARN] SL amend failed (exchange keeps its prior SL; "
+                f"local price-protection remains the fallback): {e}",
+                level="warning",
+            )
+
     @staticmethod
     def _scale_score(val: float, max_weight: float) -> float:
         return min((min(float(val), 100.0) / 100.0) * max_weight, max_weight)
@@ -1251,6 +1282,7 @@ class TradingBot:
                 f"{label} hit @ {level_price:.4f} ({r}R) → SL {old_sl:.4f} → "
                 f"{t['sl']:.4f} (+{sl_r}R)"
             )
+            self._send_amend_sl(t["sl"])
             self._queue_target_alert(label, level_price, old_sl, t["sl"])
             actions.append(f"{label} @ {level_price:.4f} SL→{t['sl']:.4f}")
 
@@ -1481,6 +1513,7 @@ class TradingBot:
             "targets":              ladder,        # (trigger_R, new_SL_R) list
             "next_target_idx":      0,
             "targets_hit":          [],            # ["T1","T2",...] for stats/lessons
+            "sl_algo_id":           None,          # OKX algoId of the attached SL/TP order (for amends)
             "tp1_pct":              tp1_pct,
             "tp2_pct":              tp2_pct,
             "trail_atr_mult":       trail_atr,
@@ -1539,6 +1572,7 @@ class TradingBot:
                     f"[FILL SYNC] requested {position_size:.6f} → filled {_fc:.6f} coins"
                 )
                 self.current_trade["remaining_size"] = _fc
+            self.current_trade["sl_algo_id"] = _open_result.get("_sl_algo_id")
 
         self.position_open         = True
         self._position_entry_bar   = self._bar_count

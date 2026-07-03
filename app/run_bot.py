@@ -241,7 +241,11 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         def _make_callback(s, t):
             def cb(order_type, trade_info):
                 result = t.execute(order_type, {**trade_info, "symbol": s})
-                if telegram:
+                # AMEND_SL's user-facing notification is already sent by
+                # _send_target_alerts (the exact "Target N Hit / SL moved"
+                # format) — the generic OPEN/CLOSE-shaped message below would
+                # just be misleading noise for this order type.
+                if telegram and order_type != "AMEND_SL":
                     try:
                         if "OPEN" in order_type:
                             msg = (

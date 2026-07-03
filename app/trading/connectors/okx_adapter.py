@@ -332,12 +332,14 @@ class OKXAdapter(BaseConnector):
     def execute(self, order_type: str, trade_info: Dict[str, Any]) -> Optional[Dict]:
         """
         Synchronous execution entry point for AdaptiveTradingBot.
-        order_type: "OPEN_LONG" | "OPEN_SHORT" | "CLOSE_PARTIAL" | "CLOSE_FULL"
+        order_type: "OPEN_LONG" | "OPEN_SHORT" | "CLOSE_PARTIAL" | "CLOSE_FULL" | "AMEND_SL"
         """
         if order_type in ("OPEN_LONG", "OPEN_SHORT"):
             return self._sync_open(order_type, trade_info)
         if order_type in ("CLOSE_PARTIAL", "CLOSE_FULL"):
             return self._sync_close(order_type, trade_info)
+        if order_type == "AMEND_SL":
+            return self._sync_amend_sl(trade_info)
         logger.error("[OKX] Unknown order_type: %s", order_type)
         return None
 
@@ -478,7 +480,95 @@ class OKXAdapter(BaseConnector):
         raw["_filled"]       = filled
         raw["_fill_price"]   = fill_price
         raw["_filled_coins"] = filled * ct_val   # actual size in coins for bot accounting
+
+        # [SL AMEND] Locate the attached SL/TP algo order's id so later ladder
+        # SL-ratchets (T1-T3) can amend the REAL exchange-side stop, not just
+        # the bot's local one. Best-effort: OKX creates this as a derived algo
+        # order a moment after the parent fills, so poll briefly. If it can't
+        # be found, the position keeps its original (wider) exchange SL as
+        # protection — local price-protection remains the fallback either way.
+        raw["_sl_algo_id"] = None
+        if sl is not None and filled > 0:
+            for _ in range(3):
+                algo_id = self._find_attached_sl_algo_id(sym, pos_side)
+                if algo_id:
+                    raw["_sl_algo_id"] = algo_id
+                    break
+                time.sleep(0.5)
+            if not raw["_sl_algo_id"]:
+                logger.warning(
+                    "[OKX] %s: could not locate attached SL algo order after "
+                    "open — SL ratchets will only update locally; exchange "
+                    "keeps the original wider SL as a fallback.", sym,
+                )
         return raw
+
+    def _find_attached_sl_algo_id(self, sym: str, pos_side: str) -> Optional[str]:
+        """
+        Find the algoId of the SL/TP algo order OKX creates when a position is
+        opened with attached stopLoss+takeProfit params (attachAlgoOrds) — it
+        becomes a single 'oco'-type algo order once the parent order fills.
+        Needed so a later ladder SL-ratchet (T1-T3) can amend this order's
+        trigger price instead of leaving the exchange-side stop at its
+        original, wider level for the whole trade.
+        """
+        try:
+            inst_id = self._ex.market(sym)["id"]
+            raw = self._call(
+                self._ex.privateGetTradeOrdersAlgoPending,
+                {"instId": inst_id, "ordType": "oco"},
+                label=f"orders_algo_pending({sym})",
+            )
+            rows = (raw or {}).get("data") or []
+            matches = [r for r in rows if r.get("posSide", pos_side) == pos_side]
+            if not matches:
+                return None
+            matches.sort(key=lambda r: int(r.get("cTime") or 0), reverse=True)
+            return matches[0].get("algoId")
+        except Exception as e:
+            logger.warning(
+                "[OKX] could not locate attached SL/TP algo order for %s: %s",
+                sym, e,
+            )
+            return None
+
+    def _sync_amend_sl(self, trade_info: Dict[str, Any]) -> Dict:
+        """
+        Amend the exchange-attached SL trigger price in place (OKX
+        amend-algo-order), so the real stop on the exchange tracks the bot's
+        local SL ratchet (T1-T3) instead of staying at the original wider
+        level for the whole trade. Only the SL leg is touched — the TP leg
+        (T4/TP2, fixed for the whole trade) is left alone by omitting the
+        newTp* fields, which OKX's amend endpoint treats as "leave unchanged".
+        Raises on failure (network/exchange error) — the caller treats an
+        amend failure as non-fatal (unlike OPEN/CLOSE, this never flips the
+        bot to ERROR: the position stays protected by whichever SL is
+        currently live on the exchange either way).
+        """
+        sym     = self.symbol or trade_info.get("symbol", "")
+        algo_id = trade_info.get("sl_algo_id")
+        new_sl  = trade_info.get("new_sl")
+        if not algo_id or new_sl is None:
+            logger.warning(
+                "[OKX] AMEND_SL skipped for %s: missing algo_id/new_sl (algo_id=%s)",
+                sym, algo_id,
+            )
+            return {"_amended": False}
+
+        inst_id = self._ex.market(sym)["id"]
+        sl_px   = self._ex.price_to_precision(sym, new_sl)
+        resp = self._call(
+            self._ex.privatePostTradeAmendAlgos,
+            {
+                "instId":         inst_id,
+                "algoId":         str(algo_id),
+                "newSlTriggerPx": str(sl_px),
+                "newSlOrdPx":     "-1",   # market-type SL, matches how it was attached at open
+            },
+            label=f"AMEND_SL({sym})",
+        )
+        logger.info("[OKX] AMEND_SL %s algoId=%s newSL=%s → %s", sym, algo_id, sl_px, resp)
+        return {"_amended": True, "_response": resp}
 
     def _sync_close(self, order_type: str, trade_info: Dict[str, Any]) -> Dict:
         sym       = self.symbol or trade_info.get("symbol", "")
