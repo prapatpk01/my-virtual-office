@@ -915,9 +915,35 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         long_gates  = long_gates  & _vol_boost_ok
         short_gates = short_gates & _vol_boost_ok
 
+    # ── Pressure / squeeze-expansion detection (only when "pressure" mode) ────
+    # A "build-up then push" pattern: the prior 1-2 bars coil (contracting range),
+    # then the current bar EXPANDS with a strong directional close — the momentum-
+    # ignition bar. The intuition was that entering on this bar gives a better
+    # average price and fewer stop-outs. Backtest Jan-May 2026 (BTC+XAG+XAU),
+    # train/test split, DISPROVED it: vs relaxed (TRAIN PF 1.95 / TEST PF 1.33),
+    # pressure got TRAIN PF 1.88 / TEST PF 1.18 with SL rate UP (18.0%→20.5%) and
+    # 60% fewer trades. Buying the expansion bar often buys the top OF the
+    # expansion, not the start of the move. Kept off; left for reference.
+    _trig_mode = p.get("final_trigger_mode") or ("strict" if p.get("final_trigger_enabled", False) else "off")
+    pressure_long  = pd.Series(False, index=out.index)
+    pressure_short = pd.Series(False, index=out.index)
+    if _trig_mode == "pressure":
+        _rng      = (out["high"] - out["low"]).replace(0, np.nan)
+        _body_up  = (out["close"] - out["low"])  / _rng   # 1.0 = closed on the high
+        _body_dn  = (out["high"] - out["close"]) / _rng   # 1.0 = closed on the low
+        _pr_ratio = float(p.get("pressure_body_ratio", 0.60))
+        _buildup  = (_rng.shift(1) < _rng.shift(2)) | (_rng.shift(1) < out["atr"].shift(1))
+        _expand   = _rng > _rng.shift(1)
+        pressure_long  = ((out["close"] > out["open"]) & (_body_up >= _pr_ratio)
+                          & _expand & _buildup & (out["close"] > out["close"].shift(1))).fillna(False)
+        pressure_short = ((out["close"] < out["open"]) & (_body_dn >= _pr_ratio)
+                          & _expand & _buildup & (out["close"] < out["close"].shift(1))).fillna(False)
+
     # ── MACD Histogram rising gate: enter early, not after peak ──────────────
     # Requires MACD histogram RISING over 2 bars (sign-agnostic for earlier entry).
     # Blocks the XAG-style "throwback after peak" where MACD is declining.
+    # In "pressure" mode a genuine expansion bar is allowed to satisfy this gate
+    # (price expansion leads MACD), so the entry can land on the ignition bar.
     _macd_hist_l_diag = pd.Series(True, index=out.index)  # diagnostic default
     _macd_hist_s_diag = pd.Series(True, index=out.index)
     if p.get("macd_hist_rising_gate", True):
@@ -925,6 +951,9 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
         _mh_lb          = int(p.get("macd_hist_lookback", 2))  # bars back for the rising check
         hist_rising_l   = macd_hist > macd_hist.shift(_mh_lb)
         hist_rising_s   = macd_hist < macd_hist.shift(_mh_lb)
+        if _trig_mode == "pressure":
+            hist_rising_l = hist_rising_l | pressure_long
+            hist_rising_s = hist_rising_s | pressure_short
         _macd_hist_l_diag = hist_rising_l
         _macd_hist_s_diag = hist_rising_s
         long_gates  = long_gates  & hist_rising_l
@@ -935,14 +964,17 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     # complete setups). "strict" waits for a break of the prior bar's high/low —
     # accurate but enters late at a worse price. "relaxed" only needs the close to
     # rise over the prior close (a softer momentum tick) — enters ~1 bar sooner.
+    # "pressure" fires on the squeeze→expansion ignition bar (build-up then push).
     # False disables it entirely (earliest, most trades).
-    _trig_mode = p.get("final_trigger_mode") or ("strict" if p.get("final_trigger_enabled", False) else "off")
     if _trig_mode == "strict":
         trigger_long  = out["close"] > out["high"].shift(1)
         trigger_short = out["close"] < out["low"].shift(1)
     elif _trig_mode == "relaxed":
         trigger_long  = out["close"] > out["close"].shift(1)
         trigger_short = out["close"] < out["close"].shift(1)
+    elif _trig_mode == "pressure":
+        trigger_long  = pressure_long
+        trigger_short = pressure_short
     else:  # "off"
         trigger_long  = pd.Series(True, index=out.index)
         trigger_short = pd.Series(True, index=out.index)
@@ -1409,6 +1441,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # gate-bottleneck diagnostic — 804 sole-blocks) but still filters bars whose
         # momentum is ticking against the trade, which is why it beats off too.
         final_trigger_mode="relaxed",
+        pressure_body_ratio=0.60,   # "pressure" mode: min close-in-bar ratio for the expansion bar
         # HTF ADX gate: require 1h AND 4h ADX > threshold alongside 15m ADX
         htf_adx_gate=False,
         htf_adx_len=14,
