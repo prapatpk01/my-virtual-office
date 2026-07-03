@@ -1405,9 +1405,16 @@ class TrendContImprovedStrategy(BaseStrategy):
         macd_hist_rising_gate=True,
         macd_hist_lookback=2,   # bars back for the rising check (1 = softer/sooner, 2 = current)
         # MACD-histogram peak/exhaustion filter: block entries where the histogram
-        # has already peaked and is rolling over (buying a weak, exhausting bounce).
-        # Opt-in; lagging by nature (peak confirmed slope_bars later). A/B tested.
-        macd_peak_filter=False,
+        # has already peaked and is rolling over (buying a weak, exhausting bounce —
+        # the ETH/XAU "entered at the top" losses). Backtest Jan-May 2026
+        # (BTC+XAG+XAU), train/test split, on top of volmom:
+        #   volmom       : TEST WR 83.7% PF 1.49 SL 16.3%  T=49
+        #   volmom+peak  : TEST WR 85.4% PF 1.60 SL 14.6%  T=41  (session-best WR/SL)
+        # Higher WR, PF, and the lowest SL rate of the whole tuning effort, at
+        # ~neutral PnL (−$4, noise) for ~16% fewer trades — a quality-over-quantity
+        # step. (OR-combining with macd was proven redundant: the peak filter
+        # removes exactly the OR-added trades, collapsing back to plain macd.)
+        macd_peak_filter=True,
         macd_peak_lookback=6,       # bars to look back for a higher histogram peak
         macd_peak_slope_bars=2,     # bars over which the post-peak decline is measured
         # Momentum confirmation source (the laggiest entry gate): "macd" (old),
