@@ -2471,6 +2471,23 @@ class TradingBot:
             entry_price = float(
                 live_position.get("entryPrice") or live_position.get("entryPx") or 0
             )
+            # [UNITS FIX] ccxt's `contracts` is the raw exchange contract
+            # count (e.g. OKX's "pos"), NOT base-currency coins — using it
+            # directly as size/remaining_size understated or overstated every
+            # PnL calc and, worse, any later PARTIAL close (e.g.
+            # HEALTH_REDUCE's 50%) computes its order size from
+            # remaining_size and would send the wrong real quantity to the
+            # exchange. CLOSE_FULL is safe regardless (it re-fetches the live
+            # contract count directly) but nothing else is.
+            real_size = abs(live_size)
+            try:
+                get_ct_val = getattr(exchange_adapter, "_get_ct_val", None)
+                if get_ct_val is not None:
+                    ct_val = float(get_ct_val(symbol))
+                    if ct_val > 0:
+                        real_size = abs(live_size) * ct_val
+            except Exception as e:
+                self._log_event(f"[RECONCILE] ct_val lookup failed, using raw contract count as size: {e}", level="warning")
             self._log_event(
                 f"[RECONCILE] exchange has unknown {direction} pos (size={abs(live_size)}) "
                 "→ creating trade record from exchange data",
@@ -2521,7 +2538,7 @@ class TradingBot:
                 "sl_algo_id": (real_stop or {}).get("algo_id"),
                 "tp1_pct": 0.50, "tp2_pct": 1.0,
                 "trail_atr_mult": 2.0,
-                "size": abs(live_size), "remaining_size": abs(live_size),
+                "size": real_size, "remaining_size": real_size,
                 "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
                 "break_even_triggered": False, "status": "OPEN",
                 "entry_time": datetime.datetime.now(datetime.timezone.utc),
