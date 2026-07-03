@@ -2429,6 +2429,13 @@ class TradingBot:
             )
             self.position_open = False
             self.current_trade = {}
+            # [WHIPSAW GUARD] A close that happens outside _close_position()
+            # (manual close on the exchange, or an exchange-side TP/SL that
+            # fired while the bot was offline) never stamped _last_close_at —
+            # the entry-spacing cooldown was silently bypassed for every
+            # externally-closed position. Stamp it here too, same as a
+            # bot-initiated close.
+            self._last_close_at = datetime.datetime.now(datetime.timezone.utc)
             if self.state == "ERROR":
                 # A close that raced an exchange-side TP/SL fill lands here:
                 # exchange is flat, local cleared — the error is stale, recover.
