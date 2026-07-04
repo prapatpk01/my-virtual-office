@@ -1,5 +1,5 @@
 """
-AI Signal strategy v5 — API-free, multi-timeframe, regime-adaptive, execution-tuned.
+AI Signal strategy v5 — API-free, multi-timeframe, regime-adaptive, all-weather tuned.
 
 Architecture (top-down):
   4h candles  → detect_regime()         — TRENDING/RANGING/VOLATILE/LOW_CONVICTION
@@ -11,7 +11,7 @@ Architecture (top-down):
 
 Execution goals:
   - Stay tradable across trending, ranging, and volatile regimes.
-  - Be more responsive when market structure, bias, and trigger stack align.
+  - Balance responsiveness with trade quality instead of optimizing only for speed.
   - Avoid low-quality trades caused by thin volume, invalid ATR, or deep bias conflict.
   - Emit rich telemetry so live-debugging, backtests, and analytics can explain every decision.
 """
@@ -32,47 +32,6 @@ from .mtf_regime import (
 
 
 class AISignalStrategy(BaseStrategy):
-    """
-    Multi-timeframe, regime-adaptive signal strategy.
-
-    No external API dependency — fully deterministic, indicator-based.
-    Keeps the same class name and interface as the original AISignalStrategy
-    so all existing bot wiring continues to work without changes.
-
-    Params (all optional, with sensible defaults):
-      position_pct        — legacy position fraction (0.05); overridden by
-                             RiskManager dynamic sizing when sl_dist_pct and
-                             risk_pct are present.
-      vol_period          — lookback for volume filter (default 20)
-      vol_threshold       — minimum vol_ratio to trade (default 0.70)
-      min_15m             — minimum 15m candles required (default 40)
-      min_1h              — minimum 1h candles required (default 55)
-      min_4h              — minimum 4h candles required (default 40)
-
-      tie_break_policy    — how to resolve near-equal long/short scores that
-                             both clear the entry threshold:
-                               "hold"   — do nothing, stay flat (default, safest)
-                               "bias"   — take the side the 1h bias favors
-                               "regime" — take the side the 4h regime favors,
-                                          falling back to bias if regime is
-                                          non-directional (e.g. RANGING)
-      tie_tolerance       — abs(long_score - short_score) <= tolerance is
-                             considered a tie (default 1e-6)
-
-      atr_guard_enabled   — if True, an invalid ATR aborts trade-plan
-                             construction and returns HOLD instead (default True)
-      atr_min_value       — minimum ATR value accepted as valid (default 1e-10)
-
-      fast_entry_enabled  — slightly lower the effective threshold when multiple
-                             high-quality alignment conditions agree (default True)
-      fast_entry_max_bonus — max threshold reduction from alignment bonus
-                             (default 0.35 score units)
-      countertrend_penalty — threshold penalty when trading against 1h bias
-                             in non-trending regimes (default 0.20)
-      min_score_separation — minimum score advantage preferred before selecting
-                             one side over another without tie logic (default 0.15)
-    """
-
     MTF_TIMEFRAMES = ["1h", "4h"]
 
     DEFAULTS = {
@@ -82,14 +41,19 @@ class AISignalStrategy(BaseStrategy):
         "min_15m": 40,
         "min_1h": 55,
         "min_4h": 40,
-        "tie_break_policy": "hold",
-        "tie_tolerance": 1e-6,
+        "tie_break_policy": "bias",
+        "tie_tolerance": 0.03,
         "atr_guard_enabled": True,
         "atr_min_value": 1e-10,
         "fast_entry_enabled": True,
-        "fast_entry_max_bonus": 0.35,
-        "countertrend_penalty": 0.20,
-        "min_score_separation": 0.15,
+        "fast_entry_max_bonus": 0.18,
+        "countertrend_penalty": 0.26,
+        "min_score_separation": 0.22,
+        "range_threshold_discount": 0.08,
+        "volatile_threshold_buffer": 0.10,
+        "trend_threshold_discount": 0.06,
+        "bias_neutral_band": 0.35,
+        "min_confidence_floor": 0.52,
     }
     VALID_TIE_BREAK_POLICIES = {"hold", "bias", "regime"}
 
@@ -100,21 +64,13 @@ class AISignalStrategy(BaseStrategy):
         self.position_pct = self._sanitize_float(
             "position_pct", self.DEFAULTS["position_pct"], minimum=0.0, maximum=1.0, strict_min=True
         )
-        self.vol_period = self._sanitize_int(
-            "vol_period", self.DEFAULTS["vol_period"], minimum=1
-        )
+        self.vol_period = self._sanitize_int("vol_period", self.DEFAULTS["vol_period"], minimum=1)
         self.vol_threshold = self._sanitize_float(
             "vol_threshold", self.DEFAULTS["vol_threshold"], minimum=0.0, strict_min=True
         )
-        self.min_15m = self._sanitize_int(
-            "min_15m", self.DEFAULTS["min_15m"], minimum=20
-        )
-        self.min_1h = self._sanitize_int(
-            "min_1h", self.DEFAULTS["min_1h"], minimum=20
-        )
-        self.min_4h = self._sanitize_int(
-            "min_4h", self.DEFAULTS["min_4h"], minimum=20
-        )
+        self.min_15m = self._sanitize_int("min_15m", self.DEFAULTS["min_15m"], minimum=20)
+        self.min_1h = self._sanitize_int("min_1h", self.DEFAULTS["min_1h"], minimum=20)
+        self.min_4h = self._sanitize_int("min_4h", self.DEFAULTS["min_4h"], minimum=20)
 
         raw_policy = str(self.params.get("tie_break_policy", self.DEFAULTS["tie_break_policy"]))
         policy = raw_policy.strip().lower()
@@ -125,18 +81,12 @@ class AISignalStrategy(BaseStrategy):
             policy = self.DEFAULTS["tie_break_policy"]
         self.tie_break_policy = policy
 
-        self.tie_tolerance = self._sanitize_float(
-            "tie_tolerance", self.DEFAULTS["tie_tolerance"], minimum=0.0
-        )
-        self.atr_guard_enabled = self._sanitize_bool(
-            "atr_guard_enabled", self.DEFAULTS["atr_guard_enabled"]
-        )
+        self.tie_tolerance = self._sanitize_float("tie_tolerance", self.DEFAULTS["tie_tolerance"], minimum=0.0)
+        self.atr_guard_enabled = self._sanitize_bool("atr_guard_enabled", self.DEFAULTS["atr_guard_enabled"])
         self.atr_min_value = self._sanitize_float(
             "atr_min_value", self.DEFAULTS["atr_min_value"], minimum=0.0, strict_min=True
         )
-        self.fast_entry_enabled = self._sanitize_bool(
-            "fast_entry_enabled", self.DEFAULTS["fast_entry_enabled"]
-        )
+        self.fast_entry_enabled = self._sanitize_bool("fast_entry_enabled", self.DEFAULTS["fast_entry_enabled"])
         self.fast_entry_max_bonus = self._sanitize_float(
             "fast_entry_max_bonus", self.DEFAULTS["fast_entry_max_bonus"], minimum=0.0
         )
@@ -146,13 +96,23 @@ class AISignalStrategy(BaseStrategy):
         self.min_score_separation = self._sanitize_float(
             "min_score_separation", self.DEFAULTS["min_score_separation"], minimum=0.0
         )
+        self.range_threshold_discount = self._sanitize_float(
+            "range_threshold_discount", self.DEFAULTS["range_threshold_discount"], minimum=0.0
+        )
+        self.volatile_threshold_buffer = self._sanitize_float(
+            "volatile_threshold_buffer", self.DEFAULTS["volatile_threshold_buffer"], minimum=0.0
+        )
+        self.trend_threshold_discount = self._sanitize_float(
+            "trend_threshold_discount", self.DEFAULTS["trend_threshold_discount"], minimum=0.0
+        )
+        self.bias_neutral_band = self._sanitize_float(
+            "bias_neutral_band", self.DEFAULTS["bias_neutral_band"], minimum=0.0
+        )
+        self.min_confidence_floor = self._sanitize_float(
+            "min_confidence_floor", self.DEFAULTS["min_confidence_floor"], minimum=0.0, maximum=0.95
+        )
 
-    async def analyze(
-        self,
-        candles: list,
-        current_price: float,
-        mtf_candles: dict = None,
-    ) -> Signal:
+    async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
         mtf = mtf_candles or {}
         candles_1h = mtf.get("1h", [])
         candles_4h = mtf.get("4h", [])
@@ -206,9 +166,7 @@ class AISignalStrategy(BaseStrategy):
                 ),
             )
 
-        vol_valid, vol_ratio = volume_ok(
-            candles, period=self.vol_period, threshold=self.vol_threshold
-        )
+        vol_valid, vol_ratio = volume_ok(candles, period=self.vol_period, threshold=self.vol_threshold)
         if not vol_valid:
             return self._hold(
                 current_price,
@@ -301,8 +259,9 @@ class AISignalStrategy(BaseStrategy):
         long_ok = long_score >= long_threshold
         short_ok = short_score >= short_threshold
         score_gap = abs(long_score - short_score)
+        tie_band = max(self.tie_tolerance, self.min_score_separation)
         is_tie = score_gap <= self.tie_tolerance
-        near_tie = score_gap <= max(self.tie_tolerance, self.min_score_separation)
+        near_tie = score_gap <= tie_band
 
         decision_meta = self._decision_meta(
             **base_meta,
@@ -311,6 +270,7 @@ class AISignalStrategy(BaseStrategy):
             score_gap=score_gap,
             tie_detected=is_tie,
             near_tie=near_tie,
+            tie_band=tie_band,
         )
 
         if long_ok and short_ok:
@@ -430,49 +390,68 @@ class AISignalStrategy(BaseStrategy):
         opposing_score: float,
     ):
         threshold = float(base_threshold)
-        alignment_bonus = 0.0
-        countertrend_penalty = 0.0
-        high_conviction_bonus = 0.0
-        score_advantage_bonus = 0.0
         bias_aligned = (side == "long" and bias_score > 0) or (side == "short" and bias_score < 0)
-        strong_bias = abs(bias_score) >= 2.0
-        healthy_volume = vol_ratio >= max(self.vol_threshold + 0.15, 0.95)
+        bias_strength = abs(bias_score)
         score_advantage = score - opposing_score
+        healthy_volume = vol_ratio >= max(self.vol_threshold + 0.12, 0.90)
+        strong_volume = vol_ratio >= max(self.vol_threshold + 0.28, 1.05)
+        directional_regime_match = (
+            (regime == RegimeType.TRENDING_UP and side == "long") or
+            (regime == RegimeType.TRENDING_DOWN and side == "short")
+        )
 
-        if self.fast_entry_enabled and bias_aligned and strong_bias:
-            alignment_bonus += min(self.fast_entry_max_bonus * 0.45, 0.16)
+        regime_adjustment = 0.0
+        if regime in (RegimeType.RANGING, RegimeType.VOLATILE):
+            regime_adjustment -= self.range_threshold_discount if regime == RegimeType.RANGING else 0.0
+            regime_adjustment += self.volatile_threshold_buffer if regime == RegimeType.VOLATILE else 0.0
+        elif directional_regime_match:
+            regime_adjustment -= self.trend_threshold_discount
+
+        alignment_bonus = 0.0
+        if self.fast_entry_enabled and bias_aligned and bias_strength >= 1.0:
+            alignment_bonus += min(self.fast_entry_max_bonus * 0.35, 0.08)
+        if self.fast_entry_enabled and bias_aligned and bias_strength >= 2.0:
+            alignment_bonus += min(self.fast_entry_max_bonus * 0.20, 0.04)
         if self.fast_entry_enabled and healthy_volume:
-            alignment_bonus += min(self.fast_entry_max_bonus * 0.25, 0.09)
-        if self.fast_entry_enabled and regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN):
-            directional_regime_match = (
-                (regime == RegimeType.TRENDING_UP and side == "long") or
-                (regime == RegimeType.TRENDING_DOWN and side == "short")
-            )
-            if directional_regime_match:
-                alignment_bonus += min(self.fast_entry_max_bonus * 0.30, 0.10)
-        if self.fast_entry_enabled and score >= base_threshold + 0.75:
-            high_conviction_bonus = min(self.fast_entry_max_bonus * 0.20, 0.06)
-        if self.fast_entry_enabled and score_advantage >= self.min_score_separation * 2:
-            score_advantage_bonus = min(self.fast_entry_max_bonus * 0.20, 0.05)
+            alignment_bonus += min(self.fast_entry_max_bonus * 0.20, 0.04)
+        if self.fast_entry_enabled and strong_volume:
+            alignment_bonus += min(self.fast_entry_max_bonus * 0.15, 0.03)
+        if self.fast_entry_enabled and directional_regime_match:
+            alignment_bonus += min(self.fast_entry_max_bonus * 0.20, 0.04)
 
-        if regime in (RegimeType.RANGING, RegimeType.VOLATILE) and not bias_aligned and abs(bias_score) >= 1.0:
-            countertrend_penalty = self.countertrend_penalty
+        quality_bonus = 0.0
+        if self.fast_entry_enabled and score >= base_threshold + 0.60:
+            quality_bonus += min(self.fast_entry_max_bonus * 0.10, 0.02)
+        if self.fast_entry_enabled and score_advantage >= self.min_score_separation * 1.5:
+            quality_bonus += min(self.fast_entry_max_bonus * 0.10, 0.02)
 
-        raw_bonus = alignment_bonus + high_conviction_bonus + score_advantage_bonus
-        threshold_bonus = min(raw_bonus, self.fast_entry_max_bonus)
-        threshold = max(0.1, threshold - threshold_bonus + countertrend_penalty)
+        countertrend_penalty = 0.0
+        if regime in (RegimeType.RANGING, RegimeType.VOLATILE) and not bias_aligned and bias_strength >= 1.0:
+            countertrend_penalty += self.countertrend_penalty
+        if directional_regime_match is False and regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN):
+            countertrend_penalty += self.countertrend_penalty * 0.5
+
+        neutral_bias_bonus = 0.0
+        if bias_strength <= self.bias_neutral_band and regime == RegimeType.RANGING:
+            neutral_bias_bonus = min(self.fast_entry_max_bonus * 0.15, 0.02)
+
+        threshold_bonus = min(alignment_bonus + quality_bonus + neutral_bias_bonus, self.fast_entry_max_bonus)
+        threshold = max(0.12, threshold + regime_adjustment - threshold_bonus + countertrend_penalty)
 
         return threshold, {
             "base_threshold": round(float(base_threshold), 4),
             "effective_threshold": round(float(threshold), 4),
+            "regime_adjustment": round(float(regime_adjustment), 4),
             "fast_entry_enabled": self.fast_entry_enabled,
             "bias_aligned": bias_aligned,
-            "strong_bias": strong_bias,
+            "bias_strength": round(float(bias_strength), 4),
             "healthy_volume": healthy_volume,
+            "strong_volume": strong_volume,
+            "directional_regime_match": directional_regime_match,
             "score_advantage": round(float(score_advantage), 4),
             "alignment_bonus": round(float(alignment_bonus), 4),
-            "high_conviction_bonus": round(float(high_conviction_bonus), 4),
-            "score_advantage_bonus": round(float(score_advantage_bonus), 4),
+            "quality_bonus": round(float(quality_bonus), 4),
+            "neutral_bias_bonus": round(float(neutral_bias_bonus), 4),
             "threshold_bonus": round(float(threshold_bonus), 4),
             "countertrend_penalty": round(float(countertrend_penalty), 4),
         }
@@ -482,14 +461,12 @@ class AISignalStrategy(BaseStrategy):
 
         if policy == "hold":
             return None
-
         if policy == "bias":
             if bias_score > 0:
                 return "long"
             if bias_score < 0:
                 return "short"
             return None
-
         if policy == "regime":
             if regime == RegimeType.TRENDING_UP:
                 return "long"
@@ -500,7 +477,6 @@ class AISignalStrategy(BaseStrategy):
             if bias_score < 0:
                 return "short"
             return None
-
         return None
 
     def _sanitize_bool(self, key: str, default: bool) -> bool:
@@ -531,14 +507,7 @@ class AISignalStrategy(BaseStrategy):
             return default
         return parsed
 
-    def _sanitize_float(
-        self,
-        key: str,
-        default: float,
-        minimum: float = None,
-        maximum: float = None,
-        strict_min: bool = False,
-    ) -> float:
+    def _sanitize_float(self, key: str, default: float, minimum: float = None, maximum: float = None, strict_min: bool = False) -> float:
         value = self.params.get(key, default)
         try:
             parsed = float(value)
@@ -574,6 +543,7 @@ class AISignalStrategy(BaseStrategy):
     def _decision_meta(self, **extra) -> dict:
         meta = {
             "strategy": "AISignalStrategy",
+            "profile": "all_weather",
             "api_free": True,
             "tie_break_policy": self.tie_break_policy,
             "position_pct": self.position_pct,
@@ -588,6 +558,11 @@ class AISignalStrategy(BaseStrategy):
             "fast_entry_max_bonus": self.fast_entry_max_bonus,
             "countertrend_penalty": self.countertrend_penalty,
             "min_score_separation": self.min_score_separation,
+            "range_threshold_discount": self.range_threshold_discount,
+            "volatile_threshold_buffer": self.volatile_threshold_buffer,
+            "trend_threshold_discount": self.trend_threshold_discount,
+            "bias_neutral_band": self.bias_neutral_band,
+            "min_confidence_floor": self.min_confidence_floor,
             "param_warnings": list(self._param_warnings),
         }
         meta.update(extra)
@@ -603,6 +578,7 @@ class AISignalStrategy(BaseStrategy):
             "short_threshold": 4,
             "best_threshold": 4,
             "score_gap": 6,
+            "tie_band": 6,
             "entry_score": 4,
             "atr_value": 10,
             "confidence": 4,
@@ -611,23 +587,8 @@ class AISignalStrategy(BaseStrategy):
                 meta[key] = round(float(meta[key]), digits)
         return meta
 
-    def _build_signal(
-        self,
-        candles: list,
-        price: float,
-        side: str,
-        score: float,
-        factors: list[str],
-        entry_debug: dict,
-        regime: RegimeType,
-        bias_score: float,
-        base_meta: dict,
-        threshold: float,
-        long_score: float,
-        short_score: float,
-    ) -> Signal:
+    def _build_signal(self, candles: list, price: float, side: str, score: float, factors: list[str], entry_debug: dict, regime: RegimeType, bias_score: float, base_meta: dict, threshold: float, long_score: float, short_score: float) -> Signal:
         sig_type = SignalType.BUY if side == "long" else SignalType.SELL
-
         conf = self._compute_confidence(
             score=score,
             threshold=threshold,
@@ -640,7 +601,6 @@ class AISignalStrategy(BaseStrategy):
 
         atr_arr = self.atr(candles, 14)
         atr_val = float(atr_arr[-1]) if len(atr_arr) > 0 and not np.isnan(atr_arr[-1]) else 0.0
-
         if self.atr_guard_enabled and atr_val <= self.atr_min_value:
             return self._hold(
                 price,
@@ -659,13 +619,9 @@ class AISignalStrategy(BaseStrategy):
 
         trade_plan = build_trade_plan(price, atr_val, side)
         uses_risk_managed_sizing = bool(trade_plan.get("sl_dist_pct"))
-
         sj = round(conf * 100 + score * 20, 2)
         factor_str = "+".join(factors[:4]) if factors else "no_factors"
-        reason = (
-            f"[MTF] {side.upper()} regime={regime.value} "
-            f"score={score:.2f} bias={bias_score:.1f} [{factor_str}]"
-        )
+        reason = f"[MTF] {side.upper()} regime={regime.value} score={score:.2f} bias={bias_score:.1f} [{factor_str}]"
 
         metadata = self._decision_meta(
             decision="buy" if side == "long" else "sell",
@@ -708,16 +664,7 @@ class AISignalStrategy(BaseStrategy):
             metadata=metadata,
         )
 
-    def _compute_confidence(
-        self,
-        score: float,
-        threshold: float,
-        side: str,
-        regime: RegimeType,
-        bias_score: float,
-        long_score: float,
-        short_score: float,
-    ) -> float:
+    def _compute_confidence(self, score: float, threshold: float, side: str, regime: RegimeType, bias_score: float, long_score: float, short_score: float) -> float:
         components = self._confidence_breakdown(
             score=score,
             threshold=threshold,
@@ -733,36 +680,28 @@ class AISignalStrategy(BaseStrategy):
             + components["separation_bonus"]
             + components["regime_bonus"]
             + components["bias_bonus"]
-            + components["velocity_bonus"]
+            + components["stability_bonus"]
         )
-        return round(max(0.0, min(conf, 0.97)), 4)
+        conf = max(self.min_confidence_floor, conf)
+        return round(max(0.0, min(conf, 0.95)), 4)
 
-    def _confidence_breakdown(
-        self,
-        score: float,
-        threshold: float,
-        side: str,
-        regime: RegimeType,
-        bias_score: float,
-        long_score: float,
-        short_score: float,
-    ) -> dict:
+    def _confidence_breakdown(self, score: float, threshold: float, side: str, regime: RegimeType, bias_score: float, long_score: float, short_score: float) -> dict:
         edge = max(0.0, score - threshold)
         separation = abs(long_score - short_score)
-        base = 0.50
-        edge_bonus = min(edge * 0.20, 0.20)
-        separation_bonus = min(separation * 0.08, 0.12)
+        base = 0.48
+        edge_bonus = min(edge * 0.16, 0.16)
+        separation_bonus = min(separation * 0.06, 0.10)
         regime_bonus = 0.0
-        if (regime == RegimeType.TRENDING_UP and side == "long") or (
-            regime == RegimeType.TRENDING_DOWN and side == "short"
-        ):
-            regime_bonus = 0.07
+        if (regime == RegimeType.TRENDING_UP and side == "long") or (regime == RegimeType.TRENDING_DOWN and side == "short"):
+            regime_bonus = 0.06
+        elif regime == RegimeType.RANGING:
+            regime_bonus = 0.03
         bias_bonus = 0.0
         if (side == "long" and bias_score > 0) or (side == "short" and bias_score < 0):
-            bias_bonus = min(abs(bias_score) * 0.015, 0.06)
-        velocity_bonus = 0.0
-        if edge >= 0.35 and separation >= self.min_score_separation:
-            velocity_bonus = 0.04
+            bias_bonus = min(abs(bias_score) * 0.0125, 0.05)
+        stability_bonus = 0.0
+        if edge >= 0.20 and separation >= self.min_score_separation:
+            stability_bonus = 0.03
         return {
             "base": round(base, 4),
             "edge": round(edge, 4),
@@ -771,5 +710,5 @@ class AISignalStrategy(BaseStrategy):
             "separation_bonus": round(separation_bonus, 4),
             "regime_bonus": round(regime_bonus, 4),
             "bias_bonus": round(bias_bonus, 4),
-            "velocity_bonus": round(velocity_bonus, 4),
+            "stability_bonus": round(stability_bonus, 4),
         }
