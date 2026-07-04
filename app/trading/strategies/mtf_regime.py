@@ -28,6 +28,11 @@ class RegimeType(str, Enum):
 _VOLATILE_ATR_PCT = 0.030
 _LOW_CONVICTION_ADX = 15
 _STRONG_TREND_ADX = 25
+_MODERATE_TREND_ADX = 20
+_STRUCTURAL_TREND_EMA_GAP_PCT = 0.006
+_STRUCTURAL_TREND_SLOPE_PCT = 0.004
+_RANGE_COMPRESSION_ATR_PCT = 0.018
+_OBV_SLOPE_MIN = 0.0
 
 _RSI_BULL_BIAS = 55.0
 _RSI_BEAR_BIAS = 45.0
@@ -65,17 +70,26 @@ BIAS_MISALIGN_SHORT_MAX = 1.0
 
 
 def detect_regime(candles_4h: list, min_candles: int = 40) -> tuple[RegimeType, dict]:
+    """
+    Step 3 hardening:
+      - Add structural confirmation beyond raw ADX/ATR.
+      - Reduce misclassification between weak trend and range.
+      - Use EMA gap/slope, recent price travel, and OBV slope to validate trend quality.
+    """
     n = len(candles_4h)
     if n < min_candles:
         return RegimeType.LOW_CONVICTION, {"reason": "insufficient_4h_data", "n": n}
 
     closes = [float(c.close) for c in candles_4h]
+    highs = [float(c.high) for c in candles_4h]
+    lows = [float(c.low) for c in candles_4h]
     price = closes[-1]
 
     adx_arr, plus_di_arr, minus_di_arr = BaseStrategy.adx(candles_4h, 14)
     adx = float(adx_arr[-1]) if not np.isnan(adx_arr[-1]) else 0.0
-    pdi = float(plus_di_arr[-1])
-    mdi = float(minus_di_arr[-1])
+    pdi = float(plus_di_arr[-1]) if not np.isnan(plus_di_arr[-1]) else 0.0
+    mdi = float(minus_di_arr[-1]) if not np.isnan(minus_di_arr[-1]) else 0.0
+    di_spread = pdi - mdi
 
     atr_arr = BaseStrategy.atr(candles_4h, 14)
     atr4h = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0.0
@@ -85,38 +99,113 @@ def detect_regime(candles_4h: list, min_candles: int = 40) -> tuple[RegimeType, 
     ema50_arr = BaseStrategy.ema(closes, 50)
     ema20 = float(ema20_arr[-1]) if not np.isnan(ema20_arr[-1]) else price
     ema50 = float(ema50_arr[-1]) if not np.isnan(ema50_arr[-1]) else price
+    ema20_prev = float(ema20_arr[-4]) if len(ema20_arr) >= 4 and not np.isnan(ema20_arr[-4]) else ema20
+    ema50_prev = float(ema50_arr[-4]) if len(ema50_arr) >= 4 and not np.isnan(ema50_arr[-4]) else ema50
+
+    ema_gap_pct = ((ema20 - ema50) / price) if price > 0 else 0.0
+    ema20_slope_pct = ((ema20 - ema20_prev) / ema20_prev) if ema20_prev not in (0, np.nan) else 0.0
+    ema50_slope_pct = ((ema50 - ema50_prev) / ema50_prev) if ema50_prev not in (0, np.nan) else 0.0
+    slope_sum = ema20_slope_pct + ema50_slope_pct
 
     obv_arr = BaseStrategy.obv(candles_4h)
     lookback = min(10, n - 1)
     obv_slope = (obv_arr[-1] - obv_arr[-lookback - 1]) if lookback > 0 else 0.0
 
+    recent_lookback = min(12, n)
+    recent_high = max(highs[-recent_lookback:]) if recent_lookback > 0 else price
+    recent_low = min(lows[-recent_lookback:]) if recent_lookback > 0 else price
+    recent_range_pct = ((recent_high - recent_low) / price) if price > 0 else 0.0
+    close_travel_pct = ((closes[-1] - closes[-recent_lookback]) / closes[-recent_lookback]) if recent_lookback > 1 and closes[-recent_lookback] > 0 else 0.0
+    price_above_ema20 = price > ema20
+    price_below_ema20 = price < ema20
+
+    structural_up = (
+        ema_gap_pct >= _STRUCTURAL_TREND_EMA_GAP_PCT and
+        slope_sum >= _STRUCTURAL_TREND_SLOPE_PCT and
+        di_spread > 0 and
+        close_travel_pct > 0 and
+        price_above_ema20 and
+        obv_slope >= _OBV_SLOPE_MIN
+    )
+    structural_down = (
+        ema_gap_pct <= -_STRUCTURAL_TREND_EMA_GAP_PCT and
+        slope_sum <= -_STRUCTURAL_TREND_SLOPE_PCT and
+        di_spread < 0 and
+        close_travel_pct < 0 and
+        price_below_ema20 and
+        obv_slope <= -_OBV_SLOPE_MIN
+    )
+    compressed_range = (
+        atr_pct <= _RANGE_COMPRESSION_ATR_PCT and
+        abs(ema_gap_pct) < _STRUCTURAL_TREND_EMA_GAP_PCT and
+        abs(close_travel_pct) < 0.02 and
+        recent_range_pct < 0.08
+    )
+
     debug = {
         "adx_4h": round(adx, 2),
         "pdi_4h": round(pdi, 2),
         "mdi_4h": round(mdi, 2),
+        "di_spread": round(di_spread, 3),
         "atr_pct_4h": round(atr_pct * 100, 3),
         "ema20_4h": round(ema20, 4),
         "ema50_4h": round(ema50, 4),
+        "ema_gap_pct": round(ema_gap_pct * 100, 4),
+        "ema20_slope_pct": round(ema20_slope_pct * 100, 4),
+        "ema50_slope_pct": round(ema50_slope_pct * 100, 4),
+        "slope_sum_pct": round(slope_sum * 100, 4),
         "obv_slope": round(float(obv_slope), 2),
+        "recent_range_pct": round(recent_range_pct * 100, 4),
+        "close_travel_pct": round(close_travel_pct * 100, 4),
+        "price_above_ema20": price_above_ema20,
+        "price_below_ema20": price_below_ema20,
+        "structural_up": structural_up,
+        "structural_down": structural_down,
+        "compressed_range": compressed_range,
     }
 
     if atr_pct > _VOLATILE_ATR_PCT:
+        if structural_up:
+            debug["regime_reason"] = "volatile_but_structural_up"
+            return RegimeType.TRENDING_UP, debug
+        if structural_down:
+            debug["regime_reason"] = "volatile_but_structural_down"
+            return RegimeType.TRENDING_DOWN, debug
         debug["regime_reason"] = "atr_pct_high"
         return RegimeType.VOLATILE, debug
 
     if adx < _LOW_CONVICTION_ADX:
+        if compressed_range:
+            debug["regime_reason"] = "adx_low_compressed_range"
+            return RegimeType.RANGING, debug
         debug["regime_reason"] = "adx_low"
         return RegimeType.LOW_CONVICTION, debug
 
     if adx >= _STRONG_TREND_ADX:
-        if pdi > mdi and ema20 >= ema50:
-            debug["regime_reason"] = "adx_trending_up"
+        if structural_up or (pdi > mdi and ema20 >= ema50 and close_travel_pct > 0):
+            debug["regime_reason"] = "adx_trending_up_structural"
             return RegimeType.TRENDING_UP, debug
-        if mdi > pdi and ema20 <= ema50:
-            debug["regime_reason"] = "adx_trending_down"
+        if structural_down or (mdi > pdi and ema20 <= ema50 and close_travel_pct < 0):
+            debug["regime_reason"] = "adx_trending_down_structural"
             return RegimeType.TRENDING_DOWN, debug
 
-    debug["regime_reason"] = "ranging"
+    if adx >= _MODERATE_TREND_ADX:
+        if structural_up:
+            debug["regime_reason"] = "moderate_adx_structural_up"
+            return RegimeType.TRENDING_UP, debug
+        if structural_down:
+            debug["regime_reason"] = "moderate_adx_structural_down"
+            return RegimeType.TRENDING_DOWN, debug
+
+    if compressed_range:
+        debug["regime_reason"] = "compressed_range"
+        return RegimeType.RANGING, debug
+
+    if recent_range_pct >= 0.10 and abs(close_travel_pct) < 0.02:
+        debug["regime_reason"] = "wide_range_without_travel"
+        return RegimeType.VOLATILE, debug
+
+    debug["regime_reason"] = "default_ranging"
     return RegimeType.RANGING, debug
 
 
@@ -264,16 +353,6 @@ def _score_factors(
     bias: float,
     min_candles: int = 40,
 ) -> tuple[float, list[str], dict]:
-    """
-    Score a potential entry trigger on 15m candles.
-
-    Step 2 hardening:
-      - Factor weights adapt more clearly by regime.
-      - Trend regime favors continuation + aligned pullbacks.
-      - Range regime favors mean-reversion + exhaustion.
-      - Volatile regime demands stronger confirmation and volume support.
-      - Bias alignment now affects factor quality instead of only downstream gating.
-    """
     n = len(candles_15m)
     if n < min_candles:
         return 0.0, [], {"reason": "insufficient_15m_data"}
