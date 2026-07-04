@@ -166,7 +166,7 @@ Respond ONLY with a JSON object in this exact format:
             confidence = self._clip(self._safe_float(parsed.get("confidence", 0.5), 0.5), 0.0, 1.0)
             reason = str(parsed.get("reason", "AI analysis"))[:self.MAX_REASON_LENGTH]
 
-            analysis = parsed.get("systematic_thinking", {}) or {}
+            analysis = parsed.get("systematic_thinking") or {}
             scores = self._normalize_component_scores(analysis)
             computed_total = sum(scores.values())
             sig_type = self._derive_signal_from_score(computed_total)
