@@ -91,7 +91,7 @@ class AISignalStrategy(BaseStrategy):
         curr_atr = float(atr_vals[-1]) if not np.isnan(atr_vals[-1]) else None
 
         prev_close = closes[-2] if len(closes) >= 2 else closes[-1]
-        price_change_pct = ((closes[-1] - prev_close) / prev_close * 100.0) if prev_close else 0.0
+        price_change_pct = ((closes[-1] - prev_close) / prev_close * 100.0) if prev_close != 0 else 0.0
         returns = np.diff(np.array(closes, dtype=float)) / np.array(closes[:-1], dtype=float)
         volatility_pct = float(np.std(returns) * 100.0) if len(returns) > 0 else 0.0
         avg_vol_5 = float(np.mean([c.volume for c in recent[-5:]])) if len(recent) >= 5 else float(recent[-1].volume)
@@ -155,7 +155,10 @@ Respond ONLY with a JSON object in this exact format:
                 text = text.split("```")[1].lstrip("json").strip()
             parsed = json.loads(text)
             llm_signal_raw = str(parsed.get("signal", "hold")).lower()
-            llm_signal = SignalType(llm_signal_raw) if llm_signal_raw in SignalType._value2member_map_ else SignalType.HOLD
+            try:
+                llm_signal = SignalType(llm_signal_raw)
+            except ValueError:
+                llm_signal = SignalType.HOLD
             confidence = self._clip(self._safe_float(parsed.get("confidence", 0.5), 0.5), 0.0, 1.0)
             reason = str(parsed.get("reason", "AI analysis"))[:100]
 
