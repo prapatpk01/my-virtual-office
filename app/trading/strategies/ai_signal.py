@@ -86,6 +86,12 @@ class AISignalStrategy(BaseStrategy):
     DEFAULT_TIE_TOLERANCE = 1e-6
     DEFAULT_ATR_GUARD_ENABLED = True
     DEFAULT_ATR_MIN_VALUE = 1e-10
+    CONF_SCORE_NORMALIZER = 4.0
+    CONF_EDGE_NORMALIZER = 2.0
+    CONF_BASE = 0.35
+    CONF_SCORE_WEIGHT = 0.35
+    CONF_THRESHOLD_WEIGHT = 0.20
+    CONF_SEPARATION_WEIGHT = 0.10
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
@@ -143,7 +149,7 @@ class AISignalStrategy(BaseStrategy):
 
         # ATR guard configuration
         self.atr_guard_enabled = self._safe_bool(
-            self.params.get("atr_guard_enabled", self.DEFAULT_ATR_GUARD_ENABLED),
+            self.params.get("atr_guard_enabled"),
             self.DEFAULT_ATR_GUARD_ENABLED,
         )
         self.atr_min_value = self._safe_float_in_range(
@@ -321,8 +327,9 @@ class AISignalStrategy(BaseStrategy):
             elif score_delta < 0:
                 side = "short"
             else:
-                side = self._resolve_tie(regime, bias_score)
-                tie_break_used = True
+                # Defensive fallback: if both sides are valid and score ordering is
+                # still unresolved, pick deterministically instead of falling through.
+                side = "long" if long_score >= short_score else "short"
 
             if side is None:
                 return self._hold(
@@ -454,8 +461,8 @@ class AISignalStrategy(BaseStrategy):
             return default
         return parsed
 
-    @classmethod
-    def _safe_choice(cls, value: object, default: str, allowed: set[str]) -> str:
+    @staticmethod
+    def _safe_choice(value: object, default: str, allowed: set) -> str:
         if not isinstance(value, str):
             return default
         normalized = value.strip().lower()
@@ -556,17 +563,17 @@ class AISignalStrategy(BaseStrategy):
         # Confidence combines raw score quality, threshold distance, and
         # separation from the opposite side score in a bounded/simple formula.
         threshold = float(base_meta.get("threshold", 0.0))
-        score_component = float(np.clip(score / 4.0, 0.0, 1.0))
+        score_component = np.clip(score / self.CONF_SCORE_NORMALIZER, 0.0, 1.0)
         threshold_edge = max(score - threshold, 0.0)
-        threshold_component = float(np.clip(threshold_edge / 2.0, 0.0, 1.0))
+        threshold_component = np.clip(threshold_edge / self.CONF_EDGE_NORMALIZER, 0.0, 1.0)
         separation = max(score - opposing_score, 0.0)
-        separation_component = float(np.clip(separation / 2.0, 0.0, 1.0))
+        separation_component = np.clip(separation / self.CONF_EDGE_NORMALIZER, 0.0, 1.0)
 
         conf = (
-            0.35
-            + 0.35 * score_component
-            + 0.20 * threshold_component
-            + 0.10 * separation_component
+            self.CONF_BASE
+            + self.CONF_SCORE_WEIGHT * score_component
+            + self.CONF_THRESHOLD_WEIGHT * threshold_component
+            + self.CONF_SEPARATION_WEIGHT * separation_component
         )
         if regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN):
             if (regime == RegimeType.TRENDING_UP and side == "long") or \
@@ -608,9 +615,9 @@ class AISignalStrategy(BaseStrategy):
 
         # ── sj_score for bot trade-ranking (higher = better quality) ─────────
         sj = round(conf * 100 + score * 20, 2)
-        uses_risk_sizing = bool(trade_plan.get("sl_dist_pct"))
-        sizing_mode = "risk_managed" if uses_risk_sizing else "fixed_fraction"
-        amount = 0 if uses_risk_sizing else self.position_pct
+        uses_sl_based_sizing = trade_plan.get("sl_dist_pct") is not None
+        sizing_mode = "risk_managed" if uses_sl_based_sizing else "fixed_fraction"
+        amount = 0 if uses_sl_based_sizing else self.position_pct
 
         # ── Reason string ──────────────────────────────────────────────────────
         factor_str = "+".join(factors[:4]) if factors else "no_factors"
@@ -632,13 +639,13 @@ class AISignalStrategy(BaseStrategy):
             "tie_break_policy":  self.tie_break_policy,
             "sizing_mode":       sizing_mode,
             "position_pct":      self.position_pct,
-            "amount_is_legacy_placeholder": uses_risk_sizing,
+            "risk_sizing_enabled": uses_sl_based_sizing,
             "confidence_breakdown": {
-                "score_component": round(float(score_component), 4),
-                "threshold_component": round(float(threshold_component), 4),
-                "separation_component": round(float(separation_component), 4),
-                "score_threshold_edge": round(float(threshold_edge), 4),
-                "score_separation": round(float(separation), 4),
+                "score_component": round(score_component, 4),
+                "threshold_component": round(threshold_component, 4),
+                "separation_component": round(separation_component, 4),
+                "score_threshold_edge": round(threshold_edge, 4),
+                "score_separation": round(separation, 4),
             },
         }
         reason_code = "signal_long" if side == "long" else "signal_short"
