@@ -1,5 +1,6 @@
 """
-AI Signal strategy v6 — API-free, multi-timeframe, regime-adaptive with presets.
+AI Signal strategy v7 — API-free, multi-timeframe, regime-adaptive with presets,
+reversal probes, and execution telemetry.
 
 Architecture (top-down):
   4h candles  → detect_regime()         — TRENDING/RANGING/VOLATILE/LOW_CONVICTION
@@ -7,12 +8,8 @@ Architecture (top-down):
   15m candles → volume_ok()             — skip entry when volume is too thin
   15m candles → _score_factors()        — entry trigger score (RSI/MACD/ST/Vol/EMA/HA)
   score layer → adaptive thresholding   — context-aware trigger sensitivity
+  profile     → preset tuning           — all_weather / aggressive / sniper
   price+ATR   → build_trade_plan()      — SL=1R, T1=0.5R … T4=1.2R, SL-ratchet ladder
-
-Supported profiles:
-  - all_weather — balanced, tradable across trend / range / volatile regimes
-  - aggressive  — faster entries, lower selectivity, more responsive
-  - sniper      — fewer trades, stronger separation, higher selectivity
 
 Execution goals:
   - Stay tradable across trending, ranging, and volatile regimes.
@@ -103,6 +100,11 @@ class AISignalStrategy(BaseStrategy):
         super().__init__(symbol, params)
 
         self._param_warnings = []
+        self._runtime_state = {
+            "last_signal_side": None,
+            "last_signal_bar_index": None,
+            "same_side_reentries": 0,
+        }
         self.profile = self._resolve_profile()
         self.DEFAULTS = self._build_defaults_for_profile(self.profile)
 
@@ -173,6 +175,7 @@ class AISignalStrategy(BaseStrategy):
         mtf = mtf_candles or {}
         candles_1h = mtf.get("1h", [])
         candles_4h = mtf.get("4h", [])
+        current_bar_index = max(len(candles) - 1, 0)
 
         if len(candles) < self.min_15m:
             return self._hold(
@@ -302,6 +305,7 @@ class AISignalStrategy(BaseStrategy):
             short_debug=short_debug,
             long_disabled_by_regime=long_disabled_by_regime,
             short_disabled_by_regime=short_disabled_by_regime,
+            bar_index=current_bar_index,
         )
 
         if regime == RegimeType.TRENDING_UP and bias_score < BIAS_MISALIGN_LONG_MIN:
@@ -325,6 +329,19 @@ class AISignalStrategy(BaseStrategy):
                 ),
             )
 
+        cooldown_blocked, cooldown_meta = self._cooldown_gate(current_bar_index)
+        if cooldown_blocked:
+            return self._hold(
+                current_price,
+                "Reentry cooldown active — skipping entry",
+                metadata=self._decision_meta(
+                    stage="cooldown_gate",
+                    reason_code="reentry_cooldown_active",
+                    **base_meta,
+                    **cooldown_meta,
+                ),
+            )
+
         long_ok = long_score >= long_threshold
         short_ok = short_score >= short_threshold
         score_gap = abs(long_score - short_score)
@@ -340,6 +357,7 @@ class AISignalStrategy(BaseStrategy):
             tie_detected=is_tie,
             near_tie=near_tie,
             tie_band=tie_band,
+            **cooldown_meta,
         )
 
         if long_ok and short_ok:
@@ -367,6 +385,20 @@ class AISignalStrategy(BaseStrategy):
                     ),
                 )
 
+            same_side_limit_hit, reentry_meta = self._same_side_reentry_gate(side)
+            if same_side_limit_hit:
+                return self._hold(
+                    current_price,
+                    f"Same-side reentry limit hit for {side}",
+                    metadata=self._decision_meta(
+                        stage="reentry_gate",
+                        reason_code="same_side_reentry_limit",
+                        side=side,
+                        **decision_meta,
+                        **reentry_meta,
+                    ),
+                )
+
             chosen_score = long_score if side == "long" else short_score
             chosen_factors = long_factors if side == "long" else short_factors
             chosen_debug = long_debug if side == "long" else short_debug
@@ -386,13 +418,28 @@ class AISignalStrategy(BaseStrategy):
                     tie_break_policy=self.tie_break_policy,
                     tie_break_used=used_resolution,
                     **decision_meta,
+                    **reentry_meta,
                 ),
                 chosen_threshold,
                 long_score,
                 short_score,
+                current_bar_index,
             )
 
         if long_ok:
+            same_side_limit_hit, reentry_meta = self._same_side_reentry_gate("long")
+            if same_side_limit_hit:
+                return self._hold(
+                    current_price,
+                    "Same-side reentry limit hit for long",
+                    metadata=self._decision_meta(
+                        stage="reentry_gate",
+                        reason_code="same_side_reentry_limit",
+                        side="long",
+                        **decision_meta,
+                        **reentry_meta,
+                    ),
+                )
             return self._build_signal(
                 candles,
                 current_price,
@@ -406,13 +453,28 @@ class AISignalStrategy(BaseStrategy):
                     stage="signal_build",
                     reason_code="long_signal_selected",
                     **decision_meta,
+                    **reentry_meta,
                 ),
                 long_threshold,
                 long_score,
                 short_score,
+                current_bar_index,
             )
 
         if short_ok:
+            same_side_limit_hit, reentry_meta = self._same_side_reentry_gate("short")
+            if same_side_limit_hit:
+                return self._hold(
+                    current_price,
+                    "Same-side reentry limit hit for short",
+                    metadata=self._decision_meta(
+                        stage="reentry_gate",
+                        reason_code="same_side_reentry_limit",
+                        side="short",
+                        **decision_meta,
+                        **reentry_meta,
+                    ),
+                )
             return self._build_signal(
                 candles,
                 current_price,
@@ -426,10 +488,12 @@ class AISignalStrategy(BaseStrategy):
                     stage="signal_build",
                     reason_code="short_signal_selected",
                     **decision_meta,
+                    **reentry_meta,
                 ),
                 short_threshold,
                 long_score,
                 short_score,
+                current_bar_index,
             )
 
         best_side = "long" if long_score >= short_score else "short"
@@ -462,6 +526,45 @@ class AISignalStrategy(BaseStrategy):
         defaults = dict(self.BASE_DEFAULTS)
         defaults.update(self.PROFILE_OVERRIDES.get(profile, {}))
         return defaults
+
+    def _cooldown_gate(self, current_bar_index: int):
+        last_bar_index = self._runtime_state.get("last_signal_bar_index")
+        bars_since_last = None if last_bar_index is None else current_bar_index - last_bar_index
+        blocked = (
+            self.reentry_cooldown_bars > 0 and
+            last_bar_index is not None and
+            bars_since_last is not None and
+            bars_since_last < self.reentry_cooldown_bars
+        )
+        return blocked, {
+            "last_signal_side": self._runtime_state.get("last_signal_side"),
+            "last_signal_bar_index": last_bar_index,
+            "bars_since_last_signal": bars_since_last,
+            "reentry_cooldown_active": blocked,
+        }
+
+    def _same_side_reentry_gate(self, side: str):
+        same_side_reentries = self._runtime_state.get("same_side_reentries", 0)
+        last_signal_side = self._runtime_state.get("last_signal_side")
+        blocked = (
+            self.max_same_side_reentries > 0 and
+            last_signal_side == side and
+            same_side_reentries >= self.max_same_side_reentries
+        )
+        return blocked, {
+            "last_signal_side": last_signal_side,
+            "same_side_reentries": same_side_reentries,
+            "max_same_side_reentries": self.max_same_side_reentries,
+            "same_side_reentry_blocked": blocked,
+        }
+
+    def _record_signal_state(self, side: str, bar_index: int):
+        if self._runtime_state.get("last_signal_side") == side:
+            self._runtime_state["same_side_reentries"] = self._runtime_state.get("same_side_reentries", 0) + 1
+        else:
+            self._runtime_state["same_side_reentries"] = 1
+        self._runtime_state["last_signal_side"] = side
+        self._runtime_state["last_signal_bar_index"] = bar_index
 
     def _effective_threshold(
         self,
@@ -665,6 +768,7 @@ class AISignalStrategy(BaseStrategy):
             "reversal_probe_max_bonus": self.reversal_probe_max_bonus,
             "reentry_cooldown_bars": self.reentry_cooldown_bars,
             "max_same_side_reentries": self.max_same_side_reentries,
+            "runtime_state": dict(self._runtime_state),
             "param_warnings": list(self._param_warnings),
         }
         meta.update(extra)
@@ -703,6 +807,7 @@ class AISignalStrategy(BaseStrategy):
         threshold: float,
         long_score: float,
         short_score: float,
+        current_bar_index: int,
     ) -> Signal:
         sig_type = SignalType.BUY if side == "long" else SignalType.SELL
         conf = self._compute_confidence(
@@ -738,6 +843,8 @@ class AISignalStrategy(BaseStrategy):
         sj = round(conf * 100 + score * 20, 2)
         factor_str = "+".join(factors[:4]) if factors else "no_factors"
         reason = f"[MTF] {side.upper()} regime={regime.value} score={score:.2f} bias={bias_score:.1f} [{factor_str}]"
+
+        self._record_signal_state(side, current_bar_index)
 
         metadata = self._decision_meta(
             decision="buy" if side == "long" else "sell",
