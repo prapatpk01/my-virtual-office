@@ -103,6 +103,8 @@ def _build_bot(config: dict, broadcast_fn: Callable):
     # Wire command callbacks so /start_bot and /stop_bot work from Telegram
     if telegram:
         telegram.get_state_fn  = bot.get_state
+        telegram.get_stats_fn  = bot.get_stats
+        telegram.get_insights_fn = bot.get_learning_insights
         telegram.start_bot_fn  = lambda: handle_start(config, broadcast_fn)
         telegram.stop_bot_fn   = lambda: handle_stop()
 

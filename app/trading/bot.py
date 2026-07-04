@@ -527,6 +527,10 @@ class TradingBot:
     def get_stats(self) -> dict:
         return self._sig.summary()
 
+    def get_learning_insights(self, days: int = 30) -> dict:
+        """Deep-dive analytics: win-rate by strategy/symbol/confidence/hour, trend, recommendations."""
+        return self._sig.deep_analysis(days=days)
+
     def get_state(self) -> dict:
         return {
             "running": self.state.running,

@@ -292,6 +292,7 @@ async def main():
     if telegram:
         telegram.get_state_fn = crypto_bot.get_state
         telegram.get_stats_fn = crypto_bot.get_stats
+        telegram.get_insights_fn = crypto_bot.get_learning_insights
         telegram.stop_bot_fn  = lambda: _stop_signal.set()
         telegram.start_bot_fn = lambda: {"message": "Bot is already running"}
 

@@ -207,6 +207,24 @@ class SignalState:
         self._save()
 
     # ------------------------------------------------------------------
+    # Deep-dive learning analysis
+    # ------------------------------------------------------------------
+
+    def deep_analysis(self, days: int = 30) -> dict:
+        """
+        Runs LearningAnalysis over the full fired/outcome history and returns
+        deep insights (win-rate by confidence/strategy/symbol/hour, trend,
+        and plain-language recommendations).
+        """
+        from .learning_analysis import LearningAnalysis
+        return LearningAnalysis(self._fired, self._outcomes).analyze(days=days)
+
+    def ai_context(self, days: int = 30) -> str:
+        """Short text digest of historical performance for use in AI prompts."""
+        from .learning_analysis import LearningAnalysis
+        return LearningAnalysis(self._fired, self._outcomes).context_for_ai(days=days)
+
+    # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
 

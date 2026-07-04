@@ -16,6 +16,15 @@ class AISignalStrategy(BaseStrategy):
         self.lookback = self.params.get("lookback", 20)
         self.position_pct = self.params.get("position_pct", 0.05)
         self._client = None
+        self.history_context = ""  # optional: plain-text digest from LearningAnalysis
+
+    def set_history_context(self, text: str):
+        """
+        Inject a short digest of historical win-rate/recommendations
+        (see trading.learning_analysis.LearningAnalysis.context_for_ai) so the
+        AI reasons using real track record, not just the current candle window.
+        """
+        self.history_context = text or ""
 
     def _get_client(self):
         if self._client is None:
@@ -38,12 +47,17 @@ class AISignalStrategy(BaseStrategy):
         closes = [c.close for c in recent]
         rsi_vals = self.rsi(closes)
         curr_rsi = float(rsi_vals[-1]) if not __import__("numpy").isnan(rsi_vals[-1]) else None
+        rsi_str = f"{curr_rsi:.1f}" if curr_rsi is not None else "N/A"
+
+        history_section = (
+            f"\n{self.history_context}\n" if self.history_context else ""
+        )
 
         prompt = f"""You are a professional quantitative trader. Analyze the following {self.lookback} recent OHLCV candles for {self.symbol} and provide a trading recommendation.
 
 Current price: {current_price}
-RSI(14): {curr_rsi:.1f if curr_rsi else 'N/A'}
-
+RSI(14): {rsi_str}
+{history_section}
 Recent candles (oldest to newest):
 {json.dumps(candle_data, indent=2)}
 
