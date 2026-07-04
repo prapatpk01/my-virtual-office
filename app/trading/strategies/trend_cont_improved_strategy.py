@@ -1006,6 +1006,19 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
             long_gates  = long_gates  & ~_post_peak_l
             short_gates = short_gates & ~_post_peak_s
 
+    # ── Price-behaviour confirmation (opt-in) ────────────────────────────────
+    # Beyond MACD: the entry candle must show real directional pressure — close
+    # in the upper part of its range for a long (buyers closed it near the high,
+    # not a long upper wick that got sold), lower part for a short. Confirms the
+    # move with PRICE, not just the histogram, per the user's "ดูพฤติกรรมราคาด้วย".
+    if p.get("price_behavior_filter", False):
+        _pb_rng = (out["high"] - out["low"]).replace(0, np.nan)
+        _pb_up  = (out["close"] - out["low"])  / _pb_rng   # 1.0 = closed on the high
+        _pb_dn  = (out["high"] - out["close"]) / _pb_rng   # 1.0 = closed on the low
+        _pb_th  = float(p.get("price_behavior_ratio", 0.55))
+        long_gates  = long_gates  & (_pb_up >= _pb_th).fillna(False)
+        short_gates = short_gates & (_pb_dn >= _pb_th).fillna(False)
+
     # ── Final entry trigger: momentum confirmation before entry ──────────────
     # Diagnostic (gate_bottleneck): this is the #1 entry blocker (804 otherwise-
     # complete setups). "strict" waits for a break of the prior bar's high/low —
@@ -1436,7 +1449,12 @@ class TrendContImprovedStrategy(BaseStrategy):
         # and reacts in 1 bar (blocks a long the moment the histogram goes
         # light-green, i.e. positive-but-falling), directly fixing buy-the-top.
         macd_peak_mode="slope",
-        macd_slope_lookback=1,   # slope mode: bars for the histogram-slope read (1=fastest)
+        macd_slope_lookback=3,   # slope mode: bars for the histogram-slope read (3=robust vs noise)
+        # Price-behaviour confirmation: entry candle must close in the upper (long)
+        # / lower (short) part of its range — real directional pressure, not just
+        # the histogram. Opt-in; A/B tested.
+        price_behavior_filter=False,
+        price_behavior_ratio=0.55,
         macd_peak_lookback=6,       # bars to look back for a higher histogram peak
         macd_peak_slope_bars=2,     # bars over which the post-peak decline is measured
         # Momentum confirmation source (the laggiest entry gate): "macd" (old),
