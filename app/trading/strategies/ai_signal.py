@@ -1,5 +1,5 @@
 """
-AI Signal strategy v2 — API-free, multi-timeframe, regime-adaptive.
+AI Signal strategy v3 — API-free, multi-timeframe, regime-adaptive (hardened).
 
 Architecture (top-down):
   4h candles  → detect_regime()      — TRENDING/RANGING/VOLATILE/LOW_CONVICTION
@@ -11,6 +11,16 @@ Architecture (top-down):
 The Signal.metadata returned is fully compatible with TradingBot._open_position():
   sl_ladder_enabled=True activates SL-ratchet mode (no partial closes; SL steps
   up as each ladder level is hit: T1→+0.3R, T2→+0.5R, T3→+0.8R, T4→full close).
+
+Improvements vs v2:
+  - Explicit min-candles guards for 1h/4h before regime/bias compute (previously
+    relied on downstream functions to silently handle insufficient data).
+  - ATR invalid guard (<=0 or NaN) -> HOLD instead of building a malformed
+    trade plan with a zero/garbage ATR value.
+  - Deterministic tie-break policy (configurable via `tie_break_policy`):
+    "hold" (default, safest), "bias", or "regime".
+  - Richer telemetry metadata (threshold, atr_value, tie_break_policy, etc.)
+    for easier debugging / analytics.
 """
 import numpy as np
 from .base import BaseStrategy, Signal, SignalType
@@ -39,13 +49,28 @@ class AISignalStrategy(BaseStrategy):
     so all existing bot wiring continues to work without changes.
 
     Params (all optional, with sensible defaults):
-      position_pct  — legacy position fraction (0.05); overridden by RiskManager
-                      dynamic sizing when sl_dist_pct and risk_pct are present.
-      vol_period    — lookback for volume filter (default 20)
-      vol_threshold — minimum vol_ratio to trade (default 0.70)
-      min_15m       — minimum 15m candles required (default 40)
-      min_1h        — minimum 1h candles required (default 55)
-      min_4h        — minimum 4h candles required (default 40)
+      position_pct       — legacy position fraction (0.05); overridden by
+                            RiskManager dynamic sizing when sl_dist_pct and
+                            risk_pct are present.
+      vol_period          — lookback for volume filter (default 20)
+      vol_threshold       — minimum vol_ratio to trade (default 0.70)
+      min_15m             — minimum 15m candles required (default 40)
+      min_1h              — minimum 1h candles required (default 55)
+      min_4h              — minimum 4h candles required (default 40)
+
+      tie_break_policy    — how to resolve near-equal long/short scores that
+                            both clear the entry threshold:
+                              "hold"   — do nothing, stay flat (default, safest)
+                              "bias"   — take the side the 1h bias favors
+                              "regime" — take the side the 4h regime favors,
+                                         falling back to bias if regime is
+                                         non-directional (e.g. RANGING)
+      tie_tolerance       — abs(long_score - short_score) <= tolerance is
+                            considered a tie (default 1e-6)
+
+      atr_guard_enabled   — if True, an invalid ATR aborts trade-plan
+                            construction and returns HOLD instead (default True)
+      atr_min_value       — minimum ATR value accepted as valid (default 1e-10)
     """
 
     # Tells the bot to also fetch "1h" and "4h" candles and pass them via mtf_candles.
@@ -60,9 +85,17 @@ class AISignalStrategy(BaseStrategy):
         self.min_1h        = self.params.get("min_1h",        55)
         self.min_4h        = self.params.get("min_4h",        40)
 
-    # ──────────────────────────────────────────────────────────────────────────
+        # Tie-break configuration
+        self.tie_break_policy = self.params.get("tie_break_policy", "hold")
+        self.tie_tolerance    = float(self.params.get("tie_tolerance", 1e-6))
+
+        # ATR guard configuration
+        self.atr_guard_enabled = bool(self.params.get("atr_guard_enabled", True))
+        self.atr_min_value     = float(self.params.get("atr_min_value", 1e-10))
+
+    # ──────────────────────────────────────────────────────────────────────
     # Main entry point
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
 
     async def analyze(
         self,
@@ -74,13 +107,13 @@ class AISignalStrategy(BaseStrategy):
         Produce a BUY / SELL / HOLD signal with full metadata.
 
         Flow:
-          1. Guard: require enough candles on all timeframes.
+          1. Guard: require enough candles on all timeframes (15m/1h/4h).
           2. Regime detection (4h).  LOW_CONVICTION → HOLD immediately.
           3. Volume filter (15m).    Low volume → HOLD.
           4. Directional bias (1h).
           5. Entry scoring (15m) for the regime-preferred direction(s).
-          6. Decide signal type and confidence.
-          7. Build TP/SL ladder trade plan.
+          6. Decide signal type and confidence, resolving ties deterministically.
+          7. Build TP/SL ladder trade plan (guarded against invalid ATR).
           8. Return Signal with rich metadata.
         """
         mtf = mtf_candles or {}
@@ -90,6 +123,26 @@ class AISignalStrategy(BaseStrategy):
         # ── 1. Data guards ────────────────────────────────────────────────────
         if len(candles) < self.min_15m:
             return self._hold(current_price, f"Insufficient 15m data ({len(candles)} bars)")
+
+        if len(candles_4h) < self.min_4h:
+            return self._hold(
+                current_price,
+                f"Insufficient 4h data ({len(candles_4h)} bars < {self.min_4h})",
+                metadata={
+                    "required_4h": self.min_4h,
+                    "actual_4h":   len(candles_4h),
+                },
+            )
+
+        if len(candles_1h) < self.min_1h:
+            return self._hold(
+                current_price,
+                f"Insufficient 1h data ({len(candles_1h)} bars < {self.min_1h})",
+                metadata={
+                    "required_1h": self.min_1h,
+                    "actual_1h":   len(candles_1h),
+                },
+            )
 
         # ── 2. Market regime (4h) ─────────────────────────────────────────────
         regime, regime_debug = detect_regime(candles_4h, min_candles=self.min_4h)
@@ -163,15 +216,54 @@ class AISignalStrategy(BaseStrategy):
             regime, regime_debug, bias_score, bias_debug,
             vol_ratio, long_score, short_score,
         )
+        base_meta["threshold"] = round(float(threshold), 4)
 
-        if long_score >= threshold and long_score > short_score:
+        long_ok  = long_score  >= threshold
+        short_ok = short_score >= threshold
+        is_tie   = abs(long_score - short_score) <= self.tie_tolerance
+
+        # ── 7a. Deterministic tie handling ───────────────────────────────────
+        # Both sides clear the threshold AND are within tolerance of each other.
+        if long_ok and short_ok and is_tie:
+            side = self._resolve_tie(regime, bias_score)
+            if side is None:
+                return self._hold(
+                    current_price,
+                    (f"Tie score (long={long_score:.4f}, short={short_score:.4f}, "
+                     f"tolerance={self.tie_tolerance}) — policy='{self.tie_break_policy}' "
+                     f"could not resolve"),
+                    metadata={
+                        **base_meta,
+                        "long_factors":     long_factors,
+                        "short_factors":    short_factors,
+                        "long_debug":       long_debug,
+                        "short_debug":      short_debug,
+                        "tie_break_policy": self.tie_break_policy,
+                        "tie_detected":     True,
+                    },
+                )
+            if side == "long":
+                return self._build_signal(
+                    candles, current_price, "long",
+                    long_score, long_factors, long_debug,
+                    regime, bias_score,
+                    {**base_meta, "tie_detected": True, "tie_break_used": True},
+                )
+            return self._build_signal(
+                candles, current_price, "short",
+                short_score, short_factors, short_debug,
+                regime, bias_score,
+                {**base_meta, "tie_detected": True, "tie_break_used": True},
+            )
+
+        if long_ok and long_score > short_score:
             return self._build_signal(
                 candles, current_price, "long",
                 long_score, long_factors, long_debug,
                 regime, bias_score, base_meta,
             )
 
-        if short_score >= threshold and short_score > long_score:
+        if short_ok and short_score > long_score:
             return self._build_signal(
                 candles, current_price, "short",
                 short_score, short_factors, short_debug,
@@ -194,9 +286,43 @@ class AISignalStrategy(BaseStrategy):
             },
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
     # Private helpers
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _resolve_tie(self, regime: RegimeType, bias_score: float):
+        """
+        Resolve a long/short score tie according to `self.tie_break_policy`.
+
+        Returns "long", "short", or None (None => stay flat / HOLD).
+        """
+        policy = (self.tie_break_policy or "hold").lower()
+
+        if policy == "hold":
+            return None
+
+        if policy == "bias":
+            if bias_score > 0:
+                return "long"
+            if bias_score < 0:
+                return "short"
+            return None  # bias is exactly neutral → still ambiguous
+
+        if policy == "regime":
+            if regime == RegimeType.TRENDING_UP:
+                return "long"
+            if regime == RegimeType.TRENDING_DOWN:
+                return "short"
+            # RANGING / VOLATILE have no directional regime preference —
+            # fall back to bias as a secondary tiebreaker.
+            if bias_score > 0:
+                return "long"
+            if bias_score < 0:
+                return "short"
+            return None
+
+        # Unknown policy value → safest fallback is to stay flat.
+        return None
 
     def _hold(self, price: float, reason: str, metadata: dict = None) -> Signal:
         return Signal(
@@ -256,14 +382,35 @@ class AISignalStrategy(BaseStrategy):
 
         # ── Trade plan (ATR-based SL/TP ladder) ───────────────────────────────
         atr_arr = self.atr(candles, 14)
-        atr_val = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0.0
+        atr_val = float(atr_arr[-1]) if len(atr_arr) > 0 and not np.isnan(atr_arr[-1]) else 0.0
+
+        # ── ATR validity guard ────────────────────────────────────────────────
+        # An ATR of zero (or effectively zero / NaN) would produce a malformed
+        # trade plan (e.g. zero-width SL/TP). Prefer a safe HOLD over opening a
+        # position with a broken risk plan.
+        if self.atr_guard_enabled and atr_val <= self.atr_min_value:
+            return self._hold(
+                price,
+                f"Invalid ATR for trade plan (atr={atr_val:.10f}) — skipping entry",
+                metadata={
+                    **base_meta,
+                    "side":               side,
+                    "entry_score":        round(score, 4),
+                    "entry_factors":      factors,
+                    "entry_debug":        entry_debug,
+                    "atr_value":          atr_val,
+                    "atr_guard_enabled":  self.atr_guard_enabled,
+                    "atr_min_value":      self.atr_min_value,
+                },
+            )
+
         trade_plan = build_trade_plan(price, atr_val, side)
 
         # ── sj_score for bot trade-ranking (higher = better quality) ─────────
         sj = round(conf * 100 + score * 20, 2)
 
         # ── Reason string ──────────────────────────────────────────────────────
-        factor_str = "+".join(factors[:4])
+        factor_str = "+".join(factors[:4]) if factors else "no_factors"
         reason = (
             f"[MTF] {side.upper()} regime={regime.value} "
             f"score={score:.2f} bias={bias_score:.1f} [{factor_str}]"
@@ -272,12 +419,14 @@ class AISignalStrategy(BaseStrategy):
         metadata = {
             **base_meta,
             **trade_plan,
-            "entry_factors":  factors,
-            "entry_debug":    entry_debug,
-            "entry_score":    round(score, 4),
-            "side":           side,
-            "sj_score":       sj,
-            "api_free":       True,
+            "entry_factors":     factors,
+            "entry_debug":       entry_debug,
+            "entry_score":       round(score, 4),
+            "side":              side,
+            "sj_score":          sj,
+            "api_free":          True,
+            "atr_value":         atr_val,
+            "tie_break_policy":  self.tie_break_policy,
         }
 
         return Signal(
