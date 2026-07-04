@@ -1,5 +1,5 @@
 """
-AI Signal strategy v5 — API-free, multi-timeframe, regime-adaptive, all-weather tuned.
+AI Signal strategy v6 — API-free, multi-timeframe, regime-adaptive with presets.
 
 Architecture (top-down):
   4h candles  → detect_regime()         — TRENDING/RANGING/VOLATILE/LOW_CONVICTION
@@ -9,10 +9,15 @@ Architecture (top-down):
   score layer → adaptive thresholding   — context-aware trigger sensitivity
   price+ATR   → build_trade_plan()      — SL=1R, T1=0.5R … T4=1.2R, SL-ratchet ladder
 
+Supported profiles:
+  - all_weather — balanced, tradable across trend / range / volatile regimes
+  - aggressive  — faster entries, lower selectivity, more responsive
+  - sniper      — fewer trades, stronger separation, higher selectivity
+
 Execution goals:
   - Stay tradable across trending, ranging, and volatile regimes.
-  - Balance responsiveness with trade quality instead of optimizing only for speed.
-  - Avoid low-quality trades caused by thin volume, invalid ATR, or deep bias conflict.
+  - Balance responsiveness with trade quality by default.
+  - Allow profile-based tuning without changing public class/interface.
   - Emit rich telemetry so live-debugging, backtests, and analytics can explain every decision.
 """
 import math
@@ -34,7 +39,8 @@ from .mtf_regime import (
 class AISignalStrategy(BaseStrategy):
     MTF_TIMEFRAMES = ["1h", "4h"]
 
-    DEFAULTS = {
+    BASE_DEFAULTS = {
+        "profile": "all_weather",
         "position_pct": 0.05,
         "vol_period": 20,
         "vol_threshold": 0.70,
@@ -54,13 +60,52 @@ class AISignalStrategy(BaseStrategy):
         "trend_threshold_discount": 0.06,
         "bias_neutral_band": 0.35,
         "min_confidence_floor": 0.52,
+        "reversal_probe_enabled": False,
+        "reversal_probe_max_bonus": 0.0,
+        "reentry_cooldown_bars": 0,
+        "max_same_side_reentries": 0,
+    }
+    PROFILE_OVERRIDES = {
+        "all_weather": {},
+        "aggressive": {
+            "tie_break_policy": "bias",
+            "tie_tolerance": 0.02,
+            "fast_entry_max_bonus": 0.30,
+            "countertrend_penalty": 0.18,
+            "min_score_separation": 0.14,
+            "range_threshold_discount": 0.10,
+            "volatile_threshold_buffer": 0.06,
+            "trend_threshold_discount": 0.09,
+            "bias_neutral_band": 0.28,
+            "min_confidence_floor": 0.50,
+            "reversal_probe_enabled": True,
+            "reversal_probe_max_bonus": 0.06,
+        },
+        "sniper": {
+            "tie_break_policy": "hold",
+            "tie_tolerance": 0.01,
+            "fast_entry_max_bonus": 0.10,
+            "countertrend_penalty": 0.34,
+            "min_score_separation": 0.32,
+            "range_threshold_discount": 0.04,
+            "volatile_threshold_buffer": 0.14,
+            "trend_threshold_discount": 0.04,
+            "bias_neutral_band": 0.20,
+            "min_confidence_floor": 0.58,
+            "reversal_probe_enabled": False,
+            "reversal_probe_max_bonus": 0.0,
+        },
     }
     VALID_TIE_BREAK_POLICIES = {"hold", "bias", "regime"}
+    VALID_PROFILES = set(PROFILE_OVERRIDES.keys())
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
 
         self._param_warnings = []
+        self.profile = self._resolve_profile()
+        self.DEFAULTS = self._build_defaults_for_profile(self.profile)
+
         self.position_pct = self._sanitize_float(
             "position_pct", self.DEFAULTS["position_pct"], minimum=0.0, maximum=1.0, strict_min=True
         )
@@ -110,6 +155,18 @@ class AISignalStrategy(BaseStrategy):
         )
         self.min_confidence_floor = self._sanitize_float(
             "min_confidence_floor", self.DEFAULTS["min_confidence_floor"], minimum=0.0, maximum=0.95
+        )
+        self.reversal_probe_enabled = self._sanitize_bool(
+            "reversal_probe_enabled", self.DEFAULTS["reversal_probe_enabled"]
+        )
+        self.reversal_probe_max_bonus = self._sanitize_float(
+            "reversal_probe_max_bonus", self.DEFAULTS["reversal_probe_max_bonus"], minimum=0.0
+        )
+        self.reentry_cooldown_bars = self._sanitize_int(
+            "reentry_cooldown_bars", self.DEFAULTS["reentry_cooldown_bars"], minimum=0
+        )
+        self.max_same_side_reentries = self._sanitize_int(
+            "max_same_side_reentries", self.DEFAULTS["max_same_side_reentries"], minimum=0
         )
 
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
@@ -190,10 +247,20 @@ class AISignalStrategy(BaseStrategy):
             candles, "short", regime, bias_score, min_candles=self.min_15m
         )
 
+        long_disabled_by_regime = False
+        short_disabled_by_regime = False
         if regime == RegimeType.TRENDING_UP:
-            short_score = -1.0
+            if self.reversal_probe_enabled and bias_score <= BIAS_MISALIGN_SHORT_MAX:
+                short_score = max(short_score - 0.35, -0.25)
+            else:
+                short_score = -1.0
+                short_disabled_by_regime = True
         elif regime == RegimeType.TRENDING_DOWN:
-            long_score = -1.0
+            if self.reversal_probe_enabled and bias_score >= BIAS_MISALIGN_LONG_MIN:
+                long_score = max(long_score - 0.35, -0.25)
+            else:
+                long_score = -1.0
+                long_disabled_by_regime = True
 
         long_threshold, long_threshold_meta = self._effective_threshold(
             side="long",
@@ -233,6 +300,8 @@ class AISignalStrategy(BaseStrategy):
             short_factors=short_factors,
             long_debug=long_debug,
             short_debug=short_debug,
+            long_disabled_by_regime=long_disabled_by_regime,
+            short_disabled_by_regime=short_disabled_by_regime,
         )
 
         if regime == RegimeType.TRENDING_UP and bias_score < BIAS_MISALIGN_LONG_MIN:
@@ -379,6 +448,21 @@ class AISignalStrategy(BaseStrategy):
             ),
         )
 
+    def _resolve_profile(self) -> str:
+        raw_profile = str(self.params.get("profile", self.BASE_DEFAULTS["profile"]))
+        profile = raw_profile.strip().lower()
+        if profile not in self.VALID_PROFILES:
+            self._param_warnings.append(
+                f"profile='{raw_profile}' invalid; fallback='{self.BASE_DEFAULTS['profile']}'"
+            )
+            return self.BASE_DEFAULTS["profile"]
+        return profile
+
+    def _build_defaults_for_profile(self, profile: str) -> dict:
+        defaults = dict(self.BASE_DEFAULTS)
+        defaults.update(self.PROFILE_OVERRIDES.get(profile, {}))
+        return defaults
+
     def _effective_threshold(
         self,
         side: str,
@@ -435,7 +519,19 @@ class AISignalStrategy(BaseStrategy):
         if bias_strength <= self.bias_neutral_band and regime == RegimeType.RANGING:
             neutral_bias_bonus = min(self.fast_entry_max_bonus * 0.15, 0.02)
 
-        threshold_bonus = min(alignment_bonus + quality_bonus + neutral_bias_bonus, self.fast_entry_max_bonus)
+        reversal_probe_bonus = 0.0
+        if self.reversal_probe_enabled and regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN):
+            counter_side = (
+                (regime == RegimeType.TRENDING_UP and side == "short") or
+                (regime == RegimeType.TRENDING_DOWN and side == "long")
+            )
+            if counter_side and bias_strength <= max(self.bias_neutral_band, 0.40):
+                reversal_probe_bonus = min(self.reversal_probe_max_bonus, 0.08)
+
+        threshold_bonus = min(
+            alignment_bonus + quality_bonus + neutral_bias_bonus + reversal_probe_bonus,
+            self.fast_entry_max_bonus + self.reversal_probe_max_bonus,
+        )
         threshold = max(0.12, threshold + regime_adjustment - threshold_bonus + countertrend_penalty)
 
         return threshold, {
@@ -452,6 +548,7 @@ class AISignalStrategy(BaseStrategy):
             "alignment_bonus": round(float(alignment_bonus), 4),
             "quality_bonus": round(float(quality_bonus), 4),
             "neutral_bias_bonus": round(float(neutral_bias_bonus), 4),
+            "reversal_probe_bonus": round(float(reversal_probe_bonus), 4),
             "threshold_bonus": round(float(threshold_bonus), 4),
             "countertrend_penalty": round(float(countertrend_penalty), 4),
         }
@@ -543,7 +640,8 @@ class AISignalStrategy(BaseStrategy):
     def _decision_meta(self, **extra) -> dict:
         meta = {
             "strategy": "AISignalStrategy",
-            "profile": "all_weather",
+            "profile": self.profile,
+            "available_profiles": sorted(self.VALID_PROFILES),
             "api_free": True,
             "tie_break_policy": self.tie_break_policy,
             "position_pct": self.position_pct,
@@ -563,6 +661,10 @@ class AISignalStrategy(BaseStrategy):
             "trend_threshold_discount": self.trend_threshold_discount,
             "bias_neutral_band": self.bias_neutral_band,
             "min_confidence_floor": self.min_confidence_floor,
+            "reversal_probe_enabled": self.reversal_probe_enabled,
+            "reversal_probe_max_bonus": self.reversal_probe_max_bonus,
+            "reentry_cooldown_bars": self.reentry_cooldown_bars,
+            "max_same_side_reentries": self.max_same_side_reentries,
             "param_warnings": list(self._param_warnings),
         }
         meta.update(extra)
@@ -587,7 +689,21 @@ class AISignalStrategy(BaseStrategy):
                 meta[key] = round(float(meta[key]), digits)
         return meta
 
-    def _build_signal(self, candles: list, price: float, side: str, score: float, factors: list[str], entry_debug: dict, regime: RegimeType, bias_score: float, base_meta: dict, threshold: float, long_score: float, short_score: float) -> Signal:
+    def _build_signal(
+        self,
+        candles: list,
+        price: float,
+        side: str,
+        score: float,
+        factors: list[str],
+        entry_debug: dict,
+        regime: RegimeType,
+        bias_score: float,
+        base_meta: dict,
+        threshold: float,
+        long_score: float,
+        short_score: float,
+    ) -> Signal:
         sig_type = SignalType.BUY if side == "long" else SignalType.SELL
         conf = self._compute_confidence(
             score=score,
