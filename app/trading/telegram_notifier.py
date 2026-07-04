@@ -483,11 +483,8 @@ class TelegramNotifier:
                 arrow = {"improving": "📈", "declining": "📉", "flat": "➡️"}.get(direction, "➡️")
                 rwr = trend.get("recent_win_rate")
                 pwr = trend.get("prior_win_rate")
-                lines.append(
-                    f"{arrow} Trend: *{direction}* "
-                    f"(recent `{rwr}%` vs prior `{pwr}%`)" if pwr is not None
-                    else f"{arrow} Trend: *{direction}* (recent `{rwr}%`)"
-                )
+                compare = f" vs prior `{pwr}%`" if pwr is not None else ""
+                lines.append(f"{arrow} Trend: *{direction}* (recent `{rwr}%`{compare})")
 
             if by_strategy:
                 lines.append("\n*By strategy:*")
