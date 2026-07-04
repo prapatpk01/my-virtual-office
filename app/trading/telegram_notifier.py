@@ -37,6 +37,7 @@ class TelegramNotifier:
         chat_id: str,
         get_state_fn: Optional[Callable] = None,
         get_stats_fn: Optional[Callable] = None,
+        get_insights_fn: Optional[Callable] = None,
         start_bot_fn: Optional[Callable] = None,
         stop_bot_fn: Optional[Callable] = None,
         min_confidence: float = 0.5,
@@ -45,6 +46,7 @@ class TelegramNotifier:
         self.chat_id = str(chat_id).strip()
         self.get_state_fn = get_state_fn
         self.get_stats_fn = get_stats_fn
+        self.get_insights_fn = get_insights_fn
         self.start_bot_fn = start_bot_fn
         self.stop_bot_fn = stop_bot_fn
         self.min_confidence = min_confidence
@@ -305,6 +307,7 @@ class TelegramNotifier:
                 "/trades — last 5 trades\n"
                 "/balance — balance & P\\&L\n"
                 "/stats — win rate & signal statistics\n"
+                "/insights — deep learning analysis & recommendations\n"
                 "/start\\_bot — start the bot\n"
                 "/stop\\_bot — stop the bot\n"
                 "/help — this message"
@@ -451,6 +454,62 @@ class TelegramNotifier:
                         f"{e} `{o['symbol']}` {o['side'].upper()} "
                         f"`{sr}{o['pnl_r']:.1f}R` [{label}]{strat_tag}"
                     )
+
+            await self._send("\n".join(lines))
+
+        elif cmd == "insights":
+            insights = self.get_insights_fn() if self.get_insights_fn else {}
+            if not insights or not insights.get("total_closed"):
+                await self._send(
+                    "📭 Not enough closed trades yet for deep analysis.\n"
+                    "Insights unlock once trades start closing."
+                )
+                return
+
+            period = insights.get("period_days", 30)
+            closed = insights.get("total_closed", 0)
+            total_sig = insights.get("total_signals", 0)
+            trend = insights.get("trend", {})
+            by_strategy = insights.get("by_strategy", {})
+            by_symbol = insights.get("by_symbol", {})
+            by_confidence = insights.get("by_confidence", {})
+            recs = insights.get("recommendations", [])
+
+            lines = [f"🧠 *Learning Analysis — ย้อนหลัง {period} วัน*\n"]
+            lines.append(f"Signals: `{total_sig}` | Closed trades: `{closed}`")
+
+            direction = trend.get("direction")
+            if direction and direction != "insufficient_data":
+                arrow = {"improving": "📈", "declining": "📉", "flat": "➡️"}.get(direction, "➡️")
+                rwr = trend.get("recent_win_rate")
+                pwr = trend.get("prior_win_rate")
+                lines.append(
+                    f"{arrow} Trend: *{direction}* "
+                    f"(recent `{rwr}%` vs prior `{pwr}%`)" if pwr is not None
+                    else f"{arrow} Trend: *{direction}* (recent `{rwr}%`)"
+                )
+
+            if by_strategy:
+                lines.append("\n*By strategy:*")
+                for s, d in sorted(by_strategy.items(), key=lambda kv: kv[1].get("win_rate") or 0, reverse=True):
+                    wr = f"{d['win_rate']}%" if d["win_rate"] is not None else "—"
+                    lines.append(f"`{s}` — {wr} ({d['wins']}W/{d['losses']}L)")
+
+            if by_symbol:
+                lines.append("\n*By symbol (Total R):*")
+                for sym, d in sorted(by_symbol.items(), key=lambda kv: kv[1].get("total_r", 0), reverse=True)[:5]:
+                    lines.append(f"`{sym}` — {d['total_r']}R ({d['trades']} trades, {d['win_rate']}% WR)")
+
+            if by_confidence:
+                lines.append("\n*By confidence:*")
+                for label, d in by_confidence.items():
+                    wr = f"{d['win_rate']}%" if d["win_rate"] is not None else "—"
+                    lines.append(f"`{label}` — {wr} ({d['trades']} trades)")
+
+            if recs:
+                lines.append("\n*💡 Recommendations:*")
+                for r in recs:
+                    lines.append(f"• {r}")
 
             await self._send("\n".join(lines))
 
