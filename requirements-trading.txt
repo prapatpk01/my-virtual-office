@@ -10,8 +10,9 @@ ccxt>=4.2.0
 # Numerical calculations (indicators: EMA, RSI, MACD, etc.)
 numpy>=1.26.0
 
-# Anthropic SDK (only needed for AI Signal strategy)
-anthropic>=0.25.0
+# Anthropic SDK (no longer required — AISignalStrategy is now API-free)
+# Uncomment only if you use another strategy that calls Anthropic directly:
+# anthropic>=0.25.0
 
 # Forex / Gold data feed (free, no API key needed)
 yfinance>=0.2.40
