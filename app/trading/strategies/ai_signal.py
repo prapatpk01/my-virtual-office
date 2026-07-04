@@ -12,13 +12,17 @@ class AISignalStrategy(BaseStrategy):
     a trading signal with reasoning.
     Requires ANTHROPIC_API_KEY in environment.
     """
+    DEFAULT_BUY_THRESHOLD = 2.0
+    DEFAULT_SELL_THRESHOLD = -2.0
+    MAX_REASON_LENGTH = 100
+    MAX_DECISION_BASIS_LENGTH = 180
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
         self.lookback = self.params.get("lookback", 20)
         self.position_pct = self.params.get("position_pct", 0.05)
-        self.buy_threshold = float(self.params.get("buy_threshold", 2.0))
-        self.sell_threshold = float(self.params.get("sell_threshold", -2.0))
+        self.buy_threshold = float(self.params.get("buy_threshold", self.DEFAULT_BUY_THRESHOLD))
+        self.sell_threshold = float(self.params.get("sell_threshold", self.DEFAULT_SELL_THRESHOLD))
         self._client = None
         self.history_context = ""  # optional: plain-text digest from LearningAnalysis
 
@@ -160,14 +164,14 @@ Respond ONLY with a JSON object in this exact format:
             except ValueError:
                 llm_signal = SignalType.HOLD
             confidence = self._clip(self._safe_float(parsed.get("confidence", 0.5), 0.5), 0.0, 1.0)
-            reason = str(parsed.get("reason", "AI analysis"))[:100]
+            reason = str(parsed.get("reason", "AI analysis"))[:self.MAX_REASON_LENGTH]
 
             analysis = parsed.get("systematic_thinking", {}) or {}
             scores = self._normalize_component_scores(analysis)
             computed_total = sum(scores.values())
             sig_type = self._derive_signal_from_score(computed_total)
             llm_total = self._safe_float(analysis.get("total_score", computed_total), computed_total)
-            decision_basis = str(analysis.get("decision_basis", ""))[:180]
+            decision_basis = str(analysis.get("decision_basis", ""))[:self.MAX_DECISION_BASIS_LENGTH]
 
             return Signal(
                 type=sig_type,
