@@ -65,9 +65,6 @@ BIAS_MISALIGN_SHORT_MAX = 1.0
 
 
 def detect_regime(candles_4h: list, min_candles: int = 40) -> tuple[RegimeType, dict]:
-    """
-    Classify the current market regime from 4h candles.
-    """
     n = len(candles_4h)
     if n < min_candles:
         return RegimeType.LOW_CONVICTION, {"reason": "insufficient_4h_data", "n": n}
@@ -124,18 +121,6 @@ def detect_regime(candles_4h: list, min_candles: int = 40) -> tuple[RegimeType, 
 
 
 def directional_bias(candles_1h: list, min_candles: int = 55) -> tuple[float, dict]:
-    """
-    Compute a directional bias score from 1h candles.
-
-    Step 1 hardening:
-      - Weighted / magnitude-aware components instead of sign-only flips.
-      - Clearer neutral RSI zone to reduce chop-induced bias changes.
-      - EMA structure and MACD histogram scaled by strength.
-      - Richer debug payload for analytics and live tuning.
-
-    Score range stays approximately -3.0 .. +3.0.
-    Returns (score, debug_dict).
-    """
     n = len(candles_1h)
     if n < min_candles:
         return 0.0, {"reason": "insufficient_1h_data", "n": n}
@@ -260,9 +245,6 @@ def directional_bias(candles_1h: list, min_candles: int = 55) -> tuple[float, di
 
 
 def volume_ok(candles_15m: list, period: int = 20, threshold: float = 0.70) -> tuple[bool, float]:
-    """
-    Return (valid, vol_ratio).
-    """
     n = len(candles_15m)
     if n < period + 1:
         return True, 1.0
@@ -284,6 +266,13 @@ def _score_factors(
 ) -> tuple[float, list[str], dict]:
     """
     Score a potential entry trigger on 15m candles.
+
+    Step 2 hardening:
+      - Factor weights adapt more clearly by regime.
+      - Trend regime favors continuation + aligned pullbacks.
+      - Range regime favors mean-reversion + exhaustion.
+      - Volatile regime demands stronger confirmation and volume support.
+      - Bias alignment now affects factor quality instead of only downstream gating.
     """
     n = len(candles_15m)
     if n < min_candles:
@@ -292,7 +281,6 @@ def _score_factors(
     closes = [float(c.close) for c in candles_15m]
     volumes = [float(c.volume) for c in candles_15m]
     price = closes[-1]
-
     is_long = side == "long"
 
     rsi14 = float(BaseStrategy.rsi(closes, 14)[-1])
@@ -306,9 +294,12 @@ def _score_factors(
     ema21_arr = BaseStrategy.ema(closes, 21)
     ema9 = float(ema9_arr[-1]) if not np.isnan(ema9_arr[-1]) else price
     ema21 = float(ema21_arr[-1]) if not np.isnan(ema21_arr[-1]) else price
+    ema9_prev = float(ema9_arr[-2]) if len(ema9_arr) > 1 and not np.isnan(ema9_arr[-2]) else ema9
+    ema21_prev = float(ema21_arr[-2]) if len(ema21_arr) > 1 and not np.isnan(ema21_arr[-2]) else ema21
 
     st_line, st_dir = BaseStrategy.supertrend(candles_15m, period=7, multiplier=3.0)
     st_now = int(st_dir[-1]) if len(st_dir) > 0 else 0
+    st_prev = int(st_dir[-2]) if len(st_dir) > 1 else st_now
 
     ha_candles, _, ha_closes = BaseStrategy._heikin_ashi(candles_15m)
     ha_opens = [float(ha_candles[i].open) for i in range(n)]
@@ -323,96 +314,205 @@ def _score_factors(
     vol_avg10 = float(np.mean(volumes[-11:-1])) if len(volumes) >= 11 else float(np.mean(volumes[:-1]) or 1)
     vol_ratio = volumes[-1] / vol_avg10 if vol_avg10 > 0 else 1.0
 
+    ema_gap_pct = ((ema9 - ema21) / price) if price > 0 else 0.0
+    ema_slope_pct = ((ema9 - ema9_prev) / ema9_prev) if ema9_prev not in (0, np.nan) else 0.0
+    bias_aligned = (is_long and bias > 0) or ((not is_long) and bias < 0)
+    bias_strength = abs(float(bias))
+
     score = 0.0
     factors: list[str] = []
+    components = {
+        "rsi": 0.0,
+        "macd": 0.0,
+        "supertrend": 0.0,
+        "volume": 0.0,
+        "ema": 0.0,
+        "heikin_ashi": 0.0,
+        "bias_alignment": 0.0,
+    }
 
-    if not np.isnan(rsi14):
-        if regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN):
+    def add_component(name: str, value: float, label: Optional[str] = None):
+        nonlocal score
+        score += value
+        components[name] += value
+        if label:
+            factors.append(label)
+
+    if regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN):
+        if not np.isnan(rsi14):
             if is_long and _RSI_TREND_LONG_MIN <= rsi14 <= _RSI_TREND_LONG_MAX:
-                score += 0.25; factors.append("rsi_trend_zone")
+                add_component("rsi", 0.24, "rsi_trend_zone")
             elif not is_long and _RSI_TREND_SHORT_MIN <= rsi14 <= _RSI_TREND_SHORT_MAX:
-                score += 0.25; factors.append("rsi_trend_zone")
-            elif is_long and rsi14 < _RSI_TREND_LONG_MIN:
-                score += 0.18; factors.append("rsi_dip")
-            elif not is_long and rsi14 > _RSI_TREND_SHORT_MAX:
-                score += 0.18; factors.append("rsi_dip")
-        elif regime == RegimeType.RANGING:
-            if is_long and rsi14 < _RSI_OVERSOLD_RANGE:
-                score += 0.25; factors.append("rsi_oversold")
-            elif not is_long and rsi14 > _RSI_OVERBOUGHT_RANGE:
-                score += 0.25; factors.append("rsi_overbought")
-            elif is_long and rsi14 < _RSI_SOFT_LOW_RANGE:
-                score += 0.12; factors.append("rsi_low_range")
-            elif not is_long and rsi14 > _RSI_SOFT_HIGH_RANGE:
-                score += 0.12; factors.append("rsi_high_range")
+                add_component("rsi", 0.24, "rsi_trend_zone")
+            elif is_long and (_RSI_TREND_LONG_MIN - 8) <= rsi14 < _RSI_TREND_LONG_MIN:
+                add_component("rsi", 0.16, "rsi_pullback")
+            elif not is_long and _RSI_TREND_SHORT_MAX < rsi14 <= (_RSI_TREND_SHORT_MAX + 8):
+                add_component("rsi", 0.16, "rsi_pullback")
+
+        if is_long:
+            if hist > 0 and hist >= hist_p:
+                add_component("macd", 0.22, "macd_bull_momentum")
+            elif hist > 0:
+                add_component("macd", 0.12, "macd_positive")
+            elif hist_p < 0 and hist > hist_p:
+                add_component("macd", 0.10, "macd_turning_bull")
+            if macd_val > sig_val:
+                add_component("macd", 0.04)
         else:
+            if hist < 0 and hist <= hist_p:
+                add_component("macd", 0.22, "macd_bear_momentum")
+            elif hist < 0:
+                add_component("macd", 0.12, "macd_negative")
+            elif hist_p > 0 and hist < hist_p:
+                add_component("macd", 0.10, "macd_turning_bear")
+            if macd_val < sig_val:
+                add_component("macd", 0.04)
+
+        if is_long and st_now == 1:
+            add_component("supertrend", 0.18, "supertrend_up")
+            if st_prev == -1:
+                add_component("supertrend", 0.04, "supertrend_flip_bull")
+        elif (not is_long) and st_now == -1:
+            add_component("supertrend", 0.18, "supertrend_down")
+            if st_prev == 1:
+                add_component("supertrend", 0.04, "supertrend_flip_bear")
+
+        if vol_ratio >= _VOL_SPIKE_RATIO:
+            add_component("volume", 0.12, "volume_spike")
+        elif vol_ratio >= _VOL_ABOVE_AVG_RATIO:
+            add_component("volume", 0.07, "volume_above_avg")
+
+        if is_long:
+            if ema9 > ema21 and price > ema9:
+                add_component("ema", 0.10, "ema_stack_bull")
+            elif ema_gap_pct > 0 and price > ema21:
+                add_component("ema", 0.06, "price_above_ema21")
+        else:
+            if ema9 < ema21 and price < ema9:
+                add_component("ema", 0.10, "ema_stack_bear")
+            elif ema_gap_pct < 0 and price < ema21:
+                add_component("ema", 0.06, "price_below_ema21")
+
+        if streak >= _HA_STRONG_STREAK:
+            add_component("heikin_ashi", 0.08, f"ha_streak_{streak}")
+        elif streak >= _HA_MODERATE_STREAK:
+            add_component("heikin_ashi", 0.05, f"ha_streak_{streak}")
+
+    elif regime == RegimeType.RANGING:
+        if not np.isnan(rsi14):
+            if is_long and rsi14 < _RSI_OVERSOLD_RANGE:
+                add_component("rsi", 0.28, "rsi_oversold")
+            elif not is_long and rsi14 > _RSI_OVERBOUGHT_RANGE:
+                add_component("rsi", 0.28, "rsi_overbought")
+            elif is_long and rsi14 < _RSI_SOFT_LOW_RANGE:
+                add_component("rsi", 0.14, "rsi_low_range")
+            elif not is_long and rsi14 > _RSI_SOFT_HIGH_RANGE:
+                add_component("rsi", 0.14, "rsi_high_range")
+
+        if is_long:
+            if hist_p < 0 and hist > hist_p:
+                add_component("macd", 0.18, "macd_turning_bull")
+            elif hist > 0:
+                add_component("macd", 0.08, "macd_positive")
+        else:
+            if hist_p > 0 and hist < hist_p:
+                add_component("macd", 0.18, "macd_turning_bear")
+            elif hist < 0:
+                add_component("macd", 0.08, "macd_negative")
+
+        if is_long and st_prev == -1 and st_now == 1:
+            add_component("supertrend", 0.14, "supertrend_flip_bull")
+        elif (not is_long) and st_prev == 1 and st_now == -1:
+            add_component("supertrend", 0.14, "supertrend_flip_bear")
+        elif (is_long and st_now == 1) or ((not is_long) and st_now == -1):
+            add_component("supertrend", 0.08, "supertrend_support")
+
+        if vol_ratio >= _VOL_SPIKE_RATIO:
+            add_component("volume", 0.10, "volume_spike")
+        elif vol_ratio >= _VOL_ABOVE_AVG_RATIO:
+            add_component("volume", 0.05, "volume_above_avg")
+
+        if is_long and ema_slope_pct >= 0:
+            add_component("ema", 0.05, "ema_slope_support")
+        elif (not is_long) and ema_slope_pct <= 0:
+            add_component("ema", 0.05, "ema_slope_support")
+
+        if streak >= _HA_STRONG_STREAK:
+            add_component("heikin_ashi", 0.08, f"ha_streak_{streak}")
+        elif streak >= _HA_MODERATE_STREAK:
+            add_component("heikin_ashi", 0.05, f"ha_streak_{streak}")
+
+    else:
+        if not np.isnan(rsi14):
             if is_long and rsi14 < _RSI_EXTREME_OVERSOLD:
-                score += 0.25; factors.append("rsi_extreme_oversold")
+                add_component("rsi", 0.26, "rsi_extreme_oversold")
             elif not is_long and rsi14 > _RSI_EXTREME_OVERBOUGHT:
-                score += 0.25; factors.append("rsi_extreme_overbought")
+                add_component("rsi", 0.26, "rsi_extreme_overbought")
 
-    if is_long:
-        if hist > 0 and hist >= hist_p:
-            score += 0.20; factors.append("macd_bull_momentum")
-        elif hist > 0:
-            score += 0.10; factors.append("macd_positive")
-        elif hist_p < 0 and hist > hist_p:
-            score += 0.15; factors.append("macd_turning_bull")
-        if macd_val > sig_val:
-            score += 0.05
+        if is_long:
+            if hist_p < 0 and hist > hist_p:
+                add_component("macd", 0.14, "macd_turning_bull")
+            if macd_val > sig_val and hist > hist_p:
+                add_component("macd", 0.08, "macd_cross_support")
+        else:
+            if hist_p > 0 and hist < hist_p:
+                add_component("macd", 0.14, "macd_turning_bear")
+            if macd_val < sig_val and hist < hist_p:
+                add_component("macd", 0.08, "macd_cross_support")
+
+        if vol_ratio >= _VOL_SPIKE_RATIO:
+            add_component("volume", 0.18, "volume_spike")
+        elif vol_ratio >= _VOL_ABOVE_AVG_RATIO:
+            add_component("volume", 0.08, "volume_above_avg")
+
+        if (is_long and st_prev == -1 and st_now == 1) or ((not is_long) and st_prev == 1 and st_now == -1):
+            add_component("supertrend", 0.16, "supertrend_flip")
+        elif (is_long and st_now == 1) or ((not is_long) and st_now == -1):
+            add_component("supertrend", 0.08, "supertrend_hold")
+
+        if is_long and ema9 > ema21 and price > ema21:
+            add_component("ema", 0.06, "ema_reclaim")
+        elif (not is_long) and ema9 < ema21 and price < ema21:
+            add_component("ema", 0.06, "ema_reclaim")
+
+        if streak >= _HA_STRONG_STREAK:
+            add_component("heikin_ashi", 0.10, f"ha_streak_{streak}")
+        elif streak >= _HA_MODERATE_STREAK:
+            add_component("heikin_ashi", 0.06, f"ha_streak_{streak}")
+
+    if bias_aligned:
+        if bias_strength >= 2.0:
+            add_component("bias_alignment", 0.08, "bias_aligned_strong")
+        elif bias_strength >= 1.0:
+            add_component("bias_alignment", 0.05, "bias_aligned")
+        elif bias_strength >= 0.35:
+            add_component("bias_alignment", 0.02, "bias_aligned_soft")
     else:
-        if hist < 0 and hist <= hist_p:
-            score += 0.20; factors.append("macd_bear_momentum")
-        elif hist < 0:
-            score += 0.10; factors.append("macd_negative")
-        elif hist_p > 0 and hist < hist_p:
-            score += 0.15; factors.append("macd_turning_bear")
-        if macd_val < sig_val:
-            score += 0.05
+        if regime == RegimeType.VOLATILE and bias_strength >= 1.0:
+            add_component("bias_alignment", -0.04, "bias_counter_volatile")
+        elif regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN) and bias_strength >= 1.0:
+            add_component("bias_alignment", -0.03, "bias_counter_trend")
 
-    if is_long:
-        if st_now == 1:
-            score += 0.20; factors.append("supertrend_up")
-            if len(st_dir) > 1 and st_dir[-2] == -1:
-                score += 0.05; factors.append("supertrend_flip_bull")
-    else:
-        if st_now == -1:
-            score += 0.20; factors.append("supertrend_down")
-            if len(st_dir) > 1 and st_dir[-2] == 1:
-                score += 0.05; factors.append("supertrend_flip_bear")
-
-    if vol_ratio >= _VOL_SPIKE_RATIO:
-        score += 0.15; factors.append("volume_spike")
-    elif vol_ratio >= _VOL_ABOVE_AVG_RATIO:
-        score += 0.08; factors.append("volume_above_avg")
-
-    if is_long:
-        if ema9 > ema21 and price > ema9:
-            score += 0.10; factors.append("ema_stack_bull")
-        elif price > ema21:
-            score += 0.05; factors.append("price_above_ema21")
-    else:
-        if ema9 < ema21 and price < ema9:
-            score += 0.10; factors.append("ema_stack_bear")
-        elif price < ema21:
-            score += 0.05; factors.append("price_below_ema21")
-
-    if streak >= _HA_STRONG_STREAK:
-        score += 0.10; factors.append(f"ha_streak_{streak}")
-    elif streak >= _HA_MODERATE_STREAK:
-        score += 0.06; factors.append(f"ha_streak_{streak}")
-
+    raw_score = min(score, 1.0)
     debug = {
         "rsi14_15m": round(rsi14, 2) if not np.isnan(rsi14) else None,
         "macd_hist": round(hist, 6),
+        "macd_hist_prev": round(hist_p, 6),
         "st_dir": st_now,
+        "st_prev": st_prev,
         "vol_ratio10": round(vol_ratio, 4),
         "ema9_15m": round(ema9, 4),
         "ema21_15m": round(ema21, 4),
+        "ema_gap_pct": round(ema_gap_pct * 100, 4),
+        "ema_slope_pct": round(ema_slope_pct * 100, 4),
         "ha_streak": streak,
+        "bias_aligned": bias_aligned,
+        "bias_strength": round(bias_strength, 4),
+        "score_components": {k: round(v, 4) for k, v in components.items()},
         "raw_score": round(score, 4),
+        "capped_score": round(raw_score, 4),
     }
-    return min(score, 1.0), factors, debug
+    return raw_score, factors, debug
 
 
 def entry_threshold(regime: RegimeType) -> float:
@@ -433,9 +533,6 @@ _SL_DIST_MAX_PCT = 0.035
 
 
 def build_trade_plan(price: float, atr_15m: float, side: str) -> dict:
-    """
-    Build the TP/SL ladder metadata dict consumed by TradingBot._open_position().
-    """
     if price <= 0 or atr_15m <= 0:
         return {"sl_ladder_enabled": False}
 
