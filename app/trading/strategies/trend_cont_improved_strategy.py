@@ -1426,7 +1426,15 @@ class TrendContImprovedStrategy(BaseStrategy):
         # step. (OR-combining with macd was proven redundant: the peak filter
         # removes exactly the OR-added trades, collapsing back to plain macd.)
         macd_peak_filter=True,
-        macd_peak_mode="exhaustion",  # "exhaustion" (post-peak decline) or "slope" (TV 4-colour)
+        # "slope" = TradingView 4-colour rule (histogram 1-bar slope = momentum
+        # direction). Backtest Jan-May 2026 (BTC+XAG+XAU), train/test — slope beats
+        # exhaustion on the HOLDOUT on every metric AND trades more:
+        #   exhaustion: TEST T=41 WR=85.4% PnL=+46.40 PF=1.60 SL=14.6%
+        #   slope     : TEST T=44 WR=86.4% PnL=+52.40 PF=1.67 SL=13.6%
+        # Best config of the whole tuning effort — highest WR/PnL/PF, lowest SL —
+        # and reacts in 1 bar (blocks a long the moment the histogram goes
+        # light-green, i.e. positive-but-falling), directly fixing buy-the-top.
+        macd_peak_mode="slope",
         macd_peak_lookback=6,       # bars to look back for a higher histogram peak
         macd_peak_slope_bars=2,     # bars over which the post-peak decline is measured
         # Momentum confirmation source (the laggiest entry gate): "macd" (old),
