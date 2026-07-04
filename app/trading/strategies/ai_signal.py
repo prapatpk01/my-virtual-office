@@ -75,23 +75,85 @@ class AISignalStrategy(BaseStrategy):
 
     # Tells the bot to also fetch "1h" and "4h" candles and pass them via mtf_candles.
     MTF_TIMEFRAMES = ["1h", "4h"]
+    DEFAULT_POSITION_PCT = 0.05
+    DEFAULT_VOL_PERIOD = 20
+    DEFAULT_VOL_THRESHOLD = 0.70
+    DEFAULT_MIN_15M = 40
+    DEFAULT_MIN_1H = 55
+    DEFAULT_MIN_4H = 40
+    DEFAULT_TIE_BREAK_POLICY = "hold"
+    ALLOWED_TIE_BREAK_POLICIES = {"hold", "bias", "regime"}
+    DEFAULT_TIE_TOLERANCE = 1e-6
+    DEFAULT_ATR_GUARD_ENABLED = True
+    DEFAULT_ATR_MIN_VALUE = 1e-10
 
     def __init__(self, symbol: str, params: dict = None):
         super().__init__(symbol, params)
-        self.position_pct  = self.params.get("position_pct",  0.05)
-        self.vol_period    = self.params.get("vol_period",    20)
-        self.vol_threshold = self.params.get("vol_threshold", 0.70)
-        self.min_15m       = self.params.get("min_15m",       40)
-        self.min_1h        = self.params.get("min_1h",        55)
-        self.min_4h        = self.params.get("min_4h",        40)
+        self.position_pct = self._safe_float_in_range(
+            self.params.get("position_pct"),
+            self.DEFAULT_POSITION_PCT,
+            lo=0.0,
+            hi=1.0,
+            include_lo=False,
+            include_hi=True,
+        )
+        self.vol_period = self._safe_int_min(
+            self.params.get("vol_period"),
+            self.DEFAULT_VOL_PERIOD,
+            min_value=1,
+        )
+        self.vol_threshold = self._safe_float_in_range(
+            self.params.get("vol_threshold"),
+            self.DEFAULT_VOL_THRESHOLD,
+            lo=0.0,
+            hi=10.0,
+            include_lo=True,
+            include_hi=True,
+        )
+        self.min_15m = self._safe_int_min(
+            self.params.get("min_15m"),
+            self.DEFAULT_MIN_15M,
+            min_value=1,
+        )
+        self.min_1h = self._safe_int_min(
+            self.params.get("min_1h"),
+            self.DEFAULT_MIN_1H,
+            min_value=1,
+        )
+        self.min_4h = self._safe_int_min(
+            self.params.get("min_4h"),
+            self.DEFAULT_MIN_4H,
+            min_value=1,
+        )
 
         # Tie-break configuration
-        self.tie_break_policy = self.params.get("tie_break_policy", "hold")
-        self.tie_tolerance    = float(self.params.get("tie_tolerance", 1e-6))
+        self.tie_break_policy = self._safe_choice(
+            self.params.get("tie_break_policy"),
+            self.DEFAULT_TIE_BREAK_POLICY,
+            self.ALLOWED_TIE_BREAK_POLICIES,
+        )
+        self.tie_tolerance = self._safe_float_in_range(
+            self.params.get("tie_tolerance"),
+            self.DEFAULT_TIE_TOLERANCE,
+            lo=0.0,
+            hi=1.0,
+            include_lo=True,
+            include_hi=True,
+        )
 
         # ATR guard configuration
-        self.atr_guard_enabled = bool(self.params.get("atr_guard_enabled", True))
-        self.atr_min_value     = float(self.params.get("atr_min_value", 1e-10))
+        self.atr_guard_enabled = self._safe_bool(
+            self.params.get("atr_guard_enabled", self.DEFAULT_ATR_GUARD_ENABLED),
+            self.DEFAULT_ATR_GUARD_ENABLED,
+        )
+        self.atr_min_value = self._safe_float_in_range(
+            self.params.get("atr_min_value"),
+            self.DEFAULT_ATR_MIN_VALUE,
+            lo=0.0,
+            hi=10.0,
+            include_lo=True,
+            include_hi=True,
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # Main entry point
@@ -122,7 +184,13 @@ class AISignalStrategy(BaseStrategy):
 
         # ── 1. Data guards ────────────────────────────────────────────────────
         if len(candles) < self.min_15m:
-            return self._hold(current_price, f"Insufficient 15m data ({len(candles)} bars)")
+            return self._hold(
+                current_price,
+                f"Insufficient 15m data ({len(candles)} bars)",
+                metadata={"required_15m": self.min_15m, "actual_15m": len(candles)},
+                stage="guard",
+                reason_code="insufficient_15m",
+            )
 
         if len(candles_4h) < self.min_4h:
             return self._hold(
@@ -132,6 +200,8 @@ class AISignalStrategy(BaseStrategy):
                     "required_4h": self.min_4h,
                     "actual_4h":   len(candles_4h),
                 },
+                stage="guard",
+                reason_code="insufficient_4h",
             )
 
         if len(candles_1h) < self.min_1h:
@@ -142,6 +212,8 @@ class AISignalStrategy(BaseStrategy):
                     "required_1h": self.min_1h,
                     "actual_1h":   len(candles_1h),
                 },
+                stage="guard",
+                reason_code="insufficient_1h",
             )
 
         # ── 2. Market regime (4h) ─────────────────────────────────────────────
@@ -152,6 +224,8 @@ class AISignalStrategy(BaseStrategy):
                 current_price,
                 f"Regime=LOW_CONVICTION (ADX weak) — skipping entry",
                 metadata={"regime": regime.value, "regime_debug": regime_debug},
+                stage="regime",
+                reason_code="low_conviction_regime",
             )
 
         # ── 3. Volume filter (15m) ────────────────────────────────────────────
@@ -167,6 +241,8 @@ class AISignalStrategy(BaseStrategy):
                     "vol_ratio": vol_ratio,
                     "regime_debug": regime_debug,
                 },
+                stage="volume",
+                reason_code="volume_below_threshold",
             )
 
         # ── 4. Directional bias (1h) ──────────────────────────────────────────
@@ -202,6 +278,8 @@ class AISignalStrategy(BaseStrategy):
                 f"Regime={regime.value} but 1h bias={bias_score:.1f} — misaligned",
                 metadata=self._base_meta(regime, regime_debug, bias_score, bias_debug,
                                          vol_ratio, long_score, short_score),
+                stage="bias",
+                reason_code="bias_misaligned_long",
             )
         if regime == RegimeType.TRENDING_DOWN and bias_score > BIAS_MISALIGN_SHORT_MAX:
             return self._hold(
@@ -209,6 +287,8 @@ class AISignalStrategy(BaseStrategy):
                 f"Regime={regime.value} but 1h bias={bias_score:.1f} — misaligned",
                 metadata=self._base_meta(regime, regime_debug, bias_score, bias_debug,
                                          vol_ratio, long_score, short_score),
+                stage="bias",
+                reason_code="bias_misaligned_short",
             )
 
         # ── 7. Signal decision ────────────────────────────────────────────────
@@ -220,18 +300,35 @@ class AISignalStrategy(BaseStrategy):
 
         long_ok  = long_score  >= threshold
         short_ok = short_score >= threshold
-        is_tie   = abs(long_score - short_score) <= self.tie_tolerance
+        score_delta = long_score - short_score
+        score_gap = abs(score_delta)
+        is_exact_tie = long_score == short_score
+        is_near_tie = score_gap <= self.tie_tolerance
+        is_tie = is_exact_tie or is_near_tie
 
         # ── 7a. Deterministic tie handling ───────────────────────────────────
-        # Both sides clear the threshold AND are within tolerance of each other.
-        if long_ok and short_ok and is_tie:
-            side = self._resolve_tie(regime, bias_score)
+        # Any both-valid state is resolved deterministically:
+        #  - near/equal scores use tie policy
+        #  - otherwise pick stronger side directly
+        if long_ok and short_ok:
+            side = None
+            tie_break_used = False
+            if is_tie:
+                side = self._resolve_tie(regime, bias_score)
+                tie_break_used = True
+            elif score_delta > 0:
+                side = "long"
+            elif score_delta < 0:
+                side = "short"
+            else:
+                side = self._resolve_tie(regime, bias_score)
+                tie_break_used = True
+
             if side is None:
                 return self._hold(
                     current_price,
-                    (f"Tie score (long={long_score:.4f}, short={short_score:.4f}, "
-                     f"tolerance={self.tie_tolerance}) — policy='{self.tie_break_policy}' "
-                     f"could not resolve"),
+                    (f"Both sides valid but unresolved (long={long_score:.4f}, "
+                     f"short={short_score:.4f}, tolerance={self.tie_tolerance})"),
                     metadata={
                         **base_meta,
                         "long_factors":     long_factors,
@@ -239,35 +336,37 @@ class AISignalStrategy(BaseStrategy):
                         "long_debug":       long_debug,
                         "short_debug":      short_debug,
                         "tie_break_policy": self.tie_break_policy,
-                        "tie_detected":     True,
+                        "tie_detected":     is_tie,
                     },
+                    stage="decision",
+                    reason_code="both_valid_unresolved",
                 )
             if side == "long":
                 return self._build_signal(
                     candles, current_price, "long",
                     long_score, long_factors, long_debug,
-                    regime, bias_score,
-                    {**base_meta, "tie_detected": True, "tie_break_used": True},
+                    regime, bias_score, short_score,
+                    {**base_meta, "tie_detected": is_tie, "tie_break_used": tie_break_used},
                 )
             return self._build_signal(
                 candles, current_price, "short",
                 short_score, short_factors, short_debug,
-                regime, bias_score,
-                {**base_meta, "tie_detected": True, "tie_break_used": True},
+                regime, bias_score, long_score,
+                {**base_meta, "tie_detected": is_tie, "tie_break_used": tie_break_used},
             )
 
         if long_ok and long_score > short_score:
             return self._build_signal(
                 candles, current_price, "long",
                 long_score, long_factors, long_debug,
-                regime, bias_score, base_meta,
+                regime, bias_score, short_score, base_meta,
             )
 
         if short_ok and short_score > long_score:
             return self._build_signal(
                 candles, current_price, "short",
                 short_score, short_factors, short_debug,
-                regime, bias_score, base_meta,
+                regime, bias_score, long_score, base_meta,
             )
 
         # Neither side clears threshold
@@ -284,6 +383,8 @@ class AISignalStrategy(BaseStrategy):
                 "long_debug":    long_debug,
                 "short_debug":   short_debug,
             },
+            stage="decision",
+            reason_code="below_threshold",
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -324,7 +425,85 @@ class AISignalStrategy(BaseStrategy):
         # Unknown policy value → safest fallback is to stay flat.
         return None
 
-    def _hold(self, price: float, reason: str, metadata: dict = None) -> Signal:
+    @staticmethod
+    def _safe_int_min(value: object, default: int, min_value: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed >= min_value else default
+
+    @staticmethod
+    def _safe_float_in_range(
+        value: object,
+        default: float,
+        lo: float,
+        hi: float,
+        include_lo: bool = True,
+        include_hi: bool = True,
+    ) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not np.isfinite(parsed):
+            return default
+        if parsed < lo or (parsed == lo and not include_lo):
+            return default
+        if parsed > hi or (parsed == hi and not include_hi):
+            return default
+        return parsed
+
+    @classmethod
+    def _safe_choice(cls, value: object, default: str, allowed: set[str]) -> str:
+        if not isinstance(value, str):
+            return default
+        normalized = value.strip().lower()
+        return normalized if normalized in allowed else default
+
+    @staticmethod
+    def _safe_bool(value: object, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    @staticmethod
+    def _decision_meta(
+        decision: str,
+        stage: str,
+        reason_code: str,
+        metadata: dict = None,
+        **extra,
+    ) -> dict:
+        merged = dict(metadata or {})
+        merged.update(
+            {
+                "decision": decision,
+                "decision_stage": stage,
+                "decision_reason_code": reason_code,
+            }
+        )
+        if extra:
+            merged.update(extra)
+        return merged
+
+    def _hold(
+        self,
+        price: float,
+        reason: str,
+        metadata: dict = None,
+        stage: str = "decision",
+        reason_code: str = "hold",
+    ) -> Signal:
         return Signal(
             type=SignalType.HOLD,
             symbol=self.symbol,
@@ -332,7 +511,12 @@ class AISignalStrategy(BaseStrategy):
             amount=0,
             reason=f"[MTF] {reason}",
             confidence=0.0,
-            metadata=metadata or {},
+            metadata=self._decision_meta(
+                decision=SignalType.HOLD.value,
+                stage=stage,
+                reason_code=reason_code,
+                metadata=metadata,
+            ),
         )
 
     @staticmethod
@@ -362,14 +546,28 @@ class AISignalStrategy(BaseStrategy):
         entry_debug: dict,
         regime: RegimeType,
         bias_score: float,
+        opposing_score: float,
         base_meta: dict,
     ) -> Signal:
         """Build a BUY/SELL Signal with trade plan metadata."""
         sig_type = SignalType.BUY if side == "long" else SignalType.SELL
 
         # ── Confidence ────────────────────────────────────────────────────────
-        # Base: raw score → 0.50–0.90 range; bonus for regime/bias alignment.
-        conf = 0.45 + min(score * 0.55, 0.45)
+        # Confidence combines raw score quality, threshold distance, and
+        # separation from the opposite side score in a bounded/simple formula.
+        threshold = float(base_meta.get("threshold", 0.0))
+        score_component = float(np.clip(score / 4.0, 0.0, 1.0))
+        threshold_edge = max(score - threshold, 0.0)
+        threshold_component = float(np.clip(threshold_edge / 2.0, 0.0, 1.0))
+        separation = max(score - opposing_score, 0.0)
+        separation_component = float(np.clip(separation / 2.0, 0.0, 1.0))
+
+        conf = (
+            0.35
+            + 0.35 * score_component
+            + 0.20 * threshold_component
+            + 0.10 * separation_component
+        )
         if regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN):
             if (regime == RegimeType.TRENDING_UP and side == "long") or \
                (regime == RegimeType.TRENDING_DOWN and side == "short"):
@@ -402,12 +600,17 @@ class AISignalStrategy(BaseStrategy):
                     "atr_guard_enabled":  self.atr_guard_enabled,
                     "atr_min_value":      self.atr_min_value,
                 },
+                stage="trade_plan",
+                reason_code="invalid_atr",
             )
 
         trade_plan = build_trade_plan(price, atr_val, side)
 
         # ── sj_score for bot trade-ranking (higher = better quality) ─────────
         sj = round(conf * 100 + score * 20, 2)
+        uses_risk_sizing = bool(trade_plan.get("sl_dist_pct"))
+        sizing_mode = "risk_managed" if uses_risk_sizing else "fixed_fraction"
+        amount = 0 if uses_risk_sizing else self.position_pct
 
         # ── Reason string ──────────────────────────────────────────────────────
         factor_str = "+".join(factors[:4]) if factors else "no_factors"
@@ -427,13 +630,32 @@ class AISignalStrategy(BaseStrategy):
             "api_free":          True,
             "atr_value":         atr_val,
             "tie_break_policy":  self.tie_break_policy,
+            "sizing_mode":       sizing_mode,
+            "position_pct":      self.position_pct,
+            "amount_is_legacy_placeholder": uses_risk_sizing,
+            "confidence_breakdown": {
+                "score_component": round(float(score_component), 4),
+                "threshold_component": round(float(threshold_component), 4),
+                "separation_component": round(float(separation_component), 4),
+                "score_threshold_edge": round(float(threshold_edge), 4),
+                "score_separation": round(float(separation), 4),
+            },
         }
+        reason_code = "signal_long" if side == "long" else "signal_short"
+        metadata = self._decision_meta(
+            decision=sig_type.value,
+            stage="entry",
+            reason_code=reason_code,
+            metadata=metadata,
+        )
 
         return Signal(
             type=sig_type,
             symbol=self.symbol,
             price=price,
-            amount=self.position_pct if not trade_plan.get("sl_dist_pct") else 0,
+            # Keep integration compatibility: when trade_plan includes sl_dist_pct,
+            # RiskManager computes size and `amount=0` is an intentional placeholder.
+            amount=amount,
             reason=reason,
             confidence=conf,
             metadata=metadata,
