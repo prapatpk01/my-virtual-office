@@ -1449,7 +1449,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # and reacts in 1 bar (blocks a long the moment the histogram goes
         # light-green, i.e. positive-but-falling), directly fixing buy-the-top.
         macd_peak_mode="slope",
-        macd_slope_lookback=3,   # slope mode: bars for the histogram-slope read (3=robust vs noise)
+        macd_slope_lookback=1,   # slope mode: 1-bar read — faster entry, best WR/SL in A/B
         # Price-behaviour confirmation: entry candle must close in the upper (long)
         # / lower (short) part of its range — real directional pressure, not just
         # the histogram. Opt-in; A/B tested.
