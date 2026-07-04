@@ -30,6 +30,79 @@ class RegimeType(str, Enum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Regime-detection thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ATR as a fraction of price: above this level the 4h market is too choppy for
+# normal trend-following or mean-reversion entries.
+_VOLATILE_ATR_PCT = 0.030           # 3% ATR/price on 4h → VOLATILE
+
+# ADX levels that separate conviction regimes.
+_LOW_CONVICTION_ADX = 15            # ADX below this → directionally weak
+_STRONG_TREND_ADX   = 25            # ADX above this + clear DI → strong trend
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Directional-bias / entry-scoring RSI thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1h bias scoring — mild momentum zones
+_RSI_BULL_BIAS = 55.0               # RSI above this → +0.5 bull bias
+_RSI_BEAR_BIAS = 45.0               # RSI below this → −0.5 bear bias
+
+# 15m entry scoring — trend-following long entries (healthy momentum zone)
+_RSI_TREND_LONG_MIN  = 40           # do not chase when RSI is below this
+_RSI_TREND_LONG_MAX  = 65           # do not enter long when RSI is above this
+_RSI_TREND_SHORT_MIN = 35           # short OK when RSI is below this (not extended down)
+_RSI_TREND_SHORT_MAX = 60           # do not short when RSI is above this
+
+# 15m entry scoring — ranging / counter-trend RSI extremes
+_RSI_OVERSOLD_RANGE   = 32          # strong long candidate in ranging market
+_RSI_OVERBOUGHT_RANGE = 68          # strong short candidate in ranging market
+_RSI_SOFT_LOW_RANGE   = 42          # mild long candidate (ranging)
+_RSI_SOFT_HIGH_RANGE  = 58          # mild short candidate (ranging)
+
+# 15m entry scoring — volatile regime requires deeper RSI extremes
+_RSI_EXTREME_OVERSOLD   = 28
+_RSI_EXTREME_OVERBOUGHT = 72
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Volume impulse thresholds (ratio vs 10-bar average)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VOL_SPIKE_RATIO    = 1.5           # clear volume surge — strong confirmation
+_VOL_ABOVE_AVG_RATIO = 1.2          # moderate above-average volume
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Heikin-Ashi streak thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HA_STRONG_STREAK   = 3             # 3+ same-direction HA candles → clear momentum
+_HA_MODERATE_STREAK = 2             # 2 same-direction HA candles → mild confirmation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry-score thresholds per regime
+# (combined factor score must meet/exceed this to fire a signal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_THRESHOLD_TRENDING  = 0.45         # trend-following: 2–3 aligned confirmations
+_THRESHOLD_RANGING   = 0.42         # mean-reversion: RSI extreme + 1 more factor
+_THRESHOLD_VOLATILE  = 0.65         # choppy: require strong multi-confirmation
+_THRESHOLD_DISABLED  = 1.01         # effectively disables entry (never reached)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1h bias misalignment gates (used by AISignalStrategy)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# When 4h regime is TRENDING_UP, skip long entries if the 1h bias score is below
+# this value (i.e. 1h is actively bearish, suggesting the trend is pausing).
+BIAS_MISALIGN_LONG_MIN  = -1.0
+# When 4h regime is TRENDING_DOWN, skip short entries if the 1h bias score
+# exceeds this value (i.e. 1h is actively bullish).
+BIAS_MISALIGN_SHORT_MAX = 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4h  ──  Market Regime Detection
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -86,17 +159,17 @@ def detect_regime(candles_4h: list, min_candles: int = 40) -> tuple[RegimeType, 
 
     # ── Classify ──────────────────────────────────────────────────────────────
     # 1. Very choppy / wide swings → VOLATILE (skip or require heavy confirmation)
-    if atr_pct > 0.030:
+    if atr_pct > _VOLATILE_ATR_PCT:
         debug["regime_reason"] = "atr_pct_high"
         return RegimeType.VOLATILE, debug
 
     # 2. Weak momentum → LOW_CONVICTION
-    if adx < 15:
+    if adx < _LOW_CONVICTION_ADX:
         debug["regime_reason"] = "adx_low"
         return RegimeType.LOW_CONVICTION, debug
 
     # 3. Strong trend
-    if adx >= 25:
+    if adx >= _STRONG_TREND_ADX:
         if pdi > mdi and ema20 >= ema50:
             debug["regime_reason"] = "adx_trending_up"
             return RegimeType.TRENDING_UP, debug
@@ -146,9 +219,9 @@ def directional_bias(candles_1h: list, min_candles: int = 55) -> tuple[float, di
 
     # RSI momentum zone
     if not np.isnan(rsi14):
-        if rsi14 > 55:
+        if rsi14 > _RSI_BULL_BIAS:
             score += 0.5
-        elif rsi14 < 45:
+        elif rsi14 < _RSI_BEAR_BIAS:
             score -= 0.5
 
     # MACD histogram (momentum)
@@ -266,30 +339,30 @@ def _score_factors(
     if not np.isnan(rsi14):
         if regime in (RegimeType.TRENDING_UP, RegimeType.TRENDING_DOWN):
             # Trend-following: healthy momentum zone, not over-extended
-            if is_long and 40 <= rsi14 <= 65:
+            if is_long and _RSI_TREND_LONG_MIN <= rsi14 <= _RSI_TREND_LONG_MAX:
                 score += 0.25; factors.append("rsi_trend_zone")
-            elif not is_long and 35 <= rsi14 <= 60:
+            elif not is_long and _RSI_TREND_SHORT_MIN <= rsi14 <= _RSI_TREND_SHORT_MAX:
                 score += 0.25; factors.append("rsi_trend_zone")
-            elif is_long and rsi14 < 40:
+            elif is_long and rsi14 < _RSI_TREND_LONG_MIN:
                 # pullback / dip buy in uptrend
                 score += 0.18; factors.append("rsi_dip")
-            elif not is_long and rsi14 > 60:
+            elif not is_long and rsi14 > _RSI_TREND_SHORT_MAX:
                 score += 0.18; factors.append("rsi_dip")
         elif regime == RegimeType.RANGING:
             # Counter-trend: RSI extremes
-            if is_long and rsi14 < 32:
+            if is_long and rsi14 < _RSI_OVERSOLD_RANGE:
                 score += 0.25; factors.append("rsi_oversold")
-            elif not is_long and rsi14 > 68:
+            elif not is_long and rsi14 > _RSI_OVERBOUGHT_RANGE:
                 score += 0.25; factors.append("rsi_overbought")
-            elif is_long and rsi14 < 42:
+            elif is_long and rsi14 < _RSI_SOFT_LOW_RANGE:
                 score += 0.12; factors.append("rsi_low_range")
-            elif not is_long and rsi14 > 58:
+            elif not is_long and rsi14 > _RSI_SOFT_HIGH_RANGE:
                 score += 0.12; factors.append("rsi_high_range")
         else:
             # VOLATILE: require strong RSI extreme
-            if is_long and rsi14 < 28:
+            if is_long and rsi14 < _RSI_EXTREME_OVERSOLD:
                 score += 0.25; factors.append("rsi_extreme_oversold")
-            elif not is_long and rsi14 > 72:
+            elif not is_long and rsi14 > _RSI_EXTREME_OVERBOUGHT:
                 score += 0.25; factors.append("rsi_extreme_overbought")
 
     # 2. MACD histogram momentum
@@ -327,9 +400,9 @@ def _score_factors(
                 score += 0.05; factors.append("supertrend_flip_bear")
 
     # 4. Volume impulse
-    if vol_ratio >= 1.5:
+    if vol_ratio >= _VOL_SPIKE_RATIO:
         score += 0.15; factors.append("volume_spike")
-    elif vol_ratio >= 1.2:
+    elif vol_ratio >= _VOL_ABOVE_AVG_RATIO:
         score += 0.08; factors.append("volume_above_avg")
 
     # 5. EMA9/EMA21 short-term alignment
@@ -345,9 +418,9 @@ def _score_factors(
             score += 0.05; factors.append("price_below_ema21")
 
     # 6. Heikin-Ashi candle streak
-    if streak >= 3:
+    if streak >= _HA_STRONG_STREAK:
         score += 0.10; factors.append(f"ha_streak_{streak}")
-    elif streak >= 2:
+    elif streak >= _HA_MODERATE_STREAK:
         score += 0.06; factors.append(f"ha_streak_{streak}")
 
     debug = {
@@ -366,11 +439,11 @@ def _score_factors(
 def entry_threshold(regime: RegimeType) -> float:
     """Minimum score required to fire an entry signal, per regime."""
     return {
-        RegimeType.TRENDING_UP:   0.45,
-        RegimeType.TRENDING_DOWN: 0.45,
-        RegimeType.RANGING:       0.42,
-        RegimeType.VOLATILE:      0.65,
-        RegimeType.LOW_CONVICTION: 1.01,  # never fires
+        RegimeType.TRENDING_UP:    _THRESHOLD_TRENDING,
+        RegimeType.TRENDING_DOWN:  _THRESHOLD_TRENDING,
+        RegimeType.RANGING:        _THRESHOLD_RANGING,
+        RegimeType.VOLATILE:       _THRESHOLD_VOLATILE,
+        RegimeType.LOW_CONVICTION: _THRESHOLD_DISABLED,
     }.get(regime, 0.50)
 
 

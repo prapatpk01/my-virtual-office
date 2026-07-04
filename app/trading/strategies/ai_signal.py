@@ -22,11 +22,12 @@ from .mtf_regime import (
     entry_threshold,
     _score_factors,
     build_trade_plan,
+    BIAS_MISALIGN_LONG_MIN,
+    BIAS_MISALIGN_SHORT_MAX,
 )
 
 # Minimum bias alignment required to trade against the 1h bias
-# (e.g. regime=TRENDING_UP but bias score is negative → skip)
-_BIAS_ALIGN_MIN = 0.0
+# (now imported from mtf_regime: BIAS_MISALIGN_LONG_MIN / BIAS_MISALIGN_SHORT_MAX)
 
 
 class AISignalStrategy(BaseStrategy):
@@ -141,7 +142,7 @@ class AISignalStrategy(BaseStrategy):
         # ── Bias alignment gate ────────────────────────────────────────────────
         # In RANGING regime the 1h bias can support either direction.
         # In TRENDING regimes require the 1h bias to not actively oppose direction.
-        if regime == RegimeType.TRENDING_UP and bias_score < -1.0:
+        if regime == RegimeType.TRENDING_UP and bias_score < BIAS_MISALIGN_LONG_MIN:
             # Strong 1h bear bias in a 4h uptrend → wait for alignment
             return self._hold(
                 current_price,
@@ -149,7 +150,7 @@ class AISignalStrategy(BaseStrategy):
                 metadata=self._base_meta(regime, regime_debug, bias_score, bias_debug,
                                          vol_ratio, long_score, short_score),
             )
-        if regime == RegimeType.TRENDING_DOWN and bias_score > 1.0:
+        if regime == RegimeType.TRENDING_DOWN and bias_score > BIAS_MISALIGN_SHORT_MAX:
             return self._hold(
                 current_price,
                 f"Regime={regime.value} but 1h bias={bias_score:.1f} — misaligned",
