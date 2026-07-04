@@ -547,6 +547,7 @@ class TradingBot:
                 partial_pct=meta.get("partial_pct", 0.5),
                 contract_size=ct,
                 one_r=one_r,
+                sl_ladder_enabled=bool(meta.get("sl_ladder_enabled", False)),
             )
             # Store pattern tier for TP1 upgrade logic
             pos = self.risk.get_position_obj(sym, strategy=slot)
@@ -591,7 +592,7 @@ class TradingBot:
             logger.warning("[BOT] Ticker fetch failed for %s: %s", sym, e)
             return
 
-        trigger = pos.stage_check(price)
+        trigger = pos.stage_check_ladder(price) if pos.sl_ladder_enabled else pos.stage_check(price)
         if not trigger:
             return
 
@@ -599,6 +600,34 @@ class TradingBot:
         close_side = "sell" if is_long else "buy"
         pos_side   = ("long" if is_long else "short") if self.futures_mode else ""
         pnl_mult   = 1 if is_long else -1
+
+        # ── SL-ratchet ladder: move stop only, no partial close, notify + log ──
+        if trigger.startswith("ladder_T"):
+            level = int(trigger[-1])                          # 1, 2, or 3
+            _, sl_r = pos.LADDER_LEVELS[level - 1]
+            new_sl = (pos.entry_price + sl_r * pos.one_r if is_long
+                      else pos.entry_price - sl_r * pos.one_r)
+            old_sl = pos.stop_loss
+            sl_ok = await self.connector.move_sl_to_breakeven(sym, pos_side, new_sl, pos.amount)
+            if not sl_ok:
+                logger.warning("[%s] Ladder T%d %s — exchange SL move failed; "
+                               "bot-side SL still updated", strategy_name, level, sym)
+            pos.stop_loss = new_sl
+            pos.ladder_stage = level
+            trigger_r, _ = pos.LADDER_LEVELS[level - 1]
+            logger.info("[%s] Ladder T%d %s @ %.4f — SL %.4f -> %.4f (+%.1fR)",
+                        strategy_name, level, sym, price, old_sl, new_sl, sl_r)
+            if self.telegram:
+                self.telegram.notify(
+                    f"✅ *{sym.split('/')[0]}USDT*\n\n"
+                    f"Target {level} Hit\n\n"
+                    f"Price : {price:.4f}\n\n"
+                    f"SL moved\n\n"
+                    f"{old_sl:.4f}\n\n"
+                    f"↓\n\n"
+                    f"{new_sl:.4f} (+{sl_r:.1f}R)"
+                )
+            return
 
         # Claim the close-lock for the whole trigger handling so the health
         # monitor can't send a concurrent close for the same position (which
@@ -704,13 +733,22 @@ class TradingBot:
                 timestamp=int(time.time() * 1000), symbol=sym, side=close_side,
                 price=price, amount=amount, pnl=pnl,
                 strategy=strategy_name, reason=trigger, paper=self.paper,
+                detail=(f"ladder T{pos.ladder_stage} reached" if pos.sl_ladder_enabled else ""),
             ))
             logger.info("[%s] CLOSED %s @ %.4f via %s  pnl≈%.2f USDT",
                         strategy_name, sym, price, trigger, pnl)
             if self.telegram:
-                self.telegram.notify_trade_closed(
-                    sym, trigger, price, pos.entry_price,
-                    pos.stop_loss, pos.take_profit, self._sig.summary(), side=pos.side)
+                if pos.sl_ladder_enabled and trigger == "take_profit2":
+                    self.telegram.notify(
+                        f"🎯 *{sym.split('/')[0]}USDT*\n\n"
+                        f"Take Profit — Target 4 Hit ({pos.LADDER_FINAL_R:.1f}R)\n\n"
+                        f"Price : {price:.4f}\n\n"
+                        f"PnL ≈ `{pnl:+.2f}$`"
+                    )
+                else:
+                    self.telegram.notify_trade_closed(
+                        sym, trigger, price, pos.entry_price,
+                        pos.stop_loss, pos.take_profit, self._sig.summary(), side=pos.side)
         finally:
             self._closing_positions.discard(close_key)
 

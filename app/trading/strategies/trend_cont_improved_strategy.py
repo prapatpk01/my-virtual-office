@@ -1571,6 +1571,17 @@ class TrendContImprovedStrategy(BaseStrategy):
         # TP1 breakeven buffer: after partial close, set runner SL to entry + N×R instead of exact BE.
         # Backtest Jan-May 2026 E:tp25_be25 winner: PnL +$121 vs +$88 baseline (+38%), PF 1.62 vs 1.45.
         tp1_be_buffer_r=0.25,       # 0.25R buffer above entry for runner stop (0=exact breakeven)
+        # SL-ratchet ladder (opt-in, replaces partial-close entirely): T1(0.5R)->
+        # SL+0.3R, T2(0.7R)->SL+0.5R, T3(1.0R)->SL+0.8R, T4(1.2R)->full close.
+        # No position splitting anywhere — see Position.stage_check_ladder().
+        # Backtest Jan-May 2026 (BTC+XAG+XAU), same entries, exit-mechanic only:
+        #   partial-close (old): T=111 WR=81.1% PnL=+202.76 PF=1.70
+        #   SL-ratchet ladder:   T=113 WR=81.4% PnL=+357.94 PF=2.23  (+76% PnL, +31% PF)
+        # Riding the FULL position through the ratchet levels (instead of only a
+        # 50% runner past a single BE+buffer) captures far more value from trades
+        # that progress partway without reaching the final target — this is what
+        # the old breakeven-heavy exit (56-60% of trades) was leaving on the table.
+        sl_ladder_enabled=True,
         # ── Market Regime ──────────────────────────────────────────────────────
         # Classifies each bar: STRONG_TREND / TREND / HIGH_VOL / RANGE / LOW_VOL / EXHAUSTION.
         # Blocks RANGE/LOW_VOL/EXHAUSTION entries; widens SL in HIGH_VOL.
@@ -1853,6 +1864,7 @@ class TrendContImprovedStrategy(BaseStrategy):
                                 else "pullback"),
                 "regime":      str(last.get("regime", "")),
                 "adx15":       float(last.get("adx15", 0) or 0),
+                "sl_ladder_enabled": bool(p.get("sl_ladder_enabled", False)),
             }
 
         if buy:

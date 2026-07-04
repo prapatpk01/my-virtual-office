@@ -34,10 +34,47 @@ class Position:
     pattern_tier: int = 0              # best pattern tier at entry (0=none, 1/2/3)
     tp1_pattern_upgraded: bool = False # True once TP1 was raised by pattern tier+BULL
     tp1_original: float = 0.0         # original TP1 price at entry (before upgrade)
+    # SL-ratchet ladder (opt-in, replaces partial-close): T1/T2/T3 move the stop
+    # only (no size reduction); T4 closes the full remaining position.
+    sl_ladder_enabled: bool = False
+    ladder_stage: int = 0               # 0=none hit yet, 1/2/3 = highest level reached
 
     @property
     def pnl_pct(self) -> float:
         return 0.0  # filled by bot at runtime
+
+    # (trigger_R, new_sl_R) — new_sl_R is the SL distance from entry, in R, once
+    # that level is hit. Final level (index 3) has no SL move; caller closes there.
+    LADDER_LEVELS = [(0.5, 0.3), (0.7, 0.5), (1.0, 0.8)]
+    LADDER_FINAL_R = 1.2
+
+    def stage_check_ladder(self, price: float) -> Optional[str]:
+        """
+        SL-ratchet ladder: T1(0.5R)->SL+0.3R, T2(0.7R)->SL+0.5R, T3(1.0R)->SL+0.8R,
+        T4(1.2R)->full close (matches the exchange-attached TP2). No partial closes
+        anywhere in this mode. Returns 'stop_loss' | 'ladder_T1'/'T2'/'T3' | 'take_profit2' | None.
+        The caller is responsible for actually moving the exchange SL order and
+        updating self.stop_loss / self.ladder_stage after acting on a ladder_* result.
+        """
+        if not self.one_r or self.one_r <= 0:
+            return None
+        long = self.side == "long"
+
+        if self.stop_loss and ((price <= self.stop_loss) if long else (price >= self.stop_loss)):
+            return "stop_loss"
+
+        final_price = (self.entry_price + self.LADDER_FINAL_R * self.one_r if long
+                       else self.entry_price - self.LADDER_FINAL_R * self.one_r)
+        if (price >= final_price) if long else (price <= final_price):
+            return "take_profit2"
+
+        if self.ladder_stage < len(self.LADDER_LEVELS):
+            trigger_r, _ = self.LADDER_LEVELS[self.ladder_stage]
+            trigger_price = (self.entry_price + trigger_r * self.one_r if long
+                             else self.entry_price - trigger_r * self.one_r)
+            if (price >= trigger_price) if long else (price <= trigger_price):
+                return f"ladder_T{self.ladder_stage + 1}"
+        return None
 
     def stage_check(self, price: float) -> Optional[str]:
         """
@@ -207,7 +244,8 @@ class RiskManager:
     def open_position(self, symbol: str, side: str, entry_price: float, amount: float,
                       strategy: str = "", stop_loss: float = None, take_profit: float = None,
                       tp1: float = None, tp2: float = None, partial_pct: float = 0.5,
-                      contract_size: float = 1.0, one_r: float = 0.0) -> Position:
+                      contract_size: float = 1.0, one_r: float = 0.0,
+                      sl_ladder_enabled: bool = False) -> Position:
         if stop_loss is None or take_profit is None:
             sl_default, tp_default = self.compute_stops(side, entry_price)
             stop_loss   = stop_loss   if stop_loss   is not None else sl_default
@@ -215,7 +253,8 @@ class RiskManager:
         pos = Position(symbol=symbol, side=side, entry_price=entry_price, amount=amount,
                        stop_loss=stop_loss, take_profit=take_profit,
                        tp1=tp1, tp2=tp2, partial_pct=partial_pct, full_amount=amount,
-                       contract_size=contract_size, one_r=one_r)
+                       contract_size=contract_size, one_r=one_r,
+                       sl_ladder_enabled=sl_ladder_enabled)
         self._positions[f"{symbol}||{strategy}"] = pos
         return pos
 
