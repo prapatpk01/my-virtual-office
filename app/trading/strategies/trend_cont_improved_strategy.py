@@ -989,8 +989,9 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
     if p.get("macd_peak_filter", False):
         _h        = macd_line - macd_sig
         if p.get("macd_peak_mode", "exhaustion") == "slope":
-            _h_up   = _h > _h.shift(1)   # rising  → dark-green / light-red
-            _h_dn   = _h < _h.shift(1)   # falling → light-green / dark-red
+            _sl = int(p.get("macd_slope_lookback", 1))  # bars for the slope read
+            _h_up   = _h > _h.shift(_sl)   # rising  → dark-green / light-red
+            _h_dn   = _h < _h.shift(_sl)   # falling → light-green / dark-red
             long_gates  = long_gates  & _h_up.fillna(False)
             short_gates = short_gates & _h_dn.fillna(False)
         else:  # "exhaustion"
@@ -1435,6 +1436,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # and reacts in 1 bar (blocks a long the moment the histogram goes
         # light-green, i.e. positive-but-falling), directly fixing buy-the-top.
         macd_peak_mode="slope",
+        macd_slope_lookback=1,   # slope mode: bars for the histogram-slope read (1=fastest)
         macd_peak_lookback=6,       # bars to look back for a higher histogram peak
         macd_peak_slope_bars=2,     # bars over which the post-peak decline is measured
         # Momentum confirmation source (the laggiest entry gate): "macd" (old),
