@@ -977,22 +977,33 @@ def _compute(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, p: dict
 
     # ── MACD-histogram peak/exhaustion filter (opt-in) ───────────────────────
     # Blocks "buying the top": the price bar can tick up with volume (passing
-    # volmom) while the MACD histogram has already PEAKED and is rolling over —
-    # a weak, exhausting bounce (the classic ETH "entered at the top" loss).
-    # Detects a post-peak decline: the histogram fell for `slope_bars` and a
-    # meaningfully higher peak existed within the last `lookback` bars.
+    # volmom) while the MACD histogram has already peaked and is rolling over.
+    # macd_peak_mode:
+    #   "exhaustion" — block a LONG only once the histogram has clearly declined
+    #     (fell for slope_bars) from a recent peak. Lenient; catches the top late.
+    #   "slope" — the TradingView 4-colour rule: histogram slope (1 bar) IS the
+    #     momentum direction. dark→light-red (hist turning UP) = buy side; dark→
+    #     light-green (hist turning DOWN) = sell side. So a LONG needs the
+    #     histogram rising and a SHORT needs it falling. Reacts in 1 bar — the
+    #     earliest a peak can be known — directly matching "don't buy light-green".
     if p.get("macd_peak_filter", False):
         _h        = macd_line - macd_sig
-        _pk_lb    = int(p.get("macd_peak_lookback", 6))
-        _pk_sb    = int(p.get("macd_peak_slope_bars", 2))
-        _decl_l   = _h < _h.shift(_pk_sb)                 # histogram sloping down
-        _peak_l   = _h.rolling(_pk_lb).max() > _h         # a higher peak exists behind us
-        _post_peak_l = (_decl_l & _peak_l).fillna(False)  # rolling over from a recent top
-        _incl_s   = _h > _h.shift(_pk_sb)                 # histogram sloping up (short exhausting)
-        _trough_s = _h.rolling(_pk_lb).min() < _h
-        _post_peak_s = (_incl_s & _trough_s).fillna(False)
-        long_gates  = long_gates  & ~_post_peak_l
-        short_gates = short_gates & ~_post_peak_s
+        if p.get("macd_peak_mode", "exhaustion") == "slope":
+            _h_up   = _h > _h.shift(1)   # rising  → dark-green / light-red
+            _h_dn   = _h < _h.shift(1)   # falling → light-green / dark-red
+            long_gates  = long_gates  & _h_up.fillna(False)
+            short_gates = short_gates & _h_dn.fillna(False)
+        else:  # "exhaustion"
+            _pk_lb    = int(p.get("macd_peak_lookback", 6))
+            _pk_sb    = int(p.get("macd_peak_slope_bars", 2))
+            _decl_l   = _h < _h.shift(_pk_sb)
+            _peak_l   = _h.rolling(_pk_lb).max() > _h
+            _post_peak_l = (_decl_l & _peak_l).fillna(False)
+            _incl_s   = _h > _h.shift(_pk_sb)
+            _trough_s = _h.rolling(_pk_lb).min() < _h
+            _post_peak_s = (_incl_s & _trough_s).fillna(False)
+            long_gates  = long_gates  & ~_post_peak_l
+            short_gates = short_gates & ~_post_peak_s
 
     # ── Final entry trigger: momentum confirmation before entry ──────────────
     # Diagnostic (gate_bottleneck): this is the #1 entry blocker (804 otherwise-
@@ -1415,6 +1426,7 @@ class TrendContImprovedStrategy(BaseStrategy):
         # step. (OR-combining with macd was proven redundant: the peak filter
         # removes exactly the OR-added trades, collapsing back to plain macd.)
         macd_peak_filter=True,
+        macd_peak_mode="exhaustion",  # "exhaustion" (post-peak decline) or "slope" (TV 4-colour)
         macd_peak_lookback=6,       # bars to look back for a higher histogram peak
         macd_peak_slope_bars=2,     # bars over which the post-peak decline is measured
         # Momentum confirmation source (the laggiest entry gate): "macd" (old),
