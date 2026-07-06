@@ -176,10 +176,19 @@ def build_config() -> dict:
         # Whipsaw guard: minutes since the last OPEN on a symbol before a new
         # entry is allowed there (0 = disabled).
         "adaptive_entry_spacing_min": _env_int("ADAPTIVE_ENTRY_SPACING_MIN", 60),
-        # Fixed-margin sizing (live default): notional per position =
-        # ADAPTIVE_MARGIN_USDT × LEVERAGE (e.g. $20 × 20x = $400). Set 0 to
-        # fall back to risk-%-of-balance sizing (ADAPTIVE_RISK_PCT).
-        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 20.0),
+        # [LEVEL 1 — ADAPTIVE RISK] Confidence-weighted %-of-balance sizing
+        # (live default): position size scales between MIN and MAX% of
+        # balance based on the bot's own conviction (score headroom above
+        # this state's entry bar, penalized by any historically-bad
+        # condition tags present — see ConditionLearningEngine). Set both to
+        # 0 to fall back to legacy fixed-$ sizing (ADAPTIVE_MARGIN_USDT), or
+        # all three to 0 for classic risk-%-of-balance (ADAPTIVE_RISK_PCT).
+        "adaptive_margin_pct_min": _env_float("ADAPTIVE_MARGIN_PCT_MIN", 0.08),
+        "adaptive_margin_pct_max": _env_float("ADAPTIVE_MARGIN_PCT_MAX", 0.15),
+        # Legacy fixed-margin sizing override: notional = ADAPTIVE_MARGIN_USDT
+        # × LEVERAGE for every trade regardless of quality. 0 = disabled
+        # (default — adaptive %-of-balance above takes over instead).
+        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 0.0),
     }
 
 
@@ -353,7 +362,9 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             tp2_r=cfg.get("adaptive_tp2_r"),
             min_ema_dist_atr=cfg.get("adaptive_min_ema_dist_atr"),
             entry_spacing_min=cfg.get("adaptive_entry_spacing_min", 60),
-            margin_usdt=cfg.get("adaptive_margin_usdt", 20.0),
+            margin_pct_min=cfg.get("adaptive_margin_pct_min", 0.08),
+            margin_pct_max=cfg.get("adaptive_margin_pct_max", 0.15),
+            margin_usdt=cfg.get("adaptive_margin_usdt", 0.0),
             sizing_leverage=cfg.get("leverage", 10),
         )
         bot.load_state(state_file)
@@ -601,6 +612,15 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             if telegram:
                                 try:
                                     telegram.send(f"[{sym}]\n{lesson}")
+                                except Exception:
+                                    pass
+
+                        # [LEVEL 3] forward adaptive-strategy activation/expiry
+                        for alert in bot.pop_strategy_alerts():
+                            logger.warning("[Strategy][%s] %s", sym, alert)
+                            if telegram:
+                                try:
+                                    telegram.send(f"[{sym}]\n{alert}")
                                 except Exception:
                                     pass
 

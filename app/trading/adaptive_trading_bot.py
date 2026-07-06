@@ -323,6 +323,74 @@ class PatternLearningEngine:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# [LEVEL 2 — ADAPTIVE SCORING] Condition-tag learning
+# PatternLearningEngine (above) tracks win-rate per ENTRY_TYPE (a handful of
+# broad buckets); this tracks win-rate per DIAGNOSTIC TAG — the specific
+# thing that was off about a losing entry (overextended, low volume, ...).
+# A candidate resembling a historically bad pattern gets a score penalty
+# even the first time its entry_type is tried, because the tag itself
+# already has a track record. Same "no ML, deterministic threshold" design
+# as PatternLearningEngine, on purpose — auditable and hard to overfit.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ConditionLearningEngine:
+    """Per-diagnostic-tag win-rate tracking, feeding a scoring penalty."""
+
+    TAGS = ["overextended", "rsi_extreme", "momentum_climax", "low_volume",
+            "choppy", "trend_to_range"]
+    MIN_SAMPLES = 8       # minimum tagged trades before a tag affects scoring
+    MAX_PENALTY = 20.0    # score points subtracted from `total`, at worst
+
+    def __init__(self):
+        self.stats: Dict[str, Dict] = {
+            tag: {"wins": 0, "losses": 0} for tag in self.TAGS
+        }
+
+    def record(self, tags: List[str], win: bool) -> None:
+        for tag in tags:
+            s = self.stats.setdefault(tag, {"wins": 0, "losses": 0})
+            if win:
+                s["wins"] += 1
+            else:
+                s["losses"] += 1
+
+    def get_penalty(self, tags: List[str]) -> float:
+        """Score penalty for a candidate carrying these tags. Untested or
+        low-sample tags contribute 0 — no penalty until there's evidence."""
+        penalty = 0.0
+        for tag in tags:
+            s = self.stats.get(tag)
+            if not s:
+                continue
+            total = s["wins"] + s["losses"]
+            if total < self.MIN_SAMPLES:
+                continue
+            wr = s["wins"] / total
+            if wr < 0.45:
+                penalty += self.MAX_PENALTY * (0.45 - wr) / 0.45
+        return min(penalty, self.MAX_PENALTY)
+
+    def get_summary(self) -> Dict:
+        out = {}
+        for tag, s in self.stats.items():
+            total = s["wins"] + s["losses"]
+            if total == 0:
+                continue
+            out[tag] = {
+                "trades":    total,
+                "win_rate":  round(s["wins"] / total, 3),
+                "penalty":   round(self.get_penalty([tag]), 1),
+            }
+        return out
+
+    def to_dict(self) -> Dict:
+        return {"stats": self.stats}
+
+    def from_dict(self, data: Dict):
+        self.stats = data.get("stats", self.stats)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # ADAPTIVE ENGINE (V7 base weights — used as fallback scoring only)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -477,6 +545,8 @@ class TradingBot:
                  min_ema_dist_atr: Optional[float] = None,
                  entry_spacing_min: int = 60,
                  margin_usdt: float = 0.0,
+                 margin_pct_min: float = 0.0,
+                 margin_pct_max: float = 0.0,
                  sizing_leverage: int = 10,
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
@@ -490,6 +560,10 @@ class TradingBot:
         self.conf_scorer       = ConfidenceScorer()
         self.bias_engine       = RegimeBiasEngine()
         self.learning_engine   = PatternLearningEngine()
+        # [LEVEL 2/3] Diagnostic-tag learning + temporary strategy tightening
+        # (see ConditionLearningEngine, _diagnose_conditions, _check_strategy_dominance)
+        self.condition_engine  = ConditionLearningEngine()
+        self._active_strategy_adjustments: Dict[str, datetime.datetime] = {}
         self.tp1_close_pct     = tp1_close_pct
         # TP geometry — instance overrides of the class defaults (env-tunable
         # WR↔profit dial: lower TP1_R = higher win-rate, smaller avg win).
@@ -510,9 +584,16 @@ class TradingBot:
         self.entry_spacing_min = entry_spacing_min
         self._last_close_at: Optional[datetime.datetime] = None
 
-        # [SIZING] fixed-margin mode (margin × leverage notional per position);
-        # 0.0 = classic risk-% sizing (backtest default)
+        # [SIZING] Three modes, checked in this precedence order in
+        # _step5_risk_engine: (1) margin_pct_min/max > 0 → [LEVEL 1] dynamic
+        # %-of-balance sizing, the bot's own conviction (score headroom above
+        # this state's bar, penalized by any historically-bad condition tags)
+        # decides where in [min, max] this trade's size falls; (2) margin_usdt
+        # > 0 → legacy fixed-$ notional (kept for explicit override); (3)
+        # neither set → classic risk-% sizing (backtest default).
         self.margin_usdt     = margin_usdt
+        self.margin_pct_min  = margin_pct_min
+        self.margin_pct_max  = margin_pct_max
         self.sizing_leverage = sizing_leverage
 
         # [SCAN-INFO] last per-direction signal evaluation, for the runner's
@@ -596,6 +677,12 @@ class TradingBot:
         self._pending_lesson: Optional[str] = None
         self._lesson_alerted_at: int = 0   # journal length when last alert fired
 
+        # [LEVEL 3] activation/expiry notifications — separate from the
+        # lesson alert (which has its own anti-spam gate that could suppress
+        # a lesson alert on the exact loss that also activates a temporary
+        # tightening) so this is always visible regardless of that timing.
+        self._pending_strategy_alerts: List[str] = []
+
     def get_filter_stats(self) -> Dict[str, int]:
         """Return and reset the rejection-reason tally since last call."""
         stats = dict(self._filter_stats)
@@ -643,6 +730,7 @@ class TradingBot:
             _n = lambda k: float(t.get(k) or 0)
             targets_hit = t.get("targets_hit") or []
             reached = ",".join(targets_hit) if targets_hit else "none"
+            tags = t.get("loss_tags") or []
             lines.append(
                 f"• {t.get('direction','?')} {t.get('e_state') or t.get('market_state','?')}"
                 f"/{t.get('entry_type','?')} → exit {t.get('exit_reason','?')} "
@@ -651,18 +739,35 @@ class TradingBot:
                 f"e={_n('e_entry'):.0f} ctx={_n('e_context'):.0f} "
                 f"fit={_n('e_fit'):.0f} | rsi={_n('e_rsi'):.0f} "
                 f"adx={_n('e_adx'):.0f}"
+                + (f"\n  likely cause: {', '.join(tags)}" if tags else "")
             )
         # exit-reason tally over the window (what's killing us)
         from collections import Counter as _Counter
         reasons = _Counter(t.get("exit_reason", "?") for t in losses)
         lines.append("")
         lines.append("exit reasons: " + ", ".join(f"{k}×{v}" for k, v in reasons.most_common()))
-        # bot's own self-adjustment (learning engine)
+        # [LEVEL 0] which diagnostic tags dominate this window's losses
+        tag_counts = _Counter(tag for t in losses for tag in (t.get("loss_tags") or []))
+        if tag_counts:
+            lines.append("likely causes: " + ", ".join(f"{k}×{v}" for k, v in tag_counts.most_common()))
+        # bot's own self-adjustment (learning engine + condition engine)
         try:
             lines.append(f"auto-adjust weights: {self.learning_engine.get_summary()}")
         except Exception:
             pass
-        lines.append("(weights auto-reduce sizing on entry types with WR<45%)")
+        try:
+            cond_summary = self.condition_engine.get_summary()
+            if cond_summary:
+                lines.append(f"condition-tag stats: {cond_summary}")
+        except Exception:
+            pass
+        if self._active_strategy_adjustments:
+            lines.append(
+                "⚠ active temporary tightening: " +
+                ", ".join(self._active_strategy_adjustments.keys())
+            )
+        lines.append("(weights auto-reduce sizing on entry types with WR<45%; "
+                     "condition tags with WR<45% get an entry-score penalty)")
 
         self._pending_lesson    = "\n".join(lines)
         self._lesson_alerted_at = len(j)
@@ -672,6 +777,12 @@ class TradingBot:
         msg = self._pending_lesson
         self._pending_lesson = None
         return msg
+
+    def pop_strategy_alerts(self) -> List[str]:
+        """Return and clear queued [LEVEL 3] activation/expiry notifications."""
+        alerts = self._pending_strategy_alerts
+        self._pending_strategy_alerts = []
+        return alerts
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -988,6 +1099,119 @@ class TradingBot:
     # markets). 0 = disabled.
     MIN_1H_EFFICIENCY: float = 0.20
 
+    # [DIAGNOSTIC TAGS] Rule-based thresholds for "what was off about this
+    # entry" — deliberately simple/auditable (no ML), built entirely from
+    # features already scored at entry time (e_ema_dist_atr, e_rsi,
+    # e_atr_exp, e_vol_ratio, e_adx). Feeds the lesson alert (Level 0),
+    # ConditionLearningEngine's scoring penalty (Level 2), and the temporary
+    # strategy tightening when one tag dominates recent losses (Level 3).
+    TAG_OVEREXTENDED_ATR    = 1.0    # e_ema_dist_atr >= this = entered far from EMA20
+    TAG_RSI_HIGH            = 68.0   # LONG entries at/above this RSI = already extended
+    TAG_RSI_LOW             = 32.0   # SHORT entries at/below this RSI = already extended
+    TAG_MOMENTUM_CLIMAX_EXP = 1.4    # e_atr_exp >= this = entered on an expansion/climax bar
+    TAG_LOW_VOLUME          = 0.85   # e_vol_ratio <= this = below-average volume at entry
+    TAG_CHOPPY_ADX          = 20.0   # e_adx <= this = weak/no trend at entry
+
+    # [LEVEL 3 — ADAPTIVE STRATEGY] When a single tag dominates recent losses,
+    # temporarily add extra scoring penalty for candidates carrying it — a
+    # bounded, self-expiring, ONE-DIRECTION-ONLY tightening (never loosens
+    # anything). Reuses ConditionLearningEngine's penalty mechanism rather
+    # than a separate rule path, so there's one scoring-penalty code path
+    # to reason about, not two.
+    STRATEGY_DOMINANCE_COUNT = 2      # tag must appear in >= this many of...
+    STRATEGY_LOOKBACK_LOSSES = 3      # ...the last N losses to trigger
+    STRATEGY_EXTRA_PENALTY   = 15.0   # additional score penalty while active
+    STRATEGY_DURATION_MIN    = 360    # auto-expire after 6 hours
+
+    def _diagnose_conditions(self, direction: str, ema_dist_atr: float, rsi: float,
+                             atr_exp: float, vol_ratio: float, adx: float) -> List[str]:
+        """
+        Rule-based tags for "what was off about this entry", from features
+        already computed at entry-scoring time. Used two ways: (1) post-hoc
+        on a closed losing trade (via its stored e_* fields) to explain why
+        in the lesson alert and train ConditionLearningEngine; (2) pre-entry
+        on a live candidate (via current indicator values) to check whether
+        it resembles a historically bad pattern before it's ever taken.
+        """
+        tags: List[str] = []
+        if ema_dist_atr >= self.TAG_OVEREXTENDED_ATR:
+            tags.append("overextended")
+        if direction == "LONG" and rsi >= self.TAG_RSI_HIGH:
+            tags.append("rsi_extreme")
+        elif direction == "SHORT" and rsi <= self.TAG_RSI_LOW:
+            tags.append("rsi_extreme")
+        if atr_exp >= self.TAG_MOMENTUM_CLIMAX_EXP:
+            tags.append("momentum_climax")
+        if vol_ratio <= self.TAG_LOW_VOLUME:
+            tags.append("low_volume")
+        if adx <= self.TAG_CHOPPY_ADX:
+            tags.append("choppy")
+        return tags
+
+    def _diagnose_loss(self, t: Dict, close_reason: str) -> List[str]:
+        """Post-hoc: tag a closed trade's condition profile from its stored
+        entry-time features — called for wins too (ConditionLearningEngine's
+        win-rate per tag needs both outcomes), despite the name. STATE_DRIFT_EXIT
+        (the market regime changed mid-trade) maps directly to the
+        'trend_to_range' tag — that exit reason already means exactly this,
+        no threshold needed."""
+        tags = self._diagnose_conditions(
+            direction    = t.get("direction", "LONG"),
+            ema_dist_atr = t.get("e_ema_dist_atr") or 0.0,
+            rsi          = t.get("e_rsi") or 50.0,
+            atr_exp      = t.get("e_atr_exp") or 1.0,
+            vol_ratio    = t.get("e_vol_ratio") or 1.0,
+            adx          = t.get("e_adx") or 25.0,
+        )
+        if close_reason == "STATE_DRIFT_EXIT" and "trend_to_range" not in tags:
+            tags.append("trend_to_range")
+        return tags
+
+    def _active_strategy_penalty(self, tags: List[str], now: datetime.datetime) -> float:
+        """[LEVEL 3] Extra penalty for tags currently under temporary
+        tightening (dominated recent losses). Opportunistically drops
+        expired entries so the dict doesn't grow unbounded."""
+        expired = [tag for tag, until in self._active_strategy_adjustments.items() if now >= until]
+        for tag in expired:
+            del self._active_strategy_adjustments[tag]
+            msg = f"[STRATEGY] temporary tightening on '{tag}' expired — reverted to normal"
+            self._log_event(msg)
+            self._pending_strategy_alerts.append(f"🔄 Adaptive Strategy\n{msg}")
+        return sum(self.STRATEGY_EXTRA_PENALTY for tag in tags
+                   if tag in self._active_strategy_adjustments)
+
+    def _check_strategy_dominance(self) -> None:
+        """
+        [LEVEL 3] After a loss: if one diagnostic tag dominates the last
+        STRATEGY_LOOKBACK_LOSSES losses, activate (or refresh) a temporary
+        extra scoring penalty for that tag. Self-expires after
+        STRATEGY_DURATION_MIN — this only ever makes entry MORE cautious for
+        a bounded window, never loosens anything, and always reverts.
+        """
+        losses = [t for t in self.trade_journal if t.get("win_loss") == "LOSS"]
+        recent = losses[-self.STRATEGY_LOOKBACK_LOSSES:]
+        if len(recent) < self.STRATEGY_LOOKBACK_LOSSES:
+            return
+        from collections import Counter as _Counter
+        tag_counts = _Counter(tag for t in recent for tag in (t.get("loss_tags") or []))
+        if not tag_counts:
+            return
+        dominant_tag, count = tag_counts.most_common(1)[0]
+        if count < self.STRATEGY_DOMINANCE_COUNT:
+            return
+        now = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
+        was_active = dominant_tag in self._active_strategy_adjustments
+        self._active_strategy_adjustments[dominant_tag] = now + datetime.timedelta(
+            minutes=self.STRATEGY_DURATION_MIN)
+        if not was_active:
+            msg = (
+                f"'{dominant_tag}' caused {count}/{len(recent)} recent losses "
+                f"→ temporary +{self.STRATEGY_EXTRA_PENALTY:.0f} entry penalty for "
+                f"{self.STRATEGY_DURATION_MIN}min"
+            )
+            self._log_event(f"[STRATEGY] {msg}", level="warning")
+            self._pending_strategy_alerts.append(f"🧠 Adaptive Strategy activated\n{msg}")
+
     def _regime_direction(self, ind_4h: Dict) -> float:
         """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
         ema5  = ind_4h.get("ema5", 0.0)
@@ -1185,13 +1409,34 @@ class TradingBot:
             return None
 
 
-        total = entry["score"] * 0.40 + ctx["score"] * 0.30 + fit * 0.30
+        # [LEVEL 2/3 — ADAPTIVE SCORING/STRATEGY] Tag this CANDIDATE with the
+        # same diagnostic tags used post-hoc on closed losses (see
+        # _diagnose_loss) — a candidate resembling a historically bad pattern
+        # gets a score penalty before it's ever taken, not just recorded
+        # after the fact. Computed for every state (not just trend states)
+        # since overextension/low-volume patterns matter for MR entries too.
+        _px_now  = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
+        _atr_now = max(ind_15m.get("atr", 1e-9), 1e-9)
+        _ema_dist_now  = abs(_px_now - ind_15m.get("ema20", _px_now)) / _atr_now
+        _atr_exp_now   = ind_15m.get("atr", 0.0) / max(ind_15m.get("atr_avg", ind_15m.get("atr", 1.0)), 1e-9)
+        _vol_ratio_now = ind_15m.get("volume", 0.0) / max(ind_15m.get("vol_avg", ind_15m.get("volume", 1.0)), 1e-9)
+        _current_tags = self._diagnose_conditions(
+            direction=direction, ema_dist_atr=_ema_dist_now, rsi=ind_15m.get("rsi", 50.0),
+            atr_exp=_atr_exp_now, vol_ratio=_vol_ratio_now, adx=ind_15m.get("adx", 25.0),
+        )
+        _now_ts = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
+        _condition_penalty = (self.condition_engine.get_penalty(_current_tags)
+                              + self._active_strategy_penalty(_current_tags, _now_ts))
+
+        total = entry["score"] * 0.40 + ctx["score"] * 0.30 + fit * 0.30 - _condition_penalty
         total_min = thrs["total_min"]
 
         self._filter_stats["checked"] += 1
         self._scan_info[direction] = (
             f"total {total:.0f}/{total_min} "
-            f"(15M:{entry['score']:.0f} 1H:{ctx['score']:.0f} 4H-fit:{fit:.0f})"
+            f"(15M:{entry['score']:.0f} 1H:{ctx['score']:.0f} 4H-fit:{fit:.0f}"
+            + (f" tag_penalty:-{_condition_penalty:.0f} [{','.join(_current_tags)}]" if _condition_penalty > 0 else "")
+            + ")"
             + (" → SIGNAL" if total >= total_min else ""))
         if total >= total_min:
             self._filter_stats["passed"] += 1
@@ -1235,6 +1480,11 @@ class TradingBot:
             "direction_fit":    fit,
             "entry_type":       entry_type,
             "strategy":         "Adaptive",
+            # [LEVEL 1/2] threaded through to _step5_risk_engine for
+            # conviction-weighted sizing, and into current_trade for the
+            # post-hoc lesson/condition-learning loop
+            "condition_penalty": _condition_penalty,
+            "entry_tags":         _current_tags,
         }
 
     # ── Lightweight cooldown check — independent of new-candle ticks ─────────
@@ -1482,12 +1732,56 @@ class TradingBot:
         learning_mult = self.learning_engine.get_weight(entry_type)
         size_mult     = conf_mult * health_mult * learning_mult
 
-        # [SIZING] Two modes:
-        # - margin_usdt > 0 (live default): FIXED notional = margin × leverage
-        #   → predictable whole-contract sizes; quality multipliers do not
-        #   scale size (the low-confidence skip gate above still applies).
-        # - margin_usdt == 0 (backtest / opt-in): classic risk-% of balance.
-        if self.margin_usdt and self.margin_usdt > 0:
+        # [SIZING] Three modes, in this precedence order:
+        # - margin_pct_min/max > 0 (Level 1 default): dynamic %-of-balance,
+        #   scaled between the two bounds by the bot's own conviction (score
+        #   headroom above this state's bar, penalized by any historically
+        #   -bad condition tags present) — a strong, clean signal gets a
+        #   bigger position than one that barely cleared the bar.
+        # - margin_usdt > 0 (legacy override): FIXED notional = margin × leverage,
+        #   the same size regardless of signal quality.
+        # - neither set (backtest / opt-out): classic risk-% of balance.
+        if self.margin_pct_min > 0 or self.margin_pct_max > 0:
+            lo = max(self.margin_pct_min, 0.0)
+            hi = max(self.margin_pct_max, lo)
+            _thrs_now = ADAPTIVE_THRESHOLDS.get(self.current_market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
+            headroom  = signal.get("total_score", 0.0) - _thrs_now["total_min"]
+            conf_norm = float(np.clip(headroom / 25.0, 0.0, 1.0))
+            tag_penalty_norm = float(np.clip(
+                signal.get("condition_penalty", 0.0) / max(self.condition_engine.MAX_PENALTY, 1e-9), 0.0, 1.0))
+            conviction    = conf_norm * (1.0 - tag_penalty_norm)
+            margin_pct    = lo + (hi - lo) * conviction
+            notional      = self.account_balance * margin_pct * max(self.sizing_leverage, 1)
+            position_size = notional / max(entry_price, 1e-9)
+
+            # [MIN-LOT FLOOR] same guard as the fixed-margin branch below —
+            # the exchange fills whole contracts, so the real required
+            # margin can silently exceed the nominal one at small sizes.
+            real_size   = max(position_size, self.min_close_size) \
+                          if self.min_close_size > 0 else position_size
+            real_margin = (real_size * entry_price) / max(self.sizing_leverage, 1)
+            if real_size > position_size:
+                position_size = real_size
+
+            if real_margin > self.account_balance:
+                self._log_event(
+                    f"[SIZING] required margin ${real_margin:.2f} "
+                    f"(min-lot floored) > balance ${self.account_balance:.2f} "
+                    f"— skip order (would be rejected for insufficient margin)",
+                    level="warning",
+                )
+                return
+
+            _risk_now = position_size * entry_price * (sl_dist / max(entry_price, 1e-9))
+            self._log_event(
+                f"[SIZING] adaptive-risk {margin_pct:.1%} of balance "
+                f"(conviction={conviction:.2f}, headroom={headroom:.1f}, "
+                f"tag_penalty={signal.get('condition_penalty', 0.0):.1f}) "
+                f"= ${notional:.0f} notional (real margin≈${real_margin:.2f}, "
+                f"risk≈${_risk_now:.2f} = "
+                f"{_risk_now / max(self.account_balance, 1e-9) * 100:.1f}% of balance)"
+            )
+        elif self.margin_usdt and self.margin_usdt > 0:
             notional      = self.margin_usdt * max(self.sizing_leverage, 1)
             position_size = notional / max(entry_price, 1e-9)
 
@@ -1878,7 +2172,20 @@ class TradingBot:
             # final close — direct evidence for fake-vs-real diagnosis
             # (e.g. "no targets hit -> SL" vs "T1,T2 hit then reversed").
             "targets_hit":         list(t.get("targets_hit", [])),
+            # [LEVEL 0/2/3] why this loss likely happened — populated below
+            "loss_tags":           [],
         }
+
+        # [LEVEL 0 — DIAGNOSIS] Tag every closed trade (win or loss) with its
+        # entry-time condition profile and feed ConditionLearningEngine
+        # (Level 2) — win-rate per tag needs both outcomes to be meaningful,
+        # not just losses. "loss_tags" in the journal (used by the lesson
+        # alert / STRATEGY_DOMINANCE) is only populated for actual losses.
+        _tags = self._diagnose_loss(t, close_reason)
+        if result == "LOSS":
+            entry["loss_tags"] = _tags
+        if _tags:
+            self.condition_engine.record(_tags, win=(result == "WIN"))
         self.trade_journal.append(entry)
 
         # [V8-7] Learning engine record
@@ -1901,6 +2208,14 @@ class TradingBot:
             self._check_lessons()
         except Exception as _le:
             self._log_event(f"[LESSON] alert build failed (non-fatal): {_le}", level="warning")
+
+        # [LEVEL 3] Check AFTER the lesson-cluster logic above so a fresh
+        # dominance-triggering loss is already in trade_journal.
+        if result == "LOSS":
+            try:
+                self._check_strategy_dominance()
+            except Exception as _se:
+                self._log_event(f"[STRATEGY] dominance check failed (non-fatal): {_se}", level="warning")
 
         # Update streaks + daily PnL
         self.daily_pnl_pct     += (pnl / max(self.account_balance, 1)) * 100
@@ -2320,6 +2635,11 @@ class TradingBot:
             "atr_history":          self.atr_history[-200:],
             "adaptive_weights":     self.adaptive_engine.base_weights,
             "pattern_learning":     self.learning_engine.to_dict(),
+            # [LEVEL 2/3] condition-tag stats + any active temporary tightening
+            "condition_learning":   self.condition_engine.to_dict(),
+            "active_strategy_adjustments": {
+                tag: until.isoformat() for tag, until in self._active_strategy_adjustments.items()
+            },
             # [TARGET ALERTS] persist queued-but-not-yet-sent alerts so a
             # crash/restart between this save and the runner popping them
             # (run_bot.py's _send_target_alerts) doesn't silently drop a
@@ -2395,6 +2715,15 @@ class TradingBot:
         pl = data.get("pattern_learning")
         if pl:
             self.learning_engine.from_dict(pl)
+
+        cl = data.get("condition_learning")
+        if cl:
+            self.condition_engine.from_dict(cl)
+
+        self._active_strategy_adjustments = {
+            tag: datetime.datetime.fromisoformat(until)
+            for tag, until in (data.get("active_strategy_adjustments") or {}).items()
+        }
 
         self._pending_target_alerts = data.get("pending_target_alerts", [])
 
