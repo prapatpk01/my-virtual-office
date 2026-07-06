@@ -865,8 +865,14 @@ class TradingBot:
                             strategy, sym, result.score)
             elif result.label == "WEAK":
                 pos.health_weak_count += 1
-                # Pattern-upgraded TP1: don't wait N confirms — exit now (momentum fading)
-                if pos.tp1_pattern_upgraded and not pos.tp1_hit:
+                # TP-ladder positions: treat any ladder stage > 0 as equivalent to tp1_hit
+                # so the pattern-upgrade immediate-exit and the N-confirm wait both use
+                # the ladder stage rather than the (never-set) partial-close tp1_hit flag.
+                _tp1_equivalent = pos.tp1_hit or (pos.sl_ladder_enabled and pos.ladder_stage > 0)
+                # Pattern-upgraded TP1: don't wait N confirms — exit now (momentum fading).
+                # Skipped when sl_ladder_enabled and no ladder level hit yet — in that mode
+                # the ladder is the exit manager; health_weak must not override it pre-T1.
+                if pos.tp1_pattern_upgraded and not _tp1_equivalent and not pos.sl_ladder_enabled:
                     logger.info(
                         "[PAT-TP1] %s %s WEAK after TP1 upgrade (%.1fR target) — exit immediately",
                         strategy, sym, TP1_BY_TIER.get(pos.pattern_tier, 0))
@@ -891,7 +897,11 @@ class TradingBot:
                 # TP1 upgrade requires BOTH: pattern tier present AND health BULL (this call)
                 # Health BULL alone → no adjustment (TP1 stays at 0.5R)
                 # Pattern alone     → no adjustment (wait for BULL confirmation)
-                if pos.pattern_tier > 0 and not pos.tp1_pattern_upgraded:
+                if pos.pattern_tier > 0 and not pos.tp1_pattern_upgraded and not pos.sl_ladder_enabled:
+                    # Pattern TP1 Upgrade is incompatible with TP-ladder mode: the ladder
+                    # manages exits via SL ratchets — an immediate-WEAK-exit armed here
+                    # would fire on every normal post-entry pullback and override the ladder.
+                    # Skip the upgrade entirely when sl_ladder_enabled=True.
                     r_mult   = TP1_BY_TIER.get(pos.pattern_tier, 0.5)
                     new_tp1  = (round(pos.entry_price + r_mult * one_r, 8) if pos.side == "long"
                                 else round(pos.entry_price - r_mult * one_r, 8))

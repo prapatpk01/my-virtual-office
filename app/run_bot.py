@@ -126,9 +126,9 @@ def build_config() -> dict:
         # Strict: 15m swing pullback parameters
         "tci_swing_lookback":   _env_int("TCI_SWING_LOOKBACK",      4),
         "tci_swing_pct":        _env_float("TCI_SWING_PCT",         0.006),
-        # Fast mode v2 — default ON
+        # Fast mode v2 — default ON; bias lowered 60→55 to reduce entry lag
         "tci_fast_mode":        _env_bool("TCI_FAST_MODE",          True),
-        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",    60.0),
+        "tci_fast_bias_gate":   _env_float("TCI_FAST_BIAS_GATE",    55.0),  # lowered 60→55 to enter earlier
         "tci_fast_adx_min":     _env_int("TCI_ADX_MIN_FAST",        15),
         "tci_fast_adx_max":     _env_int("TCI_ADX_MAX_FAST",        44),
         "tci_fast_tp2_r":       _env_float("TCI_FAST_TP2_R",        2.5),
@@ -149,6 +149,10 @@ def build_config() -> dict:
         "tci_sj_scoring":       _sj_scoring,
         "tci_sj_roc9":          _sj_roc9,
         "tci_chop_filter":      _env_bool("CHOP_FILTER_ENABLED",    True),
+        # MACD peak/slope filter: disabled — was blocking valid early entries (entry lag fix)
+        "tci_macd_peak_filter": _env_bool("TCI_MACD_PEAK_FILTER",   False),
+        # Pullback zone: compare live 15m close vs 1H EMA20 (vs stale 1H bar close)
+        "tci_pullback_live_15m": _env_bool("TCI_PULLBACK_LIVE_15M", True),
 
         # ── Position health monitor ───────────────────────────────────────────
         "monitor_interval":      _env_int("MONITOR_INTERVAL",       60),
@@ -217,6 +221,8 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "sj_scoring":             cfg["tci_sj_scoring"],
             "sj_roc9":                cfg["tci_sj_roc9"],
             "chop_filter_enabled":    cfg["tci_chop_filter"],
+            "macd_peak_filter":       cfg["tci_macd_peak_filter"],
+            "pullback_live_15m":      cfg["tci_pullback_live_15m"],
             "simple_fast_entry":      False,
         }))
 
