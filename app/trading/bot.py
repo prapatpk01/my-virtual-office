@@ -625,7 +625,9 @@ class TradingBot:
             new_sl = (pos.entry_price + sl_r * pos.one_r if is_long
                       else pos.entry_price - sl_r * pos.one_r)
             old_sl = pos.stop_loss
-            sl_ok = await self.connector.move_sl_to_breakeven(sym, pos_side, new_sl, pos.amount)
+            # Pass the TP backstop so re-arming the stop keeps the ladder's exchange TP.
+            sl_ok = await self.connector.move_sl_to_breakeven(
+                sym, pos_side, new_sl, pos.amount, tp_price=pos.tp2 or pos.take_profit)
             if not sl_ok:
                 logger.warning("[%s] Ladder T%d %s — exchange SL move failed; "
                                "bot-side SL still updated", strategy_name, level, sym)
@@ -691,10 +693,12 @@ class TradingBot:
                 be_price = (pos.entry_price + _be_buf * _one_r if pos.side == "long"
                             else pos.entry_price - _be_buf * _one_r)
                 pos.stop_loss  = be_price
-                # Move exchange algo SL to BE+buffer. Non-fatal if it fails —
-                # bot-side BE stop + health monitor protect the runner.
+                # Move exchange algo SL to BE+buffer, re-arming the runner's TP backstop
+                # so cancelling the original OCO doesn't strip take-profit protection.
+                # Non-fatal if it fails — bot-side BE stop + health monitor protect the runner.
                 sl_ok = await self.connector.move_sl_to_breakeven(
-                    sym, pos_side, be_price, pos.amount
+                    sym, pos_side, be_price, pos.amount,
+                    tp_price=pos.tp2 or pos.take_profit,
                 )
                 if not sl_ok:
                     logger.warning(
@@ -726,15 +730,30 @@ class TradingBot:
                 err_str = str(e)
                 # OKX 51169: "you don't have any positions" — exchange-side algo already closed it.
                 okx_no_pos = "51169" in err_str or "don't have any positions" in err_str.lower()
-                if trigger == "stop_loss" or okx_no_pos:
+                if okx_no_pos:
                     logger.info("[%s] Close failed for %s (OKX already closed via algo order): %s",
                                 strategy_name, trigger, e)
                     # Fall through — clean up internal state below.
                 else:
-                    # Transient network/exchange error — retry next tick.
-                    logger.warning("[%s] Close failed for %s — will retry next tick: %s",
-                                   strategy_name, trigger, e)
-                    return
+                    # Could be a transient network/exchange error OR the exchange SL algo
+                    # already fired. Do NOT assume closed just because trigger==stop_loss —
+                    # a transient error there would strand a live, unmanaged position while
+                    # the bot books PnL at a stale price and thinks it's flat. Verify with
+                    # the exchange before tearing down state.
+                    still_open = True
+                    if not self.paper and hasattr(self.connector, "fetch_position_amount"):
+                        try:
+                            amt = await self.connector.fetch_position_amount(sym, pos.side)
+                            still_open = amt > 0
+                        except Exception as ve:
+                            logger.warning("[%s] position verify failed after close error: %s",
+                                           strategy_name, ve)
+                    if still_open:
+                        logger.warning("[%s] Close failed for %s — position still open, retry next tick: %s",
+                                       strategy_name, trigger, e)
+                        return
+                    logger.info("[%s] Close for %s: order errored but exchange shows no position "
+                                "(algo already closed it) — cleaning up.", strategy_name, trigger)
 
             self.risk.register_pnl(pnl)
             self._sig.record_outcome(
@@ -802,7 +821,11 @@ class TradingBot:
 
             # ── OKX position sync: detect positions closed externally (algo TP/SL) ──
             # fetch_position_amount returns 0 if OKX has no position; clean up stale state.
-            if not self.paper:
+            # Skip if the staged-exit path already holds the close-lock for this position —
+            # otherwise this separate task can tear down state a concurrent close is
+            # mid-flight on (it interleaves at await points in the single-threaded loop).
+            close_key = f"{sym}||{strategy}"
+            if not self.paper and close_key not in self._closing_positions:
                 try:
                     actual_amt = await self.connector.fetch_position_amount(sym, pos.side)
                     if actual_amt == 0.0:
@@ -841,9 +864,10 @@ class TradingBot:
             c4h  = candle_cache.get((sym, "4h"),  [])
 
             # ── Crash-guard (v2 strategy): closes ONLY when deeply underwater + momentum reversed
-            strat_obj = next(
-                (s for s in self.strategies if s.symbol == sym and s.name == strategy), None
-            )
+            # NB: `strategy` is the slot key ("{name}_short" for shorts), so resolve via
+            # _strategy_for — a naive s.name == strategy silently misses every short
+            # position and disables the crash-guard on half of all trades.
+            strat_obj = self._strategy_for(sym, strategy)
             if strat_obj and hasattr(strat_obj, "monitor_position"):
                 one_r = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
                 cg_action, cg_reason = strat_obj.monitor_position(

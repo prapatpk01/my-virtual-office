@@ -191,12 +191,18 @@ class BinanceConnector(BaseConnector):
         if self._exchange_id == "okx":
             if self._futures:
                 # ── OKX Perpetual Futures (hedge mode) ────────────────────────
-                # Convert BTC quantity → integer contract count (1 contract = ctVal BTC)
-                try:
-                    market = self._exchange.market(symbol)
-                    ct_val = float(market.get("contractSize", 0.01))
-                except Exception:
-                    ct_val = 0.01  # OKX BTC/USDT:USDT default
+                # Convert base quantity → integer contract count (1 contract = ctVal base).
+                # Resolve ctVal via contract_size() which consults the hardcoded
+                # _OKX_CONTRACT_SIZE map on failure. A silent 0.01 fallback here was a
+                # 20x landmine: for XAU (true ctVal=1.0) it would 100x the contract count
+                # and open an instantly-liquidating position. Refuse to trade if ctVal
+                # can't be positively resolved rather than guessing.
+                ct_val = await self.contract_size(symbol)
+                if not ct_val or ct_val <= 0:
+                    raise ValueError(
+                        f"Cannot resolve contract size for {symbol} — refusing order "
+                        f"(guessing ctVal risks a massively oversized position)."
+                    )
                 contracts = int(round(amount / ct_val))  # round avoids float truncation (0.163/0.001=162.999→162)
                 if contracts < 1:
                     raise ValueError(
@@ -216,17 +222,21 @@ class BinanceConnector(BaseConnector):
                 # reduceOnly is incompatible with hedge mode and causes API error 51000
                 if reduce_only and not pos_side:
                     params["reduceOnly"] = True
-                # Attach algo TP/SL inline (OKX attachAlgoOrds structure)
-                # attachAlgoClOrdId omitted — OKX auto-generates; manual UUID with hyphens → error 51000
-                if tp_price and sl_price:
-                    params["attachAlgoOrds"] = [{
-                        "tpTriggerPx":     str(round(tp_price, 2)),
-                        "tpOrdPx":         "-1",    # market execution at trigger
-                        "tpTriggerPxType": "last",
-                        "slTriggerPx":     str(round(sl_price, 2)),
-                        "slOrdPx":         "-1",
-                        "slTriggerPxType": "last",
-                    }]
+                # Attach algo TP/SL inline (OKX attachAlgoOrds structure).
+                # attachAlgoClOrdId omitted — OKX auto-generates; manual UUID with hyphens → error 51000.
+                # Build from whichever legs are provided so an SL-only (or TP-only) caller
+                # still gets exchange-side protection instead of a naked 20x position.
+                if tp_price or sl_price:
+                    algo: dict = {}
+                    if tp_price:
+                        algo["tpTriggerPx"]     = str(round(tp_price, 2))
+                        algo["tpOrdPx"]         = "-1"    # market execution at trigger
+                        algo["tpTriggerPxType"] = "last"
+                    if sl_price:
+                        algo["slTriggerPx"]     = str(round(sl_price, 2))
+                        algo["slOrdPx"]         = "-1"
+                        algo["slTriggerPxType"] = "last"
+                    params["attachAlgoOrds"] = [algo]
                 logger.info("OKX futures: %s %s %s %d contracts  TP=%s  SL=%s  pos=%s  reduceOnly=%s",
                             side.upper(), symbol, order_type, int(amount),
                             tp_price or "—", sl_price or "—",
@@ -345,7 +355,8 @@ class BinanceConnector(BaseConnector):
         return True
 
     async def move_sl_to_breakeven(
-        self, symbol: str, pos_side: str, entry_price: float, remaining_amount: float
+        self, symbol: str, pos_side: str, entry_price: float, remaining_amount: float,
+        tp_price: Optional[float] = None,
     ) -> bool:
         """
         After TP1, cancel the exchange algo SL and replace it at breakeven price.
@@ -363,14 +374,23 @@ class BinanceConnector(BaseConnector):
             return False
 
         try:
-            # 1. Fetch all pending conditional (SL/TP) algo orders for this symbol
-            resp = await self._exchange.privateGetTradeAlgosPending({
-                "instId": inst_id,
-                "ordType": "conditional",
-            })
-            algo_orders = (resp or {}).get("data", [])
+            # 1. Fetch ALL pending algo orders for this leg. The original protective
+            # stop is attached at order time via attachAlgoOrds with BOTH tp+sl, which
+            # OKX stores as an `oco` algo — NOT `conditional`. Querying only
+            # "conditional" (the old bug) never found it, so the stale full-size stop
+            # was never cancelled and SL→BE silently failed. Query every relevant type.
+            algo_orders: list = []
+            for ord_type in ("oco", "conditional", "move_order_stop"):
+                try:
+                    resp = await self._exchange.privateGetTradeAlgosPending({
+                        "instId":  inst_id,
+                        "ordType": ord_type,
+                    })
+                    algo_orders.extend((resp or {}).get("data", []))
+                except Exception as qe:
+                    logger.warning("[SL→BE] pending-algos query (%s) failed: %s", ord_type, qe)
 
-            # Identify SL algo orders belonging to our position leg
+            # Identify algo orders carrying a stop for our position leg
             sl_orders = [
                 o for o in algo_orders
                 if (o.get("posSide") == pos_side
@@ -378,42 +398,53 @@ class BinanceConnector(BaseConnector):
             ]
 
             if sl_orders:
-                # 2. Cancel each SL algo individually — OKX cancel-algos expects a JSON
-                # array body; passing the whole list to privatePostTradeCancelAlgos in
-                # one shot can silently fail depending on ccxt version, so we cancel
-                # per-algo to guarantee each gets its own request and error surface.
+                # 2. Cancel each matched algo individually — OKX cancel-algos expects a
+                # JSON array body; per-algo requests guarantee each gets its own error
+                # surface. Cancelling removes the old SL AND its attached TP backstop,
+                # so we re-arm the TP below (step 3) to avoid stripping protection.
                 for algo in sl_orders:
                     try:
                         await self._exchange.privatePostTradeCancelAlgos(
                             [{"algoId": algo["algoId"], "instId": inst_id}]
                         )
-                        logger.info("[SL→BE] Cancelled algo SL %s for %s %s",
-                                    algo["algoId"], symbol, pos_side)
+                        logger.info("[SL→BE] Cancelled algo %s (%s) for %s %s",
+                                    algo.get("algoId"), algo.get("ordType"), symbol, pos_side)
                     except Exception as ce:
-                        logger.warning("[SL→BE] Cancel algo SL %s failed (proceeding): %s",
-                                       algo["algoId"], ce)
+                        logger.warning("[SL→BE] Cancel algo %s failed (proceeding): %s",
+                                       algo.get("algoId"), ce)
             else:
-                logger.info("[SL→BE] No pending algo SL for %s %s — attaching new one at BE",
+                logger.info("[SL→BE] No pending algo stop for %s %s — attaching new one at BE",
                             symbol, pos_side)
 
-            # 3. Place new SL at breakeven for the remaining runner contracts
+            # 3. Re-arm the exchange stop for the remaining runner. If a TP backstop was
+            # supplied, place an OCO (BE stop + TP) so cancelling the original OCO does
+            # not leave the runner without a take-profit while the bot is offline.
             ct_val    = await self.contract_size(symbol)
             contracts = max(1, round(remaining_amount / ct_val))
             close_side = "sell" if pos_side == "long" else "buy"
 
-            await self._exchange.privatePostTradeOrderAlgo({
+            algo_req: dict = {
                 "instId":          inst_id,
                 "tdMode":          "isolated",
                 "side":            close_side,
                 "posSide":         pos_side,
-                "ordType":         "conditional",
                 "sz":              str(contracts),
                 "slTriggerPx":     str(round(entry_price, 2)),
                 "slOrdPx":         "-1",
                 "slTriggerPxType": "last",
-            })
-            logger.info("[SL→BE] Exchange SL moved to BE %.4f for %s %s runner (%d contracts)",
-                        entry_price, symbol, pos_side, contracts)
+            }
+            if tp_price:
+                algo_req["ordType"]         = "oco"
+                algo_req["tpTriggerPx"]     = str(round(tp_price, 2))
+                algo_req["tpOrdPx"]         = "-1"
+                algo_req["tpTriggerPxType"] = "last"
+            else:
+                algo_req["ordType"] = "conditional"
+
+            await self._exchange.privatePostTradeOrderAlgo(algo_req)
+            logger.info("[SL→BE] Exchange stop moved to BE %.4f for %s %s runner "
+                        "(%d contracts, tp=%s)",
+                        entry_price, symbol, pos_side, contracts, tp_price or "—")
             return True
 
         except Exception as e:
