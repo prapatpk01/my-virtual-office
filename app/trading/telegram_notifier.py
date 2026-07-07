@@ -224,6 +224,11 @@ class TelegramNotifier:
         )
         self.notify(text)
 
+    def notify_service_event(self, emoji: str, title: str, lines: list[str] | None = None):
+        body = "\n".join(lines or [])
+        text = f"{emoji} *{title}*" + (f"\n{body}" if body else "")
+        self.notify(text)
+
     def notify_bot_started(self, paper: bool, strategies: list[str], symbols: list[str]):
         mode = "📄 Paper" if paper else "💰 Live"
         text = (

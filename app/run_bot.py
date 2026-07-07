@@ -46,11 +46,45 @@ def _env_list(key: str, default: str) -> list[str]:
     val = os.environ.get(key, default)
     return [s.strip() for s in val.split(",") if s.strip()]
 
-def _env_bool(key: str, default: bool) -> bool:
-    val = os.environ.get(key, "")
-    if not val:
+def _parse_bool(value, default: bool = False) -> bool:
+    if value is None:
         return default
-    return val.lower() in ("1", "true", "yes")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    return _parse_bool(os.environ.get(key), default)
+
+
+def validate_config(config: dict) -> None:
+    """Fail fast on unsafe live configuration before importing trading deps."""
+    exchange = str(config.get("exchange", "")).lower()
+    if config.get("paper", True):
+        return
+
+    if not _env_bool("LIVE_TRADING_CONFIRMED", False):
+        raise ValueError(
+            "Live trading requires LIVE_TRADING_CONFIRMED=true. "
+            "Keep PAPER_TRADING=true on Railway until you are ready for real orders."
+        )
+
+    if exchange in {"binance", "bybit", "okx", "alpaca"}:
+        if not config.get("api_key") or not config.get("api_secret"):
+            raise ValueError(f"Live trading on {exchange} requires EXCHANGE_API_KEY and EXCHANGE_API_SECRET")
+    if exchange == "okx" and not config.get("api_passphrase"):
+        raise ValueError("Live trading on OKX requires EXCHANGE_PASSPHRASE")
+    if exchange == "oanda" and (not config.get("oanda_api_key") or not config.get("oanda_account_id")):
+        raise ValueError("Live trading on OANDA requires OANDA_API_KEY and OANDA_ACCOUNT_ID")
 
 
 def build_config() -> dict:
@@ -87,6 +121,8 @@ def build_config() -> dict:
         "forex_symbols": _env_list("FOREX_SYMBOLS", "XAUUSD"),
         "forex_enabled": _env_bool("FOREX_SIGNALS", True),
         "forex_interval": int(os.environ.get("FOREX_INTERVAL_SECONDS", "60")),
+        "railway_environment": os.environ.get("RAILWAY_ENVIRONMENT_NAME", ""),
+        "railway_service": os.environ.get("RAILWAY_SERVICE_NAME", ""),
     }
 
 
@@ -239,12 +275,25 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
 async def main():
     config = build_config()
     logger.info(
-        "=== AI Expert Bot starting [%s] mode=%s symbols=%s ===",
+        "=== AI Expert Bot starting [%s] mode=%s symbols=%s railway_env=%s ===",
         "PAPER" if config["paper"] else "LIVE",
         config["strategy_mode"], config["symbols"],
+        config.get("railway_environment") or "local",
     )
 
+    validate_config(config)
     telegram    = _make_telegram(config)
+    if telegram:
+        telegram.notify_service_event(
+            "🚀",
+            "Railway Trading Bot Deploy Started",
+            [
+                f"Mode: `{'PAPER' if config['paper'] else 'LIVE'}`",
+                f"Exchange: `{config['exchange']}`",
+                f"Symbols: `{', '.join(config['symbols'])}`",
+                f"Railway env: `{config.get('railway_environment') or 'local'}`",
+            ],
+        )
     crypto_bot  = build_crypto_bot(config, telegram)
     forex_bot   = build_forex_bot(config, telegram) if config["forex_enabled"] else None
 
@@ -287,6 +336,8 @@ async def main():
     except Exception:
         pass
 
+    if telegram:
+        telegram.notify_service_event("🛑", "Railway Trading Bot Stopped", ["Shutdown completed cleanly."])
     logger.info("All bots stopped.")
 
 
@@ -295,3 +346,13 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        logger.exception("Fatal startup/runtime error")
+        try:
+            config = build_config()
+            telegram = _make_telegram(config)
+            if telegram:
+                telegram.notify_service_event("🚨", "Railway Trading Bot Error", [f"`{type(exc).__name__}: {exc}`"])
+        except Exception:
+            logger.exception("Failed to send fatal Telegram notification")
+        raise
