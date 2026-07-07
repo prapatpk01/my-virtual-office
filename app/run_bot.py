@@ -159,10 +159,13 @@ def build_config() -> dict:
         "health_weak_confirm":   _env_int("HEALTH_WEAK_CONFIRM",   3),
 
         # ── Risk / sizing ─────────────────────────────────────────────────────
-        # RISK_PER_TRADE: fraction of free balance lost if SL is hit (8-12% recommended).
-        # Dynamic sizing: notional = (balance × risk_pct) / sl_dist_pct.
-        "risk_per_trade":   _env_float("RISK_PER_TRADE",   0.10),  # 10% of balance
-        "fixed_trade_usdt": _env_float("FIXED_TRADE_USDT", 0.0),   # 0 = use risk_per_trade
+        # Risk per trade scales with signal confidence (score-based).
+        # RISK_MIN_PCT: risk% when score just clears the threshold (lowest confidence entry)
+        # RISK_MAX_PCT: risk% when score = 100 (highest confidence entry)
+        # notional = (balance × risk_pct) / sl_dist_pct
+        "risk_min_pct":     _env_float("RISK_MIN_PCT",     0.08),  # 8% at threshold
+        "risk_max_pct":     _env_float("RISK_MAX_PCT",     0.12),  # 12% at perfect score
+        "fixed_trade_usdt": _env_float("FIXED_TRADE_USDT", 0.0),   # 0 = use risk scaling
         "stop_loss_pct":   _env_float("STOP_LOSS_PCT",   0.015),
         "take_profit_pct": _env_float("TAKE_PROFIT_PCT", 0.025),
         "max_positions":  _env_int("MAX_POSITIONS", 2),
@@ -207,8 +210,9 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "trend_fade_uw_frac":     cfg["trend_fade_uw_frac"],
             # Cooldown
             "cooldown_bars":          cfg["tci_cooldown_bars"],
-            # Sizing
-            "risk_per_trade":         cfg["risk_per_trade"],
+            # Sizing (confidence-scaled)
+            "risk_min_pct":           cfg["risk_min_pct"],
+            "risk_max_pct":           cfg["risk_max_pct"],
         }))
 
     if not strategies:
@@ -278,8 +282,8 @@ async def main():
         daily_loss_limit_pct=cfg["daily_loss_limit"],
     )
     logger.info(
-        "Risk: risk_per_trade=%.0f%%  lev=%dx  max_pos=%d  drawdown=%.0f%%  dailyCB=%.0f%%",
-        cfg["risk_per_trade"] * 100, cfg["leverage"],
+        "Risk: risk=%.0f%%–%.0f%% (confidence-scaled)  lev=%dx  max_pos=%d  drawdown=%.0f%%  dailyCB=%.0f%%",
+        cfg["risk_min_pct"] * 100, cfg["risk_max_pct"] * 100, cfg["leverage"],
         cfg["max_positions"], cfg["max_drawdown"] * 100, cfg["daily_loss_limit"] * 100,
     )
 

@@ -111,8 +111,11 @@ class TrendContV2Strategy(BaseStrategy):
         htf_bias_min=20.0,       # minimum MTF bias score to consider direction valid
         # ── Cooldown ──────────────────────────────────────────────────────────
         cooldown_bars=3,         # bars to wait after a signal (whipsaw guard)
-        # ── Sizing ────────────────────────────────────────────────────────────
-        risk_per_trade=0.10,     # fraction of free balance to risk per trade (8-12%)
+        # ── Sizing (confidence-scaled) ────────────────────────────────────────
+        # risk_pct scales linearly from risk_min (score = threshold) to
+        # risk_max (score = 100). Higher-confidence signals get bigger size.
+        risk_min_pct=0.08,       # risk% when score just clears the threshold
+        risk_max_pct=0.12,       # risk% when score is perfect (100)
         # ── Startup warmup ────────────────────────────────────────────────────
         startup_warmup_min=0,
         # ── Health monitor ────────────────────────────────────────────────────
@@ -194,6 +197,13 @@ class TrendContV2Strategy(BaseStrategy):
         atr_arr = self.atr(candles, 14)
         atr_val = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else current_price * 0.01
 
+        # Confidence-scaled risk: linear from risk_min (at threshold) → risk_max (score=100)
+        thr      = score.threshold
+        raw_scl  = (score.total - thr) / max(100.0 - thr, 1.0)
+        conf_scl = max(0.0, min(1.0, raw_scl))
+        risk_pct = (self._p["risk_min_pct"]
+                    + (self._p["risk_max_pct"] - self._p["risk_min_pct"]) * conf_scl)
+
         meta = self.risk_metadata(
             current_price, atr_val, side,
             sl_atr=self._p["sl_mult"],
@@ -201,7 +211,7 @@ class TrendContV2Strategy(BaseStrategy):
             tp2_atr=self._p["tp2_r"] * self._p["sl_mult"],
             sl_min_pct=self._p["sl_min_pct"],
             sl_max_pct=self._p["sl_max_pct"],
-            risk_pct=self._p["risk_per_trade"],
+            risk_pct=risk_pct,
         )
         meta["sl_ladder_enabled"] = self._p["sl_ladder_enabled"]
         meta["sj_score"]          = round(score.total, 1)
