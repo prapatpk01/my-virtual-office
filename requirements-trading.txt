@@ -7,7 +7,7 @@ aiohttp>=3.9.0
 # Crypto exchange connectivity (Binance, Bybit, OKX)
 ccxt>=4.2.0
 
-# Numerical calculations (indicators: EMA, RSI, MACD, etc.)
+# Numerical calculations (indicators: EMA, RSI, MACD, ATR, etc.)
 numpy>=1.26.0
 
 # Anthropic SDK (only needed for AI Signal strategy)
@@ -15,6 +15,9 @@ anthropic>=0.25.0
 
 # Forex / Gold data feed (free, no API key needed)
 yfinance>=0.2.40
+
+# Statistical analysis for learning engine
+scipy>=1.11.0
 
 # Optional: for loading .env file automatically
 # python-dotenv>=1.0.0
