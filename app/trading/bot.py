@@ -377,7 +377,7 @@ class TradingBot:
                     )
                     if self.telegram:
                         try:
-                            self.telegram.send(
+                            self.telegram.notify(
                                 f"💰 *Partial TP* `{sym}` [{strategy_name}]\n"
                                 f"Closed *{update.close_pct*100:.0f}%* @ `{price:.4f}`\n"
                                 f"PnL: `{pnl:+.4f}` USDT\n_{update.reason}_"
@@ -479,7 +479,7 @@ class TradingBot:
                     )
                     if self.telegram:
                         try:
-                            self.telegram.send(
+                            self.telegram.notify(
                                 f"⚠️ *Drift Alert* [{strategy.name}]\n"
                                 f"Action: *{action.value.upper()}*\n"
                                 f"Model performance has degraded — review trading conditions."
