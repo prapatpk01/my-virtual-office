@@ -93,7 +93,7 @@ def build_config() -> dict:
         "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.036")),  # 1.2R
 
         # ── Risk limits ───────────────────────────────────────────────────
-        "max_positions": int(os.environ.get("MAX_POSITIONS",    "3")),
+        "max_positions": int(os.environ.get("MAX_POSITIONS",    "2")),
         "max_drawdown":  float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15")),    # 15 %
 
         # ── Telegram ──────────────────────────────────────────────────────
