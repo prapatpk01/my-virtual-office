@@ -159,7 +159,10 @@ def build_config() -> dict:
         "health_weak_confirm":   _env_int("HEALTH_WEAK_CONFIRM",   3),
 
         # ── Risk / sizing ─────────────────────────────────────────────────────
-        "fixed_trade_usdt": _env_float("FIXED_TRADE_USDT", 50.0),
+        # RISK_PER_TRADE: fraction of free balance lost if SL is hit (8-12% recommended).
+        # Dynamic sizing: notional = (balance × risk_pct) / sl_dist_pct.
+        "risk_per_trade":   _env_float("RISK_PER_TRADE",   0.10),  # 10% of balance
+        "fixed_trade_usdt": _env_float("FIXED_TRADE_USDT", 0.0),   # 0 = use risk_per_trade
         "stop_loss_pct":   _env_float("STOP_LOSS_PCT",   0.015),
         "take_profit_pct": _env_float("TAKE_PROFIT_PCT", 0.025),
         "max_positions":  _env_int("MAX_POSITIONS", 2),
@@ -204,6 +207,8 @@ def build_strategies(symbols: list[str], cfg: dict) -> list:
             "trend_fade_uw_frac":     cfg["trend_fade_uw_frac"],
             # Cooldown
             "cooldown_bars":          cfg["tci_cooldown_bars"],
+            # Sizing
+            "risk_per_trade":         cfg["risk_per_trade"],
         }))
 
     if not strategies:
@@ -273,9 +278,8 @@ async def main():
         daily_loss_limit_pct=cfg["daily_loss_limit"],
     )
     logger.info(
-        "Risk: SL=%.1f%%  TP=%.1f%%  fixed=%gUSDT  lev=%dx  max_pos=%d  drawdown=%.0f%%  dailyCB=%.0f%%",
-        cfg["stop_loss_pct"] * 100, cfg["take_profit_pct"] * 100,
-        cfg["fixed_trade_usdt"], cfg["leverage"],
+        "Risk: risk_per_trade=%.0f%%  lev=%dx  max_pos=%d  drawdown=%.0f%%  dailyCB=%.0f%%",
+        cfg["risk_per_trade"] * 100, cfg["leverage"],
         cfg["max_positions"], cfg["max_drawdown"] * 100, cfg["daily_loss_limit"] * 100,
     )
 
@@ -288,7 +292,7 @@ async def main():
         telegram=telegram,
         fixed_sl_pct=cfg["stop_loss_pct"],
         fixed_tp_pct=cfg["take_profit_pct"],
-        dynamic_sizing=False,
+        dynamic_sizing=True,
         monitor_interval=cfg["monitor_interval"],
     )
     bot._health_weak_confirm = cfg["health_weak_confirm"]

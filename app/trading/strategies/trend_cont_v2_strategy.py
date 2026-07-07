@@ -111,6 +111,8 @@ class TrendContV2Strategy(BaseStrategy):
         htf_bias_min=20.0,       # minimum MTF bias score to consider direction valid
         # ── Cooldown ──────────────────────────────────────────────────────────
         cooldown_bars=3,         # bars to wait after a signal (whipsaw guard)
+        # ── Sizing ────────────────────────────────────────────────────────────
+        risk_per_trade=0.10,     # fraction of free balance to risk per trade (8-12%)
         # ── Startup warmup ────────────────────────────────────────────────────
         startup_warmup_min=0,
         # ── Health monitor ────────────────────────────────────────────────────
@@ -199,6 +201,7 @@ class TrendContV2Strategy(BaseStrategy):
             tp2_atr=self._p["tp2_r"] * self._p["sl_mult"],
             sl_min_pct=self._p["sl_min_pct"],
             sl_max_pct=self._p["sl_max_pct"],
+            risk_pct=self._p["risk_per_trade"],
         )
         meta["sl_ladder_enabled"] = self._p["sl_ladder_enabled"]
         meta["sj_score"]          = round(score.total, 1)
