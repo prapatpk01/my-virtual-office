@@ -7,3 +7,7 @@ __pycache__/
 .DS_Store
 app/vo-config.json
 app/default-office-config.json.bak
+
+# Trading bot runtime data (generated at runtime, not source code)
+trade_journal.json
+model_registry.json
