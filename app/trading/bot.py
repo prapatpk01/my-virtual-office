@@ -27,6 +27,20 @@ from .engines.drift_detector import DriftAction
 
 logger = logging.getLogger("trading_bot")
 
+# Confidence level → fraction of balance to allocate per trade
+_CONFIDENCE_SIZE: dict[str, float] = {
+    "WEAK":            float(os.getenv("SIZE_WEAK",  "0.08")),
+    "GOOD":            float(os.getenv("SIZE_GOOD",  "0.10")),
+    "HIGH_CONVICTION": float(os.getenv("SIZE_HIGH",  "0.12")),
+}
+_DEFAULT_SIZE = float(os.getenv("SIZE_WEAK", "0.08"))
+
+
+def _confidence_size_pct(metadata: dict) -> float:
+    """Return allocation fraction (0.08–0.12) based on AI confidence level."""
+    level = (metadata or {}).get("confidence_level", "")
+    return _CONFIDENCE_SIZE.get(level.upper(), _DEFAULT_SIZE)
+
 
 @dataclass
 class TradeRecord:
@@ -674,7 +688,11 @@ class TradingBot:
         sl_p          = meta.get("stop_loss")
         tp_p          = meta.get("take_profit")
 
-        amount = self.risk.size_position(quote_balance, price)
+        size_pct = _confidence_size_pct(meta)
+        amount = self.risk.size_position(quote_balance, price, size_pct=size_pct)
+        logger.info("[%s] Position size: %.1f%% of balance (confidence=%s) → %.6f",
+                    strategy_name, size_pct * 100,
+                    meta.get("confidence_level", "?"), amount)
         if amount <= 0:
             logger.info("Position size 0 for %s — tracking virtually", sym)
             if sl_p and tp_p:

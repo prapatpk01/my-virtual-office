@@ -55,12 +55,14 @@ class RiskManager:
             return False
         return True
 
-    def size_position(self, balance: float, price: float) -> float:
-        """Calculate position size: spend risk_pct% of balance per trade."""
+    def size_position(self, balance: float, price: float,
+                      size_pct: float = None) -> float:
+        """Calculate position size.
+        size_pct overrides max_risk_per_trade_pct when provided (0.08–0.12 etc.)."""
         if price <= 0:
             return 0
-        risk_amount = balance * self.max_risk_per_trade_pct
-        return round(risk_amount / price, 6)
+        pct = size_pct if size_pct is not None else self.max_risk_per_trade_pct
+        return round(balance * pct / price, 6)
 
     def compute_stops(self, side: str, entry_price: float) -> tuple[float, float]:
         """Returns (stop_loss_price, take_profit_price). Accepts 'buy'/'long' or 'sell'/'short'."""
