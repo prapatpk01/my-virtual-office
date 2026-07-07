@@ -62,11 +62,8 @@ class BinanceConnector(BaseConnector):
         if self.paper:
             return await self._paper_order(symbol, side, amount, order_type, price)
 
-        kwargs = {}
-        if order_type == "limit" and price:
-            kwargs["price"] = price
-
-        raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
+        order_price = price if order_type == "limit" else None
+        raw = await self._exchange.create_order(symbol, order_type, side, amount, order_price)
         return OrderResult(
             order_id=str(raw.get("id", uuid.uuid4())),
             symbol=symbol,

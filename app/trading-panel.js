@@ -120,10 +120,17 @@ class TradingPanel {
               <input id="cfg-interval" type="number" value="60" min="10" />
             </label>
             <label><input type="checkbox" id="cfg-paper" checked /> Paper Trading (simulation)</label>
+            <label class="tp-live-confirm" id="cfg-live-confirm-wrap" style="display:none">
+              <input type="checkbox" id="cfg-live-confirm" /> I understand LIVE mode sends real market orders with real funds
+            </label>
+            <div class="tp-live-warning" id="cfg-live-warning" style="display:none">
+              ⚠ LIVE trading is real money. Use restricted API keys, start small, and verify exchange permissions.
+            </div>
             <div class="tp-key-section">
-              <div class="tp-section-title">API Keys (stored locally, never sent to server in live mode)</div>
+              <div class="tp-section-title">API Keys (required for live trading)</div>
               <label>Exchange API Key <input id="cfg-api-key" type="password" placeholder="leave blank for paper mode" /></label>
               <label>Exchange Secret   <input id="cfg-api-secret" type="password" placeholder="leave blank for paper mode" /></label>
+              <label>Exchange Passphrase <input id="cfg-api-passphrase" type="password" placeholder="required for OKX only" /></label>
               <label>Anthropic Key (for AI Signal) <input id="cfg-anthropic-key" type="password" placeholder="sk-ant-..." /></label>
             </div>
             <div class="tp-key-section">
@@ -174,6 +181,7 @@ class TradingPanel {
     $id('tp-modal-close').onclick = () => { $id('tp-config-modal').style.display = 'none'; };
     $id('tp-save-config').onclick = () => this._saveConfig();
     $id('tp-tg-test-btn').onclick = () => this._testTelegram();
+    $id('cfg-paper').onchange = () => this._syncLiveModeWarning();
 
     // Load saved config
     this._loadConfig();
@@ -330,12 +338,15 @@ class TradingPanel {
         rsi_macd:     $('cfg-rsi').checked,
         grid_trading: $('cfg-grid').checked,
         ai_signal:    $('cfg-ai').checked,
+        mcdx:         $('cfg-mcdx').checked,
       },
       timeframe: $('cfg-timeframe').value,
       interval:  parseInt($('cfg-interval').value) || 60,
       paper:     $('cfg-paper').checked,
+      live_confirmed: $('cfg-paper').checked ? false : $('cfg-live-confirm').checked,
       api_key:    $('cfg-api-key').value,
       api_secret: $('cfg-api-secret').value,
+      api_passphrase: $('cfg-api-passphrase').value,
       anthropic_key: $('cfg-anthropic-key').value,
       telegram_token:   $('cfg-tg-token').value,
       telegram_chat_id: $('cfg-tg-chat').value,
@@ -345,7 +356,17 @@ class TradingPanel {
 
   _saveConfig() {
     const cfg = this._readConfig();
-    localStorage.setItem('trading_bot_config', JSON.stringify(cfg));
+    if (!cfg.paper && !cfg.live_confirmed) {
+      this._showError('Confirm live trading before saving a LIVE configuration.');
+      return;
+    }
+    const persisted = { ...cfg };
+    delete persisted.api_key;
+    delete persisted.api_secret;
+    delete persisted.api_passphrase;
+    delete persisted.anthropic_key;
+    delete persisted.telegram_token;
+    localStorage.setItem('trading_bot_config', JSON.stringify(persisted));
     document.getElementById('tp-config-modal').style.display = 'none';
   }
 
@@ -359,16 +380,29 @@ class TradingPanel {
       if (saved.timeframe) $('cfg-timeframe').value = saved.timeframe;
       if (saved.interval)  $('cfg-interval').value  = saved.interval;
       if (saved.paper !== undefined) $('cfg-paper').checked = saved.paper;
+      if (saved.live_confirmed !== undefined) $('cfg-live-confirm').checked = saved.live_confirmed;
       if (saved.strategies) {
         $('cfg-ma').checked   = saved.strategies.ma_crossover ?? true;
         $('cfg-rsi').checked  = saved.strategies.rsi_macd ?? true;
         $('cfg-grid').checked = saved.strategies.grid_trading ?? false;
         $('cfg-ai').checked   = saved.strategies.ai_signal ?? false;
+        $('cfg-mcdx').checked = saved.strategies.mcdx ?? true;
       }
-      if (saved.telegram_token)   $('cfg-tg-token').value = saved.telegram_token;
+      // Secrets are intentionally not restored from localStorage. Re-enter them
+      // for live starts, or provide them through server-side environment variables.
       if (saved.telegram_chat_id) $('cfg-tg-chat').value  = saved.telegram_chat_id;
       if (saved.tg_min_confidence) $('cfg-tg-conf').value = saved.tg_min_confidence;
+      this._syncLiveModeWarning();
     } catch {}
+  }
+
+  _syncLiveModeWarning() {
+    const paper = document.getElementById('cfg-paper')?.checked ?? true;
+    const display = paper ? 'none' : '';
+    const confirmWrap = document.getElementById('cfg-live-confirm-wrap');
+    const warning = document.getElementById('cfg-live-warning');
+    if (confirmWrap) confirmWrap.style.display = display;
+    if (warning) warning.style.display = display;
   }
 
   _showError(msg) {
@@ -422,6 +456,8 @@ class TradingPanel {
       .tp-btn-stop  { background: #742a2a; color: #fc8181; }
       .tp-btn-config{ background: #2d3748; color: #a0aec0; }
       .tp-error { background: #742a2a; color: #fc8181; padding: 5px 8px; border-radius: 5px; margin-bottom: 8px; font-size: 11px; }
+      .tp-live-warning { background: #742a2a; color: #fed7d7; border: 1px solid #c53030; border-radius: 5px; padding: 6px 8px; margin: 6px 0; font-size: 11px; line-height: 1.4; }
+      .tp-live-confirm { color: #fed7d7; font-weight: bold; }
       .tp-section { margin-bottom: 8px; }
       .tp-section-title { color: #718096; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
       .tp-signal-row {

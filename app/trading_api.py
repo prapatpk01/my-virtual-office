@@ -17,6 +17,22 @@ _bot_lock = threading.Lock()
 _loop: Optional[asyncio.AbstractEventLoop] = None
 
 
+def _config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
 def _get_or_create_loop() -> asyncio.AbstractEventLoop:
     global _loop
     if _loop is None or _loop.is_closed():
@@ -38,6 +54,27 @@ def _run_async(coro):
 # -----------------------------------------------------------------------
 
 def _build_bot(config: dict, broadcast_fn: Callable):
+    exchange = config.get("exchange", "binance")
+    symbols = config.get("symbols", ["BTC/USDT"])
+    paper = _config_bool(config.get("paper"), True)
+    api_key = config.get("api_key", "").strip() or os.environ.get("EXCHANGE_API_KEY", "").strip()
+    api_secret = config.get("api_secret", "").strip() or os.environ.get("EXCHANGE_API_SECRET", "").strip()
+    api_passphrase = config.get("api_passphrase", "").strip() or os.environ.get("EXCHANGE_PASSPHRASE", "").strip()
+
+    if not paper:
+        live_confirmed = _config_bool(config.get("live_confirmed"), False) or _config_bool(os.environ.get("LIVE_TRADING_CONFIRMED"), False)
+        if not live_confirmed:
+            raise ValueError("Live trading requires explicit confirmation. Enable live mode and confirm real-money execution.")
+        if not api_key or not api_secret:
+            raise ValueError(f"Live trading on {exchange} requires EXCHANGE_API_KEY and EXCHANGE_API_SECRET")
+        if exchange == "okx" and not api_passphrase:
+            raise ValueError("Live trading on OKX requires EXCHANGE_PASSPHRASE")
+    interval = int(config.get("interval", 60))
+    strategy_flags = config.get("strategies", {})
+
+    # Import trading dependencies only after cheap config validation.
+    # This keeps safety guards testable even in environments where optional
+    # trading packages (ccxt/numpy/aiohttp) have not been installed yet.
     from trading.connectors.binance_conn import BinanceConnector
     from trading.connectors.alpaca_conn import AlpacaConnector
     from trading.strategies.mcdx_strategy import MCDXStrategy
@@ -45,22 +82,19 @@ def _build_bot(config: dict, broadcast_fn: Callable):
     from trading.bot import TradingBot
     from trading.telegram_notifier import TelegramNotifier
 
-    exchange = config.get("exchange", "binance")
-    symbols = config.get("symbols", ["BTC/USDT"])
-    paper = config.get("paper", True)
-    api_key = config.get("api_key", "")
-    api_secret = config.get("api_secret", "")
-    interval = int(config.get("interval", 60))
-    strategy_flags = config.get("strategies", {})
-
     # Set Anthropic key if provided
     if config.get("anthropic_key"):
         os.environ["ANTHROPIC_API_KEY"] = config["anthropic_key"]
 
     # Connector
     if exchange in ("binance", "bybit", "okx"):
-        connector = BinanceConnector(api_key=api_key, api_secret=api_secret,
-                                     paper=paper, exchange_id=exchange)
+        connector = BinanceConnector(
+            api_key=api_key,
+            api_secret=api_secret,
+            paper=paper,
+            exchange_id=exchange,
+            passphrase=api_passphrase,
+        )
     else:
         connector = AlpacaConnector(api_key=api_key, api_secret=api_secret, paper=paper)
 
