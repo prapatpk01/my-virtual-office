@@ -33,6 +33,8 @@ import os
 import time
 from typing import Optional
 
+import numpy as np
+
 from ..strategies.base import BaseStrategy, Signal, SignalType
 from ..engines.market_intelligence import MarketIntelligenceEngine, MarketRegime
 from ..engines.expert_analysis import ExpertAnalysisEngine
@@ -298,7 +300,9 @@ class AIExpertStrategy(BaseStrategy):
         candles = self._latest_candles
         pos_id  = position_key or self.symbol
 
-        atr = self._regime_engine._atr(candles)
+        atr_arr = self._regime_engine._atr(candles)
+        valid = atr_arr[~np.isnan(atr_arr)]
+        atr = float(valid[-1]) if len(valid) > 0 else 0.0
         if atr <= 0:
             return PositionUpdate(action="hold", reason="ATR unavailable")
 

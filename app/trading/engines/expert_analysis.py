@@ -236,7 +236,7 @@ class ExpertAnalysisEngine:
         ob_score = 30.0
         if len(closes) >= 5:
             for i in range(2, min(10, len(closes))):
-                body = abs(float(closes[-i]) - float(opens[-i] if hasattr(closes, '__getitem__') else closes[-i]))
+                body = abs(float(closes[-i]) - float(closes[-i - 1]))
                 if body > 0:
                     ob_score = 50.0
                     break

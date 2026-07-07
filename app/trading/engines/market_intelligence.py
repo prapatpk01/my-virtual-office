@@ -421,8 +421,10 @@ class MarketIntelligenceEngine:
             return 0.0
         prior_dir = np.sign(closes[-period] - closes[-period-1])
         recent = list(zip(closes[-period:], volumes[-period:]))
-        vol_bull = sum(v for c, v in zip(closes[-period:], volumes[-period:])
-                       if c > closes[list(closes).index(c) - 1] if list(closes).index(c) > 0 else False)
+        vol_bull = sum(
+            v for i, (c, v) in enumerate(zip(closes[-period:], volumes[-period:]))
+            if i > 0 and c > closes[-period + i - 1]
+        )
         # Simplified: large volume candle opposite to prior trend
         last_dir  = np.sign(closes[-1] - closes[-2])
         last_vol  = float(volumes[-1])
