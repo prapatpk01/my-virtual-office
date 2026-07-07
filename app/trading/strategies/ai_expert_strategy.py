@@ -91,6 +91,7 @@ class AIExpertStrategy(BaseStrategy):
         self._open_position: Optional[str]   = None
         self._signal_count   = 0
         self._last_adapt_at  = 0
+        self._latest_candles: list           = []   # updated each analyze(); used by tick_open_position
 
     async def analyze(
         self,
@@ -102,6 +103,7 @@ class AIExpertStrategy(BaseStrategy):
         if len(candles) < 60:
             return self._hold(current_price, "Not enough candles")
 
+        self._latest_candles = candles  # cache for tick_open_position()
         symbol = self.symbol
         mtf    = mtf_candles or {}
 
@@ -275,6 +277,60 @@ class AIExpertStrategy(BaseStrategy):
         n = len(self._learning_engine._journal)
         if n > 0 and n % 10 == 0:
             self._run_adaptation()
+
+    def tick_open_position(
+        self,
+        current_price: float,
+        position_key: Optional[str] = None,
+    ) -> Optional["PositionUpdate"]:
+        """
+        Called each bot tick when this strategy has an open position.
+        Runs Exit AI + Position Manager and returns a recommended action.
+        Returns None if no open entry is tracked or candles are unavailable.
+        """
+        if not self._open_entry or not self._latest_candles:
+            return None
+
+        from ..engines.position_manager import PositionUpdate
+        from ..engines.market_intelligence import MarketRegime
+
+        entry   = self._open_entry
+        candles = self._latest_candles
+        pos_id  = position_key or self.symbol
+
+        atr = self._regime_engine._atr(candles)
+        if atr <= 0:
+            return PositionUpdate(action="hold", reason="ATR unavailable")
+
+        try:
+            regime_val = MarketRegime(entry["regime"])
+        except ValueError:
+            regime_val = MarketRegime.TREND
+
+        exit_sig = self._exit_engine.evaluate(
+            candles,
+            direction=entry["direction"],
+            entry_price=entry["entry_price"],
+            current_price=current_price,
+            regime=regime_val,
+        )
+
+        if pos_id not in self._position_manager._positions:
+            self._position_manager.register_position(
+                position_id=pos_id,
+                direction=entry["direction"],
+                entry_price=entry["entry_price"],
+                stop_loss=entry["stop_loss"],
+                take_profit=entry["take_profit"],
+                atr=atr,
+            )
+
+        return self._position_manager.update(
+            position_id=pos_id,
+            current_price=current_price,
+            current_atr=atr,
+            exit_score=exit_sig.score,
+        )
 
     def get_analysis_state(self) -> dict:
         """Return current pipeline state for dashboard display."""

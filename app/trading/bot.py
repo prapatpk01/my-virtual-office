@@ -1,6 +1,12 @@
 """
-Trading Bot main engine.
-Runs strategy loops, manages orders, broadcasts state via WebSocket.
+Trading Bot main engine — Adaptive AI Edition.
+
+Integrates the full 9-layer AI Expert pipeline into the live trading loop:
+  - Layer 7: Position Manager (break-even, trailing stop, partial TP) runs every tick
+  - Layer 8: Exit AI scores feed the Position Manager each tick
+  - Layer 9: Learning Engine is fed after every position close
+  - Portfolio Engine gates every new position for heat / correlation limits
+  - Drift Detector alerts are broadcast to Telegram when thresholds are crossed
 """
 import asyncio
 import logging
@@ -16,6 +22,8 @@ from .strategies.wt_adx_strategy import WTADXStrategy
 from .risk_manager import RiskManager
 from .telegram_notifier import TelegramNotifier
 from .signal_state import SignalState
+from .engines.portfolio_engine import PortfolioEngine
+from .engines.drift_detector import DriftAction
 
 logger = logging.getLogger("trading_bot")
 
@@ -54,6 +62,11 @@ class TradingBot:
     Orchestrates multiple strategies across multiple connectors.
     Emits state updates via a broadcast callback so the Virtual Office
     server can push them to connected WebSocket clients.
+
+    AI Expert strategies get full lifecycle integration:
+      tick_open_position() → handles BE / trailing / partial TP / AI exit
+      record_closed_trade() → feeds learning engine after every close
+      Portfolio engine gates new positions for heat and correlation risk
     """
 
     def __init__(
@@ -76,13 +89,29 @@ class TradingBot:
         self._task: Optional[asyncio.Task] = None
         self._start_balance = 0.0
         self._trade_history: list[TradeRecord] = []
-        # Persistent signal state — survives restarts
         kwargs = {"path": state_file} if state_file else {}
         self._sig = SignalState(**kwargs)
-        # WTV=true → gate all signals through WaveTrend WT1 before notifying
         self.wt_verify: bool = os.getenv("WTV", "false").lower() == "true"
         if self.wt_verify:
             logger.info("[WTV] WaveTrend verify ENABLED (WT1 gate ±10 active)")
+
+        # ── Adaptive extensions ─────────────────────────────────────────────
+        # Fast lookup: strategy_name → strategy instance (for lifecycle hooks)
+        self._strategy_map: dict[str, BaseStrategy] = {s.name: s for s in strategies}
+
+        # Track when each position was opened to calculate trade duration
+        self._position_open_times: dict[str, float] = {}  # key = "symbol||strategy_name"
+
+        # Portfolio-level risk engine (shared across all strategies)
+        self._portfolio = PortfolioEngine(
+            max_portfolio_heat=float(os.getenv("MAX_PORTFOLIO_HEAT", "0.06")),
+            max_same_group=int(os.getenv("MAX_SAME_GROUP", "2")),
+            max_total_positions=self.risk.max_open_positions,
+        )
+
+        # Tick counter — used for periodic drift alerts
+        self._tick_count = 0
+        self._last_drift_alert_tick = 0
 
     # ------------------------------------------------------------------
     # Public control
@@ -154,6 +183,7 @@ class TradingBot:
 
     async def _tick(self):
         self.state.error = ""
+        self._tick_count += 1
         await self._refresh_balance()
 
         if not self.risk.check_drawdown(self.state.total_balance):
@@ -166,26 +196,46 @@ class TradingBot:
             self._broadcast_state()
             return
 
-        # Check stop-loss / take-profit on open positions
+        # ── Position management: SL/TP, AI Layer 7, and learning callbacks ──
         for pos_info in list(self.risk.get_positions()):
-            sym = pos_info["symbol"]
+            sym           = pos_info["symbol"]
             strategy_name = pos_info.get("strategy", "")
-            ticker = await self.connector.fetch_ticker(sym)
-            price = ticker["last"]
+            ticker        = await self.connector.fetch_ticker(sym)
+            price         = ticker["last"]
+
+            strategy_inst = self._strategy_map.get(strategy_name)
+
+            # Layer 7 + 8: AI Expert position management (break-even, trailing, partial TP, exit AI)
+            if hasattr(strategy_inst, "tick_open_position"):
+                try:
+                    pos_update = strategy_inst.tick_open_position(
+                        current_price=price,
+                        position_key=f"{sym}||{strategy_name}",
+                    )
+                    if pos_update and pos_update.action != "hold":
+                        closed = await self._handle_pos_update(pos_info, pos_update, price, strategy_inst)
+                        if closed:
+                            continue  # position fully closed; skip SL/TP check below
+                except Exception as e:
+                    logger.error("tick_open_position error [%s %s]: %s", strategy_name, sym, e)
+
+            # Fallback: risk-manager hard SL/TP stop check
             trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
             if trigger:
                 side = "sell" if pos_info["side"] == "long" else "buy"
                 await self.connector.create_order(sym, side, pos_info["amount"])
-                pnl = (price - pos_info["entry"]) * pos_info["amount"] if side == "sell" else 0
+                pnl = ((price - pos_info["entry"]) * pos_info["amount"]
+                       if pos_info["side"] == "long"
+                       else (pos_info["entry"] - price) * pos_info["amount"])
                 trade = TradeRecord(
                     timestamp=int(time.time() * 1000),
                     symbol=sym, side=side,
                     price=price, amount=pos_info["amount"],
-                    pnl=pnl, strategy=strategy_name or "risk_manager", reason=trigger,
+                    pnl=round(pnl, 4),
+                    strategy=strategy_name or "risk_manager", reason=trigger,
                     paper=self.connector.paper,
                 )
                 self._record_trade(trade)
-                # Record outcome + unlock so next signal can fire
                 self._sig.record_outcome(
                     symbol=sym, side=pos_info["side"],
                     entry=pos_info["entry"], exit_price=price,
@@ -194,7 +244,8 @@ class TradingBot:
                 )
                 self._sig.unlock_strategy(sym, strategy_name)
                 self.risk.close_position(sym, strategy=strategy_name)
-                logger.info("Position closed by %s: %s [%s] → signal lock released", trigger, sym, strategy_name)
+                self._on_position_closed(sym, strategy_name, price, trigger, strategy_inst)
+                logger.info("Position closed by %s: %s [%s]", trigger, sym, strategy_name)
                 if self.telegram:
                     self.telegram.notify_trade_closed(
                         sym, trigger, price,
@@ -204,18 +255,22 @@ class TradingBot:
                         self._sig.summary(),
                     )
 
-        # Run each strategy
+        # ── Periodic drift alert (every 50 ticks) ────────────────────────────
+        if self._tick_count - self._last_drift_alert_tick >= 50:
+            self._last_drift_alert_tick = self._tick_count
+            self._broadcast_drift_alerts()
+
+        # ── Run each strategy ────────────────────────────────────────────────
         new_signals = []
-        _resolved_symbols: set[str] = set()  # check virtual SL/TP once per symbol per tick
+        _resolved_symbols: set[str] = set()
         for strategy in self.strategies:
             try:
                 _tf    = os.getenv("CANDLE_TF", "15m")
                 _limit = int(os.getenv("CANDLE_LIMIT", "300"))
                 candles = await self.connector.fetch_ohlcv(strategy.symbol, timeframe=_tf, limit=_limit)
-                ticker = await self.connector.fetch_ticker(strategy.symbol)
+                ticker  = await self.connector.fetch_ticker(strategy.symbol)
                 current_price = ticker["last"]
 
-                # Check virtual SL/TP + update WT1 cache (once per symbol per tick)
                 if strategy.symbol not in _resolved_symbols and candles:
                     _resolved_symbols.add(strategy.symbol)
                     last_c = candles[-1]
@@ -227,7 +282,7 @@ class TradingBot:
                             self.telegram.notify_virtual_closed(
                                 strategy.symbol, v_reason, v_price, self._sig.summary()
                             )
-                # Fetch MTF candles for higher-TF bias (skip if already on 1h/4h)
+
                 mtf_candles = {}
                 _base_tf = os.getenv("CANDLE_TF", "15m")
                 _mtf_tfs = [t for t in ("1h", "4h") if t != _base_tf]
@@ -242,14 +297,14 @@ class TradingBot:
                 signal = await strategy.analyze(candles, current_price, mtf_candles=mtf_candles)
 
                 sig_dict = {
-                    "strategy": strategy.name,
-                    "symbol": signal.symbol,
-                    "type": signal.type.value,
-                    "price": signal.price,
+                    "strategy":   strategy.name,
+                    "symbol":     signal.symbol,
+                    "type":       signal.type.value,
+                    "price":      signal.price,
                     "confidence": signal.confidence,
-                    "reason": signal.reason,
-                    "ts": int(time.time() * 1000),
-                    "metadata": signal.metadata,
+                    "reason":     signal.reason,
+                    "ts":         int(time.time() * 1000),
+                    "metadata":   signal.metadata,
                 }
                 new_signals.append(sig_dict)
 
@@ -260,16 +315,183 @@ class TradingBot:
                 logger.error("Strategy %s error: %s", strategy.name, e)
                 new_signals.append({
                     "strategy": strategy.name,
-                    "symbol": strategy.symbol,
-                    "type": "error",
-                    "reason": str(e)[:80],
-                    "ts": int(time.time() * 1000),
+                    "symbol":   strategy.symbol,
+                    "type":     "error",
+                    "reason":   str(e)[:80],
+                    "ts":       int(time.time() * 1000),
                 })
 
-        self.state.signals = (new_signals + self.state.signals)[:20]
-        self.state.open_positions = self.risk.get_positions()
-        self.state.last_updated = int(time.time() * 1000)
+        self.state.signals         = (new_signals + self.state.signals)[:20]
+        self.state.open_positions  = self.risk.get_positions()
+        self.state.last_updated    = int(time.time() * 1000)
         self._broadcast_state()
+
+    # ------------------------------------------------------------------
+    # Adaptive position management helpers
+    # ------------------------------------------------------------------
+
+    async def _handle_pos_update(
+        self,
+        pos_info: dict,
+        update: Any,   # PositionUpdate from position_manager
+        price: float,
+        strategy_inst: Optional[BaseStrategy] = None,
+    ) -> bool:
+        """
+        Execute a Layer-7 PositionManager action.
+        Returns True if the position was fully closed (caller should skip stop-check).
+        """
+        sym           = pos_info["symbol"]
+        strategy_name = pos_info.get("strategy", "")
+
+        if update.action in ("break_even", "trail"):
+            if update.new_sl:
+                self.risk.update_stop_loss(sym, update.new_sl, strategy=strategy_name)
+                logger.info(
+                    "[%s] %s %s → SL=%.4f | %s",
+                    strategy_name, update.action.upper(), sym, update.new_sl, update.reason,
+                )
+            return False
+
+        if update.action == "partial_tp":
+            close_amt = round(pos_info["amount"] * update.close_pct, 8)
+            if close_amt > 0:
+                try:
+                    close_side = "sell" if pos_info["side"] == "long" else "buy"
+                    await self.connector.create_order(sym, close_side, close_amt)
+                    pnl = ((price - pos_info["entry"]) * close_amt
+                           if pos_info["side"] == "long"
+                           else (pos_info["entry"] - price) * close_amt)
+                    self.risk.reduce_position(sym, close_amt, strategy=strategy_name)
+                    self._record_trade(TradeRecord(
+                        timestamp=int(time.time() * 1000),
+                        symbol=sym, side=close_side,
+                        price=price, amount=close_amt,
+                        pnl=round(pnl, 4),
+                        strategy=strategy_name, reason=update.reason,
+                        paper=self.connector.paper,
+                    ))
+                    logger.info(
+                        "[%s] Partial TP %.0f%% %s @ %.4f PnL=%.4f | %s",
+                        strategy_name, update.close_pct * 100, sym, price, pnl, update.reason,
+                    )
+                    if self.telegram:
+                        try:
+                            self.telegram.send(
+                                f"💰 *Partial TP* `{sym}` [{strategy_name}]\n"
+                                f"Closed *{update.close_pct*100:.0f}%* @ `{price:.4f}`\n"
+                                f"PnL: `{pnl:+.4f}` USDT\n_{update.reason}_"
+                            )
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error("Partial TP failed [%s %s]: %s", strategy_name, sym, e)
+            return False
+
+        if update.action == "close":
+            close_side = "sell" if pos_info["side"] == "long" else "buy"
+            try:
+                await self.connector.create_order(sym, close_side, pos_info["amount"])
+                pnl = ((price - pos_info["entry"]) * pos_info["amount"]
+                       if pos_info["side"] == "long"
+                       else (pos_info["entry"] - price) * pos_info["amount"])
+                self._record_trade(TradeRecord(
+                    timestamp=int(time.time() * 1000),
+                    symbol=sym, side=close_side,
+                    price=price, amount=pos_info["amount"],
+                    pnl=round(pnl, 4),
+                    strategy=strategy_name, reason=update.reason,
+                    paper=self.connector.paper,
+                ))
+                self._sig.record_outcome(
+                    symbol=sym, side=pos_info["side"],
+                    entry=pos_info["entry"], exit_price=price,
+                    sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
+                    reason=update.reason, strategy=strategy_name,
+                )
+                self._sig.unlock_strategy(sym, strategy_name)
+                self.risk.close_position(sym, strategy=strategy_name)
+                self._on_position_closed(sym, strategy_name, price, update.reason, strategy_inst)
+                logger.info(
+                    "[%s] AI-driven CLOSE %s @ %.4f PnL=%.4f | %s",
+                    strategy_name, sym, price, pnl, update.reason,
+                )
+                if self.telegram:
+                    self.telegram.notify_trade_closed(
+                        sym, update.reason, price,
+                        pos_info["entry"],
+                        pos_info.get("stop_loss"),
+                        pos_info.get("take_profit"),
+                        self._sig.summary(),
+                    )
+            except Exception as e:
+                logger.error("AI-driven close failed [%s %s]: %s", strategy_name, sym, e)
+            return True
+
+        return False
+
+    def _on_position_closed(
+        self,
+        symbol: str,
+        strategy_name: str,
+        exit_price: float,
+        reason: str,
+        strategy_inst: Optional[BaseStrategy] = None,
+    ) -> None:
+        """
+        Lifecycle callback called after any position close (SL/TP, signal, or AI exit).
+        Feeds the learning engine and releases portfolio engine slot.
+        """
+        pos_key   = f"{symbol}||{strategy_name}"
+        open_time = self._position_open_times.pop(pos_key, time.time())
+        duration_min = (time.time() - open_time) / 60.0
+
+        if strategy_inst is None:
+            strategy_inst = self._strategy_map.get(strategy_name)
+
+        # Layer 9: feed learning engine
+        if hasattr(strategy_inst, "record_closed_trade"):
+            try:
+                strategy_inst.record_closed_trade(exit_price, reason, duration_min)
+                logger.debug(
+                    "[%s] Learning engine updated: exit=%.4f reason=%s dur=%.1fmin",
+                    strategy_name, exit_price, reason, duration_min,
+                )
+            except Exception as e:
+                logger.warning("record_closed_trade failed [%s]: %s", strategy_name, e)
+
+        # Release portfolio engine slot
+        try:
+            self._portfolio.remove_position(symbol)
+        except Exception:
+            pass
+
+    def _broadcast_drift_alerts(self) -> None:
+        """Check all AI Expert strategies for drift and alert if action is needed."""
+        for strategy in self.strategies:
+            if not hasattr(strategy, "_drift_detector"):
+                continue
+            try:
+                action = strategy._drift_detector.highest_severity_action()
+                if action in (DriftAction.RETRAIN, DriftAction.PAUSE):
+                    logger.warning(
+                        "[%s] Drift detected: action=%s", strategy.name, action.value
+                    )
+                    if self.telegram:
+                        try:
+                            self.telegram.send(
+                                f"⚠️ *Drift Alert* [{strategy.name}]\n"
+                                f"Action: *{action.value.upper()}*\n"
+                                f"Model performance has degraded — review trading conditions."
+                            )
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug("Drift check failed [%s]: %s", strategy.name, e)
+
+    # ------------------------------------------------------------------
+    # Signal execution
+    # ------------------------------------------------------------------
 
     async def _maybe_notify(self, signal: Signal, sig_dict: dict,
                              strategy_name: str, candles: list = None):
@@ -281,24 +503,21 @@ class TradingBot:
         """
         sym = signal.symbol
 
-        # ── WTV gate (env WTV=true) ──────────────────────────────────────
+        # ── WTV gate ────────────────────────────────────────────────────────
         if self.wt_verify and candles:
             wt1 = WTADXStrategy.compute_wt1(candles)
             if not math.isnan(wt1):
                 if signal.type == SignalType.BUY and wt1 >= 10:
-                    logger.debug("[WTV] %s %s BUY blocked — WT1=%.1f ≥+10",
-                                 strategy_name, sym, wt1)
+                    logger.debug("[WTV] %s %s BUY blocked — WT1=%.1f ≥+10", strategy_name, sym, wt1)
                     return
                 if signal.type == SignalType.SELL and wt1 <= -10:
-                    logger.debug("[WTV] %s %s SELL blocked — WT1=%.1f ≤-10",
-                                 strategy_name, sym, wt1)
+                    logger.debug("[WTV] %s %s SELL blocked — WT1=%.1f ≤-10", strategy_name, sym, wt1)
                     return
                 logger.debug("[WTV] %s %s passed — WT1=%.1f", strategy_name, sym, wt1)
 
         signal_only = self.risk.max_open_positions == 0
 
         if signal_only:
-            # Forex / signal-only mode: alert on direction change or after 4h stale
             last_dir, last_ts = self._sig.last_direction(sym)
             direction_changed = last_dir != signal.type.value
             stale = (int(time.time() * 1000) - last_ts) > 4 * 3600 * 1000
@@ -318,20 +537,19 @@ class TradingBot:
                 logger.debug("Forex %s suppressed — same direction", sym)
             return
 
-        # ── WaveTrend: 2-slot long stacking; SELL exits all WT longs ────
+        # ── WaveTrend: 2-slot long stacking ─────────────────────────────────
         _WT = "WTADXStrategy"
         _WT_MAX = 2
         if strategy_name == _WT:
             positions = self.risk.get_positions()
-            wt_pos    = [p for p in positions
-                         if p["symbol"] == sym and p["strategy"].startswith(_WT)]
-            wt_longs  = [p for p in wt_pos if p["side"] == "long"]
+            wt_pos   = [p for p in positions if p["symbol"] == sym and p["strategy"].startswith(_WT)]
+            wt_longs = [p for p in wt_pos if p["side"] == "long"]
 
             if signal.type == SignalType.SELL:
                 if not wt_longs:
                     return
                 logger.info("[WT] SELL signal on %s — exiting %d long(s)", sym, len(wt_longs))
-                ticker = await self.connector.fetch_ticker(sym)
+                ticker     = await self.connector.fetch_ticker(sym)
                 exit_price = ticker["last"]
                 for pos in list(wt_longs):
                     slot_name = pos["strategy"]
@@ -345,6 +563,7 @@ class TradingBot:
                         )
                         self._sig.unlock_strategy(sym, slot_name)
                         self.risk.close_position(sym, strategy=slot_name)
+                        self._on_position_closed(sym, slot_name, exit_price, "sell_signal")
                         if self.telegram:
                             self.telegram.notify_trade_closed(
                                 sym, "sell_signal", exit_price,
@@ -353,9 +572,8 @@ class TradingBot:
                             )
                     except Exception as e:
                         logger.error("WT exit on SELL failed [%s]: %s", slot_name, e)
-                return  # Never open short
+                return
 
-            # BUY: stack longs up to _WT_MAX
             if len(wt_longs) >= _WT_MAX:
                 logger.debug("[WT] %s max stack (%d) reached, suppressing", sym, _WT_MAX)
                 return
@@ -379,13 +597,14 @@ class TradingBot:
             await self._execute_signal(signal, slot_key)
             return
 
-        # ── Normal strategies: BUY-only ──────────────────────────────────
+        # ── Normal / AI Expert strategies: BUY-only ─────────────────────────
         if signal.type == SignalType.SELL:
-            # Close long belonging to THIS strategy; ignore if no position
             if self._sig.is_locked_for_strategy(sym, strategy_name):
                 positions = self.risk.get_positions()
-                existing  = next((p for p in positions
-                                  if p["symbol"] == sym and p["strategy"] == strategy_name), None)
+                existing  = next(
+                    (p for p in positions if p["symbol"] == sym and p["strategy"] == strategy_name),
+                    None,
+                )
                 if existing and existing["side"] == "long":
                     logger.info("[%s] SELL signal — exiting long on %s", strategy_name, sym)
                     try:
@@ -400,6 +619,10 @@ class TradingBot:
                         )
                         self._sig.unlock_strategy(sym, strategy_name)
                         self.risk.close_position(sym, strategy=strategy_name)
+                        self._on_position_closed(
+                            sym, strategy_name, exit_price, "sell_signal",
+                            self._strategy_map.get(strategy_name),
+                        )
                         if self.telegram:
                             self.telegram.notify_trade_closed(
                                 sym, "sell_signal", exit_price,
@@ -408,9 +631,9 @@ class TradingBot:
                             )
                     except Exception as e:
                         logger.error("Exit on SELL signal failed [%s]: %s", strategy_name, e)
-            return  # Never open short
+            return
 
-        # BUY signal — open long if not already holding one for this strategy
+        # BUY signal
         if self._sig.is_locked_for_strategy(sym, strategy_name):
             logger.debug("%s [%s] already long — suppressing BUY", sym, strategy_name)
             return
@@ -439,13 +662,13 @@ class TradingBot:
             self._sig.unlock_strategy(sym, strategy_name)
             return
 
-        balances = await self.connector.fetch_balance()
+        balances      = await self.connector.fetch_balance()
         quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
-        ticker = await self.connector.fetch_ticker(sym)
-        price = ticker["last"]
-        meta  = signal.metadata or {}
-        sl_p  = meta.get("stop_loss")
-        tp_p  = meta.get("take_profit")
+        ticker        = await self.connector.fetch_ticker(sym)
+        price         = ticker["last"]
+        meta          = signal.metadata or {}
+        sl_p          = meta.get("stop_loss")
+        tp_p          = meta.get("take_profit")
 
         amount = self.risk.size_position(quote_balance, price)
         if amount <= 0:
@@ -457,11 +680,38 @@ class TradingBot:
             self._sig.unlock_strategy(sym, strategy_name)
             return
 
+        # ── Portfolio engine pre-trade check ────────────────────────────────
+        effective_sl = sl_p or (price * (1 - self.risk.stop_loss_pct))
+        port_check   = self._portfolio.can_add_position(
+            symbol=sym, direction="long",
+            entry_price=price, stop_loss=effective_sl,
+            amount=amount, portfolio_value=quote_balance,
+        )
+        if not port_check.can_add:
+            logger.info(
+                "[%s] Portfolio gate blocked %s: %s (heat=%.1f%%)",
+                strategy_name, sym, port_check.reason,
+                port_check.portfolio_heat * 100,
+            )
+            self._sig.unlock_strategy(sym, strategy_name)
+            return
+
         try:
             order = await self.connector.create_order(sym, "buy", amount)
-            # Use ATR-based SL/TP from signal; fall back to % if not provided
             self.risk.open_position(sym, "long", price, amount, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
+
+            # Track open time for learning engine duration calculation
+            pos_key = f"{sym}||{strategy_name}"
+            self._position_open_times[pos_key] = time.time()
+
+            # Register position in portfolio engine
+            self._portfolio.add_position(
+                symbol=sym, direction="long",
+                entry_price=price, current_price=price,
+                amount=amount, stop_loss=effective_sl,
+            )
+
             trade = TradeRecord(
                 timestamp=int(time.time() * 1000),
                 symbol=sym, side="buy",
@@ -470,14 +720,20 @@ class TradingBot:
                 paper=self.connector.paper,
             )
             self._record_trade(trade)
-            logger.info("[%s] BUY %s @ %.4f  SL=%.4f  TP=%.4f (paper=%s)",
-                        strategy_name, sym, price, sl_p or 0, tp_p or 0, self.connector.paper)
+            logger.info(
+                "[%s] BUY %s @ %.4f  SL=%.4f  TP=%.4f (paper=%s)",
+                strategy_name, sym, price, sl_p or 0, tp_p or 0, self.connector.paper,
+            )
             if self.telegram:
                 self.telegram.notify_order(sym, "buy", amount, order.price,
                                            strategy_name, self.connector.paper)
         except Exception as e:
             logger.error("Order failed for %s: %s", sym, e)
             self._sig.unlock_strategy(sym, strategy_name)
+
+    # ------------------------------------------------------------------
+    # Balance, state, and stats helpers
+    # ------------------------------------------------------------------
 
     async def _refresh_balance(self):
         try:
@@ -489,6 +745,7 @@ class TradingBot:
             if self._start_balance:
                 self.state.pnl_total = self.state.total_balance - self._start_balance
                 self.risk.update_peak(self.state.total_balance)
+            self._portfolio.update_prices({})   # price updates handled per-tick above
         except Exception as e:
             logger.warning("Balance refresh failed: %s", e)
 
@@ -508,17 +765,17 @@ class TradingBot:
             self._broadcast({
                 "type": "trading_update",
                 "state": {
-                    "running": self.state.running,
-                    "paper": self.state.paper,
-                    "balance": round(self.state.total_balance, 2),
-                    "equity": round(self.state.equity, 2),
-                    "pnl_today": round(self.state.pnl_today, 2),
-                    "pnl_total": round(self.state.pnl_total, 2),
-                    "positions": self.state.open_positions,
+                    "running":       self.state.running,
+                    "paper":         self.state.paper,
+                    "balance":       round(self.state.total_balance, 2),
+                    "equity":        round(self.state.equity, 2),
+                    "pnl_today":     round(self.state.pnl_today, 2),
+                    "pnl_total":     round(self.state.pnl_total, 2),
+                    "positions":     self.state.open_positions,
                     "recent_trades": self.state.recent_trades,
-                    "signals": self.state.signals,
-                    "error": self.state.error,
-                    "last_updated": self.state.last_updated,
+                    "signals":       self.state.signals,
+                    "error":         self.state.error,
+                    "last_updated":  self.state.last_updated,
                 },
             })
         except Exception as e:
@@ -531,17 +788,33 @@ class TradingBot:
         """Deep-dive analytics: win-rate by strategy/symbol/confidence/hour, trend, recommendations."""
         return self._sig.deep_analysis(days=days)
 
+    def get_portfolio_state(self, portfolio_value: float = None) -> dict:
+        """Current portfolio-level risk summary from the portfolio engine."""
+        val = portfolio_value or self.state.total_balance or 1.0
+        return self._portfolio.portfolio_summary(val)
+
+    def get_ai_strategy_states(self) -> dict:
+        """Dashboard state for all AI Expert strategies."""
+        result = {}
+        for name, strat in self._strategy_map.items():
+            if hasattr(strat, "get_analysis_state"):
+                try:
+                    result[name] = strat.get_analysis_state()
+                except Exception:
+                    pass
+        return result
+
     def get_state(self) -> dict:
         return {
-            "running": self.state.running,
-            "paper": self.state.paper,
-            "balance": round(self.state.total_balance, 2),
-            "equity": round(self.state.equity, 2),
-            "pnl_today": round(self.state.pnl_today, 2),
-            "pnl_total": round(self.state.pnl_total, 2),
-            "positions": self.state.open_positions,
+            "running":       self.state.running,
+            "paper":         self.state.paper,
+            "balance":       round(self.state.total_balance, 2),
+            "equity":        round(self.state.equity, 2),
+            "pnl_today":     round(self.state.pnl_today, 2),
+            "pnl_total":     round(self.state.pnl_total, 2),
+            "positions":     self.state.open_positions,
             "recent_trades": self.state.recent_trades,
-            "signals": self.state.signals,
-            "error": self.state.error,
-            "last_updated": self.state.last_updated,
+            "signals":       self.state.signals,
+            "error":         self.state.error,
+            "last_updated":  self.state.last_updated,
         }

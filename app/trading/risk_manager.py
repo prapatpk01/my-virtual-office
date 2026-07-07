@@ -123,6 +123,20 @@ class RiskManager:
                 return "take_profit"
         return None
 
+    def update_stop_loss(self, symbol: str, new_sl: float, strategy: str = "") -> bool:
+        """Update the stop-loss price for an open position (used by trailing stop / break-even)."""
+        pos = self._positions.get(f"{symbol}||{strategy}")
+        if pos:
+            pos.stop_loss = new_sl
+            return True
+        return False
+
+    def reduce_position(self, symbol: str, amount: float, strategy: str = "") -> None:
+        """Reduce position size after a partial take-profit execution."""
+        pos = self._positions.get(f"{symbol}||{strategy}")
+        if pos:
+            pos.amount = max(0.0, round(pos.amount - amount, 8))
+
     def get_positions(self) -> list[dict]:
         result = []
         for key, p in self._positions.items():
