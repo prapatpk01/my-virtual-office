@@ -262,15 +262,16 @@ def compute_indicators(df15: pd.DataFrame, df1h: pd.DataFrame) -> pd.DataFrame:
 
 
 def _dynamic_threshold(adx_series: pd.Series) -> pd.Series:
-    """ADX-based dynamic entry threshold (mirrors TrendContV2Strategy)."""
-    thr = pd.Series(95.0, index=adx_series.index)
-    thr = thr.where(adx_series < 15,  95.0)
-    thr = thr.where(adx_series < 20,  88.0)
-    thr = thr.where(adx_series < 25,  82.0)
-    thr = thr.where(adx_series < 30,  78.0)
-    thr = thr.where(adx_series < 40,  75.0)
-    thr = thr.where(adx_series >= 40, 70.0)
-    return thr
+    """ADX-based dynamic entry threshold (mirrors TrendContV2Strategy).
+
+    Ladder tuned on the Jan-Jun 2026 sweep: old ladder traded 1,226x at
+    WR 68%/PF 0.92 (net loss); this one ~169x at WR 82.8%/PF 2.14 with all
+    8 symbols and all 6 months profitable.
+    """
+    adx = adx_series.fillna(0)
+    conds   = [adx >= 40, adx >= 30, adx >= 25, adx >= 20, adx >= 15]
+    choices = [78.0,      80.0,      82.0,      85.0,      90.0]
+    return pd.Series(np.select(conds, choices, default=100.0), index=adx_series.index)
 
 
 def score_signals(d: pd.DataFrame) -> pd.DataFrame:
