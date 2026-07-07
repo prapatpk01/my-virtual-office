@@ -66,8 +66,14 @@ def build_config() -> dict:
         "oanda_account_id": os.environ.get("OANDA_ACCOUNT_ID", ""),
         "oanda_env":        os.environ.get("OANDA_ENV", "practice"),
 
+        # ── Futures / leverage / hedge mode ──────────────────────────────
+        "futures":    _env_bool("FUTURES",    True),   # use perpetual swaps
+        "leverage":   int(os.environ.get("LEVERAGE",   "20")),
+        "hedge_mode": _env_bool("HEDGE_MODE", True),   # hold LONG + SHORT simultaneously
+
         # ── Symbols & candles ─────────────────────────────────────────────
-        "symbols":      _env_list("SYMBOLS", "BTC/USDT,ETH/USDT"),
+        # Perpetual format: BTC/USDT:USDT (OKX/Bybit), BTC/USDT (Binance perp)
+        "symbols":      _env_list("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT"),
         "candle_tf":    os.environ.get("CANDLE_TF",         "15m"),
         "candle_limit": int(os.environ.get("CANDLE_LIMIT",  "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
@@ -155,12 +161,12 @@ def build_crypto_bot(config: dict, telegram):
     from trading.risk_manager import RiskManager
     from trading.bot import TradingBot
 
-    exchange = config["exchange"]
+    exchange   = config["exchange"]
+    futures    = config.get("futures", True)
+    leverage   = config.get("leverage", 20)
+    hedge_mode = config.get("hedge_mode", True)
 
-    if config["paper"] and exchange in ("binance", "bybit", "okx"):
-        connector = YahooConnector()
-        logger.info("Paper trading: using Yahoo Finance (exchange=%s)", exchange)
-    elif exchange == "oanda":
+    if exchange == "oanda":
         connector = OANDAConnector(
             api_key=config["oanda_api_key"],
             account_id=config["oanda_account_id"],
@@ -172,6 +178,11 @@ def build_crypto_bot(config: dict, telegram):
             api_key=config["api_key"], api_secret=config["api_secret"],
             paper=config["paper"], exchange_id=exchange,
             passphrase=config.get("api_passphrase", ""),
+            futures=futures, leverage=leverage, hedge_mode=hedge_mode,
+        )
+        logger.info(
+            "Connector: %s | paper=%s | futures=%s | leverage=%dx | hedge=%s",
+            exchange, config["paper"], futures, leverage, hedge_mode,
         )
     else:
         connector = AlpacaConnector(

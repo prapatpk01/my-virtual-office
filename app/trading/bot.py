@@ -127,6 +127,14 @@ class TradingBot:
         self._tick_count = 0
         self._last_drift_alert_tick = 0
 
+        # Futures hedge mode — read from connector if available, else env
+        self._hedge_mode: bool = (
+            getattr(connector, "_hedge_mode", False)
+            or os.getenv("HEDGE_MODE", "false").lower() in ("1", "true", "yes")
+        )
+        # Track symbols that have had futures setup (leverage + hedge mode)
+        self._futures_setup_done: set[str] = set()
+
     # ------------------------------------------------------------------
     # Public control
     # ------------------------------------------------------------------
@@ -237,7 +245,8 @@ class TradingBot:
             trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
             if trigger:
                 side = "sell" if pos_info["side"] == "long" else "buy"
-                await self.connector.create_order(sym, side, pos_info["amount"])
+                pos_side = pos_info["side"] if self._hedge_mode else None
+                await self.connector.create_order(sym, side, pos_info["amount"], pos_side=pos_side)
                 pnl = ((price - pos_info["entry"]) * pos_info["amount"]
                        if pos_info["side"] == "long"
                        else (pos_info["entry"] - price) * pos_info["amount"])
@@ -372,7 +381,8 @@ class TradingBot:
             if close_amt > 0:
                 try:
                     close_side = "sell" if pos_info["side"] == "long" else "buy"
-                    await self.connector.create_order(sym, close_side, close_amt)
+                    pos_side = pos_info["side"] if self._hedge_mode else None
+                    await self.connector.create_order(sym, close_side, close_amt, pos_side=pos_side)
                     pnl = ((price - pos_info["entry"]) * close_amt
                            if pos_info["side"] == "long"
                            else (pos_info["entry"] - price) * close_amt)
@@ -408,8 +418,9 @@ class TradingBot:
 
         if update.action == "close":
             close_side = "sell" if pos_info["side"] == "long" else "buy"
+            pos_side = pos_info["side"] if self._hedge_mode else None
             try:
-                await self.connector.create_order(sym, close_side, pos_info["amount"])
+                await self.connector.create_order(sym, close_side, pos_info["amount"], pos_side=pos_side)
                 pnl = ((price - pos_info["entry"]) * pos_info["amount"]
                        if pos_info["side"] == "long"
                        else (pos_info["entry"] - price) * pos_info["amount"])
@@ -513,10 +524,10 @@ class TradingBot:
 
     async def _maybe_notify(self, signal: Signal, sig_dict: dict,
                              strategy_name: str, candles: list = None):
-        """BUY-only execution engine.
+        """Execution engine.
 
-        BUY  → open long (if no position open for this strategy).
-        SELL → close existing long from THIS strategy only; never opens a short.
+        Normal mode  — BUY → open long; SELL → close existing long only.
+        Hedge mode   — BUY → open long; SELL → open short (independent direction).
         Strategy isolation: a SELL from strategy A cannot close strategy B's position.
         """
         sym = signal.symbol
@@ -615,70 +626,97 @@ class TradingBot:
             await self._execute_signal(signal, slot_key)
             return
 
-        # ── Normal / AI Expert strategies: BUY-only ─────────────────────────
+        # ── Normal / AI Expert strategies ────────────────────────────────────
         if signal.type == SignalType.SELL:
-            if self._sig.is_locked_for_strategy(sym, strategy_name):
-                positions = self.risk.get_positions()
-                existing  = next(
-                    (p for p in positions if p["symbol"] == sym and p["strategy"] == strategy_name),
-                    None,
-                )
-                if existing and existing["side"] == "long":
-                    logger.info("[%s] SELL signal — exiting long on %s", strategy_name, sym)
-                    try:
-                        ticker     = await self.connector.fetch_ticker(sym)
-                        exit_price = ticker["last"]
-                        await self.connector.create_order(sym, "sell", existing["amount"])
-                        self._sig.record_outcome(
-                            symbol=sym, side="long",
-                            entry=existing["entry"], exit_price=exit_price,
-                            sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
-                            reason="sell_signal", strategy=strategy_name,
-                        )
-                        self._sig.unlock_strategy(sym, strategy_name)
-                        self.risk.close_position(sym, strategy=strategy_name)
-                        self._on_position_closed(
-                            sym, strategy_name, exit_price, "sell_signal",
-                            self._strategy_map.get(strategy_name),
-                        )
-                        if self.telegram:
-                            self.telegram.notify_trade_closed(
-                                sym, "sell_signal", exit_price,
-                                existing["entry"], existing.get("stop_loss"),
-                                existing.get("take_profit"), self._sig.summary(),
+            if self._hedge_mode:
+                # Hedge mode: SELL signal opens a SHORT position (independent of any LONG)
+                short_key = f"{strategy_name}:S"
+                if self._sig.is_locked_for_strategy(sym, short_key):
+                    logger.debug("%s [%s] already short — suppressing SELL", sym, short_key)
+                    return
+                can, reason = self.risk.can_open(sym, strategy=short_key)
+                if not can:
+                    logger.debug("Crypto %s short suppressed — %s", sym, reason)
+                    return
+                self._sig.lock_strategy(sym, short_key, signal.type.value)
+                self._sig.record_signal(sym, signal.type.value, signal.price,
+                                        signal.confidence, strategy=short_key)
+                if self.telegram:
+                    self.telegram.notify_signal(sig_dict)
+                await self._execute_signal(signal, short_key, direction="short")
+            else:
+                # Normal mode: SELL closes existing long only
+                if self._sig.is_locked_for_strategy(sym, strategy_name):
+                    positions = self.risk.get_positions()
+                    existing  = next(
+                        (p for p in positions if p["symbol"] == sym and p["strategy"] == strategy_name),
+                        None,
+                    )
+                    if existing and existing["side"] == "long":
+                        logger.info("[%s] SELL signal — exiting long on %s", strategy_name, sym)
+                        try:
+                            ticker     = await self.connector.fetch_ticker(sym)
+                            exit_price = ticker["last"]
+                            await self.connector.create_order(sym, "sell", existing["amount"])
+                            self._sig.record_outcome(
+                                symbol=sym, side="long",
+                                entry=existing["entry"], exit_price=exit_price,
+                                sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
+                                reason="sell_signal", strategy=strategy_name,
                             )
-                    except Exception as e:
-                        logger.error("Exit on SELL signal failed [%s]: %s", strategy_name, e)
+                            self._sig.unlock_strategy(sym, strategy_name)
+                            self.risk.close_position(sym, strategy=strategy_name)
+                            self._on_position_closed(
+                                sym, strategy_name, exit_price, "sell_signal",
+                                self._strategy_map.get(strategy_name),
+                            )
+                            if self.telegram:
+                                self.telegram.notify_trade_closed(
+                                    sym, "sell_signal", exit_price,
+                                    existing["entry"], existing.get("stop_loss"),
+                                    existing.get("take_profit"), self._sig.summary(),
+                                )
+                        except Exception as e:
+                            logger.error("Exit on SELL signal failed [%s]: %s", strategy_name, e)
             return
 
-        # BUY signal
-        if self._sig.is_locked_for_strategy(sym, strategy_name):
-            logger.debug("%s [%s] already long — suppressing BUY", sym, strategy_name)
+        # BUY signal → open LONG
+        long_key = f"{strategy_name}:L" if self._hedge_mode else strategy_name
+        if self._sig.is_locked_for_strategy(sym, long_key):
+            logger.debug("%s [%s] already long — suppressing BUY", sym, long_key)
             return
-        can, reason = self.risk.can_open(sym, strategy=strategy_name)
+        can, reason = self.risk.can_open(sym, strategy=long_key)
         if not can:
             logger.debug("Crypto %s suppressed — %s", sym, reason)
             return
-        self._sig.lock_strategy(sym, strategy_name, signal.type.value)
+        self._sig.lock_strategy(sym, long_key, signal.type.value)
         self._sig.record_signal(sym, signal.type.value, signal.price,
-                                signal.confidence, strategy=strategy_name)
+                                signal.confidence, strategy=long_key)
         if self.telegram:
             self.telegram.notify_signal(sig_dict)
-        await self._execute_signal(signal, strategy_name)
+        await self._execute_signal(signal, long_key, direction="long")
 
-    async def _execute_signal(self, signal: Signal, strategy_name: str):
-        """Open a LONG position. Only called for BUY signals."""
-        if signal.type != SignalType.BUY:
-            logger.warning("[%s] _execute_signal called with non-BUY — ignored", strategy_name)
-            self._sig.unlock_strategy(signal.symbol, strategy_name)
-            return
+    async def _execute_signal(self, signal: Signal, strategy_name: str,
+                              direction: str = "long"):
+        """Open a position. direction='long' for BUY, 'short' for SELL (hedge mode)."""
+        sym       = signal.symbol
+        order_side = "buy" if direction == "long" else "sell"
+        pos_side   = direction if self._hedge_mode else None
 
-        sym = signal.symbol
         can, reason = self.risk.can_open(sym, strategy=strategy_name)
         if not can:
-            logger.info("Skipping BUY for %s: %s", sym, reason)
+            logger.info("Skipping %s for %s: %s", direction.upper(), sym, reason)
             self._sig.unlock_strategy(sym, strategy_name)
             return
+
+        # Futures setup (leverage + hedge mode) — once per symbol per session
+        if self._hedge_mode and sym not in self._futures_setup_done:
+            if hasattr(self.connector, "setup_futures"):
+                try:
+                    await self.connector.setup_futures(sym)
+                except Exception as e:
+                    logger.warning("[Futures] setup_futures failed for %s: %s", sym, e)
+            self._futures_setup_done.add(sym)
 
         balances      = await self.connector.fetch_balance()
         quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
@@ -687,6 +725,12 @@ class TradingBot:
         meta          = signal.metadata or {}
         sl_p          = meta.get("stop_loss")
         tp_p          = meta.get("take_profit")
+
+        # Flip SL/TP for short positions
+        if direction == "short" and sl_p and tp_p:
+            if sl_p < price:  # AI gave LONG SL/TP; invert for short
+                sl_p = price + (price - sl_p)
+                tp_p = price - (tp_p - price)
 
         size_pct = _confidence_size_pct(meta)
         amount = self.risk.size_position(quote_balance, price, size_pct=size_pct)
@@ -703,24 +747,29 @@ class TradingBot:
             return
 
         # ── Portfolio engine pre-trade check ────────────────────────────────
-        effective_sl = sl_p or (price * (1 - self.risk.stop_loss_pct))
-        port_check   = self._portfolio.can_add_position(
-            symbol=sym, direction="long",
+        if direction == "long":
+            effective_sl = sl_p or (price * (1 - self.risk.stop_loss_pct))
+        else:
+            effective_sl = sl_p or (price * (1 + self.risk.stop_loss_pct))
+        port_check = self._portfolio.can_add_position(
+            symbol=sym, direction=direction,
             entry_price=price, stop_loss=effective_sl,
             amount=amount, portfolio_value=quote_balance,
         )
         if not port_check.can_add:
             logger.info(
-                "[%s] Portfolio gate blocked %s: %s (heat=%.1f%%)",
-                strategy_name, sym, port_check.reason,
+                "[%s] Portfolio gate blocked %s %s: %s (heat=%.1f%%)",
+                strategy_name, direction.upper(), sym, port_check.reason,
                 port_check.portfolio_heat * 100,
             )
             self._sig.unlock_strategy(sym, strategy_name)
             return
 
         try:
-            order = await self.connector.create_order(sym, "buy", amount)
-            self.risk.open_position(sym, "long", price, amount, strategy=strategy_name,
+            order = await self.connector.create_order(
+                sym, order_side, amount, pos_side=pos_side
+            )
+            self.risk.open_position(sym, direction, price, amount, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
 
             # Track open time for learning engine duration calculation
@@ -729,28 +778,29 @@ class TradingBot:
 
             # Register position in portfolio engine
             self._portfolio.add_position(
-                symbol=sym, direction="long",
+                symbol=sym, direction=direction,
                 entry_price=price, current_price=price,
                 amount=amount, stop_loss=effective_sl,
             )
 
             trade = TradeRecord(
                 timestamp=int(time.time() * 1000),
-                symbol=sym, side="buy",
+                symbol=sym, side=order_side,
                 price=order.price, amount=amount,
                 pnl=0.0, strategy=strategy_name, reason=signal.reason,
                 paper=self.connector.paper,
             )
             self._record_trade(trade)
             logger.info(
-                "[%s] BUY %s @ %.4f  SL=%.4f  TP=%.4f (paper=%s)",
-                strategy_name, sym, price, sl_p or 0, tp_p or 0, self.connector.paper,
+                "[%s] %s %s @ %.4f  SL=%.4f  TP=%.4f (paper=%s)",
+                strategy_name, direction.upper(), sym, price,
+                sl_p or 0, tp_p or 0, self.connector.paper,
             )
             if self.telegram:
-                self.telegram.notify_order(sym, "buy", amount, order.price,
+                self.telegram.notify_order(sym, order_side, amount, order.price,
                                            strategy_name, self.connector.paper)
         except Exception as e:
-            logger.error("Order failed for %s: %s", sym, e)
+            logger.error("Order failed for %s %s: %s", direction, sym, e)
             self._sig.unlock_strategy(sym, strategy_name)
 
     # ------------------------------------------------------------------

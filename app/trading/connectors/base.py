@@ -55,8 +55,10 @@ class BaseConnector(ABC):
 
     @abstractmethod
     async def create_order(self, symbol: str, side: str, amount: float,
-                           order_type: str = "market", price: Optional[float] = None) -> OrderResult:
-        """Place an order (or simulate if paper=True)."""
+                           order_type: str = "market", price: Optional[float] = None,
+                           pos_side: Optional[str] = None) -> OrderResult:
+        """Place an order (or simulate if paper=True).
+        pos_side: 'long' | 'short' — required for OKX hedge mode; ignored otherwise."""
 
     @abstractmethod
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
