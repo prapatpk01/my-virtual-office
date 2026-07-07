@@ -104,9 +104,11 @@ class TrendContV2Strategy(BaseStrategy):
         sl_mult=1.2,
         sl_min_pct=0.012,
         sl_max_pct=0.035,
-        tp1_r=0.5,
-        tp2_r=1.5,               # ladder will extend to 3R via health BULL
-        sl_ladder_enabled=True,  # use SL-ratchet ladder exit
+        tp1_r=0.5,               # TP1 at 0.5R → close 50%, move SL → breakeven
+        tp2_r=1.2,               # TP2 at 1.2R → close the remaining 50%
+        sl_ladder_enabled=False, # classic 2-TP staged exit (not SL-ratchet ladder)
+        tp1_be_buffer_r=0.0,     # SL → exact breakeven after TP1 (no profit buffer)
+        tp2_extend_enabled=False,# health BULL must NOT extend TP2 beyond 1.2R
         # ── HTF bias ──────────────────────────────────────────────────────────
         htf_bias_min=20.0,       # minimum MTF bias score to consider direction valid
         # ── Cooldown ──────────────────────────────────────────────────────────

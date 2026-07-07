@@ -427,6 +427,17 @@ class TradingBot:
 
     # ── Order execution ───────────────────────────────────────────────────
 
+    def _strategy_for(self, sym: str, slot: str):
+        """Resolve the strategy object for a slot key ('Name' or 'Name_short').
+
+        Short positions are keyed as f"{strategy.name}_short" — a naive
+        s.name == slot comparison silently misses them and per-strategy
+        params (tp1_be_buffer_r, tp2_extend_enabled) fall back to defaults.
+        """
+        base = slot[:-6] if slot.endswith("_short") else slot
+        return next((s for s in self.strategies
+                     if s.symbol == sym and s.name == base), None)
+
     async def _open_position(self, signal: Signal, slot: str, side: str, pattern_tier: int = 0):
         """Open a LONG or SHORT futures position."""
         sym = signal.symbol
@@ -511,12 +522,18 @@ class TradingBot:
             # exchange only auto-closes if the bot is offline AND price runs all
             # the way to 3.0R — so BULL TP2-extensions take real effect on live
             # instead of being pre-empted by an exchange TP at 2.5R.
-            if one_r > 0:
+            # When the strategy pins TP2 (tp2_extend_enabled=False) there are no
+            # extensions to protect — anchor the backstop at TP2 itself so the
+            # exchange closes the runner at the right level even if the bot dies.
+            _strat_obj  = self._strategy_for(sym, slot)
+            _tp2_extend = bool((getattr(_strat_obj, "_p", None) or {})
+                               .get("tp2_extend_enabled", True))
+            if one_r > 0 and _tp2_extend:
                 max_r = PositionHealthMonitor.TP_LADDER[-1]
                 exchange_tp = (round(price + max_r * one_r, 8) if side == "long"
                                else round(price - max_r * one_r, 8))
             else:
-                exchange_tp = tp_p  # no 1R info → keep strategy TP as the backstop
+                exchange_tp = tp_p  # pinned TP2 (or no 1R info) → strategy TP is the backstop
 
             order = await self.connector.create_order(
                 sym, order_side, amount,
@@ -669,8 +686,7 @@ class TradingBot:
                 pos.tp1_hit    = True
                 # Runner SL: entry + 0.25R buffer locks minimum profit instead of exact BE.
                 _one_r   = pos.one_r or abs(pos.entry_price - (pos.stop_loss or pos.entry_price))
-                _strat   = next((s for s in self.strategies
-                                 if s.symbol == sym and s.name == strategy_name), None)
+                _strat   = self._strategy_for(sym, strategy_name)
                 _be_buf  = float((getattr(_strat, "_p", None) or {}).get("tp1_be_buffer_r", 0.25))
                 be_price = (pos.entry_price + _be_buf * _one_r if pos.side == "long"
                             else pos.entry_price - _be_buf * _one_r)
@@ -928,6 +944,10 @@ class TradingBot:
                         )
             else:
                 # After TP1: runner is at BE — extend TP2 up the ladder (max 3.0R)
+                # unless the strategy pins TP2 (tp2_extend_enabled=False).
+                _strat = self._strategy_for(sym, strategy)
+                if not bool((getattr(_strat, "_p", None) or {}).get("tp2_extend_enabled", True)):
+                    return
                 new_tp = monitor.next_tp_level(pos.entry_price, one_r,
                                                pos.tp2 or pos.take_profit or 0.0, pos.side)
                 if new_tp and new_tp != pos.tp2:
