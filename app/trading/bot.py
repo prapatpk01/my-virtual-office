@@ -363,6 +363,10 @@ class TradingBot:
                            if pos_info["side"] == "long"
                            else (pos_info["entry"] - price) * close_amt)
                     self.risk.reduce_position(sym, close_amt, strategy=strategy_name)
+                    # Move SL to break-even when TP1 fires (new_sl is entry price)
+                    if update.new_sl is not None:
+                        self.risk.update_stop_loss(sym, update.new_sl, strategy=strategy_name)
+                        logger.info("[%s] SL moved to BE=%.4f after TP1", strategy_name, update.new_sl)
                     self._record_trade(TradeRecord(
                         timestamp=int(time.time() * 1000),
                         symbol=sym, side=close_side,

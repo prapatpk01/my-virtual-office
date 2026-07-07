@@ -75,13 +75,13 @@ class AIExpertStrategy(BaseStrategy):
         self._expert_engine    = ExpertAnalysisEngine()
         self._decision_engine  = DecisionEngine(min_score_threshold=min_confidence)
         self._timing_engine    = EntryTimingEngine(
-            min_rr=float(os.getenv("MIN_RR", "2.0")),
+            min_rr=float(os.getenv("MIN_RR", "1.2")),
             require_all_checks=require_all_checks,
         )
         self._exit_engine      = ExitEngine(soft_threshold=70.0, hard_threshold=85.0)
         self._position_manager = PositionManager(
-            be_atr_mult=1.0, trail_atr_mult=2.0,
-            partial_tp_1_rr=1.0, partial_tp_2_rr=2.0,
+            partial_tp_1_rr=float(os.getenv("TP1_RR", "0.5")),
+            partial_tp_2_rr=float(os.getenv("TP2_RR", "1.2")),
         )
         self._learning_engine  = AdaptiveLearningEngine(journal_path=journal_path)
         self._feature_store    = FeatureStore(ttl_seconds=60)
