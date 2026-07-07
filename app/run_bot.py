@@ -55,20 +55,25 @@ def _env_bool(key: str, default: bool) -> bool:
 
 def build_config() -> dict:
     return {
-        "exchange":        os.environ.get("EXCHANGE", "binance"),
-        "api_key":         os.environ.get("EXCHANGE_API_KEY", ""),
-        "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
-        "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),
-        "paper":           _env_bool("PAPER_TRADING", True),
-        "oanda_api_key":   os.environ.get("OANDA_API_KEY", ""),
-        "oanda_account_id":os.environ.get("OANDA_ACCOUNT_ID", ""),
-        "oanda_env":       os.environ.get("OANDA_ENV", "practice"),
-        "symbols":      _env_list("SYMBOLS", "BTC/USDT"),
-        "candle_tf":    os.environ.get("CANDLE_TF", "15m"),
-        "candle_limit": int(os.environ.get("CANDLE_LIMIT", "300")),
+        # ── Exchange ──────────────────────────────────────────────────────
+        "exchange":         os.environ.get("EXCHANGE",          "okx"),
+        "api_key":          os.environ.get("EXCHANGE_API_KEY",  ""),
+        "api_secret":       os.environ.get("EXCHANGE_API_SECRET", ""),
+        "api_passphrase":   os.environ.get("EXCHANGE_PASSPHRASE", ""),
+        "paper":            _env_bool("PAPER_TRADING", True),
+        # OANDA (forex only — leave blank for crypto)
+        "oanda_api_key":    os.environ.get("OANDA_API_KEY", ""),
+        "oanda_account_id": os.environ.get("OANDA_ACCOUNT_ID", ""),
+        "oanda_env":        os.environ.get("OANDA_ENV", "practice"),
+
+        # ── Symbols & candles ─────────────────────────────────────────────
+        "symbols":      _env_list("SYMBOLS", "BTC/USDT,ETH/USDT"),
+        "candle_tf":    os.environ.get("CANDLE_TF",         "15m"),
+        "candle_limit": int(os.environ.get("CANDLE_LIMIT",  "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
-        # Strategy selection: ai_expert | mcdx | wt_adx
-        "strategy_mode": os.environ.get("STRATEGY", "ai_expert"),
+
+        # ── Strategy ──────────────────────────────────────────────────────
+        "strategy_mode":            os.environ.get("STRATEGY", "ai_expert"),
         "strategies": {
             "mcdx":      _env_bool("STRATEGY_MCDX",      False),
             "wt_adx":    _env_bool("STRATEGY_WT_ADX",    False),
@@ -76,16 +81,29 @@ def build_config() -> dict:
         },
         "ai_expert_min_confidence": float(os.environ.get("AI_EXPERT_MIN_CONFIDENCE", "70")),
         "ai_expert_strict":         _env_bool("AI_EXPERT_STRICT", False),
-        "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.02")),
-        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),
-        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.06")),
-        "max_positions":   int(os.environ.get("MAX_POSITIONS",     "3")),
-        "max_drawdown":    float(os.environ.get("MAX_DRAWDOWN_PCT", "0.30")),
-        "telegram_token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-        "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID",   ""),
+
+        # ── Position sizing (confidence-based) ───────────────────────────
+        # Actual sizes come from bot._confidence_size_pct() using
+        # SIZE_WEAK / SIZE_GOOD / SIZE_HIGH env vars (defaults 8/10/12%).
+        # risk_per_trade is only the RiskManager fallback (non-AI paths).
+        "risk_per_trade":  float(os.environ.get("RISK_PER_TRADE",  "0.08")),
+
+        # ── Stop-loss / take-profit (fallback when AI SL/TP absent) ──────
+        "stop_loss_pct":   float(os.environ.get("STOP_LOSS_PCT",   "0.03")),   # 3 %
+        "take_profit_pct": float(os.environ.get("TAKE_PROFIT_PCT", "0.036")),  # 1.2R
+
+        # ── Risk limits ───────────────────────────────────────────────────
+        "max_positions": int(os.environ.get("MAX_POSITIONS",    "3")),
+        "max_drawdown":  float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15")),    # 15 %
+
+        # ── Telegram ──────────────────────────────────────────────────────
+        "telegram_token":    os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+        "telegram_chat_id":  os.environ.get("TELEGRAM_CHAT_ID",   ""),
         "tg_min_confidence": float(os.environ.get("TG_MIN_CONFIDENCE", "0.7")),
-        "forex_symbols": _env_list("FOREX_SYMBOLS", "XAUUSD"),
-        "forex_enabled": _env_bool("FOREX_SIGNALS", True),
+
+        # ── Forex signals (disabled by default for pure-crypto setup) ─────
+        "forex_symbols":  _env_list("FOREX_SYMBOLS", "XAUUSD"),
+        "forex_enabled":  _env_bool("FOREX_SIGNALS", False),
         "forex_interval": int(os.environ.get("FOREX_INTERVAL_SECONDS", "60")),
     }
 
