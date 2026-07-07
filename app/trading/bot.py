@@ -856,22 +856,31 @@ class TradingBot:
             pos.health_label  = result.label
             pos.health_checks += 1
 
-            # STRONG_WEAK (score < 25): sharp reversal / V-shape — close NOW, no wait.
-            # WEAK (25-49): soft fade — must persist N consecutive cycles before close.
+            # 5-level health (v2):
+            #   STRONG_WEAK (<25): sharp reversal — close NOW, no confirm wait
+            #   WEAK (25-44):      soft fade — N consecutive cycles before close
+            #   CAUTION (45-59):   warning — hold, no action
+            #   NEUTRAL (60-79):   good — hold
+            #   BULL (80+):        excellent — extend TP
             weak_confirm = self._health_weak_confirm
             if result.label == "STRONG_WEAK":
                 pos.health_weak_count = 0
                 logger.info("[MONITOR] %s %s STRONG_WEAK (score=%.0f) — closing immediately",
                             strategy, sym, result.score)
+            elif result.label == "CAUTION":
+                # Warning level: hold but reset weak counter (normal pullback territory)
+                pos.health_weak_count = 0
+                logger.info("[MONITOR] %s %s CAUTION (score=%.0f) — holding, watching",
+                            strategy, sym, result.score)
+                continue
             elif result.label == "WEAK":
                 pos.health_weak_count += 1
                 # TP-ladder positions: treat any ladder stage > 0 as equivalent to tp1_hit
                 # so the pattern-upgrade immediate-exit and the N-confirm wait both use
                 # the ladder stage rather than the (never-set) partial-close tp1_hit flag.
                 _tp1_equivalent = pos.tp1_hit or (pos.sl_ladder_enabled and pos.ladder_stage > 0)
-                # Pattern-upgraded TP1: don't wait N confirms — exit now (momentum fading).
-                # Skipped when sl_ladder_enabled and no ladder level hit yet — in that mode
-                # the ladder is the exit manager; health_weak must not override it pre-T1.
+                # Pattern-upgraded TP1: skipped when sl_ladder_enabled — the ladder
+                # manages exits via SL ratchets; health_weak must not override it pre-T1.
                 if pos.tp1_pattern_upgraded and not _tp1_equivalent and not pos.sl_ladder_enabled:
                     logger.info(
                         "[PAT-TP1] %s %s WEAK after TP1 upgrade (%.1fR target) — exit immediately",
@@ -881,7 +890,7 @@ class TradingBot:
                                 strategy, sym, result.score, pos.health_weak_count, weak_confirm)
                     continue
             else:
-                pos.health_weak_count = 0  # reset on any non-WEAK cycle
+                pos.health_weak_count = 0  # reset on any non-WEAK/STRONG_WEAK cycle
 
             await self._health_action(pos, pos_info, strategy, result, monitor)
 

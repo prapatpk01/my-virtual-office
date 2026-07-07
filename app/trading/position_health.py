@@ -326,22 +326,27 @@ def _mtf_bias(s5: pd.Series, s1h: pd.Series, s4h: pd.Series) -> float:
 
 def _classify(score: float) -> str:
     """
-    4-level health:
-      BULL        81-100  → extend TP (momentum strong)
-      NEUTRAL     40-80   → hold
-      WEAK        20-39   → close after N-cycle confirm (fade, may recover)
-      STRONG_WEAK 0-19    → close NOW, no confirm (sharp reversal / V-shape)
-    Wide NEUTRAL band (40-80) prevents premature exits on normal pullbacks;
-    only genuine reversals scoring ≤39 trigger the confirm/close sequence.
+    5-level health (v2):
+      BULL        80-100  → EXCELLENT — extend TP (momentum strong)
+      NEUTRAL     60-79   → GOOD — hold, trend intact
+      CAUTION     45-59   → WARNING — hold but watch closely
+      WEAK        25-44   → REDUCE — soft fade; close after N-cycle confirm
+      STRONG_WEAK 0-24    → EXIT — sharp reversal; close NOW, no confirm
+
+    Exit threshold lowered from 40 → 25 to prevent premature closes on
+    normal post-entry pullbacks. Genuine reversals score near 0-20 from
+    multi-indicator collapse; ordinary pullbacks score 30-50.
     """
-    if score >= 81: return "BULL"
-    if score >= 40: return "NEUTRAL"
-    if score >= 20: return "WEAK"
+    if score >= 80: return "BULL"
+    if score >= 60: return "NEUTRAL"
+    if score >= 45: return "CAUTION"
+    if score >= 25: return "WEAK"
     return "STRONG_WEAK"
 
 
 def _action(label: str, score: float) -> str:
     if label == "BULL":        return "EXTEND_TP"
-    if label == "WEAK":        return "CLOSE"   # bot delays via weak-confirm
-    if label == "STRONG_WEAK": return "CLOSE"   # bot closes immediately
+    if label == "CAUTION":     return "HOLD"       # watch but don't close
+    if label == "WEAK":        return "CLOSE"      # bot delays via weak-confirm
+    if label == "STRONG_WEAK": return "CLOSE"      # bot closes immediately
     return "HOLD"

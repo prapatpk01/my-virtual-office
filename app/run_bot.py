@@ -179,51 +179,31 @@ def build_config() -> dict:
 # ── Strategy builder ────────────────────────────────────────────────────────
 
 def build_strategies(symbols: list[str], cfg: dict) -> list:
-    from trading.strategies.trend_cont_improved_strategy import TrendContImprovedStrategy
+    from trading.strategies.trend_cont_v2_strategy import TrendContV2Strategy
 
     strategies = []
     for sym in symbols:
-        strategies.append(TrendContImprovedStrategy(sym, params={
-            "name":                   "TrendContImproved",
+        strategies.append(TrendContV2Strategy(sym, params={
+            "name":                   "TrendContV2",
             "tf":                     "15m",
             "limit":                  500,
-            "bias_gate":              cfg["tci_bias_gate"],
-            "adx_min":                cfg["tci_adx_min"],
+            # Risk
             "sl_mult":                cfg["tci_sl_mult"],
             "sl_min_pct":             cfg["tci_sl_min_pct"],
             "sl_max_pct":             cfg["tci_sl_max_pct"],
             "tp1_r":                  cfg["tci_tp1_r"],
-            "tp1_fraction":           cfg["tci_tp1_fraction"],
-            "tp2_r":                  cfg["tci_tp2_r"],
-            "min_score":              cfg["tci_min_score"],
-            "vol_mult":               cfg["tci_vol_mult"],
-            # Strict: 15m swing pullback
-            "swing_lookback":         cfg["tci_swing_lookback"],
-            "swing_pct":              cfg["tci_swing_pct"],
-            # Fast mode v2
-            "fast_mode":              cfg["tci_fast_mode"],
-            "bias_gate_fast":         cfg["tci_fast_bias_gate"],
-            "adx_min_fast":           cfg["tci_fast_adx_min"],
-            "adx_max_fast":           cfg["tci_fast_adx_max"],
-            "tp2_r_fast":             cfg["tci_fast_tp2_r"],
-            "pullback_pct_fast":      cfg["tci_fast_pullback_pct"],
-            "adx_rising_fast":        cfg["tci_adx_rising"],
-            "cooldown_bars":          cfg["tci_cooldown_bars"],
-            # Crash-guard
+            "tp2_r":                  cfg["tci_fast_tp2_r"],
+            "sl_ladder_enabled":      True,
+            # Health / crash guard
             "health_guard_enabled":   cfg["tci_health_guard"],
-            "health_underwater_frac": cfg["tci_health_uw_frac"],
-            "health_bias_flip":       cfg["tci_health_bias_flip"],
             "reversal_spike_enabled": cfg["reversal_spike_enabled"],
             "reversal_spike_atr":     cfg["reversal_spike_atr"],
             "reversal_spike_bars":    cfg["reversal_spike_bars"],
+            "reversal_spike_uw_frac": 0.7,
             "trend_fade_enabled":     cfg["trend_fade_enabled"],
             "trend_fade_uw_frac":     cfg["trend_fade_uw_frac"],
-            "sj_scoring":             cfg["tci_sj_scoring"],
-            "sj_roc9":                cfg["tci_sj_roc9"],
-            "chop_filter_enabled":    cfg["tci_chop_filter"],
-            "macd_peak_filter":       cfg["tci_macd_peak_filter"],
-            "pullback_live_15m":      cfg["tci_pullback_live_15m"],
-            "simple_fast_entry":      False,
+            # Cooldown
+            "cooldown_bars":          cfg["tci_cooldown_bars"],
         }))
 
     if not strategies:
