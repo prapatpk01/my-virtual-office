@@ -312,6 +312,24 @@ class TrendContV2Strategy(BaseStrategy):
         atr_arr = self.atr(candles, 14)
         atr_val = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else p * 0.01
 
+        # ── BREAKOUT: ATR expansion + BOS ─────────────────────────────────────
+        # Checked BEFORE CHOP: a genuine volatility breakout is the exact
+        # moment a chop ENDS. ADX is a lagging average, so at the breakout bar
+        # it is often still 10-15 — the old order (CHOP first) classified the
+        # move as chop and slept through the first 7-9 bars of the new trend.
+        atr_ma20 = float(np.nanmean(atr_arr[-20:])) if not np.all(np.isnan(atr_arr[-20:])) else atr_val
+        atr_expanding = atr_val > atr_ma20 * 1.3
+        # Price broke recent 10-bar high/low
+        recent_high = max(highs[-11:-1]) if n > 11 else p
+        recent_low  = min(lows[-11:-1])  if n > 11 else p
+        bos_long  = p > recent_high
+        bos_short = p < recent_low
+        if atr_expanding and (bos_long or bos_short):
+            bos_dir = "long" if bos_long else "short"
+            confidence = min(100.0, 60.0 + adx_val * 0.8)
+            momentum   = (pdi_val - mdi_val) if bos_dir == "long" else (mdi_val - pdi_val)
+            return MarketState("BREAKOUT", confidence, bos_dir, momentum, adx_val)
+
         # ── CHOP: ADX very low + price oscillating around EMA20 ───────────────
         if adx_val < self._p["chop_adx_max"]:
             # Check if price crossed EMA20 multiple times in last 10 bars
@@ -341,20 +359,6 @@ class TrendContV2Strategy(BaseStrategy):
             direction = ema_dir
         else:
             direction = di_direction
-
-        # ── BREAKOUT: ATR expansion + BOS ─────────────────────────────────────
-        atr_ma20 = float(np.nanmean(atr_arr[-20:])) if not np.all(np.isnan(atr_arr[-20:])) else atr_val
-        atr_expanding = atr_val > atr_ma20 * 1.3
-        # Price broke recent 10-bar high/low
-        recent_high = max(highs[-11:-1]) if n > 11 else p
-        recent_low  = min(lows[-11:-1])  if n > 11 else p
-        bos_long  = p > recent_high
-        bos_short = p < recent_low
-        if atr_expanding and (bos_long or bos_short):
-            bos_dir = "long" if bos_long else "short"
-            confidence = min(100.0, 60.0 + adx_val * 0.8)
-            momentum   = (pdi_val - mdi_val) if bos_dir == "long" else (mdi_val - pdi_val)
-            return MarketState("BREAKOUT", confidence, bos_dir, momentum, adx_val)
 
         # ── REVERSAL signals ───────────────────────────────────────────────────
         # RSI divergence check: price at extreme + RSI turning
@@ -401,6 +405,19 @@ class TrendContV2Strategy(BaseStrategy):
         # Dynamic threshold
         threshold = self._dynamic_threshold(state.adx)
 
+        # BREAKOUT override: at the birth of a move ADX is still low (10-19),
+        # which would demand 88-95 — the bot would only wake up 7-9 bars later
+        # at the bottom. If Layer 1 already confirmed an ATR-expansion breakout
+        # in our direction, cap the bar at 72 regardless of ADX.
+        if state.name == "BREAKOUT" and state.direction == direction:
+            threshold = min(threshold, 72.0)
+            # A breakout bar can never also be a pullback-to-EMA20 — the two
+            # are mutually exclusive by definition, so the 20-pt pullback
+            # bucket would stay ~0 and the total could still never reach the
+            # bar. Credit the bucket from breakout quality instead.
+            pb = max(pb, min(15.0, 8.0 + state.confidence * 0.07))
+            total = t + pb + mo + vo + st + ac
+
         # READY check: core conditions met even if total isn't at threshold yet
         ready = (t >= 18 and mo >= 12 and st >= 5)
 
@@ -435,8 +452,19 @@ class TrendContV2Strategy(BaseStrategy):
         pdi = float(plus_di[-1]) if not np.isnan(plus_di[-1]) else 0.0
         mdi = float(minus_di[-1]) if not np.isnan(minus_di[-1]) else 0.0
 
+        # Price-action compensation margin: a decisive break beyond BOTH EMAs
+        # counts almost as much as the (slow, official) EMA20/EMA50 cross.
+        # At trend birth the EMAs haven't crossed yet — without this the trend
+        # bucket scores ~0 and the total can never reach threshold until the
+        # move is 7-9 bars old.
+        atr_arr_t = self.atr(candles, 14)
+        atr_t = float(atr_arr_t[-1]) if not np.isnan(atr_arr_t[-1]) else p * 0.01
+        pa_margin = atr_t * 0.3
+
         if is_long:
-            if e20v > e50v:     score += 12.0  # bullish structure
+            if e20v > e50v:     score += 12.0  # bullish structure (official cross)
+            elif p > max(e20v, e50v) + pa_margin:
+                score += 10.0                  # PA compensation: decisive break above both EMAs
             elif p > e50v:      score += 6.0   # price above slow EMA
             elif p > e20v:      score += 3.0   # price above fast EMA only
             # DI alignment bonus (max 4) — not a gate, just extra confidence
@@ -444,7 +472,9 @@ class TrendContV2Strategy(BaseStrategy):
                 di_margin = (pdi - mdi) / (pdi + mdi + 1e-9)
                 score += min(4.0, di_margin * 10)
         else:
-            if e20v < e50v:     score += 12.0  # bearish structure
+            if e20v < e50v:     score += 12.0  # bearish structure (official cross)
+            elif p < min(e20v, e50v) - pa_margin:
+                score += 10.0                  # PA compensation: decisive break below both EMAs
             elif p < e50v:      score += 6.0   # price below slow EMA
             elif p < e20v:      score += 3.0   # price below fast EMA only
             # DI alignment bonus (max 4)
@@ -454,25 +484,37 @@ class TrendContV2Strategy(BaseStrategy):
 
         # EMA50 Slope (max 8) — use EMA50 slope which doesn't flip on pullbacks
         # 5-bar slope of EMA50: stable, tells us the underlying trend direction
+        slope_pts = 0.0
         if len(e50) >= 6:
             slope_pct = (float(e50[-1]) - float(e50[-6])) / (float(e50[-6]) + 1e-9) * 100
             if is_long:
-                if slope_pct > 0.2:   score += 8.0
-                elif slope_pct > 0.05: score += 5.0
-                elif slope_pct > 0.0: score += 2.0
+                if slope_pct > 0.2:   slope_pts = 8.0
+                elif slope_pct > 0.05: slope_pts = 5.0
+                elif slope_pct > 0.0: slope_pts = 2.0
             else:
-                if slope_pct < -0.2:   score += 8.0
-                elif slope_pct < -0.05: score += 5.0
-                elif slope_pct < 0.0:  score += 2.0
+                if slope_pct < -0.2:   slope_pts = 8.0
+                elif slope_pct < -0.05: slope_pts = 5.0
+                elif slope_pct < 0.0:  slope_pts = 2.0
         elif len(e20) >= 4:
             # Fallback: EMA20 slope
             slope_pct = (float(e20[-1]) - float(e20[-4])) / (float(e20[-4]) + 1e-9) * 100
             if is_long:
-                if slope_pct > 0.15: score += 6.0
-                elif slope_pct > 0:  score += 2.0
+                if slope_pct > 0.15: slope_pts = 6.0
+                elif slope_pct > 0:  slope_pts = 2.0
             else:
-                if slope_pct < -0.15: score += 6.0
-                elif slope_pct < 0:   score += 2.0
+                if slope_pct < -0.15: slope_pts = 6.0
+                elif slope_pct < 0:   slope_pts = 2.0
+
+        # Early-turn compensation: at trend birth EMA50 slope still points the
+        # OLD way (it just finished the prior trend). If EMA20 has already
+        # turned hard in our direction, grant partial slope credit.
+        if slope_pts < 4.0 and len(e20) >= 4:
+            e20_slope = (float(e20[-1]) - float(e20[-4])) / (float(e20[-4]) + 1e-9) * 100
+            if is_long and e20_slope > 0.15:
+                slope_pts = max(slope_pts, 4.0)
+            elif not is_long and e20_slope < -0.15:
+                slope_pts = max(slope_pts, 4.0)
+        score += slope_pts
 
         # HTF Bias (max 10) — 1H + 4H bias, most reliable at pullback entry
         if mtf_candles:
