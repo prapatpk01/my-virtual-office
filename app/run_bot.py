@@ -85,9 +85,9 @@ def _fmt_px(v) -> str:
 
 
 def _format_open_msg(order_type: str, sym: str, trade_info: dict) -> str:
-    """OPEN notification: entry / size / SL / full T1-T4 ladder (T4 = the TP
-    actually attached on the exchange). Falls back to the old TP1/TP2 line if
-    the ladder isn't in the payload."""
+    """OPEN notification: entry / size / SL / full T1-T2 target structure
+    (last level = the TP actually attached on the exchange). Falls back to
+    the old TP1/TP2 line if the ladder isn't in the payload."""
     entry    = trade_info.get("entry")
     size     = float(trade_info.get("size") or 0)
     notional = size * float(entry or 0)
@@ -478,9 +478,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         )
 
     def _send_target_alerts(sym: str, bot):
-        """Pop and forward any queued target-hit alerts (T1..T4) to Telegram,
-        in the exact format requested: symbol / "TargetN Hit" / price / SL
-        move (or "Take Profit" + close for the final level)."""
+        """Pop and forward any queued target-hit alerts (T1/T2) to Telegram,
+        in the exact format requested: symbol / "TargetN Hit" / price /
+        partial-close % + SL move to breakeven (or "Take Profit" + close for
+        the final level)."""
         for alert in bot.pop_target_alerts():
             if alert["final"]:
                 msg = (
@@ -494,10 +495,13 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 # moves the number UP, tighter-for-SHORT moves it DOWN — a
                 # hardcoded "↓" would show the wrong direction for LONG trades.
                 arrow = "↑" if alert["new_sl"] > alert["old_sl"] else "↓"
+                close_pct = alert.get("close_pct") or 0.0
+                close_line = f"Closed {close_pct:.0%} of position\n\n" if close_pct > 0 else ""
                 msg = (
                     f"✅ {sym}\n"
                     f"Target {alert['label'][1:]} Hit\n\n"
                     f"Price : {alert['price']:.4f}\n\n"
+                    f"{close_line}"
                     f"SL moved\n"
                     f"{alert['old_sl']:.4f}\n"
                     f"{arrow}\n"
@@ -602,7 +606,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             status["market_state"], status["regime_score"],
                         )
 
-                        # [TARGET LADDER] forward T1..T4 hit alerts to Telegram
+                        # [TARGET LADDER] forward T1/T2 hit alerts to Telegram
                         _send_target_alerts(sym, bot)
 
                         # [LESSON] forward loss-cluster post-mortem to Telegram

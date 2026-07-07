@@ -1028,63 +1028,43 @@ class TradingBot:
     _LOCATION_STATES: frozenset = frozenset({"STRONG_TREND", "BREAKOUT"})
 
     # TP geometry in R-multiples — TP1_R/TP2_R remain the env-tunable
-    # endpoints (T1 and the final exchange-attached target). No position
-    # splitting anywhere anymore: every state uses the SAME 4-level SL-ratchet
-    # ladder (user-designed) — each level tightens the stop, only the final
-    # level closes the position (matches the exchange-attached TP2, unchanged).
+    # endpoints. Unified 2-target structure (user-designed): T1 takes a
+    # partial (self.tp1_close_pct, constructor-configurable — see __init__)
+    # and moves the stop to breakeven, T2 closes what's left (matches the
+    # exchange-attached TP2, unchanged).
     TP1_R: float = 0.5
     TP2_R: float = 1.2
 
     def _target_ladder(self) -> List[tuple]:
-        """(trigger_R, new_SL_R) pairs. new_SL_R=None on the final entry means
-        "close the position here" rather than "move the stop"."""
+        """
+        (trigger_R, close_pct, new_SL_R) triples, walked in order by
+        _check_targets. close_pct is the fraction of the CURRENT remaining
+        size closed at that level (1.0 on the final entry — always closes
+        everything left). new_SL_R=None means "don't move the SL here" (the
+        final level has nothing left to protect).
+        T1: TP1_R  -> close self.tp1_close_pct (default 50%), SL -> breakeven (0R).
+        T2: TP2_R  -> close 100% of what's left (exchange-attached TP2).
+        """
         tp1_r, tp2_r = self.TP1_R, self.TP2_R
-        # [SAFETY] TP1_R/TP2_R are env-tunable; T2 (0.7R) and T3 (1.0R) are
-        # fixed. If a tuned endpoint crosses into fixed territory (TP1_R>=0.7
-        # or TP2_R<=1.0) the ladder's strictly-sequential trigger order breaks
-        # — worse, the exchange-attached TP2 order (okx_adapter, fires at
-        # TP2_R independent of local polling) could close the real position
-        # before the bot's local T3 level is ever reached, leaving the bot
-        # thinking the position is still open. Clamp both endpoints to stay
-        # strictly inside their fixed neighbors.
-        if tp1_r >= 0.7:
-            clamped = 0.6
+        # [SAFETY] TP2_R must stay strictly above TP1_R — otherwise the
+        # ladder's sequential trigger order breaks, and the exchange
+        # -attached TP2 order (fires at TP2_R independent of local polling)
+        # could close the real position before the bot's local T1 partial
+        # is ever reached, leaving the bot thinking the position is still
+        # fully open (and still holding a stale breakeven-move pending).
+        if tp2_r <= tp1_r:
+            clamped = round(tp1_r * 1.5, 4)
             self._log_event(
-                f"[LADDER] TP1_R {tp1_r}R >= T2's fixed 0.7R — clamped to "
-                f"{clamped}R (check ADAPTIVE_TP1_R)", level="warning",
-            )
-            tp1_r = clamped
-        if tp2_r <= 1.0:
-            clamped = 1.1
-            self._log_event(
-                f"[LADDER] TP2_R {tp2_r}R <= T3's fixed 1.0R — clamped to "
-                f"{clamped}R (check ADAPTIVE_TP2_R)", level="warning",
+                f"[LADDER] TP2_R {tp2_r}R <= TP1_R {tp1_r}R — clamped to "
+                f"{clamped}R (check ADAPTIVE_TP1_R/ADAPTIVE_TP2_R)",
+                level="warning",
             )
             tp2_r = clamped
-
-        raw = [
-            (tp1_r, 0.3),   # T1: +0.5R  -> SL to +0.3R
-            (0.7,   0.5),   # T2: +0.7R  -> SL to +0.5R
-            (1.0,   0.7),   # T3: +1.0R  -> SL to +0.7R
-            (tp2_r, None),  # T4: +1.2R  -> full close (exchange TP2)
+        close_pct = float(np.clip(self.tp1_close_pct, 0.0, 0.99))
+        return [
+            (tp1_r, close_pct, 0.0),   # T1: partial close, SL -> breakeven
+            (tp2_r, 1.0,       None),  # T2: full close of what's left
         ]
-        # [SAFETY] TP1_R/TP2_R are env-tunable (ADAPTIVE_TP1_R/TP2_R). If a
-        # tuned trigger R ends up AT OR BELOW its own hardcoded SL-lock (e.g.
-        # ADAPTIVE_TP1_R=0.2 with T1's fixed 0.3R lock), the new SL would land
-        # beyond the price that just triggered it — self-closing the trade
-        # immediately, every time. Clamp defensively to 60% of the trigger.
-        safe = []
-        for r, sl_r in raw:
-            if sl_r is not None and sl_r >= r:
-                clamped = round(r * 0.6, 4)
-                self._log_event(
-                    f"[LADDER] SL-lock {sl_r}R >= trigger {r}R — clamped to "
-                    f"{clamped}R (check ADAPTIVE_TP1_R/ADAPTIVE_TP2_R)",
-                    level="warning",
-                )
-                sl_r = clamped
-            safe.append((r, sl_r))
-        return safe
 
     # [FAKE-FILTER] Minimum price-to-EMA20 distance (in ATR) for a trend-state
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
@@ -1550,11 +1530,12 @@ class TradingBot:
 
     def _queue_target_alert(self, label: str, price: float,
                             old_sl: Optional[float], new_sl: Optional[float],
-                            final: bool = False) -> None:
+                            final: bool = False, close_pct: float = 0.0) -> None:
         """Queue a Telegram-ready dict for the runner to format/send."""
         self._pending_target_alerts.append({
             "label": label, "price": price,
             "old_sl": old_sl, "new_sl": new_sl, "final": final,
+            "close_pct": close_pct,
         })
 
     def pop_target_alerts(self) -> List[Dict]:
@@ -1566,12 +1547,13 @@ class TradingBot:
     def _check_targets(self, t: Dict, direction: str, current_price: float,
                        ind: Dict, now: Optional[datetime.datetime] = None) -> Optional[str]:
         """
-        Walk the 4-level target ladder (T1..T4, see _target_ladder): each
-        level tightens the SL; only the final level (sl_r=None) closes the
-        position. A single gap candle can cross more than one level — loop so
-        none are skipped and every crossed level still gets its Telegram alert
-        and SL move. Used by both check_price_protection (intrabar) and
-        _manage_open_position (bar close) so behavior is identical either way.
+        Walk the 2-level target structure (T1/T2, see _target_ladder): T1
+        closes a partial and moves the SL to breakeven, T2 closes whatever's
+        left (matches the exchange-attached TP2). A single gap candle can
+        cross both levels — loop so neither is skipped and each crossed
+        level still gets its Telegram alert. Used by both
+        check_price_protection (intrabar) and _manage_open_position (bar
+        close) so behavior is identical either way.
         Returns a short action description, or None if nothing fired.
         """
         targets = t.get("targets")
@@ -1582,47 +1564,71 @@ class TradingBot:
 
         while t.get("next_target_idx", 0) < len(targets):
             idx = t["next_target_idx"]
-            r, sl_r = targets[idx]
+            r, close_pct, new_sl_r = targets[idx]
             level_price = t["entry"] + t["sl_dist"] * r * dir_mult
             hit = (current_price >= level_price) if direction == "LONG" \
                   else (current_price <= level_price)
             if not hit:
                 break
             label = f"T{idx + 1}"
+            is_final = (idx == len(targets) - 1)
 
-            if sl_r is None:
-                # Final level — full close (matches the exchange-attached TP2).
-                self._close_position(f"{label}_HIT", level_price, 1.0, ind, now=now)
+            # [MIN-LOT] A partial close below the smallest fillable size
+            # would wipe the WHOLE remaining position instead of the
+            # intended fraction — degrade to a breakeven-move-only (skip
+            # the close, still tighten SL) on non-final levels, the same
+            # fallback the pre-ladder split-TP system used.
+            effective_close_pct = close_pct
+            if not is_final and self.min_close_size > 0:
+                close_amount = t.get("remaining_size", 0.0) * close_pct
+                if 0 < close_amount < self.min_close_size:
+                    effective_close_pct = 0.0
+                    self._log_event(
+                        f"{label}: partial close {close_amount:.6f} below "
+                        f"min-lot {self.min_close_size:.6f} — SL-move only, no close",
+                        level="warning",
+                    )
+
+            if effective_close_pct > 0:
+                self._close_position(f"{label}_HIT", level_price, effective_close_pct, ind, now=now)
                 if self.state == "ERROR":
-                    # Flush any earlier T1-T3 progress made this same pass even
-                    # though the final close attempt itself failed.
+                    # Flush any earlier progress made this same pass even
+                    # though this level's close attempt itself failed.
                     if actions:
                         self.save_state(self._state_file)
                     return " | ".join(actions) if actions else None
-                t["next_target_idx"] = idx + 1
+
+            old_sl = t["sl"]
+            if new_sl_r is not None:
+                new_sl = t["entry"] + t["sl_dist"] * new_sl_r * dir_mult
+                t["sl"] = max(t["sl"], new_sl) if direction == "LONG" else min(t["sl"], new_sl)
+
+            t["next_target_idx"] = idx + 1
+            t.setdefault("targets_hit", []).append(label)
+
+            if is_final or t.get("remaining_size", 0.0) <= 1e-9:
+                # Final level — closes whatever remains (matches the
+                # exchange-attached TP2), or the position happened to be
+                # fully closed already (min-lot floor consumed 100%).
                 t["tp1_hit"] = True   # legacy flags some downstream logic reads
                 t["tp2_hit"] = True
-                t.setdefault("targets_hit", []).append(label)
                 self.state = "EXITING"
                 self._queue_target_alert(label, level_price, None, None, final=True)
                 actions.append(f"{label}_HIT(close) @ {level_price:.4f}")
                 self.save_state(self._state_file)
                 return " | ".join(actions)
 
-            old_sl = t["sl"]
-            new_sl = t["entry"] + t["sl_dist"] * sl_r * dir_mult
-            t["sl"] = max(t["sl"], new_sl) if direction == "LONG" else min(t["sl"], new_sl)
-            t["next_target_idx"] = idx + 1
             t["tp1_hit"] = True
             t["break_even_triggered"] = True
-            t.setdefault("targets_hit", []).append(label)
             self._log_event(
-                f"{label} hit @ {level_price:.4f} ({r}R) → SL {old_sl:.4f} → "
-                f"{t['sl']:.4f} (+{sl_r}R)"
+                f"{label} hit @ {level_price:.4f} ({r}R) → closed "
+                f"{effective_close_pct*100:.0f}% | SL {old_sl:.4f} → {t['sl']:.4f}"
             )
             self._send_amend_sl(t["sl"])
-            self._queue_target_alert(label, level_price, old_sl, t["sl"])
-            actions.append(f"{label} @ {level_price:.4f} SL→{t['sl']:.4f}")
+            self._queue_target_alert(label, level_price, old_sl, t["sl"], close_pct=effective_close_pct)
+            actions.append(
+                f"{label} @ {level_price:.4f} close={effective_close_pct*100:.0f}% SL→{t['sl']:.4f}"
+            )
 
         if actions:
             self.save_state(self._state_file)
@@ -1868,10 +1874,11 @@ class TradingBot:
         # ── TP levels ────────────────────────────────────────────────────────
         mult = 1 if direction == "LONG" else -1
 
-        # Unified 4-level target ladder (user-designed, same for every state):
-        # T1=+0.5R->SL+0.3R, T2=+0.7R->SL+0.5R, T3=+1.0R->SL+0.7R,
-        # T4=+1.2R->full close. tp1/tp2 fields kept for logging/exchange-attach
-        # (tp2 = T4's price = what's attached as the real OKX TP order).
+        # Unified 2-level target structure (user-designed, same for every
+        # state): T1=+0.5R->close tp1_close_pct + SL to breakeven,
+        # T2=+1.2R->full close of what's left. tp1/tp2 fields kept for
+        # logging/exchange-attach (tp2 = T2's price = what's attached as the
+        # real OKX TP order).
         ladder = self._target_ladder()
         tp1 = entry_price + sl_dist * ladder[0][0] * mult
         tp2 = entry_price + sl_dist * ladder[-1][0] * mult
@@ -1884,8 +1891,8 @@ class TradingBot:
 
         self._log_event(
             f"[{strategy_tag}] OPEN {direction} entry={entry_price:.4f} "
-            f"sl={pattern_sl:.4f} tp1={tp1:.4f}({ladder[0][0]}R) "
-            f"tp2={tp2:.4f}({ladder[-1][0]}R) ladder=T1-T4 "
+            f"sl={pattern_sl:.4f} tp1={tp1:.4f}({ladder[0][0]}R, close {tp1_pct:.0%}) "
+            f"tp2={tp2:.4f}({ladder[-1][0]}R, close rest) "
             f"size×{size_mult:.2f} health={health:.0f}"
         )
 
@@ -1897,7 +1904,7 @@ class TradingBot:
             "tp1":                  tp1,
             "tp2":                  tp2,
             "tp3":                  tp3,           # None for SwingReversal
-            "targets":              ladder,        # (trigger_R, new_SL_R) list
+            "targets":              ladder,        # (trigger_R, close_pct, new_SL_R) list
             "next_target_idx":      0,
             "targets_hit":          [],            # ["T1","T2",...] for stats/lessons
             "sl_algo_id":           None,          # OKX algoId of the attached SL/TP order (for amends)
@@ -1942,12 +1949,12 @@ class TradingBot:
                 "tp1":   tp1, "tp2": tp2,
                 "tp3":   tp3,
                 "size":  position_size,
-                # Full T1-T4 ladder prices for the runner's OPEN notification
+                # Full T1-T2 ladder prices for the runner's OPEN notification
                 # (label, price, trigger_R); extra key is ignored by the
                 # exchange adapters and the backtest executor.
                 "ladder": [
                     (f"T{i + 1}", entry_price + sl_dist * r * mult, r)
-                    for i, (r, _sl_r) in enumerate(ladder)
+                    for i, (r, _close_pct, _sl_r) in enumerate(ladder)
                 ],
             })
 
@@ -2028,9 +2035,10 @@ class TradingBot:
             self._close_position("STATE_DRIFT_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
-        # Unified 4-level target ladder (T1..T4) — same for every state now.
-        # T1-T3 tighten the SL only; T4 (matches the exchange-attached TP2)
-        # closes the position. See _check_targets / _target_ladder.
+        # Unified 2-level target structure (T1/T2) — same for every state now.
+        # T1 closes a partial + moves SL to breakeven; T2 (matches the
+        # exchange-attached TP2) closes what's left. See _check_targets /
+        # _target_ladder.
         target_action = self._check_targets(t, direction, current_price, ind)
         if target_action:
             if self.state == "EXITING":
@@ -2869,8 +2877,8 @@ class TradingBot:
             )
             # Recover the REAL attached SL price from the exchange (the same
             # algo-order lookup used for SL amends) instead of guessing an
-            # arbitrary placeholder — a guessed sl_dist corrupts every ladder
-            # level derived from it (T1-T4 all computed as entry + sl_dist*R)
+            # arbitrary placeholder — a guessed sl_dist corrupts every target
+            # level derived from it (T1/T2 both computed as entry + sl_dist*R)
             # for the rest of the trade. Falls back to the old 1%-of-price
             # guess only if the real SL can't be read back (adapter doesn't
             # support the lookup, or the algo order isn't found).
