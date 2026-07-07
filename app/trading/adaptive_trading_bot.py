@@ -337,7 +337,10 @@ class ConditionLearningEngine:
     """Per-diagnostic-tag win-rate tracking, feeding a scoring penalty."""
 
     TAGS = ["overextended", "rsi_extreme", "momentum_climax", "low_volume",
-            "choppy", "trend_to_range"]
+            "choppy", "trend_to_range",
+            # [SESSION EXPERT] learned, not assumed — see _session_label
+            "session_asia", "session_london", "session_overlap",
+            "session_ny", "session_offhours"]
     MIN_SAMPLES = 8       # minimum tagged trades before a tag affects scoring
     MAX_PENALTY = 20.0    # score points subtracted from `total`, at worst
 
@@ -1123,8 +1126,26 @@ class TradingBot:
     STRATEGY_EXTRA_PENALTY   = 15.0   # additional score penalty while active
     STRATEGY_DURATION_MIN    = 360    # auto-expire after 6 hours
 
+    @staticmethod
+    def _session_label(now: datetime.datetime) -> str:
+        """
+        [SESSION EXPERT] UTC-hour session bucket. Deliberately NOT scored
+        with assumed session quality (crypto liquidity/session behavior
+        varies by symbol and isn't ours to guess) — instead fed as a tag
+        into ConditionLearningEngine so it's LEARNED from this bot's own
+        trade history which sessions actually work (or don't) per Level 9:
+        "BTC London Trend Score>87 -> Win 78%, but Asia Range -> Win 45%".
+        """
+        h = now.hour
+        if 0 <= h < 8:    return "session_asia"
+        if 8 <= h < 13:   return "session_london"
+        if 13 <= h < 16:  return "session_overlap"
+        if 16 <= h < 21:  return "session_ny"
+        return "session_offhours"
+
     def _diagnose_conditions(self, direction: str, ema_dist_atr: float, rsi: float,
-                             atr_exp: float, vol_ratio: float, adx: float) -> List[str]:
+                             atr_exp: float, vol_ratio: float, adx: float,
+                             now: Optional[datetime.datetime] = None) -> List[str]:
         """
         Rule-based tags for "what was off about this entry", from features
         already computed at entry-scoring time. Used two ways: (1) post-hoc
@@ -1146,6 +1167,8 @@ class TradingBot:
             tags.append("low_volume")
         if adx <= self.TAG_CHOPPY_ADX:
             tags.append("choppy")
+        if now is not None:
+            tags.append(self._session_label(now))
         return tags
 
     def _diagnose_loss(self, t: Dict, close_reason: str) -> List[str]:
@@ -1155,6 +1178,12 @@ class TradingBot:
         (the market regime changed mid-trade) maps directly to the
         'trend_to_range' tag — that exit reason already means exactly this,
         no threshold needed."""
+        entry_time = t.get("entry_time")
+        if isinstance(entry_time, str):
+            try:
+                entry_time = datetime.datetime.fromisoformat(entry_time)
+            except ValueError:
+                entry_time = None
         tags = self._diagnose_conditions(
             direction    = t.get("direction", "LONG"),
             ema_dist_atr = t.get("e_ema_dist_atr") or 0.0,
@@ -1162,6 +1191,7 @@ class TradingBot:
             atr_exp      = t.get("e_atr_exp") or 1.0,
             vol_ratio    = t.get("e_vol_ratio") or 1.0,
             adx          = t.get("e_adx") or 25.0,
+            now          = entry_time if isinstance(entry_time, datetime.datetime) else None,
         )
         if close_reason == "STATE_DRIFT_EXIT" and "trend_to_range" not in tags:
             tags.append("trend_to_range")
@@ -1193,7 +1223,16 @@ class TradingBot:
         if len(recent) < self.STRATEGY_LOOKBACK_LOSSES:
             return
         from collections import Counter as _Counter
-        tag_counts = _Counter(tag for t in recent for tag in (t.get("loss_tags") or []))
+        # Session tags are excluded here on purpose: consecutive journal
+        # entries are often temporally close (same trading day), so
+        # "3 losses in the same session" is common by mere clustering, not
+        # necessarily a real causal pattern. Session still feeds Level 2's
+        # steady-state penalty (MIN_SAMPLES=8 is a far more robust bar)
+        # — just not this fast-reacting 3-loss trigger.
+        tag_counts = _Counter(
+            tag for t in recent for tag in (t.get("loss_tags") or [])
+            if not tag.startswith("session_")
+        )
         if not tag_counts:
             return
         dominant_tag, count = tag_counts.most_common(1)[0]
@@ -1420,11 +1459,12 @@ class TradingBot:
         _ema_dist_now  = abs(_px_now - ind_15m.get("ema20", _px_now)) / _atr_now
         _atr_exp_now   = ind_15m.get("atr", 0.0) / max(ind_15m.get("atr_avg", ind_15m.get("atr", 1.0)), 1e-9)
         _vol_ratio_now = ind_15m.get("volume", 0.0) / max(ind_15m.get("vol_avg", ind_15m.get("volume", 1.0)), 1e-9)
+        _now_ts = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
         _current_tags = self._diagnose_conditions(
             direction=direction, ema_dist_atr=_ema_dist_now, rsi=ind_15m.get("rsi", 50.0),
             atr_exp=_atr_exp_now, vol_ratio=_vol_ratio_now, adx=ind_15m.get("adx", 25.0),
+            now=_now_ts,
         )
-        _now_ts = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
         _condition_penalty = (self.condition_engine.get_penalty(_current_tags)
                               + self._active_strategy_penalty(_current_tags, _now_ts))
 
