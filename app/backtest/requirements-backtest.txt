@@ -1,0 +1,7 @@
+# Backtest / analysis tooling dependencies (dev-only — NOT part of the live
+# bot's deploy; see ../../requirements-trading.txt for that).
+# Install: pip install -r requirements-backtest.txt
+
+pandas>=2.0.0
+numpy>=1.26.0
+matplotlib>=3.8.0

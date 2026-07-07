@@ -1631,7 +1631,8 @@ class TradingBot:
 
     # ── Intrabar price protection — runs every runner poll between bar closes ─
 
-    def check_price_protection(self, current_price: float) -> Optional[str]:
+    def check_price_protection(self, current_price: float,
+                               now: Optional[datetime.datetime] = None) -> Optional[str]:
         """
         Lightweight price-level protection (SL / target-ladder crossings)
         checked every poll (~30-60s) instead of only on 15m bar close. Full
@@ -1640,6 +1641,13 @@ class TradingBot:
         those need fresh indicators; price levels don't. Closes/partials use
         the same _close_position path (real orders + accounting).
         Returns a short action description, or None if nothing fired.
+
+        `now` defaults to real wall-clock time — correct for live polling,
+        where intrabar closes happen in real elapsed time and self._bar_now
+        (only advanced on bar close) would understate the gap. A backtest
+        replaying historical intrabar candles must override this with the
+        SIMULATED candle time instead, or the whipsaw-spacing gate would get
+        stamped with today's real date.
         """
         if not self.position_open or not self.current_trade:
             return None
@@ -1647,10 +1655,7 @@ class TradingBot:
         if t.get("status") != "OPEN":
             return None
         direction = t["direction"]
-        # Intrabar closes happen in real elapsed time, not simulated bar time —
-        # stamp the whipsaw-spacing gate with actual wall-clock now, since
-        # self._bar_now only advances on bar close and would understate the gap.
-        _now = datetime.datetime.now(datetime.timezone.utc)
+        _now = now or datetime.datetime.now(datetime.timezone.utc)
 
         sl_hit = (current_price <= t["sl"]) if direction == "LONG" else (current_price >= t["sl"])
         if sl_hit:

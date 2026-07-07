@@ -11,7 +11,9 @@ app/default-office-config.json.bak
 app/.bt_cache_*.json
 app/backtest_results/
 app/backtest/backtest_results/
+app/backtest/backtest_results_realistic/
 app/backtest/backtest_data/
+app/backtest/backtest_data_v2/
 backtest_results/
 bot_state.json
 bot_state.json.tmp
