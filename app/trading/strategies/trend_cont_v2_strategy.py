@@ -100,6 +100,15 @@ class TrendContV2Strategy(BaseStrategy):
         # ── Adaptive pullback zone ─────────────────────────────────────────────
         pullback_atr_mult=1.0,   # base zone width as ATR multiplier
         pullback_tight_mult=0.5, # tight side (counter-direction from zone)
+        # ── Breakout freshness guard (anti-chase) ──────────────────────────────
+        # The 72-cap breakout lane is ONLY for newborn impulses. These gates
+        # stop it from selling capitulation lows / buying blow-off tops.
+        breakout_max_age_bars=6, # move older than this many bars beyond EMA9 = stale
+        breakout_max_ext_atr=2.5,# price further than this from EMA20 (in ATR) = chase
+                                 # (EMA20 lags ~0.8 ATR/bar impulses; 2.5 allows genuine
+                                 # bar 1-3 births, blocks 3+ATR capitulation flushes)
+        breakout_rsi_floor=28.0, # no shorts when RSI already below this (oversold)
+        breakout_rsi_ceil=72.0,  # no longs when RSI already above this (overbought)
         # ── SL / TP ───────────────────────────────────────────────────────────
         sl_mult=1.2,
         sl_min_pct=0.012,
@@ -109,6 +118,9 @@ class TrendContV2Strategy(BaseStrategy):
         sl_ladder_enabled=False, # classic 2-TP staged exit (not SL-ratchet ladder)
         tp1_be_buffer_r=0.0,     # SL → exact breakeven after TP1 (no profit buffer)
         tp2_extend_enabled=False,# health BULL must NOT extend TP2 beyond 1.2R
+        pattern_tp1_upgrade_enabled=False,  # TP1 stays pinned at 0.5R — the pattern
+                                 # upgrade moved it to 1.0R+ and armed hair-trigger
+                                 # WEAK exits, overriding the fixed 2-TP structure
         # ── HTF bias ──────────────────────────────────────────────────────────
         htf_bias_min=20.0,       # minimum MTF bias score to consider direction valid
         # ── Cooldown ──────────────────────────────────────────────────────────
@@ -411,14 +423,24 @@ class TrendContV2Strategy(BaseStrategy):
         # which would demand 88-95 — the bot would only wake up 7-9 bars later
         # at the bottom. If Layer 1 already confirmed an ATR-expansion breakout
         # in our direction, cap the bar at 72 regardless of ADX.
+        #
+        # FRESHNESS GUARD: in a sustained dump EVERY bar breaks the rolling
+        # 10-bar low with expanded ATR, so the BREAKOUT state stays lit from
+        # bar 1 to bar 15 — without a freshness check this lane sells the
+        # capitulation low / buys the blow-off top (the recurring "short filled
+        # at the exact bottom, V-reversal kills it" failure). The 72-cap is
+        # ONLY for newborn moves; stale/overextended breakouts must clear the
+        # normal ladder (78-100), which at breakout-typical low ADX ≈ no entry.
         if state.name == "BREAKOUT" and state.direction == direction:
-            threshold = min(threshold, 72.0)
-            # A breakout bar can never also be a pullback-to-EMA20 — the two
-            # are mutually exclusive by definition, so the 20-pt pullback
-            # bucket would stay ~0 and the total could still never reach the
-            # bar. Credit the bucket from breakout quality instead.
-            pb = max(pb, min(15.0, 8.0 + state.confidence * 0.07))
-            total = t + pb + mo + vo + st + ac
+            fresh, fresh_why = self._breakout_fresh(closes, price, direction, candles)
+            if fresh:
+                threshold = min(threshold, 72.0)
+                # A breakout bar can never also be a pullback-to-EMA20 — the two
+                # are mutually exclusive by definition, so the 20-pt pullback
+                # bucket would stay ~0 and the total could still never reach the
+                # bar. Credit the bucket from breakout quality instead.
+                pb = max(pb, min(15.0, 8.0 + state.confidence * 0.07))
+                total = t + pb + mo + vo + st + ac
 
         # READY check: core conditions met even if total isn't at threshold yet
         ready = (t >= 18 and mo >= 12 and st >= 5)
@@ -431,6 +453,60 @@ class TrendContV2Strategy(BaseStrategy):
             threshold=threshold,
             ready=ready,
         )
+
+    def _breakout_fresh(self, closes, price, direction, candles) -> tuple:
+        """
+        Distinguish a NEWBORN breakout (bars 1-4 of an impulse — the lane's
+        purpose) from a STALE one (bar 7+ of an extended move — a chase into
+        the mean-reversion zone). Three independent checks; ANY failure marks
+        the breakout stale:
+
+        1. Move age — consecutive closes already beyond EMA9 in our direction.
+           A birth is 1-4 bars old. 7+ bars means the impulse is mature and
+           the "breakout" is just the rolling low breaking again.
+        2. Overextension — distance from EMA20 in ATR units. Beyond ~1.6 ATR
+           the statistical edge flips to mean-reversion: that's the hole,
+           not the doorway.
+        3. RSI extreme — shorting into oversold (<28) or buying into
+           overbought (>72) is entering exactly where V-reversals ignite.
+        """
+        is_long = (direction == "long")
+
+        e9  = self.ema(closes, 9)
+        e20 = self.ema(closes, 20)
+        atr_arr = self.atr(candles, 14)
+        atr_val = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else price * 0.01
+        if atr_val <= 0:
+            atr_val = price * 0.01
+
+        # 1) Move age
+        max_age = int(self._p["breakout_max_age_bars"])
+        age = 0
+        for i in range(len(closes) - 1, max(len(closes) - max_age - 2, -1), -1):
+            e9i = float(e9[i])
+            beyond = (closes[i] > e9i) if is_long else (closes[i] < e9i)
+            if beyond:
+                age += 1
+            else:
+                break
+        if age > max_age:
+            return False, f"stale: move already {age} bars beyond EMA9"
+
+        # 2) Overextension from EMA20
+        e20v = float(e20[-1])
+        ext = ((price - e20v) if is_long else (e20v - price)) / atr_val
+        if ext > self._p["breakout_max_ext_atr"]:
+            return False, f"overextended: {ext:.1f} ATR beyond EMA20"
+
+        # 3) RSI extreme
+        rsi_arr = self.rsi(closes, 14)
+        rsi_val = float(rsi_arr[-1]) if not np.isnan(rsi_arr[-1]) else 50.0
+        if not is_long and rsi_val < self._p["breakout_rsi_floor"]:
+            return False, f"oversold: RSI {rsi_val:.0f} — bounce zone"
+        if is_long and rsi_val > self._p["breakout_rsi_ceil"]:
+            return False, f"overbought: RSI {rsi_val:.0f} — pullback zone"
+
+        return True, f"fresh (age={age}, ext={ext:.1f}ATR, rsi={rsi_val:.0f})"
 
     def _trend_score(self, closes, highs, lows, direction, mtf_candles, candles) -> float:
         """

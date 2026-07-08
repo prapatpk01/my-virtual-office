@@ -946,7 +946,14 @@ class TradingBot:
                 # TP1 upgrade requires BOTH: pattern tier present AND health BULL (this call)
                 # Health BULL alone → no adjustment (TP1 stays at 0.5R)
                 # Pattern alone     → no adjustment (wait for BULL confirmation)
-                if pos.pattern_tier > 0 and not pos.tp1_pattern_upgraded and not pos.sl_ladder_enabled:
+                # Strategies with a pinned 2-TP structure disable the upgrade entirely
+                # (pattern_tp1_upgrade_enabled=False): it moved TP1 from 0.5R to 1.0R+
+                # and armed an immediate-WEAK exit, overriding the fixed exit design.
+                _pat_strat = self._strategy_for(sym, strategy)
+                _pat_ok = bool((getattr(_pat_strat, "_p", None) or {})
+                               .get("pattern_tp1_upgrade_enabled", True))
+                if (pos.pattern_tier > 0 and _pat_ok
+                        and not pos.tp1_pattern_upgraded and not pos.sl_ladder_enabled):
                     # Pattern TP1 Upgrade is incompatible with TP-ladder mode: the ladder
                     # manages exits via SL ratchets — an immediate-WEAK-exit armed here
                     # would fire on every normal post-entry pullback and override the ladder.
