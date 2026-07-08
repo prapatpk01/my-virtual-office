@@ -128,8 +128,8 @@ class TrendContV2Strategy(BaseStrategy):
         # ── Sizing (confidence-scaled) ────────────────────────────────────────
         # risk_pct scales linearly from risk_min (score = threshold) to
         # risk_max (score = 100). Higher-confidence signals get bigger size.
-        risk_min_pct=0.08,       # risk% when score just clears the threshold
-        risk_max_pct=0.12,       # risk% when score is perfect (100)
+        risk_min_pct=0.05,       # risk% when score just clears the threshold
+        risk_max_pct=0.10,       # risk% when score is perfect (100)
         # ── Startup warmup ────────────────────────────────────────────────────
         startup_warmup_min=0,
         # ── Health monitor ────────────────────────────────────────────────────

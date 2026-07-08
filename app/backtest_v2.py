@@ -46,8 +46,8 @@ except ImportError:
 
 LEVERAGE       = 20
 INITIAL_BAL    = 10_000.0
-RISK_MIN       = 0.08       # 8%  of balance at risk per trade (min confidence)
-RISK_MAX       = 0.12       # 12% of balance at risk per trade (max confidence)
+RISK_MIN       = 0.05       # 5%  of balance at risk per trade (min confidence)
+RISK_MAX       = 0.10       # 10% of balance at risk per trade (max confidence)
 SL_ATR_MULT    = 1.2
 SL_MIN_PCT     = 0.012      # 1.2% minimum stop distance
 SL_MAX_PCT     = 0.035      # 3.5% maximum stop distance

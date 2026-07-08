@@ -174,7 +174,7 @@ async def main():
         daily_loss_limit_pct=DAILY_CB,
     )
     logger.info(
-        "Risk: confidence-scaled 8%%–12%%  lev=%dx  max_pos=%d  drawdown=%.0f%%  dailyCB=%.0f%%",
+        "Risk: confidence-scaled 5%%–10%%  lev=%dx  max_pos=%d  drawdown=%.0f%%  dailyCB=%.0f%%",
         LEVERAGE, cfg["max_positions"], MAX_DRAWDOWN * 100, DAILY_CB * 100,
     )
 
