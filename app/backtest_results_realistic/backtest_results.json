@@ -1,5 +1,5 @@
 {
-  "run_at": "2026-07-08T00:27:11.547535+00:00",
+  "run_at": "2026-07-08T05:25:42.650639+00:00",
   "config": {
     "initial_balance": 10000.0,
     "risk_pct": 0.01,
@@ -23,58 +23,195 @@
   "metrics": {
     "BTC": {
       "symbol": "BTC",
-      "total_trades": 752,
-      "win_rate": 0.44148936170212766,
-      "profit_factor": 0.693,
-      "net_pnl": -1602.2,
-      "net_pnl_pct": -16.02,
-      "avg_win": 10.91,
-      "avg_loss": -12.44,
-      "avg_rr": 0.877,
-      "max_drawdown_pct": 16.08,
-      "sharpe": -1.962,
-      "final_balance": 8397.8,
+      "total_trades": 29,
+      "win_rate": 0.3448275862068966,
+      "profit_factor": 0.604,
+      "net_pnl": -110.64,
+      "net_pnl_pct": -1.11,
+      "avg_win": 16.87,
+      "avg_loss": -14.7,
+      "avg_rr": 1.148,
+      "max_drawdown_pct": 1.35,
+      "sharpe": -3.127,
+      "final_balance": 9889.36,
       "avg_bars_held": 1.0,
-      "total_commission": 1968.19,
+      "total_commission": 115.27,
       "by_market_state": {
-        "Range": {
-          "wins": 185,
-          "losses": 297,
-          "pnl": -1836.4063633854948,
-          "win_rate": 0.38381742738589214,
-          "total": 482
-        },
         "Trend": {
-          "wins": 125,
-          "losses": 103,
-          "pnl": 431.61181098682835,
-          "win_rate": 0.5482456140350878,
-          "total": 228
+          "wins": 3,
+          "losses": 6,
+          "pnl": -38.81743481237781,
+          "win_rate": 0.3333333333333333,
+          "total": 9
+        },
+        "Range": {
+          "wins": 7,
+          "losses": 11,
+          "pnl": -33.083807950714636,
+          "win_rate": 0.3888888888888889,
+          "total": 18
         },
         "Breakout": {
-          "wins": 14,
-          "losses": 19,
-          "pnl": -264.23191403493735,
-          "win_rate": 0.42424242424242425,
-          "total": 33
-        },
-        "Exhaustion": {
-          "wins": 4,
-          "losses": 0,
-          "pnl": 43.71626822037481,
-          "win_rate": 1.0,
-          "total": 4
-        },
-        "Reversal": {
-          "wins": 4,
-          "losses": 1,
-          "pnl": 23.106146996509487,
-          "win_rate": 0.8,
-          "total": 5
+          "wins": 0,
+          "losses": 2,
+          "pnl": -38.73726775205072,
+          "win_rate": 0.0,
+          "total": 2
         }
       },
-      "longs": 454,
-      "shorts": 298
+      "longs": 24,
+      "shorts": 5
+    },
+    "ETH": {
+      "symbol": "ETH",
+      "total_trades": 47,
+      "win_rate": 0.5531914893617021,
+      "profit_factor": 0.624,
+      "net_pnl": -315.83,
+      "net_pnl_pct": -3.16,
+      "avg_win": 20.2,
+      "avg_loss": -40.05,
+      "avg_rr": 0.504,
+      "max_drawdown_pct": 3.81,
+      "sharpe": -2.672,
+      "final_balance": 9684.17,
+      "avg_bars_held": 1.0,
+      "total_commission": 164.32,
+      "by_market_state": {
+        "Trend": {
+          "wins": 14,
+          "losses": 9,
+          "pnl": -196.3042231603681,
+          "win_rate": 0.6086956521739131,
+          "total": 23
+        },
+        "Range": {
+          "wins": 10,
+          "losses": 7,
+          "pnl": -109.65485888206905,
+          "win_rate": 0.5882352941176471,
+          "total": 17
+        },
+        "Breakout": {
+          "wins": 1,
+          "losses": 1,
+          "pnl": 47.236940859642445,
+          "win_rate": 0.5,
+          "total": 2
+        },
+        "Reversal": {
+          "wins": 1,
+          "losses": 2,
+          "pnl": -29.506915104763813,
+          "win_rate": 0.3333333333333333,
+          "total": 3
+        },
+        "Exhaustion": {
+          "wins": 0,
+          "losses": 2,
+          "pnl": -27.604811508567124,
+          "win_rate": 0.0,
+          "total": 2
+        }
+      },
+      "longs": 37,
+      "shorts": 10
+    },
+    "SOL": {
+      "symbol": "SOL",
+      "total_trades": 39,
+      "win_rate": 0.46153846153846156,
+      "profit_factor": 0.837,
+      "net_pnl": -102.39,
+      "net_pnl_pct": -1.02,
+      "avg_win": 29.18,
+      "avg_loss": -29.89,
+      "avg_rr": 0.976,
+      "max_drawdown_pct": 3.49,
+      "sharpe": -1.059,
+      "final_balance": 9897.61,
+      "avg_bars_held": 1.0,
+      "total_commission": 145.22,
+      "by_market_state": {
+        "Trend": {
+          "wins": 10,
+          "losses": 2,
+          "pnl": 341.12618615151763,
+          "win_rate": 0.8333333333333334,
+          "total": 12
+        },
+        "Range": {
+          "wins": 6,
+          "losses": 17,
+          "pnl": -358.15694373354734,
+          "win_rate": 0.2608695652173913,
+          "total": 23
+        },
+        "Reversal": {
+          "wins": 1,
+          "losses": 1,
+          "pnl": -47.69719817315776,
+          "win_rate": 0.5,
+          "total": 2
+        },
+        "Exhaustion": {
+          "wins": 0,
+          "losses": 1,
+          "pnl": -50.91067504055996,
+          "win_rate": 0.0,
+          "total": 1
+        },
+        "Breakout": {
+          "wins": 1,
+          "losses": 0,
+          "pnl": 13.252955247144769,
+          "win_rate": 1.0,
+          "total": 1
+        }
+      },
+      "longs": 31,
+      "shorts": 8
+    },
+    "XRP": {
+      "symbol": "XRP",
+      "total_trades": 11,
+      "win_rate": 0.09090909090909091,
+      "profit_factor": 0.173,
+      "net_pnl": -242.91,
+      "net_pnl_pct": -2.43,
+      "avg_win": 50.68,
+      "avg_loss": -29.36,
+      "avg_rr": 1.726,
+      "max_drawdown_pct": 2.81,
+      "sharpe": -11.972,
+      "final_balance": 9757.09,
+      "avg_bars_held": 1.0,
+      "total_commission": 38.7,
+      "by_market_state": {
+        "Range": {
+          "wins": 0,
+          "losses": 6,
+          "pnl": -163.7496674784896,
+          "win_rate": 0.0,
+          "total": 6
+        },
+        "Trend": {
+          "wins": 1,
+          "losses": 2,
+          "pnl": 20.48307120377907,
+          "win_rate": 0.3333333333333333,
+          "total": 3
+        },
+        "Exhaustion": {
+          "wins": 0,
+          "losses": 2,
+          "pnl": -99.63887533504187,
+          "win_rate": 0.0,
+          "total": 2
+        }
+      },
+      "longs": 7,
+      "shorts": 4
     }
   }
 }
