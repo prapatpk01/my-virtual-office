@@ -1,0 +1,2 @@
+symbol,total_trades,win_rate,profit_factor,net_pnl,net_pnl_pct,avg_win,avg_loss,avg_rr,max_drawdown_pct,sharpe,final_balance,avg_bars_held,total_commission,longs,shorts
+BTC,752,0.44148936170212766,0.693,-1602.2,-16.02,10.91,-12.44,0.877,16.08,-1.962,8397.8,1.0,1968.19,454,298

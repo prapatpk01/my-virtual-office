@@ -1,0 +1,55 @@
+{
+  "symbol": "XRP",
+  "total_trades": 700,
+  "win_rate": 0.4785714285714286,
+  "profit_factor": 0.861,
+  "net_pnl": -1243.54,
+  "net_pnl_pct": -12.44,
+  "avg_win": 22.98,
+  "avg_loss": -24.5,
+  "avg_rr": 0.938,
+  "max_drawdown_pct": 13.65,
+  "sharpe": -0.865,
+  "final_balance": 8756.46,
+  "avg_bars_held": 1.0,
+  "total_commission": 2770.31,
+  "by_market_state": {
+    "Range": {
+      "wins": 191,
+      "losses": 249,
+      "pnl": -2474.9286481501244,
+      "win_rate": 0.4340909090909091,
+      "total": 440
+    },
+    "Breakout": {
+      "wins": 13,
+      "losses": 15,
+      "pnl": -337.6095415805029,
+      "win_rate": 0.4642857142857143,
+      "total": 28
+    },
+    "Trend": {
+      "wins": 125,
+      "losses": 98,
+      "pnl": 1460.4741906085892,
+      "win_rate": 0.5605381165919282,
+      "total": 223
+    },
+    "Reversal": {
+      "wins": 6,
+      "losses": 1,
+      "pnl": 147.37595129868507,
+      "win_rate": 0.8571428571428571,
+      "total": 7
+    },
+    "Exhaustion": {
+      "wins": 0,
+      "losses": 2,
+      "pnl": -38.8540332996243,
+      "win_rate": 0.0,
+      "total": 2
+    }
+  },
+  "longs": 371,
+  "shorts": 329
+}
