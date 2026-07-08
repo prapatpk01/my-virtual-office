@@ -285,11 +285,17 @@ def _make_telegram(cfg: dict):
 # ---------------------------------------------------------------------------
 
 async def _run_adaptive(cfg, connector, telegram, stop_event):
-    from trading.adaptive_trading_bot import TradingBot as AdaptiveBot
+    from trading.adaptive_trading_bot import TradingBot as AdaptiveBot, ExpectancyEngine
     from trading.indicator_engine import IndicatorEngine
 
     symbols = cfg["symbols"]
     logger.info("=== ADAPTIVE MODE: %d symbols ===", len(symbols))
+
+    # [SHARED-LEARNING] One ExpectancyEngine pooled across every symbol bot —
+    # unlike the sequential-per-symbol backtest, live symbols advance in real
+    # wall-clock lockstep, so pooling here has no look-ahead concern at all;
+    # it's strictly an improvement over each symbol learning in isolation.
+    shared_expectancy = ExpectancyEngine()
 
     # FIX-#2: choose execution adapter based on configured exchange
     exchange_id = cfg.get("exchange", "okx").lower()
@@ -366,6 +372,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             margin_pct_max=cfg.get("adaptive_margin_pct_max", 0.15),
             margin_usdt=cfg.get("adaptive_margin_usdt", 0.0),
             sizing_leverage=cfg.get("leverage", 10),
+            expectancy_engine=shared_expectancy,
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)

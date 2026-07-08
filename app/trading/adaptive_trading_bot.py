@@ -598,7 +598,19 @@ class ExpectancyEngine:
         return {"outcomes": self.outcomes}
 
     def from_dict(self, data: Dict):
-        self.outcomes = data.get("outcomes", self.outcomes)
+        """
+        Merge (not overwrite): this engine instance is shared across every
+        symbol's bot, and each bot calls load_state() -> from_dict()
+        independently at startup with ITS OWN symbol's saved snapshot. A
+        plain overwrite would let whichever symbol loads last discard the
+        history every other symbol had already restored. Keep the longer
+        list per key (a reasonable proxy for "more complete rolling
+        history") and merge in any keys unique to the incoming snapshot.
+        """
+        incoming = data.get("outcomes", {})
+        for k, v in incoming.items():
+            if k not in self.outcomes or len(v) > len(self.outcomes[k]):
+                self.outcomes[k] = v
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -908,7 +920,8 @@ class TradingBot:
                  execution_callback: Optional[Callable] = None,
                  startup_warmup_minutes: int = 45,
                  enable_swing_reversal: bool = True,
-                 enable_mean_reversion: bool = False):
+                 enable_mean_reversion: bool = False,
+                 expectancy_engine: Optional["ExpectancyEngine"] = None):
         self.state: str = "SCANNING"
         self.adaptive_engine    = AdaptiveEngine()
         self.health_calc        = PositionHealthCalculator()
@@ -917,7 +930,14 @@ class TradingBot:
         self.regime_clf         = RegimeClassifier()
         self.strategy_scorer    = StrategyScorer()
         self.confidence_engine  = ConfidenceEngine()
-        self.expectancy_engine  = ExpectancyEngine()
+        # [SHARED-LEARNING] A single symbol rarely sees 12+ occurrences of one
+        # narrow (regime, strategy) combo on its own — pass one ExpectancyEngine
+        # instance shared across every symbol's bot (see run_bot.py /
+        # backtest_engine.py) so the MIN_TRADES threshold is reached from
+        # pooled cross-symbol history instead of each bot learning in
+        # isolation. Defaults to a private instance when not wired up (e.g.
+        # ad-hoc scripts/tests).
+        self.expectancy_engine  = expectancy_engine if expectancy_engine is not None else ExpectancyEngine()
         self.learning_engine    = PatternLearningEngine()
         # [LEVEL 2/3] Diagnostic-tag learning + temporary strategy tightening
         # (see ConditionLearningEngine, _diagnose_conditions, _check_strategy_dominance)
@@ -2347,7 +2367,13 @@ class TradingBot:
         _entry      = t.get("entry", 0.0)
         _sl         = t.get("sl", _entry)
         _exit       = t.get("exit_price", _entry)
-        _sl_d       = max(abs(_entry - _sl), 1e-8)
+        # [FIX] Use the ORIGINAL entry-to-SL distance (t["sl_dist"], fixed at
+        # position open) to normalize R, not the CURRENT t["sl"] — that price
+        # ratchets to breakeven at T1 (t["sl"] = t["entry"]), which made
+        # abs(_entry - _sl) collapse to ~0 for any trade closed after a T1
+        # partial and exploded realized_r into billions (a fixed but
+        # unrelated PnL divided by a near-zero denominator).
+        _sl_d       = max(float(t.get("sl_dist") or 0.0), 1e-8)
         _d_mult     = 1 if t.get("direction") == "LONG" else -1
         _realized_r = _d_mult * (_exit - _entry) / _sl_d
         _win_r      = max(_realized_r, 0.0)

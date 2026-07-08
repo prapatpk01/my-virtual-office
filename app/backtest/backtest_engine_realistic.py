@@ -37,7 +37,7 @@ from backtest.backtest_engine import (
     BacktestConfig, PaperExecutor, TradeRecord, SymbolBacktest,
     compute_metrics, _load_csv_dir, _df_to_ohlcv,
 )
-from trading.adaptive_trading_bot import TradingBot
+from trading.adaptive_trading_bot import TradingBot, ExpectancyEngine
 
 logger = logging.getLogger("backtest_realistic")
 
@@ -112,6 +112,7 @@ class RealisticSymbolBacktest(SymbolBacktest):
             startup_warmup_minutes = 0,
             enable_swing_reversal  = True,
             enable_mean_reversion  = True,
+            expectancy_engine      = self.expectancy_engine,
         )
 
         trade_records: List[TradeRecord] = []
@@ -283,12 +284,23 @@ class RealisticBacktestEngine:
         all_metrics: Dict[str, Dict] = {}
         all_trades: Dict[str, List] = {}
 
+        # [SHARED-LEARNING] see BacktestEngine.run() in backtest_engine.py —
+        # one ExpectancyEngine pooled across every symbol in this run.
+        # CAVEAT: symbols are simulated sequentially start-to-finish here
+        # (not interleaved bar-by-bar), so a combo's later months on an
+        # earlier-processed symbol can influence an earlier month on a
+        # later-processed symbol — a mild look-ahead versus live trading,
+        # where all symbols advance in lockstep wall-clock time. Treat
+        # results as directionally indicative, not a strict causal backtest.
+        shared_expectancy = ExpectancyEngine()
+
         for sym in symbols:
             logger.info("=" * 50)
             logger.info("SYMBOL: %s", sym)
             logger.info("=" * 50)
             try:
-                runner = RealisticSymbolBacktest(sym, self.cfg, self.cfg.data_root)
+                runner = RealisticSymbolBacktest(sym, self.cfg, self.cfg.data_root,
+                                                 expectancy_engine=shared_expectancy)
                 trades = runner.run()
                 metrics = compute_metrics(trades, self.cfg.initial_balance, sym)
                 all_metrics[sym] = metrics

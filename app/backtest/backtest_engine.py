@@ -30,7 +30,7 @@ if _APP not in sys.path:
     sys.path.insert(0, _APP)
 
 from trading.indicator_engine import IndicatorEngine
-from trading.adaptive_trading_bot import TradingBot
+from trading.adaptive_trading_bot import TradingBot, ExpectancyEngine
 from trading.connectors.base import OHLCV
 
 logger = logging.getLogger("backtest")
@@ -230,10 +230,14 @@ class TradeRecord:
 
 
 class SymbolBacktest:
-    def __init__(self, symbol: str, cfg: BacktestConfig, data_root: str):
+    def __init__(self, symbol: str, cfg: BacktestConfig, data_root: str,
+                 expectancy_engine=None):
         self.symbol    = symbol
         self.cfg       = cfg
         self.data_root = data_root
+        # Shared across all symbols in one multi-symbol run — see TradingBot
+        # docstring on expectancy_engine for why this must be pooled.
+        self.expectancy_engine = expectancy_engine
 
     def _load_data(self):
         sym_dir = os.path.join(self.data_root, self.symbol)
@@ -265,6 +269,7 @@ class SymbolBacktest:
             startup_warmup_minutes = 0,            # backtest has no warmup — instant start
             enable_swing_reversal  = True,
             enable_mean_reversion  = True,
+            expectancy_engine      = self.expectancy_engine,
         )
 
         trade_records: List[TradeRecord] = []
@@ -519,12 +524,19 @@ class BacktestEngine:
         all_metrics: Dict[str, Dict] = {}
         all_trades:  Dict[str, List] = {}
 
+        # [SHARED-LEARNING] One ExpectancyEngine pooled across every symbol in
+        # this run — see TradingBot.__init__ docstring: a single symbol rarely
+        # accumulates enough samples of one narrow (regime, strategy) combo to
+        # reach ExpectancyEngine.MIN_TRADES on its own.
+        shared_expectancy = ExpectancyEngine()
+
         for sym in symbols:
             logger.info("=" * 50)
             logger.info("SYMBOL: %s", sym)
             logger.info("=" * 50)
             try:
-                runner = SymbolBacktest(sym, self.cfg, self.cfg.data_root)
+                runner = SymbolBacktest(sym, self.cfg, self.cfg.data_root,
+                                        expectancy_engine=shared_expectancy)
                 trades = runner.run()
                 metrics = compute_metrics(trades, self.cfg.initial_balance, sym)
                 all_metrics[sym] = metrics
