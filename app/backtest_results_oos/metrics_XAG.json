@@ -1,0 +1,48 @@
+{
+  "symbol": "XAG",
+  "total_trades": 22,
+  "win_rate": 0.8181818181818182,
+  "profit_factor": 1.786,
+  "net_pnl": 262.06,
+  "net_pnl_pct": 2.62,
+  "avg_win": 33.08,
+  "avg_loss": -83.35,
+  "avg_rr": 0.397,
+  "max_drawdown_pct": 1.89,
+  "sharpe": 4.041,
+  "final_balance": 10262.06,
+  "avg_bars_held": 1.0,
+  "total_commission": 79.01,
+  "by_market_state": {
+    "Range": {
+      "wins": 5,
+      "losses": 0,
+      "pnl": 164.5407758316159,
+      "win_rate": 1.0,
+      "total": 5
+    },
+    "Reversal": {
+      "wins": 0,
+      "losses": 1,
+      "pnl": -68.41692498238119,
+      "win_rate": 0.0,
+      "total": 1
+    },
+    "Trend": {
+      "wins": 10,
+      "losses": 2,
+      "pnl": 192.19384948997612,
+      "win_rate": 0.8333333333333334,
+      "total": 12
+    },
+    "Breakout": {
+      "wins": 3,
+      "losses": 1,
+      "pnl": -26.25768899877407,
+      "win_rate": 0.75,
+      "total": 4
+    }
+  },
+  "longs": 14,
+  "shorts": 8
+}

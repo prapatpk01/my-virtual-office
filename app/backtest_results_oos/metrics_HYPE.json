@@ -1,0 +1,41 @@
+{
+  "symbol": "HYPE",
+  "total_trades": 26,
+  "win_rate": 0.6923076923076923,
+  "profit_factor": 0.937,
+  "net_pnl": -39.49,
+  "net_pnl_pct": -0.39,
+  "avg_win": 32.88,
+  "avg_loss": -78.93,
+  "avg_rr": 0.417,
+  "max_drawdown_pct": 1.85,
+  "sharpe": -0.449,
+  "final_balance": 9960.51,
+  "avg_bars_held": 1.0,
+  "total_commission": 95.97,
+  "by_market_state": {
+    "Trend": {
+      "wins": 9,
+      "losses": 1,
+      "pnl": 252.07734941666644,
+      "win_rate": 0.9,
+      "total": 10
+    },
+    "Range": {
+      "wins": 9,
+      "losses": 6,
+      "pnl": -223.05131512228957,
+      "win_rate": 0.6,
+      "total": 15
+    },
+    "Breakout": {
+      "wins": 0,
+      "losses": 1,
+      "pnl": -68.51857111571708,
+      "win_rate": 0.0,
+      "total": 1
+    }
+  },
+  "longs": 20,
+  "shorts": 6
+}

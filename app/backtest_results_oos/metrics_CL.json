@@ -1,0 +1,41 @@
+{
+  "symbol": "CL",
+  "total_trades": 9,
+  "win_rate": 0.6666666666666666,
+  "profit_factor": 0.744,
+  "net_pnl": -61.88,
+  "net_pnl_pct": -0.62,
+  "avg_win": 29.93,
+  "avg_loss": -80.48,
+  "avg_rr": 0.372,
+  "max_drawdown_pct": 1.73,
+  "sharpe": -2.056,
+  "final_balance": 9938.12,
+  "avg_bars_held": 1.0,
+  "total_commission": 36.04,
+  "by_market_state": {
+    "Trend": {
+      "wins": 1,
+      "losses": 3,
+      "pnl": -212.33932998333134,
+      "win_rate": 0.25,
+      "total": 4
+    },
+    "Breakout": {
+      "wins": 3,
+      "losses": 0,
+      "pnl": 94.49690827188654,
+      "win_rate": 1.0,
+      "total": 3
+    },
+    "Range": {
+      "wins": 2,
+      "losses": 0,
+      "pnl": 55.96037444434632,
+      "win_rate": 1.0,
+      "total": 2
+    }
+  },
+  "longs": 7,
+  "shorts": 2
+}
