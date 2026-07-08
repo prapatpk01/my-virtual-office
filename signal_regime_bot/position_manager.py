@@ -186,8 +186,20 @@ class PositionManager:
                            c.sl_min_pct, c.sl_max_pct)
         tp1, tp2 = calc_take_profits(side, price, sl, c.tp1_r, c.tp2_r)
 
+        # Explicit balance check BEFORE sizing — always fetch fresh (never cached/stale),
+        # log it so every entry is auditable in Railway logs, and refuse to size off
+        # a zero/failed balance read instead of silently producing a 0-amount order.
         balance = await self.client.fetch_balance_usdt()
+        if balance <= 0:
+            logger.warning("[POS] %s balance check returned %.2f USDT — refusing to size, skip entry",
+                          symbol, balance)
+            return None
+        effective_risk_pct = c.risk_per_trade * regime.size_multiplier
         amount = self.risk.size_by_risk(balance, price, sl, regime.size_multiplier)
+        logger.info("[POS] %s balance=%.2f USDT  risk=%.1f%% (base %.1f%% x regime mult %.2f)  "
+                   "sl_dist=%.3f%%  -> amount=%.6f",
+                   symbol, balance, effective_risk_pct * 100, c.risk_per_trade * 100,
+                   regime.size_multiplier, abs(price - sl) / price * 100, amount)
         if amount <= 0:
             logger.warning("[POS] %s sizing produced 0 amount — skip entry", symbol)
             return None
@@ -233,6 +245,43 @@ class PositionManager:
 
         return None
 
+    @staticmethod
+    def _is_no_position_error(e: Exception) -> bool:
+        """OKX 51169: 'you don't have any positions in this direction to reduce
+        or close' — the exchange-side algo (attached SL/TP, or the OCO re-armed
+        by move_sl_to_breakeven) already closed the position before our own
+        price check could. This is expected under normal operation, not a
+        real failure — treat it as confirmation the position is already gone."""
+        s = str(e)
+        return "51169" in s or "don't have any positions" in s.lower()
+
+    async def _sync_closed_externally(self, pos: Position, price: float, reason: str) -> Optional[dict]:
+        """
+        Called after a close order is rejected with OKX 51169. Confirms via
+        fetch_position_amount (ground truth) that the position is really gone,
+        then cleans up internal state and books an approximate PnL using the
+        last known price — the exact algo fill price isn't available to us,
+        so this is a best-effort estimate, not a source-of-truth close price.
+        Returns None (caller should retry next tick) if OKX still shows the
+        position open — the 51169 was then a different, transient problem.
+        """
+        actual = await self.client.fetch_position_amount(pos.symbol, pos.side)
+        if actual > 0:
+            logger.warning("[POS] %s %s: close failed with 'no position' but OKX still shows "
+                           "%.6f open — treating as transient, will retry", pos.symbol, reason, actual)
+            return None
+
+        pnl_mult = 1 if pos.side == LONG else -1
+        pnl = pnl_mult * (price - pos.entry_price) * pos.amount
+        balance = await self.client.fetch_balance_usdt()
+        self.risk.register_trade_result(pnl, balance, time.time())
+        del self._positions[pos.symbol]
+        logger.info("[POS] %s %s: confirmed closed externally (exchange algo) — "
+                   "synced internal state, pnl≈%.2f (approximate, exact fill unknown)",
+                   pos.symbol, reason, pnl)
+        return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": price,
+               "pnl": pnl, "position": pos, "approximate": True}
+
     async def _close_partial_tp1(self, pos: Position, price: float) -> dict:
         close_amt = round(pos.full_amount * 0.5, 8)
         close_amt = min(close_amt, pos.amount)
@@ -241,6 +290,14 @@ class PositionManager:
             await self.client.create_order(pos.symbol, okx_side, close_amt,
                                            pos_side=pos.side, reduce_only=True)
         except Exception as e:
+            if self._is_no_position_error(e):
+                # The exchange-side algo closed the FULL position before our TP1
+                # partial could fire — there's no partial left to take, sync as a
+                # full close instead of retrying a partial that can never succeed.
+                synced = await self._sync_closed_externally(pos, price, "TP1_THEN_EXTERNAL_CLOSE")
+                if synced:
+                    return synced
+                return {"event": "ERROR", "symbol": pos.symbol, "detail": f"TP1 close failed: {e}"}
             logger.warning("[POS] %s TP1 partial close failed, retry next tick: %s", pos.symbol, e)
             return {"event": "ERROR", "symbol": pos.symbol, "detail": f"TP1 close failed: {e}"}
 
@@ -266,6 +323,10 @@ class PositionManager:
             await self.client.create_order(pos.symbol, okx_side, pos.amount,
                                            pos_side=pos.side, reduce_only=True)
         except Exception as e:
+            if self._is_no_position_error(e):
+                synced = await self._sync_closed_externally(pos, price, reason)
+                if synced:
+                    return synced
             logger.warning("[POS] %s %s close failed: %s", pos.symbol, reason, e)
             return {"event": "ERROR", "symbol": pos.symbol, "detail": f"{reason} close failed: {e}"}
 

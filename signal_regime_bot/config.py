@@ -79,6 +79,9 @@ class Config:
         "SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT"))
     leverage: int             = field(default_factory=lambda: _env_int("LEVERAGE", 20))
     risk_per_trade: float     = field(default_factory=lambda: _env_float("RISK_PER_TRADE", 0.08))
+    # Hard cap on TOTAL concurrent positions across all symbols (not per-symbol).
+    # Same env var name the previous bot on this Railway service used.
+    max_positions_env: int   = field(default_factory=lambda: _env_int("MAX_POSITIONS", 2))
 
     # ── Timeframes (ENV, default per spec) ───────────────────────────────────
     tf_entry: str  = field(default_factory=lambda: os.environ.get("TIMEFRAME_ENTRY", "30m"))
@@ -140,7 +143,7 @@ class Config:
     daily_profit_lock_pct: float = 0.08   # halt new entries: day PnL >= +8%
     loss_streak_limit: int = 3
     loss_streak_cooldown_min: int = 30
-    max_open_positions: int = 0  # 0 = derive from len(symbols) (1 position per symbol)
+    max_open_positions: int = 0  # set in __post_init__ from MAX_POSITIONS (default 2)
 
     # Stop loss / take profit
     sl_atr_period: int = 14
@@ -168,8 +171,10 @@ class Config:
 
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))
-        if self.max_open_positions <= 0:
-            self.max_open_positions = max(1, len(self.symbols))
+        # Hard cap from MAX_POSITIONS, independent of how many symbols are
+        # configured — trading 5 symbols with MAX_POSITIONS=2 still means at
+        # most 2 concurrent positions total, not 5.
+        self.max_open_positions = max(1, self.max_positions_env)
 
     def validate_live(self) -> list[str]:
         """Returns a list of missing/invalid settings that block LIVE trading."""

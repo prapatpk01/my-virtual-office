@@ -196,6 +196,11 @@ class Bot:
         elif ev == "HEALTH_CLOSE":
             await self.telegram.health_close(symbol, event["price"], event["pnl"],
                                              event.get("health_score", 0.0), event.get("weak_count", 0))
+        elif ev == "TP1_THEN_EXTERNAL_CLOSE":
+            # The exchange-side algo closed the FULL position before our TP1
+            # partial fired — no separate TP1 leg happened, just note the
+            # approximate total pnl for the trade.
+            await self.telegram.tp2_hit(symbol, event["price"], event["pnl"])
         elif ev == "ERROR":
             await self.telegram.error(symbol, event.get("detail", "unknown error"))
         # HEALTH_OK / HEALTH_WEAK (not yet confirmed) are logged only, not alerted —

@@ -12,6 +12,7 @@ from the start:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -130,11 +131,22 @@ class ExchangeClient:
     # ── Market data ───────────────────────────────────────────────────────────
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 300) -> list:
-        try:
-            return await self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except Exception as e:
-            logger.error("[DATA] fetch_ohlcv failed %s %s: %s", symbol, timeframe, e)
-            raise
+        # One retry on transient network/timeout errors — OKX candle requests
+        # occasionally time out under load, and without a retry that single
+        # blip skips the whole symbol for this poll cycle instead of just
+        # costing ~1s.
+        last_err = None
+        for attempt in range(2):
+            try:
+                return await self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    logger.warning("[DATA] fetch_ohlcv %s %s attempt 1 failed, retrying: %s",
+                                  symbol, timeframe, e)
+                    await asyncio.sleep(1.0)
+        logger.error("[DATA] fetch_ohlcv failed %s %s after retry: %s", symbol, timeframe, last_err)
+        raise last_err
 
     async def fetch_ticker(self, symbol: str) -> dict:
         if self.paper:
