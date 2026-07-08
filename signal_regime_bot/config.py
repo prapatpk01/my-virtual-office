@@ -49,12 +49,25 @@ def _env_bool(key: str, default: bool) -> bool:
     return default if not val else val.lower() in ("1", "true", "yes")
 
 
+def _env_first(*keys: str, default: str = "") -> str:
+    """First non-empty env var among `keys`, in order — lets a Railway service
+    already configured under the old bot's variable names (EXCHANGE_API_KEY
+    etc.) keep working without the user having to rename anything."""
+    for k in keys:
+        v = os.environ.get(k, "")
+        if v:
+            return v
+    return default
+
+
 @dataclass
 class Config:
     # ── Exchange (ENV) ────────────────────────────────────────────────────────
-    okx_api_key: str        = field(default_factory=lambda: os.environ.get("OKX_API_KEY", ""))
-    okx_secret: str          = field(default_factory=lambda: os.environ.get("OKX_SECRET", ""))
-    okx_passphrase: str      = field(default_factory=lambda: os.environ.get("OKX_PASSPHRASE", ""))
+    # OKX_* is the primary name; EXCHANGE_* is accepted as a fallback alias
+    # (the name the previous bot on this Railway service used).
+    okx_api_key: str        = field(default_factory=lambda: _env_first("OKX_API_KEY", "EXCHANGE_API_KEY"))
+    okx_secret: str          = field(default_factory=lambda: _env_first("OKX_SECRET", "EXCHANGE_API_SECRET"))
+    okx_passphrase: str      = field(default_factory=lambda: _env_first("OKX_PASSPHRASE", "EXCHANGE_PASSPHRASE"))
     paper: bool              = field(default_factory=lambda: _env_bool("PAPER_TRADING", False))
 
     # ── Telegram (ENV) ────────────────────────────────────────────────────────

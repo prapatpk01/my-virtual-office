@@ -2,20 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Build tools needed for yfinance (lxml) and numpy
+# Build tools needed for numpy/pandas/matplotlib
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libxml2-dev libxslt-dev curl \
+    gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
-COPY requirements-trading.txt .
-RUN pip install --no-cache-dir -r requirements-trading.txt
+# Install dependencies — Signal Regime Bias Strategy bot
+COPY signal_regime_bot/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy trading bot source
-COPY app/trading/ ./trading/
-COPY app/run_bot.py .
+# Copy bot source
+COPY signal_regime_bot/ .
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \
   CMD python -c "import os, sys; sys.exit(0)"
 
-CMD ["python", "run_bot.py"]
+CMD ["python", "main.py"]
