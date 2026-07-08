@@ -135,17 +135,37 @@ class Config:
     entry_macd_slow: int = 26
     entry_macd_signal: int = 9
     entry_score_min: float = 70.0
-    # Anti-chase: the HMA cross or MACD histogram zero-cross that qualifies a
-    # setup must have happened within this many 30m bars. Without this, once
-    # HMA/MACD/ROC/EMA15 all line up they can STAY lined up for dozens of bars
-    # deep into an already-mature move — the score keeps qualifying long after
-    # the actual turn happened, so the bot enters chasing instead of at the
-    # genesis of the move. 3 bars = 1.5h on 30m.
-    entry_freshness_bars: int = 3
-    # Anti-chase 2: block entry if price is already this many ATRs away from
-    # EMA15 — i.e. a spike/capitulation candle already happened and the "meat"
-    # of the move is behind us, not ahead.
+    # ── Signal Round Gate (HMA-cross state machine) ─────────────────────────
+    # HMA10 x HMA20 cross = start of a NEW signal round (the ONLY round
+    # trigger). After the cross, the entry score gets `entry_setup_window_bars`
+    # closed bars (setup_age 1..5, cross bar = age 1) to reach threshold:
+    #   - reaches threshold within window -> enter
+    #   - window passes without reaching  -> round cancelled, wait for next cross
+    #   - cross back the other way        -> old round dies, new round starts
+    # One round = at most one entry (consumed on entry, no re-entry same round).
+    entry_setup_window_bars: int = 5
+    # Anti-chase: block entry if price is already this many ATRs away from
+    # EMA15 — a spike/capitulation candle already happened and the "meat" of
+    # the move is behind us, not ahead.
     entry_max_ext_atr: float = 1.8
+    # Market-structure confirmation (reduce false triggers): at least this many
+    # of {break prev candle high/low, volume expansion, wick rejection,
+    # liquidity sweep} must be present in the trade direction. 0 disables.
+    entry_structure_confirm_min: int = 1
+    entry_vol_expansion_mult: float = 1.5   # volume > this x vol_ma20 = expansion
+    entry_wick_reject_frac: float = 0.5     # wick >= this fraction of bar range
+    entry_sweep_lookback: int = 10          # bars for liquidity-sweep prior low/high
+
+    # ── Bias confidence (1H) ─────────────────────────────────────────────────
+    # Confidence 0-100 from: 1H ADX, RSI slope, EMA20 slope, volume confirm,
+    # pullback zone. High confidence relaxes the entry threshold slightly;
+    # low confidence tightens it.
+    bias_conf_adx_strong: float = 25.0   # ADX >= this -> full ADX points
+    bias_conf_adx_ok: float = 18.0       # ADX >= this -> partial ADX points
+    bias_conf_high: float = 70.0         # conf >= this -> entry_thr - 5
+    bias_conf_low: float = 40.0          # conf <  this -> entry_thr + 10
+    bias_conf_high_adj: float = -5.0
+    bias_conf_low_adj: float = 10.0
 
     # Risk manager
     risk_min_pct: float = 0.05

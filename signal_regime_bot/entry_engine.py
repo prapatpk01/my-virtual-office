@@ -35,6 +35,14 @@ class EntryResult:
     components: dict = field(default_factory=dict)
     fresh: bool = False
     fresh_reason: str = ""
+    # Signal Round Gate: identity of the trigger event (HMA cross / MACD
+    # zero-cross) that opened the current entry window — the timestamp of the
+    # bar where the flip landed. One round = at most ONE entry: the caller
+    # records the round_id it traded and refuses to re-enter the same round,
+    # so a stop-out can't be immediately re-chased on the same (failed) setup.
+    # None = no qualifying trigger within the lookback (no open round).
+    round_id: object = None
+    round_age_bars: object = None
 
 
 def _bars_since_sign_flip(series: pd.Series, lookback: int = 20) -> Optional[int]:
@@ -64,6 +72,64 @@ def _bars_since_sign_flip(series: pd.Series, lookback: int = 20) -> Optional[int
         if newer_sign == cur_sign and older_sign != 0 and older_sign != cur_sign:
             return back
     return None
+
+
+def _structure_confirms(df_30m: pd.DataFrame, c: Config) -> tuple[list, list]:
+    """
+    Market-structure confirmations on the last CLOSED bar, per direction.
+    Returns (long_confirms, short_confirms) — lists of short labels:
+      'break'  — close beyond the previous candle's high (long) / low (short)
+      'vol'    — volume expansion vs the 20-bar average
+      'wick'   — rejection wick (lower wick for long, upper for short)
+      'sweep'  — liquidity sweep: pierced the prior N-bar low (long) / high
+                 (short) intrabar, then closed back inside
+    """
+    long_c: list = []
+    short_c: list = []
+    if len(df_30m) < max(22, c.entry_sweep_lookback + 2):
+        return long_c, short_c
+
+    o = float(df_30m["open"].iloc[-1])
+    h = float(df_30m["high"].iloc[-1])
+    l = float(df_30m["low"].iloc[-1])
+    cl = float(df_30m["close"].iloc[-1])
+    prev_h = float(df_30m["high"].iloc[-2])
+    prev_l = float(df_30m["low"].iloc[-2])
+
+    # break of previous candle high/low
+    if cl > prev_h:
+        long_c.append("break")
+    if cl < prev_l:
+        short_c.append("break")
+
+    # volume expansion (direction-neutral signal, credited to the bar's side)
+    vol = float(df_30m["volume"].iloc[-1])
+    vol_ma = float(df_30m["volume"].iloc[-21:-1].mean())
+    if vol_ma > 0 and vol >= c.entry_vol_expansion_mult * vol_ma:
+        if cl >= o:
+            long_c.append("vol")
+        if cl <= o:
+            short_c.append("vol")
+
+    # wick rejection on the current bar
+    rng = max(h - l, 1e-12)
+    lower_wick = (min(o, cl) - l) / rng
+    upper_wick = (h - max(o, cl)) / rng
+    if lower_wick >= c.entry_wick_reject_frac:
+        long_c.append("wick")
+    if upper_wick >= c.entry_wick_reject_frac:
+        short_c.append("wick")
+
+    # liquidity sweep of the prior N-bar extreme
+    lb = c.entry_sweep_lookback
+    prior_low = float(df_30m["low"].iloc[-(lb + 1):-1].min())
+    prior_high = float(df_30m["high"].iloc[-(lb + 1):-1].max())
+    if l < prior_low and cl > prior_low:
+        long_c.append("sweep")
+    if h > prior_high and cl < prior_high:
+        short_c.append("sweep")
+
+    return long_c, short_c
 
 
 class EntryEngine:
@@ -110,40 +176,50 @@ class EntryEngine:
         close_up   = float(closes.iloc[-1]) > float(opens.iloc[-1])
         close_down = float(closes.iloc[-1]) < float(opens.iloc[-1])
 
-        # ── Freshness gate 1: the setup must be something HAPPENING NOW, not
-        # something that already ran its course many bars ago while the score
-        # merely stayed in the entry zone. Anchor on whichever trigger is most
-        # recent — HMA fast/slow crossing, or the MACD histogram crossing zero
-        # (a fresh momentum re-acceleration even without a literal HMA cross,
-        # e.g. a pullback-then-resume). If neither happened within
-        # entry_freshness_bars, the move is "old news" — wait for the next round.
+        # ── Signal Round Gate: HMA10 x HMA20 cross = start of a new round.
+        # The cross is the ONLY round trigger (the state machine the user
+        # specified: cross -> setup opens -> the entry score gets
+        # entry_setup_window_bars closed bars to reach threshold -> enter, or
+        # the round is cancelled; a cross back the other way kills the old
+        # round and starts a fresh one automatically — the flip age resets).
+        # setup_age is 1-based: the cross bar itself is age 1, per the spec's
+        # "count the entry score within the next 1-5 bars".
         hma_diff = hma_fast - hma_slow
-        hma_flip_bars  = _bars_since_sign_flip(hma_diff, lookback=20)
-        macd_flip_bars = _bars_since_sign_flip(hist, lookback=20)
+        hma_flip_bars = _bars_since_sign_flip(hma_diff, lookback=20)
 
-        def _fresh_within(bars: Optional[int]) -> bool:
-            return bars is not None and bars <= c.entry_freshness_bars
+        long_anchor  = hma_flip_bars if hf_now > hs_now else None
+        short_anchor = hma_flip_bars if hf_now < hs_now else None
+        round_id_long  = df_30m.index[-1 - long_anchor]  if long_anchor  is not None else None
+        round_id_short = df_30m.index[-1 - short_anchor] if short_anchor is not None else None
+        setup_age_long  = (long_anchor + 1)  if long_anchor  is not None else None
+        setup_age_short = (short_anchor + 1) if short_anchor is not None else None
 
-        flip_fresh_long  = (_fresh_within(hma_flip_bars)  and hf_now > hs_now) or \
-                           (_fresh_within(macd_flip_bars) and hist_now > 0)
-        flip_fresh_short = (_fresh_within(hma_flip_bars)  and hf_now < hs_now) or \
-                           (_fresh_within(macd_flip_bars) and hist_now < 0)
+        window = c.entry_setup_window_bars
+        in_window_long  = setup_age_long  is not None and setup_age_long  <= window
+        in_window_short = setup_age_short is not None and setup_age_short <= window
 
-        # ── Freshness gate 2: don't chase a spike that already happened. If
-        # price is already far (in ATR terms) from EMA15, the move's "meat" is
-        # behind us — this is what let the bot short XAG right at the bottom
-        # of a capitulation candle with a huge volume spike (bias/regime were
-        # legitimately BEAR/TREND from the established multi-hour decline, but
-        # the ENTRY itself fired chasing the final spike, not near its start).
+        # ── Anti-chase: don't enter a round whose move already ran away. If
+        # price is far (in ATR terms) from EMA15, the spike already happened —
+        # this is what let the bot short XAG at the bottom of a capitulation
+        # candle. A young round can still be a bad round.
         atr_val = float(ind.atr(df_30m, c.sl_atr_period).iloc[-1])
         ext_atr = abs(price - e15) / atr_val if (atr_val and atr_val > 0 and not np.isnan(atr_val)) else 0.0
         not_overextended = ext_atr <= c.entry_max_ext_atr
 
-        fresh_long  = flip_fresh_long  and not_overextended
-        fresh_short = flip_fresh_short and not_overextended
-        fresh_reason = (f"hma_flip={hma_flip_bars} macd_flip={macd_flip_bars} "
-                       f"(need <= {c.entry_freshness_bars} bars)  ext={ext_atr:.1f}ATR "
-                       f"(max {c.entry_max_ext_atr})")
+        # ── Market-structure confirmation (reduce false triggers): at least
+        # entry_structure_confirm_min of these must back the direction —
+        # break of previous candle high/low, volume expansion, wick rejection,
+        # liquidity sweep.
+        struct_long, struct_short = _structure_confirms(df_30m, c)
+        struct_ok_long  = len(struct_long)  >= c.entry_structure_confirm_min
+        struct_ok_short = len(struct_short) >= c.entry_structure_confirm_min
+
+        fresh_long  = in_window_long  and not_overextended and struct_ok_long
+        fresh_short = in_window_short and not_overextended and struct_ok_short
+        fresh_reason = (f"setup_age: long={setup_age_long} short={setup_age_short} "
+                       f"(window <= {window})  ext={ext_atr:.1f}ATR (max {c.entry_max_ext_atr})  "
+                       f"struct: long={struct_long or '-'} short={struct_short or '-'} "
+                       f"(need >= {c.entry_structure_confirm_min})")
 
         # ── LONG components ───────────────────────────────────────────────────
         lc = {
@@ -166,9 +242,11 @@ class EntryEngine:
         short_score = sum(sc.values())
 
         long_res  = EntryResult(LONG  if long_score  > 0 else NONE, long_score,  price, lc,
-                                fresh=fresh_long, fresh_reason=fresh_reason)
+                                fresh=fresh_long, fresh_reason=fresh_reason,
+                                round_id=round_id_long, round_age_bars=setup_age_long)
         short_res = EntryResult(SHORT if short_score > 0 else NONE, short_score, price, sc,
-                                fresh=fresh_short, fresh_reason=fresh_reason)
+                                fresh=fresh_short, fresh_reason=fresh_reason,
+                                round_id=round_id_short, round_age_bars=setup_age_short)
         return long_res, short_res
 
 
@@ -181,6 +259,8 @@ class FinalSignal:
     bias: BiasResult
     price: float
     reason: str = ""
+    round_id: object = None      # trigger-bar timestamp of the signal round
+    round_age_bars: object = None
 
 
 class SignalEngine:
@@ -194,10 +274,26 @@ class SignalEngine:
 
     def evaluate(self, df_30m: pd.DataFrame, df_1h: pd.DataFrame,
                 df_4h: pd.DataFrame) -> FinalSignal:
+        sig = self._evaluate_core(df_30m, df_1h, df_4h)
+        # Always expose round info (even on NONE results) so the status log
+        # and callers can see where the current round stands for the active
+        # bias side — not just on confirmed entries.
+        if sig.round_id is None and self._last_results is not None:
+            long_res, short_res = self._last_results
+            active = (long_res if sig.bias.bias == BIAS_BULL
+                      else short_res if sig.bias.bias == BIAS_BEAR else None)
+            if active is not None:
+                sig.round_id = active.round_id
+                sig.round_age_bars = active.round_age_bars
+        return sig
+
+    def _evaluate_core(self, df_30m: pd.DataFrame, df_1h: pd.DataFrame,
+                       df_4h: pd.DataFrame) -> FinalSignal:
         c = self.cfg
         regime = self.regime_engine.analyze(df_4h)
         bias = self.bias_engine.analyze(df_1h)
         long_res, short_res = self.entry_engine.analyze(df_30m)
+        self._last_results = (long_res, short_res)
 
         price = long_res.price or short_res.price or (
             float(df_30m["close"].iloc[-1]) if len(df_30m) else 0.0)
@@ -211,6 +307,14 @@ class SignalEngine:
         entry_thr = c.entry_score_min + regime.entry_threshold_adj
         bias_thr  = c.bias_score_min + regime.bias_threshold_adj
 
+        # Bias confidence modulates entry strictness: a well-backed bias
+        # (strong ADX, aligned RSI/EMA slopes, volume, price at value) may
+        # enter slightly easier; a shaky one must clear a higher bar.
+        if bias.confidence >= c.bias_conf_high:
+            entry_thr += c.bias_conf_high_adj
+        elif bias.confidence < c.bias_conf_low:
+            entry_thr += c.bias_conf_low_adj
+
         if bias.bias == BIAS_BULL:
             if bias.bull_score < bias_thr:
                 return FinalSignal(NONE, long_res.score, long_res.components, regime, bias,
@@ -218,10 +322,11 @@ class SignalEngine:
             if long_res.score >= entry_thr:
                 if not long_res.fresh:
                     return FinalSignal(NONE, long_res.score, long_res.components, regime, bias,
-                                       price, f"score qualifies but not fresh — {long_res.fresh_reason} "
+                                       price, f"score qualifies but round not open — {long_res.fresh_reason} "
                                        f"— waiting for next signal round")
                 return FinalSignal(LONG, long_res.score, long_res.components, regime, bias,
-                                   price, "long entry confirmed")
+                                   price, "long entry confirmed",
+                                   round_id=long_res.round_id, round_age_bars=long_res.round_age_bars)
             return FinalSignal(NONE, long_res.score, long_res.components, regime, bias, price,
                                f"entry score {long_res.score:.0f} < {entry_thr:.0f}")
 
@@ -232,10 +337,11 @@ class SignalEngine:
             if short_res.score >= entry_thr:
                 if not short_res.fresh:
                     return FinalSignal(NONE, short_res.score, short_res.components, regime, bias,
-                                       price, f"score qualifies but not fresh — {short_res.fresh_reason} "
+                                       price, f"score qualifies but round not open — {short_res.fresh_reason} "
                                        f"— waiting for next signal round")
                 return FinalSignal(SHORT, short_res.score, short_res.components, regime, bias,
-                                   price, "short entry confirmed")
+                                   price, "short entry confirmed",
+                                   round_id=short_res.round_id, round_age_bars=short_res.round_age_bars)
             return FinalSignal(NONE, short_res.score, short_res.components, regime, bias, price,
                                f"entry score {short_res.score:.0f} < {entry_thr:.0f}")
 

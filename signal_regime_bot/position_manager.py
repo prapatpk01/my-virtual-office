@@ -49,6 +49,7 @@ class Position:
     tp2: float
     one_r: float                 # initial |entry - sl|
     tp1_hit: bool = False
+    realized_pnl: float = 0.0    # accumulated pnl from partial closes (TP1 leg)
     opened_at: float = field(default_factory=time.time)
     regime_at_entry: str = ""
     bias_at_entry: str = ""
@@ -331,7 +332,8 @@ class PositionManager:
                    "synced internal state, pnl≈%.2f (approximate, exact fill unknown)",
                    pos.symbol, reason, pnl)
         return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": price,
-               "pnl": pnl, "position": pos, "approximate": True}
+               "pnl": pnl, "trade_pnl": pos.realized_pnl + pnl, "tp1_hit": pos.tp1_hit,
+               "entry_price": pos.entry_price, "position": pos, "approximate": True}
 
     async def _close_partial_tp1(self, pos: Position, price: float) -> dict:
         close_amt = round(pos.full_amount * 0.5, 8)
@@ -358,6 +360,7 @@ class PositionManager:
 
         pos.amount = round(pos.amount - close_amt, 8)
         pos.tp1_hit = True
+        pos.realized_pnl += pnl
         pos.stop_loss = pos.entry_price   # exact breakeven
 
         sl_ok = await self.client.move_sl_to_breakeven(
@@ -388,7 +391,8 @@ class PositionManager:
 
         del self._positions[pos.symbol]
         return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": price,
-               "pnl": pnl, "position": pos}
+               "pnl": pnl, "trade_pnl": pos.realized_pnl + pnl, "tp1_hit": pos.tp1_hit,
+               "entry_price": pos.entry_price, "position": pos}
 
     async def process_closed_bar_health(self, symbol: str, df_30m: pd.DataFrame,
                                         regime: RegimeResult, bias: BiasResult) -> Optional[dict]:

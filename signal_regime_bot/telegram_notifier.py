@@ -5,6 +5,7 @@ cooldown activated, OKX API error. Photos (charts) sent via sendPhoto.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import aiohttp
@@ -63,6 +64,38 @@ class TelegramNotifier:
         except Exception as e:
             logger.warning("[TG] sendPhoto failed: %s", e)
             return False
+
+    async def send_text(self, text: str) -> bool:
+        """Plain reply for the command interface."""
+        return await self._send_message(text)
+
+    async def get_updates(self, offset: int, timeout: int = 25) -> list:
+        """
+        Long-poll Telegram getUpdates for incoming commands. Returns the raw
+        update list ([] on error/disabled). Caller tracks the offset.
+        """
+        if not self.enabled:
+            await asyncio.sleep(timeout)
+            return []
+        url = API.format(token=self.token, method="getUpdates")
+        params = {"offset": offset, "timeout": timeout, "allowed_updates": '["message"]'}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=timeout + 15)) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        logger.warning("[TG] getUpdates %s: %s", r.status, body[:200])
+                        await asyncio.sleep(3)
+                        return []
+                    data = await r.json()
+                    return data.get("result", []) if data.get("ok") else []
+        except asyncio.TimeoutError:
+            return []
+        except Exception as e:
+            logger.warning("[TG] getUpdates failed: %s", e)
+            await asyncio.sleep(3)
+            return []
 
     # ── Formatted alerts ──────────────────────────────────────────────────────
 

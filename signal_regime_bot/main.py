@@ -55,9 +55,17 @@ class Bot:
         self._last_entry_bar: dict[str, pd.Timestamp] = {}
         self._last_signal_by_symbol: dict[str, object] = {}
         self._symbol_cooldown_until: dict[str, float] = {}
+        # Signal Round Gate: round_id (trigger-bar timestamp) already traded,
+        # per symbol — one round is allowed at most ONE entry, so a stop-out
+        # can't be re-chased on the same setup; a NEW trigger event (new
+        # round_id) is required before the symbol can enter again.
+        self._consumed_round: dict[str, object] = {}
         self._daily_alert_sent = False
         self._cooldown_alert_sent = False
         self._last_status_log_ts = 0.0
+        self._trade_log: list[dict] = []      # closed trades (for /stats, /trades)
+        self._cmd_task = None                 # Telegram command polling task
+        self._tg_offset = 0
         self._running = False
 
     async def start(self):
@@ -91,9 +99,18 @@ class Bot:
             )
 
         self._running = True
+        if self.telegram.enabled:
+            self._cmd_task = asyncio.create_task(self._command_loop())
+            logger.info("Telegram command interface active (/help)")
 
     async def stop(self):
         self._running = False
+        if self._cmd_task:
+            self._cmd_task.cancel()
+            try:
+                await self._cmd_task
+            except asyncio.CancelledError:
+                pass
         await self.client.close()
         logger.info("Bot stopped cleanly.")
 
@@ -179,6 +196,14 @@ class Bot:
             logger.debug("[%s] no signal: %s", symbol, sig.reason)
             return
 
+        # Signal Round Gate: one round = one entry, ever. If this round's
+        # trigger bar was already traded (entered and later stopped/closed),
+        # do NOT re-enter on the same round — wait for a new trigger event.
+        if sig.round_id is not None and self._consumed_round.get(symbol) == sig.round_id:
+            logger.info("[%s] signal round %s already traded — waiting for a new round",
+                       symbol, sig.round_id)
+            return
+
         risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
         chart_path = build_entry_chart(
             symbol, df_30m, sig.direction, sig.price,
@@ -189,6 +214,10 @@ class Bot:
             symbol, sig.direction, sig.price, df_30m, sig.regime, sig.bias, sig.entry_score)
         if pos is None:
             return
+
+        # Mark this signal round as traded — no re-entry on the same round.
+        if sig.round_id is not None:
+            self._consumed_round[symbol] = sig.round_id
 
         await self.telegram.entry_signal(
             symbol, sig.direction, pos.entry_price, pos.stop_loss, pos.tp1, pos.tp2,
@@ -244,6 +273,18 @@ class Bot:
             self._symbol_cooldown_until[symbol] = time.time() + cooldown_sec
             logger.info("[%s] closed (%s) — cooldown %d min before next entry",
                        symbol, ev, self.cfg.symbol_cooldown_min)
+            # Trade log for /stats and /trades. trade_pnl = FULL trade total
+            # (TP1 partial leg + final leg), tp1_hit drives the win rule:
+            # a TP1-then-breakeven exit counts as a WIN.
+            self._trade_log.append({
+                "time": time.time(), "symbol": symbol,
+                "side": event.get("side", ""), "reason": ev,
+                "entry": float(event.get("entry_price", 0.0) or 0.0),
+                "exit": float(event.get("price", 0.0) or 0.0),
+                "tp1_hit": bool(event.get("tp1_hit", False)),
+                "pnl": float(event.get("trade_pnl", event.get("pnl", 0.0)) or 0.0),
+            })
+            del self._trade_log[:-200]   # keep the last 200 trades
 
     async def _check_global_alerts(self):
         now = time.time()
@@ -267,6 +308,129 @@ class Bot:
         elif not in_cd:
             self._cooldown_alert_sent = False
 
+    # ── Telegram command interface ───────────────────────────────────────────
+
+    async def _command_loop(self):
+        """Long-poll Telegram for /commands from the configured chat."""
+        while self._running:
+            try:
+                updates = await self.telegram.get_updates(self._tg_offset + 1)
+                for u in updates:
+                    self._tg_offset = max(self._tg_offset, int(u.get("update_id", 0)))
+                    msg = u.get("message") or {}
+                    chat_id = str((msg.get("chat") or {}).get("id", ""))
+                    text = (msg.get("text") or "").strip()
+                    if chat_id != str(self.telegram.chat_id) or not text.startswith("/"):
+                        continue
+                    try:
+                        await self._handle_command(text.split("@")[0].lower())
+                    except Exception as ce:
+                        logger.warning("[TG-CMD] %s failed: %s", text, ce)
+                        await self.telegram.send_text(f"command failed: {ce}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("[TG-CMD] loop error: %s", e)
+                await asyncio.sleep(5)
+
+    async def _handle_command(self, cmd: str):
+        if cmd in ("/help", "/start"):
+            await self.telegram.send_text(
+                "🤖 *Signal Regime Bias Bot*\n\n"
+                "/help — รายการคำสั่ง\n"
+                "/stats — สถิติเทรด (winrate, TP1/TP2 rate)\n"
+                "/balance — ยอด USDT ปัจจุบัน\n"
+                "/positions — position ที่เปิดอยู่\n"
+                "/trades — 5 เทรดล่าสุด\n"
+                "/status — regime/bias/score ทุก symbol"
+            )
+        elif cmd == "/balance":
+            bal = await self.client.fetch_balance_usdt()
+            day = self.risk.state
+            day_pnl = day.day_realized_pnl
+            await self.telegram.send_text(
+                f"💰 *Balance*: `{bal:.2f}` USDT\n"
+                f"Today PnL: `{day_pnl:+.2f}` USDT\n"
+                f"Open positions: `{self.positions.open_position_count()}`/"
+                f"`{self.cfg.max_open_positions}`"
+            )
+        elif cmd == "/positions":
+            lines = []
+            for sym in self.cfg.symbols:
+                pos = self.positions.get(sym)
+                if pos is None:
+                    continue
+                lines.append(
+                    f"`{sym}` *{pos.side.upper()}* @ `{pos.entry_price:.6g}`\n"
+                    f"  amt `{pos.amount:.6g}`  SL `{pos.stop_loss:.6g}`"
+                    f"  TP1 `{(f'{pos.tp1:.6g}' if pos.tp1 else '-')}`  TP2 `{pos.tp2:.6g}`"
+                    f"  TP1hit: {'✅' if pos.tp1_hit else '—'}"
+                )
+            await self.telegram.send_text(
+                "📊 *Open Positions*\n\n" + ("\n".join(lines) if lines else "no open positions"))
+        elif cmd == "/trades":
+            last = self._trade_log[-5:]
+            if not last:
+                await self.telegram.send_text("no closed trades yet")
+                return
+            lines = []
+            for t in reversed(last):
+                ts = time.strftime("%m-%d %H:%M", time.gmtime(t["time"]))
+                win = t["pnl"] > 0 or t["tp1_hit"]
+                lines.append(
+                    f"{'🟢' if win else '🔴'} `{t['symbol']}` {t['side'].upper()} "
+                    f"{t['reason']}  pnl `{t['pnl']:+.2f}`  {ts}")
+            await self.telegram.send_text("🧾 *Last 5 Trades*\n\n" + "\n".join(lines))
+        elif cmd == "/stats":
+            await self.telegram.send_text(self._stats_text())
+        elif cmd == "/status":
+            lines = []
+            now = time.time()
+            for sym in self.cfg.symbols:
+                sig = self._last_signal_by_symbol.get(sym)
+                pos = self.positions.get(sym)
+                pos_label = f"OPEN {pos.side.upper()}" if pos else "flat"
+                if sig is None:
+                    lines.append(f"`{sym}` {pos_label} — no data yet")
+                    continue
+                cd = self._symbol_cooldown_until.get(sym, 0)
+                cd_lb = f" cd={max(0,(cd-now))/60:.0f}m" if cd > now else ""
+                lines.append(
+                    f"`{sym}` {pos_label}\n"
+                    f"  regime `{sig.regime.name}`({sig.regime.score:.0f}) "
+                    f"bias `{sig.bias.bias}`({max(sig.bias.bull_score, sig.bias.bear_score):.0f}) "
+                    f"conf `{sig.bias.confidence:.0f}`\n"
+                    f"  entry `{sig.entry_score:.0f}` dir `{sig.direction}` "
+                    f"round `{sig.round_age_bars if sig.round_age_bars is not None else '-'}`{cd_lb}")
+            await self.telegram.send_text("📡 *Status*\n\n" + "\n".join(lines))
+        else:
+            await self.telegram.send_text(f"unknown command: {cmd} — try /help")
+
+    def _stats_text(self) -> str:
+        trades = self._trade_log
+        total = len(trades)
+        if total == 0:
+            return "📈 *Stats*\n\nno closed trades yet"
+        # Win rule (per spec): TP1 hit then stopped at breakeven still counts
+        # as a WIN — the trade banked the TP1 partial.
+        wins = [t for t in trades if t["pnl"] > 0 or t["tp1_hit"]]
+        losses = total - len(wins)
+        tp1 = [t for t in trades if t["tp1_hit"]]
+        tp2 = [t for t in trades if t["reason"] == "TP2_HIT"]
+        net = sum(t["pnl"] for t in trades)
+        winrate = len(wins) / total * 100
+        tp1_of_wins = (len(tp1) / len(wins) * 100) if wins else 0.0
+        tp2_of_total = len(tp2) / total * 100
+        return (
+            "📈 *Stats*\n\n"
+            f"Trades: `{total}`  Win: `{len(wins)}`  Loss: `{losses}`\n"
+            f"Winrate: `{winrate:.0f}%` _(TP1→SL counts as win)_\n"
+            f"TP1 hit: `{len(tp1)}` — `{tp1_of_wins:.0f}%` of wins "
+            f"(win {len(wins)} tp1 {len(tp1)}={tp1_of_wins:.0f}%)\n"
+            f"TP2 hit: `{len(tp2)}` — `{tp2_of_total:.0f}%` of trades\n"
+            f"Net PnL: `{net:+.2f}` USDT"
+        )
+
     async def _maybe_log_status(self):
         """Per-symbol regime/bias/entry snapshot, every status_log_interval_sec
         (default 5 min) — uses the signal already computed this tick in
@@ -287,12 +451,18 @@ class Bot:
                 continue
             cd_until = self._symbol_cooldown_until.get(symbol, 0)
             cd_label = f" cooldown={max(0,(cd_until-now))/60:.0f}m" if cd_until > now else ""
+            if sig.round_age_bars is not None:
+                used = (sig.round_id is not None
+                        and self._consumed_round.get(symbol) == sig.round_id)
+                round_label = f" round={sig.round_age_bars}bar{'(used)' if used else ''}"
+            else:
+                round_label = " round=none"
             logger.info(
-                "  %-16s %-24s regime=%-12s(%.0f) bias=%-8s(%.0f) entry=%.0f dir=%s%s",
+                "  %-16s %-24s regime=%-12s(%.0f) bias=%-8s(%.0f) entry=%.0f dir=%s%s%s",
                 symbol, pos_label,
                 sig.regime.name, sig.regime.score,
                 sig.bias.bias, max(sig.bias.bull_score, sig.bias.bear_score),
-                sig.entry_score, sig.direction, cd_label,
+                sig.entry_score, sig.direction, round_label, cd_label,
             )
 
 

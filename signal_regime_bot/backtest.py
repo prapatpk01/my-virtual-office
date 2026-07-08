@@ -136,6 +136,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
     tp1_hit = False
     weak_count = 0
     last_health_i = -1
+    consumed_round = None   # Signal Round Gate: round_id already traded
 
     n = len(df_30m)
     warmup = max(cfg.min_bars, 60)
@@ -272,6 +273,10 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
         if sig.direction not in (LONG, SHORT):
             continue
 
+        # Signal Round Gate: one round = one entry (same rule as main.py).
+        if sig.round_id is not None and sig.round_id == consumed_round:
+            continue
+
         entry_px = float(df_30m["open"].iloc[i + 1])
         entry_px *= (1 + SLIPPAGE) if sig.direction == LONG else (1 - SLIPPAGE)
 
@@ -301,6 +306,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
         )
         pos.pnl_usd = -entry_fee
         balance -= entry_fee
+        consumed_round = sig.round_id   # this round is now traded — no re-entry on it
         tp1_hit, weak_count, last_health_i = False, 0, -1
 
     return trades
