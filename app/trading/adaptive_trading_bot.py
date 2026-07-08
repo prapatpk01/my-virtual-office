@@ -1,47 +1,45 @@
 """
-Adaptive Trading Bot — v8.0  SwingReversalPro + MeanReversion
-==============================================================
-7 major improvements from V7:
+Adaptive Trading Bot — v9.0  Multi-Layer AI Decision Engine
+============================================================
+3-layer pipeline replacing the old 8-state flat classifier:
 
-[V8-1] Market State Engine — 8 states redesigned:
-       STRONG_TREND / TRENDING / SIDEWAY / LOW_VOL / HIGH_VOL
-       EXHAUSTION / BREAKOUT / REVERSAL
-       Using: ADX, ATR%, EMA Slope, BB Width, Volume, RSI
-       Tradeable: STRONG_TREND, TRENDING, BREAKOUT, REVERSAL, HIGH_VOL, EXHAUSTION, SIDEWAY
-       Skip: LOW_VOL immediately
+  L1  4H MacroTrendEngine
+      EMA20/50 cross · EMA slope · ADX+DI direction · efficiency ratio
+      ATR regime · structure score
+      → Trend Score 0-100 · 5-level label (STRONG_BULL … STRONG_BEAR)
 
-[V8-2] Adaptive Thresholds — RSI/MACD/ADX/ATR gates adapt per market state:
-       TRENDING: RSI<45 (dip-buy)  |  SIDEWAY: RSI<35  |  EXHAUSTION: RSI<50
+  L2  1H ContextBiasEngine
+      7 weighted components: structure(20%) · pattern(20%) · liquidity(15%)
+      · EMA pullback(15%) · RSI(10%) · MACD(10%) · volume(10%)
+      → separate Bull score and Bear score 0-100
 
-[V8-3] Entry Health Score (0-100) — composite quality gate before entry:
-       EMA Trend:20  MACD:15  ADX:15  Volume:15  ATR:10  RSI:10  Pattern:15  State:10
-       ≥75→full position  65-74→reduced  <65→skip
+  L3  RegimeClassifier
+      Combines L1 + L2 + 15M ADX/ATR/BB/RSI/efficiency
+      → 5 regimes: Trend · Range · Breakout · Reversal · Exhaustion
 
-[V8-4] Confidence Score (0-100) — position conviction level:
-       Trend:20  Momentum:20  Volume:15  Volatility:15  Structure:15  Pattern:15
-       95→Strong, 85→Buy, 75→Normal, 65→Weak, <65→Skip
+  Dynamic Strategy Selection (4 strategies per regime):
+      Trend     → EMA_Pullback · ADX_Trend · MACD_Trend · HMA_Trend
+      Range     → RSI_Bounce · BB_Revert · VWAP_Rev · Mean_Rev
+      Breakout  → Volume_Break · ATR_Expand · BOS_Break · BB_Squeeze
+      Reversal  → RSI_Diverge · QM_Pattern · CHOCH_Rev · Exhaust_Rev
+      Exhaustion→ RSI_Diverge · CHOCH_Rev · BB_Revert · QM_Pattern
 
-[V8-5] Regime Bias Engine — 5-level trend bias from 4H+1H:
-       STRONG_BULL / BULL / NEUTRAL / BEAR / STRONG_BEAR
-       Long only: BULL, STRONG_BULL
-       Short only: BEAR, STRONG_BEAR
-       NEUTRAL: mean-revert states only (SIDEWAY, REVERSAL)
+  Dynamic Weighting (weights shift per regime):
+      Trend: EMA25% · ADX20% · Momentum20% · Volume15% · Liquidity10% · Pattern10%
+      Range: RSI25% · BB20% · VWAP20% · Volume15% · Liquidity10% · Pattern10%
+      Breakout: Volume25% · ATR20% · Momentum20% · EMA15% · Pattern10% · Liquidity10%
+      Reversal/Exhaustion: RSI25% · Pattern20% · Structure20% · Momentum15% …
 
-[V8-6] Cooldown (tighter):
-       2 consecutive SL hits → 90-min cooldown
-       3 losses in session  → 4-hour cooldown
+  Confidence Engine selects single highest-scoring strategy per signal.
 
-[V8-7] Pattern Learning Engine (simplified, anti-overfit):
-       Track per entry_type: Wins, Losses, Avg R, Avg Hold, Expectancy
-       WR<45% → reduce weight ×0.85 (min 0.5)
-       WR>65% → increase weight ×1.15 (max 1.5)
-
-All V7 infrastructure preserved:
-- State machine (SCANNING→FILTERING→WAIT_CONFIRM→PENDING_ORDER→IN_POSITION→EXITING)
-- Partial TP (TP1 50% + TP2 full), Break-even, ATR Trailing Stop
-- Position Health Calculator, Reversal Spike/Trend Fade protection
-- save_state/load_state/reconcile_with_exchange
-- Daily PnL limits, win-streak risk reduction
+V8 execution infrastructure preserved:
+  - State machine SCANNING→FILTERING→PENDING_ORDER→IN_POSITION→EXITING
+  - 2-target TP: T1=0.5R close 50% + SL→breakeven, T2=1.2R full close
+  - Position Health Calculator, reversal spike / trend-fade protection
+  - save_state / load_state / reconcile_with_exchange
+  - Daily PnL limits · cooldown · win-streak risk reduction
+  - ConditionLearningEngine (Level 0/2/3 adaptive learning)
+  - PatternLearningEngine (per-entry-type WR tracking)
 """
 
 import numpy as np
@@ -57,198 +55,483 @@ from .strategies.mean_reversion import MeanReversionStrategy
 logger = logging.getLogger("adaptive_trading_bot")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# [V9] ADAPTIVE THRESHOLDS — per 8-state market
-# rsi_long/rsi_short feed EntryHealthScorer's RSI sub-component.
-# total_min is the SINGLE gate on the unified 0-100 signal score (see
-# TradingBot._generate_signal) — replaces the old stacked
-# bias/adx/health/confidence AND-chain with one composite threshold.
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# REGIME CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
 
-ADAPTIVE_THRESHOLDS: Dict[str, Dict] = {
-    "STRONG_TREND": {"rsi_long": (38, 65), "rsi_short": (35, 62), "total_min": 55},
-    "TRENDING":     {"rsi_long": (30, 55), "rsi_short": (45, 65), "total_min": 62},
-    "BREAKOUT":     {"rsi_long": (42, 72), "rsi_short": (28, 58), "total_min": 55},
-    "REVERSAL":     {"rsi_long": (25, 45), "rsi_short": (55, 75), "total_min": 62},
-    "SIDEWAY":      {"rsi_long": (28, 48), "rsi_short": (52, 72), "total_min": 68},
-    "HIGH_VOL":     {"rsi_long": (35, 55), "rsi_short": (45, 65), "total_min": 62},
-    # [#4] EXHAUSTION fades the 4H trend — near-zero edge historically, so make
-    # it highly selective: only the strongest aggregate setups pass.
-    "EXHAUSTION":   {"rsi_long": (25, 44), "rsi_short": (56, 75), "total_min": 68},
-    "LOW_VOL":      {"rsi_long": (50, 50), "rsi_short": (50, 50), "total_min": 999},
+# Regime → candidate strategy pool (scored by StrategyScorer, best selected by ConfidenceEngine)
+REGIME_STRATEGIES: Dict[str, List[str]] = {
+    "Trend":      ["EMA_Pullback", "ADX_Trend",    "MACD_Trend",  "HMA_Trend"],
+    "Range":      ["RSI_Bounce",   "BB_Revert",    "VWAP_Rev",    "Mean_Rev"],
+    "Breakout":   ["Volume_Break", "ATR_Expand",   "BOS_Break",   "BB_Squeeze"],
+    "Reversal":   ["RSI_Diverge",  "QM_Pattern",   "CHOCH_Rev",   "Exhaust_Rev"],
+    "Exhaustion": ["RSI_Diverge",  "CHOCH_Rev",    "BB_Revert",   "QM_Pattern"],
 }
 
-# States the bot will trade in — LOW_VOL skipped entirely
-_TRADEABLE_STATES: frozenset = frozenset({
-    "STRONG_TREND", "TRENDING", "BREAKOUT", "REVERSAL",
-    "SIDEWAY", "HIGH_VOL",
-})
-
-# Which states trade counter-direction of Regime Bias
-# (reversal states want OPPOSITE of macro trend)
-_COUNTER_TREND_STATES: frozenset = frozenset({"REVERSAL", "EXHAUSTION"})
-
-# Entry type label per state — for learning engine
-_STATE_ENTRY_TYPE: Dict[str, str] = {
-    "STRONG_TREND": "trend_follow",
-    "TRENDING":     "trend_follow",
-    "BREAKOUT":     "breakout",
-    "REVERSAL":     "reversal",
-    "SIDEWAY":      "mean_revert",
-    "HIGH_VOL":     "momentum",
-    "EXHAUSTION":   "counter_trend",
-    "LOW_VOL":      "none",
+# Per-regime indicator weights (values in each dict must sum to 1.0)
+REGIME_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "Trend": {
+        "ema": 0.25, "adx": 0.20, "momentum": 0.20,
+        "volume": 0.15, "liquidity": 0.10, "pattern": 0.10,
+    },
+    "Range": {
+        "rsi": 0.25, "bb": 0.20, "vwap": 0.20,
+        "volume": 0.15, "liquidity": 0.10, "pattern": 0.10,
+    },
+    "Breakout": {
+        "volume": 0.25, "atr": 0.20, "momentum": 0.20,
+        "ema": 0.15, "pattern": 0.10, "liquidity": 0.10,
+    },
+    "Reversal": {
+        "rsi": 0.25, "pattern": 0.20, "structure": 0.20,
+        "momentum": 0.15, "volume": 0.10, "liquidity": 0.10,
+    },
+    "Exhaustion": {
+        "rsi": 0.25, "pattern": 0.20, "structure": 0.20,
+        "momentum": 0.15, "volume": 0.10, "atr": 0.10,
+    },
 }
 
-# Invert-keys for SHORT scoring (same as V7)
-_DIR_INVERT_KEYS: tuple = ("momentum", "structure", "ema", "vwap", "macd")
+# Minimum composite score (strategy*0.40 + L2ctx*0.30 + L1fit*0.30 - penalty) to generate a signal
+REGIME_THRESHOLDS: Dict[str, int] = {
+    "Trend":      60,
+    "Range":      65,
+    "Breakout":   58,
+    "Reversal":   65,
+    "Exhaustion": 68,
+}
+
+# All 5 regimes are tradeable — no LOW_VOL equivalent in the new pipeline
+_TRADEABLE_REGIMES: frozenset = frozenset({"Trend", "Range", "Breakout", "Reversal", "Exhaustion"})
+
+# Regimes where entries FADE the macro trend (want opposite of L1 direction)
+_COUNTER_REGIMES: frozenset = frozenset({"Reversal", "Exhaustion"})
+
+# Regimes where we use mean-reversion SL calculation (MR strategy's _step14_sl)
+_MR_REGIMES: frozenset = frozenset({"Range", "Reversal", "Exhaustion"})
+
+# Entry-type label per regime (fed into PatternLearningEngine + journal)
+_REGIME_ENTRY_TYPE: Dict[str, str] = {
+    "Trend":      "trend_follow",
+    "Range":      "mean_revert",
+    "Breakout":   "breakout",
+    "Reversal":   "reversal",
+    "Exhaustion": "counter_trend",
+}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# [V8-3] ENTRY HEALTH SCORER
-# 100-pt composite: EMA(20) + MACD(15) + ADX(15) + Volume(15) + ATR(10)
-#                    + RSI(10) + Pattern(15) + Market State(10)
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# L1 — 4H MACRO TREND ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
-class EntryHealthScorer:
-    """Compute a 0-100 entry quality score before opening a position."""
+class MacroTrendEngine:
+    """
+    L1: 4H Macro Trend Engine
+    Inputs: 4H indicators (ema20, ema50, slope, adx, pdi, mdi, eff_ratio,
+            atr_exp, structure_score)
+    Outputs: score 0-100 (100=max bull, 0=max bear), 5-level label, direction
 
-    _STATE_QUALITY = {
-        "STRONG_TREND": 95, "TRENDING": 80, "BREAKOUT": 88,
-        "REVERSAL": 72, "HIGH_VOL": 65, "EXHAUSTION": 68,
-        "SIDEWAY": 60, "LOW_VOL": 5,
+    Component weights:
+      EMA20 vs EMA50 cross & distance : 25%
+      EMA20 slope                      : 20%
+      ADX strength + DI direction      : 20%
+      Efficiency ratio (HH/HL proxy)   : 15%
+      ATR regime (expansion=trending)  : 10%
+      Market structure score           : 10%
+    """
+
+    LEVELS = [
+        (80, "STRONG_BULL"),
+        (60, "BULL"),
+        (40, "NEUTRAL"),
+        (20, "BEAR"),
+        ( 0, "STRONG_BEAR"),
+    ]
+
+    def compute(self, ind_4h: Dict) -> Dict:
+        ema20  = ind_4h.get("ema20", 0.0)
+        ema50  = ind_4h.get("ema50", ema20)
+        slope  = ind_4h.get("ema20_slope_score", 50.0)
+        adx    = ind_4h.get("adx", 20.0)
+        pdi    = ind_4h.get("pdi", 20.0)
+        mdi    = ind_4h.get("mdi", 20.0)
+        atr_e  = ind_4h.get("atr_exp", 1.0)
+        struct = ind_4h.get("structure_score", 50.0)  # price vs EMA20 vs EMA50
+
+        # 1. EMA20 vs EMA50 cross / distance (25%)
+        ref = max(ema50, 1e-9)
+        ema_spread  = (ema20 - ref) / ref
+        ema_score   = float(np.clip(50.0 + ema_spread * 1500.0, 0, 100))
+
+        # 2. EMA20 slope (20%)
+        slope_score = float(np.clip(slope, 0, 100))
+
+        # 3. ADX strength + DI direction (20%)
+        adx_str   = float(np.clip(adx / 45.0 * 100, 0, 100))
+        di_bull   = pdi > mdi
+        adx_score = float(np.clip(50.0 + (1 if di_bull else -1) * adx_str * 0.5, 0, 100)) \
+                    if adx > 12 else 50.0
+
+        # 4. Efficiency ratio — structure_score carries directionality (15%)
+        eff_dir_score = float(np.clip(struct, 0, 100))
+
+        # 5. ATR regime (10%) — atr_exp > 1 = expanding/trending, < 1 = contracting
+        atr_score = float(np.clip(50.0 + (atr_e - 1.0) * 50.0, 0, 100))
+
+        # 6. Structure score (10%) — 15/35/50/65/85 from indicator engine
+        struct_score = float(np.clip(struct, 0, 100))
+
+        score = (
+            ema_score    * 0.25 +
+            slope_score  * 0.20 +
+            adx_score    * 0.20 +
+            eff_dir_score * 0.15 +
+            atr_score    * 0.10 +
+            struct_score * 0.10
+        )
+        score = float(np.clip(score, 0, 100))
+
+        level = "STRONG_BEAR"
+        for threshold, lbl in self.LEVELS:
+            if score >= threshold:
+                level = lbl
+                break
+
+        return {
+            "score":       score,
+            "level":       level,
+            "direction":   1 if score >= 55 else (-1 if score <= 45 else 0),
+            "ema_score":   ema_score,
+            "adx_score":   adx_score,
+            "slope_score": slope_score,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# L2 — 1H CONTEXT BIAS ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ContextBiasEngine:
+    """
+    L2: 1H Context & Bias Engine
+    Returns separate bull_score and bear_score (0-100 each).
+    Caller uses bull_score for LONG candidates, bear_score for SHORT.
+
+    Component weights:
+      Structure (EMA20/50 alignment)  : 20%
+      Pattern (candle clarity)         : 20%
+      Liquidity (momentum proxy)       : 15%
+      EMA pullback (EMA5 vs EMA20)     : 15%
+      RSI (mean-reversion lean)        : 10%
+      MACD (histogram direction)       : 10%
+      Volume (directional confirmation): 10%
+    """
+
+    W = {
+        "structure":    0.20,
+        "pattern":      0.20,
+        "liquidity":    0.15,
+        "ema_pullback": 0.15,
+        "rsi":          0.10,
+        "macd":         0.10,
+        "volume":       0.10,
     }
 
-    def compute(self, ind: Dict, direction: str, market_state: str) -> float:
-        score = 0.0
+    def compute(self, ind_1h: Dict) -> Dict:
+        ema5   = ind_1h.get("ema5",  0.0)
+        ema20  = ind_1h.get("ema20", max(ema5, 1.0))
+        rsi    = ind_1h.get("rsi",   50.0)
+        macd   = ind_1h.get("macd",  0.0)
+        msig   = ind_1h.get("macd_signal", 0.0)
+        vol    = ind_1h.get("volume", 0.0)
+        vavg   = max(ind_1h.get("vol_avg", max(vol, 1e-9)), 1e-9)
+        mom    = ind_1h.get("momentum_score", 50.0)
+        struct = ind_1h.get("structure_score", 50.0)
+        pat    = float(np.clip(ind_1h.get("pattern_score", 50.0), 0, 100))
 
-        # — EMA Trend (20 pts) —
-        ema5  = ind.get("ema5",  ind.get("close", 0))
-        ema20 = ind.get("ema20", ind.get("close", 1))
-        price = ind.get("close", ema5)
-        if direction == "LONG":
-            if price > ema20 and ema5 > ema20:  ema_s = 100.0
-            elif price > ema20:                  ema_s = 60.0
-            else:                                ema_s = 15.0
+        # Structure (directional 15/35/50/65/85 from indicator engine)
+        sb = float(np.clip(struct, 0, 100));       sB = 100.0 - sb
+
+        # Pattern
+        pb = pat;                                  pB = 100.0 - pat
+
+        # Liquidity (momentum_score as sweep/liquidity proxy)
+        lb = float(np.clip(mom, 0, 100));          lB = 100.0 - lb
+
+        # EMA pullback: EMA5 vs EMA20 lean
+        el   = (ema5 - ema20) / max(ema20, 1e-9)
+        eb   = float(np.clip(50.0 + el * 2000.0, 0, 100))
+        eB   = 100.0 - eb
+
+        # RSI (oversold=bullish lean, overbought=bearish)
+        rb   = float(np.clip(50.0 + (50.0 - rsi) * 1.5, 0, 100))
+        rB   = 100.0 - rb
+
+        # MACD histogram direction
+        mhist = macd - msig
+        mstr  = float(np.clip(abs(mhist / max(abs(msig), 1e-9)) * 50.0, 0, 50))
+        mb    = float(np.clip(50.0 + (mstr if mhist > 0 else -mstr), 0, 100))
+        mB    = 100.0 - mb
+
+        # Volume (directionless — slight amplifier, clipped to [30,70])
+        vr  = vol / vavg
+        vb  = float(np.clip(50.0 + (vr - 1.0) * 10.0, 30, 70))
+        vB  = vb
+
+        W = self.W
+        bull = (sb * W["structure"] + pb * W["pattern"] + lb * W["liquidity"] +
+                eb * W["ema_pullback"] + rb * W["rsi"] + mb * W["macd"] + vb * W["volume"])
+        bear = (sB * W["structure"] + pB * W["pattern"] + lB * W["liquidity"] +
+                eB * W["ema_pullback"] + rB * W["rsi"] + mB * W["macd"] + vB * W["volume"])
+
+        return {
+            "bull_score": float(np.clip(bull, 0, 100)),
+            "bear_score": float(np.clip(bear, 0, 100)),
+            "components": {
+                "struct_bull": sb, "pat_bull": pb,
+                "liq_bull":   lb, "ema_bull": eb,
+                "rsi_bull":   rb, "macd_bull": mb,
+            },
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# L3 — MARKET REGIME CLASSIFIER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RegimeClassifier:
+    """
+    L3: Combines L1 macro trend + L2 context + 15M micro indicators
+    to classify into one of 5 regimes.
+
+    Priority order (most specific wins):
+      Exhaustion → Reversal → Breakout → Trend → Range
+    """
+
+    def classify(self, l1: Dict, l2: Dict, ind_15m: Dict) -> Dict:
+        ts    = l1["score"]           # 0-100, 50=neutral
+        bull  = l2["bull_score"]
+        bear  = l2["bear_score"]
+        bias_diff = abs(bull - bear)
+
+        adx   = ind_15m.get("adx",      20.0)
+        atr_e = ind_15m.get("atr_exp",   1.0)
+        bb_w  = ind_15m.get("bb_width",  0.5)
+        rsi   = ind_15m.get("rsi",      50.0)
+        eff   = ind_15m.get("eff_ratio", 0.5)
+
+        # 1. Exhaustion: trend extended + RSI extreme + efficiency collapsing
+        if (ts >= 72 or ts <= 28) and (rsi >= 70 or rsi <= 30) and eff < 0.30 and adx > 18:
+            return {"regime": "Exhaustion", "confidence": 0.85}
+
+        # 2. Reversal: RSI extreme + context losing momentum direction
+        if (rsi >= 67 or rsi <= 33) and bias_diff < 25 and adx > 15 and eff < 0.40:
+            return {"regime": "Reversal", "confidence": 0.78}
+
+        # 3. Breakout: BB compression expanding with ATR
+        if bb_w < 0.25 and atr_e > 1.15 and adx < 22:
+            return {"regime": "Breakout", "confidence": 0.80}
+
+        # 4. Trend: L1 directional + 15M efficiency + L2 context agreement
+        if adx > 20 and eff > 0.38:
+            if (ts >= 58 and bull >= 53) or (ts <= 42 and bear >= 53):
+                return {"regime": "Trend", "confidence": 0.85}
+            if (ts >= 62 or ts <= 38) and adx > 24:
+                return {"regime": "Trend", "confidence": 0.72}
+
+        # 5. Range: balanced / low-energy / choppy
+        if adx < 22 and eff < 0.38 and atr_e < 1.2:
+            return {"regime": "Range", "confidence": 0.75}
+
+        # Fallback
+        if adx > 20 and eff > 0.30:
+            return {"regime": "Trend", "confidence": 0.60}
+        return {"regime": "Range", "confidence": 0.60}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY SCORER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StrategyScorer:
+    """Score each strategy candidate (0-100) for a direction in a given regime."""
+
+    def score(self, strategy: str, direction: str, ind_15m: Dict,
+              l1: Dict, l2: Dict, regime: str) -> float:
+        W   = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["Trend"])
+        dm  = 1 if direction == "LONG" else -1
+
+        ema5   = ind_15m.get("ema5",  0.0)
+        ema20  = ind_15m.get("ema20", max(ema5, 1.0))
+        price  = ind_15m.get("close", ema20)
+        rsi    = ind_15m.get("rsi",   50.0)
+        adx    = ind_15m.get("adx",   20.0)
+        pdi    = ind_15m.get("pdi",   20.0)
+        mdi    = ind_15m.get("mdi",   20.0)
+        macd   = ind_15m.get("macd",  0.0)
+        msig   = ind_15m.get("macd_signal", 0.0)
+        vol    = ind_15m.get("volume",  0.0)
+        vavg   = max(ind_15m.get("vol_avg", max(vol, 1e-9)), 1e-9)
+        atr_e  = ind_15m.get("atr_exp", 1.0)
+        bb_w   = ind_15m.get("bb_width", 0.5)
+        mom    = ind_15m.get("momentum_score", 50.0)
+        struct = ind_15m.get("structure_score", 50.0)
+        pat    = ind_15m.get("pattern_score",   50.0)
+
+        # — EMA lean —
+        ema_lean  = (price - ema20) / max(ema20, 1e-9)
+        ema_raw   = float(np.clip(50.0 + ema_lean * 2000.0 * dm, 0, 100))
+
+        # — ADX + DI direction —
+        adx_str  = float(np.clip(adx / 40.0 * 100, 0, 100))
+        di_ok    = (pdi > mdi) if direction == "LONG" else (mdi > pdi)
+        adx_raw  = float(np.clip(adx_str * (1.0 if di_ok else 0.25), 0, 100))
+
+        # — Momentum (MACD-derived) —
+        mom_raw  = float(np.clip(mom if direction == "LONG" else 100.0 - mom, 0, 100))
+
+        # — RSI (MR regimes want extremes; trend wants healthy mid-zone) —
+        if regime in _MR_REGIMES:
+            rsi_raw = float(np.clip((50.0 - rsi) / 25.0 * 50.0 + 50.0, 0, 100)) if direction == "LONG" \
+                      else float(np.clip((rsi - 50.0) / 25.0 * 50.0 + 50.0, 0, 100))
         else:
-            if price < ema20 and ema5 < ema20:  ema_s = 100.0
-            elif price < ema20:                  ema_s = 60.0
-            else:                                ema_s = 15.0
-        score += ema_s * 0.20
+            rsi_raw = float(np.clip(100.0 - max(0.0, rsi - 60.0) * 5.0 - max(0.0, 38.0 - rsi) * 3.0, 0, 100)) \
+                      if direction == "LONG" \
+                      else float(np.clip(100.0 - max(0.0, 62.0 - rsi) * 5.0 - max(0.0, rsi - 40.0) * 3.0, 0, 100))
 
-        # — MACD (15 pts) —
-        macd        = ind.get("macd", 0.0)
-        macd_signal = ind.get("macd_signal", 0.0)
-        macd_hist   = ind.get("macd_hist", macd - macd_signal)
-        if direction == "LONG":
-            above_sig = macd > macd_signal
-            hist_pos  = macd_hist > 0
-            macd_s = 100.0 if (above_sig and hist_pos) else 65.0 if above_sig else 20.0
-        else:
-            below_sig = macd < macd_signal
-            hist_neg  = macd_hist < 0
-            macd_s = 100.0 if (below_sig and hist_neg) else 65.0 if below_sig else 20.0
-        score += macd_s * 0.15
+        # — BB (tight = good for Range/Reversal; wide = good for Breakout/Trend) —
+        bb_raw   = float(np.clip((0.5 - bb_w) / 0.5 * 100, 0, 100)) \
+                   if regime in ("Range", "Reversal") \
+                   else float(np.clip(bb_w / 0.6 * 100, 0, 100))
 
-        # — ADX (15 pts) —
-        adx = ind.get("adx", 0.0)
-        adx_s = float(np.clip((adx - 10.0) / 30.0 * 100, 0, 100))
-        score += adx_s * 0.15
+        # — Volume —
+        vol_raw  = float(np.clip((vol / vavg) / 2.0 * 100, 0, 100))
 
-        # — Volume (15 pts) —
-        volume  = ind.get("volume", 0)
-        vol_avg = ind.get("vol_avg", volume if volume > 0 else 1)
-        vol_ratio = volume / max(vol_avg, 1e-9)
-        vol_s = float(np.clip(vol_ratio / 2.0 * 100, 0, 100))
-        score += vol_s * 0.15
+        # — ATR expansion —
+        atr_raw  = float(np.clip((atr_e - 0.8) / 1.0 * 100, 0, 100)) \
+                   if regime in ("Breakout", "Trend") \
+                   else float(np.clip((2.0 - atr_e) / 1.5 * 100, 0, 100))
 
-        # — ATR expansion (10 pts) — expanding ATR = momentum
-        atr     = ind.get("atr", 0.0)
-        atr_avg = ind.get("atr_avg", atr if atr > 0 else 1e-9)
-        atr_ratio = atr / max(atr_avg, 1e-9)
-        atr_s = float(np.clip((atr_ratio - 0.5) / 1.5 * 100, 0, 100))
-        score += atr_s * 0.10
+        # — Liquidity (L2 context bias for this direction) —
+        liq_raw  = (l2["bull_score"] if direction == "LONG" else l2["bear_score"])
 
-        # — RSI pullback zone (10 pts) —
-        rsi = ind.get("rsi", 50.0)
-        thrs = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
-        if direction == "LONG":
-            lo, hi = thrs["rsi_long"]
-            rsi_s = 100.0 if lo <= rsi <= hi else 40.0 if rsi < 50 else 10.0
-        else:
-            lo, hi = thrs["rsi_short"]
-            rsi_s = 100.0 if lo <= rsi <= hi else 40.0 if rsi > 50 else 10.0
-        score += rsi_s * 0.10
+        # — Structure —
+        struct_raw = float(np.clip(struct, 0, 100)) if direction == "LONG" \
+                     else float(np.clip(100.0 - struct, 0, 100))
 
-        # — Pattern score (15 pts) — from indicator engine
-        pat_s = float(np.clip(ind.get("pattern_score", 50.0), 0, 100))
-        score += pat_s * 0.15
+        # — Pattern —
+        pat_raw  = float(np.clip(pat, 0, 100)) if direction == "LONG" \
+                   else float(np.clip(100.0 - pat, 0, 100))
 
-        # — Market State quality (10 pts) —
-        st_s = self._STATE_QUALITY.get(market_state, 50.0)
-        score += st_s * 0.10
+        base = (
+            ema_raw    * W.get("ema",       0) +
+            adx_raw    * W.get("adx",       0) +
+            mom_raw    * W.get("momentum",  0) +
+            rsi_raw    * W.get("rsi",       0) +
+            bb_raw     * W.get("bb",        0) +
+            vol_raw    * W.get("volume",    0) +
+            atr_raw    * W.get("atr",       0) +
+            liq_raw    * W.get("liquidity", 0) +
+            struct_raw * W.get("structure", 0) +
+            pat_raw    * W.get("pattern",   0) +
+            ema_raw    * W.get("vwap",      0)   # EMA20 as VWAP proxy
+        )
 
-        return float(np.clip(score, 0, 100))
+        bonus = self._strategy_bonus(strategy, direction, ind_15m)
+        return float(np.clip(base + bonus, 0, 100))
+
+    def _strategy_bonus(self, strategy: str, direction: str, ind_15m: Dict) -> float:
+        rsi   = ind_15m.get("rsi",   50.0)
+        adx   = ind_15m.get("adx",   20.0)
+        ema20 = ind_15m.get("ema20",  0.0)
+        price = ind_15m.get("close", ema20)
+        atr   = max(ind_15m.get("atr",  1e-9), 1e-9)
+        macd  = ind_15m.get("macd",   0.0)
+        msig  = ind_15m.get("macd_signal", 0.0)
+        bb_w  = ind_15m.get("bb_width", 0.5)
+        vol   = ind_15m.get("volume",  0.0)
+        vavg  = max(ind_15m.get("vol_avg", max(vol, 1e-9)), 1e-9)
+        pat   = ind_15m.get("pattern_score", 50.0)
+        atr_e = ind_15m.get("atr_exp", 1.0)
+        struct = ind_15m.get("structure_score", 50.0)
+
+        if strategy == "EMA_Pullback":
+            dist = (price - ema20) / atr if direction == "LONG" else (ema20 - price) / atr
+            if 0 < dist < 1.5:   return 12.0
+            if dist <= 0:        return -5.0
+
+        elif strategy == "ADX_Trend":
+            if adx > 25:    return 12.0
+            if adx < 15:    return -8.0
+
+        elif strategy == "MACD_Trend":
+            return 10.0 if ((macd > msig) if direction == "LONG" else (macd < msig)) else -5.0
+
+        elif strategy == "HMA_Trend":
+            mom = ind_15m.get("momentum_score", 50.0)
+            lean = mom if direction == "LONG" else 100.0 - mom
+            return float(np.clip((lean - 50.0) * 0.2, -8, 10))
+
+        elif strategy == "RSI_Bounce":
+            if direction == "LONG":
+                if rsi < 35: return 15.0
+                if rsi < 45: return  7.0
+            else:
+                if rsi > 65: return 15.0
+                if rsi > 55: return  7.0
+            return -5.0
+
+        elif strategy == "BB_Revert":
+            if bb_w < 0.2:   return 10.0
+            if bb_w > 0.5:   return -5.0
+
+        elif strategy in ("VWAP_Rev", "Mean_Rev"):
+            return float(np.clip(abs(price - ema20) / atr * 5.0, -5, 12))
+
+        elif strategy in ("RSI_Diverge", "Exhaust_Rev", "CHOCH_Rev"):
+            if direction == "LONG":
+                if rsi < 35: return 15.0
+                if rsi < 42: return  8.0
+            else:
+                if rsi > 65: return 15.0
+                if rsi > 58: return  8.0
+            return -8.0
+
+        elif strategy == "QM_Pattern":
+            return float(np.clip((pat - 50.0) * 0.2, -8, 12))
+
+        elif strategy == "Volume_Break":
+            r = vol / vavg
+            if r > 1.8: return 12.0
+            if r > 1.3: return  6.0
+            return -5.0
+
+        elif strategy in ("ATR_Expand", "BB_Squeeze"):
+            if atr_e > 1.3: return 12.0
+            if atr_e > 1.1: return  5.0
+
+        elif strategy == "BOS_Break":
+            return float(np.clip((struct - 50.0) * 0.3, -8, 12))
+
+        return 0.0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# [V8-4] CONFIDENCE SCORER
-# 100-pt conviction: Trend(20) + Momentum(20) + Volume(15) + Volatility(15)
-#                    + Structure(15) + Pattern(15)
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIDENCE ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
-class ConfidenceScorer:
-    """Position-sizing lookup from the unified signal score (0-100)."""
+class ConfidenceEngine:
+    """Select the single highest-scoring strategy for a direction."""
 
-    def get_size_multiplier(self, score: float) -> float:
-        if score >= 85:   return 1.0
-        if score >= 75:   return 1.0
-        if score >= 60:   return 0.65
-        return 0.0  # skip — below all state total_min values
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# [V8-5] REGIME BIAS ENGINE — 5-level macro direction label from 4H + 1H
-# STRONG_BULL / BULL / NEUTRAL / BEAR / STRONG_BEAR
-# Descriptive only (status/logging) — direction compatibility for entries is
-# decided by TradingBot._direction_fit using the continuous regime score.
-# ──────────────────────────────────────────────────────────────────────────────
-
-class RegimeBiasEngine:
-    """5-level directional bias label from 4H and 1H trend structure."""
-
-    def compute(self, ind_4h: Dict, ind_1h: Dict) -> str:
-        score = 0
-
-        # 4H signals — weight 3
-        ema5_4h  = ind_4h.get("ema5",  0.0)
-        ema20_4h = ind_4h.get("ema20", 1.0)
-        slope_4h = ind_4h.get("ema20_slope_score", 50.0)
-        rsi_4h   = ind_4h.get("rsi", 50.0)
-        if ema5_4h > ema20_4h: score += 2
-        elif ema5_4h < ema20_4h: score -= 2
-        if slope_4h > 58:   score += 1
-        elif slope_4h < 42: score -= 1
-        if rsi_4h > 58:     score += 1
-        elif rsi_4h < 42:   score -= 1
-
-        # 1H signals — weight 2
-        ema5_1h  = ind_1h.get("ema5",  0.0)
-        ema20_1h = ind_1h.get("ema20", 1.0)
-        rsi_1h   = ind_1h.get("rsi", 50.0)
-        if ema5_1h > ema20_1h: score += 2
-        elif ema5_1h < ema20_1h: score -= 2
-        if rsi_1h > 55:    score += 1
-        elif rsi_1h < 45:  score -= 1
-
-        if score >= 5:    return "STRONG_BULL"
-        if score >= 2:    return "BULL"
-        if score >= -1:   return "NEUTRAL"
-        if score >= -4:   return "BEAR"
-        return "STRONG_BEAR"
+    def select_best(self, scores: Dict[str, float]) -> Optional[tuple]:
+        """Returns (strategy_name, score) or None if scores is empty."""
+        if not scores:
+            return None
+        best = max(scores, key=scores.__getitem__)
+        return (best, scores[best])
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # [V8-7] PATTERN LEARNING ENGINE — simplified, anti-overfit
 # Tracks per entry_type: WR, Avg R, Avg Hold, Expectancy
 # WR<45% → weight ×0.85 (floor 0.5)   WR>65% → weight ×1.15 (ceil 1.5)
@@ -557,12 +840,14 @@ class TradingBot:
                  enable_swing_reversal: bool = True,
                  enable_mean_reversion: bool = False):
         self.state: str = "SCANNING"
-        self.adaptive_engine   = AdaptiveEngine()
-        self.health_calc       = PositionHealthCalculator()
-        self.entry_scorer      = EntryHealthScorer()
-        self.conf_scorer       = ConfidenceScorer()
-        self.bias_engine       = RegimeBiasEngine()
-        self.learning_engine   = PatternLearningEngine()
+        self.adaptive_engine    = AdaptiveEngine()
+        self.health_calc        = PositionHealthCalculator()
+        self.macro_engine       = MacroTrendEngine()
+        self.context_engine     = ContextBiasEngine()
+        self.regime_clf         = RegimeClassifier()
+        self.strategy_scorer    = StrategyScorer()
+        self.confidence_engine  = ConfidenceEngine()
+        self.learning_engine    = PatternLearningEngine()
         # [LEVEL 2/3] Diagnostic-tag learning + temporary strategy tightening
         # (see ConditionLearningEngine, _diagnose_conditions, _check_strategy_dominance)
         self.condition_engine  = ConditionLearningEngine()
@@ -628,9 +913,12 @@ class TradingBot:
         self.current_trade: Dict     = {}
 
         self.atr_history: List[float]               = []
-        self.current_market_state: str              = "SIDEWAY"
+        self.current_market_state: str              = "Range"
         self.current_regime_bias: str               = "NEUTRAL"
-        self.regime_score: float                    = 0.0
+        self.regime_score: float                    = 50.0
+        self._l1_cache: Dict                        = {}
+        self._l2_cache: Dict                        = {}
+        self._l3_cache: Dict                        = {}
         self.direction_focus: Optional[str]         = None
         self.bars_since_trigger: int                = 0
 
@@ -673,7 +961,8 @@ class TradingBot:
         # so the dominant blocking component is visible without needing LOG_LEVEL=DEBUG)
         self._filter_stats: Dict[str, int] = {
             "checked": 0, "passed": 0,
-            "bias_fail": 0, "health_fail": 0, "confidence_fail": 0,
+            "veto_chop": 0, "veto_climax": 0, "veto_1h_chop": 0,
+            "strategy_fail": 0, "threshold_fail": 0,
         }
 
         # [LESSON] loss-cluster alerting state
@@ -692,6 +981,27 @@ class TradingBot:
         for k in self._filter_stats:
             self._filter_stats[k] = 0
         return stats
+
+    # ── [V9] New helper methods ───────────────────────────────────────────────
+
+    def _compute_l1_fit(self, l1: Dict, direction: str, regime: str) -> float:
+        """0-100 fit of this direction vs L1 macro score.
+        Counter-trend regimes (Reversal/Exhaustion) invert the lean."""
+        lean = (l1["score"] - 50.0) * (1 if direction == "LONG" else -1)
+        if regime in _COUNTER_REGIMES:
+            lean = -lean
+        return float(np.clip(50.0 + lean, 0, 100))
+
+    def _compute_sl_price(self, ind_15m: Dict, candle_15m: Dict,
+                          direction: str, regime: str) -> float:
+        """SL price: MR regimes use MR strategy method; Trend/Breakout use ATR-based."""
+        if regime in _MR_REGIMES:
+            sl_price, _ = self._mr_strategy._step14_sl(ind_15m, candle_15m, direction)
+            return sl_price
+        entry = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
+        atr   = max(ind_15m.get("atr", entry * 0.01), 1e-9)
+        mult  = 1 if direction == "LONG" else -1
+        return entry - atr * 1.5 * mult
 
     # ── [LESSON] loss-cluster detection & post-mortem ────────────────────────
 
@@ -940,92 +1250,9 @@ class TradingBot:
 
         return signals
 
-    # ── [V8-1] MODULE 1: Market State Engine (8 states) ─────────────────────
-
-    def _step1_market_state_engine(self, ind: Dict) -> str:
-        """
-        8-state regime from 4H indicators.
-        Priority: HIGH_VOL → LOW_VOL → BREAKOUT → STRONG_TREND
-                → TRENDING → REVERSAL → EXHAUSTION → SIDEWAY
-        """
-        adx      = ind.get("adx", 0)
-        eff      = ind.get("eff_ratio", 0)
-        atr_exp  = ind.get("atr_exp", 1.0)
-        bb_w     = ind.get("bb_width", 0.5)
-        pdi      = ind.get("pdi", 20)
-        mdi      = ind.get("mdi", 20)
-        rsi      = ind.get("rsi", 50)
-        volume   = ind.get("volume", 0)
-        vol_avg  = ind.get("vol_avg", max(volume, 1))
-        vol_ratio = volume / max(vol_avg, 1e-9)
-
-        # 1. HIGH_VOL — dangerous volatility expansion
-        if atr_exp > 1.8 and bb_w > 0.7:
-            return "HIGH_VOL"
-
-        # 2. LOW_VOL — squeeze, skip
-        if bb_w < 0.2 and atr_exp < 0.8:
-            return "LOW_VOL"
-
-        # 3. BREAKOUT — expanding from compression with volume confirmation.
-        # NOTE: this gate is effectively unreachable on real 4H data (bb_w>0.3
-        # is the ~99.2th percentile jointly with the rest — 0 occurrences in
-        # 5 months × 5 symbols). A recalibrated p75-p90 version (bb_w>0.09,
-        # atr_exp>1.15, vol>1.3) was tested across all 5 symbols and came out
-        # aggregate-neutral-to-negative (-$246 total, XAG -$330), so the state
-        # is intentionally left dormant rather than force-enabled.
-        if bb_w > 0.3 and atr_exp > 1.2 and vol_ratio > 1.4 and adx < 24:
-            return "BREAKOUT"
-
-        # 4. STRONG_TREND — efficient trend, large DI gap
-        if adx > 25 and eff > 0.55 and abs(pdi - mdi) > 8:
-            return "STRONG_TREND"
-
-        # 5. TRENDING — moderate trend with directional dominance
-        if adx > 18 and eff > 0.35 and abs(pdi - mdi) > 3:
-            return "TRENDING"
-
-        # 6. REVERSAL — extreme RSI with fading efficiency
-        if (rsi > 68 or rsi < 32) and adx > 15 and eff < 0.42:
-            return "REVERSAL"
-
-        # 7. EXHAUSTION — elevated ADX but directional efficiency collapsed
-        if adx > 20 and eff < 0.28:
-            return "EXHAUSTION"
-
-        # 8. SIDEWAY — default (ranging/no-trend)
-        return "SIDEWAY"
-
-    # ── Step 2: 4H Regime score ───────────────────────────────────────────────
-
-    def _step2_4h_regime(self, ind: Dict) -> float:
-        score  = self._scale_score(ind.get("ema20_slope_score", 50), 30)
-        score += self._scale_score(ind.get("adx_score",         50), 20)
-        score += self._scale_score(ind.get("eff_score",         50), 20)
-        score += self._scale_score(ind.get("atr_score",         50), 15)
-        score += self._scale_score(ind.get("vol_score",         50), 15)
-        return float(np.clip(score, 0, 100))
-
     # ══════════════════════════════════════════════════════════════════════════
-    # [V9] UNIFIED SIGNAL PIPELINE — 4H regime → 1H context → 15M entry
-    # Replaces the old stacked bias/adx/health/confidence AND-gates with one
-    # composite 0-100 score per candidate direction, gated by a single
-    # `total_min` per market state (ADAPTIVE_THRESHOLDS). MeanReversion and
-    # SwingReversal are folded into one path — the market state alone decides
-    # which entry-scoring style applies (mean-revert vs trend-follow), not a
-    # separate strategy toggle.
+    # [V9] MULTI-LAYER SIGNAL PIPELINE
     # ══════════════════════════════════════════════════════════════════════════
-
-    # States where price is expected to revert to the mean rather than trend
-    _MR_STATES: frozenset = frozenset({"SIDEWAY", "EXHAUSTION", "REVERSAL"})
-
-    # [#3] Minimum standalone 15M entry score — an entry bar below this is
-    # rejected regardless of how strong the 4H/1H alignment is.
-    ENTRY_SCORE_FLOOR: float = 45.0
-
-    # [#2] States where entry-location (buy-the-pullback) preference is applied.
-    # Efficient trends only — moderate/choppy trends trade better on continuation.
-    _LOCATION_STATES: frozenset = frozenset({"STRONG_TREND", "BREAKOUT"})
 
     # TP geometry in R-multiples — TP1_R/TP2_R remain the env-tunable
     # endpoints. Unified 2-target structure (user-designed): T1 takes a
@@ -1231,280 +1458,132 @@ class TradingBot:
             self._log_event(f"[STRATEGY] {msg}", level="warning")
             self._pending_strategy_alerts.append(f"🧠 Adaptive Strategy activated\n{msg}")
 
-    def _regime_direction(self, ind_4h: Dict) -> float:
-        """4H directional lean, continuous -100 (strong bear) .. +100 (strong bull)."""
-        ema5  = ind_4h.get("ema5", 0.0)
-        ema20 = ind_4h.get("ema20", 1.0)
-        slope = ind_4h.get("ema20_slope_score", 50.0)
-        rsi   = ind_4h.get("rsi", 50.0)
-
-        d  = 40.0 * float(np.clip((ema5 - ema20) / max(abs(ema20), 1e-9) * 200, -1, 1))
-        d += 30.0 * float(np.clip((slope - 50.0) / 25.0, -1, 1))
-        d += 30.0 * float(np.clip((rsi - 50.0) / 25.0, -1, 1))
-        return float(np.clip(d, -100, 100))
-
-    def _context_score(self, ind_1h: Dict, direction: str) -> Dict:
-        """
-        1H context — does the mid timeframe support the candidate direction?
-
-        Confluence-count design: rather than blending EMA-lean and RSI-lean
-        into one continuous number (where one badly-wrong input can be
-        diluted/hidden by the others averaging it out), count how many of 4
-        independent 1H signals agree with the candidate direction. Momentum
-        and structure use momentum_score/structure_score — condition scores
-        the indicator engine already computes for every timeframe (magnitude
-        -aware MACD read and EMA5/EMA20/EMA50 stack read respectively) —
-        instead of a cruder local MACD-cross boolean or ignoring structure
-        entirely. ADX (not directional) stays a separate strength weight.
-        """
-        adx             = ind_1h.get("adx", 0.0)
-        rsi             = ind_1h.get("rsi", 50.0)
-        ema5            = ind_1h.get("ema5", 0.0)
-        ema20           = ind_1h.get("ema20", 1.0)
-        momentum_score  = ind_1h.get("momentum_score", 50.0)
-        structure_score = ind_1h.get("structure_score", 50.0)
-
-        h_dir = float(np.clip((ema5 - ema20) / max(abs(ema20), 1e-9) * 200, -1, 1)) * 100.0
-
-        dir_mult = 1 if direction == "LONG" else -1
-        votes = [
-            h_dir * dir_mult > 0,                     # EMA5 vs EMA20 trend
-            (rsi - 50.0) * dir_mult > 0,               # RSI lean
-            (momentum_score - 50.0) * dir_mult > 0,    # MACD strength+direction
-            (structure_score - 50.0) * dir_mult > 0,   # EMA-stack structure
-        ]
-        confluence = sum(votes)   # 0-4 signals agreeing with candidate direction
-
-        score  = (confluence / 4.0) * 100.0 * 0.80
-        score += float(np.clip(adx / 30.0 * 100, 0, 100)) * 0.20
-        return {
-            "score":      float(np.clip(score, 0, 100)),
-            "direction":  h_dir,
-            "confluence": confluence,
-        }
-
-    def _direction_fit(self, market_state: str, regime_direction: float, direction: str) -> float:
-        """
-        0-100 score for whether the candidate direction fits the 4H regime:
-        trend states want agreement, counter-trend states (REVERSAL/EXHAUSTION)
-        want the opposite (fading an exhausted move), SIDEWAY has no bias.
-        """
-        if market_state == "SIDEWAY":
-            return 70.0
-        dir_mult = 1 if direction == "LONG" else -1
-        agree = regime_direction * dir_mult
-        if market_state in _COUNTER_TREND_STATES:
-            agree = -agree
-        return float(np.clip(50.0 + agree / 2.0, 0, 100))
-
-    def _entry_location_score(self, ind_15m: Dict, candle_15m: Dict,
-                              direction: str) -> float:
-        """
-        [#2] 0-100 score for WHERE price is relative to EMA20, in ATR units.
-        For trend entries we want to buy pullbacks, not chase extensions:
-        at/below EMA20 (LONG) → ~100; the further extended above → the lower.
-        Penalty ~40 pts per ATR of extension.
-        """
-        close = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
-        ema20 = ind_15m.get("ema20", close)
-        atr   = max(ind_15m.get("atr", 1e-9), 1e-9)
-        if direction == "LONG":
-            over = (close - ema20) / atr        # >0 = extended above (chasing)
-        else:
-            over = (ema20 - close) / atr        # >0 = extended below (chasing)
-        return float(np.clip(100.0 - max(0.0, over) * 40.0, 0.0, 100.0))
-
-    def _entry_score(self, ind_15m: Dict, candle_15m: Dict, direction: str,
-                     market_state: str) -> Dict:
-        """15M entry trigger — mean-revert scoring for ranging/exhausted states,
-        trend-follow (EntryHealthScorer) scoring otherwise.
-        Returns {score, sl_price, struct_ok}."""
-        if market_state in self._MR_STATES:
-            mr = self._mr_strategy
-            ext_ok    = mr._step3_overextension(ind_15m, candle_15m, direction)
-            sweep_ok  = mr._step4_sweep(ind_15m, candle_15m, direction)
-            struct_ok = mr._step5_structure(ind_15m, direction)
-            mom_ok    = mr._step6_momentum(ind_15m, direction)
-            candle_ok = mr._step7_candle(candle_15m, direction)
-            vol_ok    = mr._step8_volume(ind_15m)
-            score = (
-                (100.0 if ext_ok    else 0.0) * 0.25 +
-                (100.0 if sweep_ok  else 0.0) * 0.20 +
-                (100.0 if struct_ok else 0.0) * 0.20 +
-                (100.0 if mom_ok    else 0.0) * 0.20 +
-                (100.0 if candle_ok else 0.0) * 0.10 +
-                (100.0 if vol_ok    else 0.0) * 0.05
-            )
-            sl_price, _method = mr._step14_sl(ind_15m, candle_15m, direction)
-            return {"score": float(np.clip(score, 0, 100)),
-                    "sl_price": sl_price, "struct_ok": struct_ok}
-
-        # Trend-follow entry: blend market-health quality with entry LOCATION [#2].
-        # Backtest showed the pullback preference helps EFFICIENT trends
-        # (STRONG_TREND, eff>0.55 — pullbacks reliably resume) but HURTS choppier
-        # moderate trends (TRENDING, eff>0.35 — pullbacks often fail, momentum
-        # continuation is better). So apply the location blend only where it pays.
-        health = self.entry_scorer.compute(ind_15m, direction, market_state)
-        if market_state in self._LOCATION_STATES:
-            location = self._entry_location_score(ind_15m, candle_15m, direction)
-            score    = health * 0.70 + location * 0.30
-        else:
-            score    = health
-
-        entry_price = float(candle_15m.get("close", 0.0))
-        if direction == "LONG":
-            sl_price = candle_15m.get("pattern_low", entry_price * 0.99)
-        else:
-            sl_price = candle_15m.get("pattern_high", entry_price * 1.01)
-        return {"score": float(np.clip(score, 0, 100)),
-                "sl_price": sl_price, "struct_ok": True}
-
     def _generate_signal(self, direction: str, candle_15m: Dict, ind_15m: Dict,
-                         ind_1h: Dict, ind_4h: Dict, market_state: str,
-                         regime_direction: float) -> Optional[Dict]:
+                         ind_1h: Dict, ind_4h: Dict,
+                         l1: Dict, l2: Dict, l3: Dict) -> Optional[Dict]:
         """
-        Combine 4H regime fit + 1H context + 15M entry into one 0-100 score,
-        gated by the state's total_min. Tallies rejection reasons for
-        get_filter_stats() diagnostics.
+        V9 3-layer signal pipeline.
+        Scores all regime strategies, selects the best, combines with L2 context
+        and L1 macro fit, gates on REGIME_THRESHOLDS.
         """
-        thrs = ADAPTIVE_THRESHOLDS.get(market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
+        regime     = l3["regime"]
+        threshold  = REGIME_THRESHOLDS.get(regime, 62)
 
-        # [FAKE-FILTER] Chop-zone veto: entries taken while price sits within
-        # MIN_EMA_DIST_ATR of EMA20 have near-zero historical edge (WR ~48.6%,
-        # ~$1/trade) — price has no established direction there and whipsaws
-        # into the SL. Requiring price to have separated from the mean removes
-        # the bulk of straight-to-SL "fake" signals. MR states are exempt (they
-        # deliberately enter at mean extremes, which are already far from EMA).
-        if market_state not in self._MR_STATES:
+        # ── Veto filters (non-MR regimes only) ──────────────────────────────
+        if regime not in _MR_REGIMES:
             _px  = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
             _e20 = ind_15m.get("ema20", _px)
             _atr = max(ind_15m.get("atr", 1e-9), 1e-9)
             if abs(_px - _e20) / _atr < self.MIN_EMA_DIST_ATR:
                 self._filter_stats["checked"] += 1
-                self._filter_stats["health_fail"] += 1
+                self._filter_stats["veto_chop"] += 1
                 self._scan_info[direction] = (
-                    f"veto:chop-zone (dist {abs(_px - _e20) / _atr:.2f} "
-                    f"< {self.MIN_EMA_DIST_ATR} ATR from EMA20)")
+                    f"veto:chop-zone (dist {abs(_px-_e20)/_atr:.2f} "
+                    f"< {self.MIN_EMA_DIST_ATR} ATR)")
                 return None
 
-            # [CLIMAX-VETO] Don't enter on a blow-off bar: a single bar whose
-            # range exceeds CLIMAX_BAR_ATR × ATR is a vertical exhaustion spike
-            # — the exact failure seen live (entry at the top of a climax bar,
-            # momentum dies next bar).
             _rng = float(candle_15m.get("high", _px)) - float(candle_15m.get("low", _px))
             if _rng > self.CLIMAX_BAR_ATR * _atr:
                 self._filter_stats["checked"] += 1
-                self._filter_stats["health_fail"] += 1
+                self._filter_stats["veto_climax"] += 1
                 self._scan_info[direction] = (
-                    f"veto:climax-bar (range {_rng / _atr:.1f} > "
-                    f"{self.CLIMAX_BAR_ATR} ATR)")
+                    f"veto:climax-bar (range {_rng/_atr:.1f} > {self.CLIMAX_BAR_ATR} ATR)")
                 return None
 
-            # [1H CHOP-FILTER] The "confirming" 1H timeframe must itself show
-            # some directional efficiency — a choppy 1H means the confirmation
-            # is noise, no matter how the EMA/RSI/momentum snapshot reads
-            # right now. MR states are exempt (see class docstring above).
             _eff_1h = ind_1h.get("eff_ratio", 0.5)
             if self.MIN_1H_EFFICIENCY > 0 and _eff_1h < self.MIN_1H_EFFICIENCY:
                 self._filter_stats["checked"] += 1
-                self._filter_stats["health_fail"] += 1
+                self._filter_stats["veto_1h_chop"] += 1
                 self._scan_info[direction] = (
                     f"veto:1h-chop (eff {_eff_1h:.2f} < {self.MIN_1H_EFFICIENCY})")
                 return None
 
-        entry = self._entry_score(ind_15m, candle_15m, direction, market_state)
-        ctx   = self._context_score(ind_1h, direction)
-        fit   = self._direction_fit(market_state, regime_direction, direction)
-
-        # [#3] Hard floor on the 15M entry itself — a weak entry bar must not
-        # pass on HTF strength alone. Keeps the bot from entering mediocre bars
-        # just because 4H+1H look aligned.
-        if entry["score"] < self.ENTRY_SCORE_FLOOR:
+        # ── Strategy scoring ─────────────────────────────────────────────────
+        strategy_scores = {
+            s: self.strategy_scorer.score(s, direction, ind_15m, l1, l2, regime)
+            for s in REGIME_STRATEGIES.get(regime, REGIME_STRATEGIES["Trend"])
+        }
+        best = self.confidence_engine.select_best(strategy_scores)
+        if best is None:
             self._filter_stats["checked"] += 1
-            self._filter_stats["health_fail"] += 1
-            self._scan_info[direction] = (
-                f"veto:entry-floor (15M score {entry['score']:.0f} "
-                f"< {self.ENTRY_SCORE_FLOOR:.0f})")
+            self._filter_stats["strategy_fail"] += 1
+            return None
+        best_strategy, best_score = best
+
+        if best_score < 30.0:
+            self._filter_stats["checked"] += 1
+            self._filter_stats["strategy_fail"] += 1
+            self._scan_info[direction] = f"strategy_fail: best={best_strategy} {best_score:.0f}"
             return None
 
+        # ── L1 fit + L2 context ──────────────────────────────────────────────
+        l1_fit  = self._compute_l1_fit(l1, direction, regime)
+        l2_ctx  = l2["bull_score"] if direction == "LONG" else l2["bear_score"]
 
-        # [LEVEL 2/3 — ADAPTIVE SCORING/STRATEGY] Tag this CANDIDATE with the
-        # same diagnostic tags used post-hoc on closed losses (see
-        # _diagnose_loss) — a candidate resembling a historically bad pattern
-        # gets a score penalty before it's ever taken, not just recorded
-        # after the fact. Computed for every state (not just trend states)
-        # since overextension/low-volume patterns matter for MR entries too.
-        _px_now  = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
-        _atr_now = max(ind_15m.get("atr", 1e-9), 1e-9)
-        _ema_dist_now  = abs(_px_now - ind_15m.get("ema20", _px_now)) / _atr_now
-        _atr_exp_now   = ind_15m.get("atr", 0.0) / max(ind_15m.get("atr_avg", ind_15m.get("atr", 1.0)), 1e-9)
-        _vol_ratio_now = ind_15m.get("volume", 0.0) / max(ind_15m.get("vol_avg", ind_15m.get("volume", 1.0)), 1e-9)
-        _now_ts = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
+        # ── Condition penalty (Level 2/3 adaptive learning) ──────────────────
+        _px_now      = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
+        _atr_now     = max(ind_15m.get("atr", 1e-9), 1e-9)
+        _ema_dist    = abs(_px_now - ind_15m.get("ema20", _px_now)) / _atr_now
+        _atr_exp     = ind_15m.get("atr", 0.0) / max(ind_15m.get("atr_avg", ind_15m.get("atr", 1.0)), 1e-9)
+        _vol_ratio   = ind_15m.get("volume", 0.0) / max(ind_15m.get("vol_avg", ind_15m.get("volume", 1.0)), 1e-9)
+        _now_ts      = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
         _current_tags = self._diagnose_conditions(
-            direction=direction, ema_dist_atr=_ema_dist_now, rsi=ind_15m.get("rsi", 50.0),
-            atr_exp=_atr_exp_now, vol_ratio=_vol_ratio_now, adx=ind_15m.get("adx", 25.0),
-            now=_now_ts,
+            direction=direction, ema_dist_atr=_ema_dist,
+            rsi=ind_15m.get("rsi", 50.0), atr_exp=_atr_exp,
+            vol_ratio=_vol_ratio, adx=ind_15m.get("adx", 25.0), now=_now_ts,
         )
         _condition_penalty = (self.condition_engine.get_penalty(_current_tags)
                               + self._active_strategy_penalty(_current_tags, _now_ts))
 
-        total = entry["score"] * 0.40 + ctx["score"] * 0.30 + fit * 0.30 - _condition_penalty
-        total_min = thrs["total_min"]
+        # ── Composite score ──────────────────────────────────────────────────
+        total = best_score * 0.40 + l2_ctx * 0.30 + l1_fit * 0.30 - _condition_penalty
 
         self._filter_stats["checked"] += 1
         self._scan_info[direction] = (
-            f"total {total:.0f}/{total_min} "
-            f"(15M:{entry['score']:.0f} 1H:{ctx['score']:.0f} 4H-fit:{fit:.0f}"
-            + (f" tag_penalty:-{_condition_penalty:.0f} [{','.join(_current_tags)}]" if _condition_penalty > 0 else "")
-            + ")"
-            + (" → SIGNAL" if total >= total_min else ""))
-        if total >= total_min:
-            self._filter_stats["passed"] += 1
-        else:
-            # Attribute the rejection to whichever component is weakest,
-            # keeping the bias/health/confidence tally names for continuity.
-            # Every rejection lands in at least one bucket: if none of the
-            # three components is individually weak enough to trip its own
-            # threshold, the total still failed on aggregate, so attribute
-            # to the single lowest-scoring component instead of dropping it.
-            attributed = False
-            if fit < 40:            self._filter_stats["bias_fail"] += 1;       attributed = True
-            if entry["score"] < 50: self._filter_stats["health_fail"] += 1;     attributed = True
-            if ctx["score"] < 50:   self._filter_stats["confidence_fail"] += 1; attributed = True
-            if not attributed:
-                lowest = min(("bias_fail", fit), ("health_fail", entry["score"]),
-                             ("confidence_fail", ctx["score"]), key=lambda kv: kv[1])
-                self._filter_stats[lowest[0]] += 1
+            f"total {total:.0f}/{threshold} regime={regime} "
+            f"strat={best_strategy}({best_score:.0f}) l2={l2_ctx:.0f} l1fit={l1_fit:.0f}"
+            + (f" pen=-{_condition_penalty:.0f}" if _condition_penalty > 0 else "")
+            + (" → SIGNAL" if total >= threshold else "")
+        )
+
+        if total < threshold:
+            self._filter_stats["threshold_fail"] += 1
             self._log_event(
                 f"\n{'='*36}\n"
-                f"  ENTRY CHECK ({direction} | {market_state})\n"
-                f"  Regime Fit : {fit:.0f}/100 (regime_dir={regime_direction:.0f})\n"
-                f"  1H Context : {ctx['score']:.0f}/100\n"
-                f"  15M Entry  : {entry['score']:.0f}/100\n"
-                f"  Total      : {total:.0f} / {total_min}\n"
+                f"  ENTRY CHECK ({direction} | {regime})\n"
+                f"  Strategy   : {best_strategy} {best_score:.0f}/100\n"
+                f"  L2 Context : {l2_ctx:.0f}/100\n"
+                f"  L1 Fit     : {l1_fit:.0f}/100\n"
+                f"  Total      : {total:.0f} / {threshold}\n"
                 f"  Result     : NO TRADE\n"
                 f"{'='*36}",
                 level="debug",
             )
             return None
 
-        entry_type = _STATE_ENTRY_TYPE.get(market_state, "trend_follow")
+        self._filter_stats["passed"] += 1
+        sl_price   = self._compute_sl_price(ind_15m, candle_15m, direction, regime)
+        entry_type = _REGIME_ENTRY_TYPE.get(regime, "trend_follow")
+
         return {
-            "direction":        direction,
-            "sl_price":         entry["sl_price"],
-            "health_score":     entry["score"],
-            "confidence_score": (ctx["score"] + fit) / 2.0,
-            "total_score":      total,
-            "entry_score":      entry["score"],
-            "context_score":    ctx["score"],
-            "direction_fit":    fit,
-            "entry_type":       entry_type,
-            "strategy":         "Adaptive",
-            # [LEVEL 1/2] threaded through to _step5_risk_engine for
-            # conviction-weighted sizing, and into current_trade for the
-            # post-hoc lesson/condition-learning loop
+            "direction":         direction,
+            "sl_price":          sl_price,
+            "health_score":      best_score,
+            "confidence_score":  (l2_ctx + l1_fit) / 2.0,
+            "total_score":       total,
+            "entry_score":       best_score,
+            "context_score":     l2_ctx,
+            "direction_fit":     l1_fit,
+            "entry_type":        entry_type,
+            "strategy":          best_strategy,
+            "regime":            regime,
+            "l1_score":          l1["score"],
+            "l1_level":          l1["level"],
+            "l2_bull":           l2["bull_score"],
+            "l2_bear":           l2["bear_score"],
+            "all_strategies":    strategy_scores,
             "condition_penalty": _condition_penalty,
-            "entry_tags":         _current_tags,
+            "entry_tags":        _current_tags,
         }
 
     # ── Lightweight cooldown check — independent of new-candle ticks ─────────
@@ -1724,14 +1803,9 @@ class TradingBot:
             )
             return False
 
-        # [V8-1] LOW_VOL: skip immediately
-        if self.current_market_state == "LOW_VOL":
-            self._log_event("SKIP: LOW_VOL — awaiting breakout", level="debug")
-            return False
-
-        if self.current_market_state not in _TRADEABLE_STATES:
+        if self.current_market_state not in _TRADEABLE_REGIMES:
             self._log_event(
-                f"SKIP: unrecognised state={self.current_market_state}", level="debug"
+                f"SKIP: untradeable regime={self.current_market_state}", level="debug"
             )
             return False
 
@@ -1771,17 +1845,13 @@ class TradingBot:
             risk_pct *= 0.80
             self._log_event(f"Win streak {self.win_streak} → risk {risk_pct:.2%}")
 
-        health     = signal.get("health_score", 0.0)
-        confidence = signal.get("confidence_score", health)
-        conf_mult  = self.conf_scorer.get_size_multiplier(confidence)
-        if conf_mult == 0.0:
-            self._log_event("Confidence too low → skip order", level="warning")
-            return
+        health        = signal.get("health_score", 0.0)
+        confidence    = signal.get("confidence_score", health)
         health_mult   = 1.0 if health >= 75 else 0.65
-        entry_type    = signal.get("entry_type") or _STATE_ENTRY_TYPE.get(
+        entry_type    = signal.get("entry_type") or _REGIME_ENTRY_TYPE.get(
             self.current_market_state, "trend_follow")
         learning_mult = self.learning_engine.get_weight(entry_type)
-        size_mult     = conf_mult * health_mult * learning_mult
+        size_mult     = health_mult * learning_mult
 
         # [SIZING] Three modes, in this precedence order:
         # - margin_pct_min/max > 0 (Level 1 default): dynamic %-of-balance,
@@ -1795,8 +1865,8 @@ class TradingBot:
         if self.margin_pct_min > 0 or self.margin_pct_max > 0:
             lo = max(self.margin_pct_min, 0.0)
             hi = max(self.margin_pct_max, lo)
-            _thrs_now = ADAPTIVE_THRESHOLDS.get(self.current_market_state, ADAPTIVE_THRESHOLDS["TRENDING"])
-            headroom  = signal.get("total_score", 0.0) - _thrs_now["total_min"]
+            _thrs_now = REGIME_THRESHOLDS.get(self.current_market_state, 62)
+            headroom  = signal.get("total_score", 0.0) - _thrs_now
             conf_norm = float(np.clip(headroom / 25.0, 0.0, 1.0))
             tag_penalty_norm = float(np.clip(
                 signal.get("condition_penalty", 0.0) / max(self.condition_engine.MAX_PENALTY, 1e-9), 0.0, 1.0))
@@ -2030,8 +2100,8 @@ class TradingBot:
         # this entry decayed into a non-tradeable regime before TP1.
         if (not t.get("tp1_hit")
                 and t.get("e_state")
-                and self.current_market_state in ("EXHAUSTION", "LOW_VOL")
-                and t["e_state"] not in ("EXHAUSTION", "LOW_VOL")):
+                and self.current_market_state in ("Exhaustion",)
+                and t["e_state"] not in ("Exhaustion",)):
             self._close_position("STATE_DRIFT_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
@@ -2170,7 +2240,7 @@ class TradingBot:
         _vol_state    = self.adaptive_engine.get_atr_volatility_state(
             ind.get("atr", 0), self.atr_history)
 
-        entry_type = t.get("entry_type", _STATE_ENTRY_TYPE.get(self.current_market_state, "trend_follow"))
+        entry_type = t.get("entry_type", _REGIME_ENTRY_TYPE.get(self.current_market_state, "trend_follow"))
 
         entry = {
             "symbol":              extras.get("symbol", "BTCUSDT"),
@@ -2370,11 +2440,14 @@ class TradingBot:
             if len(self.atr_history) > 200:
                 self.atr_history.pop(0)
 
-        # [V8-1] Market state from 4H
-        self.current_market_state = self._step1_market_state_engine(ind_4h)
-        self.regime_score          = self._step2_4h_regime(ind_4h)
-        # [V8-5] Regime bias from 4H + 1H
-        self.current_regime_bias   = self.bias_engine.compute(ind_4h, ind_1h)
+        # [V9] 3-layer macro → context → regime classification
+        _l1 = self.macro_engine.compute(ind_4h)
+        _l2 = self.context_engine.compute(ind_1h)
+        _l3 = self.regime_clf.classify(_l1, _l2, ind_15m)
+        self.current_market_state = _l3["regime"]
+        self.current_regime_bias  = _l1["level"]
+        self.regime_score         = _l1["score"]
+        self._l1_cache, self._l2_cache, self._l3_cache = _l1, _l2, _l3
 
         self._tick_depth = 0
         state_changed = True
@@ -2406,11 +2479,10 @@ class TradingBot:
 
                 best_signal: Optional[Dict] = None
                 if self._entries_enabled:
-                    regime_direction = self._regime_direction(ind_4h)
                     for direction in ("LONG", "SHORT"):
                         sig = self._generate_signal(
                             direction, candle_15m, ind_15m, ind_1h, ind_4h,
-                            self.current_market_state, regime_direction,
+                            self._l1_cache, self._l2_cache, self._l3_cache,
                         )
                         if sig and (best_signal is None
                                     or sig["total_score"] > best_signal["total_score"]):
@@ -2428,10 +2500,11 @@ class TradingBot:
                     state_changed                = True
                     self._log_event(
                         f"Signal: {best_signal['direction']} | {self.current_market_state} "
+                        f"| strat={best_signal['strategy']} "
                         f"| total={best_signal['total_score']:.0f} "
-                        f"(entry={best_signal['entry_score']:.0f} "
-                        f"ctx={best_signal['context_score']:.0f} "
-                        f"fit={best_signal['direction_fit']:.0f})"
+                        f"(strat={best_signal['entry_score']:.0f} "
+                        f"l2ctx={best_signal['context_score']:.0f} "
+                        f"l1fit={best_signal['direction_fit']:.0f})"
                     )
                 else:
                     self._pending_signal = None
@@ -2530,10 +2603,9 @@ class TradingBot:
                                ind_4h: Dict, atr_4h: float):
         original_risk = self.base_risk_pct
         self.base_risk_pct *= 0.5
-        regime_direction = self._regime_direction(ind_4h)
         for direction in ("LONG", "SHORT"):
             sig = self._generate_signal(direction, candle, ind_15m, ind_1h, ind_4h,
-                                        self.current_market_state, regime_direction)
+                                        self._l1_cache, self._l2_cache, self._l3_cache)
             if sig:
                 self._step5_risk_engine(candle, direction, ind_15m, mr_signal=sig)
                 # mirror PENDING_ORDER: the risk engine may skip (low confidence)
@@ -2754,7 +2826,7 @@ class TradingBot:
         self.trading_date = (datetime.date.fromisoformat(trading_date)
                              if trading_date else None)
 
-        self.current_market_state  = data.get("current_market_state", "SIDEWAY")
+        self.current_market_state  = data.get("current_market_state", "Range")
         self.current_regime_bias   = data.get("current_regime_bias", "NEUTRAL")
         self.regime_score          = data.get("regime_score", 0.0)
         self.direction_focus       = data.get("direction_focus")
