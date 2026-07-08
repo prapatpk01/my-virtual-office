@@ -765,8 +765,22 @@ class TradingBot:
                 sl_p = price + (price - sl_p)
                 tp_p = price - (tp_p - price)
 
-        size_pct = _confidence_size_pct(meta)
-        amount = self.risk.size_position(quote_balance, price, size_pct=size_pct)
+        # ── Risk-based position sizing ─────────────────────────────────────────
+        # amount is sized so that a full SL hit loses exactly RISK_PER_TRADE_PCT
+        # of balance — not a fixed % of balance as notional (that conflates
+        # position size with risk, which vary a lot with how far SL sits).
+        risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "0.06"))
+        risk_per_unit = abs(price - sl_p) if sl_p else 0
+
+        if risk_per_unit > 0:
+            risk_dollars = quote_balance * risk_pct
+            amount = round(risk_dollars / risk_per_unit, 6)
+            sizing_label = f"risk-based {risk_pct*100:.1f}% (SL {risk_per_unit/price*100:.2f}% away)"
+        else:
+            # No usable SL from the signal — fall back to confidence-tiered notional sizing
+            size_pct = _confidence_size_pct(meta)
+            amount = self.risk.size_position(quote_balance, price, size_pct=size_pct)
+            sizing_label = f"confidence-based {size_pct*100:.1f}% (no SL available)"
 
         # ── Margin check: clamp size to what the free balance can actually
         # cover, instead of attempting an order that the exchange will reject.
@@ -780,17 +794,19 @@ class TradingBot:
             max_notional = quote_balance * safety_buffer * (leverage if is_futures else 1)
             clamped_amount = round(max_notional / price, 6) if price > 0 else 0
             logger.warning(
-                "[%s] Margin required $%.2f exceeds available $%.2f — clamping size %.6f → %.6f",
-                strategy_name, required_margin, quote_balance, amount, clamped_amount,
+                "[%s] Margin required $%.2f exceeds available $%.2f — clamping size %.6f → %.6f "
+                "(actual risk if SL hit will be below the %.1f%% target)",
+                strategy_name, required_margin, quote_balance, amount, clamped_amount, risk_pct * 100,
             )
             amount = clamped_amount
 
+        actual_risk_dollars = amount * risk_per_unit if risk_per_unit > 0 else 0
         logger.info(
-            "[%s] Position size: %.1f%% of balance (confidence=%s) → %.6f  "
-            "(notional=$%.2f, margin=$%.2f, leverage=%dx)",
-            strategy_name, size_pct * 100, meta.get("confidence_level", "?"),
-            amount, amount * price, (amount * price / leverage) if is_futures else amount * price,
-            leverage,
+            "[%s] Position size: %s → %.6f  "
+            "(notional=$%.2f, margin=$%.2f, leverage=%dx, risk=$%.2f)",
+            strategy_name, sizing_label, amount, amount * price,
+            (amount * price / leverage) if is_futures else amount * price,
+            leverage, actual_risk_dollars,
         )
         if amount <= 0:
             logger.info("Position size 0 for %s — tracking virtually", sym)
