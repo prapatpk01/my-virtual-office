@@ -623,7 +623,7 @@ class TradingBot:
                                     signal.confidence, strategy=slot_key)
             if self.telegram:
                 self.telegram.notify_signal(sig_dict)
-            await self._execute_signal(signal, slot_key)
+            await self._execute_signal(signal, slot_key, candles=candles)
             return
 
         # ── Normal / AI Expert strategies ────────────────────────────────────
@@ -643,7 +643,7 @@ class TradingBot:
                                         signal.confidence, strategy=short_key)
                 if self.telegram:
                     self.telegram.notify_signal(sig_dict)
-                await self._execute_signal(signal, short_key, direction="short")
+                await self._execute_signal(signal, short_key, direction="short", candles=candles)
             else:
                 # Normal mode: SELL closes existing long only
                 if self._sig.is_locked_for_strategy(sym, strategy_name):
@@ -694,10 +694,10 @@ class TradingBot:
                                 signal.confidence, strategy=long_key)
         if self.telegram:
             self.telegram.notify_signal(sig_dict)
-        await self._execute_signal(signal, long_key, direction="long")
+        await self._execute_signal(signal, long_key, direction="long", candles=candles)
 
     async def _execute_signal(self, signal: Signal, strategy_name: str,
-                              direction: str = "long"):
+                              direction: str = "long", candles: list = None):
         """Open a position. direction='long' for BUY, 'short' for SELL (hedge mode)."""
         sym       = signal.symbol
         order_side = "buy" if direction == "long" else "sell"
@@ -799,6 +799,17 @@ class TradingBot:
             if self.telegram:
                 meta = signal.metadata or {}
                 macro_info = meta.get("macro_trend", {})
+                chart_path = None
+                if candles:
+                    try:
+                        from .chart_renderer import render_entry_chart
+                        chart_path = render_entry_chart(
+                            candles, sym, direction, order.price,
+                            sl=sl_p, tp=tp_p, strategy=strategy_name,
+                            macro_bias=macro_info.get("bias", ""),
+                        )
+                    except Exception as e:
+                        logger.warning("Chart render failed for %s: %s", sym, e)
                 self.telegram.notify_order(
                     sym, order_side, amount, order.price,
                     strategy_name, self.connector.paper,
@@ -809,6 +820,7 @@ class TradingBot:
                     strategy_confidence=meta.get("strategy_confidence"),
                     regime=meta.get("regime"),
                     direction=direction,
+                    chart_path=chart_path,
                 )
         except Exception as e:
             logger.error("Order failed for %s %s: %s", direction, sym, e)

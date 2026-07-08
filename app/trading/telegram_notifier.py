@@ -20,6 +20,7 @@ Commands received (polling loop):
 import asyncio
 import json
 import logging
+import os
 import time
 import threading
 from typing import Callable, Optional
@@ -92,6 +93,23 @@ class TelegramNotifier:
             except Exception:
                 pass
 
+    def notify_photo(self, photo_path: str, caption: str = ""):
+        """Fire-and-forget photo send (with optional caption) from any thread.
+        Falls back to a text-only message if the photo send fails."""
+        if not self._enabled:
+            return
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._send_photo(photo_path, caption), self._loop)
+        else:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._send_photo(photo_path, caption))
+                else:
+                    loop.run_until_complete(self._send_photo(photo_path, caption))
+            except Exception:
+                pass
+
     def notify_signal(self, signal_dict: dict):
         sig_type = signal_dict.get("type", "hold")
         if sig_type == "hold":
@@ -126,12 +144,12 @@ class TelegramNotifier:
         )
         self.notify(text)
 
-    def notify_order(self, symbol: str, side: str, amount: float,
-                     price: float, strategy: str, paper: bool,
-                     sl: float = None, tp: float = None,
-                     macro_score: float = None, macro_bias: str = None,
-                     selected_strategy: str = None, strategy_confidence: float = None,
-                     regime: str = None, direction: str = None):
+    def build_order_caption(self, symbol: str, side: str, amount: float,
+                            price: float, strategy: str, paper: bool,
+                            sl: float = None, tp: float = None,
+                            macro_score: float = None, macro_bias: str = None,
+                            selected_strategy: str = None, strategy_confidence: float = None,
+                            regime: str = None, direction: str = None) -> str:
         emoji = "🟢" if side == "buy" else "🔴"
         mode  = "📄 PAPER" if paper else "💰 LIVE"
         dir_label = f"LONG" if direction == "long" else "SHORT" if direction == "short" else side.upper()
@@ -163,7 +181,27 @@ class TelegramNotifier:
             lines.append(f"🌍 Regime: `{regime}`")
         lines.append(f"⚙️ {strategy}")
 
-        self.notify("\n".join(lines))
+        return "\n".join(lines)
+
+    def notify_order(self, symbol: str, side: str, amount: float,
+                     price: float, strategy: str, paper: bool,
+                     sl: float = None, tp: float = None,
+                     macro_score: float = None, macro_bias: str = None,
+                     selected_strategy: str = None, strategy_confidence: float = None,
+                     regime: str = None, direction: str = None,
+                     chart_path: str = None):
+        """Send the order alert. If chart_path is given, sends it as a photo
+        with the order details as caption; otherwise sends text only."""
+        caption = self.build_order_caption(
+            symbol, side, amount, price, strategy, paper,
+            sl=sl, tp=tp, macro_score=macro_score, macro_bias=macro_bias,
+            selected_strategy=selected_strategy, strategy_confidence=strategy_confidence,
+            regime=regime, direction=direction,
+        )
+        if chart_path:
+            self.notify_photo(chart_path, caption=caption)
+        else:
+            self.notify(caption)
 
     def notify_trade_closed(self, symbol: str, reason: str, exit_price: float,
                             entry: float, sl, tp, stats: dict):
@@ -281,6 +319,41 @@ class TelegramNotifier:
         except Exception as e:
             logger.warning("Telegram send error: %s", e)
             return False
+
+    async def _send_photo(self, photo_path: str, caption: str = "",
+                          parse_mode: str = "Markdown") -> bool:
+        url = TELEGRAM_API.format(token=self.token, method="sendPhoto")
+        try:
+            with open(photo_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("chat_id", self.chat_id)
+                if caption:
+                    data.add_field("caption", caption[:1024])  # Telegram caption limit
+                    data.add_field("parse_mode", parse_mode)
+                data.add_field("photo", f, filename=os.path.basename(photo_path),
+                               content_type="image/png")
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, data=data,
+                                            timeout=aiohttp.ClientTimeout(total=20)) as r:
+                        if r.status != 200:
+                            body = await r.text()
+                            logger.warning("Telegram sendPhoto failed %s: %s", r.status, body[:200])
+                            # Fall back to text-only so the alert isn't lost
+                            await self._send(caption or "(chart failed to send)")
+                            return False
+                        return True
+        except Exception as e:
+            logger.warning("Telegram sendPhoto error: %s", e)
+            try:
+                await self._send(caption or "(chart failed to send)")
+            except Exception:
+                pass
+            return False
+        finally:
+            try:
+                os.remove(photo_path)
+            except OSError:
+                pass
 
     async def _get_updates(self) -> list:
         url = TELEGRAM_API.format(token=self.token, method="getUpdates")

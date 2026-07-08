@@ -19,5 +19,10 @@ yfinance>=0.2.40
 # Statistical analysis for learning engine
 scipy>=1.11.0
 
+# Entry chart rendering (candlesticks + EMA + SL/TP) sent to Telegram
+pandas>=2.1.0
+matplotlib>=3.8.0
+mplfinance>=0.12.10b0
+
 # Optional: for loading .env file automatically
 # python-dotenv>=1.0.0
