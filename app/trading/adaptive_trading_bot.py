@@ -983,6 +983,12 @@ class TradingBot:
         # SL ratchet move, popped by the runner after on_tick / intrabar checks
         self._pending_target_alerts: List[Dict] = []
 
+        # [PROTECT-LAYER SWITCH] see _manage_open_position. Env-tunable so a
+        # backtest can measure pure T1/T2/SL outcomes (ADAPTIVE_PROTECT_EXITS=0)
+        # without touching live behavior (default on).
+        self.enable_protect_exits: bool = \
+            os.environ.get("ADAPTIVE_PROTECT_EXITS", "1") != "0"
+
         # [MIN-LOT TP1] Smallest close size (in coins) the exchange can fill —
         # set by the runner from the symbol's contract size. When a TP1 partial
         # would be below this (e.g. a 1-contract position can't close 50%),
@@ -2198,7 +2204,15 @@ class TradingBot:
         t["mae"] = min(t["mae"], current_r)
         t["mfe"] = max(t["mfe"], current_r)
 
-        reversal = self._detect_reversal_signals(ind)
+        # [PROTECT-LAYER SWITCH] Master gate for every discretionary mid-trade
+        # exit below (reversal spike, trend fade, emergency, state drift,
+        # health tiers). Backtest evidence: ~77% of trades were closed by this
+        # layer instead of TP/SL (61/71 losses cut early at -0.1..-0.9R,
+        # 36/55 wins truncated to <0.3R), so the designed T1/T2 geometry was
+        # almost never allowed to play out. ADAPTIVE_PROTECT_EXITS=0 disables
+        # the layer to measure pure entry quality (trades run to T1/T2/SL
+        # only); default stays on for live safety.
+        reversal = self._detect_reversal_signals(ind) if self.enable_protect_exits else {}
         if reversal.get("reversal_spike"):
             sig = reversal["reversal_spike"]
             self._log_event(
@@ -2228,14 +2242,15 @@ class TradingBot:
             ind.get("momentum_collapse"),
             ind.get("volume_collapse"),
             ind.get("invalid_structure"),
-        ]
+        ] if self.enable_protect_exits else []
         if any(emergency_signals):
             self._close_position("EMERGENCY_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
         # [STATE-DRIFT TEST] thesis invalidation: the 4H regime that justified
         # this entry decayed into a non-tradeable regime before TP1.
-        if (not t.get("tp1_hit")
+        if (self.enable_protect_exits
+                and not t.get("tp1_hit")
                 and t.get("e_state")
                 and self.current_market_state in ("Exhaustion",)
                 and t["e_state"] not in ("Exhaustion",)):
@@ -2256,7 +2271,9 @@ class TradingBot:
         tp1_hit = t.get("tp1_hit", False)
         health  = self.health_calc.calculate(ind, t, current_price)
 
-        if health >= 80:
+        if not self.enable_protect_exits:
+            pass   # experiment mode: pure T1/T2/SL — no health-tier actions
+        elif health >= 80:
             self._log_event(
                 f"Health {health:.0f} (≥80) → HOLD (r={current_r:.2f})", level="debug"
             )
