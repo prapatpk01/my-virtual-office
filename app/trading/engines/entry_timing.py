@@ -209,15 +209,10 @@ class EntryTimingEngine:
             MarketRegime.LOW_VOLATILITY: 1.0,
         }.get(regime, 1.5)
 
-        # R:R target per regime (minimum 2.0)
-        rr_target = {
-            MarketRegime.TREND:          3.0,
-            MarketRegime.RANGE:          2.0,
-            MarketRegime.BREAKOUT:       3.5,
-            MarketRegime.REVERSAL:       2.0,
-            MarketRegime.HIGH_VOLATILITY:2.5,
-            MarketRegime.LOW_VOLATILITY: 2.0,
-        }.get(regime, 2.5)
+        # R:R target — tight 1.2R across all regimes.
+        # TP1 (position_manager) triggers at 0.6R (halfway) → 50% off + SL to BE.
+        # TP2 triggers here at 1.2R → close remaining 50%.
+        rr_target = 1.2
 
         # Structure-based SL: beyond the recent swing with an ATR buffer.
         # SL must clear both the structure level and a minimum ATR distance,

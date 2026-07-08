@@ -78,7 +78,7 @@ class AIExpertStrategy(BaseStrategy):
         self._expert_engine    = ExpertAnalysisEngine()
         self._decision_engine  = DecisionEngine(min_score_threshold=min_confidence)
         self._timing_engine    = EntryTimingEngine(
-            min_rr=float(os.getenv("MIN_RR", "1.2")),
+            min_rr=float(os.getenv("MIN_RR", "1.0")),
             require_all_checks=require_all_checks,
         )
         self._exit_engine      = ExitEngine(soft_threshold=70.0, hard_threshold=85.0)

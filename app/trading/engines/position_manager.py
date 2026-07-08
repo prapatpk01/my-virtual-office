@@ -32,8 +32,8 @@ class PositionManager:
 
     def __init__(
         self,
-        partial_tp_1_rr:  float = 0.5,    # R multiple to trigger TP1
-        partial_tp_2_rr:  float = 1.2,    # R multiple to trigger TP2 (full close)
+        partial_tp_1_rr:  float = 0.6,    # halfway to TP2 (0.6R of 1.2R)
+        partial_tp_2_rr:  float = 1.2,    # full TP target
         close_exit_score: float = 70.0,   # exit AI score threshold for forced close
         # legacy params accepted but unused (keeps call-sites compatible)
         be_atr_mult:      float = 1.0,
@@ -97,7 +97,7 @@ class PositionManager:
                 exit_score=exit_score,
             )
 
-        # ── TP2 @ 1.2R → close all remaining ─────────────────────────────
+        # ── TP2 @ 1.2R → close remaining 50% ────────────────────────────────
         if not pos["tp2_done"] and current_rr >= self.tp2_rr:
             pos["tp2_done"] = True
             return PositionUpdate(
@@ -106,7 +106,7 @@ class PositionManager:
                 exit_score=exit_score,
             )
 
-        # ── TP1 @ 0.5R → close 50%, move SL to BE ────────────────────────
+        # ── TP1 @ 0.6R (halfway) → close 50%, move SL to BE ─────────────────
         if not pos["tp1_done"] and current_rr >= self.tp1_rr:
             pos["tp1_done"] = True
             # break-even = entry price (slight buffer of 0 pips — user can adjust)
