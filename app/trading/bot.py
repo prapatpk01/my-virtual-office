@@ -318,6 +318,7 @@ class TradingBot:
                         pass
 
                 signal = await strategy.analyze(candles, current_price, mtf_candles=mtf_candles)
+                self._log_scan(strategy.symbol, strategy.name, current_price, signal)
 
                 sig_dict = {
                     "strategy":   strategy.name,
@@ -348,6 +349,24 @@ class TradingBot:
         self.state.open_positions  = self.risk.get_positions()
         self.state.last_updated    = int(time.time() * 1000)
         self._broadcast_state()
+
+    def _log_scan(self, symbol: str, strategy_name: str, price: float, signal: "Signal") -> None:
+        """INFO-level one-line summary printed every tick for every symbol,
+        so Railway logs show live scan activity even when no trade fires."""
+        meta       = signal.metadata or {}
+        macro      = meta.get("macro_trend", {})
+        regime     = meta.get("regime", "?")
+        strat_sel  = meta.get("selected_strategy", "?")
+        strat_conf = meta.get("strategy_confidence")
+        conf_str   = f"{strat_conf:.0f}" if isinstance(strat_conf, (int, float)) else "?"
+        macro_str  = f"{macro.get('bias', '?')}({macro.get('score', 0):.0f})" if macro else "?"
+        reason     = (signal.reason or "")[:90]
+
+        logger.info(
+            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s regime=%-10s macro=%-16s strat=%s(%s) | %s",
+            strategy_name, symbol, price, signal.type.value.upper(),
+            regime, macro_str, strat_sel, conf_str, reason,
+        )
 
     # ------------------------------------------------------------------
     # Adaptive position management helpers

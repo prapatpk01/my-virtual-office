@@ -138,6 +138,20 @@ class AIExpertStrategy(BaseStrategy):
             return self._hold(
                 current_price,
                 reason=f"Strategy selector: {reason}",
+                metadata={
+                    "regime": regime.regime.value,
+                    "macro_trend": {
+                        "score": macro.score, "bias": macro.bias.value,
+                        "structure": macro.structure,
+                    },
+                    "context_1h": {
+                        "type": context.context.value,
+                        "bull_score": context.bull_score, "bear_score": context.bear_score,
+                    },
+                    "selected_strategy": selection.selected.value,
+                    "strategy_scores": selection.scores,
+                    "strategy_confidence": selection.confidence,
+                },
             )
 
         # ── Layer 2: Expert Analysis ─────────────────────────────────────────
