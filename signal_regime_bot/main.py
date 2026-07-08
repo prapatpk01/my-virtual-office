@@ -53,8 +53,11 @@ class Bot:
         self.telegram = TelegramNotifier(self.cfg.telegram_bot_token, self.cfg.telegram_chat_id)
 
         self._last_entry_bar: dict[str, pd.Timestamp] = {}
+        self._last_signal_by_symbol: dict[str, object] = {}
+        self._symbol_cooldown_until: dict[str, float] = {}
         self._daily_alert_sent = False
         self._cooldown_alert_sent = False
+        self._last_status_log_ts = 0.0
         self._running = False
 
     async def start(self):
@@ -73,6 +76,20 @@ class Bot:
         if not self.telegram.enabled:
             logger.warning("Telegram not configured — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing")
 
+        # Adopt any position that already exists on OKX but isn't tracked —
+        # this bot's state is in-memory only, so a restart would otherwise
+        # orphan every open position (no more SL/TP/health management for it).
+        adopted = await self.positions.reconcile_with_exchange(self.cfg.symbols)
+        if adopted:
+            logger.warning("[STARTUP] Adopted %d orphaned position(s) from a prior run: %s",
+                          len(adopted), adopted)
+            await self.telegram.error(
+                "STARTUP",
+                f"Adopted {len(adopted)} orphaned position(s) from a prior run: "
+                f"{', '.join(adopted)}. Resuming management in single-TP mode "
+                f"(original TP1 unknown)."
+            )
+
         self._running = True
 
     async def stop(self):
@@ -89,6 +106,7 @@ class Bot:
                     logger.error("[%s] unhandled error: %s", symbol, e, exc_info=True)
                     await self.telegram.error(symbol, str(e))
             await self._check_global_alerts()
+            await self._maybe_log_status()
             await asyncio.sleep(self.cfg.poll_interval_sec)
 
     # ── Per-symbol processing ────────────────────────────────────────────────
@@ -105,10 +123,16 @@ class Bot:
         df_1h = frames[self.cfg.tf_bias]
         df_4h = frames[self.cfg.tf_regime]
 
+        # Computed once per symbol per tick and cached — reused by the entry
+        # check below AND by the 5-minute status log, instead of the health
+        # branch and the entry branch each re-running regime/bias separately.
+        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h)
+        self._last_signal_by_symbol[symbol] = sig
+
         if self.positions.has_position(symbol):
             await self._manage_open_position(symbol, df_30m, df_1h, df_4h)
         else:
-            await self._look_for_entry(symbol, df_30m, df_1h, df_4h)
+            await self._look_for_entry(symbol, df_30m, sig)
 
     async def _manage_open_position(self, symbol: str, df_30m, df_1h, df_4h):
         pos = self.positions.get(symbol)
@@ -133,20 +157,24 @@ class Bot:
             if hevent:
                 await self._handle_event(hevent)
 
-    async def _look_for_entry(self, symbol: str, df_30m, df_1h, df_4h):
+    async def _look_for_entry(self, symbol: str, df_30m, sig):
         bar_ts = df_30m.index[-1] if len(df_30m) else None
         if bar_ts is None or self._last_entry_bar.get(symbol) == bar_ts:
             return   # already evaluated this closed bar
         self._last_entry_bar[symbol] = bar_ts
 
         now = time.time()
+        cooldown_until = self._symbol_cooldown_until.get(symbol, 0)
+        if now < cooldown_until:
+            logger.debug("[%s] symbol cooldown: %.0f min left", symbol, (cooldown_until - now) / 60)
+            return
+
         balance = await self.client.fetch_balance_usdt()
         can_open, reason = self.risk.can_open_new(balance, now, self.positions.open_position_count())
         if not can_open:
             logger.debug("[%s] entry blocked: %s", symbol, reason)
             return
 
-        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h)
         if sig.direction not in (LONG, SHORT):
             logger.debug("[%s] no signal: %s", symbol, sig.reason)
             return
@@ -182,6 +210,11 @@ class Bot:
         tp1, tp2 = calc_take_profits(side, sig.price, sl, c.tp1_r, c.tp2_r)
         return sl, tp1, tp2
 
+    # Events that fully close the position (as opposed to TP1_HIT, which only
+    # partially closes and leaves the runner open) — each one starts this
+    # symbol's post-close cooldown.
+    _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", "HEALTH_CLOSE", "TP1_THEN_EXTERNAL_CLOSE"}
+
     async def _handle_event(self, event: dict):
         ev = event.get("event")
         symbol = event.get("symbol", "")
@@ -206,6 +239,12 @@ class Bot:
         # HEALTH_OK / HEALTH_WEAK (not yet confirmed) are logged only, not alerted —
         # avoids spamming Telegram every 30m bar while a position rides normally.
 
+        if ev in self._TERMINAL_EVENTS and symbol:
+            cooldown_sec = self.cfg.symbol_cooldown_min * 60
+            self._symbol_cooldown_until[symbol] = time.time() + cooldown_sec
+            logger.info("[%s] closed (%s) — cooldown %d min before next entry",
+                       symbol, ev, self.cfg.symbol_cooldown_min)
+
     async def _check_global_alerts(self):
         now = time.time()
         balance = await self.client.fetch_balance_usdt()
@@ -227,6 +266,34 @@ class Bot:
                 int(self.risk.cooldown_remaining_sec(now) / 60), self.risk.state.loss_streak)
         elif not in_cd:
             self._cooldown_alert_sent = False
+
+    async def _maybe_log_status(self):
+        """Per-symbol regime/bias/entry snapshot, every status_log_interval_sec
+        (default 5 min) — uses the signal already computed this tick in
+        _process_symbol (self._last_signal_by_symbol), no extra API calls."""
+        now = time.time()
+        if now - self._last_status_log_ts < self.cfg.status_log_interval_sec:
+            return
+        self._last_status_log_ts = now
+
+        now_wall = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now))
+        logger.info("=== STATUS [%s UTC] ===", now_wall)
+        for symbol in self.cfg.symbols:
+            sig = self._last_signal_by_symbol.get(symbol)
+            pos = self.positions.get(symbol)
+            pos_label = f"OPEN {pos.side.upper()} @ {pos.entry_price:.6g}" if pos else "flat"
+            if sig is None:
+                logger.info("  %-16s %-24s no data yet", symbol, pos_label)
+                continue
+            cd_until = self._symbol_cooldown_until.get(symbol, 0)
+            cd_label = f" cooldown={max(0,(cd_until-now))/60:.0f}m" if cd_until > now else ""
+            logger.info(
+                "  %-16s %-24s regime=%-12s(%.0f) bias=%-8s(%.0f) entry=%.0f dir=%s%s",
+                symbol, pos_label,
+                sig.regime.name, sig.regime.score,
+                sig.bias.bias, max(sig.bias.bull_score, sig.bias.bear_score),
+                sig.entry_score, sig.direction, cd_label,
+            )
 
 
 async def _main():

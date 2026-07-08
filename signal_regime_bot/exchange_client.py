@@ -181,6 +181,63 @@ class ExchangeClient:
             logger.warning("[DATA] fetch_position_amount failed %s %s: %s", symbol, side, e)
         return 0.0
 
+    async def fetch_position_details(self, symbol: str, side: str) -> Optional[dict]:
+        """Amount + entry price of an open OKX position, for restart reconciliation."""
+        if self.paper:
+            key = f"{symbol}||{side}"
+            pos = self._paper_positions.get(key)
+            if pos:
+                return {"amount": float(pos["amount"]), "entry_price": float(pos["entry"])}
+            return None
+        try:
+            positions = await self._exchange.fetch_positions([symbol])
+            for p in positions:
+                if p.get("side") == side and float(p.get("contracts", 0)) > 0:
+                    ct_val = float(p.get("contractSize") or 1.0)
+                    entry = p.get("entryPrice")
+                    if entry is None:
+                        return None
+                    return {"amount": float(p["contracts"]) * ct_val, "entry_price": float(entry)}
+        except Exception as e:
+            logger.warning("[DATA] fetch_position_details failed %s %s: %s", symbol, side, e)
+        return None
+
+    async def fetch_attached_stops(self, symbol: str, pos_side: str) -> tuple:
+        """
+        Current SL/TP prices from OKX's pending algo orders for this leg — used
+        to reconstruct a Position after a restart (we don't know the strategy's
+        original TP1, so an adopted position resumes as single-TP: whatever
+        SL/TP the exchange currently has attached is treated as (SL, TP2)).
+        Returns (sl_price, tp_price), either may be None if not found.
+        """
+        if self.paper:
+            return None, None
+        try:
+            market = self._exchange.market(symbol)
+            inst_id = market["id"]
+        except Exception as e:
+            logger.warning("[RECONCILE] market lookup failed for %s: %s", symbol, e)
+            return None, None
+
+        sl_price, tp_price = None, None
+        for ord_type in ("oco", "conditional", "move_order_stop"):
+            try:
+                resp = await self._exchange.privateGetTradeAlgosPending({
+                    "instId": inst_id, "ordType": ord_type,
+                })
+                for algo in (resp or {}).get("data", []):
+                    if algo.get("posSide") != pos_side:
+                        continue
+                    sl_raw = algo.get("slTriggerPx")
+                    tp_raw = algo.get("tpTriggerPx")
+                    if sl_raw not in (None, "", "0", "0.0") and sl_price is None:
+                        sl_price = float(sl_raw)
+                    if tp_raw not in (None, "", "0", "0.0") and tp_price is None:
+                        tp_price = float(tp_raw)
+            except Exception as e:
+                logger.warning("[RECONCILE] pending-algos query (%s) failed: %s", ord_type, e)
+        return sl_price, tp_price
+
     # ── Orders ───────────────────────────────────────────────────────────────
 
     async def create_order(self, symbol: str, side: str, amount: float,

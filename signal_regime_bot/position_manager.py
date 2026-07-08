@@ -164,6 +164,57 @@ class PositionManager:
                 return False
         return True
 
+    async def reconcile_with_exchange(self, symbols: list[str]) -> list[str]:
+        """
+        Adopt any OKX position that already exists but isn't in internal
+        state — the ONLY state this bot keeps is in-memory, so a Railway
+        restart (redeploy, crash, OOM) would otherwise orphan every open
+        position: nobody manages its SL/TP/health going forward, it just
+        sits there protected by whatever exchange-side algo was last
+        attached. Call this once at startup before the main loop.
+
+        We don't know the original TP1/entry_score/regime — an adopted
+        position resumes in single-TP mode (tp1=None, tp1_hit=True) using
+        whatever SL/TP OKX currently has attached as (stop_loss, tp2).
+        Returns the list of symbols adopted, for the startup log/alert.
+        """
+        adopted = []
+        for symbol in symbols:
+            if self.has_position(symbol):
+                continue
+            for side in (LONG, SHORT):
+                details = await self.client.fetch_position_details(symbol, side)
+                if not details or details["amount"] <= 0:
+                    continue
+                sl_price, tp_price = await self.client.fetch_attached_stops(symbol, side)
+                entry_price = details["entry_price"]
+                amount = details["amount"]
+                # Fall back to a wide ATR-independent guess only if OKX has no
+                # attached stop at all (shouldn't happen — every entry attaches
+                # one — but never leave a position with sl=None, which would
+                # make every price "past SL").
+                if sl_price is None:
+                    sl_price = entry_price * (0.9 if side == LONG else 1.1)
+                    logger.warning("[RECONCILE] %s %s: no attached SL found on OKX — "
+                                  "using a 10%% fallback stop until health monitor takes over",
+                                  symbol, side)
+                if tp_price is None:
+                    tp_price = entry_price * (1.1 if side == LONG else 0.9)
+
+                pos = Position(
+                    symbol=symbol, side=side, entry_price=entry_price, amount=amount,
+                    full_amount=amount, stop_loss=sl_price, tp1=None, tp2=tp_price,
+                    one_r=abs(entry_price - sl_price), tp1_hit=True,
+                    regime_at_entry="ADOPTED", bias_at_entry="ADOPTED",
+                )
+                self._positions[symbol] = pos
+                adopted.append(f"{symbol} {side.upper()}")
+                logger.warning("[RECONCILE] Adopted orphaned %s %s position: entry=%.6f "
+                              "amount=%.6f SL=%.6f TP=%.6f (from a prior run — resuming "
+                              "in single-TP mode)", symbol, side, entry_price, amount,
+                              sl_price, tp_price)
+        return adopted
+
     async def open_position(self, symbol: str, direction: str, price: float,
                             df_30m: pd.DataFrame, regime: RegimeResult, bias: BiasResult,
                             entry_score: float) -> Optional[Position]:

@@ -135,6 +135,17 @@ class Config:
     entry_macd_slow: int = 26
     entry_macd_signal: int = 9
     entry_score_min: float = 70.0
+    # Anti-chase: the HMA cross or MACD histogram zero-cross that qualifies a
+    # setup must have happened within this many 30m bars. Without this, once
+    # HMA/MACD/ROC/EMA15 all line up they can STAY lined up for dozens of bars
+    # deep into an already-mature move — the score keeps qualifying long after
+    # the actual turn happened, so the bot enters chasing instead of at the
+    # genesis of the move. 3 bars = 1.5h on 30m.
+    entry_freshness_bars: int = 3
+    # Anti-chase 2: block entry if price is already this many ATRs away from
+    # EMA15 — i.e. a spike/capitulation candle already happened and the "meat"
+    # of the move is behind us, not ahead.
+    entry_max_ext_atr: float = 1.8
 
     # Risk manager
     risk_min_pct: float = 0.05
@@ -162,9 +173,11 @@ class Config:
     weak_confirm_bars: int = 3     # consecutive WEAK 30m-bar-close reads before force exit
     health_score_min: float = 55.0
     health_check_on_closed_bar_only: bool = True
+    symbol_cooldown_min: int = 30  # no new entry on a symbol for this long after it closes
 
     # Loop timing
     poll_interval_sec: int = 30    # how often main.py checks for a newly-closed 30m bar
+    status_log_interval_sec: int = 300  # per-symbol regime/bias/entry status log cadence
     fetch_limit_entry: int = 300
     fetch_limit_bias: int = 300
     fetch_limit_regime: int = 300
