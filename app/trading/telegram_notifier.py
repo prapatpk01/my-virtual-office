@@ -127,16 +127,43 @@ class TelegramNotifier:
         self.notify(text)
 
     def notify_order(self, symbol: str, side: str, amount: float,
-                     price: float, strategy: str, paper: bool):
-        emoji = "✅" if side == "buy" else "🏁"
-        mode = "📄 PAPER" if paper else "💰 LIVE"
-        text = (
-            f"{emoji} *Order Executed* {mode}\n"
-            f"`{symbol}` — *{side.upper()}*\n"
-            f"Amount: `{amount}` @ `{price:,.4f}`\n"
-            f"Strategy: {strategy}"
-        )
-        self.notify(text)
+                     price: float, strategy: str, paper: bool,
+                     sl: float = None, tp: float = None,
+                     macro_score: float = None, macro_bias: str = None,
+                     selected_strategy: str = None, strategy_confidence: float = None,
+                     regime: str = None, direction: str = None):
+        emoji = "🟢" if side == "buy" else "🔴"
+        mode  = "📄 PAPER" if paper else "💰 LIVE"
+        dir_label = f"LONG" if direction == "long" else "SHORT" if direction == "short" else side.upper()
+
+        lines = [
+            f"{emoji} *Order Executed* {mode}",
+            f"`{symbol}` — *{dir_label}*",
+            f"Entry: `{price:,.4f}`  |  Amount: `{amount}`",
+        ]
+
+        if sl and tp:
+            risk   = abs(price - sl)
+            reward = abs(tp - price)
+            rr     = reward / risk if risk > 0 else 0
+            lines += [
+                f"🛑 SL: `{sl:,.4f}`  ({abs(price-sl)/price*100:.2f}%)",
+                f"🎯 TP: `{tp:,.4f}`  ({abs(tp-price)/price*100:.2f}%)",
+                f"📐 R:R `1:{rr:.2f}`",
+            ]
+        elif sl:
+            lines.append(f"🛑 SL: `{sl:,.4f}`")
+
+        lines.append("")
+        if selected_strategy:
+            lines.append(f"🧠 Strategy: `{selected_strategy}` ({strategy_confidence:.0f})" if strategy_confidence else f"🧠 Strategy: `{selected_strategy}`")
+        if macro_score is not None and macro_bias:
+            lines.append(f"📈 Macro: `{macro_bias}` ({macro_score:.0f}/100)")
+        if regime:
+            lines.append(f"🌍 Regime: `{regime}`")
+        lines.append(f"⚙️ {strategy}")
+
+        self.notify("\n".join(lines))
 
     def notify_trade_closed(self, symbol: str, reason: str, exit_price: float,
                             entry: float, sl, tp, stats: dict):

@@ -797,8 +797,19 @@ class TradingBot:
                 sl_p or 0, tp_p or 0, self.connector.paper,
             )
             if self.telegram:
-                self.telegram.notify_order(sym, order_side, amount, order.price,
-                                           strategy_name, self.connector.paper)
+                meta = signal.metadata or {}
+                macro_info = meta.get("macro_trend", {})
+                self.telegram.notify_order(
+                    sym, order_side, amount, order.price,
+                    strategy_name, self.connector.paper,
+                    sl=sl_p, tp=tp_p,
+                    macro_score=macro_info.get("score"),
+                    macro_bias=macro_info.get("bias"),
+                    selected_strategy=meta.get("selected_strategy"),
+                    strategy_confidence=meta.get("strategy_confidence"),
+                    regime=meta.get("regime"),
+                    direction=direction,
+                )
         except Exception as e:
             logger.error("Order failed for %s %s: %s", direction, sym, e)
             self._sig.unlock_strategy(sym, strategy_name)
