@@ -16,5 +16,10 @@ anthropic>=0.25.0
 # Forex / Gold data feed (free, no API key needed)
 yfinance>=0.2.40
 
+# Entry-alert chart rendering (candlesticks + EMA/SL/TP overlays -> Telegram photo)
+mplfinance>=0.12.10b0
+matplotlib>=3.8.0
+pandas>=2.0.0
+
 # Optional: for loading .env file automatically
 # python-dotenv>=1.0.0

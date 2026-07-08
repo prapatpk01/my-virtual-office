@@ -287,6 +287,7 @@ def _make_telegram(cfg: dict):
 async def _run_adaptive(cfg, connector, telegram, stop_event):
     from trading.adaptive_trading_bot import TradingBot as AdaptiveBot, ExpectancyEngine
     from trading.indicator_engine import IndicatorEngine
+    from trading.chart_renderer import render_entry_chart
 
     symbols = cfg["symbols"]
     logger.info("=== ADAPTIVE MODE: %d symbols ===", len(symbols))
@@ -325,6 +326,72 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     bots: dict = {}
     last_bar_ts: dict = {}  # symbol → last processed 15m bar timestamp
 
+    # [CHART ALERTS] latest fetched 15m candles per symbol — the OPEN-alert
+    # chart renderer reads from here at execution-callback time (the callback
+    # itself only receives the order payload, not market data).
+    last_c15m_cache: dict = {}
+
+    def _send_open_chart_alert(sym: str, order_type: str, trade_info: dict) -> bool:
+        """Render an entry chart + HTML caption and send as a Telegram photo.
+        Returns True when the photo was queued (send_photo itself falls back
+        to a text message if the upload fails); False → caller sends the
+        plain-text alert instead."""
+        candles = last_c15m_cache.get(sym) or []
+        if len(candles) < 30:
+            return False
+        direction = "LONG" if "LONG" in order_type else "SHORT"
+        entry = float(trade_info.get("entry") or 0)
+        sl    = float(trade_info.get("sl") or 0)
+        tp1   = float(trade_info.get("tp1") or 0)
+        tp2   = float(trade_info.get("tp2") or 0)
+        size  = float(trade_info.get("size") or 0)
+
+        # Signal context lives on the bot (current_trade is set before the
+        # OPEN order is sent), not in the order payload.
+        bot_ref = bots.get(sym, (None, None))[0] if sym in bots else None
+        strategy = regime = l1_level = ""
+        l1_score = 0.0
+        close_pct = 0.75
+        if bot_ref is not None:
+            t = getattr(bot_ref, "current_trade", {}) or {}
+            strategy  = t.get("strategy", "") or ""
+            regime    = t.get("e_state", "") or getattr(bot_ref, "current_market_state", "")
+            l1_level  = getattr(bot_ref, "current_regime_bias", "")
+            l1_score  = float(getattr(bot_ref, "regime_score", 0.0) or 0.0)
+            close_pct = float(getattr(bot_ref, "tp1_close_pct", 0.75) or 0.75)
+
+        chart_path = render_entry_chart(
+            candles, sym, direction, entry, sl, tp1, tp2,
+            strategy=strategy, regime=regime,
+        )
+        if not chart_path:
+            return False
+
+        emoji    = "🟢" if direction == "LONG" else "🔴"
+        sl_pct   = abs(sl - entry) / entry * 100 if entry else 0.0
+        notional = size * entry
+        lines = [
+            f"{emoji} <b>OPEN {direction}</b>  {sym}",
+            "━━━━━━━━━━━━━━━",
+            f"📍 Entry : <code>{_fmt_px(entry)}</code>",
+            f"🛑 SL : <code>{_fmt_px(sl)}</code> (-{sl_pct:.2f}%)",
+            f"🎯 T1 : <code>{_fmt_px(tp1)}</code> (0.5R · close {close_pct:.0%} · SL→BE)",
+            f"🏁 T2 : <code>{_fmt_px(tp2)}</code> (1.0R · close rest)",
+            f"💰 Size : {size:.4f} (≈${notional:,.2f})",
+        ]
+        if strategy or regime:
+            lines.append("━━━━━━━━━━━━━━━")
+            ctx = []
+            if strategy:
+                ctx.append(f"Strategy: <b>{strategy}</b>")
+            if regime:
+                ctx.append(f"Regime: <b>{regime}</b>")
+            lines.append("📊 " + " | ".join(ctx))
+        if l1_level:
+            lines.append(f"🧭 4H Macro: <b>{l1_level}</b> ({l1_score:.0f}/100)")
+        telegram.send_photo(chart_path, "\n".join(lines), parse_mode="HTML")
+        return True
+
     # FIX-#6: use BOT_STATE_DIR env var so state survives container restarts
     import os as _os
     _state_dir = _os.environ.get("BOT_STATE_DIR", "/tmp")
@@ -344,10 +411,18 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 if telegram and order_type != "AMEND_SL":
                     try:
                         if "OPEN" in order_type:
-                            msg = _format_open_msg(order_type, s, trade_info)
+                            # [CHART ALERTS] photo (candles + EMA + entry/SL/
+                            # T1/T2 levels) with an HTML caption; plain-text
+                            # fallback when rendering isn't possible.
+                            sent = False
+                            try:
+                                sent = _send_open_chart_alert(s, order_type, trade_info)
+                            except Exception as ce:
+                                logger.warning("[Chart][%s] alert failed (%s) — text fallback", s, ce)
+                            if not sent:
+                                telegram.send(_format_open_msg(order_type, s, trade_info))
                         else:
-                            msg = _format_close_msg(order_type, s, trade_info)
-                        telegram.send(msg)
+                            telegram.send(_format_close_msg(order_type, s, trade_info))
                     except Exception:
                         pass
                 return result
@@ -536,6 +611,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 if not c15m or not c1h or not c4h:
                     logger.warning("[Adaptive][%s] Empty candles — skipping", sym)
                     continue
+
+                # [CHART ALERTS] keep the freshest candles available for the
+                # OPEN-alert renderer (fires inside on_tick below).
+                last_c15m_cache[sym] = c15m
 
                 latest_ts = c15m[-1].timestamp if c15m else 0
                 is_new_bar = latest_ts > last_bar_ts[sym]

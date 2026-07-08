@@ -64,6 +64,28 @@ class TelegramNotifier:
             except Exception:
                 pass
 
+    def send_photo(self, photo_path: str, caption: str = "",
+                   parse_mode: str = "", delete_after: bool = True):
+        """Fire-and-forget photo send (chart alerts). Falls back to a plain
+        text message when the photo upload fails, so an alert is never lost
+        to a rendering/upload problem. delete_after removes the temp PNG
+        once the upload attempt finishes."""
+        if not self._enabled:
+            return
+        coro = self._send_photo(photo_path, caption, parse_mode, delete_after)
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        else:
+            try:
+                cur = asyncio.get_event_loop()
+                if cur.is_running():
+                    cur.create_task(coro)
+                else:
+                    cur.run_until_complete(coro)
+            except Exception:
+                pass
+
     # Alias for backward compatibility
     def notify(self, text: str):
         self.send(text)
@@ -288,6 +310,48 @@ class TelegramNotifier:
         except Exception as e:
             logger.warning("Telegram send error: %s", e)
             return False
+
+    async def _send_photo(self, photo_path: str, caption: str,
+                          parse_mode: str, delete_after: bool) -> bool:
+        """Upload a photo via sendPhoto (multipart). Telegram caps captions
+        at 1024 chars — truncate rather than fail. On any failure, fall back
+        to sending the caption as a plain text message."""
+        url = TELEGRAM_API.format(token=self.token, method="sendPhoto")
+        ok = False
+        try:
+            with open(photo_path, "rb") as f:
+                form = aiohttp.FormData()
+                form.add_field("chat_id", self.chat_id)
+                form.add_field("photo", f, filename="chart.png",
+                               content_type="image/png")
+                if caption:
+                    form.add_field("caption", caption[:1024])
+                if parse_mode:
+                    form.add_field("parse_mode", parse_mode)
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url, data=form, timeout=aiohttp.ClientTimeout(total=30)
+                    ) as r:
+                        if r.status != 200:
+                            body = await r.text()
+                            logger.warning("Telegram sendPhoto failed %s: %s",
+                                           r.status, body[:200])
+                        else:
+                            ok = True
+        except Exception as e:
+            logger.warning("Telegram sendPhoto error: %s", e)
+        finally:
+            if delete_after:
+                try:
+                    import os as _os
+                    _os.remove(photo_path)
+                except OSError:
+                    pass
+        if not ok and caption:
+            # Markdown entities in the caption may not be valid plain text —
+            # send as-is (sendMessage without parse_mode renders raw text).
+            await self._send(caption)
+        return ok
 
     async def _get_updates(self) -> list:
         url = TELEGRAM_API.format(token=self.token, method="getUpdates")
