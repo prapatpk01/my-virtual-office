@@ -240,9 +240,14 @@ class BinanceConnector(BaseConnector):
             return [Balance(asset=k, free=v, used=0.0, total=v)
                     for k, v in self._paper_balance.items() if v > 0]
         raw = await self._exchange.fetch_balance()
-        return [Balance(asset=k, free=v["free"], used=v["used"], total=v["total"])
-                for k, v in raw["total"].items()
-                if isinstance(raw.get(k), dict) and raw[k].get("total", 0) > 0]
+        # ccxt unified format: raw["total"]/["free"]/["used"] are {asset: float},
+        # while raw[asset] (top-level) is the {"free","used","total"} dict per asset.
+        skip = {"info", "free", "used", "total", "timestamp", "datetime"}
+        return [
+            Balance(asset=k, free=v.get("free", 0.0), used=v.get("used", 0.0), total=v.get("total", 0.0))
+            for k, v in raw.items()
+            if k not in skip and isinstance(v, dict) and v.get("total", 0) > 0
+        ]
 
     async def close(self):
         await self._exchange.close()
