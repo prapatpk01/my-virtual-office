@@ -101,8 +101,16 @@ REGIME_THRESHOLDS: Dict[str, int] = {
     "Exhaustion": 68,
 }
 
-# All 5 regimes are tradeable — no LOW_VOL equivalent in the new pipeline
-_TRADEABLE_REGIMES: frozenset = frozenset({"Trend", "Range", "Breakout", "Reversal", "Exhaustion"})
+# [V9.1 QUALITY] Only regimes with proven positive expectancy generate entries.
+# Backtest evidence (2,972 trades, 4 symbols, Jan–Jul 2026, realistic 3m intrabar):
+#   Trend      968 trades  55.2% WR  +$4,529   → tradeable (with pullback filter → 72%)
+#   Reversal    26 trades  76.9% WR    +$360   → tradeable
+#   Exhaustion  21 trades  61.9% WR     +$86   → tradeable
+#   Range     1839 trades  42.1% WR  -$8,085   → BLOCKED (no sub-slice was profitable)
+#   Breakout   118 trades  47.5% WR  -$1,038   → BLOCKED
+# Range/Breakout are still CLASSIFIED (regime display, state-drift checks) —
+# they just never open a position.
+_TRADEABLE_REGIMES: frozenset = frozenset({"Trend", "Reversal", "Exhaustion"})
 
 # Regimes where entries FADE the macro trend (want opposite of L1 direction)
 _COUNTER_REGIMES: frozenset = frozenset({"Reversal", "Exhaustion"})
@@ -532,6 +540,68 @@ class ConfidenceEngine:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# EXPECTANCY ENGINE — per (regime, strategy) self-pruning
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ExpectancyEngine:
+    """
+    Tracks realized win-rate per (regime, strategy) combo and BLOCKS combos
+    whose live track record proves negative expectancy. Same rule-based,
+    no-ML design as PatternLearningEngine/ConditionLearningEngine: a combo
+    is only judged after MIN_TRADES samples, and a blocked combo is
+    re-admitted automatically if its rolling window recovers (stats use a
+    rolling window, not lifetime totals, so one bad month doesn't ban a
+    strategy forever).
+    """
+
+    MIN_TRADES = 12          # samples before a combo can be blocked
+    MIN_WR     = 0.45        # rolling WR below this → blocked
+    WINDOW     = 40          # rolling window per combo (recent outcomes only)
+
+    def __init__(self):
+        # {"Trend|EMA_Pullback": [1,0,1,...]}  (1=win, most recent last)
+        self.outcomes: Dict[str, List[int]] = {}
+
+    @staticmethod
+    def _key(regime: str, strategy: str) -> str:
+        return f"{regime}|{strategy}"
+
+    def record(self, regime: str, strategy: str, win: bool) -> None:
+        if not regime or not strategy:
+            return
+        k = self._key(regime, strategy)
+        lst = self.outcomes.setdefault(k, [])
+        lst.append(1 if win else 0)
+        if len(lst) > self.WINDOW:
+            del lst[:-self.WINDOW]
+
+    def is_blocked(self, regime: str, strategy: str) -> bool:
+        lst = self.outcomes.get(self._key(regime, strategy))
+        if not lst or len(lst) < self.MIN_TRADES:
+            return False
+        return (sum(lst) / len(lst)) < self.MIN_WR
+
+    def get_summary(self) -> Dict:
+        out = {}
+        for k, lst in self.outcomes.items():
+            if not lst:
+                continue
+            regime, strategy = k.split("|", 1)
+            out[k] = {
+                "trades":  len(lst),
+                "wr":      round(sum(lst) / len(lst), 3),
+                "blocked": self.is_blocked(regime, strategy),
+            }
+        return out
+
+    def to_dict(self) -> Dict:
+        return {"outcomes": self.outcomes}
+
+    def from_dict(self, data: Dict):
+        self.outcomes = data.get("outcomes", self.outcomes)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # [V8-7] PATTERN LEARNING ENGINE — simplified, anti-overfit
 # Tracks per entry_type: WR, Avg R, Avg Hold, Expectancy
 # WR<45% → weight ×0.85 (floor 0.5)   WR>65% → weight ×1.15 (ceil 1.5)
@@ -847,6 +917,7 @@ class TradingBot:
         self.regime_clf         = RegimeClassifier()
         self.strategy_scorer    = StrategyScorer()
         self.confidence_engine  = ConfidenceEngine()
+        self.expectancy_engine  = ExpectancyEngine()
         self.learning_engine    = PatternLearningEngine()
         # [LEVEL 2/3] Diagnostic-tag learning + temporary strategy tightening
         # (see ConditionLearningEngine, _diagnose_conditions, _check_strategy_dominance)
@@ -962,7 +1033,7 @@ class TradingBot:
         self._filter_stats: Dict[str, int] = {
             "checked": 0, "passed": 0,
             "veto_chop": 0, "veto_climax": 0, "veto_1h_chop": 0,
-            "strategy_fail": 0, "threshold_fail": 0,
+            "veto_chase": 0, "strategy_fail": 0, "threshold_fail": 0,
         }
 
         # [LESSON] loss-cluster alerting state
@@ -1297,6 +1368,22 @@ class TradingBot:
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
     MIN_EMA_DIST_ATR: float = 0.6
 
+    # ── [V9.1 QUALITY GATES] Backtest-proven filters (2,972 trades) ──────────
+    # Trend entries with 15m ADX already elevated are LATE (chasing an
+    # extended leg): ADX≤22 quartile ran 68.9% WR vs 47-49% above 30.
+    # Enter the pullback/quiet phase of a 4H trend, not the climax.
+    MAX_15M_ADX_TREND: float = 22.0
+
+    # Trend-direction RSI chase guard: LONG into overbought / SHORT into
+    # oversold on the 15m entry bar = buying the top of the leg.
+    TREND_RSI_CHASE_HI: float = 65.0
+    TREND_RSI_CHASE_LO: float = 35.0
+
+    # Asia session (00-05 UTC) ran 37-45% WR across every regime — thin
+    # liquidity whipsaw. Hard-gated rather than left to the session-tag
+    # learner (which needs 8+ samples per tag to react).
+    BLOCKED_ENTRY_HOURS_UTC: frozenset = frozenset({0, 1, 2, 3, 4, 5})
+
     # [CLIMAX-VETO] Skip trend entries on bars with range > this × ATR
     # (vertical blow-off spikes). 99 = disabled.
     CLIMAX_BAR_ATR: float = 2.0
@@ -1498,10 +1585,33 @@ class TradingBot:
                     f"veto:1h-chop (eff {_eff_1h:.2f} < {self.MIN_1H_EFFICIENCY})")
                 return None
 
-        # ── Strategy scoring ─────────────────────────────────────────────────
+        # ── [V9.1 QUALITY] Trend pullback + RSI-chase vetoes ─────────────────
+        # Enter the QUIET phase of a 4H trend (15m ADX still low = pullback),
+        # never the extended leg. Backtest: ADX≤22 → 68.9% WR, ADX>30 → 47%.
+        if regime == "Trend":
+            _adx15 = ind_15m.get("adx", 20.0)
+            if _adx15 > self.MAX_15M_ADX_TREND:
+                self._filter_stats["checked"] += 1
+                self._filter_stats["veto_chase"] += 1
+                self._scan_info[direction] = (
+                    f"veto:late-trend (15m ADX {_adx15:.0f} > "
+                    f"{self.MAX_15M_ADX_TREND:.0f} — leg already extended)")
+                return None
+
+            _rsi15 = ind_15m.get("rsi", 50.0)
+            if ((direction == "LONG" and _rsi15 > self.TREND_RSI_CHASE_HI) or
+                    (direction == "SHORT" and _rsi15 < self.TREND_RSI_CHASE_LO)):
+                self._filter_stats["checked"] += 1
+                self._filter_stats["veto_chase"] += 1
+                self._scan_info[direction] = (
+                    f"veto:rsi-chase (rsi {_rsi15:.0f} — entering into extreme)")
+                return None
+
+        # ── Strategy scoring (expectancy-blocked combos excluded) ────────────
         strategy_scores = {
             s: self.strategy_scorer.score(s, direction, ind_15m, l1, l2, regime)
             for s in REGIME_STRATEGIES.get(regime, REGIME_STRATEGIES["Trend"])
+            if not self.expectancy_engine.is_blocked(regime, s)
         }
         best = self.confidence_engine.select_best(strategy_scores)
         if best is None:
@@ -1806,6 +1916,13 @@ class TradingBot:
         if self.current_market_state not in _TRADEABLE_REGIMES:
             self._log_event(
                 f"SKIP: untradeable regime={self.current_market_state}", level="debug"
+            )
+            return False
+
+        # [V9.1 QUALITY] Session gate — Asia hours (00-05 UTC) proved 37-45% WR
+        if _now.hour in self.BLOCKED_ENTRY_HOURS_UTC:
+            self._log_event(
+                f"SKIP: blocked session hour {_now.hour:02d} UTC", level="debug"
             )
             return False
 
@@ -2318,6 +2435,12 @@ class TradingBot:
             r_multiple=_realized_r,
             hold_bars=_holding_bars,
         )
+        # [V9.1] Expectancy engine — per (regime, strategy) self-pruning
+        self.expectancy_engine.record(
+            t.get("e_state") or self.current_market_state,
+            t.get("strategy") or "",
+            win=(result == "WIN"),
+        )
         # Update weights every 20 trades
         if len(self.trade_journal) % 20 == 0:
             self.learning_engine.update_weights()
@@ -2762,6 +2885,8 @@ class TradingBot:
             "pattern_learning":     self.learning_engine.to_dict(),
             # [LEVEL 2/3] condition-tag stats + any active temporary tightening
             "condition_learning":   self.condition_engine.to_dict(),
+            # [V9.1] per (regime, strategy) expectancy tracking
+            "expectancy":           self.expectancy_engine.to_dict(),
             "active_strategy_adjustments": {
                 tag: until.isoformat() for tag, until in self._active_strategy_adjustments.items()
             },
@@ -2844,6 +2969,10 @@ class TradingBot:
         cl = data.get("condition_learning")
         if cl:
             self.condition_engine.from_dict(cl)
+
+        ex = data.get("expectancy")
+        if ex:
+            self.expectancy_engine.from_dict(ex)
 
         self._active_strategy_adjustments = {
             tag: datetime.datetime.fromisoformat(until)
