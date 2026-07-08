@@ -219,18 +219,24 @@ class EntryTimingEngine:
             MarketRegime.LOW_VOLATILITY: 2.0,
         }.get(regime, 2.5)
 
-        # Structure-based SL: use recent swing low/high
+        # Structure-based SL: beyond the recent swing with an ATR buffer.
+        # SL must clear both the structure level and a minimum ATR distance,
+        # otherwise ordinary noise stops the trade out. Width capped at 3×ATR.
         lookback = min(20, len(highs))
         if direction == "long":
-            swing_sl = float(lows[-lookback:].min()) if lookback > 0 else price * 0.98
-            atr_sl   = price - sl_mult * atr
-            sl       = max(swing_sl, atr_sl)  # tighter of the two
-            tp       = price + rr_target * (price - sl)
+            swing_sl  = float(lows[-lookback:].min()) if lookback > 0 else price * 0.98
+            struct_sl = swing_sl - 0.3 * atr
+            atr_sl    = price - sl_mult * atr
+            sl        = min(struct_sl, atr_sl)          # wider of the two
+            sl        = max(sl, price - 3.0 * atr)      # cap max width
+            tp        = price + rr_target * (price - sl)
         else:  # short
-            swing_sl = float(highs[-lookback:].max()) if lookback > 0 else price * 1.02
-            atr_sl   = price + sl_mult * atr
-            sl       = min(swing_sl, atr_sl)
-            tp       = price - rr_target * (sl - price)
+            swing_sl  = float(highs[-lookback:].max()) if lookback > 0 else price * 1.02
+            struct_sl = swing_sl + 0.3 * atr
+            atr_sl    = price + sl_mult * atr
+            sl        = max(struct_sl, atr_sl)          # wider of the two
+            sl        = min(sl, price + 3.0 * atr)      # cap max width
+            tp        = price - rr_target * (sl - price)
 
         return sl, tp
 

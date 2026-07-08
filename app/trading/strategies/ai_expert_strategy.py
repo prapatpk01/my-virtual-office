@@ -47,6 +47,9 @@ from ..engines.feature_store import FeatureStore
 from ..engines.model_registry import ModelRegistry
 from ..engines.portfolio_engine import PortfolioEngine
 from ..engines.drift_detector import DriftDetector, DriftAction
+from ..engines.macro_trend_engine import MacroTrendEngine, TrendBias
+from ..engines.context_bias_engine import ContextBiasEngine, ContextType
+from ..engines.regime_strategy_selector import RegimeStrategySelector, StrategyType
 
 logger = logging.getLogger("ai_expert_strategy")
 
@@ -87,6 +90,10 @@ class AIExpertStrategy(BaseStrategy):
         self._feature_store    = FeatureStore(ttl_seconds=60)
         self._model_registry   = ModelRegistry(registry_path=registry_path)
         self._drift_detector   = DriftDetector()
+        # ── Multi-layer decision architecture ─────────────────────────────────
+        self._macro_engine     = MacroTrendEngine()          # Layer 1: 4H macro trend
+        self._context_engine   = ContextBiasEngine()         # Layer 2: 1H context + bias
+        self._selector         = RegimeStrategySelector()    # Layer 3: strategy selection
 
         # Internal state per signal
         self._open_entry:    Optional[dict]  = None
@@ -94,6 +101,9 @@ class AIExpertStrategy(BaseStrategy):
         self._signal_count   = 0
         self._last_adapt_at  = 0
         self._latest_candles: list           = []   # updated each analyze(); used by tick_open_position
+        self._last_macro     = None   # MacroTrendResult from last analyze()
+        self._last_context   = None   # ContextBiasResult
+        self._last_selection = None   # StrategySelectionResult
 
     async def analyze(
         self,
@@ -111,6 +121,24 @@ class AIExpertStrategy(BaseStrategy):
 
         # ── Layer 1: Market Intelligence (Regime) ─────────────────────────────
         regime = self._regime_engine.analyze(candles, mtf_candles=mtf)
+
+        # ── 4H Macro Trend → 1H Context & Bias → Strategy Selection ──────────
+        macro     = self._macro_engine.analyze(mtf.get("4h", []))
+        context   = self._context_engine.analyze(mtf.get("1h", []), macro.score)
+        selection = self._selector.select(macro, context, regime)
+        self._last_macro, self._last_context, self._last_selection = macro, context, selection
+
+        if not selection.is_tradeable():
+            reason = selection.block_reason or "No strategy cleared confidence threshold"
+            logger.debug(
+                "[%s] Selector NO_TRADE: %s | macro=%.0f(%s) ctx=%s scores=%s",
+                symbol, reason, macro.score, macro.bias.value,
+                context.context.value, selection.scores,
+            )
+            return self._hold(
+                current_price,
+                reason=f"Strategy selector: {reason}",
+            )
 
         # ── Layer 2: Expert Analysis ─────────────────────────────────────────
         experts = self._expert_engine.analyze(
@@ -144,9 +172,17 @@ class AIExpertStrategy(BaseStrategy):
             if regime.regime.value in recs:
                 adapt_weights = recs[regime.regime.value].get("weights")
 
-        # ── Layer 3+4: Decision Engine ─────────────────────────────────────────
+        # ── Layer 3+4: Decision Engine (selector-driven weights) ──────────────
+        # The selected strategy type dictates the indicator weights.
+        # Learned adaptive weights (if enough journal history) take precedence.
+        strategy_weights = {
+            k: v for k, v in selection.weights.items() if k != "correlation"
+        }
+        _wt = sum(strategy_weights.values()) or 1.0
+        strategy_weights = {k: v / _wt for k, v in strategy_weights.items()}
+
         decision = self._decision_engine.decide(
-            experts, regime, adaptive_weights=adapt_weights
+            experts, regime, adaptive_weights=adapt_weights or strategy_weights
         )
 
         # ── Layer 8: Exit AI (check open position first) ──────────────────────
@@ -184,6 +220,22 @@ class AIExpertStrategy(BaseStrategy):
             return self._hold(
                 current_price,
                 reason=entry_signal.reason,
+                metadata=self._build_metadata(regime, experts, decision, entry_signal),
+            )
+
+        # ── Macro direction gate: block counter-trend entries ─────────────────
+        if entry_signal.direction == "long" and not selection.allows_long():
+            return self._hold(
+                current_price,
+                reason=(f"LONG blocked — macro {macro.bias.value} ({macro.score:.0f}) "
+                        f"direction_filter={selection.direction_filter}"),
+                metadata=self._build_metadata(regime, experts, decision, entry_signal),
+            )
+        if entry_signal.direction == "short" and not selection.allows_short():
+            return self._hold(
+                current_price,
+                reason=(f"SHORT blocked — macro {macro.bias.value} ({macro.score:.0f}) "
+                        f"direction_filter={selection.direction_filter}"),
                 metadata=self._build_metadata(regime, experts, decision, entry_signal),
             )
 
@@ -226,13 +278,16 @@ class AIExpertStrategy(BaseStrategy):
             },
             "decision_score":   decision.confidence,
             "confidence_level": decision.confidence_level.value,
+            "strategy_type":    selection.selected.value,
+            "macro_score":      macro.score,
             "opened_at":        time.time(),
         }
 
         self._signal_count += 1
         logger.info(
-            "[%s] %s SIGNAL | Regime=%s | Conf=%s %.0f | R:R=%.1f | SL=%.4f TP=%.4f",
+            "[%s] %s SIGNAL | Strategy=%s | Macro=%.0f(%s) | Regime=%s | Conf=%s %.0f | R:R=%.1f | SL=%.4f TP=%.4f",
             symbol, signal_type.value.upper(),
+            selection.selected.value, macro.score, macro.bias.value,
             regime.regime.value, decision.confidence_level.value,
             decision.confidence, entry_signal.rr_ratio,
             entry_signal.stop_loss, entry_signal.take_profit,
@@ -394,6 +449,23 @@ class AIExpertStrategy(BaseStrategy):
             "checklist":      getattr(entry_signal, "checklist", {}),
             "regime_detail":  regime.detail,
             "direction_bias": experts.direction_bias,
+            "macro_trend": {
+                "score":     self._last_macro.score if self._last_macro else 50.0,
+                "bias":      self._last_macro.bias.value if self._last_macro else "neutral",
+                "structure": self._last_macro.structure if self._last_macro else "mixed",
+            },
+            "context_1h": {
+                "type":       self._last_context.context.value if self._last_context else "unclear",
+                "bull_score": self._last_context.bull_score if self._last_context else 50.0,
+                "bear_score": self._last_context.bear_score if self._last_context else 50.0,
+            },
+            "selected_strategy": (
+                self._last_selection.selected.value if self._last_selection else "unknown"
+            ),
+            "strategy_scores": self._last_selection.scores if self._last_selection else {},
+            "strategy_confidence": (
+                self._last_selection.confidence if self._last_selection else 0.0
+            ),
         }
 
     def _run_adaptation(self) -> None:
