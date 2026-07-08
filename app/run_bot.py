@@ -680,15 +680,29 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         if _time.time() - last_filter_stats_log >= FILTER_STATS_LOG_SECS:
             last_filter_stats_log = _time.time()
             for sym, (bot, _sf) in bots.items():
-                fs = bot.get_filter_stats()
-                if fs["checked"] == 0:
-                    continue
-                logger.info(
-                    "[FilterStats][%s] checked=%d passed=%d | "
-                    "bias_fail=%d health_fail=%d confidence_fail=%d",
-                    sym, fs["checked"], fs["passed"],
-                    fs["bias_fail"], fs["health_fail"], fs["confidence_fail"],
-                )
+                # [CRASH-FIX] This block previously had no try/except — a
+                # stats-schema mismatch (e.g. get_filter_stats() key rename)
+                # raised uncaught here, killing the whole _run_adaptive
+                # coroutine (and therefore the process) on the next 5-min
+                # tick after any symbol had a signal evaluation, which is
+                # exactly when positions tend to open/close. Every other
+                # periodic block in this loop (balance sync, reconcile,
+                # scan log) already guards itself the same way.
+                try:
+                    fs = bot.get_filter_stats()
+                    if fs.get("checked", 0) == 0:
+                        continue
+                    logger.info(
+                        "[FilterStats][%s] checked=%d passed=%d | "
+                        "veto_chop=%d veto_climax=%d veto_1h_chop=%d "
+                        "veto_chase=%d strategy_fail=%d threshold_fail=%d",
+                        sym, fs.get("checked", 0), fs.get("passed", 0),
+                        fs.get("veto_chop", 0), fs.get("veto_climax", 0),
+                        fs.get("veto_1h_chop", 0), fs.get("veto_chase", 0),
+                        fs.get("strategy_fail", 0), fs.get("threshold_fail", 0),
+                    )
+                except Exception as e:
+                    logger.warning("[FilterStats][%s] log failed (non-fatal): %s", sym, e)
 
         if _time.time() - last_balance_sync >= BALANCE_SYNC_SECS:
             last_balance_sync = _time.time()
