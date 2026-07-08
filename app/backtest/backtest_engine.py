@@ -45,11 +45,11 @@ class BacktestConfig:
     # Account
     initial_balance: float = 10_000.0
     risk_pct:        float = 0.01          # 1% per trade
-    tp1_close_pct:   float = 0.50          # 50% close at TP1
+    tp1_close_pct:   float = 0.75          # [V9.2] 75% close at TP1
 
     # TP/SL structure (must match live bot)
     tp1_r:           float = 0.5           # TP1 at 0.5R
-    tp2_r:           float = 1.2           # TP2 at 1.2R
+    tp2_r:           float = 1.0           # [V9.2] TP2 at 1.0R (was 1.2R)
 
     # Risk limits
     daily_loss_pct:   float = -3.0

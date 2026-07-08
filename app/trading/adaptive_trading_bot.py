@@ -101,16 +101,18 @@ REGIME_THRESHOLDS: Dict[str, int] = {
     "Exhaustion": 68,
 }
 
-# [V9.1 QUALITY] Only regimes with proven positive expectancy generate entries.
-# Backtest evidence (2,972 trades, 4 symbols, Jan–Jul 2026, realistic 3m intrabar):
-#   Trend      968 trades  55.2% WR  +$4,529   → tradeable (with pullback filter → 72%)
-#   Reversal    26 trades  76.9% WR    +$360   → tradeable
-#   Exhaustion  21 trades  61.9% WR     +$86   → tradeable
-#   Range     1839 trades  42.1% WR  -$8,085   → BLOCKED (no sub-slice was profitable)
-#   Breakout   118 trades  47.5% WR  -$1,038   → BLOCKED
-# Range/Breakout are still CLASSIFIED (regime display, state-drift checks) —
+# [V9.2 QUALITY] Only regimes with proven positive expectancy generate entries.
+# Clean-run evidence (protection layer off, trades ran purely to T1/T2/SL,
+# 183 trades, 4 symbols, Jan–Jul 2026 realistic 3m intrabar):
+#   Trend      102 trades  68.6% WR (above the 66.7% random baseline at this
+#              geometry, and 79-82% when the 4H macro is decisive — see the
+#              NEUTRAL-L1 veto in _generate_signal)          → tradeable
+#   Reversal    78 trades  55.1% WR  -$1,684 (WELL below baseline) → BLOCKED
+#   Exhaustion   3 trades  (sample too small to trust)       → BLOCKED
+#   Range/Breakout: blocked since V9.1 (42.1%/47.5% WR over 1,957 trades).
+# Blocked regimes are still CLASSIFIED (regime display, state-drift checks) —
 # they just never open a position.
-_TRADEABLE_REGIMES: frozenset = frozenset({"Trend", "Reversal", "Exhaustion"})
+_TRADEABLE_REGIMES: frozenset = frozenset({"Trend"})
 
 # Regimes where entries FADE the macro trend (want opposite of L1 direction)
 _COUNTER_REGIMES: frozenset = frozenset({"Reversal", "Exhaustion"})
@@ -907,7 +909,10 @@ class TradingBot:
                  daily_profit_limit_pct: float = 8.0,
                  cooldown_minutes: int = 20,
                  max_loss_streak: int = 4,
-                 tp1_close_pct: float = 0.50,
+                 # [V9.2] 75% banked at T1 (was 50%): the majority of the
+                 # position locks in at the high-probability first target,
+                 # leaving a 25% runner for T2.
+                 tp1_close_pct: float = 0.75,
                  tp1_r: Optional[float] = None,
                  tp2_r: Optional[float] = None,
                  min_ema_dist_atr: Optional[float] = None,
@@ -1059,7 +1064,8 @@ class TradingBot:
         self._filter_stats: Dict[str, int] = {
             "checked": 0, "passed": 0,
             "veto_chop": 0, "veto_climax": 0, "veto_1h_chop": 0,
-            "veto_chase": 0, "strategy_fail": 0, "threshold_fail": 0,
+            "veto_chase": 0, "veto_macro": 0,
+            "strategy_fail": 0, "threshold_fail": 0,
         }
 
         # [LESSON] loss-cluster alerting state
@@ -1356,8 +1362,12 @@ class TradingBot:
     # partial (self.tp1_close_pct, constructor-configurable — see __init__)
     # and moves the stop to breakeven, T2 closes what's left (matches the
     # exchange-attached TP2, unchanged).
+    # [V9.2] T2 pulled in from 1.2R: clean-run data showed only 39.7% of
+    # trades that reached T1 went on to 1.2R (≈ the 41.7% random baseline);
+    # at 1.0R the same leg has ~50% odds, and with 75% already banked at T1
+    # the trade's outcome no longer depends on the weak runner leg.
     TP1_R: float = 0.5
-    TP2_R: float = 1.2
+    TP2_R: float = 1.0
 
     def _target_ladder(self) -> List[tuple]:
         """
@@ -1610,6 +1620,19 @@ class TradingBot:
                 self._scan_info[direction] = (
                     f"veto:1h-chop (eff {_eff_1h:.2f} < {self.MIN_1H_EFFICIENCY})")
                 return None
+
+        # ── [V9.2 QUALITY] Macro-conviction veto ─────────────────────────────
+        # A 15m "Trend" classification with a NEUTRAL 4H macro behind it is a
+        # trend with no higher-timeframe fuel. Clean-run evidence: L1 score in
+        # the neutral middle third → 44% WR (-$1,217); decisive L1 either
+        # direction → 79-82% WR (+$945).
+        if regime == "Trend" and l1.get("level") == "NEUTRAL":
+            self._filter_stats["checked"] += 1
+            self._filter_stats["veto_macro"] += 1
+            self._scan_info[direction] = (
+                f"veto:neutral-macro (L1 {l1.get('score', 50):.0f} — 15m trend "
+                f"with no 4H trend behind it)")
+            return None
 
         # ── [V9.1 QUALITY] Trend pullback + RSI-chase vetoes ─────────────────
         # Enter the QUIET phase of a 4H trend (15m ADX still low = pullback),
@@ -2209,10 +2232,17 @@ class TradingBot:
         # health tiers). Backtest evidence: ~77% of trades were closed by this
         # layer instead of TP/SL (61/71 losses cut early at -0.1..-0.9R,
         # 36/55 wins truncated to <0.3R), so the designed T1/T2 geometry was
-        # almost never allowed to play out. ADAPTIVE_PROTECT_EXITS=0 disables
-        # the layer to measure pure entry quality (trades run to T1/T2/SL
-        # only); default stays on for live safety.
-        reversal = self._detect_reversal_signals(ind) if self.enable_protect_exits else {}
+        # almost never allowed to play out — WR 43.7% with the layer on vs
+        # 63.4% with it off, same entries.
+        #
+        # [V9.2] The layer is therefore active only AFTER T1: pre-T1 the trade
+        # has exactly two exits (T1 or the hard SL) and is allowed to breathe;
+        # post-T1 75% is banked and the SL is at breakeven, so the protection
+        # exits are locking in profit on the runner instead of strangling the
+        # trade before it reaches its first target.
+        # ADAPTIVE_PROTECT_EXITS=0 disables the layer entirely (experiments).
+        _protect = self.enable_protect_exits and t.get("tp1_hit", False)
+        reversal = self._detect_reversal_signals(ind) if _protect else {}
         if reversal.get("reversal_spike"):
             sig = reversal["reversal_spike"]
             self._log_event(
@@ -2242,19 +2272,9 @@ class TradingBot:
             ind.get("momentum_collapse"),
             ind.get("volume_collapse"),
             ind.get("invalid_structure"),
-        ] if self.enable_protect_exits else []
+        ] if _protect else []
         if any(emergency_signals):
             self._close_position("EMERGENCY_EXIT", current_price, 1.0, ind)
-            return "EXITING"
-
-        # [STATE-DRIFT TEST] thesis invalidation: the 4H regime that justified
-        # this entry decayed into a non-tradeable regime before TP1.
-        if (self.enable_protect_exits
-                and not t.get("tp1_hit")
-                and t.get("e_state")
-                and self.current_market_state in ("Exhaustion",)
-                and t["e_state"] not in ("Exhaustion",)):
-            self._close_position("STATE_DRIFT_EXIT", current_price, 1.0, ind)
             return "EXITING"
 
         # Unified 2-level target structure (T1/T2) — same for every state now.
@@ -2271,8 +2291,8 @@ class TradingBot:
         tp1_hit = t.get("tp1_hit", False)
         health  = self.health_calc.calculate(ind, t, current_price)
 
-        if not self.enable_protect_exits:
-            pass   # experiment mode: pure T1/T2/SL — no health-tier actions
+        if not _protect:
+            pass   # pre-T1 (or experiment mode): pure T1/T2/SL — no health-tier actions
         elif health >= 80:
             self._log_event(
                 f"Health {health:.0f} (≥80) → HOLD (r={current_r:.2f})", level="debug"

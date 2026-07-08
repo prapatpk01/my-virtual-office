@@ -702,10 +702,12 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     logger.info(
                         "[FilterStats][%s] checked=%d passed=%d | "
                         "veto_chop=%d veto_climax=%d veto_1h_chop=%d "
-                        "veto_chase=%d strategy_fail=%d threshold_fail=%d",
+                        "veto_chase=%d veto_macro=%d "
+                        "strategy_fail=%d threshold_fail=%d",
                         sym, fs.get("checked", 0), fs.get("passed", 0),
                         fs.get("veto_chop", 0), fs.get("veto_climax", 0),
                         fs.get("veto_1h_chop", 0), fs.get("veto_chase", 0),
+                        fs.get("veto_macro", 0),
                         fs.get("strategy_fail", 0), fs.get("threshold_fail", 0),
                     )
                 except Exception as e:
