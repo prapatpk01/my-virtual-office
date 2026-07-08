@@ -60,7 +60,7 @@ def build_config() -> dict:
         "api_key":          os.environ.get("EXCHANGE_API_KEY",  ""),
         "api_secret":       os.environ.get("EXCHANGE_API_SECRET", ""),
         "api_passphrase":   os.environ.get("EXCHANGE_PASSPHRASE", ""),
-        "paper":            _env_bool("PAPER_TRADING", True),
+        "paper":            _env_bool("PAPER_TRADING", False),
         # OANDA (forex only — leave blank for crypto)
         "oanda_api_key":    os.environ.get("OANDA_API_KEY", ""),
         "oanda_account_id": os.environ.get("OANDA_ACCOUNT_ID", ""),
@@ -76,7 +76,7 @@ def build_config() -> dict:
         "symbols":      _env_list("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT"),
         "candle_tf":    os.environ.get("CANDLE_TF",         "15m"),
         "candle_limit": int(os.environ.get("CANDLE_LIMIT",  "300")),
-        "interval":     int(os.environ.get("INTERVAL_SECONDS", "60")),
+        "interval":     int(os.environ.get("INTERVAL_SECONDS", "300")),
 
         # ── Strategy ──────────────────────────────────────────────────────
         "strategy_mode":            os.environ.get("STRATEGY", "ai_expert"),
