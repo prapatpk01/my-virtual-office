@@ -737,6 +737,7 @@ class TradingBot:
                     logger.warning("[Futures] setup_futures failed for %s: %s", sym, e)
             self._futures_setup_done.add(sym)
 
+        # ── Balance check (always fresh, right before sizing) ─────────────────
         balances      = await self.connector.fetch_balance()
         quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
         ticker        = await self.connector.fetch_ticker(sym)
@@ -744,6 +745,19 @@ class TradingBot:
         meta          = signal.metadata or {}
         sl_p          = meta.get("stop_loss")
         tp_p          = meta.get("take_profit")
+
+        min_balance = float(os.getenv("MIN_BALANCE_USD", "10"))
+        logger.info(
+            "[%s] Balance check: free=$%.2f  min_required=$%.2f  (paper=%s)",
+            strategy_name, quote_balance, min_balance, self.connector.paper,
+        )
+        if quote_balance < min_balance:
+            logger.warning(
+                "[%s] Balance too low ($%.2f < $%.2f) — skipping %s on %s",
+                strategy_name, quote_balance, min_balance, direction.upper(), sym,
+            )
+            self._sig.unlock_strategy(sym, strategy_name)
+            return
 
         # Flip SL/TP for short positions
         if direction == "short" and sl_p and tp_p:
@@ -753,9 +767,31 @@ class TradingBot:
 
         size_pct = _confidence_size_pct(meta)
         amount = self.risk.size_position(quote_balance, price, size_pct=size_pct)
-        logger.info("[%s] Position size: %.1f%% of balance (confidence=%s) → %.6f",
-                    strategy_name, size_pct * 100,
-                    meta.get("confidence_level", "?"), amount)
+
+        # ── Margin check: clamp size to what the free balance can actually
+        # cover, instead of attempting an order that the exchange will reject.
+        leverage      = max(getattr(self.connector, "_leverage", 1), 1)
+        is_futures    = getattr(self.connector, "_futures", False)
+        notional      = amount * price
+        required_margin = (notional / leverage) if is_futures else notional
+        safety_buffer = 0.95  # leave headroom for fees/slippage
+
+        if required_margin > quote_balance * safety_buffer:
+            max_notional = quote_balance * safety_buffer * (leverage if is_futures else 1)
+            clamped_amount = round(max_notional / price, 6) if price > 0 else 0
+            logger.warning(
+                "[%s] Margin required $%.2f exceeds available $%.2f — clamping size %.6f → %.6f",
+                strategy_name, required_margin, quote_balance, amount, clamped_amount,
+            )
+            amount = clamped_amount
+
+        logger.info(
+            "[%s] Position size: %.1f%% of balance (confidence=%s) → %.6f  "
+            "(notional=$%.2f, margin=$%.2f, leverage=%dx)",
+            strategy_name, size_pct * 100, meta.get("confidence_level", "?"),
+            amount, amount * price, (amount * price / leverage) if is_futures else amount * price,
+            leverage,
+        )
         if amount <= 0:
             logger.info("Position size 0 for %s — tracking virtually", sym)
             if sl_p and tp_p:
