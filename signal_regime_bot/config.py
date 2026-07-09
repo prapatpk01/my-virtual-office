@@ -195,6 +195,22 @@ class Config:
     health_check_on_closed_bar_only: bool = True
     symbol_cooldown_min: int = 30  # no new entry on a symbol for this long after it closes
 
+    # ── SpikeGuard (fast 5m/15m reversal-spike protection) ───────────────────
+    # Runs EVERY poll tick while a position is open — the slow 30m health
+    # monitor cannot react to a V-reversal that eats the SL in minutes.
+    spike_guard_enabled: bool = True
+    spike_5m_atr_mult: float = 2.5     # 5m bar range >= this x ATR14(5m) = spike
+    spike_15m_atr_mult: float = 2.0    # 15m bar range >= this x ATR14(15m) = spike
+    spike_15m_cum_atr_mult: float = 2.5  # 3-bar cumulative 15m thrust vs ATR
+    spike_live_atr_mult: float = 1.8   # live ticker move beyond last 5m close vs ATR
+    spike_close_frac: float = 0.7      # spike bar must close in the extreme 30% (momentum, not wick)
+    spike_min_adverse_r: float = 0.3   # arm CLOSE only once this deep into the stop (in R)
+    spike_hard_atr_mult: float = 3.5   # a spike this big closes regardless of depth
+    spike_vol_mult: float = 2.0        # volume >= this x avg20 -> soften ATR bars 20%
+    spike_tf_fast: str = "5m"
+    spike_tf_slow: str = "15m"
+    spike_fetch_limit: int = 60
+
     # Loop timing
     poll_interval_sec: int = 30    # how often main.py checks for a newly-closed 30m bar
     status_log_interval_sec: int = 300  # per-symbol regime/bias/entry status log cadence

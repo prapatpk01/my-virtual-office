@@ -23,12 +23,13 @@ import pandas as pd
 
 from config import load_config
 from exchange_client import ExchangeClient
-from data_engine import DataEngine
+from data_engine import DataEngine, drop_unclosed_bar, _ohlcv_to_df
 from entry_engine import SignalEngine, LONG, SHORT
 from risk_manager import RiskManager
 from position_manager import PositionManager
 from telegram_notifier import TelegramNotifier
 from chart_engine import build_entry_chart
+from spike_guard import check_spike, CLOSE as SPIKE_CLOSE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -165,7 +166,15 @@ class Bot:
             await self._handle_event(event)
             return   # position fully or partially closed this tick — health check waits for next
 
-        # Health monitor — once per newly-closed 30m bar only.
+        # SpikeGuard — EVERY tick, 5m/15m closed bars + live price. The fast
+        # layer: force-close before a V-reversal eats the full SL (+slippage).
+        if self.cfg.spike_guard_enabled:
+            spike_event = await self._check_spike_guard(symbol, pos, price)
+            if spike_event:
+                await self._handle_event(spike_event)
+                return
+
+        # Health monitor — once per newly-closed 30m bar only (the slow layer).
         bar_ts = df_30m.index[-1] if len(df_30m) else None
         if bar_ts is not None and pos.last_health_bar_ts != bar_ts:
             regime = self.signal_engine.regime_engine.analyze(df_4h)
@@ -173,6 +182,29 @@ class Bot:
             hevent = await self.positions.process_closed_bar_health(symbol, df_30m, regime, bias)
             if hevent:
                 await self._handle_event(hevent)
+
+    async def _check_spike_guard(self, symbol: str, pos, price: float):
+        """Fetch 5m/15m closed bars and run the spike check. Non-fatal on data errors."""
+        import time as _t
+        c = self.cfg
+        now_ms = int(_t.time() * 1000)
+        try:
+            raw5 = await self.client.fetch_ohlcv(symbol, c.spike_tf_fast, limit=c.spike_fetch_limit)
+            raw15 = await self.client.fetch_ohlcv(symbol, c.spike_tf_slow, limit=c.spike_fetch_limit)
+        except Exception as e:
+            logger.warning("[%s] spike-guard data fetch failed (skipping this tick): %s", symbol, e)
+            return None
+        df5 = drop_unclosed_bar(_ohlcv_to_df(raw5), c.spike_tf_fast, now_ms)
+        df15 = drop_unclosed_bar(_ohlcv_to_df(raw15), c.spike_tf_slow, now_ms)
+
+        result = check_spike(pos.side, pos.entry_price, pos.one_r, df5, df15, price, c)
+        if result.action != SPIKE_CLOSE:
+            return None
+        logger.warning("[%s] SPIKE GUARD firing: %s", symbol, result.reason)
+        event = await self.positions._close_full(pos, price, "SPIKE_GUARD")
+        if event.get("event") == "SPIKE_GUARD":
+            event["spike_reason"] = result.reason
+        return event
 
     async def _look_for_entry(self, symbol: str, df_30m, sig):
         bar_ts = df_30m.index[-1] if len(df_30m) else None
@@ -242,7 +274,8 @@ class Bot:
     # Events that fully close the position (as opposed to TP1_HIT, which only
     # partially closes and leaves the runner open) — each one starts this
     # symbol's post-close cooldown.
-    _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", "HEALTH_CLOSE", "TP1_THEN_EXTERNAL_CLOSE"}
+    _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", "HEALTH_CLOSE",
+                        "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD"}
 
     async def _handle_event(self, event: dict):
         ev = event.get("event")
@@ -258,6 +291,9 @@ class Bot:
         elif ev == "HEALTH_CLOSE":
             await self.telegram.health_close(symbol, event["price"], event["pnl"],
                                              event.get("health_score", 0.0), event.get("weak_count", 0))
+        elif ev == "SPIKE_GUARD":
+            await self.telegram.spike_guard(symbol, event["price"], event["pnl"],
+                                            event.get("spike_reason", ""))
         elif ev == "TP1_THEN_EXTERNAL_CLOSE":
             # The exchange-side algo closed the FULL position before our TP1
             # partial fired — no separate TP1 leg happened, just note the

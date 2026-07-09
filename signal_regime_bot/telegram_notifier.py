@@ -153,6 +153,14 @@ class TelegramNotifier:
             f"Price: `{price:.6f}`\nPnL: `{pnl:+.2f}` USDT"
         )
 
+    async def spike_guard(self, symbol: str, price: float, pnl: float, reason: str):
+        await self._send_message(
+            f"⚡️ *Spike Guard — Emergency Close* `{symbol}`\n\n"
+            f"Reversal spike detected — closed before full SL.\n"
+            f"`{reason}`\n"
+            f"Price: `{price:.6f}`\nPnL: `{pnl:+.2f}` USDT"
+        )
+
     async def health_close(self, symbol: str, price: float, pnl: float,
                            health_score: float, weak_count: int):
         await self._send_message(
