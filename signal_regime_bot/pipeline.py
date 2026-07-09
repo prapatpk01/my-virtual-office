@@ -98,7 +98,11 @@ class Pipeline:
                                   reason=context.reason, bias=bias, context=context, **base)
 
         # ── Layer 4 — Entry (30M setup + adaptive threshold) ─────────────────
-        entry = self.entry_engine.analyze(df_30m, bias.direction,
+        # Pass the REGIME/trade side (not bias's winner-take-all direction) —
+        # the bias gate above already confirmed this side is supported. Passing
+        # bias.direction would reject a valid setup whenever short-horizon
+        # momentum's winner differs from the structural side (e.g. a pullback).
+        entry = self.entry_engine.analyze(df_30m, side,
                                           regime.adaptive_threshold_adj, context.context_score)
         common = dict(bias=bias, context=context, entry=entry,
                       round_id=entry.round_id, round_age_bars=entry.setup_age, **base)
