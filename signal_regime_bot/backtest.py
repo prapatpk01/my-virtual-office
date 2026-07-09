@@ -31,7 +31,7 @@ import pandas as pd
 import indicators as ind
 from config import Config, load_config
 from exchange_client import ExchangeClient
-from entry_engine import SignalEngine, LONG, SHORT
+from pipeline import Pipeline as SignalEngine, LONG, SHORT
 from risk_manager import RiskManager
 from position_manager import calc_stop_loss, calc_take_profits, evaluate_health, Position
 
@@ -269,7 +269,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
         if len(hist_30m) < cfg.min_bars or len(hist_1h) < cfg.min_bars or len(hist_4h) < cfg.min_bars:
             continue
 
-        sig = engine.evaluate(hist_30m, hist_1h, hist_4h)
+        sig = engine.evaluate(hist_30m, hist_1h, hist_4h, None)  # 15m absent in backtest -> booster disabled
         if sig.direction not in (LONG, SHORT):
             continue
 

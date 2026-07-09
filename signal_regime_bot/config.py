@@ -78,7 +78,9 @@ class Config:
     symbols: list[str]       = field(default_factory=lambda: _env_list(
         "SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT"))
     leverage: int             = field(default_factory=lambda: _env_int("LEVERAGE", 20))
-    risk_per_trade: float     = field(default_factory=lambda: _env_float("RISK_PER_TRADE", 0.08))
+    # Fixed 5% risk per trade (spec). The regime/context size_multiplier scales
+    # DOWN from here in weaker conditions; it never scales up past this.
+    risk_per_trade: float     = field(default_factory=lambda: _env_float("RISK_PER_TRADE", 0.05))
     # Hard cap on TOTAL concurrent positions across all symbols (not per-symbol).
     # Same env var name the previous bot on this Railway service used.
     max_positions_env: int   = field(default_factory=lambda: _env_int("MAX_POSITIONS", 2))
@@ -87,6 +89,8 @@ class Config:
     tf_entry: str  = field(default_factory=lambda: os.environ.get("TIMEFRAME_ENTRY", "30m"))
     tf_bias: str   = field(default_factory=lambda: os.environ.get("TIMEFRAME_BIAS", "1h"))
     tf_regime: str = field(default_factory=lambda: os.environ.get("TIMEFRAME_REGIME", "4h"))
+    tf_context: str = "30m"   # Context Engine timeframe
+    tf_fast: str    = "15m"   # Bias-secondary + Early Booster timeframe
 
     # ── Hardcoded strategy constants (not exposed as ENV) ───────────────────
     market_type: str = "swap"
@@ -143,7 +147,7 @@ class Config:
     #   - window passes without reaching  -> round cancelled, wait for next cross
     #   - cross back the other way        -> old round dies, new round starts
     # One round = at most one entry (consumed on entry, no re-entry same round).
-    entry_setup_window_bars: int = 5
+    entry_setup_window_bars: int = 3   # HMA-cross setup window (spec Layer 4)
     # Anti-chase: block entry if price is already this many ATRs away from
     # EMA15 — a spike/capitulation candle already happened and the "meat" of
     # the move is behind us, not ahead.
@@ -217,12 +221,65 @@ class Config:
     spike_tf_slow: str = "15m"
     spike_fetch_limit: int = 60
 
+    # ══ Hard Gate + Soft Score + Adaptive Threshold pipeline ════════════════
+    # Layer 1 — Regime (HARD GATE, 4H + 1H)
+    regime_block_below_score: float = 60.0     # regime score < this -> block trade
+    regime_extension_atr_max: float = 1.5      # |close-EMA20|/ATR above this -> anti-chase block
+    regime_weight_4h: float = 0.6              # blend of 4H/1H into the combined regime score
+    regime_weight_1h: float = 0.4
+    regime_strong_score: float = 85.0          # >= this -> adaptive_threshold_adj = -5
+    regime_normal_score: float = 70.0          # 70-84 -> 0 ; 60-69 -> +5
+    regime_transition_relax: float = 0.0       # TRANSITION must NEVER relax entry (spec)
+    # per-quality size multipliers
+    size_mult_strong: float = 1.0
+    size_mult_normal: float = 0.85
+    size_mult_weak: float = 0.6
+    size_mult_transition: float = 0.5
+
+    # Layer 2 — Bias (SOFT confirmation + min gate, 1H + 15M)
+    bias_weight_1h: float = 0.7
+    bias_weight_15m: float = 0.3
+    bias_min_threshold: float = 65.0           # weighted score must clear this
+    bias_strong_opposite: float = 70.0         # opposite-TF score >= this -> NEUTRAL (hard veto)
+
+    # Layer 3 — Context (SOFT SCORE, 30M)
+    context_base_threshold: float = 60.0
+    context_thr_strong: float = 55.0           # regime strong -> easier context bar
+    context_thr_normal: float = 60.0
+    context_thr_weak: float = 70.0
+    context_thr_transition: float = 75.0
+    context_w_sweep: float = 15.0
+    context_w_bos: float = 20.0
+    context_w_vwap: float = 15.0
+    context_w_pullback: float = 15.0
+    context_w_volume: float = 15.0
+    context_w_retest: float = 10.0
+    context_w_session: float = 10.0
+
+    # Layer 4 — Entry (30M setup + score + adaptive threshold)
+    entry_base_threshold: float = 70.0
+    entry_threshold_floor: float = 65.0        # adaptive threshold can never fall below this
+    entry_near_miss_floor: float = 65.0        # score in [floor, threshold) -> Early Booster
+    entry_context_strong: float = 75.0         # context >= this -> entry_threshold -3
+    entry_context_weak: float = 60.0           # context < this  -> entry_threshold +5
+    entry_context_strong_adj: float = -3.0
+    entry_context_weak_adj: float = 5.0
+
+    # Layer 5 — Early Entry Booster (15M, never trades alone)
+    booster_max_bonus_strong: float = 10.0     # regime >= 85
+    booster_max_bonus_normal: float = 8.0      # 70-84
+    booster_max_bonus_weak: float = 5.0        # 60-69
+    booster_max_bonus_transition: float = 4.0
+    booster_score_to_bonus: float = 0.5        # early_bonus = min(early_score * this, max_bonus)
+
     # Loop timing
     poll_interval_sec: int = 30    # how often main.py checks for a newly-closed 30m bar
     status_log_interval_sec: int = 300  # per-symbol regime/bias/entry status log cadence
     fetch_limit_entry: int = 300
     fetch_limit_bias: int = 300
     fetch_limit_regime: int = 300
+    fetch_limit_context: int = 300
+    fetch_limit_fast: int = 300
 
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))

@@ -24,7 +24,7 @@ import pandas as pd
 from config import load_config
 from exchange_client import ExchangeClient
 from data_engine import DataEngine, drop_unclosed_bar, _ohlcv_to_df
-from entry_engine import SignalEngine, LONG, SHORT
+from pipeline import Pipeline, LONG, SHORT
 from risk_manager import RiskManager
 from position_manager import PositionManager
 from telegram_notifier import TelegramNotifier
@@ -48,7 +48,7 @@ class Bot:
             leverage=self.cfg.leverage, margin_mode=self.cfg.margin_mode,
         )
         self.data = DataEngine(self.cfg, self.client)
-        self.signal_engine = SignalEngine(self.cfg)
+        self.signal_engine = Pipeline(self.cfg)
         self.risk = RiskManager(self.cfg)
         self.positions = PositionManager(self.cfg, self.client, self.risk)
         self.telegram = TelegramNotifier(self.cfg.telegram_bot_token, self.cfg.telegram_chat_id)
@@ -140,11 +140,12 @@ class Bot:
         df_30m = frames[self.cfg.tf_entry]
         df_1h = frames[self.cfg.tf_bias]
         df_4h = frames[self.cfg.tf_regime]
+        df_15m = frames[self.cfg.tf_fast]
 
-        # Computed once per symbol per tick and cached — reused by the entry
-        # check below AND by the 5-minute status log, instead of the health
-        # branch and the entry branch each re-running regime/bias separately.
-        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h)
+        # Full pipeline computed once per symbol per tick and cached — reused by
+        # the entry check below AND by the 5-minute status log, so the health
+        # branch and the entry branch never re-run the layers separately.
+        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h, df_15m)
         self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):
@@ -225,7 +226,7 @@ class Bot:
             return
 
         if sig.direction not in (LONG, SHORT):
-            logger.debug("[%s] no signal: %s", symbol, sig.reason)
+            self._log_pipeline_block(symbol, sig)
             return
 
         # Signal Round Gate: one round = one entry, ever. If this round's
@@ -235,6 +236,11 @@ class Bot:
             logger.info("[%s] signal round %s already traded — waiting for a new round",
                        symbol, sig.round_id)
             return
+
+        if sig.used_booster and sig.booster is not None:
+            logger.info("[%s] EARLY BOOST PASS  30M=%.0f  early=%.0f  bonus=+%.0f  final=%.0f  -> OPEN %s",
+                       symbol, sig.entry.entry_score, sig.booster.early_score,
+                       sig.booster.early_bonus, sig.booster.final_score, sig.direction)
 
         risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
         chart_path = build_entry_chart(
@@ -256,6 +262,33 @@ class Bot:
             sig.regime, sig.bias, sig.entry_score, risk_pct, self.cfg.leverage, chart_path)
         await self.telegram.order_opened(
             symbol, sig.direction, pos.entry_price, pos.amount, pos.stop_loss, pos.tp1, pos.tp2)
+
+    def _log_pipeline_block(self, symbol: str, sig):
+        """Explain WHICH layer stopped the trade — never a generic 'no signal'."""
+        r = sig.regime
+        layer = sig.blocked_layer
+        if layer == "REGIME":
+            logger.info("[%s] REGIME BLOCK  4H=%s(%.0f) 1H=%s(%.0f) aligned=%s ext=%.1fATR — %s",
+                       symbol, r.regime_4h, r.score_4h, r.regime_1h, r.score_1h,
+                       r.aligned, r.extension_atr, r.reason)
+        elif layer == "BIAS" and sig.bias is not None:
+            b = sig.bias
+            logger.info("[%s] BIAS FAIL  1H=%.0f 15M=%.0f weighted=%.1f dir=%s — %s",
+                       symbol, b.score_1h, b.score_15m, b.weighted_score, b.direction, b.reason)
+        elif layer == "CONTEXT" and sig.context is not None:
+            cx = sig.context
+            logger.info("[%s] CONTEXT FAIL  score=%.0f threshold=%.0f — %s",
+                       symbol, cx.context_score, cx.threshold, cx.reason)
+        elif layer == "ENTRY" and sig.entry is not None:
+            e = sig.entry
+            tag = "NEAR MISS" if e.near_miss else "ENTRY FAIL"
+            logger.info("[%s] %s  30M=%.0f threshold=%.0f setup_age=%s — %s",
+                       symbol, tag, e.entry_score, e.entry_threshold, e.setup_age, e.reason)
+        elif layer == "BOOSTER" and sig.booster is not None:
+            logger.info("[%s] EARLY %s  — %s", symbol,
+                       "CANCEL" if sig.booster.cancel_setup else "FAIL", sig.booster.reason)
+        else:
+            logger.debug("[%s] no trade: %s", symbol, sig.reason)
 
     def _preview_sl_tp(self, sig, df_30m) -> tuple[float, float, float]:
         """Compute SL/TP1/TP2 for the chart BEFORE the order is placed (same math as open_position)."""

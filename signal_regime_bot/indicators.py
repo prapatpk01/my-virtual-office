@@ -70,6 +70,18 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26,
     return line, sig, line - sig
 
 
+def vwap(df: pd.DataFrame, window: int = 48) -> pd.Series:
+    """
+    Rolling VWAP over the last `window` bars — a session-anchored VWAP needs
+    exchange session boundaries we don't track per-symbol, so a rolling window
+    (default 48 = one 24h day on 30m) is the robust, symbol-agnostic stand-in.
+    """
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    pv = (typical * df["volume"]).rolling(window, min_periods=1).sum()
+    vol = df["volume"].rolling(window, min_periods=1).sum().replace(0, np.nan)
+    return pv / vol
+
+
 # ── Volatility / trend strength ──────────────────────────────────────────────
 
 def true_range(df: pd.DataFrame) -> pd.Series:

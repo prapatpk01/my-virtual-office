@@ -63,9 +63,10 @@ class DataEngine:
         now_ms = int(time.time() * 1000)
         out = {}
         for tf, limit_attr in (
-            (c.tf_entry, "fetch_limit_entry"),
-            (c.tf_bias, "fetch_limit_bias"),
-            (c.tf_regime, "fetch_limit_regime"),
+            (c.tf_fast, "fetch_limit_fast"),        # 15M — Bias secondary + Early Booster
+            (c.tf_entry, "fetch_limit_entry"),      # 30M — Context + Entry
+            (c.tf_bias, "fetch_limit_bias"),        # 1H  — Regime secondary + Bias primary
+            (c.tf_regime, "fetch_limit_regime"),    # 4H  — Regime primary
         ):
             key = (symbol, tf)
             if key in self._cache:

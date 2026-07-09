@@ -1,8 +1,16 @@
 """
-Bias Engine — TF 1H.
+Layer 2 — Bias Engine (SOFT confirmation + minimum gate).  1H + 15M.
 
-Decides which SIDE (long/short) is allowed. This runs after the regime
-gate passes and before the entry engine looks for a trigger.
+Answers: "Which side has the better probability right now?"
+
+Deliberately momentum-focused, NOT trend-focused — trend/structure is the
+Regime layer's job and re-scoring it here would just double-count. This
+layer reads ROC, MACD histogram, RSI, momentum slope, volume, and EMA
+pullback: the shorter-horizon push behind the regime.
+
+Weighted, not strict-AND: weighted = score_1h*0.7 + score_15m*0.3. The
+only HARD parts are the two vetoes — a strongly-opposite 1H or 15M forces
+NEUTRAL regardless of the weighted number.
 """
 from __future__ import annotations
 
@@ -20,13 +28,28 @@ BIAS_NEUTRAL = "NEUTRAL"
 
 
 @dataclass
-class BiasResult:
-    bias: str
-    bull_score: float
-    bear_score: float
-    structure: str
+class TFBias:
+    bull: float
+    bear: float
     components: dict = field(default_factory=dict)
-    confidence: float = 50.0        # 0-100 — HOW trustworthy the bias call is
+
+
+@dataclass
+class BiasResult:
+    direction: str            # LONG | SHORT | NEUTRAL  (kept as .bias too for compat)
+    score_1h: float
+    score_15m: float
+    weighted_score: float
+    aligned: bool
+    allow_entry: bool
+    reason: str
+    # backward-compat fields (health monitor / status log read these)
+    bias: str = BIAS_NEUTRAL
+    bull_score: float = 0.0
+    bear_score: float = 0.0
+    confidence: float = 0.0
+    structure: str = "MIXED"
+    components: dict = field(default_factory=dict)
     conf_components: dict = field(default_factory=dict)
 
 
@@ -34,95 +57,103 @@ class BiasEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    def analyze(self, df_1h: pd.DataFrame) -> BiasResult:
+    def _tf_bias(self, df: pd.DataFrame) -> TFBias:
+        """Momentum-only bull/bear score 0-100 for one timeframe."""
         c = self.cfg
-        if len(df_1h) < c.bias_ema_slow + 5:
-            return BiasResult(BIAS_NEUTRAL, 0.0, 0.0, "MIXED", {})
+        if len(df) < max(c.bias_ema_slow, 30):
+            return TFBias(0.0, 0.0)
 
-        closes = df_1h["close"]
-        ema_fast_s = ind.ema(closes, c.bias_ema_fast)
-        e_fast = float(ema_fast_s.iloc[-1])
-        e_slow = float(ind.ema(closes, c.bias_ema_slow).iloc[-1])
-        close_v = float(closes.iloc[-1])
+        closes = df["close"]
+        comp_bull, comp_bear = {}, {}
 
-        structure = ind.market_structure(df_1h["high"], df_1h["low"],
-                                         c.bias_structure_left, c.bias_structure_right)
+        # ROC direction (25)
+        roc_v = float(ind.roc(closes, c.bias_roc_period).iloc[-1] or 0.0)
+        comp_bull["roc"] = 25.0 if roc_v > 0 else 0.0
+        comp_bear["roc"] = 25.0 if roc_v < 0 else 0.0
 
-        roc_s = ind.roc(closes, c.bias_roc_period)
-        roc_v = float(roc_s.iloc[-1]) if not np.isnan(roc_s.iloc[-1]) else 0.0
+        # MACD histogram direction (25) — rising vs falling
+        _, _, hist = ind.macd(closes)
+        h_now = float(hist.iloc[-1]) if not np.isnan(hist.iloc[-1]) else 0.0
+        h_prev = float(hist.iloc[-2]) if not np.isnan(hist.iloc[-2]) else 0.0
+        comp_bull["macd"] = 25.0 if h_now > h_prev else 0.0
+        comp_bear["macd"] = 25.0 if h_now < h_prev else 0.0
 
-        comps = {}
-        comps["ema_bull"] = 40.0 if e_fast > e_slow else 0.0
-        comps["ema_bear"] = 40.0 if e_fast < e_slow else 0.0
-        comps["structure_bull"] = 30.0 if structure == "HH_HL" else 0.0
-        comps["structure_bear"] = 30.0 if structure == "LH_LL" else 0.0
-        comps["roc_bull"] = 20.0 if roc_v > 0 else 0.0
-        comps["roc_bear"] = 20.0 if roc_v < 0 else 0.0
-        comps["close_bull"] = 10.0 if close_v > e_fast else 0.0
-        comps["close_bear"] = 10.0 if close_v < e_fast else 0.0
+        # RSI regime (20) — above/below 50, not overbought/oversold extremes
+        rsi_v = float(ind.rsi(closes, 14).iloc[-1])
+        comp_bull["rsi"] = 20.0 if rsi_v >= 50 else 0.0
+        comp_bear["rsi"] = 20.0 if rsi_v < 50 else 0.0
 
-        bull = comps["ema_bull"] + comps["structure_bull"] + comps["roc_bull"] + comps["close_bull"]
-        bear = comps["ema_bear"] + comps["structure_bear"] + comps["roc_bear"] + comps["close_bear"]
+        # momentum slope (15) — EMA9 slope
+        e9 = ind.ema(closes, 9)
+        slope_v = float(ind.slope_pct(e9, 3).iloc[-1] or 0.0)
+        comp_bull["mom_slope"] = 15.0 if slope_v > 0 else 0.0
+        comp_bear["mom_slope"] = 15.0 if slope_v < 0 else 0.0
 
-        if bull >= c.bias_score_min and bull > bear:
-            bias = BIAS_BULL
-        elif bear >= c.bias_score_min and bear > bull:
-            bias = BIAS_BEAR
+        # volume confirmation (15) — expansion credited to the bar's direction
+        o = float(df["open"].iloc[-1]); cl = float(closes.iloc[-1])
+        vol = float(df["volume"].iloc[-1])
+        vol_ma = float(df["volume"].iloc[-21:-1].mean()) if len(df) >= 21 else 0.0
+        vol_up = vol_ma > 0 and vol > vol_ma
+        comp_bull["volume"] = 15.0 if (vol_up and cl >= o) else 0.0
+        comp_bear["volume"] = 15.0 if (vol_up and cl <= o) else 0.0
+
+        return TFBias(sum(comp_bull.values()), sum(comp_bear.values()),
+                      {"bull": comp_bull, "bear": comp_bear})
+
+    def analyze(self, df_1h: pd.DataFrame, df_15m: pd.DataFrame | None = None) -> BiasResult:
+        c = self.cfg
+        b1 = self._tf_bias(df_1h)
+        # 15M optional — falls back to 1H if the caller has no 15M frame
+        b15 = self._tf_bias(df_15m) if df_15m is not None and len(df_15m) else b1
+
+        # net directional score per TF (bull minus bear, floored at 0 per side)
+        s1_bull, s1_bear = b1.bull, b1.bear
+        s15_bull, s15_bear = b15.bull, b15.bear
+
+        w1, w15 = c.bias_weight_1h, c.bias_weight_15m
+        weighted_bull = s1_bull * w1 + s15_bull * w15
+        weighted_bear = s1_bear * w1 + s15_bear * w15
+
+        # single reported per-TF score = the dominant side of that TF
+        score_1h = max(s1_bull, s1_bear)
+        score_15m = max(s15_bull, s15_bear)
+
+        # strong-opposite HARD vetoes
+        veto_long = s1_bear >= c.bias_strong_opposite or s15_bear >= c.bias_strong_opposite
+        veto_short = s1_bull >= c.bias_strong_opposite or s15_bull >= c.bias_strong_opposite
+
+        direction = BIAS_NEUTRAL
+        weighted_score = 0.0
+        reason = "no side cleared the bias threshold"
+        allow = False
+
+        if weighted_bull >= c.bias_min_threshold and weighted_bull > weighted_bear and not veto_long:
+            direction, weighted_score, allow = BIAS_BULL, weighted_bull, True
+            reason = f"weighted bull {weighted_bull:.1f} >= {c.bias_min_threshold:.0f}"
+        elif weighted_bear >= c.bias_min_threshold and weighted_bear > weighted_bull and not veto_short:
+            direction, weighted_score, allow = BIAS_BEAR, weighted_bear, True
+            reason = f"weighted bear {weighted_bear:.1f} >= {c.bias_min_threshold:.0f}"
         else:
-            bias = BIAS_NEUTRAL
+            weighted_score = max(weighted_bull, weighted_bear)
+            if veto_long or veto_short:
+                reason = "strong opposite bias on 1H/15M — NEUTRAL"
 
-        confidence, conf_comps = self._confidence(df_1h, bias, ema_fast_s)
-        return BiasResult(bias=bias, bull_score=bull, bear_score=bear,
-                          structure=structure, components=comps,
-                          confidence=confidence, conf_components=conf_comps)
+        # aligned = both TFs lean the same way on the chosen side
+        if direction == BIAS_BULL:
+            aligned = s1_bull >= s1_bear and s15_bull >= s15_bear
+        elif direction == BIAS_BEAR:
+            aligned = s1_bear >= s1_bull and s15_bear >= s15_bull
+        else:
+            aligned = False
 
-    def _confidence(self, df_1h: pd.DataFrame, bias: str, ema_fast_s) -> tuple[float, dict]:
-        """
-        Confidence 0-100 — how much to TRUST the bias call (the bias score says
-        which side; this says how hard the side is backed):
-          ADX strength   (25): 1H ADX >= 25 full, >= 18 partial
-          RSI slope      (20): RSI(14) 3-bar slope in the bias direction
-          EMA slope      (20): EMA20 5-bar slope in the bias direction
-          Volume confirm (15): last volume above its 20-bar average
-          Pullback zone  (20): price within 1 ATR of EMA20 (entering at value,
-                               not at an extreme far from the mean)
-        NEUTRAL bias always gets confidence 0 — there is nothing to trust.
-        """
-        c = self.cfg
-        comps: dict = {"adx": 0.0, "rsi_slope": 0.0, "ema_slope": 0.0,
-                       "volume": 0.0, "pullback_zone": 0.0}
-        if bias == BIAS_NEUTRAL:
-            return 0.0, comps
-        is_bull = bias == BIAS_BULL
-        closes = df_1h["close"]
+        # confidence (compat): how backed the chosen side is, 0-100
+        confidence = min(100.0, weighted_score) if direction != BIAS_NEUTRAL else 0.0
 
-        adx_s, _, _ = ind.adx(df_1h, 14)
-        adx_v = float(adx_s.iloc[-1]) if not np.isnan(adx_s.iloc[-1]) else 0.0
-        if adx_v >= c.bias_conf_adx_strong:
-            comps["adx"] = 25.0
-        elif adx_v >= c.bias_conf_adx_ok:
-            comps["adx"] = 15.0
-
-        rsi_s = ind.rsi(closes, 14)
-        if len(rsi_s) >= 4:
-            rsi_slope = float(rsi_s.iloc[-1]) - float(rsi_s.iloc[-4])
-            if (rsi_slope > 0) if is_bull else (rsi_slope < 0):
-                comps["rsi_slope"] = 20.0
-
-        slope_s = ind.slope_pct(ema_fast_s, 5)
-        slope_v = float(slope_s.iloc[-1]) if not np.isnan(slope_s.iloc[-1]) else 0.0
-        if (slope_v > 0) if is_bull else (slope_v < 0):
-            comps["ema_slope"] = 20.0
-
-        vol = float(df_1h["volume"].iloc[-1])
-        vol_ma = float(df_1h["volume"].iloc[-21:-1].mean()) if len(df_1h) >= 21 else 0.0
-        if vol_ma > 0 and vol > vol_ma:
-            comps["volume"] = 15.0
-
-        atr_v = float(ind.atr(df_1h, 14).iloc[-1])
-        e20_v = float(ema_fast_s.iloc[-1])
-        price = float(closes.iloc[-1])
-        if atr_v > 0 and not np.isnan(atr_v) and abs(price - e20_v) <= atr_v:
-            comps["pullback_zone"] = 20.0
-
-        return sum(comps.values()), comps
+        return BiasResult(
+            direction=direction, score_1h=score_1h, score_15m=score_15m,
+            weighted_score=round(weighted_score, 1), aligned=aligned, allow_entry=allow,
+            reason=reason, bias=direction,
+            bull_score=weighted_bull, bear_score=weighted_bear,
+            confidence=confidence, structure="—",
+            components={"1h": b1.components, "15m": b15.components},
+        )
