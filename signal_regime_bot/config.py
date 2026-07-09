@@ -239,12 +239,14 @@ class Config:
     # Layer 2 — Bias (SOFT confirmation + min gate, 1H + 15M)
     bias_weight_1h: float = 0.7
     bias_weight_15m: float = 0.3
-    # Soft confirmation gate. Calibrated to the momentum scorer's real scale on
-    # BTC/6mo: the regime-side bias score centers at ~50 (p50=50), so 65 (the
-    # spec's number, which assumed a differently-scaled scorer) admitted almost
-    # nothing. 50 keeps ~half of regime-passing bars — the Entry layer does the
-    # real selection; this only rejects momentum-against-the-regime setups.
-    bias_min_threshold: float = 50.0           # weighted regime-side score must clear this
+    # Soft confirmation gate, calibrated to the momentum scorer's real scale.
+    # On regime-aligned bars the trade-side momentum score has a ~35 base (RSI
+    # past the midline + one slope), rising to 60+ only when ROC or MACD also
+    # lean the trade's way. 40 admits exactly those "momentum actually aligned"
+    # bars and rejects the bounce bars where structure says short but momentum
+    # is counter. (The spec's 65 assumed a differently-scaled scorer and blocked
+    # everything.) The Entry layer's HMA trigger does the final selection.
+    bias_min_threshold: float = 40.0           # weighted trade-side momentum must clear this
     bias_strong_opposite: float = 70.0         # opposite side >= this -> hard veto (NEUTRAL)
 
     # Layer 3 — Context (SOFT SCORE, 30M)
