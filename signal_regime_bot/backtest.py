@@ -187,7 +187,12 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
                 pnl -= _exit_fee(notional * exit_px)
                 pos.pnl_usd += pnl
                 pos.exit_price, pos.exit_time = exit_px, df_30m.index[i]
-                pos.exit_reason = "BE" if tp1_hit else "SL"
+                if not tp1_hit:
+                    pos.exit_reason = "SL"
+                elif (exit_px > pos.entry_price) if is_long else (exit_px < pos.entry_price):
+                    pos.exit_reason = "TRAIL"      # runner stopped out in profit
+                else:
+                    pos.exit_reason = "BE"
                 pos.tp1_hit = tp1_hit
                 balance += pnl
                 pos.balance_after = balance
@@ -212,6 +217,20 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
                     tp1_hit = True
                     pos.sl = pos.entry_price   # exact breakeven
                     balance += pnl
+
+            # Runner trailing stop after TP1 — ratchet the stop toward price by
+            # trail_atr_mult*ATR, never looser than breakeven. Gives winners a
+            # real tail instead of capping them at the old 1.2R TP2.
+            if tp1_hit and cfg.trail_enabled:
+                atr_now = float(ind.atr(hist_30m, cfg.sl_atr_period).iloc[-1])
+                if not np.isnan(atr_now) and atr_now > 0:
+                    close_now = float(bar["close"])
+                    if is_long:
+                        new_stop = close_now - cfg.trail_atr_mult * atr_now
+                        pos.sl = max(pos.sl, new_stop, pos.entry_price)
+                    else:
+                        new_stop = close_now + cfg.trail_atr_mult * atr_now
+                        pos.sl = min(pos.sl, new_stop, pos.entry_price)
 
             tp2_trigger = (hi >= pos.tp2) if is_long else (lo <= pos.tp2)
             if tp2_trigger and tp1_hit:
