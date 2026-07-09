@@ -239,8 +239,13 @@ class Config:
     # Layer 2 — Bias (SOFT confirmation + min gate, 1H + 15M)
     bias_weight_1h: float = 0.7
     bias_weight_15m: float = 0.3
-    bias_min_threshold: float = 65.0           # weighted score must clear this
-    bias_strong_opposite: float = 70.0         # opposite-TF score >= this -> NEUTRAL (hard veto)
+    # Soft confirmation gate. Calibrated to the momentum scorer's real scale on
+    # BTC/6mo: the regime-side bias score centers at ~50 (p50=50), so 65 (the
+    # spec's number, which assumed a differently-scaled scorer) admitted almost
+    # nothing. 50 keeps ~half of regime-passing bars — the Entry layer does the
+    # real selection; this only rejects momentum-against-the-regime setups.
+    bias_min_threshold: float = 50.0           # weighted regime-side score must clear this
+    bias_strong_opposite: float = 70.0         # opposite side >= this -> hard veto (NEUTRAL)
 
     # Layer 3 — Context (SOFT SCORE, 30M)
     context_base_threshold: float = 60.0
