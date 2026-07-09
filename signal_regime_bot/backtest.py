@@ -180,7 +180,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
             sl_hit = (lo <= pos.sl) if is_long else (hi >= pos.sl)
             if sl_hit:
                 exit_px = pos.sl
-                remaining = 0.5 if tp1_hit else 1.0
+                remaining = (1.0 - cfg.tp1_fraction) if tp1_hit else 1.0
                 notional = pos.amount * remaining
                 pnl = ((exit_px - pos.entry_price) if is_long else (pos.entry_price - exit_px)) \
                     / pos.entry_price * notional * pos.entry_price
@@ -204,10 +204,10 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
             if not tp1_hit and pos.tp1 is not None:
                 tp1_trigger = (hi >= pos.tp1) if is_long else (lo <= pos.tp1)
                 if tp1_trigger:
-                    half = pos.amount * 0.5
+                    part = pos.amount * cfg.tp1_fraction
                     pnl = ((pos.tp1 - pos.entry_price) if is_long else (pos.entry_price - pos.tp1)) \
-                        / pos.entry_price * half * pos.entry_price
-                    pnl -= _exit_fee(half * pos.tp1)
+                        / pos.entry_price * part * pos.entry_price
+                    pnl -= _exit_fee(part * pos.tp1)
                     pos.pnl_usd += pnl
                     tp1_hit = True
                     pos.sl = pos.entry_price   # exact breakeven
@@ -215,10 +215,10 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
 
             tp2_trigger = (hi >= pos.tp2) if is_long else (lo <= pos.tp2)
             if tp2_trigger and tp1_hit:
-                half = pos.amount * 0.5
+                part = pos.amount * (1.0 - cfg.tp1_fraction)
                 pnl = ((pos.tp2 - pos.entry_price) if is_long else (pos.entry_price - pos.tp2)) \
-                    / pos.entry_price * half * pos.entry_price
-                pnl -= _exit_fee(half * pos.tp2)
+                    / pos.entry_price * part * pos.entry_price
+                pnl -= _exit_fee(part * pos.tp2)
                 pos.pnl_usd += pnl
                 pos.exit_price, pos.exit_time = pos.tp2, df_30m.index[i]
                 pos.exit_reason = "TP2"
@@ -246,7 +246,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
                     weak_count += 1
                     if weak_count >= cfg.weak_confirm_bars:
                         exit_px = float(bar["close"])
-                        remaining = 0.5 if tp1_hit else 1.0
+                        remaining = (1.0 - cfg.tp1_fraction) if tp1_hit else 1.0
                         notional = pos.amount * remaining
                         pnl = ((exit_px - pos.entry_price) if is_long else
                               (pos.entry_price - exit_px)) / pos.entry_price * notional * pos.entry_price

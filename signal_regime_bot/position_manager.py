@@ -336,7 +336,7 @@ class PositionManager:
                "entry_price": pos.entry_price, "position": pos, "approximate": True}
 
     async def _close_partial_tp1(self, pos: Position, price: float) -> dict:
-        close_amt = round(pos.full_amount * 0.5, 8)
+        close_amt = round(pos.full_amount * self.cfg.tp1_fraction, 8)
         close_amt = min(close_amt, pos.amount)
         okx_side = "sell" if pos.side == LONG else "buy"
         try:

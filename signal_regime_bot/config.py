@@ -185,6 +185,12 @@ class Config:
     sl_min_pct: float = 0.004   # 0.4%
     sl_max_pct: float = 0.035  # 3.5%
     tp1_r: float = 0.5
+    # Fraction of the position closed at TP1 (remainder rides to TP2/SL-at-BE).
+    # Swept against the live 6-symbol backtest (BTC/ETH/SOL/XAU/XAG, Jan-Jun
+    # 2026): the TP2 bucket is the strategy's only real profit source, so a
+    # SMALLER TP1 take (bigger runner) improves expected value — 40% beat
+    # both 50% (previous default) and 70%/60%@0.6R.
+    tp1_fraction: float = 0.4
     tp2_r: float = 1.2
     swing_lookback_left: int = 3
     swing_lookback_right: int = 3
