@@ -195,15 +195,15 @@ class Config:
     # SMALLER TP1 take (bigger runner) improves expected value — 40% beat
     # both 50% (previous default) and 70%/60%@0.6R.
     tp1_fraction: float = 0.4
-    # TP2 is now a FAR cap, not the primary exit — after TP1 the runner is
-    # managed by an ATR trailing stop so a strong trend can pay for several
-    # losers (the old 1.2R cap let winners top out below a 1R loss, which is
-    # why WR ~48% still lost). tp2_r 1.2 -> 2.5.
-    tp2_r: float = 2.5
-    # Runner trailing stop (after TP1). Trail the stop at close - mult*ATR30m
-    # (long) / close + mult*ATR30m (short), ratcheting only in the favorable
-    # direction, never looser than breakeven.
-    trail_enabled: bool = True
+    # TP2 kept at 1.2R. MEASURED: moving it out to 2.5R with an ATR trailing
+    # runner made XAU WORSE (net -6701 vs -6327, PF 0.22 vs the tighter
+    # config) — only 4 of 62 trades trailed into profit; the 1.2R target was
+    # capturing 13 reliable wins the wider target gave back as breakevens.
+    # The winners don't run far enough in this data for a tail to exist.
+    tp2_r: float = 1.2
+    # Trailing runner code retained but DISABLED (config-gated). It's here to
+    # re-test on other data/regimes, but it hurt on the measured set.
+    trail_enabled: bool = False
     trail_atr_mult: float = 2.0
     swing_lookback_left: int = 3
     swing_lookback_right: int = 3
