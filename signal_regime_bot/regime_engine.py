@@ -192,9 +192,15 @@ class RegimeEngine:
         r4 = self._tf_regime(df_4h)
         r1 = self._tf_regime(df_1h) if df_1h is not None and len(df_1h) else r4
 
-        if r4.label == HIGH_VOL or r1.label == HIGH_VOL:
-            label, reason = HIGH_VOL, f"volatility expansion (4H={r4.label}, 1H={r1.label})"
-        elif r4.label in BULL_LABELS and r1.label in BULL_LABELS:
+        # Directional agreement first — this must win over a noisy single-TF
+        # HIGH_VOLATILITY read. Empirically, 1H volume/candle-range "expansion"
+        # (single-bar vs its own 20-bar MA) fires on ordinary noisy bars far
+        # more often than real macro volatility events, and previously it
+        # unconditionally overrode a clean 4H STRONG_BULL/BEAR_TREND — on one
+        # instrument (XAU) that wiped out ~100% of otherwise-valid trend bars,
+        # producing zero trades all backtest. HIGH_VOLATILITY as a combined
+        # label is now reserved for when NEITHER TF shows a real trend.
+        if r4.label in BULL_LABELS and r1.label in BULL_LABELS:
             label = STRONG_BULL if (r4.label == STRONG_BULL and r1.label == STRONG_BULL) else EARLY_BULL
             reason = f"4H={r4.label} 1H={r1.label} -> {label}"
         elif r4.label in BEAR_LABELS and r1.label in BEAR_LABELS:
@@ -203,6 +209,15 @@ class RegimeEngine:
         elif (r4.label in BULL_LABELS and r1.label in BEAR_LABELS) or \
              (r4.label in BEAR_LABELS and r1.label in BULL_LABELS):
             label, reason = RANGE, f"4H/1H directional conflict (4H={r4.label}, 1H={r1.label}) -> RANGE"
+        elif r4.label in BULL_LABELS:
+            # Macro (4H) shows a real trend but 1H isn't confirming it (noisy,
+            # HIGH_VOL, RANGE, or COMPRESSION) -> downgrade to Early rather
+            # than discard it; the Bias layer's floors gate quality from here.
+            label, reason = EARLY_BULL, f"4H={r4.label} 1H={r1.label} (non-confirming) -> EARLY_BULL_TREND"
+        elif r4.label in BEAR_LABELS:
+            label, reason = EARLY_BEAR, f"4H={r4.label} 1H={r1.label} (non-confirming) -> EARLY_BEAR_TREND"
+        elif r4.label == HIGH_VOL or r1.label == HIGH_VOL:
+            label, reason = HIGH_VOL, f"volatility expansion, no macro trend (4H={r4.label}, 1H={r1.label})"
         elif r4.label == COMPRESSION or r1.label == COMPRESSION:
             label, reason = COMPRESSION, f"4H={r4.label} 1H={r1.label} -> COMPRESSION"
         else:
