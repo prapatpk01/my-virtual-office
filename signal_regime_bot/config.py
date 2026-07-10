@@ -140,15 +140,15 @@ class Config:
     entry_macd_slow: int = 26
     entry_macd_signal: int = 9
     entry_score_min: float = 70.0
-    # ── Signal Round Gate (HMA-cross state machine) ─────────────────────────
-    # HMA10 x HMA20 cross = start of a NEW signal round (the ONLY round
-    # trigger). After the cross, the entry score gets `entry_setup_window_bars`
-    # closed bars (setup_age 1..5, cross bar = age 1) to reach threshold:
-    #   - reaches threshold within window -> enter
-    #   - window passes without reaching  -> round cancelled, wait for next cross
-    #   - cross back the other way        -> old round dies, new round starts
-    # One round = at most one entry (consumed on entry, no re-entry same round).
-    entry_setup_window_bars: int = 3   # HMA-cross setup window (spec Layer 4)
+    # ── Setup freshness window ───────────────────────────────────────────────
+    # A setup opens on whichever of {ROC>0, MACD favorable, HMA cross} turns
+    # true FIRST in the trade direction; full category confirmation (>=4/5)
+    # is only accepted within this many bars of that first trigger, or the
+    # setup is stale and skipped (wait for a fresh trigger rather than
+    # chasing an old one). MEASURED on the local BTC/XAU set: 2 is a local
+    # optimum — 3 gave PF 0.685, 2 gave PF 0.821-0.841 (with ADX gate), 1
+    # gave PF 0.722-0.800 (WORSE than 2 — tighter isn't always better).
+    entry_setup_window_bars: int = 2
     # Anti-chase: block entry if price is already this many ATRs away from
     # EMA15 — a spike/capitulation candle already happened and the "meat" of
     # the move is behind us, not ahead.
@@ -166,7 +166,11 @@ class Config:
     # -> enabled. entry_participation_mandatory measured WORSE (PF->0.598)
     # -> stays off.
     entry_adx_gate_enabled: bool = True
-    entry_adx_min: float = 20.0             # 30M ADX must clear this when the gate is on
+    # 25 (paired with entry_setup_window_bars=2) MEASURED as the local optimum:
+    # PF 0.841, WR 72.0%, net -2234, avg_R -0.039 — the best combination
+    # found this session (vs. window=2/ADX=20 PF 0.821, window=2/ADX=30
+    # PF 0.820, window=1 variants all worse).
+    entry_adx_min: float = 25.0             # 30M ADX must clear this when the gate is on
     entry_participation_mandatory: bool = False  # require volume/participation, not just optional
 
     # ── Bias confidence (1H) ─────────────────────────────────────────────────
