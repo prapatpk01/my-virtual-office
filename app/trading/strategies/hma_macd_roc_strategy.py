@@ -1,13 +1,17 @@
 """
 TF30M HMA-MACD-ROC Momentum Strategy.
 
-State machine, gated entry, OR-based exit — implemented exactly per spec:
+Instant AND-gated entry, OR-based exit:
 
-  Entry = AND logic:  HMA10/HMA20 cross is the gate; within a 3-bar
-          confirmation window (starting on the cross bar itself), MACD
-          must cross in the same direction AND ROC(9) must agree AND
-          HMA10/HMA20 must not have flipped back — all on TF=30m,
-          evaluated only when a 30m bar closes.
+  Entry = AND logic, single bar, no confirmation window: the moment a
+          30m bar closes with HMA10/HMA20 crossing AND MACD line
+          already on the same side of its signal line AND ROC(9)
+          agreeing in sign — enter immediately. (An earlier version
+          used a 3-bar confirmation window requiring a fresh MACD
+          cross; that added ~1-2 bars of entry lag waiting for MACD/ROC
+          to catch up to the HMA cross, so it was dropped in favor of
+          this instant check — MACD/ROC just need to already agree,
+          not freshly cross, on the same bar as the HMA gate.)
   Exit  = OR logic: any one of HMA reverse / MACD reverse / ROC sign
           flip closes the position 100% immediately, no partial, no
           runner, no same-bar reversal into the opposite side.
@@ -38,10 +42,6 @@ from .base import BaseStrategy, Signal, SignalType
 
 class HMAMacdROCStrategy(BaseStrategy):
 
-    STATE_WAITING = "waiting"
-    STATE_LONG_CONFIRMATION = "long_confirmation"
-    STATE_SHORT_CONFIRMATION = "short_confirmation"
-
     def __init__(
         self,
         symbol: str,
@@ -56,7 +56,6 @@ class HMAMacdROCStrategy(BaseStrategy):
         sl_atr_mult: float = 1.5,
         rr_ratio: float = 1.0,
         margin_pct: float = 0.05,
-        confirmation_bars: int = 3,
     ):
         super().__init__(symbol, params)
         self.name = f"HMAMacdROC({symbol})"
@@ -70,12 +69,7 @@ class HMAMacdROCStrategy(BaseStrategy):
         self.sl_atr_mult = sl_atr_mult
         self.rr_ratio = rr_ratio
         self.margin_pct = margin_pct
-        self.confirmation_bars = confirmation_bars
 
-        self._state = self.STATE_WAITING
-        self._confirmation_bar = 0
-        self._macd_confirmed = False
-        self._roc_confirmed = False
         self._open_position: Optional[str] = None   # "long" | "short" | None
         self._last_bar_ts: Optional[int] = None       # last 30m bar this strategy has acted on
         self._latest_candles: list = []
@@ -106,83 +100,24 @@ class HMAMacdROCStrategy(BaseStrategy):
         self._last_bar_ts = bar_ts
 
         hma_cross_up, hma_cross_down = ind["hma_cross_up"], ind["hma_cross_down"]
-        macd_cross_up, macd_cross_down = ind["macd_cross_up"], ind["macd_cross_down"]
-        hma10_last, hma20_last = ind["hma10_last"], ind["hma20_last"]
+        macd_bullish, macd_bearish = ind["macd_bullish"], ind["macd_bearish"]
         roc_val = ind["roc_val"]
         atr_val = ind["atr_val"]
         close_price = c30[-1].close
 
-        # ── WAITING: look for an HMA gate ────────────────────────────────────
-        if self._state == self.STATE_WAITING:
-            if hma_cross_up:
-                self._enter_confirmation("long", macd_cross_up, roc_val > 0)
-                return self._hold(current_price, "Long Gate: HMA10 crossed above HMA20 — confirmation window started (bar 1/3)")
-            if hma_cross_down:
-                self._enter_confirmation("short", macd_cross_down, roc_val < 0)
-                return self._hold(current_price, "Short Gate: HMA10 crossed below HMA20 — confirmation window started (bar 1/3)")
-            return self._hold(current_price, "Waiting for HMA10/HMA20 cross (30m)")
+        # ── Instant AND gate: HMA cross + MACD already agreeing + ROC sign ────
+        if hma_cross_up and macd_bullish and roc_val > 0:
+            return self._open_trade("long", close_price, atr_val,
+                                    "Long: HMA10 crossed above HMA20, MACD bullish, ROC9>0 (30m)", current_price)
+        if hma_cross_down and macd_bearish and roc_val < 0:
+            return self._open_trade("short", close_price, atr_val,
+                                    "Short: HMA10 crossed below HMA20, MACD bearish, ROC9<0 (30m)", current_price)
 
-        # ── LONG_CONFIRMATION ─────────────────────────────────────────────────
-        if self._state == self.STATE_LONG_CONFIRMATION:
-            if hma_cross_down:
-                self._reset("Long setup failed: opposite HMA gate fired")
-                self._enter_confirmation("short", macd_cross_down, roc_val < 0)
-                return self._hold(current_price, "Long setup failed (opposite HMA gate) — new Short confirmation started")
-            if hma10_last <= hma20_last:
-                self._reset("Long setup failed: HMA10 no longer above HMA20")
-                return self._hold(current_price, "Long setup failed: HMA10 no longer above HMA20")
+        if hma_cross_up or hma_cross_down:
+            gate = "Long" if hma_cross_up else "Short"
+            return self._hold(current_price, f"{gate} Gate fired but MACD/ROC didn't agree on the same bar — no entry")
 
-            self._confirmation_bar += 1
-            if macd_cross_up:
-                self._macd_confirmed = True
-            self._roc_confirmed = roc_val > 0
-
-            if self._macd_confirmed and self._roc_confirmed and hma10_last > hma20_last:
-                return self._open_trade("long", close_price, atr_val,
-                                        f"Long confirmed (bar {self._confirmation_bar}/{self.confirmation_bars}): "
-                                        f"HMA10>HMA20, MACD crossed up, ROC9>0", current_price)
-
-            if self._confirmation_bar >= self.confirmation_bars:
-                self._reset("Long setup failed: confirmation window expired without MACD+ROC confirmation")
-                return self._hold(current_price, "Long setup failed: 3-bar confirmation window expired")
-
-            return self._hold(
-                current_price,
-                f"Long confirmation bar {self._confirmation_bar}/{self.confirmation_bars} — "
-                f"macd_confirmed={self._macd_confirmed} roc_confirmed={self._roc_confirmed}",
-            )
-
-        # ── SHORT_CONFIRMATION ────────────────────────────────────────────────
-        if self._state == self.STATE_SHORT_CONFIRMATION:
-            if hma_cross_up:
-                self._reset("Short setup failed: opposite HMA gate fired")
-                self._enter_confirmation("long", macd_cross_up, roc_val > 0)
-                return self._hold(current_price, "Short setup failed (opposite HMA gate) — new Long confirmation started")
-            if hma10_last >= hma20_last:
-                self._reset("Short setup failed: HMA10 no longer below HMA20")
-                return self._hold(current_price, "Short setup failed: HMA10 no longer below HMA20")
-
-            self._confirmation_bar += 1
-            if macd_cross_down:
-                self._macd_confirmed = True
-            self._roc_confirmed = roc_val < 0
-
-            if self._macd_confirmed and self._roc_confirmed and hma10_last < hma20_last:
-                return self._open_trade("short", close_price, atr_val,
-                                        f"Short confirmed (bar {self._confirmation_bar}/{self.confirmation_bars}): "
-                                        f"HMA10<HMA20, MACD crossed down, ROC9<0", current_price)
-
-            if self._confirmation_bar >= self.confirmation_bars:
-                self._reset("Short setup failed: confirmation window expired without MACD+ROC confirmation")
-                return self._hold(current_price, "Short setup failed: 3-bar confirmation window expired")
-
-            return self._hold(
-                current_price,
-                f"Short confirmation bar {self._confirmation_bar}/{self.confirmation_bars} — "
-                f"macd_confirmed={self._macd_confirmed} roc_confirmed={self._roc_confirmed}",
-            )
-
-        return self._hold(current_price, "Unexpected state — resetting")
+        return self._hold(current_price, "Waiting for HMA10/HMA20 cross (30m)")
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
         """Exit check — OR logic across HMA/MACD/ROC reversal, evaluated only
@@ -231,19 +166,9 @@ class HMAMacdROCStrategy(BaseStrategy):
 
         return PositionUpdate(action="hold")
 
-    # ── State machine helpers ───────────────────────────────────────────────
-
-    def _enter_confirmation(self, direction: str, macd_confirmed_now: bool, roc_confirmed_now: bool) -> None:
-        self._state = self.STATE_LONG_CONFIRMATION if direction == "long" else self.STATE_SHORT_CONFIRMATION
-        self._confirmation_bar = 1
-        self._macd_confirmed = macd_confirmed_now
-        self._roc_confirmed = roc_confirmed_now
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _reset(self, reason: str) -> None:
-        self._state = self.STATE_WAITING
-        self._confirmation_bar = 0
-        self._macd_confirmed = False
-        self._roc_confirmed = False
         self._open_position = None
 
     def _open_trade(self, direction: str, entry_price: float, atr_val: float, reason: str, current_price: float) -> Signal:
@@ -258,10 +183,6 @@ class HMAMacdROCStrategy(BaseStrategy):
             sig_type = SignalType.SELL
 
         self._open_position = direction
-        self._state = self.STATE_WAITING
-        self._confirmation_bar = 0
-        self._macd_confirmed = False
-        self._roc_confirmed = False
 
         return Signal(
             type=sig_type, symbol=self.symbol, price=current_price, amount=0.0,
@@ -292,8 +213,14 @@ class HMAMacdROCStrategy(BaseStrategy):
             "hma_cross_up": hma10[-2] <= hma20[-2] and hma10[-1] > hma20[-1],
             "hma_cross_down": hma10[-2] >= hma20[-2] and hma10[-1] < hma20[-1],
             "hma10_last": float(hma10[-1]), "hma20_last": float(hma20[-1]),
+            # Cross events (transition) — used for the OR-based exit, per spec
             "macd_cross_up": macd_line[-2] <= macd_signal_line[-2] and macd_line[-1] > macd_signal_line[-1],
             "macd_cross_down": macd_line[-2] >= macd_signal_line[-2] and macd_line[-1] < macd_signal_line[-1],
+            # Current state (not necessarily a fresh cross) — used for the
+            # instant entry gate, so MACD just needs to already agree with
+            # the HMA cross's direction on the same bar.
+            "macd_bullish": macd_line[-1] > macd_signal_line[-1],
+            "macd_bearish": macd_line[-1] < macd_signal_line[-1],
             "roc_val": float(roc_arr[-1]),
             "atr_val": float(atr_arr[-1]),
         }
