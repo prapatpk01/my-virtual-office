@@ -15,6 +15,13 @@ Exit LONG:  EMA12 crosses back below EMA26
             OR (MACD 30m turns bearish AND price pulls back down to touch SMA50)
 Exit SHORT: mirror.
 
+Exits are evaluated in tick_open_position() (called by bot.py every tick for
+an open position), NOT by returning a SELL/BUY Signal from analyze(). In
+hedge mode a SELL Signal always OPENS a new short (independent of any open
+long) — returning one to mean "close" would silently open the wrong
+position. tick_open_position()'s PositionUpdate("close") always closes the
+position that's actually open, regardless of hedge mode.
+
 TP/SL: 1:1 R:R, distance = ATR(14) on 15m (SL/TP method wasn't specified in
 the request — ATR-based is the same convention used elsewhere in this repo;
 adjust rr_ratio or the ATR multiplier via params if you want a different spec).
@@ -59,11 +66,17 @@ class EMAMacdStrategy(BaseStrategy):
 
         self._open_position: Optional[str] = None   # "long" | "short" | None
         self._entry_price: float = 0.0
+        self._latest_candles: list = []
 
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
         min_needed = max(self.ema_slow, self.sma_trend) + 5
         if len(candles) < min_needed:
             return self._hold(current_price, f"Need {min_needed}+ candles, have {len(candles)}")
+
+        self._latest_candles = candles  # cached for tick_open_position()
+
+        if self._open_position is not None:
+            return self._hold(current_price, f"Holding {self._open_position.upper()} — managed via tick_open_position()")
 
         closes = [c.close for c in candles]
         ema_f = self.ema(closes, self.ema_fast)
@@ -82,31 +95,6 @@ class EMAMacdStrategy(BaseStrategy):
 
         atr_arr = self.atr(candles, 14)
         atr_val = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else current_price * 0.01
-        last = candles[-1]
-        touched_sma50 = last.low <= sma50[-1] <= last.high
-
-        # ── Manage an open position first ───────────────────────────────────
-        if self._open_position == "long":
-            if cross_down or (macd_down and touched_sma50):
-                reason = "EMA12 crossed below EMA26 (15m)" if cross_down \
-                    else "MACD 30m turned bearish + price touched SMA50 (15m)"
-                self._open_position = None
-                return Signal(
-                    type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
-                    reason=f"Exit LONG: {reason}", confidence=1.0, metadata={"exit": True},
-                )
-            return self._hold(current_price, "Holding LONG — no exit condition yet")
-
-        if self._open_position == "short":
-            if cross_up or (macd_up and touched_sma50):
-                reason = "EMA12 crossed above EMA26 (15m)" if cross_up \
-                    else "MACD 30m turned bullish + price touched SMA50 (15m)"
-                self._open_position = None
-                return Signal(
-                    type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
-                    reason=f"Exit SHORT: {reason}", confidence=1.0, metadata={"exit": True},
-                )
-            return self._hold(current_price, "Holding SHORT — no exit condition yet")
 
         # ── Look for a new entry ─────────────────────────────────────────────
         if cross_up and price_above_sma50 and macd_up:
@@ -135,6 +123,46 @@ class EMAMacdStrategy(BaseStrategy):
 
         return self._hold(current_price, "No entry: waiting for EMA cross + SMA50 + MACD30m alignment")
 
+    def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
+        """Called every bot tick while a position is open. Hedge-mode-safe
+        exit path — closes via PositionUpdate, never a SELL/BUY Signal."""
+        if self._open_position is None or not self._latest_candles:
+            return None
+
+        from ..engines.position_manager import PositionUpdate
+
+        candles = self._latest_candles
+        closes = [c.close for c in candles]
+        ema_f = self.ema(closes, self.ema_fast)
+        ema_s = self.ema(closes, self.ema_slow)
+        sma50 = self.sma(closes, self.sma_trend)
+        if np.isnan(ema_f[-2]) or np.isnan(ema_s[-2]) or np.isnan(sma50[-1]):
+            return PositionUpdate(action="hold", reason="Indicators warming up")
+
+        cross_up = ema_f[-2] <= ema_s[-2] and ema_f[-1] > ema_s[-1]
+        cross_down = ema_f[-2] >= ema_s[-2] and ema_f[-1] < ema_s[-1]
+        macd_up, macd_down = self._macd_30m_trend(candles)
+        last = candles[-1]
+        touched_sma50 = last.low <= sma50[-1] <= last.high
+
+        if self._open_position == "long":
+            if cross_down or (macd_down and touched_sma50):
+                reason = "EMA12 crossed below EMA26 (15m)" if cross_down \
+                    else "MACD 30m turned bearish + price touched SMA50 (15m)"
+                self._open_position = None
+                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason}")
+            return PositionUpdate(action="hold", reason="Holding LONG")
+
+        if self._open_position == "short":
+            if cross_up or (macd_up and touched_sma50):
+                reason = "EMA12 crossed above EMA26 (15m)" if cross_up \
+                    else "MACD 30m turned bullish + price touched SMA50 (15m)"
+                self._open_position = None
+                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason}")
+            return PositionUpdate(action="hold", reason="Holding SHORT")
+
+        return PositionUpdate(action="hold")
+
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _macd_30m_trend(self, candles_15m: list) -> tuple[bool, bool]:
@@ -153,7 +181,9 @@ class EMAMacdStrategy(BaseStrategy):
 
     @staticmethod
     def _resample(candles: list, minutes: int) -> list:
-        """Group candles into `minutes`-wide buckets by timestamp (ms epoch)."""
+        """Group candles into `minutes`-wide buckets by timestamp (ms epoch).
+        Drops the last bucket if it hasn't fully elapsed yet, so MACD 30m
+        confirmation only ever reads a genuinely closed 30m candle."""
         if not candles:
             return []
         bucket_ms = minutes * 60_000
@@ -168,13 +198,20 @@ class EMAMacdStrategy(BaseStrategy):
                 self.timestamp = ts; self.open = o; self.high = h
                 self.low = l; self.close = cl; self.volume = v
 
+        keys = sorted(buckets)
         out = []
-        for key in sorted(buckets):
+        for key in keys:
             grp = buckets[key]
             out.append(_Bar(
                 key, grp[0].open, max(g.high for g in grp), min(g.low for g in grp),
                 grp[-1].close, sum(g.volume for g in grp),
             ))
+
+        last_c15_end = candles[-1].timestamp + 15 * 60_000
+        last_bucket_end = keys[-1] + bucket_ms
+        if last_c15_end < last_bucket_end:
+            out = out[:-1]
+
         return out
 
     def _hold(self, price: float, reason: str = "") -> Signal:

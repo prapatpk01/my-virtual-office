@@ -144,6 +144,15 @@ class TradingBot:
         # Track symbols that have had futures setup (leverage + hedge mode)
         self._futures_setup_done: set[str] = set()
 
+    def _resolve_strategy_inst(self, strategy_name: str) -> Optional[BaseStrategy]:
+        """Look up a strategy instance by its position-tracking key, which in
+        hedge mode carries a ':L'/':S' suffix (e.g. "AIExpert(BTC/USDT:USDT):L")
+        that _strategy_map's keys (plain strategy.name) don't have."""
+        inst = self._strategy_map.get(strategy_name)
+        if inst is None and strategy_name.endswith((":L", ":S")):
+            inst = self._strategy_map.get(strategy_name[:-2])
+        return inst
+
     # ------------------------------------------------------------------
     # Public control
     # ------------------------------------------------------------------
@@ -240,7 +249,7 @@ class TradingBot:
             ticker        = await self.connector.fetch_ticker(sym)
             price         = ticker["last"]
 
-            strategy_inst = self._strategy_map.get(strategy_name)
+            strategy_inst = self._resolve_strategy_inst(strategy_name)
 
             # Layer 7 + 8: AI Expert position management (break-even, trailing, partial TP, exit AI)
             if hasattr(strategy_inst, "tick_open_position"):
@@ -539,7 +548,7 @@ class TradingBot:
         duration_min = (time.time() - open_time) / 60.0
 
         if strategy_inst is None:
-            strategy_inst = self._strategy_map.get(strategy_name)
+            strategy_inst = self._resolve_strategy_inst(strategy_name)
 
         # Layer 9: feed learning engine
         if hasattr(strategy_inst, "record_closed_trade"):
@@ -731,7 +740,7 @@ class TradingBot:
                             self.risk.close_position(sym, strategy=strategy_name)
                             self._on_position_closed(
                                 sym, strategy_name, exit_price, "sell_signal",
-                                self._strategy_map.get(strategy_name),
+                                self._resolve_strategy_inst(strategy_name),
                             )
                             if self.telegram:
                                 self.telegram.notify_trade_closed(
@@ -809,51 +818,64 @@ class TradingBot:
                 sl_p = price + (price - sl_p)
                 tp_p = price - (tp_p - price)
 
-        # ── Risk-based position sizing ─────────────────────────────────────────
-        # amount is sized so that a full SL hit loses exactly RISK_PER_TRADE_PCT
-        # of balance — not a fixed % of balance as notional (that conflates
-        # position size with risk, which vary a lot with how far SL sits).
-        # Layer 8 (Dynamic Risk Engine) scales this base risk% up/down per
-        # trade based on market quality / confidence / expectancy / volatility.
-        base_risk_pct    = float(os.getenv("RISK_PER_TRADE_PCT", "0.05"))
-        risk_multiplier  = meta.get("dynamic_risk", {}).get("risk_multiplier", 1.0)
-        risk_pct         = base_risk_pct * risk_multiplier
-        risk_per_unit    = abs(price - sl_p) if sl_p else 0
-
-        if risk_per_unit > 0:
-            risk_dollars = quote_balance * risk_pct
-            amount = round(risk_dollars / risk_per_unit, 6)
-            sizing_label = (
-                f"risk-based {risk_pct*100:.2f}% (base {base_risk_pct*100:.1f}% x "
-                f"{risk_multiplier:.2f} Layer8) — SL {risk_per_unit/price*100:.2f}% away"
-            )
-        else:
-            # No usable SL from the signal — fall back to confidence-tiered notional sizing
-            size_pct = _confidence_size_pct(meta)
-            amount = self.risk.size_position(quote_balance, price, size_pct=size_pct)
-            sizing_label = f"confidence-based {size_pct*100:.1f}% (no SL available)"
-
         leverage      = max(getattr(self.connector, "_leverage", 1), 1)
         is_futures    = getattr(self.connector, "_futures", False)
+        sizing_mode   = meta.get("sizing_mode", "risk")
+
+        if sizing_mode == "margin":
+            # ── Margin-based sizing (opt-in via signal.metadata) ─────────────
+            # Position margin = balance × margin_pct, notional = margin × leverage.
+            # Note: this is NOT the same as risking margin_pct of balance — actual
+            # $ risk on a stop-out depends on SL distance, same as any leveraged size.
+            margin_pct = float(meta.get("margin_pct", 0.05))
+            margin = quote_balance * margin_pct
+            notional_target = margin * (leverage if is_futures else 1)
+            amount = round(notional_target / price, 6) if price > 0 else 0
+            risk_per_unit = abs(price - sl_p) if sl_p else 0
+            sizing_label = f"margin-based {margin_pct*100:.1f}% of balance (leverage {leverage}x)"
+        else:
+            # ── Risk-based position sizing ───────────────────────────────────
+            # amount is sized so that a full SL hit loses exactly RISK_PER_TRADE_PCT
+            # of balance — not a fixed % of balance as notional (that conflates
+            # position size with risk, which vary a lot with how far SL sits).
+            # Layer 8 (Dynamic Risk Engine) scales this base risk% up/down per
+            # trade based on market quality / confidence / expectancy / volatility.
+            base_risk_pct    = float(os.getenv("RISK_PER_TRADE_PCT", "0.05"))
+            risk_multiplier  = meta.get("dynamic_risk", {}).get("risk_multiplier", 1.0)
+            risk_pct         = base_risk_pct * risk_multiplier
+            risk_per_unit    = abs(price - sl_p) if sl_p else 0
+
+            if risk_per_unit > 0:
+                risk_dollars = quote_balance * risk_pct
+                amount = round(risk_dollars / risk_per_unit, 6)
+                sizing_label = (
+                    f"risk-based {risk_pct*100:.2f}% (base {base_risk_pct*100:.1f}% x "
+                    f"{risk_multiplier:.2f} Layer8) — SL {risk_per_unit/price*100:.2f}% away"
+                )
+            else:
+                # No usable SL from the signal — fall back to confidence-tiered notional sizing
+                size_pct = _confidence_size_pct(meta)
+                amount = self.risk.size_position(quote_balance, price, size_pct=size_pct)
+                sizing_label = f"confidence-based {size_pct*100:.1f}% (no SL available)"
 
         # ── Margin concentration cap — independent of the risk target ─────────
         # A very tight SL (e.g. low-volatility regime) blows up amount = risk$/SL-distance
-        # to a huge notional. Risk stays correct at RISK_PER_TRADE_PCT, but margin
-        # tied up in one trade can balloon past a sane share of the account —
-        # cap it so one trade can never lock up more than MAX_MARGIN_PCT_PER_TRADE.
+        # to a huge notional under risk-based sizing. Cap it so one trade can
+        # never lock up more than MAX_MARGIN_PCT_PER_TRADE (margin-mode already
+        # targets a fixed, typically-smaller share, so this rarely engages there).
         max_margin_pct = float(os.getenv("MAX_MARGIN_PCT_PER_TRADE", "0.20"))
         notional        = amount * price
         required_margin = (notional / leverage) if is_futures else notional
         max_margin      = quote_balance * max_margin_pct
 
-        if required_margin > max_margin:
+        if sizing_mode != "margin" and required_margin > max_margin:
             max_notional_by_risk_cap = max_margin * (leverage if is_futures else 1)
             capped_amount = round(max_notional_by_risk_cap / price, 6) if price > 0 else 0
             logger.warning(
                 "[%s] SL too tight (%.2f%% away) — risk-sized margin $%.2f would exceed the "
-                "%.0f%% per-trade cap ($%.2f). Capping size %.6f → %.6f (actual risk drops below %.1f%%)",
+                "%.0f%% per-trade cap ($%.2f). Capping size %.6f → %.6f",
                 strategy_name, risk_per_unit / price * 100, required_margin,
-                max_margin_pct * 100, max_margin, amount, capped_amount, risk_pct * 100,
+                max_margin_pct * 100, max_margin, amount, capped_amount,
             )
             amount = capped_amount
             notional = amount * price
@@ -867,9 +889,8 @@ class TradingBot:
             max_notional = quote_balance * safety_buffer * (leverage if is_futures else 1)
             clamped_amount = round(max_notional / price, 6) if price > 0 else 0
             logger.warning(
-                "[%s] Margin required $%.2f exceeds available $%.2f — clamping size %.6f → %.6f "
-                "(actual risk if SL hit will be below the %.1f%% target)",
-                strategy_name, required_margin, quote_balance, amount, clamped_amount, risk_pct * 100,
+                "[%s] Margin required $%.2f exceeds available $%.2f — clamping size %.6f → %.6f",
+                strategy_name, required_margin, quote_balance, amount, clamped_amount,
             )
             amount = clamped_amount
 

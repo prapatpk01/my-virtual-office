@@ -10,6 +10,7 @@ Config via environment variables (see .env.example) or a .env file.
 Strategy modes (STRATEGY env var):
   ai_expert  — Layer 0-8 AI Decision Engine (default, institutional grade)
   ema_macd   — EMA12/26 cross + SMA50 filter (15m) + MACD 30m confirmation
+  hma_macd_roc — HMA10/20 cross gate + MACD + ROC 3-bar confirmation (30m)
   mcdx       — Legacy MCDX strategy
   wt_adx     — Legacy WaveTrend + ADX strategy
 """
@@ -126,6 +127,9 @@ def _make_strategies(symbols: list, config: dict):
         if mode == "ema_macd":
             from trading.strategies.ema_macd_strategy import EMAMacdStrategy
             strategies.append(EMAMacdStrategy(sym))
+        elif mode == "hma_macd_roc":
+            from trading.strategies.hma_macd_roc_strategy import HMAMacdROCStrategy
+            strategies.append(HMAMacdROCStrategy(sym))
         elif mode == "mcdx" or flags.get("mcdx", False):
             from trading.strategies.mcdx_strategy import MCDXStrategy
             strategies.append(MCDXStrategy(sym))
