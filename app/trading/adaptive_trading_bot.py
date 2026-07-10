@@ -999,6 +999,14 @@ class TradingBot:
         # (see on_tick's raw_candles param) — None until the first tick.
         self._raw_candles: Optional[Dict[str, List]] = None
 
+        # [SESSION CONTROL] set by run_bot.py from the shared TradingSessionEngine
+        # BEFORE each on_tick call (see session_engine.py) — gates only the
+        # SCANNING->FILTERING transition (_check_global_gates), never position
+        # management. Defaults open so ad-hoc scripts/backtests without a
+        # session engine wired up behave exactly as before this feature.
+        self.session_gate_open: bool = True
+        self.session_state: str = "ACTIVE"
+
         # [TARGET ALERTS] queued Telegram-ready dicts for each target hit /
         # SL ratchet move, popped by the runner after on_tick / intrabar checks
         self._pending_target_alerts: List[Dict] = []
@@ -1985,6 +1993,15 @@ class TradingBot:
         if self.position_open:
             return False
 
+        # [SESSION CONTROL] Extended commodity-market session gate (see
+        # session_engine.py) — blocks only new entries. Existing positions,
+        # protective orders, Telegram alerts, and exchange heartbeat all run
+        # through code paths that never call _check_global_gates(), so
+        # nothing else in the bot is affected while this is closed.
+        if not self.session_gate_open:
+            self._log_event(f"SKIP: session {self.session_state} — new entries disabled", level="debug")
+            return False
+
         _now = self._bar_now or datetime.datetime.now()
 
         if self._startup_unblock_at and _now < self._startup_unblock_at:
@@ -2921,6 +2938,8 @@ class TradingBot:
             "regime_bias":        self.current_regime_bias,
             "regime_score":       self.regime_score,
             "entry_engine":       self.entry_engine,
+            "session_state":      self.session_state,
+            "session_gate_open":  self.session_gate_open,
             "cooldown_until":     self.cooldown_until.isoformat() if self.cooldown_until else None,
             "warmup_remaining_m": warmup_remaining,
             "scan_info":          dict(self._scan_info),

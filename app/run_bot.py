@@ -531,6 +531,33 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     SCAN_LOG_SECS = _env_int("SCAN_LOG_SECONDS", 300)
     last_scan_log = _time.time()
 
+    # [SESSION CONTROL] Extended commodity-market session gate — see
+    # session_engine.py. ONE shared engine (the weekly session is a single
+    # global fact, not per-symbol); every bot's session_gate_open is set from
+    # its output right before that bot's on_tick call. Position management,
+    # protective orders, Telegram alerts, and exchange heartbeat are never
+    # touched by this — only the SCANNING->FILTERING (new entry) transition.
+    from trading.session_engine import TradingSessionEngine
+    session_engine = TradingSessionEngine(
+        reference_market=os.environ.get("REFERENCE_MARKET", "XAU"),
+        market_tz_name=os.environ.get("MARKET_SESSION_TIMEZONE", "America/New_York"),
+        open_weekday=os.environ.get("WEEKLY_OPEN_WEEKDAY", "SUNDAY"),
+        open_hour=_env_int("WEEKLY_OPEN_HOUR", 18),
+        close_weekday=os.environ.get("WEEKLY_CLOSE_WEEKDAY", "FRIDAY"),
+        close_hour=_env_int("WEEKLY_CLOSE_HOUR", 17),
+        pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 3.0),
+        post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 3.0),
+    )
+    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", True)
+    # Approximate, manually-maintained classification (this codebase has no
+    # richer per-symbol asset-class metadata) — only consulted at all when
+    # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=false, to let crypto symbols opt out
+    # of the commodity schedule and trade 24/7 as before this feature.
+    _commodity_symbols = {"XAU", "XAG", "CL"}
+    SESSION_LOG_SECS = _env_int("SESSION_LOG_SECONDS", 300)
+    last_session_log = 0.0   # force an immediate log on the first loop tick
+    last_session_state = None
+
     _HEALTH_EMOJI = {
         "STRONG":   "✅",
         "GOOD":     "🟢",
@@ -608,6 +635,19 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     # 5-minute health logs are written to Railway log automatically below.
 
     while not stop_event.is_set():
+        # [SESSION CONTROL] One evaluation per loop pass, shared by every
+        # symbol this iteration — the weekly session is a single global fact.
+        session = session_engine.evaluate()
+        if (_time.time() - last_session_log >= SESSION_LOG_SECS
+                or session.state.value != last_session_state):
+            last_session_log = _time.time()
+            if session.state.value != last_session_state and last_session_state is not None:
+                # State transition — worth a Telegram ping, not just a log line.
+                if telegram:
+                    telegram.send(session.view_log_message)
+            last_session_state = session.state.value
+            logger.info(session.view_log_message)
+
         for sym in symbols:
             try:
                 # Fetch candles for all 3 timeframes
@@ -626,6 +666,16 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 latest_ts = c15m[-1].timestamp if c15m else 0
                 is_new_bar = latest_ts > last_bar_ts[sym]
                 bot, state_file = bots[sym]
+
+                # [SESSION CONTROL] gate only new entries (never position
+                # management — _check_global_gates is the only reader of
+                # session_gate_open). Crypto symbols follow the same
+                # commodity-market schedule by default; set
+                # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=false to exempt them.
+                base_sym = sym.split("/")[0].upper()
+                applies = _follow_session_for_crypto or base_sym in _commodity_symbols
+                bot.session_gate_open = session.allow_new_positions if applies else True
+                bot.session_state = session.state.value if applies else "ACTIVE"
 
                 if is_new_bar:
                     last_bar_ts[sym] = latest_ts
@@ -699,9 +749,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                         # Log state on every new bar
                         status = bot.get_status()
                         logger.info(
-                            "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f",
+                            "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f session=%s",
                             sym, status["state"], status["position_open"],
                             status["market_state"], status["regime_score"],
+                            status["session_state"],
                         )
 
                         # [TARGET LADDER] forward T1/T2 hit alerts to Telegram
@@ -839,9 +890,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 try:
                     status = bot.get_status()
                     logger.info(
-                        "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f",
+                        "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f session=%s",
                         sym, status["state"], status["position_open"],
                         status["market_state"], status["regime_score"],
+                        status["session_state"],
                     )
                     # analysis detail: last per-direction evaluation (scores vs
                     # threshold, or which veto blocked) so the scan shows WHY.
