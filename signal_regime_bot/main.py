@@ -98,6 +98,15 @@ class Bot:
         if self.telegram.enabled:
             self._cmd_task = asyncio.create_task(self._command_loop())
             logger.info("Telegram command interface active (/help)")
+            # Confirm in Telegram that a (re)deploy actually came up healthy —
+            # otherwise a clean restart is completely silent in the chat and
+            # there's no way to tell "still starting" from "crashed".
+            await self.telegram.send_text(
+                f"🤖 *Bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
+                f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
+                f"Balance: `{balance:.2f}` USDT\n"
+                f"Architecture: Regime → Bias → Entry (strict 3-layer)"
+            )
 
     async def stop(self):
         self._running = False
