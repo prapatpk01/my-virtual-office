@@ -189,6 +189,12 @@ class Config:
     # profit targets fail to clear round-trip fees (see calc_stop_loss docstring).
     sl_min_pct: float = 0.004   # 0.4%
     sl_max_pct: float = 0.035  # 3.5%
+    # Pulls the final SL distance in to this fraction of the ATR/swing/floor
+    # calc — the tightened distance becomes the "1R" unit TP1/TP2 are measured
+    # against. 0.85 = stop 15% closer to entry (testing whether a tighter R
+    # unit, paired with SpikeGuard's fast reversal protection, improves the
+    # TP1-then-breakeven fee-drag problem measured on the local BTC/XAU set).
+    sl_tighten_mult: float = 0.85
     tp1_r: float = 0.5
     # Fraction of the position closed at TP1 (remainder rides to TP2/SL-at-BE).
     # Swept against the live 6-symbol backtest (BTC/ETH/SOL/XAU/XAG, Jan-Jun
@@ -196,12 +202,10 @@ class Config:
     # SMALLER TP1 take (bigger runner) improves expected value — 40% beat
     # both 50% (previous default) and 70%/60%@0.6R.
     tp1_fraction: float = 0.6
-    # TP2 kept at 1.2R. MEASURED: moving it out to 2.5R with an ATR trailing
-    # runner made XAU WORSE (net -6701 vs -6327, PF 0.22 vs the tighter
-    # config) — only 4 of 62 trades trailed into profit; the 1.2R target was
-    # capturing 13 reliable wins the wider target gave back as breakevens.
-    # The winners don't run far enough in this data for a tail to exist.
-    tp2_r: float = 1.5
+    # Reward target of 1.0R (against the tightened sl_tighten_mult R unit
+    # above) — testing whether a tighter SL + 1.0R reward fixes the
+    # TP1-then-breakeven fee-drag problem vs. the previous 1.5R.
+    tp2_r: float = 1.0
     # Trailing runner code retained but DISABLED (config-gated). It's here to
     # re-test on other data/regimes, but it hurt on the measured set.
     trail_enabled: bool = False

@@ -62,10 +62,16 @@ class Position:
 
 def calc_stop_loss(direction: str, entry: float, atr_val: float, atr_mult: float,
                    swing_high: float, swing_low: float,
-                   sl_min_pct: float = 0.0, sl_max_pct: float = 1.0) -> float:
+                   sl_min_pct: float = 0.0, sl_max_pct: float = 1.0,
+                   sl_tighten_mult: float = 1.0) -> float:
     """
     ATR-based SL, tightened to the nearest swing level if that's safer (closer),
-    then clamped to [sl_min_pct, sl_max_pct] of entry price.
+    then clamped to [sl_min_pct, sl_max_pct] of entry price, then optionally
+    pulled in further by `sl_tighten_mult` (e.g. 0.85 = stop 15% closer to
+    entry than the ATR/swing/floor calc alone would place it) — this is the
+    unit TP1/TP2 R-multiples are measured against, so tightening it changes
+    both risk-per-trade-in-price-terms AND how close the R-multiple targets
+    sit, not just the stop.
 
     The floor matters more than it looks: on quiet 30m candles ATR*1.5 can come
     out well under 0.1% of price. With TP1=0.5R/TP2=1.2R that shrinks the dollar
@@ -76,12 +82,12 @@ def calc_stop_loss(direction: str, entry: float, atr_val: float, atr_mult: float
     if direction == LONG:
         atr_sl = entry - atr_val * atr_mult
         sl = float(swing_low) if (not np.isnan(swing_low) and swing_low > atr_sl) else float(atr_sl)
-        dist = max(entry * sl_min_pct, min(entry - sl, entry * sl_max_pct))
+        dist = max(entry * sl_min_pct, min(entry - sl, entry * sl_max_pct)) * sl_tighten_mult
         return entry - dist
     else:
         atr_sl = entry + atr_val * atr_mult
         sl = float(swing_high) if (not np.isnan(swing_high) and swing_high < atr_sl) else float(atr_sl)
-        dist = max(entry * sl_min_pct, min(sl - entry, entry * sl_max_pct))
+        dist = max(entry * sl_min_pct, min(sl - entry, entry * sl_max_pct)) * sl_tighten_mult
         return entry + dist
 
 
@@ -235,7 +241,7 @@ class PositionManager:
             df_30m["high"], df_30m["low"], c.swing_lookback_left, c.swing_lookback_right)
 
         sl = calc_stop_loss(side, price, atr_val, c.sl_atr_mult, swing_high, swing_low,
-                           c.sl_min_pct, c.sl_max_pct)
+                           c.sl_min_pct, c.sl_max_pct, c.sl_tighten_mult)
         tp1, tp2 = calc_take_profits(side, price, sl, c.tp1_r, c.tp2_r)
 
         # Explicit balance check BEFORE sizing — always fetch fresh (never cached/stale),

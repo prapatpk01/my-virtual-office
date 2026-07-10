@@ -311,7 +311,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
             hist_30m["high"], hist_30m["low"], cfg.swing_lookback_left, cfg.swing_lookback_right)
         side = "long" if sig.direction == LONG else "short"
         sl = calc_stop_loss(side, entry_px, atr_val, cfg.sl_atr_mult, swing_high, swing_low,
-                           cfg.sl_min_pct, cfg.sl_max_pct)
+                           cfg.sl_min_pct, cfg.sl_max_pct, cfg.sl_tighten_mult)
         tp1, tp2 = calc_take_profits(side, entry_px, sl, cfg.tp1_r, cfg.tp2_r)
 
         amount = risk.size_by_risk(balance, entry_px, sl, sig.regime.size_multiplier)

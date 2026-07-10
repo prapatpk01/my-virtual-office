@@ -278,7 +278,7 @@ class Bot:
             df_30m["high"], df_30m["low"], c.swing_lookback_left, c.swing_lookback_right)
         side = "long" if sig.direction == LONG else "short"
         sl = calc_stop_loss(side, sig.price, atr_val, c.sl_atr_mult, swing_high, swing_low,
-                           c.sl_min_pct, c.sl_max_pct)
+                           c.sl_min_pct, c.sl_max_pct, c.sl_tighten_mult)
         tp1, tp2 = calc_take_profits(side, sig.price, sl, c.tp1_r, c.tp2_r)
         return sl, tp1, tp2
 
