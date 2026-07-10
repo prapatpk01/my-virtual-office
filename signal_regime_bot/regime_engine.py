@@ -164,18 +164,24 @@ class RegimeEngine:
                           (r4.direction == SHORT and r1.direction == LONG and r1.score >= c.regime_normal_score)
 
         # ── 6-regime classification (priority order) ─────────────────────────
+        # Non-trend conditions (compression, range) are checked BEFORE the
+        # trend bands: a low-ADX / high-chop market is a RANGE even when the
+        # EMAs mildly lean (structurally "aligned"). Checking trend first
+        # mislabelled a choppy market as HEALTHY_TREND and never routed it to
+        # mean-reversion — which is exactly the style that fits this market.
+        strong_trend = adx_1h >= c.regime_adx_trend_lo   # a real trend needs momentum, not just EMA lean
         if strong_conflict or r4.label == TRANSITION or r1.label == TRANSITION:
             regime_type = "TRANSITION"
-        elif aligned and combined >= c.regime_strong_trend_min:
+        elif atr_pct_1h <= c.regime_compression_atrpct_max and chop_1h >= c.regime_range_chop_min:
+            regime_type = "COMPRESSION"
+        elif chop_1h >= c.regime_range_chop_min or adx_1h < c.regime_range_adx_max:
+            regime_type = "RANGE"
+        elif aligned and strong_trend and combined >= c.regime_strong_trend_min:
             regime_type = "STRONG_TREND"
-        elif aligned and combined >= c.regime_healthy_trend_min:
+        elif aligned and strong_trend and combined >= c.regime_healthy_trend_min:
             regime_type = "HEALTHY_TREND"
         elif aligned and combined >= c.regime_early_trend_min:
             regime_type = "EARLY_TREND"
-        elif atr_pct_1h <= c.regime_compression_atrpct_max and chop_1h >= c.regime_range_chop_min:
-            regime_type = "COMPRESSION"
-        elif adx_1h < c.regime_range_adx_max and chop_1h >= c.regime_range_chop_min:
-            regime_type = "RANGE"
         else:
             regime_type = "TRANSITION"
 
