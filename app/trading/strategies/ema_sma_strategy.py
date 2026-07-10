@@ -11,22 +11,35 @@ Entry LONG:
 
 Entry SHORT: mirror (cross down, candle opens below SMA50).
 
-Exit LONG:  EMA12 crosses back below EMA26  OR  price closes below SMA50
-Exit SHORT: mirror.
+SL/TP: same method + same post-entry management as ai_expert_strategy.py's
+Layer 5 (Strategy Engine) / Layer 7 (Position Manager):
+  - SL = wider of (recent swing high/low + 0.3xATR buffer) and (ATR x1.5),
+    capped at 3xATR max width. ai_expert additionally scales the 1.5x
+    multiplier by market regime (1.0-2.5x); this strategy has no regime
+    classifier, so it always uses the TREND-regime default of 1.5x.
+  - TP  = entry + 1.2R (R = |entry - SL|) — same rr_target as ai_expert.
+  - TP1 @ 0.6R -> close 50%, move SL to break-even.
+  - TP2 @ 1.2R -> close the remaining 100%.
+  Driven by the same engines.position_manager.PositionManager used by
+  ai_expert (TP1_RR/TP2_RR env vars, default 0.6/1.2), so a position opened
+  by this strategy behaves identically to an ai_expert position once it's
+  live, right up until TP2 or a full close.
+
+Full close ALSO fires early (before TP2) on: EMA12 crossing back the wrong
+way, OR price closing on the wrong side of SMA50 — same discretionary exit
+this strategy always had, checked only after PositionManager's TP1/TP2 pass
+declines to act on the current tick.
 
 Exits are evaluated in tick_open_position() (called by bot.py every tick for
 an open position), NOT by returning a SELL/BUY Signal from analyze() — in
 hedge mode a SELL Signal always OPENS a new short rather than closing an
-open long. tick_open_position()'s PositionUpdate("close") always closes
-whichever position is actually open, regardless of hedge mode.
-
-TP/SL: 1:1 R:R, distance = ATR(14) on 15m x 2.0 (not specified in the
-request; ATR-based is the same convention used elsewhere in this repo —
-the 2x multiplier avoids stops that are too tight for a single 15m bar's
-ATR; adjust atr_mult for a different distance).
+open long. tick_open_position()'s PositionUpdate("close"/"partial_tp")
+always acts on whichever position is actually open, regardless of hedge
+mode.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -42,18 +55,28 @@ class EMASMAStrategy(BaseStrategy):
         ema_fast: int = 12,
         ema_slow: int = 26,
         sma_trend: int = 50,
-        rr_ratio: float = 1.0,
-        atr_mult: float = 2.0,
+        sl_atr_mult: float = 1.5,
+        rr_target: float = 1.2,
+        tp1_rr: Optional[float] = None,
+        tp2_rr: Optional[float] = None,
     ):
         super().__init__(symbol, params)
         self.name = f"EMASMA({symbol})"
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.sma_trend = sma_trend
-        self.rr_ratio = rr_ratio
-        self.atr_mult = atr_mult
+        self.sl_atr_mult = sl_atr_mult
+        self.rr_target = rr_target
+        self.tp1_rr = tp1_rr if tp1_rr is not None else float(os.getenv("TP1_RR", "0.6"))
+        self.tp2_rr = tp2_rr if tp2_rr is not None else float(os.getenv("TP2_RR", "1.2"))
+
+        from ..engines.position_manager import PositionManager
+        self._position_manager = PositionManager(
+            partial_tp_1_rr=self.tp1_rr, partial_tp_2_rr=self.tp2_rr,
+        )
 
         self._open_position: Optional[str] = None   # "long" | "short" | None
+        self._entry: Optional[dict] = None
         self._latest_candles: list = []
 
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
@@ -83,41 +106,71 @@ class EMASMAStrategy(BaseStrategy):
 
         atr_arr = self.atr(candles, 14)
         atr_val = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else current_price * 0.01
+        highs = np.array([c.high for c in candles], dtype=float)
+        lows = np.array([c.low for c in candles], dtype=float)
 
         # ── Look for a new entry ─────────────────────────────────────────────
         if cross_up and open_above_sma50:
-            sl = current_price - self.atr_mult * atr_val
-            tp = current_price + self.atr_mult * atr_val * self.rr_ratio
+            sl, tp = self._compute_sl_tp("long", current_price, atr_val, highs, lows)
             self._open_position = "long"
+            self._entry = {"direction": "long", "entry_price": current_price,
+                            "stop_loss": sl, "take_profit": tp, "atr": atr_val}
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                 reason="EMA12↑EMA26 (15m) + candle opened above SMA50 (15m)",
                 confidence=1.0,
-                metadata={"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio},
+                metadata={"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_target},
             )
 
         if cross_down and open_below_sma50:
-            sl = current_price + self.atr_mult * atr_val
-            tp = current_price - self.atr_mult * atr_val * self.rr_ratio
+            sl, tp = self._compute_sl_tp("short", current_price, atr_val, highs, lows)
             self._open_position = "short"
+            self._entry = {"direction": "short", "entry_price": current_price,
+                            "stop_loss": sl, "take_profit": tp, "atr": atr_val}
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
                 reason="EMA12↓EMA26 (15m) + candle opened below SMA50 (15m)",
                 confidence=1.0,
-                metadata={"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio},
+                metadata={"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_target},
             )
 
         return self._hold(current_price, "No entry: waiting for EMA cross + SMA50 open-side alignment")
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
         """Called every bot tick while a position is open. Hedge-mode-safe
-        exit path — closes via PositionUpdate, never a SELL/BUY Signal."""
-        if self._open_position is None or not self._latest_candles:
+        exit path — always acts via PositionUpdate, never a SELL/BUY Signal."""
+        if self._open_position is None or not self._latest_candles or not self._entry:
             return None
 
         from ..engines.position_manager import PositionUpdate
 
+        pos_id = position_key or self.symbol
+        entry = self._entry
         candles = self._latest_candles
+
+        # ── Same TP1/TP2/break-even mechanics as ai_expert (Layer 7) ────────
+        if pos_id not in self._position_manager._positions:
+            self._position_manager.register_position(
+                position_id=pos_id, direction=entry["direction"],
+                entry_price=entry["entry_price"], stop_loss=entry["stop_loss"],
+                take_profit=entry["take_profit"], atr=entry["atr"],
+                tp1_rr=self.tp1_rr, tp2_rr=self.tp2_rr,
+            )
+
+        pm_update = self._position_manager.update(
+            position_id=pos_id, current_price=current_price,
+            current_atr=entry["atr"], exit_score=0.0,
+        )
+        if pm_update.action == "close":
+            self._position_manager.remove_position(pos_id)
+            self._open_position = None
+            self._entry = None
+            return pm_update
+        if pm_update.action == "partial_tp":
+            return pm_update
+
+        # ── PositionManager passed — fall back to the strategy's own
+        # discretionary exit: EMA reversal or price crossing SMA50 ─────────
         closes = [c.close for c in candles]
         ema_f = self.ema(closes, self.ema_fast)
         ema_s = self.ema(closes, self.ema_slow)
@@ -135,7 +188,9 @@ class EMASMAStrategy(BaseStrategy):
             if cross_down or close_below_sma50:
                 reason = "EMA12 crossed below EMA26 (15m)" if cross_down \
                     else "Price closed below SMA50 (15m)"
+                self._position_manager.remove_position(pos_id)
                 self._open_position = None
+                self._entry = None
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason}")
             return PositionUpdate(action="hold", reason="Holding LONG")
 
@@ -143,11 +198,37 @@ class EMASMAStrategy(BaseStrategy):
             if cross_up or close_above_sma50:
                 reason = "EMA12 crossed above EMA26 (15m)" if cross_up \
                     else "Price closed above SMA50 (15m)"
+                self._position_manager.remove_position(pos_id)
                 self._open_position = None
+                self._entry = None
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason}")
             return PositionUpdate(action="hold", reason="Holding SHORT")
 
         return PositionUpdate(action="hold")
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _compute_sl_tp(self, direction: str, price: float, atr: float,
+                        highs: np.ndarray, lows: np.ndarray) -> tuple[float, float]:
+        """Same structure+ATR SL/TP formula as ai_expert_strategy's Layer 5
+        Strategy Engine (entry_timing.py's _compute_sl_tp), minus the
+        regime-based multiplier scaling (fixed at the TREND-regime default)."""
+        lookback = min(20, len(highs))
+        if direction == "long":
+            swing_sl  = float(lows[-lookback:].min()) if lookback > 0 else price * 0.98
+            struct_sl = swing_sl - 0.3 * atr
+            atr_sl    = price - self.sl_atr_mult * atr
+            sl        = min(struct_sl, atr_sl)          # wider of the two
+            sl        = max(sl, price - 3.0 * atr)      # cap max width
+            tp        = price + self.rr_target * (price - sl)
+        else:  # short
+            swing_sl  = float(highs[-lookback:].max()) if lookback > 0 else price * 1.02
+            struct_sl = swing_sl + 0.3 * atr
+            atr_sl    = price + self.sl_atr_mult * atr
+            sl        = max(struct_sl, atr_sl)          # wider of the two
+            sl        = min(sl, price + 3.0 * atr)      # cap max width
+            tp        = price - self.rr_target * (sl - price)
+        return sl, tp
 
     def _hold(self, price: float, reason: str = "") -> Signal:
         return Signal(
