@@ -76,6 +76,8 @@ class BinanceConnector(BaseConnector):
         self._futures_setup_symbols: set[str] = set()  # symbols already configured
 
         self._paper_balance = {"USDT": 10000.0, "BTC": 0.0, "ETH": 0.0}
+        self._paper_used: dict[str, float] = {}     # margin locked in open futures positions
+        self._paper_positions: dict[str, dict] = {} # key: f"{symbol}|{pos_side}" -> {amount, entry_price, margin}
         self._paper_open_orders: list[OrderResult] = []
 
     # ------------------------------------------------------------------
@@ -160,25 +162,62 @@ class BinanceConnector(BaseConnector):
         exec_price = price if (order_type == "limit" and price) else ticker["last"]
 
         if self._futures:
-            # Futures paper: deduct margin from USDT (notional / leverage)
-            margin = round((amount * exec_price) / max(self._leverage, 1), 4)
-            if side == "buy" and pos_side in ("long", None):
+            # side='buy'+pos_side='long' or side='sell'+pos_side='short' OPENS
+            # a position; the opposite side CLOSES it. Non-hedge mode never
+            # passes pos_side and only ever tracks longs (BUY opens, SELL
+            # closes), so pos_side=None always means "long".
+            direction = pos_side or "long"
+            pos_key   = f"{symbol}|{direction}"
+            is_open   = (side == "buy" and direction == "long") or \
+                        (side == "sell" and direction == "short")
+
+            if is_open:
+                margin = round((amount * exec_price) / max(self._leverage, 1), 4)
                 if self._paper_balance.get("USDT", 0) < margin:
                     raise ValueError(
                         f"[Paper/Futures] Insufficient USDT: need {margin:.2f}, "
                         f"have {self._paper_balance.get('USDT', 0):.2f}"
                     )
                 self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) - margin
-            elif side == "sell" and pos_side in ("short", None):
-                if self._paper_balance.get("USDT", 0) < margin:
-                    raise ValueError(
-                        f"[Paper/Futures] Insufficient USDT: need {margin:.2f}, "
-                        f"have {self._paper_balance.get('USDT', 0):.2f}"
-                    )
-                self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) - margin
+                self._paper_used["USDT"] = self._paper_used.get("USDT", 0) + margin
+                existing = self._paper_positions.get(pos_key)
+                if existing:
+                    # Adding to an existing position — blend entry price
+                    total_amt = existing["amount"] + amount
+                    existing["entry_price"] = (
+                        existing["entry_price"] * existing["amount"] + exec_price * amount
+                    ) / total_amt
+                    existing["amount"] = total_amt
+                    existing["margin"] += margin
+                else:
+                    self._paper_positions[pos_key] = {
+                        "amount": amount, "entry_price": exec_price, "margin": margin,
+                    }
             else:
-                # Closing a position: return margin to balance (approximate)
-                self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) + margin
+                # Closing (all or part of) an existing position — realize P&L,
+                # return the ORIGINAL margin for the closed portion (not
+                # recomputed at exit price), and release the used-margin lock.
+                pos = self._paper_positions.get(pos_key)
+                if not pos or pos["amount"] <= 0:
+                    logger.warning(
+                        "[Paper/Futures] Close order for %s with no tracked position "
+                        "— crediting notional/leverage only (no P&L realized)", pos_key,
+                    )
+                    margin = round((amount * exec_price) / max(self._leverage, 1), 4)
+                    self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) + margin
+                else:
+                    close_amt = min(amount, pos["amount"])
+                    entry     = pos["entry_price"]
+                    pnl = ((exec_price - entry) if direction == "long" else (entry - exec_price)) * close_amt
+                    margin_released = pos["margin"] * (close_amt / pos["amount"])
+
+                    self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) + margin_released + pnl
+                    self._paper_used["USDT"] = max(0.0, self._paper_used.get("USDT", 0) - margin_released)
+
+                    pos["amount"] -= close_amt
+                    pos["margin"] -= margin_released
+                    if pos["amount"] <= 1e-12:
+                        self._paper_positions.pop(pos_key, None)
         else:
             # Spot trading
             base_asset  = symbol.split("/")[0]
@@ -237,8 +276,18 @@ class BinanceConnector(BaseConnector):
 
     async def fetch_balance(self) -> list[Balance]:
         if self.paper:
-            return [Balance(asset=k, free=v, used=0.0, total=v)
-                    for k, v in self._paper_balance.items() if v > 0]
+            # total = free + used (margin locked in open positions) so that
+            # opening a leveraged position never looks like a loss of equity —
+            # only realized P&L on close changes total.
+            assets = set(self._paper_balance) | set(self._paper_used)
+            out = []
+            for k in assets:
+                free  = self._paper_balance.get(k, 0.0)
+                used  = self._paper_used.get(k, 0.0)
+                total = free + used
+                if total > 0:
+                    out.append(Balance(asset=k, free=free, used=used, total=total))
+            return out
         raw = await self._exchange.fetch_balance()
         # ccxt unified format: raw["total"]/["free"]/["used"] are {asset: float},
         # while raw[asset] (top-level) is the {"free","used","total"} dict per asset.
