@@ -1,5 +1,5 @@
 {
-  "run_at": "2026-07-08T10:11:23.891414+00:00",
+  "run_at": "2026-07-10T09:02:28.470823+00:00",
   "config": {
     "initial_balance": 10000.0,
     "risk_pct": 0.01,
@@ -13,12 +13,13 @@
     "warmup_15m": 60,
     "warmup_1h": 60,
     "warmup_4h": 60,
+    "entry_engine": "adaptive",
     "min_sl_pct": 0.02,
     "max_position_usd": 10000,
     "commission_pct": 0.0005,
     "slippage_pct": 0.0002,
     "data_root": "backtest/backtest_data_v2",
-    "output_dir": "/tmp/claude-0/-home-user-my-virtual-office/d635e122-be1d-52e7-aade-d61ad8dfdfee/scratchpad/oos_results"
+    "output_dir": "backtest_results_oos"
   },
   "metrics": {
     "HYPE": {
