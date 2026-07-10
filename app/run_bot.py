@@ -8,7 +8,8 @@ Usage:
 Config via environment variables (see .env.example) or a .env file.
 
 Strategy modes (STRATEGY env var):
-  ai_expert  — Full 9-layer AI Expert analysis (default, institutional grade)
+  ai_expert  — Layer 0-8 AI Decision Engine (default, institutional grade)
+  ema_macd   — EMA12/26 cross + SMA50 filter (15m) + MACD 30m confirmation
   mcdx       — Legacy MCDX strategy
   wt_adx     — Legacy WaveTrend + ADX strategy
 """
@@ -122,19 +123,22 @@ def _make_strategies(symbols: list, config: dict):
     strategies = []
 
     for sym in symbols:
-        if mode == "ai_expert" or flags.get("ai_expert", True):
+        if mode == "ema_macd":
+            from trading.strategies.ema_macd_strategy import EMAMacdStrategy
+            strategies.append(EMAMacdStrategy(sym))
+        elif mode == "mcdx" or flags.get("mcdx", False):
+            from trading.strategies.mcdx_strategy import MCDXStrategy
+            strategies.append(MCDXStrategy(sym))
+        elif mode == "wt_adx" or flags.get("wt_adx", False):
+            from trading.strategies.wt_adx_strategy import WTADXStrategy
+            strategies.append(WTADXStrategy(sym))
+        elif mode == "ai_expert" or flags.get("ai_expert", True):
             from trading.strategies.ai_expert_strategy import AIExpertStrategy
             strategies.append(AIExpertStrategy(
                 sym,
                 min_confidence=config.get("ai_expert_min_confidence", 70.0),
                 require_all_checks=config.get("ai_expert_strict", False),
             ))
-        elif flags.get("mcdx", False):
-            from trading.strategies.mcdx_strategy import MCDXStrategy
-            strategies.append(MCDXStrategy(sym))
-        elif flags.get("wt_adx", False):
-            from trading.strategies.wt_adx_strategy import WTADXStrategy
-            strategies.append(WTADXStrategy(sym))
         else:
             from trading.strategies.ai_expert_strategy import AIExpertStrategy
             strategies.append(AIExpertStrategy(sym))
