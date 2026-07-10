@@ -20,9 +20,10 @@ hedge mode a SELL Signal always OPENS a new short rather than closing an
 open long. tick_open_position()'s PositionUpdate("close") always closes
 whichever position is actually open, regardless of hedge mode.
 
-TP/SL: 1:1 R:R, distance = ATR(14) on 15m (not specified in the request;
-ATR-based is the same convention used elsewhere in this repo — adjust via
-params for a different distance method).
+TP/SL: 1:1 R:R, distance = ATR(14) on 15m x 2.0 (not specified in the
+request; ATR-based is the same convention used elsewhere in this repo —
+the 2x multiplier avoids stops that are too tight for a single 15m bar's
+ATR; adjust atr_mult for a different distance).
 """
 from __future__ import annotations
 
@@ -42,7 +43,7 @@ class EMASMAStrategy(BaseStrategy):
         ema_slow: int = 26,
         sma_trend: int = 50,
         rr_ratio: float = 1.0,
-        atr_mult: float = 1.0,
+        atr_mult: float = 2.0,
     ):
         super().__init__(symbol, params)
         self.name = f"EMASMA({symbol})"
