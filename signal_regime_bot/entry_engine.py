@@ -24,10 +24,20 @@ Two additional HARD gates, config-toggled (off unless enabled):
                                not just a low-conviction chop bounce.
     entry_participation_mandatory  Participation (volume) required alongside
                                Momentum + Structure, not just optional.
+
+Setup freshness window: the category check alone has no memory of WHEN
+momentum first turned, so it can fire many bars after the actual shift —
+by then price has already run and the "entry" is really a chase. A setup
+opens on whichever of {ROC>0, MACD favorable, HMA cross} turns true FIRST
+in the trade direction; only within `entry_setup_window_bars` bars of that
+first trigger is an entry allowed. If full confirmation (>=4/5 categories)
+hasn't arrived by the window's end, the setup goes stale and is skipped —
+the bot waits for a fresh trigger rather than chasing an old one.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -51,6 +61,22 @@ class EntryResult:
     price: float = 0.0
     entry_score: float = 0.0   # passed_count/5 * 100, for logging/telegram compat
     adx: float = 0.0
+    setup_age: Optional[int] = None    # bars since the earliest active momentum trigger
+
+
+def _consecutive_true_run(values: np.ndarray, cap: int = 20) -> Optional[int]:
+    """Age (0 = just turned true this bar) of the current True run in a bool
+    array, or None if the last value is False. Capped at `cap` bars back."""
+    n = len(values)
+    if n == 0 or not values[-1]:
+        return None
+    count = 0
+    for i in range(n - 1, max(-1, n - 1 - cap), -1):
+        if values[i]:
+            count += 1
+        else:
+            break
+    return count - 1
 
 
 class EntryEngine:
@@ -90,6 +116,32 @@ class EntryEngine:
         adx_s, _, _ = ind.adx(df_30m, c.regime_adx_period)
         adx_now = float(adx_s.iloc[-1]) if not np.isnan(adx_s.iloc[-1]) else 0.0
 
+        # ── setup freshness: age of the EARLIEST currently-active momentum
+        # trigger among {ROC>0, MACD favorable, HMA cross}, in the trade
+        # direction. Whichever fired first sets the window's start.
+        roc_v = roc9.values
+        hist_v = hist.values
+        hma_diff_v = (hma_f - hma_s).values
+        if is_long:
+            roc_fav = roc_v > 0
+            macd_fav = hist_v > 0
+            hma_fav = hma_diff_v > 0
+        else:
+            roc_fav = roc_v < 0
+            macd_fav = hist_v < 0
+            hma_fav = hma_diff_v < 0
+        roc_fav = np.nan_to_num(roc_fav.astype(float), nan=0.0).astype(bool)
+        macd_fav = np.nan_to_num(macd_fav.astype(float), nan=0.0).astype(bool)
+        hma_fav = np.nan_to_num(hma_fav.astype(float), nan=0.0).astype(bool)
+
+        ages = [a for a in (
+            _consecutive_true_run(roc_fav, c.entry_setup_window_bars + 15),
+            _consecutive_true_run(macd_fav, c.entry_setup_window_bars + 15),
+            _consecutive_true_run(hma_fav, c.entry_setup_window_bars + 15),
+        ) if a is not None]
+        setup_age = max(ages) if ages else None
+        in_window = setup_age is not None and setup_age < c.entry_setup_window_bars
+
         if is_long:
             categories = {
                 "momentum":      macd_cross_up or (h_now > h_prev) or (float(roc9.iloc[-1] or 0.0) > 0),
@@ -119,18 +171,24 @@ class EntryEngine:
             mandatory_cats.append("participation")
         mandatory_ok = all(categories[k] for k in mandatory_cats)
         adx_ok = (not c.entry_adx_gate_enabled) or adx_now >= c.entry_adx_min
-        allow = passed >= c.entry_min_categories and mandatory_ok and adx_ok
+        allow = passed >= c.entry_min_categories and mandatory_ok and adx_ok and in_window
         score = round(passed / 5.0 * 100.0, 1)
 
         if allow:
-            reason = f"{direction} trigger: {passed}/5 categories ({', '.join(k for k, v in categories.items() if v)}) ADX={adx_now:.0f}"
+            reason = (f"{direction} trigger: {passed}/5 categories ({', '.join(k for k, v in categories.items() if v)}) "
+                      f"ADX={adx_now:.0f} setup_age={setup_age}")
+        elif setup_age is None:
+            reason = f"{direction} trigger not ready: no active momentum trigger (ROC/MACD/HMA)"
+        elif not in_window:
+            reason = (f"{direction} trigger stale: momentum fired {setup_age} bars ago "
+                      f">= window {c.entry_setup_window_bars} — skip, wait for a fresh trigger")
         elif not mandatory_ok:
             missing = [k for k in mandatory_cats if not categories[k]]
-            reason = f"{direction} trigger blocked: mandatory {'/'.join(missing)} not met ({passed}/5 passed)"
+            reason = f"{direction} trigger blocked: mandatory {'/'.join(missing)} not met ({passed}/5 passed, setup_age={setup_age})"
         elif not adx_ok:
             reason = f"{direction} trigger blocked: ADX {adx_now:.0f} < {c.entry_adx_min:.0f} ({passed}/5 categories passed)"
         else:
-            reason = f"{direction} trigger not ready: {passed}/5 categories (need >= {c.entry_min_categories})"
+            reason = f"{direction} trigger not ready: {passed}/5 categories (need >= {c.entry_min_categories}, setup_age={setup_age})"
 
         return EntryResult(direction if allow else NONE, allow, passed, categories, reason,
-                           price=price, entry_score=score, adx=adx_now)
+                           price=price, entry_score=score, adx=adx_now, setup_age=setup_age)
