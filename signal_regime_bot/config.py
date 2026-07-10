@@ -160,6 +160,12 @@ class Config:
     entry_vol_expansion_mult: float = 1.5   # volume > this x vol_ma20 = expansion
     entry_wick_reject_frac: float = 0.5     # wick >= this fraction of bar range
     entry_sweep_lookback: int = 10          # bars for liquidity-sweep prior low/high
+    # Optional hard gates on top of the 5-category >=4/5 check, off by
+    # default — toggle on to test whether they cut the low-conviction
+    # TP1-then-breakeven bucket found in the local BTC/XAU backtest.
+    entry_adx_gate_enabled: bool = False
+    entry_adx_min: float = 20.0             # 30M ADX must clear this when the gate is on
+    entry_participation_mandatory: bool = False  # require volume/participation, not just optional
 
     # ── Bias confidence (1H) ─────────────────────────────────────────────────
     # Confidence 0-100 from: 1H ADX, RSI slope, EMA20 slope, volume confirm,

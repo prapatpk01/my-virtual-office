@@ -17,6 +17,13 @@ Five trigger categories, each true/false:
 
 Needs >= 4/5 categories, with Momentum AND Structure mandatory regardless
 of the total count.
+
+Two additional HARD gates, config-toggled (off unless enabled):
+    entry_adx_gate_enabled     30M ADX must clear entry_adx_min — confirms
+                               the move has real directional force behind it,
+                               not just a low-conviction chop bounce.
+    entry_participation_mandatory  Participation (volume) required alongside
+                               Momentum + Structure, not just optional.
 """
 from __future__ import annotations
 
@@ -43,6 +50,7 @@ class EntryResult:
     reason: str = ""
     price: float = 0.0
     entry_score: float = 0.0   # passed_count/5 * 100, for logging/telegram compat
+    adx: float = 0.0
 
 
 class EntryEngine:
@@ -79,6 +87,9 @@ class EntryEngine:
         vol_ma20 = float(df_30m["volume"].iloc[-21:-1].mean()) if len(df_30m) >= 21 else 0.0
         rel_vol = (vol_now / vol_ma20) if vol_ma20 > 0 else 1.0
 
+        adx_s, _, _ = ind.adx(df_30m, c.regime_adx_period)
+        adx_now = float(adx_s.iloc[-1]) if not np.isnan(adx_s.iloc[-1]) else 0.0
+
         if is_long:
             categories = {
                 "momentum":      macd_cross_up or (h_now > h_prev) or (float(roc9.iloc[-1] or 0.0) > 0),
@@ -103,17 +114,23 @@ class EntryEngine:
             }
 
         passed = sum(categories.values())
-        mandatory_ok = categories["momentum"] and categories["structure"]
-        allow = passed >= c.entry_min_categories and mandatory_ok
+        mandatory_cats = ["momentum", "structure"]
+        if c.entry_participation_mandatory:
+            mandatory_cats.append("participation")
+        mandatory_ok = all(categories[k] for k in mandatory_cats)
+        adx_ok = (not c.entry_adx_gate_enabled) or adx_now >= c.entry_adx_min
+        allow = passed >= c.entry_min_categories and mandatory_ok and adx_ok
         score = round(passed / 5.0 * 100.0, 1)
 
         if allow:
-            reason = f"{direction} trigger: {passed}/5 categories ({', '.join(k for k, v in categories.items() if v)})"
+            reason = f"{direction} trigger: {passed}/5 categories ({', '.join(k for k, v in categories.items() if v)}) ADX={adx_now:.0f}"
         elif not mandatory_ok:
-            missing = [k for k in ("momentum", "structure") if not categories[k]]
+            missing = [k for k in mandatory_cats if not categories[k]]
             reason = f"{direction} trigger blocked: mandatory {'/'.join(missing)} not met ({passed}/5 passed)"
+        elif not adx_ok:
+            reason = f"{direction} trigger blocked: ADX {adx_now:.0f} < {c.entry_adx_min:.0f} ({passed}/5 categories passed)"
         else:
             reason = f"{direction} trigger not ready: {passed}/5 categories (need >= {c.entry_min_categories})"
 
         return EntryResult(direction if allow else NONE, allow, passed, categories, reason,
-                           price=price, entry_score=score)
+                           price=price, entry_score=score, adx=adx_now)
