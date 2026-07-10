@@ -201,13 +201,13 @@ def build_config() -> dict:
         # not currently recommended.
         "adaptive_early_trend": _env_bool("ADAPTIVE_EARLY_TREND", False),
         # [FAST MACRO EMA] override L1's EMA20/50 cross component with a
-        # faster pair (e.g. 12/26, the classic MACD periods). Backtested on
-        # real Jan-Jun 2026 data: +$209 combined vs EMA20/50 baseline,
-        # improving BOTH the in-sample and out-of-sample splits independently
-        # (not just one) — recommended, but still off by default until it's
-        # been run live/paper for a stretch. Set both or neither.
-        "adaptive_macro_ema_fast": (_env_int("ADAPTIVE_MACRO_EMA_FAST", 0) or None),
-        "adaptive_macro_ema_slow": (_env_int("ADAPTIVE_MACRO_EMA_SLOW", 0) or None),
+        # faster pair. 12/26 (the classic MACD periods) is now the DEFAULT —
+        # backtested on real Jan-Jun 2026 data at +$209 combined vs EMA20/50,
+        # improving BOTH the in-sample and out-of-sample splits independently.
+        # Set ADAPTIVE_MACRO_EMA_FAST=0 (or leave *_SLOW unset) to restore the
+        # old EMA20/50-only behavior.
+        "adaptive_macro_ema_fast": (_env_int("ADAPTIVE_MACRO_EMA_FAST", 12) or None),
+        "adaptive_macro_ema_slow": (_env_int("ADAPTIVE_MACRO_EMA_SLOW", 26) or None),
     }
 
 

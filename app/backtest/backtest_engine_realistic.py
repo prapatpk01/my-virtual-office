@@ -397,13 +397,16 @@ if __name__ == "__main__":
     parser.add_argument("--early-trend", action="store_true",
                         help="fold a fast dual-TF (4H+1H) HMA/MACD/ROC lean into "
                              "L1's score when confirmed (see compute_early_trend)")
-    parser.add_argument("--macro-ema", default="",
+    parser.add_argument("--macro-ema", default="12,26",
                         help="override L1's EMA20/50 cross component with a faster "
-                             "pair, e.g. --macro-ema 12,26")
+                             "pair (default: 12,26, the classic MACD periods — "
+                             "backtested improvement over EMA20/50)")
+    parser.add_argument("--macro-ema-off", action="store_true",
+                        help="restore the old EMA20/50-only behavior (no override)")
     args = parser.parse_args()
 
     macro_ema_fast = macro_ema_slow = None
-    if args.macro_ema:
+    if not args.macro_ema_off and args.macro_ema:
         macro_ema_fast, macro_ema_slow = (int(x) for x in args.macro_ema.split(","))
 
     cfg = BacktestConfig(

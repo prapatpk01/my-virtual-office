@@ -72,10 +72,11 @@ class BacktestConfig:
     enable_early_trend: bool = False
 
     # [FAST MACRO EMA] override L1's EMA20/50 cross component with a faster
-    # pair (e.g. 12/26) computed fresh from raw 4H candles. None/None (default)
-    # = untouched EMA20/50 (IndicatorEngine's shared values).
-    macro_ema_fast: Optional[int] = None
-    macro_ema_slow: Optional[int] = None
+    # pair computed fresh from raw 4H candles. 12/26 is now the DEFAULT —
+    # backtested at +$209 combined vs EMA20/50, improving both in-sample and
+    # out-of-sample splits independently. None/None restores old EMA20/50.
+    macro_ema_fast: Optional[int] = 12
+    macro_ema_slow: Optional[int] = 26
 
     # Position sizing safety
     min_sl_pct:     float = 0.020    # minimum SL distance = 2.0% — limits notional to ≤$5000 at 1% risk
