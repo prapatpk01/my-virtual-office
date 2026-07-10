@@ -101,6 +101,8 @@ def build_config() -> dict:
         # ── Risk limits ───────────────────────────────────────────────────
         "max_positions": int(os.environ.get("MAX_POSITIONS",    "2")),
         "max_drawdown":  float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15")),    # 15 %
+        "max_consecutive_sl": int(os.environ.get("MAX_CONSECUTIVE_SL", "3")),
+        "cooldown_hours":     float(os.environ.get("COOLDOWN_HOURS", "4")),
 
         # ── Telegram ──────────────────────────────────────────────────────
         "telegram_token":    os.environ.get("TELEGRAM_BOT_TOKEN", ""),
@@ -201,6 +203,8 @@ def build_crypto_bot(config: dict, telegram):
         take_profit_pct=config["take_profit_pct"],
         max_open_positions=config["max_positions"],
         max_drawdown_pct=config["max_drawdown"],
+        max_consecutive_sl=config["max_consecutive_sl"],
+        cooldown_hours=config["cooldown_hours"],
     )
     return TradingBot(
         connector=connector, strategies=strategies,

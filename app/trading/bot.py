@@ -218,6 +218,12 @@ class TradingBot:
             self._broadcast_state()
             return
 
+        # Cooldown (3 consecutive losing closes) blocks NEW entries only —
+        # existing positions still get managed/closed normally below.
+        in_cd, remaining = self.risk.in_cooldown()
+        if in_cd:
+            self.state.error = f"Cooldown active — resumes in {remaining/60:.0f} min"
+
         # ── Position management: SL/TP, AI Layer 7, and learning callbacks ──
         for pos_info in list(self.risk.get_positions()):
             sym           = pos_info["symbol"]
@@ -277,6 +283,7 @@ class TradingBot:
                         pos_info.get("take_profit"),
                         self._sig.summary(),
                     )
+                self._check_cooldown_trigger(pnl)
 
         # ── Periodic drift alert (every 50 ticks) ────────────────────────────
         if self._tick_count - self._last_drift_alert_tick >= 50:
@@ -422,6 +429,7 @@ class TradingBot:
                         "[%s] Partial TP %.0f%% %s @ %.4f PnL=%.4f | %s",
                         strategy_name, update.close_pct * 100, sym, price, pnl, update.reason,
                     )
+                    self._check_cooldown_trigger(pnl)
                     if self.telegram:
                         try:
                             self.telegram.notify(
@@ -472,11 +480,25 @@ class TradingBot:
                         pos_info.get("take_profit"),
                         self._sig.summary(),
                     )
+                self._check_cooldown_trigger(pnl)
             except Exception as e:
                 logger.error("AI-driven close failed [%s %s]: %s", strategy_name, sym, e)
             return True
 
         return False
+
+    def _check_cooldown_trigger(self, pnl: float) -> None:
+        """Feed a closed trade's PnL into the consecutive-loss streak tracker.
+        Notifies Telegram the moment a cooldown gets triggered."""
+        triggered = self.risk.record_trade_result(pnl)
+        if triggered:
+            hours = self.risk.cooldown_seconds / 3600
+            logger.warning(
+                "Cooldown triggered: %d consecutive losing closes — new entries paused for %.1fh",
+                self.risk.max_consecutive_sl, hours,
+            )
+            if self.telegram:
+                self.telegram.notify_cooldown_halt(self.risk.max_consecutive_sl, hours)
 
     def _on_position_closed(
         self,

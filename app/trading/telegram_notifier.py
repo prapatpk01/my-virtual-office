@@ -289,6 +289,15 @@ class TelegramNotifier:
         )
         self.notify(text)
 
+    def notify_cooldown_halt(self, streak: int, hours: float):
+        text = (
+            f"🧊 *Cooldown Started — New Entries Paused*\n"
+            f"`{streak}` consecutive losing closes in a row.\n"
+            f"Resumes automatically in `{hours:.1f}h` — existing positions "
+            f"are still managed normally, no action needed."
+        )
+        self.notify(text)
+
     def notify_bot_started(self, paper: bool, strategies: list[str], symbols: list[str]):
         mode = "📄 Paper" if paper else "💰 Live"
         text = (

@@ -31,15 +31,21 @@ class RiskManager:
                  take_profit_pct: float = 0.06,          # 6% take-profit (2:1 RR)
                  max_open_positions: int = 5,
                  max_drawdown_pct: float = 0.15,         # halt if 15% drawdown
+                 max_consecutive_sl: int = 3,            # cooldown after N losing closes in a row
+                 cooldown_hours: float = 4.0,            # how long the cooldown lasts
                  ):
         self.max_risk_per_trade_pct = max_risk_per_trade_pct
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.max_open_positions = max_open_positions
         self.max_drawdown_pct = max_drawdown_pct
+        self.max_consecutive_sl = max_consecutive_sl
+        self.cooldown_seconds = cooldown_hours * 3600
         self._positions: dict[str, Position] = {}
         self._peak_balance: float = 0.0
         self._halted: bool = False
+        self._sl_streak: int = 0
+        self._cooldown_until: float = 0.0
 
     def update_peak(self, balance: float):
         if balance > self._peak_balance:
@@ -54,6 +60,30 @@ class RiskManager:
             self._halted = True
             return False
         return True
+
+    def record_trade_result(self, pnl: float) -> bool:
+        """
+        Track consecutive losing closes. A losing close (pnl < 0) extends the
+        streak; any non-losing close (win or scratch, pnl >= 0) resets it.
+        Returns True the moment this result just triggered a cooldown.
+        """
+        if pnl < 0:
+            self._sl_streak += 1
+        else:
+            self._sl_streak = 0
+
+        if self._sl_streak >= self.max_consecutive_sl:
+            self._cooldown_until = time.time() + self.cooldown_seconds
+            self._sl_streak = 0
+            return True
+        return False
+
+    def in_cooldown(self) -> tuple[bool, float]:
+        """Returns (is_in_cooldown, seconds_remaining)."""
+        remaining = self._cooldown_until - time.time()
+        if remaining > 0:
+            return True, remaining
+        return False, 0.0
 
     def size_position(self, balance: float, price: float,
                       size_pct: float = None) -> float:
@@ -77,6 +107,12 @@ class RiskManager:
     def can_open(self, symbol: str, strategy: str = "") -> tuple[bool, str]:
         if self._halted:
             return False, "Trading halted: max drawdown reached"
+        in_cd, remaining = self.in_cooldown()
+        if in_cd:
+            return False, (
+                f"Cooldown active after {self.max_consecutive_sl} consecutive losing closes "
+                f"— resumes in {remaining/60:.0f} min"
+            )
         key = f"{symbol}||{strategy}"
         if key in self._positions:
             return False, f"{strategy} already has open position for {symbol}"
