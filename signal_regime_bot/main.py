@@ -464,11 +464,15 @@ class Bot:
                     continue
                 cd = self._symbol_cooldown_until.get(sym, 0)
                 cd_lb = f" cd={max(0,(cd-now))/60:.0f}m" if cd > now else ""
+                if sig.bias is not None:
+                    bias_str = (f"`{sig.bias.bias}`({max(sig.bias.bull_score, sig.bias.bear_score):.0f}) "
+                                f"conf `{sig.bias.confidence:.0f}`")
+                else:
+                    bias_str = f"`—` (blocked at {sig.blocked_layer})"
                 lines.append(
                     f"`{sym}` {pos_label}\n"
                     f"  regime `{sig.regime.name}`({sig.regime.score:.0f}) "
-                    f"bias `{sig.bias.bias}`({max(sig.bias.bull_score, sig.bias.bear_score):.0f}) "
-                    f"conf `{sig.bias.confidence:.0f}`\n"
+                    f"bias {bias_str}\n"
                     f"  entry `{sig.entry_score:.0f}` dir `{sig.direction}` "
                     f"round `{sig.round_age_bars if sig.round_age_bars is not None else '-'}`{cd_lb}")
             await self.telegram.send_text("📡 *Status*\n\n" + "\n".join(lines))
@@ -526,12 +530,17 @@ class Bot:
                 round_label = f" round={sig.round_age_bars}bar{'(used)' if used else ''}"
             else:
                 round_label = " round=none"
+            # sig.bias / sig.context are None when the pipeline blocked at an
+            # earlier layer (e.g. REGIME) — guard every optional layer.
+            bias_lbl = sig.bias.bias if sig.bias is not None else "—"
+            bias_val = max(sig.bias.bull_score, sig.bias.bear_score) if sig.bias is not None else 0.0
+            blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(
-                "  %-16s %-24s regime=%-12s(%.0f) bias=%-8s(%.0f) entry=%.0f dir=%s%s%s",
+                "  %-16s %-24s regime=%-12s(%.0f) bias=%-8s(%.0f) entry=%.0f dir=%s%s%s%s",
                 symbol, pos_label,
                 sig.regime.name, sig.regime.score,
-                sig.bias.bias, max(sig.bias.bull_score, sig.bias.bear_score),
-                sig.entry_score, sig.direction, round_label, cd_label,
+                bias_lbl, bias_val,
+                sig.entry_score, sig.direction, round_label, cd_label, blk,
             )
 
 
