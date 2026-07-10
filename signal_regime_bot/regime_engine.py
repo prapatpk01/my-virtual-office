@@ -60,6 +60,12 @@ class RegimeResult:
     size_multiplier: float
     quality: str          # 'strong' | 'normal' | 'weak' | 'transition'
     reason: str
+    # 6-regime + trade style
+    regime_type: str = "TRANSITION"   # STRONG_TREND | HEALTHY_TREND | EARLY_TREND | RANGE | COMPRESSION | TRANSITION
+    style: str = "BLOCK"              # TREND | SWING | MEANREV | BREAKOUT | BLOCK
+    adx_1h: float = 0.0
+    chop_1h: float = 0.0
+    atr_pct_1h: float = 50.0
     # kept for backward-compat with health monitor / status log call sites
     name: str = ""
     score: float = 0.0
@@ -135,59 +141,76 @@ class RegimeEngine:
         r1 = self._tf_regime(df_1h) if df_1h is not None and len(df_1h) else r4
 
         combined = round(r4.score * c.regime_weight_4h + r1.score * c.regime_weight_1h, 1)
-        # extension anti-chase uses the FASTER (1H) frame — that's where a chase shows first
         ext = r1.extension_atr
         extension_ok = ext <= c.regime_extension_atr_max
+
+        # 1H context indicators for RANGE / COMPRESSION detection
+        src = df_1h if (df_1h is not None and len(df_1h)) else df_4h
+        adx_1h = float(ind.adx(src, c.regime_adx_period)[0].iloc[-1] or 0.0)
+        chop_1h = float(ind.choppiness_index(src, c.regime_chop_period).iloc[-1] or 50.0)
+        atr_s = ind.atr(src, c.regime_atr_period)
+        atr_pct_1h = float(ind.atr_percentile(atr_s, c.regime_atr_pct_lookback).iloc[-1])
+        if np.isnan(atr_pct_1h):
+            atr_pct_1h = 50.0
 
         long_labels = {BULL, EARLY_BULL}
         short_labels = {BEAR, EARLY_BEAR}
         both_long = r4.label in long_labels and r1.label in long_labels
         both_short = r4.label in short_labels and r1.label in short_labels
         aligned = both_long or both_short
+        direction = LONG if both_long else SHORT if both_short else NEUTRAL
 
-        # strong conflict: the two frames point opposite with real conviction
         strong_conflict = (r4.direction == LONG and r1.direction == SHORT and r1.score >= c.regime_normal_score) or \
                           (r4.direction == SHORT and r1.direction == LONG and r1.score >= c.regime_normal_score)
 
-        direction = LONG if both_long else SHORT if both_short else NEUTRAL
-
-        # ── adaptive threshold + quality band from combined score ────────────
-        if combined >= c.regime_strong_score:
-            adj, quality, size_mult = -5.0, "strong", c.size_mult_strong
-        elif combined >= c.regime_normal_score:
-            adj, quality, size_mult = 0.0, "normal", c.size_mult_normal
-        elif combined >= c.regime_block_below_score:
-            adj, quality, size_mult = 5.0, "weak", c.size_mult_weak
+        # ── 6-regime classification (priority order) ─────────────────────────
+        if strong_conflict or r4.label == TRANSITION or r1.label == TRANSITION:
+            regime_type = "TRANSITION"
+        elif aligned and combined >= c.regime_strong_trend_min:
+            regime_type = "STRONG_TREND"
+        elif aligned and combined >= c.regime_healthy_trend_min:
+            regime_type = "HEALTHY_TREND"
+        elif aligned and combined >= c.regime_early_trend_min:
+            regime_type = "EARLY_TREND"
+        elif atr_pct_1h <= c.regime_compression_atrpct_max and chop_1h >= c.regime_range_chop_min:
+            regime_type = "COMPRESSION"
+        elif adx_1h < c.regime_range_adx_max and chop_1h >= c.regime_range_chop_min:
+            regime_type = "RANGE"
         else:
-            adj, quality, size_mult = 0.0, "transition", c.size_mult_transition
+            regime_type = "TRANSITION"
 
-        # a TRANSITION label on either frame pins quality to transition and
-        # NEVER relaxes the entry bar (spec: regime_transition_relax = 0)
-        if r4.label == TRANSITION or r1.label == TRANSITION:
-            quality = "transition"
-            size_mult = c.size_mult_transition
-            adj = max(adj, c.regime_transition_relax)   # never negative in transition
+        # ── regime type -> style + adaptive threshold + quality/size ─────────
+        adj, quality, size_mult, style, allow = 0.0, "normal", c.size_mult_normal, "BLOCK", False
+        if regime_type == "STRONG_TREND":
+            adj, quality, size_mult, style, allow = c.regime_strong_trend_adj, "strong", c.size_mult_strong, "TREND", True
+        elif regime_type == "HEALTHY_TREND":
+            adj, quality, size_mult, style, allow = 0.0, "normal", c.size_mult_normal, "TREND", True
+        elif regime_type == "EARLY_TREND":
+            adj, quality, size_mult, style, allow = c.regime_early_trend_adj, "weak", c.size_mult_weak, "SWING", True
+        elif regime_type == "RANGE" and c.style_range_enabled:
+            adj, quality, size_mult, style, allow = 0.0, "weak", c.meanrev_size_mult, "MEANREV", True
+        elif regime_type == "COMPRESSION" and c.style_compression_enabled:
+            adj, quality, size_mult, style, allow = 0.0, "weak", c.breakout_size_mult, "BREAKOUT", True
+        else:  # TRANSITION or disabled style
+            adj, quality, size_mult, style, allow = 0.0, "transition", c.size_mult_transition, "BLOCK", False
 
-        # ── the hard gate ─────────────────────────────────────────────────────
-        reasons = []
-        allow = True
-        if combined < c.regime_block_below_score:
-            allow = False; reasons.append(f"combined score {combined:.0f} < {c.regime_block_below_score:.0f}")
-        if not aligned:
-            allow = False; reasons.append(f"4H={r4.label} 1H={r1.label} not aligned")
-        if strong_conflict:
-            allow = False; reasons.append("4H/1H strong conflict")
-        if not extension_ok:
-            allow = False; reasons.append(f"overextended {ext:.1f}ATR past EMA20 (max {c.regime_extension_atr_max})")
-
-        reason = "regime OK" if allow else "; ".join(reasons)
+        # trend styles carry the extension anti-chase hard gate; mean-reversion
+        # WANTS extension (it fades stretched price) so it's exempt.
+        if style in ("TREND", "SWING") and not extension_ok:
+            allow = False
+            reason = f"{regime_type}: overextended {ext:.1f}ATR past EMA20 (max {c.regime_extension_atr_max})"
+        elif not allow:
+            reason = f"{regime_type}: no tradeable style"
+        else:
+            reason = f"{regime_type} -> {style}"
 
         return RegimeResult(
-            allow_trade=allow, direction=direction if allow else NEUTRAL,
+            allow_trade=allow, direction=direction if style in ("TREND", "SWING") else NEUTRAL,
             regime_4h=r4.label, regime_1h=r1.label, score_4h=r4.score, score_1h=r1.score,
             combined_score=combined, aligned=aligned, extension_atr=ext,
             price_extension_ok=extension_ok, adaptive_threshold_adj=adj,
             size_multiplier=size_mult, quality=quality, reason=reason,
-            name=r4.label, score=combined,
+            regime_type=regime_type, style=style, adx_1h=adx_1h, chop_1h=chop_1h, atr_pct_1h=atr_pct_1h,
+            name=regime_type, score=combined,
             components={"4h": r4.components, "1h": r1.components},
         )

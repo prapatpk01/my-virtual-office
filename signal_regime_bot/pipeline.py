@@ -55,18 +55,27 @@ class Pipeline:
         self.context_engine = ContextEngine(cfg)
         self.entry_engine = EntryEngine(cfg)
         self.booster = EarlyBooster(cfg)
+        from style_engines import MeanReversionEntry, BreakoutEntry
+        self.meanrev_engine = MeanReversionEntry(cfg)
+        self.breakout_engine = BreakoutEntry(cfg)
 
     def evaluate(self, df_30m: pd.DataFrame, df_1h: pd.DataFrame,
                  df_4h: pd.DataFrame, df_15m: Optional[pd.DataFrame] = None) -> PipelineResult:
         price = float(df_30m["close"].iloc[-1]) if len(df_30m) else 0.0
 
-        # ── Layer 1 — Regime (HARD GATE) ─────────────────────────────────────
+        # ── Layer 1 — Regime (HARD GATE + style routing) ─────────────────────
         regime = self.regime_engine.analyze(df_4h, df_1h)
         base = dict(price=price, size_multiplier=regime.size_multiplier, regime=regime)
         if not regime.allow_trade:
             return PipelineResult(NONE, entry_score=0.0, blocked_layer="REGIME",
                                   reason=regime.reason, **base)
 
+        # RANGE -> mean-reversion, COMPRESSION -> breakout: their own entry
+        # logic determines the side and bypasses the trend-momentum bias gate.
+        if regime.style in ("MEANREV", "BREAKOUT"):
+            return self._evaluate_style(regime, df_30m, base)
+
+        # trend styles (TREND / SWING) — regime already fixed the side
         side = LONG if regime.direction == R_LONG else SHORT
 
         # ── Layer 2 — Bias (SOFT confirmation of the regime side + hard veto) ─
@@ -128,6 +137,28 @@ class Pipeline:
                                   reason=f"early-boost: {booster.reason}", **common)
         return PipelineResult(NONE, entry_score=booster.final_score, blocked_layer="BOOSTER",
                               reason=booster.reason, **common)
+
+
+    def _evaluate_style(self, regime, df_30m, base) -> PipelineResult:
+        """MEANREV / BREAKOUT — the style engine picks the side, then Context
+        confirms. The trend-momentum Bias gate is intentionally skipped: a
+        mean-reversion trade is counter-trend, so momentum would always veto it."""
+        eng = self.meanrev_engine if regime.style == "MEANREV" else self.breakout_engine
+        entry = eng.analyze(df_30m)
+        common = dict(entry=entry, round_id=entry.round_id,
+                      round_age_bars=entry.setup_age, **base)
+        if entry.setup_direction not in (LONG, SHORT):
+            return PipelineResult(NONE, entry_score=entry.entry_score, blocked_layer="ENTRY",
+                                  reason=f"{regime.style}: {entry.reason}", **common)
+
+        side = entry.setup_direction
+        context = self.context_engine.analyze(df_30m, side, regime.quality)
+        common["context"] = context
+        if not context.context_pass:
+            return PipelineResult(NONE, entry_score=entry.entry_score, blocked_layer="CONTEXT",
+                                  reason=f"{regime.style}: {context.reason}", **common)
+        return PipelineResult(side, entry_score=entry.entry_score, blocked_layer=None,
+                              reason=f"{regime.style}: {entry.reason}", **common)
 
 
 # Backward-compat alias — main.py / backtest.py imported `SignalEngine`.

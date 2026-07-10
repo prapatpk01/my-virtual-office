@@ -118,7 +118,7 @@ class Config:
     regime_score_min_to_trade: float = 55.0
     regime_compression_breakout_lookback: int = 20
     regime_high_vol_size_cut: float = 0.30      # reduce position size 30% in HIGH_VOLATILITY
-    regime_transition_entry_relax: float = 5.0  # TRANSITION: entry threshold -5
+    regime_transition_entry_relax: float = 0.0  # TRANSITION must NEVER relax entry (user note #3)
     regime_transition_bias_tighten: float = 10.0  # TRANSITION: bias threshold +10
 
     # Bias engine (1h)
@@ -151,7 +151,7 @@ class Config:
     # Anti-chase: block entry if price is already this many ATRs away from
     # EMA15 — a spike/capitulation candle already happened and the "meat" of
     # the move is behind us, not ahead.
-    entry_max_ext_atr: float = 1.8
+    entry_max_ext_atr: float = 1.5
     # Market-structure confirmation (reduce false triggers): at least this many
     # of {break prev candle high/low, volume expansion, wick rejection,
     # liquidity sweep} must be present in the trade direction. 0 disables.
@@ -194,13 +194,13 @@ class Config:
     # 2026): the TP2 bucket is the strategy's only real profit source, so a
     # SMALLER TP1 take (bigger runner) improves expected value — 40% beat
     # both 50% (previous default) and 70%/60%@0.6R.
-    tp1_fraction: float = 0.4
+    tp1_fraction: float = 0.6
     # TP2 kept at 1.2R. MEASURED: moving it out to 2.5R with an ATR trailing
     # runner made XAU WORSE (net -6701 vs -6327, PF 0.22 vs the tighter
     # config) — only 4 of 62 trades trailed into profit; the 1.2R target was
     # capturing 13 reliable wins the wider target gave back as breakevens.
     # The winners don't run far enough in this data for a tail to exist.
-    tp2_r: float = 1.2
+    tp2_r: float = 1.5
     # Trailing runner code retained but DISABLED (config-gated). It's here to
     # re-test on other data/regimes, but it hurt on the measured set.
     trail_enabled: bool = False
@@ -245,6 +245,39 @@ class Config:
     size_mult_weak: float = 0.6
     size_mult_transition: float = 0.5
 
+    # ── 6-regime classification (user note #2) ──────────────────────────────
+    # Combined 4H+1H score bands -> regime type -> trade STYLE + entry adj.
+    regime_strong_trend_min: float = 80.0      # STRONG_TREND  (entry -5)
+    regime_healthy_trend_min: float = 65.0     # HEALTHY_TREND (entry 0)
+    regime_early_trend_min: float = 55.0       # EARLY_TREND   (needs context/entry confirm)
+    regime_range_adx_max: float = 18.0         # RANGE: ADX below this + high chop
+    regime_range_chop_min: float = 55.0
+    regime_compression_atrpct_max: float = 25.0  # COMPRESSION: low ATR percentile
+    regime_strong_trend_adj: float = -5.0
+    regime_early_trend_adj: float = 3.0        # EARLY_TREND slightly stricter entry
+
+    # ── Trade styles (user request: 3 styles routed by regime) ──────────────
+    # STRONG_TREND / HEALTHY_TREND -> TREND     (with-trend continuation)
+    # EARLY_TREND                  -> SWING      (early continuation, needs confirm)
+    # RANGE                        -> MEANREV    (fade extremes back to mean)
+    # COMPRESSION                  -> BREAKOUT   (wait for expansion breakout)
+    # TRANSITION                   -> blocked
+    style_range_enabled: bool = True           # allow mean-reversion in RANGE
+    style_compression_enabled: bool = True     # allow breakout in COMPRESSION
+    # Mean-reversion (RANGE): fade when price is stretched from the mean and RSI
+    # is at an extreme, expecting reversion. Direction is COUNTER to the stretch.
+    meanrev_rsi_long_max: float = 30.0         # RSI <= this -> oversold, fade up (LONG)
+    meanrev_rsi_short_min: float = 70.0        # RSI >= this -> overbought, fade down (SHORT)
+    meanrev_ext_atr_min: float = 1.2           # price must be at least this many ATR from EMA20
+    meanrev_bias_relax: float = 999.0          # MEANREV ignores the trend-momentum bias gate
+    meanrev_entry_threshold: float = 60.0      # its own entry-score bar (reversal trigger)
+    meanrev_size_mult: float = 0.6             # smaller size (counter-trend is riskier)
+    # Breakout (COMPRESSION): enter on a range break WITH volume expansion.
+    breakout_lookback: int = 20
+    breakout_vol_mult: float = 1.5
+    breakout_entry_threshold: float = 60.0
+    breakout_size_mult: float = 0.7
+
     # Layer 2 — Bias (SOFT confirmation + min gate, 1H + 15M)
     bias_weight_1h: float = 0.7
     bias_weight_15m: float = 0.3
@@ -258,19 +291,24 @@ class Config:
     bias_min_threshold: float = 40.0           # weighted trade-side momentum must clear this
     bias_strong_opposite: float = 70.0         # opposite side >= this -> hard veto (NEUTRAL)
 
-    # Layer 3 — Context (SOFT SCORE, 30M)
-    context_base_threshold: float = 60.0
-    context_thr_strong: float = 55.0           # regime strong -> easier context bar
-    context_thr_normal: float = 60.0
-    context_thr_weak: float = 70.0
-    context_thr_transition: float = 75.0
-    context_w_sweep: float = 15.0
-    context_w_bos: float = 20.0
-    context_w_vwap: float = 15.0
-    context_w_pullback: float = 15.0
-    context_w_volume: float = 15.0
-    context_w_retest: float = 10.0
-    context_w_session: float = 10.0
+    # Layer 3 — Context (SOFT SCORE, 30M) — reweighted per user note #1.
+    # CHOCH and Volume Expansion are FUSED into one component: CHOCH alone
+    # scores partial, CHOCH + volume expansion scores full. Total = 100.
+    context_base_threshold: float = 45.0
+    context_thr_strong: float = 40.0           # strong trend -> easiest context bar
+    context_thr_normal: float = 45.0
+    context_thr_weak: float = 50.0
+    context_thr_transition: float = 75.0       # transition is blocked anyway
+    context_w_choch_vol: float = 25.0          # CHOCH + volume expansion (fused)
+    context_w_choch_partial: float = 12.0      # CHOCH with weak/no volume -> partial
+    context_w_vwap: float = 10.0
+    context_w_pullback: float = 10.0           # EMA pullback / bounce
+    context_w_sweep: float = 15.0              # liquidity sweep
+    context_w_retest: float = 10.0             # retest quality
+    context_w_session: float = 10.0            # session quality (scaled 0..1)
+    context_w_vol_cont: float = 10.0           # volume continuation (expansion in trend dir)
+    context_w_breakout: float = 10.0           # breakout quality (break prev extreme)
+    context_vol_confirm_mult: float = 1.2      # volume > vol_ma20 x this -> "confirmed"
 
     # Layer 4 — Entry (30M setup + score + adaptive threshold)
     entry_base_threshold: float = 70.0

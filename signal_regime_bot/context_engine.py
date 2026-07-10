@@ -53,34 +53,34 @@ class ContextEngine:
             return ContextResult(0.0, False, {}, threshold, "insufficient 30m history")
 
         comp: dict = {}
+        vol_confirmed = pa.volume_expansion(df_30m, c.context_vol_confirm_mult)
 
-        sweep = pa.liquidity_sweep(df_30m, side, c.entry_sweep_lookback)
-        comp["liquidity_sweep"] = c.context_w_sweep if sweep else 0.0
-
+        # CHOCH + Volume Expansion (fused, 25) — CHOCH alone = partial, CHOCH
+        # with volume confirmation = full (user note #1).
         bos, choch = pa.bos_choch(df_30m, side, c.swing_lookback_left, c.swing_lookback_right)
-        comp["bos_choch"] = c.context_w_bos if (bos or choch) else 0.0
+        structure_break = bos or choch
+        if structure_break and vol_confirmed:
+            comp["choch_vol"] = c.context_w_choch_vol
+        elif structure_break:
+            comp["choch_vol"] = c.context_w_choch_partial
+        else:
+            comp["choch_vol"] = 0.0
 
-        vwap = pa.vwap_reclaim(df_30m, side)
-        comp["vwap"] = c.context_w_vwap if vwap else 0.0
-
-        pullback = pa.ema_pullback(df_30m, side, c.entry_ema_ref)
-        comp["ema_pullback"] = c.context_w_pullback if pullback else 0.0
-
-        vol = pa.volume_expansion(df_30m, c.entry_vol_expansion_mult)
-        comp["volume_expansion"] = c.context_w_volume if vol else 0.0
-
-        retest = pa.successful_retest(df_30m, side, c.entry_sweep_lookback)
-        comp["retest"] = c.context_w_retest if retest else 0.0
-
-        sess = pa.session_quality(df_30m)
-        comp["session"] = round(c.context_w_session * sess, 1)
+        comp["vwap"] = c.context_w_vwap if pa.vwap_reclaim(df_30m, side) else 0.0
+        comp["ema_pullback"] = c.context_w_pullback if pa.ema_pullback(df_30m, side, c.entry_ema_ref) else 0.0
+        comp["liquidity_sweep"] = c.context_w_sweep if pa.liquidity_sweep(df_30m, side, c.entry_sweep_lookback) else 0.0
+        comp["retest"] = c.context_w_retest if pa.successful_retest(df_30m, side, c.entry_sweep_lookback) else 0.0
+        comp["session"] = round(c.context_w_session * pa.session_quality(df_30m), 1)
+        # volume continuation — expansion in the trade direction (separate from
+        # the fused CHOCH+volume, which credits the structural break specifically)
+        o = float(df_30m["open"].iloc[-1]); cl = float(df_30m["close"].iloc[-1])
+        cont_dir = (cl >= o) if side == LONG else (cl <= o)
+        comp["vol_cont"] = c.context_w_vol_cont if (vol_confirmed and cont_dir) else 0.0
+        comp["breakout"] = c.context_w_breakout if pa.break_prev_extreme(df_30m, side) else 0.0
 
         score = round(sum(comp.values()), 1)
         passed = score >= threshold
-
         present = [k for k, v in comp.items() if v > 0]
         reason = (f"context {score:.0f} >= {threshold:.0f} [{', '.join(present)}]" if passed
-                  else f"context {score:.0f} < {threshold:.0f} — weak setup location "
-                       f"[have: {', '.join(present) or 'none'}]")
-
+                  else f"context {score:.0f} < {threshold:.0f} weak setup [{', '.join(present) or 'none'}]")
         return ContextResult(score, passed, comp, threshold, reason)
