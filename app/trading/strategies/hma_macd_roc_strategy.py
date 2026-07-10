@@ -166,6 +166,22 @@ class HMAMacdROCStrategy(BaseStrategy):
 
         return PositionUpdate(action="hold")
 
+    def record_closed_trade(self, exit_price: float, exit_reason: str, duration_min: float = 0.0) -> None:
+        """Called by bot.py after ANY close, including ones this strategy
+        didn't decide itself (e.g. the risk-manager's hard SL/TP fallback
+        firing before the HMA/MACD/ROC exit condition triggers). Without
+        this, _open_position would stay set forever and analyze() would
+        refuse all future entries."""
+        self._reset("Closed externally (risk-manager fallback)")
+
+    def cancel_pending_entry(self, reason: str = "") -> None:
+        """Called by bot.py when a signal this strategy just emitted failed
+        to actually open (rejected by risk/portfolio gates, insufficient
+        balance, or an order error) — undoes the optimistic _open_position
+        set made in analyze() so the strategy isn't stuck believing a
+        position exists that was never really opened."""
+        self._reset(reason or "Entry cancelled — order didn't execute")
+
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _reset(self, reason: str) -> None:

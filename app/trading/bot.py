@@ -153,6 +153,21 @@ class TradingBot:
             inst = self._strategy_map.get(strategy_name[:-2])
         return inst
 
+    def _cancel_pending_entry(self, strategy_name: str, reason: str = "") -> None:
+        """Call after a signal is rejected/fails between analyze() and a
+        confirmed order. Several strategies (ema_sma, ema_macd, hma_macd_roc)
+        optimistically flip an internal 'position open' flag as soon as
+        analyze() emits an entry signal — if bot.py never actually opens
+        the position (risk/portfolio gate, low balance, order error), that
+        flag would otherwise stay stuck forever and silently block every
+        future entry on the symbol."""
+        strategy_inst = self._resolve_strategy_inst(strategy_name)
+        if hasattr(strategy_inst, "cancel_pending_entry"):
+            try:
+                strategy_inst.cancel_pending_entry(reason)
+            except Exception as e:
+                logger.warning("cancel_pending_entry failed [%s]: %s", strategy_name, e)
+
     # ------------------------------------------------------------------
     # Public control
     # ------------------------------------------------------------------
@@ -709,6 +724,7 @@ class TradingBot:
                 can, reason = self.risk.can_open(sym, strategy=short_key)
                 if not can:
                     logger.debug("Crypto %s short suppressed — %s", sym, reason)
+                    self._cancel_pending_entry(short_key, reason=reason)
                     return
                 self._sig.lock_strategy(sym, short_key, signal.type.value)
                 self._sig.record_signal(sym, signal.type.value, signal.price,
@@ -760,6 +776,7 @@ class TradingBot:
         can, reason = self.risk.can_open(sym, strategy=long_key)
         if not can:
             logger.debug("Crypto %s suppressed — %s", sym, reason)
+            self._cancel_pending_entry(long_key, reason=reason)
             return
         self._sig.lock_strategy(sym, long_key, signal.type.value)
         self._sig.record_signal(sym, signal.type.value, signal.price,
@@ -779,6 +796,7 @@ class TradingBot:
         if not can:
             logger.info("Skipping %s for %s: %s", direction.upper(), sym, reason)
             self._sig.unlock_strategy(sym, strategy_name)
+            self._cancel_pending_entry(strategy_name, reason=reason)
             return
 
         # Futures setup (leverage + hedge mode) — once per symbol per session
@@ -810,6 +828,7 @@ class TradingBot:
                 strategy_name, quote_balance, min_balance, direction.upper(), sym,
             )
             self._sig.unlock_strategy(sym, strategy_name)
+            self._cancel_pending_entry(strategy_name, reason="balance too low")
             return
 
         # Flip SL/TP for short positions
@@ -909,6 +928,7 @@ class TradingBot:
                 self._sig.add_pending(vkey, sym, signal.type.value, signal.price,
                                       sl_p, tp_p, strategy=strategy_name)
             self._sig.unlock_strategy(sym, strategy_name)
+            self._cancel_pending_entry(strategy_name, reason="position size rounded to 0")
             return
 
         # ── Portfolio engine pre-trade check ────────────────────────────────
@@ -928,6 +948,7 @@ class TradingBot:
                 port_check.portfolio_heat * 100,
             )
             self._sig.unlock_strategy(sym, strategy_name)
+            self._cancel_pending_entry(strategy_name, reason=port_check.reason)
             return
 
         try:
@@ -961,7 +982,21 @@ class TradingBot:
                 strategy_name, direction.upper(), sym, price,
                 sl_p or 0, tp_p or 0, self.connector.paper,
             )
-            if self.telegram:
+        except Exception as e:
+            # Order genuinely never went through — no real position exists,
+            # so it's safe (and necessary) to unlock and let the strategy
+            # know its optimistic entry latch didn't pan out.
+            logger.error("Order failed for %s %s: %s", direction, sym, e)
+            self._sig.unlock_strategy(sym, strategy_name)
+            self._cancel_pending_entry(strategy_name, reason=f"order failed: {e}")
+            return
+
+        # ── Telegram notify — deliberately OUTSIDE the order try/except: a
+        # notify failure here must never be mistaken for an order failure.
+        # The position is already open at this point regardless of whether
+        # the notification succeeds. ──────────────────────────────────────
+        if self.telegram:
+            try:
                 meta = signal.metadata or {}
                 macro_info = meta.get("macro_trend", {})
                 chart_path = None
@@ -987,9 +1022,8 @@ class TradingBot:
                     direction=direction,
                     chart_path=chart_path,
                 )
-        except Exception as e:
-            logger.error("Order failed for %s %s: %s", direction, sym, e)
-            self._sig.unlock_strategy(sym, strategy_name)
+            except Exception as e:
+                logger.warning("Telegram notify_order failed for %s %s (position is still open): %s", sym, direction, e)
 
     # ------------------------------------------------------------------
     # Balance, state, and stats helpers
