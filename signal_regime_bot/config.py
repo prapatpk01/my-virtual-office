@@ -190,11 +190,14 @@ class Config:
     sl_min_pct: float = 0.004   # 0.4%
     sl_max_pct: float = 0.035  # 3.5%
     # Pulls the final SL distance in to this fraction of the ATR/swing/floor
-    # calc — the tightened distance becomes the "1R" unit TP1/TP2 are measured
-    # against. 0.85 = stop 15% closer to entry (testing whether a tighter R
-    # unit, paired with SpikeGuard's fast reversal protection, improves the
-    # TP1-then-breakeven fee-drag problem measured on the local BTC/XAU set).
-    sl_tighten_mult: float = 0.85
+    # calc. MEASURED on the local BTC/XAU set (Jan-May 2026): 0.85 made every
+    # metric WORSE (PF 0.647->0.520, WR 64.4%->61.9%, net -17828->-19324,
+    # trades/month 106->117) — a tighter stop gets hit by ordinary noise more
+    # often (SL-count rose 189->223) since R-based position sizing keeps
+    # dollar-risk-per-trade constant regardless of stop width, so tightening
+    # only adds re-entry churn and fee drag without reducing risk. Reverted
+    # to 1.0 (no tightening).
+    sl_tighten_mult: float = 1.0
     tp1_r: float = 0.5
     # Fraction of the position closed at TP1 (remainder rides to TP2/SL-at-BE).
     # Swept against the live 6-symbol backtest (BTC/ETH/SOL/XAU/XAG, Jan-Jun
@@ -202,10 +205,9 @@ class Config:
     # SMALLER TP1 take (bigger runner) improves expected value — 40% beat
     # both 50% (previous default) and 70%/60%@0.6R.
     tp1_fraction: float = 0.6
-    # Reward target of 1.0R (against the tightened sl_tighten_mult R unit
-    # above) — testing whether a tighter SL + 1.0R reward fixes the
-    # TP1-then-breakeven fee-drag problem vs. the previous 1.5R.
-    tp2_r: float = 1.0
+    # MEASURED WORSE at 1.0R paired with sl_tighten_mult=0.85 (see above) —
+    # reverted to 1.5R, the local-backtest baseline (PF 0.647, WR 64.4%).
+    tp2_r: float = 1.5
     # Trailing runner code retained but DISABLED (config-gated). It's here to
     # re-test on other data/regimes, but it hurt on the measured set.
     trail_enabled: bool = False
