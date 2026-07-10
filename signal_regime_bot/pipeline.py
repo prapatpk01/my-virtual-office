@@ -152,13 +152,16 @@ class Pipeline:
                                   reason=f"{regime.style}: {entry.reason}", **common)
 
         side = entry.setup_direction
+        # Context is ADVISORY for style trades — the trend-continuation context
+        # (BOS/CHOCH in the trade direction) never aligns at a mean-reversion
+        # extreme, so hard-gating on it blocks every fade. The style engine's
+        # own multi-component score (RSI extreme + rejection + sweep for
+        # MEANREV; break + volume for BREAKOUT) is the quality gate here.
         context = self.context_engine.analyze(df_30m, side, regime.quality)
         common["context"] = context
-        if not context.context_pass:
-            return PipelineResult(NONE, entry_score=entry.entry_score, blocked_layer="CONTEXT",
-                                  reason=f"{regime.style}: {context.reason}", **common)
         return PipelineResult(side, entry_score=entry.entry_score, blocked_layer=None,
-                              reason=f"{regime.style}: {entry.reason}", **common)
+                              reason=f"{regime.style}: {entry.reason} (ctx {context.context_score:.0f})",
+                              **common)
 
 
 # Backward-compat alias — main.py / backtest.py imported `SignalEngine`.

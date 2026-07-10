@@ -267,7 +267,8 @@ class PositionManager:
         pos = Position(
             symbol=symbol, side=side, entry_price=price, amount=order.amount,
             full_amount=order.amount, stop_loss=sl, tp1=tp1, tp2=tp2,
-            one_r=abs(price - sl), regime_at_entry=regime.name, bias_at_entry=bias.bias,
+            one_r=abs(price - sl), regime_at_entry=regime.name,
+            bias_at_entry=(bias.bias if bias is not None else regime.style),
             entry_score=entry_score,
         )
         self._positions[symbol] = pos

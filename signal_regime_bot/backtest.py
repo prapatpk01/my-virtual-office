@@ -320,7 +320,8 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
         pos = BTTrade(
             symbol=symbol, direction=sig.direction, entry_time=df_30m.index[i + 1],
             entry_price=entry_px, sl=sl, tp1=tp1, tp2=tp2, amount=amount,
-            risk_amount=risk_amount, regime_at_entry=sig.regime.name, bias_at_entry=sig.bias.bias,
+            risk_amount=risk_amount, regime_at_entry=sig.regime.name,
+            bias_at_entry=(sig.bias.bias if sig.bias is not None else sig.regime.style),
             entry_score=sig.entry_score, balance_before=balance,
         )
         pos.pnl_usd = -entry_fee

@@ -102,6 +102,12 @@ class TelegramNotifier:
     async def entry_signal(self, symbol: str, direction: str, price: float, sl: float,
                            tp1: float, tp2: float, regime, bias, entry_score: float,
                            risk_pct: float, leverage: int, chart_path: str | None = None):
+        # bias is None for MEANREV / BREAKOUT style trades (they bypass the
+        # momentum-bias gate) — show the trade style instead.
+        if bias is not None:
+            bias_line = f"Bias: `{bias.bias}` ({bias.bull_score if direction=='LONG' else bias.bear_score:.0f})"
+        else:
+            bias_line = f"Style: `{getattr(regime, 'style', '—')}` ({getattr(regime, 'regime_type', '—')})"
         text = (
             f"🎯 *Entry Signal*\n\n"
             f"Symbol: `{symbol}`\n"
@@ -111,7 +117,7 @@ class TelegramNotifier:
             f"TP1: `{tp1:.6f}`\n"
             f"TP2: `{tp2:.6f}`\n"
             f"Regime: `{regime.name}` ({regime.score:.0f})\n"
-            f"Bias: `{bias.bias}` ({bias.bull_score if direction=='LONG' else bias.bear_score:.0f})\n"
+            f"{bias_line}\n"
             f"Entry Score: `{entry_score:.0f}`\n"
             f"Risk: `{risk_pct*100:.1f}%`\n"
             f"Leverage: `{leverage}x`"
