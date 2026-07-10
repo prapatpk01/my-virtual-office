@@ -127,6 +127,11 @@ class TradingBot:
         self._tick_count = 0
         self._last_drift_alert_tick = 0
 
+        # Warm-up: skip opening new positions for the first N ticks after
+        # (re)start, so a restart doesn't fire an entry off the very first
+        # scan before the strategy has re-observed live market conditions.
+        self._warmup_ticks_remaining = int(os.getenv("WARMUP_TICKS", "1"))
+
         # Futures hedge mode — read from connector if available, else env
         self._hedge_mode: bool = (
             getattr(connector, "_hedge_mode", False)
@@ -340,7 +345,15 @@ class TradingBot:
                 new_signals.append(sig_dict)
 
                 if signal.type != SignalType.HOLD:
-                    await self._maybe_notify(signal, sig_dict, strategy.name, candles)
+                    if self._warmup_ticks_remaining > 0:
+                        logger.info(
+                            "[WARMUP] %s %s signal on %s suppressed — %d scan(s) left "
+                            "before entries are allowed post-restart",
+                            strategy.name, signal.type.value.upper(), strategy.symbol,
+                            self._warmup_ticks_remaining,
+                        )
+                    else:
+                        await self._maybe_notify(signal, sig_dict, strategy.name, candles)
 
             except Exception as e:
                 logger.error("Strategy %s error: %s", strategy.name, e)
@@ -351,6 +364,11 @@ class TradingBot:
                     "reason":   str(e)[:80],
                     "ts":       int(time.time() * 1000),
                 })
+
+        if self._warmup_ticks_remaining > 0:
+            self._warmup_ticks_remaining -= 1
+            if self._warmup_ticks_remaining == 0:
+                logger.info("[WARMUP] Complete — entries allowed from the next scan onward")
 
         self.state.signals         = (new_signals + self.state.signals)[:20]
         self.state.open_positions  = self.risk.get_positions()
