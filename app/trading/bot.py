@@ -769,7 +769,7 @@ class TradingBot:
         # amount is sized so that a full SL hit loses exactly RISK_PER_TRADE_PCT
         # of balance — not a fixed % of balance as notional (that conflates
         # position size with risk, which vary a lot with how far SL sits).
-        risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "0.06"))
+        risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "0.05"))
         risk_per_unit = abs(price - sl_p) if sl_p else 0
 
         if risk_per_unit > 0:
@@ -782,14 +782,36 @@ class TradingBot:
             amount = self.risk.size_position(quote_balance, price, size_pct=size_pct)
             sizing_label = f"confidence-based {size_pct*100:.1f}% (no SL available)"
 
-        # ── Margin check: clamp size to what the free balance can actually
-        # cover, instead of attempting an order that the exchange will reject.
         leverage      = max(getattr(self.connector, "_leverage", 1), 1)
         is_futures    = getattr(self.connector, "_futures", False)
-        notional      = amount * price
-        required_margin = (notional / leverage) if is_futures else notional
-        safety_buffer = 0.95  # leave headroom for fees/slippage
 
+        # ── Margin concentration cap — independent of the risk target ─────────
+        # A very tight SL (e.g. low-volatility regime) blows up amount = risk$/SL-distance
+        # to a huge notional. Risk stays correct at RISK_PER_TRADE_PCT, but margin
+        # tied up in one trade can balloon past a sane share of the account —
+        # cap it so one trade can never lock up more than MAX_MARGIN_PCT_PER_TRADE.
+        max_margin_pct = float(os.getenv("MAX_MARGIN_PCT_PER_TRADE", "0.20"))
+        notional        = amount * price
+        required_margin = (notional / leverage) if is_futures else notional
+        max_margin      = quote_balance * max_margin_pct
+
+        if required_margin > max_margin:
+            max_notional_by_risk_cap = max_margin * (leverage if is_futures else 1)
+            capped_amount = round(max_notional_by_risk_cap / price, 6) if price > 0 else 0
+            logger.warning(
+                "[%s] SL too tight (%.2f%% away) — risk-sized margin $%.2f would exceed the "
+                "%.0f%% per-trade cap ($%.2f). Capping size %.6f → %.6f (actual risk drops below %.1f%%)",
+                strategy_name, risk_per_unit / price * 100, required_margin,
+                max_margin_pct * 100, max_margin, amount, capped_amount, risk_pct * 100,
+            )
+            amount = capped_amount
+            notional = amount * price
+            required_margin = (notional / leverage) if is_futures else notional
+
+        # ── Margin availability check: clamp size to what the free balance can
+        # actually cover, instead of attempting an order that the exchange
+        # would reject.
+        safety_buffer = 0.95  # leave headroom for fees/slippage
         if required_margin > quote_balance * safety_buffer:
             max_notional = quote_balance * safety_buffer * (leverage if is_futures else 1)
             clamped_amount = round(max_notional / price, 6) if price > 0 else 0
