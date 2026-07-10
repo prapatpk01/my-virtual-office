@@ -348,10 +348,30 @@ class Config:
     rg_highvol_vol_mult: float = 2.0        # volume >= this x vol_ma20 -> volume-expansion signal
     rg_highvol_range_mult: float = 2.0      # bar range >= this x range_ma20 -> candle-expansion signal
 
-    # Layer 2 — Bias: strict all-timeframe AND gate (1H + 15M + 5M).
-    bias_long_threshold: float = 70.0       # every TF score must be > this for LONG ONLY
-    bias_short_threshold: float = 30.0      # every TF score must be < this for SHORT ONLY
+    # Layer 2 — Bias: Dynamic Combined Bias Score (1H + 15M + 5M), weights and
+    # pass threshold depend on the Regime tier (Confirmed/Strong trend wants
+    # more 1H weight for continuity; Early trend wants more 15M/5M weight to
+    # react faster). Every TF must ALSO individually clear a floor and not be
+    # flagged the opposite direction — the weighted average alone can't pass.
     bias_rel_vol_min: float = 1.0           # current bar volume / vol_ma20 >= this -> "relative volume" point
+    bias_direction_bull_min: float = 55.0   # per-TF score >= this -> that TF's Direction = BULL
+    bias_direction_bear_max: float = 45.0   # per-TF score <= this -> that TF's Direction = BEAR
+    bias_tf_floor_1h: float = 55.0          # 1H Bull Bias must clear this for LONG (mirror: 100-x for SHORT)
+    bias_tf_floor_15m: float = 55.0         # 15M Bull Bias floor
+    bias_tf_floor_5m: float = 40.0          # 5M Bull Bias floor (loosest — lowest weight, noisiest TF)
+    # weight profile + combined-score pass bar, by Regime tier
+    bias_w1h_confirmed: float = 0.50        # STRONG_BULL/BEAR_TREND ("Confirmed Trend") — 1H-heavy for continuity
+    bias_w15m_confirmed: float = 0.35
+    bias_w5m_confirmed: float = 0.15
+    bias_threshold_confirmed: float = 65.0
+    bias_w1h_early: float = 0.35            # EARLY_BULL/BEAR_TREND ("Early Trend") — faster-reacting TFs weighted up
+    bias_w15m_early: float = 0.45
+    bias_w5m_early: float = 0.20
+    bias_threshold_early: float = 60.0
+    bias_w1h_default: float = 0.45          # fallback weight profile (regime not a recognized trend tier)
+    bias_w15m_default: float = 0.40
+    bias_w5m_default: float = 0.15
+    bias_threshold_default: float = 60.0
 
     # Layer 3 — Entry: 5-category trigger, >= entry_min_categories with
     # Momentum + Structure mandatory regardless of the total count.

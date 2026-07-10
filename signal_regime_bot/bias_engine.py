@@ -1,5 +1,6 @@
 """
-Layer 2 — MTF Bias Engine (DIRECTION, strict).  1H + 15M + 5M.
+Layer 2 — MTF Bias Engine (DIRECTION, Dynamic Combined Bias Score).
+1H + 15M + 5M.
 
 Answers: "Now that we know the Regime, which side — if any — is actually
 allowed to trade?" This layer picks the Trading Direction and nothing else:
@@ -11,14 +12,22 @@ components (EMA Position, EMA Alignment, MACD Direction, ROC Direction, RSI
 Zone, VWAP Position, Volume, Relative Volume, Market Structure) — 100 =
 every component bullish, 0 = every component bearish, ~50 = mixed.
 
-Trading Direction (STRICT AND — every timeframe must individually clear the
-bar; this is deliberately NOT a weighted blend):
-    LONG ONLY   <- regime in {STRONG_BULL_TREND, EARLY_BULL_TREND}
-                   AND 1H > 70 AND 15M > 70 AND 5M > 70
-    SHORT ONLY  <- regime in {STRONG_BEAR_TREND, EARLY_BEAR_TREND}
-                   AND 1H < 30 AND 15M < 30 AND 5M < 30
-    NO TRADE    <- anything else (regime/bias mismatch, TF conflict, Range,
-                   Compression, High Volatility, below threshold)
+Combined Bias = 1H*w1h + 15M*w15m + 5M*w5m — weights and the pass bar are
+DYNAMIC, keyed off the Regime tier:
+    Confirmed Trend (STRONG_BULL/BEAR_TREND): 1H=50% 15M=35% 5M=15%, pass 65
+      -> 1H-heavy: an established trend wants continuity, not noise.
+    Early Trend (EARLY_BULL/BEAR_TREND):      1H=35% 15M=45% 5M=20%, pass 60
+      -> faster TFs weighted up so an early trend gets caught sooner.
+
+The weighted average alone can't pass — every TF must ALSO individually
+clear a floor and not be flagged the opposite direction:
+    LONG_BIAS_PASS  = bull regime AND Combined Bull Bias >= threshold
+                       AND 1H >= 55 AND 15M >= 55 AND 5M >= 40
+                       AND 1H Direction != BEAR AND 15M Direction != BEAR
+    SHORT_BIAS_PASS = mirror (bear regime, Combined <= 100-threshold,
+                       1H <= 45, 15M <= 45, 5M <= 60, no BULL-flagged TF)
+    NO TRADE        <- anything else (regime/bias mismatch, TF conflict,
+                       Range, Compression, High Volatility, below threshold)
 """
 from __future__ import annotations
 
@@ -29,7 +38,8 @@ import pandas as pd
 
 import indicators as ind
 from config import Config
-from regime_engine import BULL_LABELS, BEAR_LABELS
+from regime_engine import (BULL_LABELS, BEAR_LABELS, STRONG_BULL, STRONG_BEAR,
+                           EARLY_BULL, EARLY_BEAR)
 
 BIAS_BULL    = "BULL"
 BIAS_BEAR    = "BEAR"
@@ -114,6 +124,23 @@ class BiasEngine:
 
         return TFBiasScore(round(sum(comp.values()), 1), comp)
 
+    def _tf_direction(self, score: float) -> str:
+        c = self.cfg
+        if score >= c.bias_direction_bull_min:
+            return BIAS_BULL
+        if score <= c.bias_direction_bear_max:
+            return BIAS_BEAR
+        return BIAS_NEUTRAL
+
+    def _weight_profile(self, regime_label: str) -> tuple[float, float, float, float]:
+        """(w1h, w15m, w5m, long_pass_threshold) for the regime's trend tier."""
+        c = self.cfg
+        if regime_label in (STRONG_BULL, STRONG_BEAR):
+            return c.bias_w1h_confirmed, c.bias_w15m_confirmed, c.bias_w5m_confirmed, c.bias_threshold_confirmed
+        if regime_label in (EARLY_BULL, EARLY_BEAR):
+            return c.bias_w1h_early, c.bias_w15m_early, c.bias_w5m_early, c.bias_threshold_early
+        return c.bias_w1h_default, c.bias_w15m_default, c.bias_w5m_default, c.bias_threshold_default
+
     def analyze(self, df_1h: pd.DataFrame, df_15m: pd.DataFrame | None = None,
                df_5m: pd.DataFrame | None = None, regime_label: str = "") -> BiasResult:
         c = self.cfg
@@ -121,41 +148,49 @@ class BiasEngine:
         # 15M/5M optional in callers with only 1H available (legacy health-check
         # call sites) — fall back to the 1H score so those degrade safely to
         # "same as 1H" rather than crashing, but LIVE/backtest entries always
-        # pass real 15M/5M frames since the strict gate needs them for real.
+        # pass real 15M/5M frames since the combined score needs them for real.
         s15 = self._tf_score(df_15m) if df_15m is not None and len(df_15m) else s1h
         s5 = self._tf_score(df_5m) if df_5m is not None and len(df_5m) else s15
 
         bull_regime = regime_label in BULL_LABELS
         bear_regime = regime_label in BEAR_LABELS
-        thr_hi, thr_lo = c.bias_long_threshold, c.bias_short_threshold
+        w1h, w15m, w5m, long_thr = self._weight_profile(regime_label)
+        short_thr = 100.0 - long_thr
+        combined = s1h.score * w1h + s15.score * w15m + s5.score * w5m
 
-        long_ok = bull_regime and s1h.score > thr_hi and s15.score > thr_hi and s5.score > thr_hi
-        short_ok = bear_regime and s1h.score < thr_lo and s15.score < thr_lo and s5.score < thr_lo
+        dir_1h, dir_15m = self._tf_direction(s1h.score), self._tf_direction(s15.score)
 
+        long_ok = (bull_regime and combined >= long_thr
+                  and s1h.score >= c.bias_tf_floor_1h and s15.score >= c.bias_tf_floor_15m
+                  and s5.score >= c.bias_tf_floor_5m
+                  and dir_1h != BIAS_BEAR and dir_15m != BIAS_BEAR)
+        short_ok = (bear_regime and combined <= short_thr
+                   and s1h.score <= 100.0 - c.bias_tf_floor_1h and s15.score <= 100.0 - c.bias_tf_floor_15m
+                   and s5.score <= 100.0 - c.bias_tf_floor_5m
+                   and dir_1h != BIAS_BULL and dir_15m != BIAS_BULL)
+
+        tag = f"regime={regime_label} combined={combined:.1f} (w1h={w1h:.2f} w15m={w15m:.2f} w5m={w5m:.2f}) 1H={s1h.score:.0f} 15M={s15.score:.0f} 5M={s5.score:.0f}"
         if long_ok:
             direction = LONG
-            reason = f"LONG ONLY: regime={regime_label} 1H={s1h.score:.0f} 15M={s15.score:.0f} 5M={s5.score:.0f} (all > {thr_hi:.0f})"
+            reason = f"LONG ONLY: {tag} combined>={long_thr:.0f} + all TF floors clear"
         elif short_ok:
             direction = SHORT
-            reason = f"SHORT ONLY: regime={regime_label} 1H={s1h.score:.0f} 15M={s15.score:.0f} 5M={s5.score:.0f} (all < {thr_lo:.0f})"
+            reason = f"SHORT ONLY: {tag} combined<={short_thr:.0f} + all TF floors clear"
         else:
             direction = NEUTRAL
             if not (bull_regime or bear_regime):
                 reason = f"NO TRADE: regime={regime_label} is not a bull/bear trend"
             elif bull_regime:
-                reason = (f"NO TRADE: bull regime but TF bias not all > {thr_hi:.0f} "
-                          f"(1H={s1h.score:.0f} 15M={s15.score:.0f} 5M={s5.score:.0f})")
+                reason = f"NO TRADE: bull regime but LONG_BIAS_PASS failed — {tag} (need >={long_thr:.0f})"
             else:
-                reason = (f"NO TRADE: bear regime but TF bias not all < {thr_lo:.0f} "
-                          f"(1H={s1h.score:.0f} 15M={s15.score:.0f} 5M={s5.score:.0f})")
+                reason = f"NO TRADE: bear regime but SHORT_BIAS_PASS failed — {tag} (need <={short_thr:.0f})"
 
         bias_str = BIAS_BULL if direction == LONG else BIAS_BEAR if direction == SHORT else BIAS_NEUTRAL
-        avg_score = (s1h.score + s15.score + s5.score) / 3.0
 
         return BiasResult(
             direction=direction, score_1h=s1h.score, score_15m=s15.score, score_5m=s5.score,
             reason=reason, components={"1h": s1h.components, "15m": s15.components, "5m": s5.components},
-            bias=bias_str, bull_score=round(avg_score, 1), bear_score=round(100.0 - avg_score, 1),
-            confidence=round(abs(avg_score - 50.0) * 2.0, 1), weighted_score=round(avg_score, 1),
+            bias=bias_str, bull_score=round(combined, 1), bear_score=round(100.0 - combined, 1),
+            confidence=round(abs(combined - 50.0) * 2.0, 1), weighted_score=round(combined, 1),
             aligned=long_ok or short_ok, allow_entry=long_ok or short_ok,
         )
