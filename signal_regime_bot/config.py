@@ -206,8 +206,9 @@ class Config:
     # both 50% (previous default) and 70%/60%@0.6R.
     tp1_fraction: float = 0.6
     # MEASURED WORSE at 1.0R paired with sl_tighten_mult=0.85 (see above) —
-    # reverted to 1.5R, the local-backtest baseline (PF 0.647, WR 64.4%).
-    tp2_r: float = 1.5
+    # reverted, sl_tighten_mult back to 1.0 (untightened). tp2_r set to 1.2R
+    # per user request.
+    tp2_r: float = 1.2
     # Trailing runner code retained but DISABLED (config-gated). It's here to
     # re-test on other data/regimes, but it hurt on the measured set.
     trail_enabled: bool = False

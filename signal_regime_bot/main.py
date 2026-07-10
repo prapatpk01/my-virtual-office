@@ -265,6 +265,11 @@ class Bot:
             logger.info("[%s] regime=%s dir=%s(bias)  ENTRY NOT READY  %d/5 categories — %s",
                        symbol, r.label, sig.bias.direction if sig.bias else "-",
                        e.passed_count, e.reason)
+        elif layer == "CONTEXT" and sig.context is not None:
+            cx = sig.context
+            logger.info("[%s] regime=%s dir=%s(bias)  CONTEXT FAIL  score=%.0f threshold=%.0f — %s",
+                       symbol, r.label, sig.bias.direction if sig.bias else "-",
+                       cx.context_score, cx.threshold, cx.reason)
         else:
             logger.debug("[%s] no trade: %s", symbol, sig.reason)
 
