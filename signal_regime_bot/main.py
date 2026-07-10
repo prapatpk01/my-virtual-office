@@ -56,11 +56,6 @@ class Bot:
         self._last_entry_bar: dict[str, pd.Timestamp] = {}
         self._last_signal_by_symbol: dict[str, object] = {}
         self._symbol_cooldown_until: dict[str, float] = {}
-        # Signal Round Gate: round_id (trigger-bar timestamp) already traded,
-        # per symbol — one round is allowed at most ONE entry, so a stop-out
-        # can't be re-chased on the same setup; a NEW trigger event (new
-        # round_id) is required before the symbol can enter again.
-        self._consumed_round: dict[str, object] = {}
         self._daily_alert_sent = False
         self._cooldown_alert_sent = False
         self._last_status_log_ts = 0.0
@@ -141,19 +136,20 @@ class Bot:
         df_1h = frames[self.cfg.tf_bias]
         df_4h = frames[self.cfg.tf_regime]
         df_15m = frames[self.cfg.tf_fast]
+        df_5m = frames[self.cfg.tf_micro]
 
         # Full pipeline computed once per symbol per tick and cached — reused by
         # the entry check below AND by the 5-minute status log, so the health
         # branch and the entry branch never re-run the layers separately.
-        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h, df_15m)
+        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h, df_15m, df_5m)
         self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):
-            await self._manage_open_position(symbol, df_30m, df_1h, df_4h)
+            await self._manage_open_position(symbol, df_30m, df_1h, df_4h, df_15m, df_5m)
         else:
             await self._look_for_entry(symbol, df_30m, sig)
 
-    async def _manage_open_position(self, symbol: str, df_30m, df_1h, df_4h):
+    async def _manage_open_position(self, symbol: str, df_30m, df_1h, df_4h, df_15m, df_5m):
         pos = self.positions.get(symbol)
         try:
             ticker = await self.client.fetch_ticker(symbol)
@@ -178,8 +174,8 @@ class Bot:
         # Health monitor — once per newly-closed 30m bar only (the slow layer).
         bar_ts = df_30m.index[-1] if len(df_30m) else None
         if bar_ts is not None and pos.last_health_bar_ts != bar_ts:
-            regime = self.signal_engine.regime_engine.analyze(df_4h)
-            bias = self.signal_engine.bias_engine.analyze(df_1h)
+            regime = self.signal_engine.regime_engine.analyze(df_4h, df_1h)
+            bias = self.signal_engine.bias_engine.analyze(df_1h, df_15m, df_5m, regime.label)
             hevent = await self.positions.process_closed_bar_health(symbol, df_30m, regime, bias)
             if hevent:
                 await self._handle_event(hevent)
@@ -229,19 +225,6 @@ class Bot:
             self._log_pipeline_block(symbol, sig)
             return
 
-        # Signal Round Gate: one round = one entry, ever. If this round's
-        # trigger bar was already traded (entered and later stopped/closed),
-        # do NOT re-enter on the same round — wait for a new trigger event.
-        if sig.round_id is not None and self._consumed_round.get(symbol) == sig.round_id:
-            logger.info("[%s] signal round %s already traded — waiting for a new round",
-                       symbol, sig.round_id)
-            return
-
-        if sig.used_booster and sig.booster is not None:
-            logger.info("[%s] EARLY BOOST PASS  30M=%.0f  early=%.0f  bonus=+%.0f  final=%.0f  -> OPEN %s",
-                       symbol, sig.entry.entry_score, sig.booster.early_score,
-                       sig.booster.early_bonus, sig.booster.final_score, sig.direction)
-
         risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
         chart_path = build_entry_chart(
             symbol, df_30m, sig.direction, sig.price,
@@ -253,10 +236,6 @@ class Bot:
         if pos is None:
             return
 
-        # Mark this signal round as traded — no re-entry on the same round.
-        if sig.round_id is not None:
-            self._consumed_round[symbol] = sig.round_id
-
         await self.telegram.entry_signal(
             symbol, sig.direction, pos.entry_price, pos.stop_loss, pos.tp1, pos.tp2,
             sig.regime, sig.bias, sig.entry_score, risk_pct, self.cfg.leverage, chart_path)
@@ -267,26 +246,16 @@ class Bot:
         """Explain WHICH layer stopped the trade — never a generic 'no signal'."""
         r = sig.regime
         layer = sig.blocked_layer
-        if layer == "REGIME":
-            logger.info("[%s] REGIME BLOCK  4H=%s(%.0f) 1H=%s(%.0f) aligned=%s ext=%.1fATR — %s",
-                       symbol, r.regime_4h, r.score_4h, r.regime_1h, r.score_1h,
-                       r.aligned, r.extension_atr, r.reason)
-        elif layer == "BIAS" and sig.bias is not None:
+        if layer == "BIAS" and sig.bias is not None:
             b = sig.bias
-            logger.info("[%s] BIAS FAIL  1H=%.0f 15M=%.0f weighted=%.1f dir=%s — %s",
-                       symbol, b.score_1h, b.score_15m, b.weighted_score, b.direction, b.reason)
-        elif layer == "CONTEXT" and sig.context is not None:
-            cx = sig.context
-            logger.info("[%s] CONTEXT FAIL  score=%.0f threshold=%.0f — %s",
-                       symbol, cx.context_score, cx.threshold, cx.reason)
+            logger.info("[%s] regime=%s(4H=%s,1H=%s)  BIAS NO-TRADE  1H=%.0f 15M=%.0f 5M=%.0f — %s",
+                       symbol, r.label, r.label_4h, r.label_1h,
+                       b.score_1h, b.score_15m, b.score_5m, b.reason)
         elif layer == "ENTRY" and sig.entry is not None:
             e = sig.entry
-            tag = "NEAR MISS" if e.near_miss else "ENTRY FAIL"
-            logger.info("[%s] %s  30M=%.0f threshold=%.0f setup_age=%s — %s",
-                       symbol, tag, e.entry_score, e.entry_threshold, e.setup_age, e.reason)
-        elif layer == "BOOSTER" and sig.booster is not None:
-            logger.info("[%s] EARLY %s  — %s", symbol,
-                       "CANCEL" if sig.booster.cancel_setup else "FAIL", sig.booster.reason)
+            logger.info("[%s] regime=%s dir=%s(bias)  ENTRY NOT READY  %d/5 categories — %s",
+                       symbol, r.label, sig.bias.direction if sig.bias else "-",
+                       e.passed_count, e.reason)
         else:
             logger.debug("[%s] no trade: %s", symbol, sig.reason)
 
@@ -465,16 +434,16 @@ class Bot:
                 cd = self._symbol_cooldown_until.get(sym, 0)
                 cd_lb = f" cd={max(0,(cd-now))/60:.0f}m" if cd > now else ""
                 if sig.bias is not None:
-                    bias_str = (f"`{sig.bias.bias}`({max(sig.bias.bull_score, sig.bias.bear_score):.0f}) "
-                                f"conf `{sig.bias.confidence:.0f}`")
+                    b = sig.bias
+                    bias_str = f"`{b.direction}` 1H`{b.score_1h:.0f}` 15M`{b.score_15m:.0f}` 5M`{b.score_5m:.0f}`"
                 else:
-                    bias_str = f"`—` (blocked at {sig.blocked_layer})"
+                    bias_str = "`—`"
+                entry_str = f"`{sig.entry.passed_count}/5`" if sig.entry is not None else "`-`"
                 lines.append(
                     f"`{sym}` {pos_label}\n"
-                    f"  regime `{sig.regime.name}`({sig.regime.score:.0f}) "
-                    f"bias {bias_str}\n"
-                    f"  entry `{sig.entry_score:.0f}` dir `{sig.direction}` "
-                    f"round `{sig.round_age_bars if sig.round_age_bars is not None else '-'}`{cd_lb}")
+                    f"  regime `{sig.regime.label}`\n"
+                    f"  bias {bias_str}\n"
+                    f"  entry {entry_str} dir `{sig.direction}`{cd_lb}")
             await self.telegram.send_text("📡 *Status*\n\n" + "\n".join(lines))
         else:
             await self.telegram.send_text(f"unknown command: {cmd} — try /help")
@@ -524,23 +493,19 @@ class Bot:
                 continue
             cd_until = self._symbol_cooldown_until.get(symbol, 0)
             cd_label = f" cooldown={max(0,(cd_until-now))/60:.0f}m" if cd_until > now else ""
-            if sig.round_age_bars is not None:
-                used = (sig.round_id is not None
-                        and self._consumed_round.get(symbol) == sig.round_id)
-                round_label = f" round={sig.round_age_bars}bar{'(used)' if used else ''}"
+            # sig.bias/sig.entry are None only when an earlier layer's own
+            # dataclass wasn't reached (never happens in this pipeline since
+            # Regime always classifies and Bias always runs) — guard anyway.
+            if sig.bias is not None:
+                bias_label = f"{sig.bias.direction}(1H={sig.bias.score_1h:.0f},15M={sig.bias.score_15m:.0f},5M={sig.bias.score_5m:.0f})"
             else:
-                round_label = " round=none"
-            # sig.bias / sig.context are None when the pipeline blocked at an
-            # earlier layer (e.g. REGIME) — guard every optional layer.
-            bias_lbl = sig.bias.bias if sig.bias is not None else "—"
-            bias_val = max(sig.bias.bull_score, sig.bias.bear_score) if sig.bias is not None else 0.0
+                bias_label = "—"
+            entry_label = f"{sig.entry.passed_count}/5" if sig.entry is not None else "-"
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(
-                "  %-16s %-24s regime=%-12s(%.0f) bias=%-8s(%.0f) entry=%.0f dir=%s%s%s%s",
-                symbol, pos_label,
-                sig.regime.name, sig.regime.score,
-                bias_lbl, bias_val,
-                sig.entry_score, sig.direction, round_label, cd_label, blk,
+                "  %-16s %-24s regime=%-20s bias=%-40s entry=%-5s dir=%s%s%s",
+                symbol, pos_label, sig.regime.label, bias_label, entry_label,
+                sig.direction, cd_label, blk,
             )
 
 

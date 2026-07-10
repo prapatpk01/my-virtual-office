@@ -1,16 +1,15 @@
 """
-Layer 1 — Regime Engine (HARD GATE).  4H + 1H.
+Layer 1 — Market Regime Engine (CLASSIFICATION ONLY).  4H macro + 1H mid.
 
-Answers one question: "Should the system trade at all, and which side?"
-This is the only hard gate at the top of the pipeline — if it blocks,
-nothing downstream runs. It also emits the adaptive_threshold_adj and
-size_multiplier that the Entry and Risk layers read.
+Answers ONE question: "What state is the market in right now?" This layer
+NEVER decides to open a position and never picks a trade direction — it only
+emits one label out of seven. Direction is Layer 2's job (Bias); timing is
+Layer 3's job (Entry). See pipeline.py for the full "Directional Trading
+Architecture" flow this implements.
 
-Design: each timeframe gets a directional regime label + 0-100 quality
-score from the SAME feature set (EMA structure, slope, ADX, chop, ATR).
-The combined score is a weighted blend; the gate opens only when both
-timeframes lean the same way, they aren't strongly conflicting, and price
-isn't overextended past EMA20 (anti-chase).
+Output — exactly one of:
+    STRONG_BULL_TREND | EARLY_BULL_TREND | RANGE | COMPRESSION |
+    EARLY_BEAR_TREND | STRONG_BEAR_TREND | HIGH_VOLATILITY
 """
 from __future__ import annotations
 
@@ -22,13 +21,16 @@ import pandas as pd
 import indicators as ind
 from config import Config
 
-# directional regime labels per timeframe
-BULL        = "BULL"
-EARLY_BULL  = "EARLY_BULL"
-BEAR        = "BEAR"
-EARLY_BEAR  = "EARLY_BEAR"
+STRONG_BULL = "STRONG_BULL_TREND"
+EARLY_BULL  = "EARLY_BULL_TREND"
 RANGE       = "RANGE"
-TRANSITION  = "TRANSITION"
+COMPRESSION = "COMPRESSION"
+EARLY_BEAR  = "EARLY_BEAR_TREND"
+STRONG_BEAR = "STRONG_BEAR_TREND"
+HIGH_VOL    = "HIGH_VOLATILITY"
+
+BULL_LABELS = (STRONG_BULL, EARLY_BULL)
+BEAR_LABELS = (STRONG_BEAR, EARLY_BEAR)
 
 LONG    = "LONG"
 SHORT   = "SHORT"
@@ -38,185 +40,185 @@ NEUTRAL = "NEUTRAL"
 @dataclass
 class TFRegime:
     label: str
-    score: float          # 0-100 quality
-    direction: str        # LONG | SHORT | NEUTRAL
-    extension_atr: float
-    components: dict = field(default_factory=dict)
+    checks: dict = field(default_factory=dict)   # criterion name -> bool, for logging
+    pass_count: int = 0
+    pass_total: int = 6
 
 
 @dataclass
 class RegimeResult:
-    allow_trade: bool
-    direction: str
-    regime_4h: str
-    regime_1h: str
-    score_4h: float
-    score_1h: float
-    combined_score: float
-    aligned: bool
-    extension_atr: float
-    price_extension_ok: bool
-    adaptive_threshold_adj: float
-    size_multiplier: float
-    quality: str          # 'strong' | 'normal' | 'weak' | 'transition'
-    reason: str
-    # 6-regime + trade style
-    regime_type: str = "TRANSITION"   # STRONG_TREND | HEALTHY_TREND | EARLY_TREND | RANGE | COMPRESSION | TRANSITION
-    style: str = "BLOCK"              # TREND | SWING | MEANREV | BREAKOUT | BLOCK
-    adx_1h: float = 0.0
-    chop_1h: float = 0.0
-    atr_pct_1h: float = 50.0
-    # kept for backward-compat with health monitor / status log call sites
+    label: str            # the 7-way classification (final combined call)
+    label_4h: str
+    label_1h: str
+    checks_4h: dict = field(default_factory=dict)
+    checks_1h: dict = field(default_factory=dict)
+    reason: str = ""
+    # backward-compat fields other modules key off of (health monitor,
+    # telegram, status logging) — `name`/`score` are display-only here, this
+    # layer no longer gates or sizes trades.
     name: str = ""
     score: float = 0.0
-    components: dict = field(default_factory=dict)
+    style: str = ""
+    size_multiplier: float = 1.0
 
 
 class RegimeEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    # ── One timeframe -> directional label + quality score ───────────────────
+    # ── One timeframe -> 7-way label + the checks that produced it ───────────
     def _tf_regime(self, df: pd.DataFrame) -> TFRegime:
         c = self.cfg
-        if len(df) < c.regime_ema_slow + 6:
-            return TFRegime(TRANSITION, 0.0, NEUTRAL, 0.0)
+        min_len = max(c.regime_ema_slow, 60) + 10
+        if len(df) < min_len:
+            return TFRegime(RANGE, {}, 0, 6)
 
-        closes = df["close"]
-        e_fast = ind.ema(closes, c.regime_ema_fast)
-        e_slow = ind.ema(closes, c.regime_ema_slow)
-        e_fast_v, e_slow_v = float(e_fast.iloc[-1]), float(e_slow.iloc[-1])
+        closes, highs, lows, vols = df["close"], df["high"], df["low"], df["volume"]
         price = float(closes.iloc[-1])
 
+        e20 = ind.ema(closes, c.regime_ema_fast)
+        e50 = ind.ema(closes, c.regime_ema_slow)
+        e20_v, e50_v = float(e20.iloc[-1]), float(e50.iloc[-1])
+        slope20 = float(ind.slope_pct(e20, c.regime_ema_slope_lookback).iloc[-1] or 0.0)
+
         adx_s, _, _ = ind.adx(df, c.regime_adx_period)
-        adx_v = float(adx_s.iloc[-1]) if not np.isnan(adx_s.iloc[-1]) else 0.0
-        chop_s = ind.choppiness_index(df, c.regime_chop_period)
-        chop_v = float(chop_s.iloc[-1]) if not np.isnan(chop_s.iloc[-1]) else 50.0
-        slope_v = float(ind.slope_pct(e_fast, c.regime_ema_slope_lookback).iloc[-1] or 0.0)
-        atr_v = float(ind.atr(df, c.regime_atr_period).iloc[-1])
-        structure = ind.market_structure(df["high"], df["low"],
-                                         c.bias_structure_left, c.bias_structure_right)
+        adx_now = float(adx_s.iloc[-1]) if not np.isnan(adx_s.iloc[-1]) else 0.0
+        adx_prev = float(adx_s.iloc[-2]) if not np.isnan(adx_s.iloc[-2]) else 0.0
+        adx_rising = adx_now > adx_prev
 
-        # ── Direction + label come from EMA STRUCTURE, not the quality score.
-        # "Bull regime" is a structural fact (EMA20>EMA50); the 0-100 score
-        # only measures HOW strong it is, and drives the adaptive threshold.
-        # Coupling the label to a high score made alignment unreachable on
-        # real data (per-TF score rarely cleared 60, so nothing was ever
-        # labelled even EARLY_BULL).
-        price_above = price > e_fast_v
-        slope_up = slope_v > 0
-        if e_fast_v > e_slow_v:
-            direction = LONG
-            label = BULL if (price_above and slope_up) else EARLY_BULL
-        elif e_fast_v < e_slow_v:
-            direction = SHORT
-            label = BEAR if ((not price_above) and (not slope_up)) else EARLY_BEAR
-        else:
-            direction = NEUTRAL
-            label = RANGE
+        _, _, hist = ind.macd(closes)
+        h_now = float(hist.iloc[-1]) if not np.isnan(hist.iloc[-1]) else 0.0
+        h_prev = float(hist.iloc[-2]) if not np.isnan(hist.iloc[-2]) else 0.0
 
-        # quality score 0-100 (30 structure / 20 slope / 25 ADX / 15 chop / 10 struct-HH-LL)
-        comp = {}
-        comp["trend_align"] = 30.0 if direction != NEUTRAL else 0.0
-        slope_ok = (direction == LONG and slope_v > 0) or (direction == SHORT and slope_v < 0)
-        comp["slope"] = 20.0 if slope_ok else 0.0
-        # ADX >= lo means "trending" — no upper cap (a strong 4H trend shouldn't
-        # be scored down for being strong; the old 18-40 band zeroed most trends).
-        comp["adx"] = 25.0 if adx_v >= c.regime_adx_trend_lo else 0.0
-        comp["chop"] = 15.0 if chop_v < 50.0 else 0.0
-        struct_ok = (direction == LONG and structure == "HH_HL") or \
-                    (direction == SHORT and structure == "LH_LL")
-        comp["structure"] = 10.0 if struct_ok else 0.0
-        score = sum(comp.values())
+        roc9 = float(ind.roc(closes, 9).iloc[-1] or 0.0)
+        structure = ind.market_structure(highs, lows, c.bias_structure_left, c.bias_structure_right)
+        sflags = ind.structure_flags(highs, lows, c.bias_structure_left, c.bias_structure_right)
 
-        ext = abs(price - e_fast_v) / atr_v if (atr_v and atr_v > 0 and not np.isnan(atr_v)) else 0.0
-        return TFRegime(label, score, direction, ext, comp)
+        atr_s = ind.atr(df, c.regime_atr_period)
+        atr_pctl = float(ind.atr_percentile(atr_s, c.regime_atr_pct_lookback).iloc[-1])
+        atr_pctl = 50.0 if np.isnan(atr_pctl) else atr_pctl
+        bb_w = ind.bollinger_width(df, 20, 2.0)
+        bb_pctl = float(ind.rolling_percentile(bb_w, c.regime_atr_pct_lookback).iloc[-1])
+        bb_pctl = 50.0 if np.isnan(bb_pctl) else bb_pctl
 
-    # ── Combined 4H + 1H hard gate ───────────────────────────────────────────
+        vol_now = float(vols.iloc[-1])
+        vol_ma20 = float(vols.iloc[-21:-1].mean()) if len(vols) >= 21 else 0.0
+        vol_expansion = vol_ma20 > 0 and vol_now >= c.rg_highvol_vol_mult * vol_ma20
+        rng_now = float(highs.iloc[-1] - lows.iloc[-1])
+        rng_ma20 = float((highs.iloc[-21:-1] - lows.iloc[-21:-1]).mean()) if len(df) >= 21 else 0.0
+        candle_expansion = rng_ma20 > 0 and rng_now >= c.rg_highvol_range_mult * rng_ma20
+        bull_vol = float(closes.iloc[-1]) >= float(df["open"].iloc[-1]) and vol_expansion
+        bear_vol = float(closes.iloc[-1]) <= float(df["open"].iloc[-1]) and vol_expansion
+
+        # ── Strong Bull Trend: pass >= 4/6 ────────────────────────────────────
+        strong_bull_checks = {
+            "ema20>ema50":      e20_v > e50_v,
+            "close>ema20":      price > e20_v,
+            "ema20_slope_up":   slope20 > 0,
+            "adx_trending":     adx_now > c.rg_adx_trend_min or adx_rising,
+            "hh_hl":            structure == "HH_HL",
+            "macd_hist>0":      h_now > 0,
+        }
+        # ── Strong Bear Trend: mirror ─────────────────────────────────────────
+        strong_bear_checks = {
+            "ema20<ema50":      e20_v < e50_v,
+            "close<ema20":      price < e20_v,
+            "ema20_slope_dn":   slope20 < 0,
+            "adx_trending":     adx_now > c.rg_adx_trend_min or adx_rising,
+            "lh_ll":            structure == "LH_LL",
+            "macd_hist<0":      h_now < 0,
+        }
+        # ── Early Bull: pass >= 4/6 ────────────────────────────────────────────
+        early_bull_checks = {
+            "reclaim_ema20":    ind.recent_cross_above(closes, e20, lookback=5),
+            "ema20_turning_up": slope20 > 0,
+            "macd_improving":   h_now > h_prev,
+            "roc9>0":           roc9 > 0,
+            "higher_low":       sflags["higher_low"],
+            "bullish_volume":   bull_vol,
+        }
+        early_bear_checks = {
+            "reclaim_ema20_dn": ind.recent_cross_below(closes, e20, lookback=5),
+            "ema20_turning_dn": slope20 < 0,
+            "macd_falling":     h_now < h_prev,
+            "roc9<0":           roc9 < 0,
+            "lower_high":       sflags["lower_high"],
+            "bearish_volume":   bear_vol,
+        }
+        # ── Compression / Range / High Volatility ─────────────────────────────
+        compression_checks = {
+            "atr_low":  atr_pctl <= c.rg_compression_pctile_max,
+            "bbw_low":  bb_pctl <= c.rg_compression_pctile_max,
+            "adx_low":  adx_now < c.rg_range_adx_max,
+        }
+        range_checks = {
+            "adx_low":         adx_now < c.rg_range_adx_max,
+            "structure_mixed": structure == "MIXED",
+            "ema_flat":        abs(slope20) < c.rg_range_flat_slope_pct,
+        }
+        highvol_checks = {
+            "atr_expansion":    atr_pctl >= c.rg_highvol_atr_pctile_min,
+            "volume_expansion": vol_expansion,
+            "candle_expansion": candle_expansion,
+        }
+
+        sb_n = sum(strong_bull_checks.values())
+        be_n = sum(strong_bear_checks.values())
+        eb_n = sum(early_bull_checks.values())
+        er_n = sum(early_bear_checks.values())
+        cp_n = sum(compression_checks.values())
+        rg_n = sum(range_checks.values())
+        hv_n = sum(highvol_checks.values())
+
+        # Priority: volatility expansion overrides trend/range calls (it's an
+        # urgent condition, not a steady-state one) -> then strong trend ->
+        # early trend -> compression -> range (the default catch-all).
+        if hv_n >= 2:
+            return TFRegime(HIGH_VOL, highvol_checks, hv_n, 3)
+        if sb_n >= 4:
+            return TFRegime(STRONG_BULL, strong_bull_checks, sb_n, 6)
+        if be_n >= 4:
+            return TFRegime(STRONG_BEAR, strong_bear_checks, be_n, 6)
+        if eb_n >= 4:
+            return TFRegime(EARLY_BULL, early_bull_checks, eb_n, 6)
+        if er_n >= 4:
+            return TFRegime(EARLY_BEAR, early_bear_checks, er_n, 6)
+        if cp_n >= 2:
+            return TFRegime(COMPRESSION, compression_checks, cp_n, 3)
+        return TFRegime(RANGE, range_checks, rg_n, 3)
+
+    # ── Combine 4H (macro) + 1H (mid) into ONE final classification ──────────
     def analyze(self, df_4h: pd.DataFrame, df_1h: pd.DataFrame | None = None) -> RegimeResult:
-        c = self.cfg
         r4 = self._tf_regime(df_4h)
-        # 1H is optional so single-TF callers (e.g. legacy backtest) still work;
-        # if absent, 4H alone drives the gate.
         r1 = self._tf_regime(df_1h) if df_1h is not None and len(df_1h) else r4
 
-        combined = round(r4.score * c.regime_weight_4h + r1.score * c.regime_weight_1h, 1)
-        ext = r1.extension_atr
-        extension_ok = ext <= c.regime_extension_atr_max
-
-        # 1H context indicators for RANGE / COMPRESSION detection
-        src = df_1h if (df_1h is not None and len(df_1h)) else df_4h
-        adx_1h = float(ind.adx(src, c.regime_adx_period)[0].iloc[-1] or 0.0)
-        chop_1h = float(ind.choppiness_index(src, c.regime_chop_period).iloc[-1] or 50.0)
-        atr_s = ind.atr(src, c.regime_atr_period)
-        atr_pct_1h = float(ind.atr_percentile(atr_s, c.regime_atr_pct_lookback).iloc[-1])
-        if np.isnan(atr_pct_1h):
-            atr_pct_1h = 50.0
-
-        long_labels = {BULL, EARLY_BULL}
-        short_labels = {BEAR, EARLY_BEAR}
-        both_long = r4.label in long_labels and r1.label in long_labels
-        both_short = r4.label in short_labels and r1.label in short_labels
-        aligned = both_long or both_short
-        direction = LONG if both_long else SHORT if both_short else NEUTRAL
-
-        strong_conflict = (r4.direction == LONG and r1.direction == SHORT and r1.score >= c.regime_normal_score) or \
-                          (r4.direction == SHORT and r1.direction == LONG and r1.score >= c.regime_normal_score)
-
-        # ── 6-regime classification (priority order) ─────────────────────────
-        # Non-trend conditions (compression, range) are checked BEFORE the
-        # trend bands: a low-ADX / high-chop market is a RANGE even when the
-        # EMAs mildly lean (structurally "aligned"). Checking trend first
-        # mislabelled a choppy market as HEALTHY_TREND and never routed it to
-        # mean-reversion — which is exactly the style that fits this market.
-        strong_trend = adx_1h >= c.regime_adx_trend_lo   # a real trend needs momentum, not just EMA lean
-        if strong_conflict or r4.label == TRANSITION or r1.label == TRANSITION:
-            regime_type = "TRANSITION"
-        elif atr_pct_1h <= c.regime_compression_atrpct_max and chop_1h >= c.regime_range_chop_min:
-            regime_type = "COMPRESSION"
-        elif chop_1h >= c.regime_range_chop_min or adx_1h < c.regime_range_adx_max:
-            regime_type = "RANGE"
-        elif aligned and strong_trend and combined >= c.regime_strong_trend_min:
-            regime_type = "STRONG_TREND"
-        elif aligned and strong_trend and combined >= c.regime_healthy_trend_min:
-            regime_type = "HEALTHY_TREND"
-        elif aligned and combined >= c.regime_early_trend_min:
-            regime_type = "EARLY_TREND"
+        if r4.label == HIGH_VOL or r1.label == HIGH_VOL:
+            label, reason = HIGH_VOL, f"volatility expansion (4H={r4.label}, 1H={r1.label})"
+        elif r4.label in BULL_LABELS and r1.label in BULL_LABELS:
+            label = STRONG_BULL if (r4.label == STRONG_BULL and r1.label == STRONG_BULL) else EARLY_BULL
+            reason = f"4H={r4.label} 1H={r1.label} -> {label}"
+        elif r4.label in BEAR_LABELS and r1.label in BEAR_LABELS:
+            label = STRONG_BEAR if (r4.label == STRONG_BEAR and r1.label == STRONG_BEAR) else EARLY_BEAR
+            reason = f"4H={r4.label} 1H={r1.label} -> {label}"
+        elif (r4.label in BULL_LABELS and r1.label in BEAR_LABELS) or \
+             (r4.label in BEAR_LABELS and r1.label in BULL_LABELS):
+            label, reason = RANGE, f"4H/1H directional conflict (4H={r4.label}, 1H={r1.label}) -> RANGE"
+        elif r4.label == COMPRESSION or r1.label == COMPRESSION:
+            label, reason = COMPRESSION, f"4H={r4.label} 1H={r1.label} -> COMPRESSION"
         else:
-            regime_type = "TRANSITION"
+            label, reason = RANGE, f"4H={r4.label} 1H={r1.label} -> RANGE"
 
-        # ── regime type -> style + adaptive threshold + quality/size ─────────
-        adj, quality, size_mult, style, allow = 0.0, "normal", c.size_mult_normal, "BLOCK", False
-        if regime_type == "STRONG_TREND":
-            adj, quality, size_mult, style, allow = c.regime_strong_trend_adj, "strong", c.size_mult_strong, "TREND", True
-        elif regime_type == "HEALTHY_TREND":
-            adj, quality, size_mult, style, allow = 0.0, "normal", c.size_mult_normal, "TREND", True
-        elif regime_type == "EARLY_TREND":
-            adj, quality, size_mult, style, allow = c.regime_early_trend_adj, "weak", c.size_mult_weak, "SWING", True
-        elif regime_type == "RANGE" and c.style_range_enabled:
-            adj, quality, size_mult, style, allow = 0.0, "weak", c.meanrev_size_mult, "MEANREV", True
-        elif regime_type == "COMPRESSION" and c.style_compression_enabled:
-            adj, quality, size_mult, style, allow = 0.0, "weak", c.breakout_size_mult, "BREAKOUT", True
-        else:  # TRANSITION or disabled style
-            adj, quality, size_mult, style, allow = 0.0, "transition", c.size_mult_transition, "BLOCK", False
-
-        # trend styles carry the extension anti-chase hard gate; mean-reversion
-        # WANTS extension (it fades stretched price) so it's exempt.
-        if style in ("TREND", "SWING") and not extension_ok:
-            allow = False
-            reason = f"{regime_type}: overextended {ext:.1f}ATR past EMA20 (max {c.regime_extension_atr_max})"
-        elif not allow:
-            reason = f"{regime_type}: no tradeable style"
+        # display-only quality score (0-100) — NOT used for gating anymore,
+        # kept so status logs / telegram still show something meaningful.
+        if label in (STRONG_BULL, STRONG_BEAR):
+            score = max(r4.pass_count, r1.pass_count) / 6.0 * 100.0
+        elif label in (EARLY_BULL, EARLY_BEAR):
+            score = max(r4.pass_count, r1.pass_count) / 6.0 * 70.0
         else:
-            reason = f"{regime_type} -> {style}"
+            score = 40.0
 
         return RegimeResult(
-            allow_trade=allow, direction=direction if style in ("TREND", "SWING") else NEUTRAL,
-            regime_4h=r4.label, regime_1h=r1.label, score_4h=r4.score, score_1h=r1.score,
-            combined_score=combined, aligned=aligned, extension_atr=ext,
-            price_extension_ok=extension_ok, adaptive_threshold_adj=adj,
-            size_multiplier=size_mult, quality=quality, reason=reason,
-            regime_type=regime_type, style=style, adx_1h=adx_1h, chop_1h=chop_1h, atr_pct_1h=atr_pct_1h,
-            name=regime_type, score=combined,
-            components={"4h": r4.components, "1h": r1.components},
+            label=label, label_4h=r4.label, label_1h=r1.label,
+            checks_4h=r4.checks, checks_1h=r1.checks, reason=reason,
+            name=label, score=round(score, 1),
         )

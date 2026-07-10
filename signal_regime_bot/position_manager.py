@@ -26,7 +26,7 @@ import indicators as ind
 from config import Config
 from exchange_client import ExchangeClient
 from risk_manager import RiskManager
-from regime_engine import RegimeResult
+from regime_engine import RegimeResult, BULL_LABELS, BEAR_LABELS
 from bias_engine import BiasResult, BIAS_BULL, BIAS_BEAR
 
 logger = logging.getLogger("position_manager")
@@ -110,7 +110,7 @@ def evaluate_health(pos: Position, df_30m: pd.DataFrame, bias: BiasResult,
     bias_ok = (bias.bias == BIAS_BULL) if is_long else (bias.bias == BIAS_BEAR)
     comps["bias_aligned"] = 40.0 if bias_ok else 0.0
 
-    regime_ok = regime.name in ("TREND", "EARLY_TREND")
+    regime_ok = regime.label in (BULL_LABELS if is_long else BEAR_LABELS)
     comps["regime_ok"] = 30.0 if regime_ok else 0.0
 
     macd_ok = False

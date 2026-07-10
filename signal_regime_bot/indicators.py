@@ -95,12 +95,26 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
 
-def atr_percentile(atr_series: pd.Series, lookback: int = 100) -> pd.Series:
-    """Percentile rank (0-100) of the current ATR within the trailing `lookback` window."""
+def rolling_percentile(series: pd.Series, lookback: int = 100) -> pd.Series:
+    """Percentile rank (0-100) of the current value within the trailing `lookback` window."""
     def _rank(window: np.ndarray) -> float:
         cur = window[-1]
         return float((window <= cur).sum() - 1) / max(len(window) - 1, 1) * 100.0
-    return atr_series.rolling(lookback, min_periods=max(20, lookback // 4)).apply(_rank, raw=True)
+    return series.rolling(lookback, min_periods=max(20, lookback // 4)).apply(_rank, raw=True)
+
+
+def atr_percentile(atr_series: pd.Series, lookback: int = 100) -> pd.Series:
+    """Percentile rank (0-100) of the current ATR within the trailing `lookback` window."""
+    return rolling_percentile(atr_series, lookback)
+
+
+def bollinger_width(df: pd.DataFrame, period: int = 20, mult: float = 2.0) -> pd.Series:
+    """Bollinger Band width as % of the middle band — a compression/expansion gauge."""
+    close = df["close"]
+    mid = sma(close, period)
+    std = close.rolling(period).std()
+    upper, lower = mid + mult * std, mid - mult * std
+    return (upper - lower) / mid.replace(0, np.nan) * 100
 
 
 def adx(df: pd.DataFrame, period: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -189,6 +203,54 @@ def market_structure(highs: pd.Series, lows: pd.Series,
     if lower_high and lower_low:
         return "LH_LL"
     return "MIXED"
+
+
+def structure_flags(highs: pd.Series, lows: pd.Series,
+                    left: int = 3, right: int = 3) -> dict:
+    """
+    Individual swing-structure flags from the two most recent CONFIRMED pivots
+    on each side — unlike market_structure() this doesn't require BOTH the
+    high and low leg to agree, so callers can ask for e.g. "higher low" alone
+    (an early-trend / reversal tell) without also needing a higher high.
+    """
+    ph, pl = swing_pivots(highs, lows, left, right)
+    h_vals, l_vals = highs.values, lows.values
+    return {
+        "higher_high": len(ph) >= 2 and h_vals[ph[-1]] > h_vals[ph[-2]],
+        "lower_high":  len(ph) >= 2 and h_vals[ph[-1]] < h_vals[ph[-2]],
+        "higher_low":  len(pl) >= 2 and l_vals[pl[-1]] > l_vals[pl[-2]],
+        "lower_low":   len(pl) >= 2 and l_vals[pl[-1]] < l_vals[pl[-2]],
+    }
+
+
+def recent_cross_above(price: pd.Series, level: pd.Series, lookback: int = 5) -> bool:
+    """True if `price` is above `level` now and crossed up within the last `lookback` bars."""
+    n = len(price)
+    if n < lookback + 2 or level.iloc[-1] != level.iloc[-1]:  # NaN check
+        return False
+    if not (price.iloc[-1] > level.iloc[-1]):
+        return False
+    for back in range(1, lookback + 1):
+        if n - 1 - back < 0:
+            break
+        if price.iloc[-1 - back] <= level.iloc[-1 - back]:
+            return True
+    return False
+
+
+def recent_cross_below(price: pd.Series, level: pd.Series, lookback: int = 5) -> bool:
+    """True if `price` is below `level` now and crossed down within the last `lookback` bars."""
+    n = len(price)
+    if n < lookback + 2 or level.iloc[-1] != level.iloc[-1]:
+        return False
+    if not (price.iloc[-1] < level.iloc[-1]):
+        return False
+    for back in range(1, lookback + 1):
+        if n - 1 - back < 0:
+            break
+        if price.iloc[-1 - back] >= level.iloc[-1 - back]:
+            return True
+    return False
 
 
 def recent_swing_levels(highs: pd.Series, lows: pd.Series,

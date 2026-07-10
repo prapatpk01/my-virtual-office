@@ -90,7 +90,8 @@ class Config:
     tf_bias: str   = field(default_factory=lambda: os.environ.get("TIMEFRAME_BIAS", "1h"))
     tf_regime: str = field(default_factory=lambda: os.environ.get("TIMEFRAME_REGIME", "4h"))
     tf_context: str = "30m"   # Context Engine timeframe
-    tf_fast: str    = "15m"   # Bias-secondary + Early Booster timeframe
+    tf_fast: str    = "15m"   # Bias secondary timeframe
+    tf_micro: str   = "5m"    # Bias tertiary timeframe (strict 3-layer architecture)
 
     # ── Hardcoded strategy constants (not exposed as ENV) ───────────────────
     market_type: str = "swap"
@@ -334,6 +335,28 @@ class Config:
     fetch_limit_regime: int = 300
     fetch_limit_context: int = 300
     fetch_limit_fast: int = 300
+    fetch_limit_micro: int = 300
+
+    # ══ Regime -> Bias -> Entry (strict 3-layer "Directional Trading         ══
+    # ══ Architecture") ════════════════════════════════════════════════════
+    # Layer 1 — Regime classification thresholds (7-way label, 4H+1H).
+    rg_adx_trend_min: float = 15.0          # ADX > this (or rising) counts toward Strong Bull/Bear
+    rg_compression_pctile_max: float = 25.0 # ATR/BBwidth percentile <= this -> compression signal
+    rg_range_adx_max: float = 18.0          # ADX < this -> range/compression signal
+    rg_range_flat_slope_pct: float = 0.15   # |EMA20 slope| < this% -> "EMA flat" (range signal)
+    rg_highvol_atr_pctile_min: float = 85.0 # ATR percentile >= this -> volatility-expansion signal
+    rg_highvol_vol_mult: float = 2.0        # volume >= this x vol_ma20 -> volume-expansion signal
+    rg_highvol_range_mult: float = 2.0      # bar range >= this x range_ma20 -> candle-expansion signal
+
+    # Layer 2 — Bias: strict all-timeframe AND gate (1H + 15M + 5M).
+    bias_long_threshold: float = 70.0       # every TF score must be > this for LONG ONLY
+    bias_short_threshold: float = 30.0      # every TF score must be < this for SHORT ONLY
+    bias_rel_vol_min: float = 1.0           # current bar volume / vol_ma20 >= this -> "relative volume" point
+
+    # Layer 3 — Entry: 5-category trigger, >= entry_min_categories with
+    # Momentum + Structure mandatory regardless of the total count.
+    entry_min_categories: int = 4
+    entry_rel_vol_min: float = 1.2          # softer bar than bias_rel_vol_min — "elevated" for a trigger
 
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))

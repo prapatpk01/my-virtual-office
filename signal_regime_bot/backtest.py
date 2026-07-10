@@ -42,7 +42,7 @@ TAKER_FEE = 0.0005
 MAKER_FEE = 0.0002
 SLIPPAGE = 0.0003
 
-_TF_MS = {"30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
+_TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
 
 
 # ── Historical data pagination ────────────────────────────────────────────────
@@ -127,7 +127,8 @@ def _closed_htf_cutoff(close_ms_sorted: np.ndarray, as_of_close_ms: int) -> int:
 
 
 def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.DataFrame,
-                    df_4h: pd.DataFrame, initial_balance: float) -> list[BTTrade]:
+                    df_4h: pd.DataFrame, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
+                    initial_balance: float) -> list[BTTrade]:
     engine = SignalEngine(cfg)
     risk = RiskManager(cfg)
     trades: list[BTTrade] = []
@@ -136,19 +137,20 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
     tp1_hit = False
     weak_count = 0
     last_health_i = -1
-    consumed_round = None   # Signal Round Gate: round_id already traded
 
     n = len(df_30m)
     warmup = max(cfg.min_bars, 60)
 
-    # Precompute HTF close-time arrays ONCE (O(log n) lookup per bar via
+    # Precompute HTF/LTF close-time arrays ONCE (O(log n) lookup per bar via
     # searchsorted, instead of an O(n) boolean scan every bar — this alone
-    # turns an O(n_30m * n_htf) scan into O(n_30m * log n_htf)).
+    # turns an O(n_30m * n_tf) scan into O(n_30m * log n_tf)).
     close_ms_1h = (df_1h.index.view("int64") // 1_000_000) + _TF_MS["1h"]
     close_ms_4h = (df_4h.index.view("int64") // 1_000_000) + _TF_MS["4h"]
+    close_ms_15m = (df_15m.index.view("int64") // 1_000_000) + _TF_MS["15m"]
+    close_ms_5m = (df_5m.index.view("int64") // 1_000_000) + _TF_MS["5m"]
 
     # Bound every indicator computation to a trailing window matching what
-    # live's DataEngine actually fetches (fetch_limit_entry/bias/regime).
+    # live's DataEngine actually fetches (fetch_limit_entry/bias/regime/...).
     # Two reasons this MUST match live, not just "be fast":
     #  1. Performance: recomputing indicators over an ever-growing full
     #     history is O(n^2) — a 6-month, 8600-bar 30m series never finishes.
@@ -161,6 +163,8 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
     w30 = cfg.fetch_limit_entry
     w1h = cfg.fetch_limit_bias
     w4h = cfg.fetch_limit_regime
+    w15 = cfg.fetch_limit_fast
+    w5 = cfg.fetch_limit_micro
 
     for i in range(warmup, n - 1):
         bar = df_30m.iloc[i]
@@ -171,6 +175,10 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
         hist_1h = df_1h.iloc[max(0, cutoff_1h - w1h): cutoff_1h]
         cutoff_4h = _closed_htf_cutoff(close_ms_4h, bar_close_ms)
         hist_4h = df_4h.iloc[max(0, cutoff_4h - w4h): cutoff_4h]
+        cutoff_15m = _closed_htf_cutoff(close_ms_15m, bar_close_ms)
+        hist_15m = df_15m.iloc[max(0, cutoff_15m - w15): cutoff_15m]
+        cutoff_5m = _closed_htf_cutoff(close_ms_5m, bar_close_ms)
+        hist_5m = df_5m.iloc[max(0, cutoff_5m - w5): cutoff_5m]
 
         # ── Manage open position against THIS bar's OHLC ────────────────────
         if pos is not None:
@@ -252,8 +260,8 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
             # Health monitor — once per closed 30m bar.
             if i != last_health_i:
                 last_health_i = i
-                regime = engine.regime_engine.analyze(hist_4h)
-                bias = engine.bias_engine.analyze(hist_1h)
+                regime = engine.regime_engine.analyze(hist_4h, hist_1h)
+                bias = engine.bias_engine.analyze(hist_1h, hist_15m, hist_5m, regime.label)
                 fake_pos = Position(symbol=symbol, side=pos.direction.lower(),
                                     entry_price=pos.entry_price, amount=pos.amount,
                                     full_amount=pos.amount, stop_loss=pos.sl, tp1=pos.tp1,
@@ -285,15 +293,12 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
         can_open, _ = risk.can_open_new(balance, bar_close_ms / 1000, 0)
         if not can_open:
             continue
-        if len(hist_30m) < cfg.min_bars or len(hist_1h) < cfg.min_bars or len(hist_4h) < cfg.min_bars:
+        if len(hist_30m) < cfg.min_bars or len(hist_1h) < cfg.min_bars or len(hist_4h) < cfg.min_bars \
+           or len(hist_15m) < cfg.min_bars or len(hist_5m) < cfg.min_bars:
             continue
 
-        sig = engine.evaluate(hist_30m, hist_1h, hist_4h, None)  # 15m absent in backtest -> booster disabled
+        sig = engine.evaluate(hist_30m, hist_1h, hist_4h, hist_15m, hist_5m)
         if sig.direction not in (LONG, SHORT):
-            continue
-
-        # Signal Round Gate: one round = one entry (same rule as main.py).
-        if sig.round_id is not None and sig.round_id == consumed_round:
             continue
 
         entry_px = float(df_30m["open"].iloc[i + 1])
@@ -326,7 +331,6 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
         )
         pos.pnl_usd = -entry_fee
         balance -= entry_fee
-        consumed_round = sig.round_id   # this round is now traded — no re-entry on it
         tp1_hit, weak_count, last_health_i = False, 0, -1
 
     return trades
@@ -344,11 +348,15 @@ async def run_backtest(symbols: list[str], start_ms: int, end_ms: int,
             df_30m = await fetch_history(client, symbol, cfg.tf_entry, start_ms, end_ms)
             df_1h = await fetch_history(client, symbol, cfg.tf_bias, start_ms, end_ms)
             df_4h = await fetch_history(client, symbol, cfg.tf_regime, start_ms, end_ms)
-            logger.info("  %s: 30m=%d 1h=%d 4h=%d bars", symbol, len(df_30m), len(df_1h), len(df_4h))
-            if len(df_30m) < cfg.min_bars or len(df_1h) < cfg.min_bars or len(df_4h) < cfg.min_bars:
+            df_15m = await fetch_history(client, symbol, cfg.tf_fast, start_ms, end_ms)
+            df_5m = await fetch_history(client, symbol, cfg.tf_micro, start_ms, end_ms)
+            logger.info("  %s: 5m=%d 15m=%d 30m=%d 1h=%d 4h=%d bars",
+                       symbol, len(df_5m), len(df_15m), len(df_30m), len(df_1h), len(df_4h))
+            if len(df_30m) < cfg.min_bars or len(df_1h) < cfg.min_bars or len(df_4h) < cfg.min_bars \
+               or len(df_15m) < cfg.min_bars or len(df_5m) < cfg.min_bars:
                 logger.warning("  %s: insufficient history — skipped", symbol)
                 continue
-            trades = simulate_symbol(cfg, symbol, df_30m, df_1h, df_4h, initial_balance)
+            trades = simulate_symbol(cfg, symbol, df_30m, df_1h, df_4h, df_15m, df_5m, initial_balance)
             logger.info("  %s: %d trades  PnL=%+.2f", symbol, len(trades),
                        sum(t.pnl_usd for t in trades))
             all_trades.extend(trades)
