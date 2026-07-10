@@ -187,10 +187,16 @@ class Config:
     # Risk manager
     risk_min_pct: float = 0.05
     risk_max_pct: float = 0.10
-    daily_loss_limit_pct: float = 0.03    # halt new entries: day PnL <= -3%
+    # Disabled by user request: at risk_per_trade=5%, one SL loss is already
+    # ~5% of the day-start balance — past this 3% limit on the FIRST loss of
+    # the day, freezing all new entries until next UTC day (up to ~24h idle
+    # off a single trade). The loss-streak cooldown below is the intended
+    # brake instead.
+    daily_loss_limit_enabled: bool = False
+    daily_loss_limit_pct: float = 0.03    # halt new entries: day PnL <= -3% (only if enabled above)
     daily_profit_lock_pct: float = 0.08   # halt new entries: day PnL >= +8%
-    loss_streak_limit: int = 3
-    loss_streak_cooldown_min: int = 30
+    loss_streak_limit: int = 3            # 3 consecutive losses ->
+    loss_streak_cooldown_min: int = 180   # -> 3-hour cooldown (was 30 min)
     max_open_positions: int = 0  # set in __post_init__ from MAX_POSITIONS (default 2)
 
     # Stop loss / take profit

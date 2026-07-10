@@ -71,7 +71,12 @@ class RiskManager:
         if self.state.day_start_balance <= 0:
             return True, "ok"
         pnl_pct = self.state.day_realized_pnl / self.state.day_start_balance
-        if pnl_pct <= -self.cfg.daily_loss_limit_pct:
+        # Disabled by default (user request): at risk_per_trade=5%, a single
+        # SL loss is already ~5% of balance — past the old 3% daily_loss_limit
+        # on the FIRST loss of the day, freezing entries until next UTC day
+        # (up to ~24h off one trade). Loss-streak cooldown (below) is the
+        # intended brake now: 3 consecutive losses -> pause, not 1 bad trade.
+        if self.cfg.daily_loss_limit_enabled and pnl_pct <= -self.cfg.daily_loss_limit_pct:
             return False, f"Daily loss limit hit: {pnl_pct*100:.1f}% <= -{self.cfg.daily_loss_limit_pct*100:.0f}%"
         if pnl_pct >= self.cfg.daily_profit_lock_pct:
             return False, f"Daily profit lock hit: {pnl_pct*100:.1f}% >= +{self.cfg.daily_profit_lock_pct*100:.0f}%"
