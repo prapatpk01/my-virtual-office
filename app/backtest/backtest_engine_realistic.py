@@ -113,6 +113,7 @@ class RealisticSymbolBacktest(SymbolBacktest):
             enable_swing_reversal  = True,
             enable_mean_reversion  = True,
             expectancy_engine      = self.expectancy_engine,
+            entry_engine           = self.cfg.entry_engine,
         )
 
         trade_records: List[TradeRecord] = []
@@ -225,6 +226,7 @@ class RealisticSymbolBacktest(SymbolBacktest):
                     ind_15m, ind_1h, ind_4h,
                     extras, float(bar15.close),
                     bar_dt=bar_dt,
+                    raw_candles={"15m": slice15m, "1h": slice1h, "4h": slice4h},
                 )
             except Exception as e:
                 logger.error("[%s] on_tick error bar %d: %s", self.symbol, i, e)
@@ -385,6 +387,10 @@ if __name__ == "__main__":
     parser.add_argument("--symbols", default="BTC,ETH,SOL,XRP,HYPE,XAU,XAG,CL")
     parser.add_argument("--balance", type=float, default=10_000.0)
     parser.add_argument("--risk", type=float, default=0.01)
+    parser.add_argument("--entry-engine", default="adaptive",
+                        choices=["adaptive", "mtf_confluence"],
+                        help="adaptive (default V9.2 pipeline) or mtf_confluence "
+                             "(4H+1H trend-alignment + 15m 3-signal confluence)")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
@@ -392,6 +398,7 @@ if __name__ == "__main__":
         risk_pct=args.risk,
         data_root=args.data_root,
         output_dir=args.output_dir,
+        entry_engine=args.entry_engine,
     )
     syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
     engine = RealisticBacktestEngine(data_root=args.data_root, output_dir=args.output_dir, cfg=cfg)

@@ -62,6 +62,10 @@ class BacktestConfig:
     warmup_1h:   int = 60
     warmup_4h:   int = 60
 
+    # [MTF-CONFLUENCE] "adaptive" (default) or "mtf_confluence" — see
+    # trading/mtf_confluence_engine.py and TradingBot's entry_engine param.
+    entry_engine: str = "adaptive"
+
     # Position sizing safety
     min_sl_pct:     float = 0.020    # minimum SL distance = 2.0% — limits notional to ≤$5000 at 1% risk
     max_position_usd: float = 10_000  # max notional per trade (safety cap)
@@ -270,6 +274,7 @@ class SymbolBacktest:
             enable_swing_reversal  = True,
             enable_mean_reversion  = True,
             expectancy_engine      = self.expectancy_engine,
+            entry_engine           = self.cfg.entry_engine,
         )
 
         trade_records: List[TradeRecord] = []
@@ -342,6 +347,7 @@ class SymbolBacktest:
                     ind_15m, ind_1h, ind_4h,
                     extras, float(bar15.close),
                     bar_dt=bar_dt,
+                    raw_candles={"15m": slice15m, "1h": slice1h, "4h": slice4h},
                 )
             except Exception as e:
                 logger.error("[%s] on_tick error bar %d: %s", self.symbol, i, e)

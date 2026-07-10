@@ -50,6 +50,7 @@ import logging
 from typing import Optional, Callable, Dict, List, Any
 
 from .strategies.mean_reversion import MeanReversionStrategy
+from .mtf_confluence_engine import MTFConfluenceEngine
 
 
 logger = logging.getLogger("adaptive_trading_bot")
@@ -926,8 +927,18 @@ class TradingBot:
                  startup_warmup_minutes: int = 45,
                  enable_swing_reversal: bool = True,
                  enable_mean_reversion: bool = False,
-                 expectancy_engine: Optional["ExpectancyEngine"] = None):
+                 expectancy_engine: Optional["ExpectancyEngine"] = None,
+                 # [MTF-CONFLUENCE] Alternate, fully deterministic entry engine
+                 # (see mtf_confluence_engine.py) selectable alongside the
+                 # default V9.2 L1/L2/L3/StrategyScorer pipeline — swap via
+                 # ADAPTIVE_ENTRY_ENGINE=mtf_confluence in run_bot.py. Exit
+                 # management (T1/T2/SL/post-T1 protection) is unchanged
+                 # either way; this only replaces how direction+timing is
+                 # decided. "adaptive" = existing V9.2 pipeline (default).
+                 entry_engine: str = "adaptive"):
         self.state: str = "SCANNING"
+        self.entry_engine       = entry_engine
+        self.mtf_engine         = MTFConfluenceEngine()
         self.adaptive_engine    = AdaptiveEngine()
         self.health_calc        = PositionHealthCalculator()
         self.macro_engine       = MacroTrendEngine()
@@ -983,6 +994,10 @@ class TradingBot:
         # [SCAN-INFO] last per-direction signal evaluation, for the runner's
         # 5-min scan log (why we are / aren't trading right now)
         self._scan_info: Dict[str, str] = {}
+
+        # [MTF-CONFLUENCE] raw OHLCV lists from the most recent on_tick call
+        # (see on_tick's raw_candles param) — None until the first tick.
+        self._raw_candles: Optional[Dict[str, List]] = None
 
         # [TARGET ALERTS] queued Telegram-ready dicts for each target hit /
         # SL ratchet move, popped by the runner after on_tick / intrabar checks
@@ -1745,6 +1760,58 @@ class TradingBot:
             "entry_tags":        _current_tags,
         }
 
+    # ── [MTF-CONFLUENCE] Alternate entry engine ───────────────────────────────
+
+    def _generate_signal_mtf(self, candle_15m: Dict, ind_15m: Dict) -> Optional[Dict]:
+        """
+        Deterministic MTF alignment + 3-signal confluence entry (see
+        mtf_confluence_engine.py). Direction/timing come entirely from that
+        engine — SL/sizing/exits below reuse the existing V9.2 machinery
+        unchanged so this only swaps *when and which way* a trade opens.
+        The confluence check is boolean (all-or-nothing), so unlike the
+        scored V9.2 signal there's no graded confidence to report — a fired
+        signal gets full conviction (health/confidence/total = 100).
+        """
+        raw = self._raw_candles or {}
+        c15 = raw.get("15m")
+        if not c15:
+            self._scan_info["MTF"] = "no raw 15m candles supplied to on_tick"
+            return None
+
+        direction = self.mtf_engine.process_15m(
+            c15, self._bar_count, self.position_open, self.state == "COOLDOWN",
+        )
+        diag = self.mtf_engine.last_diag
+        self._scan_info["MTF"] = (
+            f"macro={diag.get('macro')} mid={diag.get('mid')} "
+            f"dir={diag.get('trade_direction')} "
+            f"long={diag.get('long_status')} short={diag.get('short_status')}"
+        )
+        if direction is None:
+            return None
+
+        sl_price = self._compute_sl_price(ind_15m, candle_15m, direction, "Trend")
+        return {
+            "direction":         direction,
+            "sl_price":          sl_price,
+            "health_score":      100.0,
+            "confidence_score":  100.0,
+            "total_score":       100.0,
+            "entry_score":       100.0,
+            "context_score":     100.0,
+            "direction_fit":     100.0,
+            "entry_type":        "mtf_confluence",
+            "strategy":          f"MTF_{direction}",
+            "regime":            self.current_market_state,
+            "l1_score":          self.regime_score,
+            "l1_level":          self.current_regime_bias,
+            "l2_bull":           0.0,
+            "l2_bear":           0.0,
+            "all_strategies":    {},
+            "condition_penalty": 0.0,
+            "entry_tags":        [],
+        }
+
     # ── Lightweight cooldown check — independent of new-candle ticks ─────────
 
     def check_cooldown_expiry(self, now: Optional[datetime.datetime] = None) -> bool:
@@ -1962,18 +2029,25 @@ class TradingBot:
             )
             return False
 
-        if self.current_market_state not in _TRADEABLE_REGIMES:
-            self._log_event(
-                f"SKIP: untradeable regime={self.current_market_state}", level="debug"
-            )
-            return False
+        # [MTF-CONFLUENCE] These two gates are V9.2-specific entry-quality
+        # rules learned from the L1/L2/L3 pipeline's own backtests (the
+        # 5-regime taxonomy and the Asia-hours WR finding). The MTF engine
+        # has its own direction gate (4H+1H trend alignment, checked inside
+        # process_15m/_generate_signal_mtf) that plays the equivalent role,
+        # so neither V9.2 rule applies when it's the active engine.
+        if self.entry_engine == "adaptive":
+            if self.current_market_state not in _TRADEABLE_REGIMES:
+                self._log_event(
+                    f"SKIP: untradeable regime={self.current_market_state}", level="debug"
+                )
+                return False
 
-        # [V9.1 QUALITY] Session gate — Asia hours (00-05 UTC) proved 37-45% WR
-        if _now.hour in self.BLOCKED_ENTRY_HOURS_UTC:
-            self._log_event(
-                f"SKIP: blocked session hour {_now.hour:02d} UTC", level="debug"
-            )
-            return False
+            # [V9.1 QUALITY] Session gate — Asia hours (00-05 UTC) proved 37-45% WR
+            if _now.hour in self.BLOCKED_ENTRY_HOURS_UTC:
+                self._log_event(
+                    f"SKIP: blocked session hour {_now.hour:02d} UTC", level="debug"
+                )
+                return False
 
         return True
 
@@ -2598,15 +2672,22 @@ class TradingBot:
     def on_tick(self, candle_15m: Dict, candle_1h: Dict, candle_4h: Dict,
                 ind_15m: Dict, ind_1h: Dict, ind_4h: Dict,
                 extras: Dict, current_price: float,
-                bar_dt: Optional[datetime.datetime] = None):
+                bar_dt: Optional[datetime.datetime] = None,
+                raw_candles: Optional[Dict[str, List]] = None):
         """
         Called once per closed 15M candle.
-        Signature unchanged from V7 — backtest engine compatible.
+        Signature backward compatible with V7/V9.2 callers — `raw_candles`
+        is new and optional (default None), only read when entry_engine is
+        "mtf_confluence" (that engine needs whole OHLCV series, current +
+        previous bar, for HMA/ROC/MACD cross detection — the ind_* dicts
+        here carry only the latest bar's scalar values). Expected shape:
+        {"15m": [...], "1h": [...], "4h": [...]} (connectors.base.OHLCV lists).
         """
         now = bar_dt or datetime.datetime.now()
         self._bar_now = now
         self._bar_count += 1
         self._last_candle_15m = candle_15m
+        self._raw_candles = raw_candles
 
         if self._startup_unblock_at is None and self.startup_warmup_minutes > 0:
             self._startup_unblock_at = now + datetime.timedelta(
@@ -2634,6 +2715,14 @@ class TradingBot:
         self.current_regime_bias  = _l1["level"]
         self.regime_score         = _l1["score"]
         self._l1_cache, self._l2_cache, self._l3_cache = _l1, _l2, _l3
+
+        # [MTF-CONFLUENCE] Runs alongside the V9.2 classification above
+        # (cheap, and keeps current_market_state/regime_score meaningful for
+        # logging/chart-alert display even in this mode) — only the FILTERING
+        # branch below actually acts on it when entry_engine is set to it.
+        if raw_candles and raw_candles.get("4h") and raw_candles.get("1h"):
+            self.mtf_engine.update_macro(raw_candles["4h"])
+            self.mtf_engine.update_mid(raw_candles["1h"])
 
         self._tick_depth = 0
         state_changed = True
@@ -2664,7 +2753,9 @@ class TradingBot:
                 )
 
                 best_signal: Optional[Dict] = None
-                if self._entries_enabled:
+                if self._entries_enabled and self.entry_engine == "mtf_confluence":
+                    best_signal = self._generate_signal_mtf(candle_15m, ind_15m)
+                elif self._entries_enabled:
                     for direction in ("LONG", "SHORT"):
                         sig = self._generate_signal(
                             direction, candle_15m, ind_15m, ind_1h, ind_4h,
@@ -2829,6 +2920,7 @@ class TradingBot:
             "market_state":       self.current_market_state,
             "regime_bias":        self.current_regime_bias,
             "regime_score":       self.regime_score,
+            "entry_engine":       self.entry_engine,
             "cooldown_until":     self.cooldown_until.isoformat() if self.cooldown_until else None,
             "warmup_remaining_m": warmup_remaining,
             "scan_info":          dict(self._scan_info),
@@ -2958,6 +3050,9 @@ class TradingBot:
             # (run_bot.py's _send_target_alerts) doesn't silently drop a
             # Telegram notification for a ladder level that already fired.
             "pending_target_alerts": self._pending_target_alerts,
+            # [MTF-CONFLUENCE] in-flight setup state (bar-window based, so a
+            # restart mid-collection would otherwise silently drop it)
+            "mtf_engine":           self.mtf_engine.to_dict(),
             "saved_at":             datetime.datetime.now().isoformat(),
         }
         tmp_path = f"{path}.tmp"
@@ -3043,6 +3138,8 @@ class TradingBot:
         }
 
         self._pending_target_alerts = data.get("pending_target_alerts", [])
+
+        self.mtf_engine.load_dict(data.get("mtf_engine"))
 
         self._log_event(
             f"State loaded | state={self.state} pos={self.position_open} "

@@ -189,6 +189,12 @@ def build_config() -> dict:
         # × LEVERAGE for every trade regardless of quality. 0 = disabled
         # (default — adaptive %-of-balance above takes over instead).
         "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 0.0),
+        # [MTF-CONFLUENCE] "adaptive" (default) = V9.2 L1/L2/L3/StrategyScorer
+        # pipeline. "mtf_confluence" = deterministic 4H+1H trend-alignment +
+        # 15m 3-signal confluence entry engine (see mtf_confluence_engine.py)
+        # — exit management (T1/T2/SL/post-T1 protection) is identical
+        # either way, only entry direction+timing changes.
+        "adaptive_entry_engine": os.environ.get("ADAPTIVE_ENTRY_ENGINE", "adaptive").strip().lower(),
     }
 
 
@@ -448,6 +454,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             margin_usdt=cfg.get("adaptive_margin_usdt", 0.0),
             sizing_leverage=cfg.get("leverage", 10),
             expectancy_engine=shared_expectancy,
+            entry_engine=cfg.get("adaptive_entry_engine", "adaptive"),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)
@@ -681,6 +688,11 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                                 ind_15m, ind_1h, ind_4h,
                                 extras, price,
                                 bar_dt=bdt,
+                                # [MTF-CONFLUENCE] needs whole OHLCV series
+                                # (current+previous bar) for HMA/ROC/MACD
+                                # cross detection — no-op when entry_engine
+                                # is "adaptive" (default).
+                                raw_candles={"15m": c15m, "1h": c1h, "4h": c4h},
                             )
                         )
 
