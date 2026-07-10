@@ -160,10 +160,12 @@ class Config:
     entry_vol_expansion_mult: float = 1.5   # volume > this x vol_ma20 = expansion
     entry_wick_reject_frac: float = 0.5     # wick >= this fraction of bar range
     entry_sweep_lookback: int = 10          # bars for liquidity-sweep prior low/high
-    # Optional hard gates on top of the 5-category >=4/5 check, off by
-    # default — toggle on to test whether they cut the low-conviction
-    # TP1-then-breakeven bucket found in the local BTC/XAU backtest.
-    entry_adx_gate_enabled: bool = False
+    # Optional hard gates on top of the 5-category >=4/5 check. MEASURED on
+    # the local BTC/XAU set: ADX gate alone improved every metric (PF
+    # 0.637->0.670, WR 63.8%->65.2%, net -18102->-16022, avg_R -0.153->-0.136)
+    # -> enabled. entry_participation_mandatory measured WORSE (PF->0.598)
+    # -> stays off.
+    entry_adx_gate_enabled: bool = True
     entry_adx_min: float = 20.0             # 30M ADX must clear this when the gate is on
     entry_participation_mandatory: bool = False  # require volume/participation, not just optional
 
