@@ -54,6 +54,8 @@ class PositionManager:
         stop_loss:   float,
         take_profit: float,
         atr:         float,
+        tp1_rr:      Optional[float] = None,  # Layer 8 (Dynamic Risk Engine) override
+        tp2_rr:      Optional[float] = None,
     ) -> None:
         self._positions[position_id] = {
             "direction":      direction,
@@ -61,6 +63,8 @@ class PositionManager:
             "sl":             stop_loss,
             "tp":             take_profit,
             "initial_risk":   abs(entry_price - stop_loss),
+            "tp1_rr":         tp1_rr if tp1_rr is not None else self.tp1_rr,
+            "tp2_rr":         tp2_rr if tp2_rr is not None else self.tp2_rr,
             "tp1_done":       False,
             "tp2_done":       False,
             "opened_at":      time.time(),
@@ -80,6 +84,8 @@ class PositionManager:
         direction  = pos["direction"]
         entry      = pos["entry"]
         init_risk  = pos["initial_risk"]
+        tp1_rr     = pos.get("tp1_rr", self.tp1_rr)
+        tp2_rr     = pos.get("tp2_rr", self.tp2_rr)
 
         if direction == "long":
             profit = current_price - entry
@@ -97,17 +103,17 @@ class PositionManager:
                 exit_score=exit_score,
             )
 
-        # ── TP2 @ 1.2R → close remaining 50% ────────────────────────────────
-        if not pos["tp2_done"] and current_rr >= self.tp2_rr:
+        # ── TP2 (regime-aware R target) → close remaining 50% ───────────────
+        if not pos["tp2_done"] and current_rr >= tp2_rr:
             pos["tp2_done"] = True
             return PositionUpdate(
                 action="close", close_pct=1.0,
-                reason=f"TP2 @ R:R {current_rr:.2f} (target {self.tp2_rr}R)",
+                reason=f"TP2 @ R:R {current_rr:.2f} (target {tp2_rr}R)",
                 exit_score=exit_score,
             )
 
-        # ── TP1 @ 0.6R (halfway) → close 50%, move SL to BE ─────────────────
-        if not pos["tp1_done"] and current_rr >= self.tp1_rr:
+        # ── TP1 (regime-aware halfway target) → close 50%, move SL to BE ────
+        if not pos["tp1_done"] and current_rr >= tp1_rr:
             pos["tp1_done"] = True
             # break-even = entry price (slight buffer of 0 pips — user can adjust)
             be_sl = round(entry, 8)
@@ -115,7 +121,7 @@ class PositionManager:
             return PositionUpdate(
                 action="partial_tp", close_pct=0.50,
                 new_sl=be_sl,
-                reason=f"TP1 @ R:R {current_rr:.2f} (≥{self.tp1_rr}R) → 50% closed, SL→BE",
+                reason=f"TP1 @ R:R {current_rr:.2f} (≥{tp1_rr}R) → 50% closed, SL→BE",
                 exit_score=exit_score,
             )
 

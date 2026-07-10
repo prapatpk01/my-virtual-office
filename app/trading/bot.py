@@ -27,19 +27,23 @@ from .engines.drift_detector import DriftAction
 
 logger = logging.getLogger("trading_bot")
 
-# Confidence level → fraction of balance to allocate per trade
+# Confidence level → fraction of balance to allocate per trade (fallback
+# sizing only, used when a signal has no usable SL price).
 _CONFIDENCE_SIZE: dict[str, float] = {
     "WEAK":            float(os.getenv("SIZE_WEAK",  "0.08")),
     "GOOD":            float(os.getenv("SIZE_GOOD",  "0.10")),
     "HIGH_CONVICTION": float(os.getenv("SIZE_HIGH",  "0.12")),
 }
 _DEFAULT_SIZE = float(os.getenv("SIZE_WEAK", "0.08"))
+# Layer 6 Confidence Engine level names -> legacy tier names above
+_LEVEL_ALIAS = {"GOOD": "GOOD", "HIGH_CONFIDENCE": "HIGH_CONVICTION", "SKIP": "WEAK"}
 
 
 def _confidence_size_pct(metadata: dict) -> float:
     """Return allocation fraction (0.08–0.12) based on AI confidence level."""
-    level = (metadata or {}).get("confidence_level", "")
-    return _CONFIDENCE_SIZE.get(level.upper(), _DEFAULT_SIZE)
+    level = (metadata or {}).get("confidence_level", "").upper()
+    level = _LEVEL_ALIAS.get(level, level)
+    return _CONFIDENCE_SIZE.get(level, _DEFAULT_SIZE)
 
 
 @dataclass
@@ -809,13 +813,20 @@ class TradingBot:
         # amount is sized so that a full SL hit loses exactly RISK_PER_TRADE_PCT
         # of balance — not a fixed % of balance as notional (that conflates
         # position size with risk, which vary a lot with how far SL sits).
-        risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "0.05"))
-        risk_per_unit = abs(price - sl_p) if sl_p else 0
+        # Layer 8 (Dynamic Risk Engine) scales this base risk% up/down per
+        # trade based on market quality / confidence / expectancy / volatility.
+        base_risk_pct    = float(os.getenv("RISK_PER_TRADE_PCT", "0.05"))
+        risk_multiplier  = meta.get("dynamic_risk", {}).get("risk_multiplier", 1.0)
+        risk_pct         = base_risk_pct * risk_multiplier
+        risk_per_unit    = abs(price - sl_p) if sl_p else 0
 
         if risk_per_unit > 0:
             risk_dollars = quote_balance * risk_pct
             amount = round(risk_dollars / risk_per_unit, 6)
-            sizing_label = f"risk-based {risk_pct*100:.1f}% (SL {risk_per_unit/price*100:.2f}% away)"
+            sizing_label = (
+                f"risk-based {risk_pct*100:.2f}% (base {base_risk_pct*100:.1f}% x "
+                f"{risk_multiplier:.2f} Layer8) — SL {risk_per_unit/price*100:.2f}% away"
+            )
         else:
             # No usable SL from the signal — fall back to confidence-tiered notional sizing
             size_pct = _confidence_size_pct(meta)

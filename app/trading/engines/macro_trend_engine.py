@@ -13,11 +13,15 @@ Score components (100 pts total):
   Market structure (BOS)    15 pts
 
 Thresholds:
-  85+   STRONG_BULL
-  65-85 BULL
-  35-65 NEUTRAL
-  15-35 BEAR
-  0-15  STRONG_BEAR
+  90+   STRONG_BULL  -> allowed_direction = long_only
+  70-89 BULL         -> allowed_direction = both
+  45-69 NEUTRAL      -> allowed_direction = both
+  20-44 BEAR         -> allowed_direction = both
+  0-19  STRONG_BEAR  -> allowed_direction = short_only
+
+Macro NEVER picks entries. It only constrains which directions the
+lower layers (Regime Classifier / Strategy Selector / Strategy Engine)
+are permitted to act on — this is Layer 1's "Direction Gate" role.
 """
 from __future__ import annotations
 
@@ -47,16 +51,28 @@ class MacroTrendResult:
     detail: dict
 
     def allows_long(self) -> bool:
-        return self.score >= 35
+        return self.score >= 20
 
     def allows_short(self) -> bool:
-        return self.score <= 65
+        return self.score <= 80
 
     def is_counter_trend_long(self) -> bool:
         return self.bias in (TrendBias.BEAR, TrendBias.STRONG_BEAR)
 
     def is_counter_trend_short(self) -> bool:
         return self.bias in (TrendBias.BULL, TrendBias.STRONG_BULL)
+
+    def allowed_direction(self) -> str:
+        """Layer 1 output: 'long_only' | 'short_only' | 'both' | 'no_trade'.
+        Macro NEVER picks entries — it only fences which directions Layer 4/5
+        are allowed to act on."""
+        if self.bias == TrendBias.STRONG_BULL:
+            return "long_only"
+        if self.bias == TrendBias.STRONG_BEAR:
+            return "short_only"
+        if self.bias in (TrendBias.BULL, TrendBias.NEUTRAL, TrendBias.BEAR):
+            return "both"
+        return "no_trade"
 
 
 class MacroTrendEngine:
@@ -184,13 +200,13 @@ class MacroTrendEngine:
 
     @staticmethod
     def _classify(score: float) -> TrendBias:
-        if score >= 85:
+        if score >= 90:
             return TrendBias.STRONG_BULL
-        if score >= 65:
+        if score >= 70:
             return TrendBias.BULL
-        if score >= 35:
+        if score >= 45:
             return TrendBias.NEUTRAL
-        if score >= 15:
+        if score >= 20:
             return TrendBias.BEAR
         return TrendBias.STRONG_BEAR
 
