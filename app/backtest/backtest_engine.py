@@ -71,6 +71,12 @@ class BacktestConfig:
     # UNVALIDATED pending backtest; off by default.
     enable_early_trend: bool = False
 
+    # [FAST MACRO EMA] override L1's EMA20/50 cross component with a faster
+    # pair (e.g. 12/26) computed fresh from raw 4H candles. None/None (default)
+    # = untouched EMA20/50 (IndicatorEngine's shared values).
+    macro_ema_fast: Optional[int] = None
+    macro_ema_slow: Optional[int] = None
+
     # Position sizing safety
     min_sl_pct:     float = 0.020    # minimum SL distance = 2.0% — limits notional to ≤$5000 at 1% risk
     max_position_usd: float = 10_000  # max notional per trade (safety cap)
@@ -281,6 +287,8 @@ class SymbolBacktest:
             expectancy_engine      = self.expectancy_engine,
             entry_engine           = self.cfg.entry_engine,
             enable_early_trend     = self.cfg.enable_early_trend,
+            macro_ema_fast         = self.cfg.macro_ema_fast,
+            macro_ema_slow         = self.cfg.macro_ema_slow,
         )
 
         trade_records: List[TradeRecord] = []

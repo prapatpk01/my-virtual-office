@@ -195,6 +195,19 @@ def build_config() -> dict:
         # — exit management (T1/T2/SL/post-T1 protection) is identical
         # either way, only entry direction+timing changes.
         "adaptive_entry_engine": os.environ.get("ADAPTIVE_ENTRY_ENGINE", "adaptive").strip().lower(),
+        # [EARLY TREND] fast dual-TF (4H+1H) HMA/MACD/ROC lean folded into L1's
+        # score when confirmed. Backtested MIXED on real data (helps OOS,
+        # hurts in-sample, net ~breakeven across both) — off by default,
+        # not currently recommended.
+        "adaptive_early_trend": _env_bool("ADAPTIVE_EARLY_TREND", False),
+        # [FAST MACRO EMA] override L1's EMA20/50 cross component with a
+        # faster pair (e.g. 12/26, the classic MACD periods). Backtested on
+        # real Jan-Jun 2026 data: +$209 combined vs EMA20/50 baseline,
+        # improving BOTH the in-sample and out-of-sample splits independently
+        # (not just one) — recommended, but still off by default until it's
+        # been run live/paper for a stretch. Set both or neither.
+        "adaptive_macro_ema_fast": (_env_int("ADAPTIVE_MACRO_EMA_FAST", 0) or None),
+        "adaptive_macro_ema_slow": (_env_int("ADAPTIVE_MACRO_EMA_SLOW", 0) or None),
     }
 
 
@@ -455,6 +468,9 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             sizing_leverage=cfg.get("leverage", 10),
             expectancy_engine=shared_expectancy,
             entry_engine=cfg.get("adaptive_entry_engine", "adaptive"),
+            enable_early_trend=cfg.get("adaptive_early_trend", False),
+            macro_ema_fast=cfg.get("adaptive_macro_ema_fast"),
+            macro_ema_slow=cfg.get("adaptive_macro_ema_slow"),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)

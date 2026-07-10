@@ -224,9 +224,19 @@ class MacroTrendEngine:
         ( 0, "STRONG_BEAR"),
     ]
 
-    def compute(self, ind_4h: Dict, early_trend: Optional[Dict] = None) -> Dict:
-        ema20  = ind_4h.get("ema20", 0.0)
-        ema50  = ind_4h.get("ema50", ema20)
+    def compute(self, ind_4h: Dict, early_trend: Optional[Dict] = None,
+               ema_fast_override: Optional[float] = None,
+               ema_slow_override: Optional[float] = None) -> Dict:
+        # [FAST MACRO EMA] Component 1 defaults to IndicatorEngine's EMA20/50
+        # (shared with every other consumer — chop-zone veto, ContextBiasEngine,
+        # etc., untouched). ema_fast_override/ema_slow_override (e.g. EMA12/26,
+        # computed by the caller from raw 4H candles — see on_tick) let this ONE
+        # component react faster without recomputing IndicatorEngine's shared
+        # EMA20/50 globally. slope_score below intentionally keeps reading
+        # ind_4h's real EMA20 slope either way — this only affects the cross
+        # /distance read, a narrower, independently-testable change.
+        ema20  = ema_fast_override if ema_fast_override is not None else ind_4h.get("ema20", 0.0)
+        ema50  = ema_slow_override if ema_slow_override is not None else ind_4h.get("ema50", ema20)
         slope  = ind_4h.get("ema20_slope_score", 50.0)
         adx    = ind_4h.get("adx", 20.0)
         pdi    = ind_4h.get("pdi", 20.0)
@@ -234,7 +244,7 @@ class MacroTrendEngine:
         atr_e  = ind_4h.get("atr_exp", 1.0)
         struct = ind_4h.get("structure_score", 50.0)  # price vs EMA20 vs EMA50
 
-        # 1. EMA20 vs EMA50 cross / distance (25%)
+        # 1. EMA fast vs slow cross / distance (25%) — EMA20/50 unless overridden
         ref = max(ema50, 1e-9)
         ema_spread  = (ema20 - ref) / ref
         ema_score   = float(np.clip(50.0 + ema_spread * 1500.0, 0, 100))
@@ -1019,10 +1029,19 @@ class TradingBot:
                  # [EARLY TREND] see compute_early_trend/MacroTrendEngine —
                  # UNVALIDATED pending backtest; default off so nothing
                  # changes for existing deployments until proven.
-                 enable_early_trend: bool = False):
+                 enable_early_trend: bool = False,
+                 # [FAST MACRO EMA] Override L1's EMA20/50 cross/distance
+                 # component with a faster pair (e.g. 12/26, the classic MACD
+                 # periods) computed from raw 4H candles — see MacroTrendEngine
+                 # .compute()'s ema_fast_override/ema_slow_override. None/None
+                 # (default) = untouched EMA20/50 behavior.
+                 macro_ema_fast: Optional[int] = None,
+                 macro_ema_slow: Optional[int] = None):
         self.state: str = "SCANNING"
         self.entry_engine       = entry_engine
         self.enable_early_trend = enable_early_trend
+        self.macro_ema_fast     = macro_ema_fast
+        self.macro_ema_slow     = macro_ema_slow
         self.mtf_engine         = MTFConfluenceEngine()
         self.adaptive_engine    = AdaptiveEngine()
         self.health_calc        = PositionHealthCalculator()
@@ -2817,8 +2836,22 @@ class TradingBot:
         if self.enable_early_trend and raw_candles and raw_candles.get("4h") and raw_candles.get("1h"):
             _early_trend = compute_early_trend(raw_candles["4h"], raw_candles["1h"])
 
+        # [FAST MACRO EMA] EMA_fast/EMA_slow (e.g. 12/26) computed fresh from
+        # raw 4H candles — IndicatorEngine's shared ema20/ema50 are untouched.
+        _ema_fast_ovr = _ema_slow_ovr = None
+        if self.macro_ema_fast and self.macro_ema_slow and raw_candles and raw_candles.get("4h"):
+            _closes_4h = [float(c.close) for c in raw_candles["4h"]]
+            if len(_closes_4h) >= self.macro_ema_slow:
+                _fast_arr = BaseStrategy.ema(_closes_4h, self.macro_ema_fast)
+                _slow_arr = BaseStrategy.ema(_closes_4h, self.macro_ema_slow)
+                if not (np.isnan(_fast_arr[-1]) or np.isnan(_slow_arr[-1])):
+                    _ema_fast_ovr, _ema_slow_ovr = float(_fast_arr[-1]), float(_slow_arr[-1])
+
         # [V9] 3-layer macro → context → regime classification
-        _l1 = self.macro_engine.compute(ind_4h, early_trend=_early_trend)
+        _l1 = self.macro_engine.compute(
+            ind_4h, early_trend=_early_trend,
+            ema_fast_override=_ema_fast_ovr, ema_slow_override=_ema_slow_ovr,
+        )
         _l2 = self.context_engine.compute(ind_1h)
         _l3 = self.regime_clf.classify(_l1, _l2, ind_15m)
         self.current_market_state = _l3["regime"]

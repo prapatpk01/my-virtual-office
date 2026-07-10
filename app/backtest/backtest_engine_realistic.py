@@ -115,6 +115,8 @@ class RealisticSymbolBacktest(SymbolBacktest):
             expectancy_engine      = self.expectancy_engine,
             entry_engine           = self.cfg.entry_engine,
             enable_early_trend     = self.cfg.enable_early_trend,
+            macro_ema_fast         = self.cfg.macro_ema_fast,
+            macro_ema_slow         = self.cfg.macro_ema_slow,
         )
 
         trade_records: List[TradeRecord] = []
@@ -395,7 +397,14 @@ if __name__ == "__main__":
     parser.add_argument("--early-trend", action="store_true",
                         help="fold a fast dual-TF (4H+1H) HMA/MACD/ROC lean into "
                              "L1's score when confirmed (see compute_early_trend)")
+    parser.add_argument("--macro-ema", default="",
+                        help="override L1's EMA20/50 cross component with a faster "
+                             "pair, e.g. --macro-ema 12,26")
     args = parser.parse_args()
+
+    macro_ema_fast = macro_ema_slow = None
+    if args.macro_ema:
+        macro_ema_fast, macro_ema_slow = (int(x) for x in args.macro_ema.split(","))
 
     cfg = BacktestConfig(
         initial_balance=args.balance,
@@ -404,6 +413,8 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         entry_engine=args.entry_engine,
         enable_early_trend=args.early_trend,
+        macro_ema_fast=macro_ema_fast,
+        macro_ema_slow=macro_ema_slow,
     )
     syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
     engine = RealisticBacktestEngine(data_root=args.data_root, output_dir=args.output_dir, cfg=cfg)
