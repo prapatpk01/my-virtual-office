@@ -1,0 +1,41 @@
+{
+  "symbol": "SOL",
+  "total_trades": 6,
+  "win_rate": 0.5,
+  "profit_factor": 0.437,
+  "net_pnl": -135.87,
+  "net_pnl_pct": -1.36,
+  "avg_win": 35.13,
+  "avg_loss": -80.42,
+  "avg_rr": 0.437,
+  "max_drawdown_pct": 1.73,
+  "sharpe": -6.039,
+  "final_balance": 9864.13,
+  "avg_bars_held": 1.0,
+  "total_commission": 22.88,
+  "by_market_state": {
+    "Range": {
+      "wins": 1,
+      "losses": 2,
+      "pnl": -89.28382390571338,
+      "win_rate": 0.3333333333333333,
+      "total": 3
+    },
+    "Breakout": {
+      "wins": 2,
+      "losses": 0,
+      "pnl": 57.97575328052275,
+      "win_rate": 1.0,
+      "total": 2
+    },
+    "Trend": {
+      "wins": 0,
+      "losses": 1,
+      "pnl": -104.5574963014652,
+      "win_rate": 0.0,
+      "total": 1
+    }
+  },
+  "longs": 4,
+  "shorts": 2
+}

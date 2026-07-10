@@ -114,6 +114,7 @@ class RealisticSymbolBacktest(SymbolBacktest):
             enable_mean_reversion  = True,
             expectancy_engine      = self.expectancy_engine,
             entry_engine           = self.cfg.entry_engine,
+            enable_early_trend     = self.cfg.enable_early_trend,
         )
 
         trade_records: List[TradeRecord] = []
@@ -391,6 +392,9 @@ if __name__ == "__main__":
                         choices=["adaptive", "mtf_confluence"],
                         help="adaptive (default V9.2 pipeline) or mtf_confluence "
                              "(4H+1H trend-alignment + 15m 3-signal confluence)")
+    parser.add_argument("--early-trend", action="store_true",
+                        help="fold a fast dual-TF (4H+1H) HMA/MACD/ROC lean into "
+                             "L1's score when confirmed (see compute_early_trend)")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
@@ -399,6 +403,7 @@ if __name__ == "__main__":
         data_root=args.data_root,
         output_dir=args.output_dir,
         entry_engine=args.entry_engine,
+        enable_early_trend=args.early_trend,
     )
     syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
     engine = RealisticBacktestEngine(data_root=args.data_root, output_dir=args.output_dir, cfg=cfg)

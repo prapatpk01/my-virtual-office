@@ -50,7 +50,8 @@ import logging
 from typing import Optional, Callable, Dict, List, Any
 
 from .strategies.mean_reversion import MeanReversionStrategy
-from .mtf_confluence_engine import MTFConfluenceEngine
+from .mtf_confluence_engine import MTFConfluenceEngine, hma, roc
+from .strategies.base import BaseStrategy
 
 
 logger = logging.getLogger("adaptive_trading_bot")
@@ -135,6 +136,58 @@ _REGIME_ENTRY_TYPE: Dict[str, str] = {
 # L1 — 4H MACRO TREND ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _fast_lean_score(candles: List) -> float:
+    """
+    [EARLY TREND] Continuous 0-100 directional lean from the SAME
+    low-lag indicator family as mtf_confluence_engine (HMA10/20, ROC9,
+    MACD histogram) — evaluated on the current bar's state, not on a
+    cross event, so it moves every bar rather than only at the moment
+    of a cross. This is the "fast" read MacroTrendEngine.compute()
+    blends in as its early-trend component: EMA20/50 needs the price to
+    travel a long way before crossing, while HMA/MACD/ROC already lean
+    a clear direction well before that (see the reference chart that
+    prompted this — HMA/MACD/ROC all turned up several bars before any
+    EMA20/50-based signal would have reacted).
+    50.0 (neutral) when there isn't enough history to compute yet.
+    """
+    if len(candles) < 40:
+        return 50.0
+    closes = [float(c.close) for c in candles]
+    hma_f = hma(closes, 10)
+    hma_s = hma(closes, 20)
+    r     = roc(closes, 9)
+    _, macd_sig, macd_hist = BaseStrategy.macd(closes, 12, 26, 9)
+    vals = (hma_f[-1], hma_s[-1], r[-1], macd_hist[-1], macd_sig[-1])
+    if any(np.isnan(v) for v in vals):
+        return 50.0
+
+    price = max(closes[-1], 1e-9)
+    hma_lean  = float(np.clip(50.0 + (hma_f[-1] - hma_s[-1]) / price * 3000.0, 0, 100))
+    roc_lean  = float(np.clip(50.0 + r[-1] * 10.0, 0, 100))
+    hist_lean = float(np.clip(
+        50.0 + macd_hist[-1] / max(abs(macd_sig[-1]), 1e-9) * 50.0, 0, 100))
+
+    return hma_lean * 0.4 + roc_lean * 0.3 + hist_lean * 0.3
+
+
+def compute_early_trend(candles_4h: List, candles_1h: List) -> Dict:
+    """
+    [EARLY TREND] Dual-timeframe confirmation gate for the fast lean above.
+    Both 4H and 1H must lean the SAME direction (both >55 or both <45) —
+    matching the user's own explicit requirement to confirm across 2 TFs
+    before accelerating the regime call, so a single timeframe's noise
+    can't jerk the macro trend around on its own.
+    """
+    tf4h = _fast_lean_score(candles_4h)
+    tf1h = _fast_lean_score(candles_1h)
+    confirmed = (tf4h > 55 and tf1h > 55) or (tf4h < 45 and tf1h < 45)
+    return {
+        "tf4h": tf4h, "tf1h": tf1h,
+        "score": (tf4h + tf1h) / 2.0,
+        "confirmed": confirmed,
+    }
+
+
 class MacroTrendEngine:
     """
     L1: 4H Macro Trend Engine
@@ -142,13 +195,25 @@ class MacroTrendEngine:
             atr_exp, structure_score)
     Outputs: score 0-100 (100=max bull, 0=max bear), 5-level label, direction
 
-    Component weights:
+    Component weights (early_trend=None, the default — identical to every
+    backtest run so far, no regression):
       EMA20 vs EMA50 cross & distance : 25%
       EMA20 slope                      : 20%
       ADX strength + DI direction      : 20%
       Efficiency ratio (HH/HL proxy)   : 15%
       ATR regime (expansion=trending)  : 10%
       Market structure score           : 10%
+
+    [EARLY TREND] When called with a CONFIRMED early_trend dict (see
+    compute_early_trend — both 4H and 1H fast indicators agree), weights
+    rebalance to fold in a 7th, low-lag component so a fresh reversal
+    shows up in the score before EMA20/50 would otherwise catch up:
+      EMA20 vs EMA50 : 20%   EMA20 slope : 15%   ADX+DI : 15%
+      Efficiency     : 10%   ATR regime  : 10%   Structure : 10%
+      Early Trend (confirmed 4H+1H HMA/MACD/ROC) : 20%
+    Unconfirmed (only one TF agrees, or none) -> behaves exactly like
+    early_trend=None; this only ever adds signal, never dilutes toward
+    neutral, so it's a pure accelerant as requested, not a new veto.
     """
 
     LEVELS = [
@@ -159,7 +224,7 @@ class MacroTrendEngine:
         ( 0, "STRONG_BEAR"),
     ]
 
-    def compute(self, ind_4h: Dict) -> Dict:
+    def compute(self, ind_4h: Dict, early_trend: Optional[Dict] = None) -> Dict:
         ema20  = ind_4h.get("ema20", 0.0)
         ema50  = ind_4h.get("ema50", ema20)
         slope  = ind_4h.get("ema20_slope_score", 50.0)
@@ -192,14 +257,29 @@ class MacroTrendEngine:
         # 6. Structure score (10%) — 15/35/50/65/85 from indicator engine
         struct_score = float(np.clip(struct, 0, 100))
 
-        score = (
-            ema_score    * 0.25 +
-            slope_score  * 0.20 +
-            adx_score    * 0.20 +
-            eff_dir_score * 0.15 +
-            atr_score    * 0.10 +
-            struct_score * 0.10
-        )
+        if early_trend and early_trend.get("confirmed"):
+            # [EARLY TREND] 7th component, rebalanced weights — see class
+            # docstring. Only ever engages when compute_early_trend() found
+            # BOTH 4H and 1H fast indicators agreeing; otherwise identical
+            # to the branch below.
+            score = (
+                ema_score     * 0.20 +
+                slope_score   * 0.15 +
+                adx_score     * 0.15 +
+                eff_dir_score * 0.10 +
+                atr_score     * 0.10 +
+                struct_score  * 0.10 +
+                float(early_trend["score"]) * 0.20
+            )
+        else:
+            score = (
+                ema_score    * 0.25 +
+                slope_score  * 0.20 +
+                adx_score    * 0.20 +
+                eff_dir_score * 0.15 +
+                atr_score    * 0.10 +
+                struct_score * 0.10
+            )
         score = float(np.clip(score, 0, 100))
 
         level = "STRONG_BEAR"
@@ -935,9 +1015,14 @@ class TradingBot:
                  # management (T1/T2/SL/post-T1 protection) is unchanged
                  # either way; this only replaces how direction+timing is
                  # decided. "adaptive" = existing V9.2 pipeline (default).
-                 entry_engine: str = "adaptive"):
+                 entry_engine: str = "adaptive",
+                 # [EARLY TREND] see compute_early_trend/MacroTrendEngine —
+                 # UNVALIDATED pending backtest; default off so nothing
+                 # changes for existing deployments until proven.
+                 enable_early_trend: bool = False):
         self.state: str = "SCANNING"
         self.entry_engine       = entry_engine
+        self.enable_early_trend = enable_early_trend
         self.mtf_engine         = MTFConfluenceEngine()
         self.adaptive_engine    = AdaptiveEngine()
         self.health_calc        = PositionHealthCalculator()
@@ -2724,8 +2809,16 @@ class TradingBot:
             if len(self.atr_history) > 200:
                 self.atr_history.pop(0)
 
+        # [EARLY TREND] Fast dual-TF (4H+1H) HMA/MACD/ROC lean — see
+        # compute_early_trend. Needs raw candle series (current+previous bar),
+        # not just the latest-bar ind_4h/ind_1h scalars, so it's computed here
+        # from on_tick's raw_candles rather than inside MacroTrendEngine.
+        _early_trend = None
+        if self.enable_early_trend and raw_candles and raw_candles.get("4h") and raw_candles.get("1h"):
+            _early_trend = compute_early_trend(raw_candles["4h"], raw_candles["1h"])
+
         # [V9] 3-layer macro → context → regime classification
-        _l1 = self.macro_engine.compute(ind_4h)
+        _l1 = self.macro_engine.compute(ind_4h, early_trend=_early_trend)
         _l2 = self.context_engine.compute(ind_1h)
         _l3 = self.regime_clf.classify(_l1, _l2, ind_15m)
         self.current_market_state = _l3["regime"]

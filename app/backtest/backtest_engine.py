@@ -66,6 +66,11 @@ class BacktestConfig:
     # trading/mtf_confluence_engine.py and TradingBot's entry_engine param.
     entry_engine: str = "adaptive"
 
+    # [EARLY TREND] fast dual-TF (4H+1H) HMA/MACD/ROC lean folded into L1's
+    # score when confirmed — see compute_early_trend/MacroTrendEngine.
+    # UNVALIDATED pending backtest; off by default.
+    enable_early_trend: bool = False
+
     # Position sizing safety
     min_sl_pct:     float = 0.020    # minimum SL distance = 2.0% — limits notional to ≤$5000 at 1% risk
     max_position_usd: float = 10_000  # max notional per trade (safety cap)
@@ -275,6 +280,7 @@ class SymbolBacktest:
             enable_mean_reversion  = True,
             expectancy_engine      = self.expectancy_engine,
             entry_engine           = self.cfg.entry_engine,
+            enable_early_trend     = self.cfg.enable_early_trend,
         )
 
         trade_records: List[TradeRecord] = []
