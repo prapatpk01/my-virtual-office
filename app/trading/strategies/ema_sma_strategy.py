@@ -11,35 +11,28 @@ Entry LONG:
 
 Entry SHORT: mirror (cross down, candle opens below SMA50).
 
-SL/TP: same method + same post-entry management as ai_expert_strategy.py's
-Layer 5 (Strategy Engine) / Layer 7 (Position Manager):
+SL/TP price levels use the same formula as ai_expert_strategy.py's Layer 5
+Strategy Engine (entry_timing.py's _compute_sl_tp):
   - SL = wider of (recent swing high/low + 0.3xATR buffer) and (ATR x1.5),
     capped at 3xATR max width. ai_expert additionally scales the 1.5x
     multiplier by market regime (1.0-2.5x); this strategy has no regime
     classifier, so it always uses the TREND-regime default of 1.5x.
   - TP  = entry + 1.2R (R = |entry - SL|) — same rr_target as ai_expert.
-  - TP1 @ 0.6R -> close 50%, move SL to break-even.
-  - TP2 @ 1.2R -> close the remaining 100%.
-  Driven by the same engines.position_manager.PositionManager used by
-  ai_expert (TP1_RR/TP2_RR env vars, default 0.6/1.2), so a position opened
-  by this strategy behaves identically to an ai_expert position once it's
-  live, right up until TP2 or a full close.
+  These levels are only the hard-stop safety net (checked by bot.py's
+  risk-manager fallback against live price) — actual position closing is
+  NOT R:R/TP1/TP2-driven like ai_expert. It stays purely signal-based:
 
-Full close ALSO fires early (before TP2) on: EMA12 crossing back the wrong
-way, OR price closing on the wrong side of SMA50 — same discretionary exit
-this strategy always had, checked only after PositionManager's TP1/TP2 pass
-declines to act on the current tick.
+Exit LONG:  EMA12 crosses back below EMA26  OR  price closes below SMA50
+Exit SHORT: mirror.
 
 Exits are evaluated in tick_open_position() (called by bot.py every tick for
 an open position), NOT by returning a SELL/BUY Signal from analyze() — in
 hedge mode a SELL Signal always OPENS a new short rather than closing an
-open long. tick_open_position()'s PositionUpdate("close"/"partial_tp")
-always acts on whichever position is actually open, regardless of hedge
-mode.
+open long. tick_open_position()'s PositionUpdate("close") always closes
+whichever position is actually open, regardless of hedge mode.
 """
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import numpy as np
@@ -57,8 +50,6 @@ class EMASMAStrategy(BaseStrategy):
         sma_trend: int = 50,
         sl_atr_mult: float = 1.5,
         rr_target: float = 1.2,
-        tp1_rr: Optional[float] = None,
-        tp2_rr: Optional[float] = None,
     ):
         super().__init__(symbol, params)
         self.name = f"EMASMA({symbol})"
@@ -67,16 +58,8 @@ class EMASMAStrategy(BaseStrategy):
         self.sma_trend = sma_trend
         self.sl_atr_mult = sl_atr_mult
         self.rr_target = rr_target
-        self.tp1_rr = tp1_rr if tp1_rr is not None else float(os.getenv("TP1_RR", "0.6"))
-        self.tp2_rr = tp2_rr if tp2_rr is not None else float(os.getenv("TP2_RR", "1.2"))
-
-        from ..engines.position_manager import PositionManager
-        self._position_manager = PositionManager(
-            partial_tp_1_rr=self.tp1_rr, partial_tp_2_rr=self.tp2_rr,
-        )
 
         self._open_position: Optional[str] = None   # "long" | "short" | None
-        self._entry: Optional[dict] = None
         self._latest_candles: list = []
 
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
@@ -113,8 +96,6 @@ class EMASMAStrategy(BaseStrategy):
         if cross_up and open_above_sma50:
             sl, tp = self._compute_sl_tp("long", current_price, atr_val, highs, lows)
             self._open_position = "long"
-            self._entry = {"direction": "long", "entry_price": current_price,
-                            "stop_loss": sl, "take_profit": tp, "atr": atr_val}
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                 reason="EMA12↑EMA26 (15m) + candle opened above SMA50 (15m)",
@@ -125,8 +106,6 @@ class EMASMAStrategy(BaseStrategy):
         if cross_down and open_below_sma50:
             sl, tp = self._compute_sl_tp("short", current_price, atr_val, highs, lows)
             self._open_position = "short"
-            self._entry = {"direction": "short", "entry_price": current_price,
-                            "stop_loss": sl, "take_profit": tp, "atr": atr_val}
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
                 reason="EMA12↓EMA26 (15m) + candle opened below SMA50 (15m)",
@@ -138,39 +117,13 @@ class EMASMAStrategy(BaseStrategy):
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
         """Called every bot tick while a position is open. Hedge-mode-safe
-        exit path — always acts via PositionUpdate, never a SELL/BUY Signal."""
-        if self._open_position is None or not self._latest_candles or not self._entry:
+        exit path — closes via PositionUpdate, never a SELL/BUY Signal."""
+        if self._open_position is None or not self._latest_candles:
             return None
 
         from ..engines.position_manager import PositionUpdate
 
-        pos_id = position_key or self.symbol
-        entry = self._entry
         candles = self._latest_candles
-
-        # ── Same TP1/TP2/break-even mechanics as ai_expert (Layer 7) ────────
-        if pos_id not in self._position_manager._positions:
-            self._position_manager.register_position(
-                position_id=pos_id, direction=entry["direction"],
-                entry_price=entry["entry_price"], stop_loss=entry["stop_loss"],
-                take_profit=entry["take_profit"], atr=entry["atr"],
-                tp1_rr=self.tp1_rr, tp2_rr=self.tp2_rr,
-            )
-
-        pm_update = self._position_manager.update(
-            position_id=pos_id, current_price=current_price,
-            current_atr=entry["atr"], exit_score=0.0,
-        )
-        if pm_update.action == "close":
-            self._position_manager.remove_position(pos_id)
-            self._open_position = None
-            self._entry = None
-            return pm_update
-        if pm_update.action == "partial_tp":
-            return pm_update
-
-        # ── PositionManager passed — fall back to the strategy's own
-        # discretionary exit: EMA reversal or price crossing SMA50 ─────────
         closes = [c.close for c in candles]
         ema_f = self.ema(closes, self.ema_fast)
         ema_s = self.ema(closes, self.ema_slow)
@@ -188,9 +141,7 @@ class EMASMAStrategy(BaseStrategy):
             if cross_down or close_below_sma50:
                 reason = "EMA12 crossed below EMA26 (15m)" if cross_down \
                     else "Price closed below SMA50 (15m)"
-                self._position_manager.remove_position(pos_id)
                 self._open_position = None
-                self._entry = None
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason}")
             return PositionUpdate(action="hold", reason="Holding LONG")
 
@@ -198,9 +149,7 @@ class EMASMAStrategy(BaseStrategy):
             if cross_up or close_above_sma50:
                 reason = "EMA12 crossed above EMA26 (15m)" if cross_up \
                     else "Price closed above SMA50 (15m)"
-                self._position_manager.remove_position(pos_id)
                 self._open_position = None
-                self._entry = None
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason}")
             return PositionUpdate(action="hold", reason="Holding SHORT")
 
