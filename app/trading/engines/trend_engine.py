@@ -4,13 +4,21 @@ Trend Engine — shared, timeframe-agnostic trend scoring engine.
 Weighted composite score, 0-100, one number instead of a discrete
 bull/bear/neutral vote. 4 checks, each turned into its own continuous
 0-100 sub-score (50 = neutral, 100 = maximally bullish, 0 = maximally
-bearish), combined by weight, then averaged over the last 3 bars so a
-single noisy bar can't swing the read:
+bearish), combined by weight, then blended over the last 3 bars
+(50/30/20% weighted toward the most recent bar, not a flat average) so
+a single noisy bar can't swing the read without also lagging behind a
+real move:
 
-  EMA12/26 spread   30% — (ema12-ema26)/ema26, scaled through tanh
+  EMA12/26 spread   30% — (ema12-ema26)/ATR, scaled through tanh
   ADX + DI direction 25% — strength capped at 50, signed by +DI vs -DI
   RSI(14)            25% — used directly, already a natural 0-100/50-center scale
-  EMA12 slope        20% — bar-to-bar % change of EMA12, scaled through tanh
+  EMA12 slope        20% — bar-to-bar change of EMA12/ATR, scaled through tanh
+
+Both EMA checks are normalized by ATR, not raw %-of-price — a flat %
+threshold miscalibrates across timeframes (the same real move is a
+much smaller % on a 15m bar than a 1H bar), so scaling by the
+instrument's own current volatility keeps the score equally responsive
+whether it's fed 15m, 30m, 1H, or 4H candles.
 
 Bands (symmetric around 50):
   76-100  strong_bull      56-65  early_bull
@@ -52,23 +60,25 @@ class TrendResult:
 
 class TrendEngine:
     _WEIGHTS = {"ema": 0.30, "adx": 0.25, "rsi": 0.25, "slope": 0.20}
+    _BAR_WEIGHTS = (0.5, 0.3, 0.2)   # most-recent-first; must match avg_bars length
 
     def __init__(self, ema_fast: int = 12, ema_slow: int = 26,
-                 adx_period: int = 14, rsi_period: int = 14,
+                 adx_period: int = 14, rsi_period: int = 14, atr_period: int = 14,
                  avg_bars: int = 3,
-                 ema_spread_sensitivity: float = 15.0,
-                 slope_sensitivity: float = 80.0):
+                 ema_spread_sensitivity: float = 0.8,
+                 slope_sensitivity: float = 1.5):
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.adx_period = adx_period
         self.rsi_period = rsi_period
+        self.atr_period = atr_period
         self.avg_bars = avg_bars
         self.ema_spread_sensitivity = ema_spread_sensitivity
         self.slope_sensitivity = slope_sensitivity
 
     def analyze(self, candles: list) -> TrendResult:
         n = self.avg_bars
-        min_needed = max(self.ema_slow, self.adx_period * 2, self.rsi_period) + n + 5
+        min_needed = max(self.ema_slow, self.adx_period * 2, self.rsi_period, self.atr_period) + n + 5
         if len(candles) < min_needed:
             return TrendResult(50.0, TrendBand.SIDEWAY,
                                detail={"reason": f"need {min_needed}+ candles, have {len(candles)}"})
@@ -81,15 +91,17 @@ class TrendEngine:
         ema_s = self._ema(closes, self.ema_slow)
         adx_arr, pdi_arr, mdi_arr = self._adx(closes, highs, lows, self.adx_period)
         rsi_arr = self._rsi(closes, self.rsi_period)
+        atr_arr = self._atr(closes, highs, lows, self.atr_period)
 
         composites = []
         last_subs = None
         for k in range(n):
             i = -1 - k  # -1, -2, -3, ...
+            atr_v = float(atr_arr[i]) if not np.isnan(atr_arr[i]) and atr_arr[i] > 0 else closes[i] * 0.005
 
-            # ── EMA12/26 spread, tanh-scaled ──────────────────────────────
-            spread_pct = (ema_f[i] - ema_s[i]) / (abs(ema_s[i]) + 1e-9)
-            ema_score = 50.0 + 50.0 * math.tanh(self.ema_spread_sensitivity * spread_pct)
+            # ── EMA12/26 spread, ATR-normalized + tanh-scaled ─────────────
+            spread_atr = (ema_f[i] - ema_s[i]) / atr_v
+            ema_score = 50.0 + 50.0 * math.tanh(self.ema_spread_sensitivity * spread_atr)
 
             # ── ADX strength, signed by +DI/-DI ───────────────────────────
             adx_v = float(adx_arr[i]) if not np.isnan(adx_arr[i]) else 0.0
@@ -102,10 +114,10 @@ class TrendEngine:
             rsi_v = float(rsi_arr[i]) if not np.isnan(rsi_arr[i]) else 50.0
             rsi_score = rsi_v
 
-            # ── EMA12 bar-to-bar slope, tanh-scaled ───────────────────────
+            # ── EMA12 bar-to-bar slope, ATR-normalized + tanh-scaled ──────
             ef_prev = ema_f[i - 1]
-            slope_pct = (ema_f[i] - ef_prev) / (abs(ef_prev) + 1e-9)
-            slope_score = 50.0 + 50.0 * math.tanh(self.slope_sensitivity * slope_pct)
+            slope_atr = (ema_f[i] - ef_prev) / atr_v
+            slope_score = 50.0 + 50.0 * math.tanh(self.slope_sensitivity * slope_atr)
 
             subs = {"ema": ema_score, "adx": adx_score, "rsi": rsi_score, "slope": slope_score}
             composite = sum(subs[k2] * w for k2, w in self._WEIGHTS.items())
@@ -113,7 +125,11 @@ class TrendEngine:
             if k == 0:
                 last_subs = subs
 
-        score = round(sum(composites) / len(composites), 1)
+        # Recency-weighted blend across the last n bars (0.5/0.3/0.2 for
+        # n=3) instead of a flat average — dilutes single-bar noise
+        # without lagging a full bar-count behind a real move.
+        bar_weights = self._BAR_WEIGHTS if n == 3 else [1.0 / n] * n
+        score = round(sum(c * w for c, w in zip(composites, bar_weights)), 1)
         score = max(0.0, min(100.0, score))
         band = self._classify(score)
 
@@ -150,6 +166,19 @@ class TrendEngine:
         for i in range(period, len(arr)):
             out[i] = arr[i] * k + out[i - 1] * (1 - k)
         return out
+
+    @staticmethod
+    def _atr(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, period: int = 14) -> np.ndarray:
+        n = len(closes)
+        tr = np.full(n, np.nan)
+        for i in range(1, n):
+            tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        atr = np.full(n, np.nan)
+        if n > period:
+            atr[period] = float(np.nanmean(tr[1:period + 1]))
+            for i in range(period + 1, n):
+                atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+        return atr
 
     @staticmethod
     def _rsi(closes: np.ndarray, period: int = 14) -> np.ndarray:
