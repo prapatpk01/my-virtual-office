@@ -180,11 +180,21 @@ class PositionManager:
         sits there protected by whatever exchange-side algo was last
         attached. Call this once at startup before the main loop.
 
-        We don't know the original TP1/entry_score/regime — an adopted
-        position resumes in single-TP mode (tp1=None, tp1_hit=True) using
-        whatever SL/TP OKX currently has attached as (stop_loss, tp2).
+        TP1 status is INFERRED from what OKX still knows, not lost: after
+        TP1 fires, _close_partial_tp1() moves the stop to exact entry price
+        (breakeven). So if the attached SL is essentially AT entry, TP1
+        already hit — no partial left to take, resume in single-TP mode. If
+        the SL is still a real distance from entry, TP1 hasn't hit — and
+        since entry/SL are both known exactly, TP1 can be RECOMPUTED with
+        the same formula that produced it originally (calc_take_profits),
+        recovering the partial-take-profit behavior losslessly rather than
+        discarding it. A local-disk cache wouldn't survive a Railway
+        *redeploy* anyway (fresh container, fresh filesystem) — this reads
+        the truth from the exchange instead.
+
         Returns the list of symbols adopted, for the startup log/alert.
         """
+        c = self.cfg
         adopted = []
         for symbol in symbols:
             if self.has_position(symbol):
@@ -208,18 +218,29 @@ class PositionManager:
                 if tp_price is None:
                     tp_price = entry_price * (1.1 if side == LONG else 0.9)
 
+                # SL within sl_min_pct of entry (the floor a real ATR stop can
+                # never come inside — see calc_stop_loss) means it can only be
+                # there because move_sl_to_breakeven() put it there after TP1.
+                sl_dist_pct = abs(entry_price - sl_price) / entry_price
+                tp1_hit = sl_dist_pct < c.sl_min_pct
+                if tp1_hit:
+                    tp1 = None
+                    mode = "single-TP mode (TP1 already hit before restart)"
+                else:
+                    tp1, _ = calc_take_profits(side, entry_price, sl_price, c.tp1_r, c.tp2_r)
+                    mode = f"TP1 recovered at {tp1:.6f} (not yet hit)"
+
                 pos = Position(
                     symbol=symbol, side=side, entry_price=entry_price, amount=amount,
-                    full_amount=amount, stop_loss=sl_price, tp1=None, tp2=tp_price,
-                    one_r=abs(entry_price - sl_price), tp1_hit=True,
+                    full_amount=amount, stop_loss=sl_price, tp1=tp1, tp2=tp_price,
+                    one_r=abs(entry_price - sl_price), tp1_hit=tp1_hit,
                     regime_at_entry="ADOPTED", bias_at_entry="ADOPTED",
                 )
                 self._positions[symbol] = pos
                 adopted.append(f"{symbol} {side.upper()}")
                 logger.warning("[RECONCILE] Adopted orphaned %s %s position: entry=%.6f "
-                              "amount=%.6f SL=%.6f TP=%.6f (from a prior run — resuming "
-                              "in single-TP mode)", symbol, side, entry_price, amount,
-                              sl_price, tp_price)
+                              "amount=%.6f SL=%.6f TP2=%.6f — %s",
+                              symbol, side, entry_price, amount, sl_price, tp_price, mode)
         return adopted
 
     async def open_position(self, symbol: str, direction: str, price: float,

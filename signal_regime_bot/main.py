@@ -87,11 +87,15 @@ class Bot:
         if adopted:
             logger.warning("[STARTUP] Adopted %d orphaned position(s) from a prior run: %s",
                           len(adopted), adopted)
+            # TP1 status is inferred per-position from the attached SL (at
+            # entry = already hit, still a real distance away = recovered) —
+            # see reconcile_with_exchange for the detail; this alert just
+            # confirms adoption happened, the Railway log has the per-symbol mode.
             await self.telegram.error(
                 "STARTUP",
                 f"Adopted {len(adopted)} orphaned position(s) from a prior run: "
-                f"{', '.join(adopted)}. Resuming management in single-TP mode "
-                f"(original TP1 unknown)."
+                f"{', '.join(adopted)}. TP1 status inferred from the attached "
+                f"stop (already hit -> single-TP mode; still wide -> TP1 recovered)."
             )
 
         self._running = True
