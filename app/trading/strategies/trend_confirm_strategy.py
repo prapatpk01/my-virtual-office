@@ -1,26 +1,41 @@
 """
 TF30M Trend-Confirmed EMA5/10 Cross Strategy.
 
-Trend gate (both must agree before ANY entry is allowed — never trade
-against either):
+Two-step, in order — trend must be confirmed BEFORE an entry is even
+looked for, and the entry that gets acted on must occur at-or-after the
+bar the trend confirmed, never before:
+
+Step 1 — Trend gate (SMA30 and MACD must agree, or no trade at all):
   SMA30 trend : candle opens above SMA30 -> uptrend, opens below -> downtrend
   MACD trend  : MACD(12,26,9) line > signal AND histogram > 0 -> uptrend
                 MACD line < signal AND histogram < 0 -> downtrend
-  If SMA30 and MACD disagree (or neither is a clean up/down read), no trade
-  at all — direction is undecided, so neither long nor short is allowed.
+  Every 30m bar, the confirmed direction ("up" / "down" / None-if-undecided
+  or conflicting) is tracked in self._trend_state. Whenever it CHANGES
+  (including None -> up/down, up -> down, or a brief conflict that later
+  reconfirms the same direction), that's a fresh trend-confirmation event
+  and self._traded_this_trend resets to False — this trend is now allowed
+  exactly one trade.
 
-Entry LONG (only when the trend gate above confirms uptrend):
-  1. EMA5 crosses above EMA10                      (30m)
-  2. Price is above SMA30 by no more than 1.5xATR   (30m)
-  If EMA5/10 crosses but price is already more than 1.5xATR away from
-  SMA30, the entry fails outright — no chase. Because cross_up/cross_down
-  are one-shot transition events, the strategy naturally won't re-look at
-  this until price pulls back toward SMA30 AND EMA5/10 crosses again,
-  which is exactly the "wait for pullback then a fresh cross" behavior
-  the spec asks for — no extra state needed for it.
+Step 2 — Entry (only once per confirmed-trend streak, only in the
+confirmed direction):
+  1. EMA5 crosses EMA10 the matching way             (30m)
+  2. Price is within 1.5xATR of SMA30                (30m)
+  Because cross_up/cross_down are one-shot transition events, a cross that
+  happened on an earlier bar — before this trend was confirmed, e.g. as
+  part of the PREVIOUS trend's exit — is never true again on a later bar,
+  so it can never retroactively count once the trend flips. Only a cross
+  occurring on the same bar the trend confirms, or any bar after (while
+  self._traded_this_trend is still False), can trigger an entry.
+  If the cross fires but price is already more than 1.5xATR from SMA30,
+  the setup fails outright — no chase, and _traded_this_trend stays False
+  so a later pullback + fresh cross within the SAME confirmed trend can
+  still try again.
 
-Entry SHORT: mirror (downtrend confirmed, EMA5 crosses below EMA10, price
-below SMA30 by no more than 1.5xATR).
+Once a trade actually opens, self._traded_this_trend latches True for
+the rest of that trend streak — even after it closes (e.g. via the EMA
+cross reversal exit below), no re-entry is taken until the trend gate
+produces a brand new confirmation event. "Close and wait for the next
+trend confirmation," not "close and look for the next cross."
 
 Exit LONG:  EMA5 crosses back below EMA10
 Exit SHORT: EMA5 crosses back above EMA10
@@ -78,6 +93,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self.rr_ratio = rr_ratio
 
         self._open_position: Optional[str] = None   # "long" | "short" | None
+        self._trend_state: Optional[str] = None      # "up" | "down" | None
+        self._traded_this_trend: bool = False         # 1 trade max per confirmed-trend streak
         self._last_bar_ts: Optional[int] = None
         self._latest_candles: list = []
 
@@ -102,28 +119,44 @@ class TrendConfirmStrategy(BaseStrategy):
         if ind is None:
             return self._hold(current_price, "Indicators still warming up (30m)")
 
-        # ── Trend gate: SMA30 and MACD must agree, or no trade at all ───────
+        # ── Step 1: Trend gate — SMA30 and MACD must agree, or no trade ─────
         sma_up, sma_down = ind["sma_up"], ind["sma_down"]
         macd_up, macd_down = ind["macd_up"], ind["macd_down"]
         trend_up   = sma_up and macd_up
         trend_down = sma_down and macd_down
+        new_trend = "up" if trend_up else "down" if trend_down else None
 
-        if not trend_up and not trend_down:
+        if new_trend != self._trend_state:
+            # Fresh trend-confirmation event (including a flip, or a
+            # conflict clearing back to the same direction) — this trend
+            # streak gets exactly one trade, reset the gate.
+            self._trend_state = new_trend
+            self._traded_this_trend = False
+
+        if new_trend is None:
             return self._hold(current_price, "No trade: SMA30/MACD trend not confirmed or conflicting")
 
+        if self._traded_this_trend:
+            return self._hold(current_price, f"Already traded this {new_trend}trend streak — waiting for a new trend confirmation")
+
+        # ── Step 2: Entry — EMA5/10 cross in the confirmed direction only,
+        # occurring at-or-after the bar the trend confirmed (guaranteed by
+        # cross_up/cross_down being one-shot: a cross from a prior trend
+        # streak can never read True again on a later bar) ─────────────────
         close_price = c30[-1].close
         dist_atr = abs(close_price - ind["sma_val"]) / ind["atr_val"] if ind["atr_val"] > 0 else 999.0
 
-        if trend_up:
+        if new_trend == "up":
             if ind["cross_down"]:
                 return self._hold(current_price, "Trend UP confirmed but EMA5/10 crossed down — no counter-trend entry")
             if ind["cross_up"]:
                 if dist_atr > self.max_dist_atr_mult:
                     return self._hold(current_price,
                         f"Long setup FAILED: price {dist_atr:.2f}xATR above SMA30 (max {self.max_dist_atr_mult}x) "
-                        f"— waiting for pullback + fresh EMA cross")
+                        f"— waiting for pullback + fresh EMA cross (still this trend streak)")
                 sl, tp = self._compute_sl_tp("long", close_price, ind["atr_val"])
                 self._open_position = "long"
+                self._traded_this_trend = True
                 return Signal(
                     type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                     reason=f"Uptrend confirmed (SMA30+MACD 30m) + EMA5↑EMA10 within {dist_atr:.2f}xATR of SMA30",
@@ -132,16 +165,17 @@ class TrendConfirmStrategy(BaseStrategy):
                 )
             return self._hold(current_price, "Trend UP confirmed — waiting for EMA5/10 cross")
 
-        # trend_down
+        # new_trend == "down"
         if ind["cross_up"]:
             return self._hold(current_price, "Trend DOWN confirmed but EMA5/10 crossed up — no counter-trend entry")
         if ind["cross_down"]:
             if dist_atr > self.max_dist_atr_mult:
                 return self._hold(current_price,
                     f"Short setup FAILED: price {dist_atr:.2f}xATR below SMA30 (max {self.max_dist_atr_mult}x) "
-                    f"— waiting for pullback + fresh EMA cross")
+                    f"— waiting for pullback + fresh EMA cross (still this trend streak)")
             sl, tp = self._compute_sl_tp("short", close_price, ind["atr_val"])
             self._open_position = "short"
+            self._traded_this_trend = True
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
                 reason=f"Downtrend confirmed (SMA30+MACD 30m) + EMA5↓EMA10 within {dist_atr:.2f}xATR of SMA30",
