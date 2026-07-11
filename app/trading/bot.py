@@ -168,6 +168,89 @@ class TradingBot:
             except Exception as e:
                 logger.warning("cancel_pending_entry failed [%s]: %s", strategy_name, e)
 
+    async def _reconcile_positions(self) -> None:
+        """Runs once, right before the first tick of every (re)start.
+
+        Nothing in this process persists open positions across a restart —
+        RiskManager._positions, PortfolioEngine._positions, and each
+        strategy's _open_position/_open_entry are all plain in-memory state
+        that starts empty every time. If the bot restarts while a position
+        is genuinely still open on the exchange, it would otherwise be
+        invisible to the bot forever: no hard SL/TP fallback, no portfolio
+        heat accounting, and the strategy would try to open a duplicate on
+        the next signal instead of managing the existing one.
+
+        This re-derives those positions directly from the exchange (ccxt
+        fetch_positions) and re-registers them everywhere they're normally
+        tracked. The original SL/TP levels aren't recoverable (never
+        persisted), so RiskManager.open_position() falls back to its
+        default percentage-based stops — better than no protection at all,
+        but a human should sanity-check them against the original plan.
+        Connectors that don't support fetch_positions (or paper mode, which
+        has no exchange-side state to reconcile against) are a no-op."""
+        if not hasattr(self.connector, "fetch_positions"):
+            return
+        symbols = list({s.symbol for s in self.strategies})
+        try:
+            live_positions = await self.connector.fetch_positions(symbols)
+        except Exception as e:
+            logger.warning("[Reconcile] fetch_positions failed: %s", e)
+            return
+        if not live_positions:
+            return
+
+        by_symbol: dict[str, list[dict]] = {}
+        for p in live_positions:
+            by_symbol.setdefault(p["symbol"], []).append(p)
+
+        for strategy in self.strategies:
+            for p in by_symbol.get(strategy.symbol, []):
+                side = p["side"]
+                strategy_name = (
+                    f"{strategy.name}:{'L' if side == 'long' else 'S'}"
+                    if self._hedge_mode else strategy.name
+                )
+                risk_key = f"{strategy.symbol}||{strategy_name}"
+                if risk_key in self.risk._positions:
+                    continue
+
+                entry_price = p["entry_price"]
+                amount = p["amount"]
+                pos = self.risk.open_position(
+                    strategy.symbol, side, entry_price, amount, strategy=strategy_name,
+                )
+                self._portfolio.add_position(
+                    symbol=strategy.symbol, direction=side,
+                    entry_price=entry_price, current_price=entry_price,
+                    amount=amount, stop_loss=pos.stop_loss,
+                )
+                self._position_open_times[f"{strategy.symbol}||{strategy_name}"] = time.time()
+
+                strategy_inst = self._resolve_strategy_inst(strategy_name)
+                if hasattr(strategy_inst, "attach_existing_position"):
+                    try:
+                        strategy_inst.attach_existing_position(
+                            side, entry_price, pos.stop_loss, pos.take_profit,
+                        )
+                    except Exception as e:
+                        logger.warning("[Reconcile] attach_existing_position failed [%s]: %s",
+                                       strategy_name, e)
+
+                logger.warning(
+                    "[Reconcile] Found existing %s position on %s (%s) — entry=%.4f amount=%.6f "
+                    "SL=%.4f TP=%.4f (default stops — original unknown) — resuming management",
+                    side.upper(), strategy.symbol, strategy_name, entry_price, amount,
+                    pos.stop_loss or 0, pos.take_profit or 0,
+                )
+                if self.telegram:
+                    try:
+                        self.telegram.notify_reconciled_position(
+                            strategy.symbol, strategy_name, side, entry_price, amount,
+                            pos.stop_loss, pos.take_profit,
+                        )
+                    except Exception:
+                        pass
+
     # ------------------------------------------------------------------
     # Public control
     # ------------------------------------------------------------------
@@ -225,6 +308,7 @@ class TradingBot:
         await self._refresh_balance()
         self._start_balance = self.state.total_balance
         self.risk.update_peak(self._start_balance)
+        await self._reconcile_positions()
 
         while self.state.running:
             try:

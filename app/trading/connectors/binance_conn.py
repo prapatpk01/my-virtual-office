@@ -274,6 +274,33 @@ class BinanceConnector(BaseConnector):
             status=r.get("status", "open"),
         ) for r in raw_list]
 
+    async def fetch_positions(self, symbols: Optional[list[str]] = None) -> list[dict]:
+        """Live open positions from the exchange (nonzero contracts only) —
+        used on startup to re-derive positions that were opened before a
+        bot restart, since nothing in-process persists them. Paper mode has
+        no exchange-side state to reconcile against (a fresh process starts
+        with an empty paper position book anyway), so it always returns [].
+        Returns a plain dict per position: symbol/side/amount/entry_price."""
+        if self.paper:
+            return []
+        raw_list = await self._exchange.fetch_positions(symbols)
+        out = []
+        for p in raw_list:
+            contracts = p.get("contracts") or 0
+            if not contracts:
+                continue
+            side = p.get("side") or ("long" if contracts > 0 else "short")
+            entry_price = p.get("entryPrice")
+            if not entry_price:
+                continue
+            out.append({
+                "symbol": p.get("symbol"),
+                "side": side,
+                "amount": abs(float(contracts)),
+                "entry_price": float(entry_price),
+            })
+        return out
+
     async def fetch_balance(self) -> list[Balance]:
         if self.paper:
             # total = free + used (margin locked in open positions) so that

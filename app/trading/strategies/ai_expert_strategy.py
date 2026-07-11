@@ -320,6 +320,28 @@ class AIExpertStrategy(BaseStrategy):
         if n > 0 and n % 10 == 0:
             self._run_adaptation()
 
+    def attach_existing_position(self, direction: str, entry_price: float,
+                                  stop_loss: Optional[float] = None,
+                                  take_profit: Optional[float] = None) -> None:
+        """Called once on bot startup when a position for this symbol is
+        already open on the exchange (from before a restart) — self._open_entry
+        would otherwise stay None forever, so analyze() would try to open a
+        duplicate and tick_open_position()/record_closed_trade() would never
+        manage or journal the exit. The original entry's regime/expert-score
+        context is gone (never persisted), so those fields are filled with
+        placeholders — the position still gets SL/TP + PositionManager
+        lifecycle management, it just won't contribute a fully-detailed
+        row to the learning engine's journal when it eventually closes."""
+        self._open_entry = {
+            "direction": direction, "entry_price": entry_price,
+            "stop_loss": stop_loss, "take_profit": take_profit,
+            "regime": "reconciled:reconciled", "session": "unknown",
+            "expert_scores": {}, "decision_score": 0.0, "confidence_level": "unknown",
+            "strategy_type": "reconciled", "macro_score": 50.0,
+            "risk_multiplier": 1.0, "tp1_rr": None, "tp2_rr": None,
+            "opened_at": time.time(),
+        }
+
     def tick_open_position(
         self,
         current_price: float,

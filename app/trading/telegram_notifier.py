@@ -310,6 +310,17 @@ class TelegramNotifier:
     def notify_bot_stopped(self):
         self.notify("⏹ *Trading Bot Stopped*")
 
+    def notify_reconciled_position(self, symbol: str, strategy_name: str, side: str,
+                                    entry_price: float, amount: float,
+                                    stop_loss: Optional[float], take_profit: Optional[float]):
+        text = (
+            f"🔄 *Reconciled Position on Restart*\n"
+            f"`{strategy_name}` on `{symbol}`\n"
+            f"Side: *{side.upper()}*  Entry: `{entry_price:.4f}`  Amount: `{amount:.6f}`\n"
+            f"SL: `{stop_loss:.4f}`  TP: `{take_profit:.4f}` _(default — original stops unknown)_"
+        )
+        self.notify(text)
+
     # ------------------------------------------------------------------
     # Telegram HTTP helpers
     # ------------------------------------------------------------------

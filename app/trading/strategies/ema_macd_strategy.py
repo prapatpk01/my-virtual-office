@@ -178,6 +178,16 @@ class EMAMacdStrategy(BaseStrategy):
         position exists that was never really opened."""
         self._open_position = None
 
+    def attach_existing_position(self, direction: str, entry_price: float,
+                                  stop_loss: Optional[float] = None,
+                                  take_profit: Optional[float] = None) -> None:
+        """Called once on bot startup when a position for this symbol is
+        already open on the exchange (from before a restart) — nothing in
+        this strategy's in-memory state would otherwise know about it, so
+        analyze() would try to open a duplicate and tick_open_position()
+        would never manage the exit."""
+        self._open_position = direction
+
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _macd_30m_trend(self, candles_15m: list) -> tuple[bool, bool]:
