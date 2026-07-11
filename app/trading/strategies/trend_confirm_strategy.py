@@ -132,6 +132,19 @@ class TrendConfirmStrategy(BaseStrategy):
         if ind is None:
             return self._hold(current_price, "Indicators still warming up (30m)")
 
+        def dbg(entry_status: str, dist_atr: Optional[float] = None) -> dict:
+            sma_trend = "up" if ind["sma_up"] else "down" if ind["sma_down"] else "flat"
+            macd_trend = "up" if ind["macd_up"] else "down" if ind["macd_down"] else "flat"
+            return {"trend_confirm": {
+                "sma_trend": sma_trend,
+                "macd_trend": macd_trend,
+                "confirmed": self._trend_state,
+                "open_position": self._open_position,
+                "entry_status": entry_status,
+                "dist_atr": round(dist_atr, 2) if dist_atr is not None else None,
+                "max_dist_atr": self.max_dist_atr_mult,
+            }}
+
         # Cross/trend tracking must run on every new bar REGARDLESS of
         # whether a position is currently open — otherwise a cross that
         # happens while holding (e.g. the very cross that closes the
@@ -155,13 +168,15 @@ class TrendConfirmStrategy(BaseStrategy):
         new_trend = self._trend_state
 
         if self._open_position is not None:
-            return self._hold(current_price, f"Holding {self._open_position.upper()} — managed via tick_open_position()")
+            return self._hold(current_price, f"Holding {self._open_position.upper()} — managed via tick_open_position()",
+                              metadata=dbg("position_open"))
 
         if not is_new_bar:
-            return self._hold(current_price, "Waiting for the next 30m bar close")
+            return self._hold(current_price, "Waiting for the next 30m bar close", metadata=dbg("waiting_next_bar"))
 
         if new_trend is None:
-            return self._hold(current_price, "No trade: SMA30/MACD trend not confirmed or conflicting")
+            return self._hold(current_price, "No trade: SMA30/MACD trend not confirmed or conflicting",
+                              metadata=dbg("no_trend"))
 
         # ── Step 2: Entry — EMA5/10 cross in the confirmed direction only,
         # occurring at-or-after the bar the trend confirmed (guaranteed by
@@ -178,45 +193,55 @@ class TrendConfirmStrategy(BaseStrategy):
             up_ago = _bars_ago(self._last_cross_up_ts)
             cross_ok = up_ago is not None and 0 <= up_ago <= self.cross_grace_bars
             if ind["cross_down"] and not cross_ok:
-                return self._hold(current_price, "Trend UP confirmed but EMA5/10 crossed down — no counter-trend entry")
+                return self._hold(current_price, "Trend UP confirmed but EMA5/10 crossed down — no counter-trend entry",
+                                  metadata=dbg("counter_cross_blocked", dist_atr))
             if cross_ok:
                 if dist_atr > self.max_dist_atr_mult:
                     return self._hold(current_price,
                         f"Long setup FAILED: price {dist_atr:.2f}xATR above SMA30 (max {self.max_dist_atr_mult}x) "
-                        f"— waiting for pullback + fresh EMA cross")
+                        f"— waiting for pullback + fresh EMA cross",
+                        metadata=dbg("cross_pass_distance_fail", dist_atr))
                 sl, tp = self._compute_sl_tp("long", close_price, ind["atr_val"])
                 self._open_position = "long"
                 self._last_cross_up_ts = None
                 grace_note = f" ({up_ago} bar(s) before trend confirmed)" if up_ago > 0 else ""
+                meta = dbg("entered", dist_atr)
+                meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
                 return Signal(
                     type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                     reason=f"Uptrend confirmed (SMA30+MACD 30m) + EMA5↑EMA10 within {dist_atr:.2f}xATR of SMA30{grace_note}",
                     confidence=1.0,
-                    metadata={"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio},
+                    metadata=meta,
                 )
-            return self._hold(current_price, "Trend UP confirmed — waiting for EMA5/10 cross")
+            return self._hold(current_price, "Trend UP confirmed — waiting for EMA5/10 cross",
+                              metadata=dbg("waiting_cross"))
 
         # new_trend == "down"
         down_ago = _bars_ago(self._last_cross_down_ts)
         cross_ok = down_ago is not None and 0 <= down_ago <= self.cross_grace_bars
         if ind["cross_up"] and not cross_ok:
-            return self._hold(current_price, "Trend DOWN confirmed but EMA5/10 crossed up — no counter-trend entry")
+            return self._hold(current_price, "Trend DOWN confirmed but EMA5/10 crossed up — no counter-trend entry",
+                              metadata=dbg("counter_cross_blocked", dist_atr))
         if cross_ok:
             if dist_atr > self.max_dist_atr_mult:
                 return self._hold(current_price,
                     f"Short setup FAILED: price {dist_atr:.2f}xATR below SMA30 (max {self.max_dist_atr_mult}x) "
-                    f"— waiting for pullback + fresh EMA cross")
+                    f"— waiting for pullback + fresh EMA cross",
+                    metadata=dbg("cross_pass_distance_fail", dist_atr))
             sl, tp = self._compute_sl_tp("short", close_price, ind["atr_val"])
             self._open_position = "short"
             self._last_cross_down_ts = None
             grace_note = f" ({down_ago} bar(s) before trend confirmed)" if down_ago > 0 else ""
+            meta = dbg("entered", dist_atr)
+            meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
                 reason=f"Downtrend confirmed (SMA30+MACD 30m) + EMA5↓EMA10 within {dist_atr:.2f}xATR of SMA30{grace_note}",
                 confidence=1.0,
-                metadata={"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio},
+                metadata=meta,
             )
-        return self._hold(current_price, "Trend DOWN confirmed — waiting for EMA5/10 cross")
+        return self._hold(current_price, "Trend DOWN confirmed — waiting for EMA5/10 cross",
+                          metadata=dbg("waiting_cross"))
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
         """Exit = OR logic: candle opens on the wrong side of SMA30, OR
@@ -341,8 +366,8 @@ class TrendConfirmStrategy(BaseStrategy):
 
         return out
 
-    def _hold(self, price: float, reason: str = "") -> Signal:
+    def _hold(self, price: float, reason: str = "", metadata: Optional[dict] = None) -> Signal:
         return Signal(
             type=SignalType.HOLD, symbol=self.symbol, price=price, amount=0.0,
-            reason=reason, confidence=0.0, metadata={},
+            reason=reason, confidence=0.0, metadata=metadata or {},
         )

@@ -406,7 +406,13 @@ class TradingBot:
     def _log_scan(self, symbol: str, strategy_name: str, price: float, signal: "Signal") -> None:
         """INFO-level one-line summary printed every tick for every symbol,
         so Railway logs show live scan activity even when no trade fires."""
-        meta       = signal.metadata or {}
+        meta = signal.metadata or {}
+
+        tc = meta.get("trend_confirm")
+        if tc is not None:
+            self._log_scan_trend_confirm(symbol, strategy_name, price, signal, tc)
+            return
+
         macro      = meta.get("macro_trend", {})
         context1h  = meta.get("context_1h", {})
         mtf        = meta.get("mtf_combined", {})
@@ -425,6 +431,53 @@ class TradingBot:
             "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s regime=%-10s 4H=%-14s 1H=%-10s aligned=%s mtf=%-6s strat=%s(%s) | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
             regime, macro_str, ctx_str, align_str, mtf_str, strat_sel, conf_str, reason,
+        )
+
+    def _log_scan_trend_confirm(self, symbol: str, strategy_name: str, price: float,
+                                 signal: "Signal", tc: dict) -> None:
+        """TrendConfirmStrategy-specific scan line — shows SMA30/MACD trend
+        reads directly and which side (if any) is confirmed, then the
+        entry-gate checklist status instead of the ai_expert-only fields
+        (macro/context/mtf) that don't apply to this strategy."""
+        sma_trend  = tc.get("sma_trend", "?")
+        macd_trend = tc.get("macd_trend", "?")
+        confirmed  = tc.get("confirmed") or "none"
+        open_pos   = tc.get("open_position") or "-"
+        status     = tc.get("entry_status", "?")
+
+        _STATUS_LABEL = {
+            "position_open":          "holding",
+            "waiting_next_bar":       "wait_bar_close",
+            "no_trend":               "n/a (no trend)",
+            "waiting_cross":          "wait_ema_cross",
+            "counter_cross_blocked":  "blocked (counter cross)",
+            "cross_pass_distance_fail": "cross_ok/dist_fail",
+            "entered":                "entered",
+        }
+        entry_str = _STATUS_LABEL.get(status, status)
+
+        dist_atr = tc.get("dist_atr")
+        max_dist = tc.get("max_dist_atr")
+        if dist_atr is not None:
+            dist_str = f"{dist_atr:.2f}/{max_dist:.1f}xATR"
+        else:
+            dist_str = "n/a"
+
+        cross_check = "pass" if status in ("entered",) else (
+            "pass" if status == "cross_pass_distance_fail" else
+            ("n/a" if status in ("position_open", "waiting_next_bar", "no_trend") else "wait")
+        )
+        dist_check = "pass" if status == "entered" else (
+            "fail" if status == "cross_pass_distance_fail" else "n/a"
+        )
+
+        reason = (signal.reason or "")[:90]
+        logger.info(
+            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s SMA=%-4s MACD=%-4s confirm=%-5s pos=%-5s | "
+            "entry[cross=%-4s dist=%-4s(%s)]=%s | %s",
+            strategy_name, symbol, price, signal.type.value.upper(),
+            sma_trend, macd_trend, confirmed, open_pos,
+            cross_check, dist_check, dist_str, entry_str, reason,
         )
 
     # ------------------------------------------------------------------
