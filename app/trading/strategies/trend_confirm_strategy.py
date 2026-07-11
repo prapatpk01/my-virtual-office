@@ -7,8 +7,12 @@ bar the trend confirmed, never before:
 
 Step 1 — Trend gate (SMA30 and MACD must agree, or no trade at all):
   SMA30 trend : candle opens above SMA30 -> uptrend, opens below -> downtrend
-  MACD trend  : MACD(12,26,9) line > signal AND histogram > 0 -> uptrend
-                MACD line < signal AND histogram < 0 -> downtrend
+  MACD trend  : raw MACD LINE (fast EMA - slow EMA, the "MACD 4C" zero-line
+                read, not the line-vs-signal read) above zero -> uptrend,
+                below zero -> downtrend. Matches the user-supplied Pine
+                script (macd() line only, colored purely by sign +
+                accelerating/decelerating — the trend read here only uses
+                the sign, i.e. currMacd > 0 / < 0).
   Every 30m bar, the confirmed direction ("up" / "down" / None-if-undecided
   or conflicting) is tracked in self._trend_state. Whenever it CHANGES
   (including None -> up/down, up -> down, or a brief conflict that later
@@ -43,8 +47,14 @@ cross reversal exit below), no re-entry is taken until the trend gate
 produces a brand new confirmation event. "Close and wait for the next
 trend confirmation," not "close and look for the next cross."
 
-Exit LONG:  EMA5 crosses back below EMA10
-Exit SHORT: EMA5 crosses back above EMA10
+Exit LONG:  candle opens below SMA30 (30m)
+Exit SHORT: candle opens above SMA30 (30m)
+  Not the EMA5/10 cross — during a choppy stretch EMA5/10 can cross back
+  and forth many times while price never actually leaves the SMA30 side
+  it entered on (a live chart showed this clearly: a cluster of crosses
+  all within a single still-uptrending swing). Gating the exit on SMA30
+  instead lets the position ride out that chop and only closes once price
+  genuinely opens on the wrong side of the trend line.
 SL/TP: ATR(14, 30m) x1.5 distance, 1:1 R:R — same ATR multiplier as the
 entry's max-distance-from-SMA30 filter, kept as a hard-stop safety net
 checked by bot.py's risk-manager fallback (not the active close trigger).
@@ -224,7 +234,8 @@ class TrendConfirmStrategy(BaseStrategy):
         return self._hold(current_price, "Trend DOWN confirmed — waiting for EMA5/10 cross")
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
-        """Exit = EMA5/10 cross reversal, evaluated only on a newly-closed
+        """Exit = candle opens on the wrong side of SMA30 (not an EMA5/10
+        cross — see module docstring), evaluated only on a newly-closed
         30m bar. Hedge-mode-safe: always closes whichever position is
         actually open, never relies on signal.type semantics."""
         if self._open_position is None or not self._latest_candles:
@@ -247,12 +258,12 @@ class TrendConfirmStrategy(BaseStrategy):
             return PositionUpdate(action="hold", reason="Indicators warming up (30m)")
         self._last_exit_bar_ts = bar_ts
 
-        if self._open_position == "long" and ind["cross_down"]:
+        if self._open_position == "long" and ind["sma_down"]:
             self._open_position = None
-            return PositionUpdate(action="close", close_pct=1.0, reason="Exit LONG: EMA5 crossed below EMA10 (30m)")
-        if self._open_position == "short" and ind["cross_up"]:
+            return PositionUpdate(action="close", close_pct=1.0, reason="Exit LONG: candle opened below SMA30 (30m)")
+        if self._open_position == "short" and ind["sma_up"]:
             self._open_position = None
-            return PositionUpdate(action="close", close_pct=1.0, reason="Exit SHORT: EMA5 crossed above EMA10 (30m)")
+            return PositionUpdate(action="close", close_pct=1.0, reason="Exit SHORT: candle opened above SMA30 (30m)")
 
         return PositionUpdate(action="hold", reason=f"Holding {self._open_position.upper()}")
 
@@ -301,8 +312,11 @@ class TrendConfirmStrategy(BaseStrategy):
             "sma_up":   last.open > sma_t[-1],
             "sma_down": last.open < sma_t[-1],
             "sma_val":  float(sma_t[-1]),
-            "macd_up":   macd_line[-1] > macd_signal_line[-1] and hist[-1] > 0,
-            "macd_down": macd_line[-1] < macd_signal_line[-1] and hist[-1] < 0,
+            # "MACD 4C" trend read: raw MACD line vs zero, not vs its
+            # signal line — matches the user-supplied Pine script, which
+            # only plots/colors currMacd by sign (+ momentum direction).
+            "macd_up":   macd_line[-1] > 0,
+            "macd_down": macd_line[-1] < 0,
             "atr_val":  float(atr_arr[-1]),
         }
 
