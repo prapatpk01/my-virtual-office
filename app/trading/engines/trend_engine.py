@@ -2,17 +2,28 @@
 Trend Engine — shared, timeframe-agnostic trend scoring engine.
 
 Weighted composite score, 0-100, one number instead of a discrete
-bull/bear/neutral vote. 3 categories, 5 checks total (1-2 per
-category), each check turned into its own continuous 0-100 sub-score
-(50 = neutral, 100 = maximally bullish, 0 = maximally bearish):
+bull/bear/neutral vote. 3 categories, 7 checks total, each turned into
+its own continuous 0-100 sub-score (50 = neutral, 100 = maximally
+bullish, 0 = maximally bearish):
 
   Trend    50% — direction & structure
-    EMA12/26 spread   25% — (ema12-ema26)/ATR, tanh-scaled
-    ADX + DI direction 25% — strength capped at 50, continuously signed
-                             by +DI vs -DI (tanh, not a hard flip)
+    EMA12/26 spread    16.7% — (ema12-ema26)/ATR, tanh-scaled
+    ADX + DI direction 16.7% — strength capped at 50, continuously signed
+                               by +DI vs -DI (tanh, not a hard flip)
+    Price vs SMA50     16.7% — (price-sma50)/ATR, tanh-scaled — a much
+                               slower-moving anchor than the two above,
+                               added specifically to damp the score's
+                               swinginess: EMA12/26 and ADX both react
+                               within a handful of bars, SMA50 doesn't,
+                               so it holds the composite steadier
+                               through short-lived noise.
   Momentum 30% — how hard and how fast it's currently moving
-    RSI(14)            15% — used directly, already 0-100/50-center
-    EMA12 slope        15% — bar-to-bar change of EMA12/ATR, tanh-scaled
+    RSI(14)             10% — used directly, already 0-100/50-center
+    EMA12 slope         10% — bar-to-bar change of EMA12/ATR, tanh-scaled
+    MACD histogram      10% — MACD(12,26,9) histogram / ATR, tanh-scaled
+                               — smoother than raw RSI/slope since it's
+                               itself a difference-of-EMAs already once
+                               smoothed by its own signal line.
   Volume   20% — does volume confirm the bar's own direction
     Volume vs 20-bar average, signed by that bar's close-vs-open,
     tanh-scaled — a high-volume bar confirms whichever way it closed;
@@ -68,33 +79,49 @@ class TrendResult:
 
 
 class TrendEngine:
-    # category weights: trend 50% (ema+adx), momentum 30% (rsi+slope), volume 20%
-    _WEIGHTS = {"ema": 0.25, "adx": 0.25, "rsi": 0.15, "slope": 0.15, "volume": 0.20}
-    _CATEGORY = {"ema": "trend", "adx": "trend", "rsi": "momentum", "slope": "momentum", "volume": "volume"}
+    # category weights: trend 50% (ema+adx+sma50), momentum 30% (rsi+slope+macd), volume 20%
+    _W_TREND, _W_MOMENTUM, _W_VOLUME = 0.50, 0.30, 0.20
+    _WEIGHTS = {
+        "ema": _W_TREND / 3, "adx": _W_TREND / 3, "sma50": _W_TREND / 3,
+        "rsi": _W_MOMENTUM / 3, "slope": _W_MOMENTUM / 3, "macd": _W_MOMENTUM / 3,
+        "volume": _W_VOLUME,
+    }
+    _CATEGORY = {"ema": "trend", "adx": "trend", "sma50": "trend",
+                "rsi": "momentum", "slope": "momentum", "macd": "momentum", "volume": "volume"}
     _BAR_WEIGHTS = (0.5, 0.3, 0.2)   # most-recent-first; must match avg_bars length
 
-    def __init__(self, ema_fast: int = 12, ema_slow: int = 26,
+    def __init__(self, ema_fast: int = 12, ema_slow: int = 26, sma_trend: int = 50,
                  adx_period: int = 14, rsi_period: int = 14, atr_period: int = 14,
+                 macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9,
                  volume_lookback: int = 20,
                  avg_bars: int = 3,
                  ema_spread_sensitivity: float = 0.8,
                  slope_sensitivity: float = 1.5,
+                 sma_dist_sensitivity: float = 0.6,
+                 macd_hist_sensitivity: float = 1.0,
                  volume_sensitivity: float = 1.2):
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
+        self.sma_trend = sma_trend
         self.adx_period = adx_period
         self.rsi_period = rsi_period
         self.atr_period = atr_period
+        self.macd_fast = macd_fast
+        self.macd_slow = macd_slow
+        self.macd_signal = macd_signal
         self.volume_lookback = volume_lookback
         self.avg_bars = avg_bars
         self.ema_spread_sensitivity = ema_spread_sensitivity
         self.slope_sensitivity = slope_sensitivity
+        self.sma_dist_sensitivity = sma_dist_sensitivity
+        self.macd_hist_sensitivity = macd_hist_sensitivity
         self.volume_sensitivity = volume_sensitivity
 
     def analyze(self, candles: list) -> TrendResult:
         n = self.avg_bars
-        min_needed = max(self.ema_slow, self.adx_period * 2, self.rsi_period,
-                         self.atr_period, self.volume_lookback) + n + 5
+        min_needed = max(self.ema_slow, self.sma_trend, self.adx_period * 2, self.rsi_period,
+                         self.atr_period, self.volume_lookback,
+                         self.macd_slow + self.macd_signal) + n + 5
         if len(candles) < min_needed:
             return TrendResult(50.0, TrendBand.SIDEWAY,
                                detail={"reason": f"need {min_needed}+ candles, have {len(candles)}"})
@@ -107,12 +134,13 @@ class TrendEngine:
 
         ema_f = self._ema(closes, self.ema_fast)
         ema_s = self._ema(closes, self.ema_slow)
+        sma50 = self._sma(closes, self.sma_trend)
         adx_arr, pdi_arr, mdi_arr = self._adx(closes, highs, lows, self.adx_period)
         rsi_arr = self._rsi(closes, self.rsi_period)
         atr_arr = self._atr(closes, highs, lows, self.atr_period)
+        _, _, macd_hist = self._macd(closes, self.macd_fast, self.macd_slow, self.macd_signal)
 
         composites = []
-        cat_composites = []
         last_subs = None
         for k in range(n):
             i = -1 - k  # -1, -2, -3, ...
@@ -131,6 +159,13 @@ class TrendEngine:
             di_lean = math.tanh(0.08 * (pdi_v - mdi_v))   # -1..1, continuous
             adx_score = 50.0 + di_lean * min(adx_v, 50.0)
 
+            # ── Trend: price vs SMA50, ATR-normalized — slow-moving anchor
+            # that damps the composite's swinginess against the two
+            # faster trend checks above ────────────────────────────────
+            sma_v = float(sma50[i]) if not np.isnan(sma50[i]) else closes[i]
+            sma_dist_atr = (closes[i] - sma_v) / atr_v
+            sma50_score = 50.0 + 50.0 * math.tanh(self.sma_dist_sensitivity * sma_dist_atr)
+
             # ── Momentum: RSI, used directly ───────────────────────────────
             rsi_v = float(rsi_arr[i]) if not np.isnan(rsi_arr[i]) else 50.0
             rsi_score = rsi_v
@@ -139,6 +174,12 @@ class TrendEngine:
             ef_prev = ema_f[i - 1]
             slope_atr = (ema_f[i] - ef_prev) / atr_v
             slope_score = 50.0 + 50.0 * math.tanh(self.slope_sensitivity * slope_atr)
+
+            # ── Momentum: MACD histogram / ATR, tanh-scaled — smoother than
+            # raw RSI/slope since it's already a smoothed difference-of-EMAs
+            hist_v = float(macd_hist[i]) if not np.isnan(macd_hist[i]) else 0.0
+            hist_atr = hist_v / atr_v
+            macd_score = 50.0 + 50.0 * math.tanh(self.macd_hist_sensitivity * hist_atr)
 
             # ── Volume: volume vs its 20-bar average, signed by that bar's
             # own close-vs-open — confirms whichever way the bar closed,
@@ -150,15 +191,16 @@ class TrendEngine:
             bar_dir = 1.0 if closes[i] > opens[i] else (-1.0 if closes[i] < opens[i] else 0.0)
             volume_score = 50.0 + bar_dir * 50.0 * math.tanh(self.volume_sensitivity * (vol_ratio - 1.0))
 
-            subs = {"ema": ema_score, "adx": adx_score, "rsi": rsi_score,
-                    "slope": slope_score, "volume": volume_score}
+            subs = {"ema": ema_score, "adx": adx_score, "sma50": sma50_score,
+                    "rsi": rsi_score, "slope": slope_score, "macd": macd_score,
+                    "volume": volume_score}
             composite = sum(subs[k2] * w for k2, w in self._WEIGHTS.items())
             composites.append(composite)
             if k == 0:
                 last_subs = subs
                 last_cats = {
-                    "trend":    (subs["ema"] * 0.25 + subs["adx"] * 0.25) / 0.50,
-                    "momentum": (subs["rsi"] * 0.15 + subs["slope"] * 0.15) / 0.30,
+                    "trend":    (subs["ema"] + subs["adx"] + subs["sma50"]) / 3,
+                    "momentum": (subs["rsi"] + subs["slope"] + subs["macd"]) / 3,
                     "volume":   subs["volume"],
                 }
 
@@ -206,6 +248,27 @@ class TrendEngine:
         for i in range(period, len(arr)):
             out[i] = arr[i] * k + out[i - 1] * (1 - k)
         return out
+
+    @staticmethod
+    def _sma(arr: np.ndarray, period: int) -> np.ndarray:
+        out = np.full(len(arr), np.nan)
+        for i in range(period - 1, len(arr)):
+            out[i] = float(np.mean(arr[i - period + 1:i + 1]))
+        return out
+
+    @classmethod
+    def _macd(cls, closes: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9):
+        ema_fast = cls._ema(closes, fast)
+        ema_slow = cls._ema(closes, slow)
+        macd_line = ema_fast - ema_slow
+        valid = ~np.isnan(macd_line)
+        sig_line = np.full(len(closes), np.nan)
+        idx = np.where(valid)[0]
+        if len(idx) >= signal:
+            sig_seg = cls._ema(macd_line[idx], signal)
+            sig_line[idx] = sig_seg
+        hist = macd_line - sig_line
+        return macd_line, sig_line, hist
 
     @staticmethod
     def _atr(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, period: int = 14) -> np.ndarray:
