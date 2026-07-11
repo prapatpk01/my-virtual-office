@@ -48,6 +48,7 @@ class MacroTrendResult:
     ema_aligned: bool
     adx: float
     structure: str        # "hh_hl" | "ll_lh" | "mixed"
+    stage: str             # "early" | "mid" | "late" | "n/a" (n/a when bias is neutral)
     detail: dict
 
     def allows_long(self) -> bool:
@@ -86,7 +87,8 @@ class MacroTrendEngine:
             return MacroTrendResult(
                 score=50.0, bias=TrendBias.NEUTRAL,
                 counter_trend_block=False, ema_aligned=False,
-                adx=0.0, structure="mixed", detail={"reason": "insufficient_candles"},
+                adx=0.0, structure="mixed", stage="n/a",
+                detail={"reason": "insufficient_candles"},
             )
 
         closes = np.array([float(c.close) for c in candles_4h], dtype=float)
@@ -186,6 +188,9 @@ class MacroTrendEngine:
         bias = self._classify(score)
         ema_aligned = price > ema20[-1] > ema50[-1] or price < ema20[-1] < ema50[-1]
 
+        stage = self._classify_stage(bias, adx_arr, atr_arr, closes, ema20)
+        detail["stage"] = stage
+
         return MacroTrendResult(
             score=round(score, 1),
             bias=bias,
@@ -193,10 +198,38 @@ class MacroTrendEngine:
             ema_aligned=ema_aligned,
             adx=round(adx_val, 1),
             structure=structure,
+            stage=stage,
             detail=detail,
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _classify_stage(
+        bias: TrendBias, adx_arr: np.ndarray, atr_arr: np.ndarray,
+        closes: np.ndarray, ema20: np.ndarray,
+    ) -> str:
+        """Trend maturity, not just direction — how far along the move is:
+          early : ADX still low (<20), trend just getting going
+          mid   : ADX rising through the 20-35 trending band
+          late  : ADX high but flattening/declining (momentum stalling),
+                  OR price stretched >3x ATR from EMA20 (overextended)
+        Only meaningful for a directional bias; NEUTRAL has no stage."""
+        if bias == TrendBias.NEUTRAL:
+            return "n/a"
+
+        adx_val = float(adx_arr[-1]) if len(adx_arr) and not np.isnan(adx_arr[-1]) else 0.0
+        adx_5ago = float(adx_arr[-6]) if len(adx_arr) > 5 and not np.isnan(adx_arr[-6]) else adx_val
+        adx_rising = adx_val > adx_5ago
+
+        atr_val = float(atr_arr[-1]) if len(atr_arr) and not np.isnan(atr_arr[-1]) else 0.0
+        ext_atr = abs(closes[-1] - ema20[-1]) / atr_val if atr_val > 0 else 0.0
+
+        if adx_val < 20:
+            return "early"
+        if ext_atr > 3.0 or (adx_val >= 35 and not adx_rising):
+            return "late"
+        return "mid"
 
     @staticmethod
     def _classify(score: float) -> TrendBias:

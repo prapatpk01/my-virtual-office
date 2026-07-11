@@ -408,17 +408,23 @@ class TradingBot:
         so Railway logs show live scan activity even when no trade fires."""
         meta       = signal.metadata or {}
         macro      = meta.get("macro_trend", {})
+        context1h  = meta.get("context_1h", {})
+        mtf        = meta.get("mtf_combined", {})
         regime     = meta.get("regime", "?")
         strat_sel  = meta.get("selected_strategy", "?")
         strat_conf = meta.get("strategy_confidence")
         conf_str   = f"{strat_conf:.0f}" if isinstance(strat_conf, (int, float)) else "?"
-        macro_str  = f"{macro.get('bias', '?')}({macro.get('score', 0):.0f})" if macro else "?"
+        macro_str  = f"{macro.get('bias', '?')}/{macro.get('stage', '?')}({macro.get('score', 0):.0f})" if macro else "?"
+        ctx_str    = f"{context1h.get('dominant_bias', '?')}/{context1h.get('stage', '?')}" if context1h else "?"
+        aligned    = mtf.get("aligned_1h_4h")
+        align_str  = "✓" if aligned else ("✗" if aligned is not None else "?")
+        mtf_str    = f"{mtf.get('pct', 0):+.0f}%" if mtf else "?"
         reason     = (signal.reason or "")[:90]
 
         logger.info(
-            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s regime=%-10s macro=%-16s strat=%s(%s) | %s",
+            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s regime=%-10s 4H=%-14s 1H=%-10s aligned=%s mtf=%-6s strat=%s(%s) | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
-            regime, macro_str, strat_sel, conf_str, reason,
+            regime, macro_str, ctx_str, align_str, mtf_str, strat_sel, conf_str, reason,
         )
 
     # ------------------------------------------------------------------

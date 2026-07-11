@@ -46,6 +46,7 @@ class ContextBiasResult:
     bear_score: float         # 0-100
     context: ContextType
     dominant_bias: str        # "bull" | "bear" | "neutral"
+    stage: str = "n/a"         # "early" | "mid" | "late" | "n/a" (n/a when neutral)
     score_breakdown: dict = field(default_factory=dict)
     detail: dict = field(default_factory=dict)
 
@@ -149,11 +150,15 @@ class ContextBiasEngine:
         else:
             dominant_bias = "neutral"
 
+        stage = self._classify_stage(dominant_bias, closes)
+        detail["stage"] = stage
+
         return ContextBiasResult(
             bull_score=bull_score,
             bear_score=bear_score,
             context=context,
             dominant_bias=dominant_bias,
+            stage=stage,
             score_breakdown=breakdown,
             detail=detail,
         )
@@ -505,6 +510,31 @@ class ContextBiasEngine:
             return ContextType.ACCUMULATION
 
         return ContextType.UNCLEAR
+
+    def _classify_stage(self, dominant_bias: str, closes: np.ndarray) -> str:
+        """Trend maturity on 1H, mirroring MacroTrendEngine's 4H stage read:
+          early : RSI hasn't reached the trending zone yet
+          mid   : RSI comfortably in the trend zone (55-75 bull / 25-45 bear)
+          late  : RSI extreme (>=75 bull / <=25 bear) — momentum exhaustion risk
+        Only meaningful with a dominant bias; neutral has no stage."""
+        if dominant_bias == "neutral":
+            return "n/a"
+
+        rsi = self._rsi(closes, 14)
+        val = float(rsi[-1]) if not np.isnan(rsi[-1]) else 50.0
+
+        if dominant_bias == "bull":
+            if val < 55:
+                return "early"
+            if val >= 75:
+                return "late"
+            return "mid"
+        else:  # bear
+            if val > 45:
+                return "early"
+            if val <= 25:
+                return "late"
+            return "mid"
 
     # ── Math helpers ──────────────────────────────────────────────────────────
 

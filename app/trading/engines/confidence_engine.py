@@ -15,10 +15,11 @@ Components:
   Pattern/Structure  15 pts — ExpertScores.liquidity as a structure/pattern proxy
   Trend Alignment    10 pts — macro score distance from neutral, signed with direction
 
-Threshold:
-  <75    SKIP
-  75-84  GOOD
-  85-100 HIGH_CONFIDENCE
+Threshold (loosened — roughly "3-4 of the 7 components confirming" rather
+than requiring most of them; ~AI_EXPERT_CONFIDENCE_SKIP/_HIGH env vars):
+  <45    SKIP
+  45-64  GOOD
+  65-100 HIGH_CONFIDENCE
 """
 from __future__ import annotations
 
@@ -47,7 +48,7 @@ class ConfidenceResult:
 
 
 class ConfidenceEngine:
-    def __init__(self, skip_threshold: float = 75.0, high_threshold: float = 85.0):
+    def __init__(self, skip_threshold: float = 45.0, high_threshold: float = 65.0):
         self.skip_threshold = skip_threshold
         self.high_threshold = high_threshold
 

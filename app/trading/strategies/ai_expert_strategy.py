@@ -99,7 +99,10 @@ class AIExpertStrategy(BaseStrategy):
         self._regime_classifier = RegimeClassifier()                  # Layer 3
         self._selector          = RegimeStrategySelector()            # Layer 4
         # Layer 5 strategy instances are shared module-level singletons (stateless)
-        self._confidence_engine = ConfidenceEngine()                  # Layer 6
+        self._confidence_engine = ConfidenceEngine(                   # Layer 6
+            skip_threshold=float(os.getenv("AI_EXPERT_CONFIDENCE_SKIP", "45")),
+            high_threshold=float(os.getenv("AI_EXPERT_CONFIDENCE_HIGH", "65")),
+        )
         self._expectancy_engine = ExpectancyEngine()                  # Layer 7
         self._risk_engine       = DynamicRiskEngine(                  # Layer 8
             base_tp1_rr=float(os.getenv("TP1_RR", "0.6")),
@@ -154,10 +157,20 @@ class AIExpertStrategy(BaseStrategy):
         # ── Layer 3: Market Regime Classifier — the heart of the system ──────
         regime = self._regime_classifier.analyze(candles)
 
+        # Weighted 15m/1h/4h combined bias (-100..+100, higher TF weighted
+        # more) — breaks the direction tie when 4H macro alone is neutral.
+        mtf_pct, mtf_label = self.compute_mtf_bias(candles, mtf)
+        mtf_aligned = (
+            context.dominant_bias == "bull" and macro.score >= 50
+        ) or (
+            context.dominant_bias == "bear" and macro.score <= 50
+        )
+
         # ── Layer 4: Dynamic Strategy Selector — exactly one strategy survives ─
-        selection = self._selector.select(macro, context, regime)
+        selection = self._selector.select(macro, context, regime, mtf_pct=mtf_pct)
 
         base_meta = self._base_metadata(quality, macro, context, regime, selection)
+        base_meta["mtf_combined"] = {"pct": round(mtf_pct, 1), "label": mtf_label, "aligned_1h_4h": mtf_aligned}
 
         # ── Exit check for an already-open position runs regardless of
         # whether Layer 4 allows new entries this bar ────────────────────────
@@ -379,13 +392,13 @@ class AIExpertStrategy(BaseStrategy):
         return {
             "market_quality": {"score": quality.score, "band": quality.band.value},
             "macro_trend": {
-                "score": macro.score, "bias": macro.bias.value,
+                "score": macro.score, "bias": macro.bias.value, "stage": macro.stage,
                 "structure": macro.structure, "allowed_direction": macro.allowed_direction(),
             },
             "context_1h": {
                 "type": context.context.value,
                 "bull_score": context.bull_score, "bear_score": context.bear_score,
-                "dominant_bias": context.dominant_bias,
+                "dominant_bias": context.dominant_bias, "stage": context.stage,
             },
             "regime": regime.primary.value,
             "regime_secondary": regime.secondary.value,

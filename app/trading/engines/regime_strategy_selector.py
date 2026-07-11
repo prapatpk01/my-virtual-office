@@ -119,7 +119,11 @@ class RegimeStrategySelector:
         macro: MacroTrendResult,
         context: ContextBiasResult,
         regime: RegimeResult,
+        mtf_pct: float = 0.0,
     ) -> StrategySelectionResult:
+        """mtf_pct: weighted 15m/1h/4h combined bias score (-100..+100, higher
+        TF weighted more) — used to break ties when Layer 1 (4H macro alone)
+        reads neutral, instead of leaving direction fully unconstrained."""
         primary = regime.primary
 
         if primary in (PrimaryRegime.BULL_TREND, PrimaryRegime.BEAR_TREND):
@@ -145,7 +149,7 @@ class RegimeStrategySelector:
                 detail={"regime_confidence": regime.confidence},
             )
 
-        direction_filter = self._direction_filter(macro, selected, primary)
+        direction_filter = self._direction_filter(macro, selected, primary, mtf_pct)
         block_reason = "" if direction_filter != "none" else "Counter-trend blocked by macro direction gate"
 
         return StrategySelectionResult(
@@ -155,11 +159,16 @@ class RegimeStrategySelector:
         )
 
     @staticmethod
-    def _direction_filter(macro: MacroTrendResult, selected: StrategyType, primary: PrimaryRegime) -> str:
+    def _direction_filter(macro: MacroTrendResult, selected: StrategyType,
+                          primary: PrimaryRegime, mtf_pct: float = 0.0) -> str:
         """Layer 1's allowed_direction() is the hard fence; trend-following
         strategies obey it directly, counter-trend strategies (mean
-        reversion / swing reversal) may fade it but not against an extreme."""
+        reversion / swing reversal) may fade it but not against an extreme.
+        When macro alone reads neutral ("both") and the regime has no lean
+        of its own, the weighted 15m/1h/4h combined score (mtf_pct) breaks
+        the tie instead of leaving direction fully unconstrained."""
         macro_dir = macro.allowed_direction()
+        MTF_LEAN_THRESHOLD = 15.0  # |mtf_pct| below this = still too mixed to lean
 
         if selected in (StrategyType.TREND_CONTINUATION, StrategyType.MOMENTUM_EXPANSION, StrategyType.BREAKOUT):
             if macro_dir == "no_trade":
@@ -172,6 +181,10 @@ class RegimeStrategySelector:
             if primary == PrimaryRegime.BULL_TREND:
                 return "long_only"
             if primary == PrimaryRegime.BEAR_TREND:
+                return "short_only"
+            if mtf_pct >= MTF_LEAN_THRESHOLD:
+                return "long_only"
+            if mtf_pct <= -MTF_LEAN_THRESHOLD:
                 return "short_only"
             return "both"
 
