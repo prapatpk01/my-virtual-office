@@ -101,8 +101,8 @@ class Config:
     min_bars: int = 100          # skip trading a symbol if any TF has fewer closed bars
 
     # Regime engine (4h)
-    regime_ema_fast: int = 20
-    regime_ema_slow: int = 50
+    regime_ema_fast: int = 10   # was 20 — faster pair (10/20) per user request
+    regime_ema_slow: int = 20   # was 50
     regime_ema_slope_lookback: int = 5
     regime_adx_period: int = 14
     regime_chop_period: int = 14
@@ -166,11 +166,9 @@ class Config:
     # -> enabled. entry_participation_mandatory measured WORSE (PF->0.598)
     # -> stays off.
     entry_adx_gate_enabled: bool = True
-    # 25 (paired with entry_setup_window_bars=2) MEASURED as the local optimum:
-    # PF 0.841, WR 72.0%, net -2234, avg_R -0.039 — the best combination
-    # found this session (vs. window=2/ADX=20 PF 0.821, window=2/ADX=30
-    # PF 0.820, window=1 variants all worse).
-    entry_adx_min: float = 25.0             # 30M ADX must clear this when the gate is on
+    # Per user request: 18-or-rising (matches Regime's own "adx_trending"
+    # style: adx >= min OR adx rising) instead of a flat >=25 bar.
+    entry_adx_min: float = 18.0             # 30M ADX must clear this OR be rising when the gate is on
     entry_participation_mandatory: bool = False  # require volume/participation, not just optional
 
     # ── Bias confidence (1H) ─────────────────────────────────────────────────
@@ -400,7 +398,7 @@ class Config:
 
     # Layer 3 — Entry: 5-category trigger, >= entry_min_categories with
     # Momentum + Structure mandatory regardless of the total count.
-    entry_min_categories: int = 4
+    entry_min_categories: int = 3   # was 4, per user request
     entry_rel_vol_min: float = 1.2          # softer bar than bias_rel_vol_min — "elevated" for a trigger
 
     def __post_init__(self):

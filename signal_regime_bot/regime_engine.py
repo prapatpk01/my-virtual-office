@@ -76,10 +76,10 @@ class RegimeEngine:
         closes, highs, lows, vols = df["close"], df["high"], df["low"], df["volume"]
         price = float(closes.iloc[-1])
 
-        e20 = ind.ema(closes, c.regime_ema_fast)
-        e50 = ind.ema(closes, c.regime_ema_slow)
-        e20_v, e50_v = float(e20.iloc[-1]), float(e50.iloc[-1])
-        slope20 = float(ind.slope_pct(e20, c.regime_ema_slope_lookback).iloc[-1] or 0.0)
+        e_fast = ind.ema(closes, c.regime_ema_fast)     # EMA10
+        e_slow = ind.ema(closes, c.regime_ema_slow)     # EMA20
+        e_fast_v, e_slow_v = float(e_fast.iloc[-1]), float(e_slow.iloc[-1])
+        slope_fast = float(ind.slope_pct(e_fast, c.regime_ema_slope_lookback).iloc[-1] or 0.0)
 
         adx_s, _, _ = ind.adx(df, c.regime_adx_period)
         adx_now = float(adx_s.iloc[-1]) if not np.isnan(adx_s.iloc[-1]) else 0.0
@@ -112,38 +112,38 @@ class RegimeEngine:
 
         # ── Strong Bull Trend: pass >= 4/6 ────────────────────────────────────
         strong_bull_checks = {
-            "ema20>ema50":      e20_v > e50_v,
-            "close>ema20":      price > e20_v,
-            "ema20_slope_up":   slope20 > 0,
-            "adx_trending":     adx_now > c.rg_adx_trend_min or adx_rising,
-            "hh_hl":            structure == "HH_HL",
-            "macd_hist>0":      h_now > 0,
+            "ema_fast>ema_slow": e_fast_v > e_slow_v,
+            "close>ema_fast":    price > e_fast_v,
+            "ema_fast_slope_up": slope_fast > 0,
+            "adx_trending":      adx_now > c.rg_adx_trend_min or adx_rising,
+            "hh_hl":             structure == "HH_HL",
+            "macd_hist>0":       h_now > 0,
         }
         # ── Strong Bear Trend: mirror ─────────────────────────────────────────
         strong_bear_checks = {
-            "ema20<ema50":      e20_v < e50_v,
-            "close<ema20":      price < e20_v,
-            "ema20_slope_dn":   slope20 < 0,
-            "adx_trending":     adx_now > c.rg_adx_trend_min or adx_rising,
-            "lh_ll":            structure == "LH_LL",
-            "macd_hist<0":      h_now < 0,
+            "ema_fast<ema_slow": e_fast_v < e_slow_v,
+            "close<ema_fast":    price < e_fast_v,
+            "ema_fast_slope_dn": slope_fast < 0,
+            "adx_trending":      adx_now > c.rg_adx_trend_min or adx_rising,
+            "lh_ll":             structure == "LH_LL",
+            "macd_hist<0":       h_now < 0,
         }
         # ── Early Bull: pass >= 4/6 ────────────────────────────────────────────
         early_bull_checks = {
-            "reclaim_ema20":    ind.recent_cross_above(closes, e20, lookback=5),
-            "ema20_turning_up": slope20 > 0,
-            "macd_improving":   h_now > h_prev,
-            "roc9>0":           roc9 > 0,
-            "higher_low":       sflags["higher_low"],
-            "bullish_volume":   bull_vol,
+            "reclaim_ema_fast":     ind.recent_cross_above(closes, e_fast, lookback=5),
+            "ema_fast_turning_up":  slope_fast > 0,
+            "macd_improving":       h_now > h_prev,
+            "roc9>0":                roc9 > 0,
+            "higher_low":            sflags["higher_low"],
+            "bullish_volume":        bull_vol,
         }
         early_bear_checks = {
-            "reclaim_ema20_dn": ind.recent_cross_below(closes, e20, lookback=5),
-            "ema20_turning_dn": slope20 < 0,
-            "macd_falling":     h_now < h_prev,
-            "roc9<0":           roc9 < 0,
-            "lower_high":       sflags["lower_high"],
-            "bearish_volume":   bear_vol,
+            "reclaim_ema_fast_dn":  ind.recent_cross_below(closes, e_fast, lookback=5),
+            "ema_fast_turning_dn":  slope_fast < 0,
+            "macd_falling":         h_now < h_prev,
+            "roc9<0":                roc9 < 0,
+            "lower_high":            sflags["lower_high"],
+            "bearish_volume":        bear_vol,
         }
         # ── Compression / Range / High Volatility ─────────────────────────────
         compression_checks = {
@@ -154,7 +154,7 @@ class RegimeEngine:
         range_checks = {
             "adx_low":         adx_now < c.rg_range_adx_max,
             "structure_mixed": structure == "MIXED",
-            "ema_flat":        abs(slope20) < c.rg_range_flat_slope_pct,
+            "ema_flat":        abs(slope_fast) < c.rg_range_flat_slope_pct,
         }
         highvol_checks = {
             "atr_expansion":    atr_pctl >= c.rg_highvol_atr_pctile_min,

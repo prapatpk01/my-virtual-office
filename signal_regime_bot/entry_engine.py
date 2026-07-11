@@ -15,15 +15,18 @@ Five trigger categories, each true/false:
     Liquidity     Sweep / rejection wick
     Participation Volume expansion / elevated relative volume
 
-Needs >= 4/5 categories, with Momentum AND Structure mandatory regardless
-of the total count.
+Needs >= entry_min_categories (3/5) categories, with Momentum AND Structure
+mandatory regardless of the total count.
 
-Two additional HARD gates, config-toggled (off unless enabled):
-    entry_adx_gate_enabled     30M ADX must clear entry_adx_min — confirms
-                               the move has real directional force behind it,
-                               not just a low-conviction chop bounce.
+Two additional HARD gates, config-toggled:
+    entry_adx_gate_enabled     30M ADX must clear entry_adx_min OR be rising
+                               (mirrors Regime's own "adx_trending" check) —
+                               confirms the move has real directional force
+                               behind it, not just a low-conviction chop
+                               bounce. Enabled, threshold 18.
     entry_participation_mandatory  Participation (volume) required alongside
                                Momentum + Structure, not just optional.
+                               Measured worse in testing — stays off.
 
 Setup freshness window: the category check alone has no memory of WHEN
 momentum first turned, so it can fire many bars after the actual shift —
@@ -115,6 +118,8 @@ class EntryEngine:
 
         adx_s, _, _ = ind.adx(df_30m, c.regime_adx_period)
         adx_now = float(adx_s.iloc[-1]) if not np.isnan(adx_s.iloc[-1]) else 0.0
+        adx_prev = float(adx_s.iloc[-2]) if not np.isnan(adx_s.iloc[-2]) else 0.0
+        adx_rising = adx_now > adx_prev
 
         # ── setup freshness: age of the EARLIEST currently-active momentum
         # trigger among {ROC>0, MACD favorable, HMA cross}, in the trade
@@ -170,7 +175,7 @@ class EntryEngine:
         if c.entry_participation_mandatory:
             mandatory_cats.append("participation")
         mandatory_ok = all(categories[k] for k in mandatory_cats)
-        adx_ok = (not c.entry_adx_gate_enabled) or adx_now >= c.entry_adx_min
+        adx_ok = (not c.entry_adx_gate_enabled) or adx_now >= c.entry_adx_min or adx_rising
         allow = passed >= c.entry_min_categories and mandatory_ok and adx_ok and in_window
         score = round(passed / 5.0 * 100.0, 1)
 
@@ -186,7 +191,8 @@ class EntryEngine:
             missing = [k for k in mandatory_cats if not categories[k]]
             reason = f"{direction} trigger blocked: mandatory {'/'.join(missing)} not met ({passed}/5 passed, setup_age={setup_age})"
         elif not adx_ok:
-            reason = f"{direction} trigger blocked: ADX {adx_now:.0f} < {c.entry_adx_min:.0f} ({passed}/5 categories passed)"
+            reason = (f"{direction} trigger blocked: ADX {adx_now:.0f} < {c.entry_adx_min:.0f} and not rising "
+                      f"({passed}/5 categories passed)")
         else:
             reason = f"{direction} trigger not ready: {passed}/5 categories (need >= {c.entry_min_categories}, setup_age={setup_age})"
 
