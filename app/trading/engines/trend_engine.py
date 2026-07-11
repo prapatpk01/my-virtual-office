@@ -2,19 +2,28 @@
 Trend Engine — shared, timeframe-agnostic trend scoring engine.
 
 Weighted composite score, 0-100, one number instead of a discrete
-bull/bear/neutral vote. 4 checks, each turned into its own continuous
-0-100 sub-score (50 = neutral, 100 = maximally bullish, 0 = maximally
-bearish), combined by weight, then blended over the last 3 bars
-(50/30/20% weighted toward the most recent bar, not a flat average) so
-a single noisy bar can't swing the read without also lagging behind a
-real move:
+bull/bear/neutral vote. 3 categories, 5 checks total (1-2 per
+category), each check turned into its own continuous 0-100 sub-score
+(50 = neutral, 100 = maximally bullish, 0 = maximally bearish):
 
-  EMA12/26 spread   30% — (ema12-ema26)/ATR, scaled through tanh
-  ADX + DI direction 25% — strength capped at 50, signed by +DI vs -DI
-  RSI(14)            25% — used directly, already a natural 0-100/50-center scale
-  EMA12 slope        20% — bar-to-bar change of EMA12/ATR, scaled through tanh
+  Trend    50% — direction & structure
+    EMA12/26 spread   25% — (ema12-ema26)/ATR, tanh-scaled
+    ADX + DI direction 25% — strength capped at 50, continuously signed
+                             by +DI vs -DI (tanh, not a hard flip)
+  Momentum 30% — how hard and how fast it's currently moving
+    RSI(14)            15% — used directly, already 0-100/50-center
+    EMA12 slope        15% — bar-to-bar change of EMA12/ATR, tanh-scaled
+  Volume   20% — does volume confirm the bar's own direction
+    Volume vs 20-bar average, signed by that bar's close-vs-open,
+    tanh-scaled — a high-volume bar confirms whichever way it closed;
+    an average-or-below-volume bar contributes near nothing regardless
+    of direction (weak conviction either way).
 
-Both EMA checks are normalized by ATR, not raw %-of-price — a flat %
+Each check is computed at the last 3 bars and blended 50/30/20%
+weighted toward the most recent bar (not a flat average), so a single
+noisy bar can't swing the read without lagging behind a real move.
+
+EMA and slope are normalized by ATR, not raw %-of-price — a flat %
 threshold miscalibrates across timeframes (the same real move is a
 much smaller % on a 15m bar than a 1H bar), so scaling by the
 instrument's own current volatility keeps the score equally responsive
@@ -59,33 +68,42 @@ class TrendResult:
 
 
 class TrendEngine:
-    _WEIGHTS = {"ema": 0.30, "adx": 0.25, "rsi": 0.25, "slope": 0.20}
+    # category weights: trend 50% (ema+adx), momentum 30% (rsi+slope), volume 20%
+    _WEIGHTS = {"ema": 0.25, "adx": 0.25, "rsi": 0.15, "slope": 0.15, "volume": 0.20}
+    _CATEGORY = {"ema": "trend", "adx": "trend", "rsi": "momentum", "slope": "momentum", "volume": "volume"}
     _BAR_WEIGHTS = (0.5, 0.3, 0.2)   # most-recent-first; must match avg_bars length
 
     def __init__(self, ema_fast: int = 12, ema_slow: int = 26,
                  adx_period: int = 14, rsi_period: int = 14, atr_period: int = 14,
+                 volume_lookback: int = 20,
                  avg_bars: int = 3,
                  ema_spread_sensitivity: float = 0.8,
-                 slope_sensitivity: float = 1.5):
+                 slope_sensitivity: float = 1.5,
+                 volume_sensitivity: float = 1.2):
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.adx_period = adx_period
         self.rsi_period = rsi_period
         self.atr_period = atr_period
+        self.volume_lookback = volume_lookback
         self.avg_bars = avg_bars
         self.ema_spread_sensitivity = ema_spread_sensitivity
         self.slope_sensitivity = slope_sensitivity
+        self.volume_sensitivity = volume_sensitivity
 
     def analyze(self, candles: list) -> TrendResult:
         n = self.avg_bars
-        min_needed = max(self.ema_slow, self.adx_period * 2, self.rsi_period, self.atr_period) + n + 5
+        min_needed = max(self.ema_slow, self.adx_period * 2, self.rsi_period,
+                         self.atr_period, self.volume_lookback) + n + 5
         if len(candles) < min_needed:
             return TrendResult(50.0, TrendBand.SIDEWAY,
                                detail={"reason": f"need {min_needed}+ candles, have {len(candles)}"})
 
-        closes = np.array([float(c.close) for c in candles], dtype=float)
-        highs  = np.array([float(c.high)  for c in candles], dtype=float)
-        lows   = np.array([float(c.low)   for c in candles], dtype=float)
+        closes  = np.array([float(c.close)  for c in candles], dtype=float)
+        highs   = np.array([float(c.high)   for c in candles], dtype=float)
+        lows    = np.array([float(c.low)    for c in candles], dtype=float)
+        opens   = np.array([float(c.open)   for c in candles], dtype=float)
+        volumes = np.array([float(c.volume) for c in candles], dtype=float)
 
         ema_f = self._ema(closes, self.ema_fast)
         ema_s = self._ema(closes, self.ema_slow)
@@ -94,43 +112,55 @@ class TrendEngine:
         atr_arr = self._atr(closes, highs, lows, self.atr_period)
 
         composites = []
+        cat_composites = []
         last_subs = None
         for k in range(n):
             i = -1 - k  # -1, -2, -3, ...
             atr_v = float(atr_arr[i]) if not np.isnan(atr_arr[i]) and atr_arr[i] > 0 else closes[i] * 0.005
 
-            # ── EMA12/26 spread, ATR-normalized + tanh-scaled ─────────────
+            # ── Trend: EMA12/26 spread, ATR-normalized + tanh-scaled ──────
             spread_atr = (ema_f[i] - ema_s[i]) / atr_v
             ema_score = 50.0 + 50.0 * math.tanh(self.ema_spread_sensitivity * spread_atr)
 
-            # ── ADX strength, signed by +DI/-DI (continuous, not a hard flip) ─
-            # A hard sign(+1/-1) on which of +DI/-DI is bigger snaps the
-            # whole ±adx_val contribution to the opposite side the instant
-            # they cross, even by a hair — one noisy bar near a +DI/-DI tie
-            # can swing this sub-score ~50pts and, at 25% weight, the
-            # composite ~12+pts in a single bar. tanh(di_diff) makes a near
-            # -tie contribute near-neutral instead of snapping fully to
-            # one side; ADX magnitude still scales confidence smoothly.
+            # ── Trend: ADX strength, signed by +DI/-DI (continuous, not a
+            # hard flip — see history: a hard sign(+1/-1) snapped this
+            # ~50pts on a hairline +DI/-DI cross) ─────────────────────────
             adx_v = float(adx_arr[i]) if not np.isnan(adx_arr[i]) else 0.0
             pdi_v = float(pdi_arr[i]) if not np.isnan(pdi_arr[i]) else 50.0
             mdi_v = float(mdi_arr[i]) if not np.isnan(mdi_arr[i]) else 50.0
             di_lean = math.tanh(0.08 * (pdi_v - mdi_v))   # -1..1, continuous
             adx_score = 50.0 + di_lean * min(adx_v, 50.0)
 
-            # ── RSI, used directly (already a natural 0-100/50-center scale) ─
+            # ── Momentum: RSI, used directly ───────────────────────────────
             rsi_v = float(rsi_arr[i]) if not np.isnan(rsi_arr[i]) else 50.0
             rsi_score = rsi_v
 
-            # ── EMA12 bar-to-bar slope, ATR-normalized + tanh-scaled ──────
+            # ── Momentum: EMA12 bar-to-bar slope, ATR-normalized ──────────
             ef_prev = ema_f[i - 1]
             slope_atr = (ema_f[i] - ef_prev) / atr_v
             slope_score = 50.0 + 50.0 * math.tanh(self.slope_sensitivity * slope_atr)
 
-            subs = {"ema": ema_score, "adx": adx_score, "rsi": rsi_score, "slope": slope_score}
+            # ── Volume: volume vs its 20-bar average, signed by that bar's
+            # own close-vs-open — confirms whichever way the bar closed,
+            # scaled by how much above/below average the volume was ────
+            vlb = self.volume_lookback
+            vol_window = volumes[i - vlb:i] if i - vlb >= -len(volumes) else volumes[:i]
+            vol_avg = float(np.mean(vol_window)) if len(vol_window) > 0 else volumes[i]
+            vol_ratio = volumes[i] / (vol_avg + 1e-9)
+            bar_dir = 1.0 if closes[i] > opens[i] else (-1.0 if closes[i] < opens[i] else 0.0)
+            volume_score = 50.0 + bar_dir * 50.0 * math.tanh(self.volume_sensitivity * (vol_ratio - 1.0))
+
+            subs = {"ema": ema_score, "adx": adx_score, "rsi": rsi_score,
+                    "slope": slope_score, "volume": volume_score}
             composite = sum(subs[k2] * w for k2, w in self._WEIGHTS.items())
             composites.append(composite)
             if k == 0:
                 last_subs = subs
+                last_cats = {
+                    "trend":    (subs["ema"] * 0.25 + subs["adx"] * 0.25) / 0.50,
+                    "momentum": (subs["rsi"] * 0.15 + subs["slope"] * 0.15) / 0.30,
+                    "volume":   subs["volume"],
+                }
 
         # Recency-weighted blend across the last n bars (0.5/0.3/0.2 for
         # n=3) instead of a flat average — dilutes single-bar noise
@@ -142,7 +172,10 @@ class TrendEngine:
 
         return TrendResult(
             score=score, band=band, sub_scores={k: round(v, 1) for k, v in last_subs.items()},
-            detail={"composites": [round(c, 1) for c in composites]},
+            detail={
+                "composites": [round(c, 1) for c in composites],
+                "categories": {k: round(v, 1) for k, v in last_cats.items()},
+            },
         )
 
     @staticmethod
