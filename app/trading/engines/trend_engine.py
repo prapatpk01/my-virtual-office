@@ -103,12 +103,19 @@ class TrendEngine:
             spread_atr = (ema_f[i] - ema_s[i]) / atr_v
             ema_score = 50.0 + 50.0 * math.tanh(self.ema_spread_sensitivity * spread_atr)
 
-            # ── ADX strength, signed by +DI/-DI ───────────────────────────
+            # ── ADX strength, signed by +DI/-DI (continuous, not a hard flip) ─
+            # A hard sign(+1/-1) on which of +DI/-DI is bigger snaps the
+            # whole ±adx_val contribution to the opposite side the instant
+            # they cross, even by a hair — one noisy bar near a +DI/-DI tie
+            # can swing this sub-score ~50pts and, at 25% weight, the
+            # composite ~12+pts in a single bar. tanh(di_diff) makes a near
+            # -tie contribute near-neutral instead of snapping fully to
+            # one side; ADX magnitude still scales confidence smoothly.
             adx_v = float(adx_arr[i]) if not np.isnan(adx_arr[i]) else 0.0
             pdi_v = float(pdi_arr[i]) if not np.isnan(pdi_arr[i]) else 50.0
             mdi_v = float(mdi_arr[i]) if not np.isnan(mdi_arr[i]) else 50.0
-            sign = 1.0 if pdi_v > mdi_v else (-1.0 if mdi_v > pdi_v else 0.0)
-            adx_score = 50.0 + sign * min(adx_v, 50.0)
+            di_lean = math.tanh(0.08 * (pdi_v - mdi_v))   # -1..1, continuous
+            adx_score = 50.0 + di_lean * min(adx_v, 50.0)
 
             # ── RSI, used directly (already a natural 0-100/50-center scale) ─
             rsi_v = float(rsi_arr[i]) if not np.isnan(rsi_arr[i]) else 50.0
