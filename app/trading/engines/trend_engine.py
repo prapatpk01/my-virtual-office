@@ -1,82 +1,76 @@
 """
-Trend Engine — shared, timeframe-agnostic trend direction + stage classifier.
+Trend Engine — shared, timeframe-agnostic trend scoring engine.
 
-Consolidates the stage-classification logic that macro_trend_engine.py (4H)
-and context_bias_engine.py (1H) each grew independently into one engine,
-usable on any candle series/timeframe. Exactly 4 checks:
+Weighted composite score, 0-100, one number instead of a discrete
+bull/bear/neutral vote. 4 checks, each turned into its own continuous
+0-100 sub-score (50 = neutral, 100 = maximally bullish, 0 = maximally
+bearish), combined by weight, then averaged over the last 3 bars so a
+single noisy bar can't swing the read:
 
-  1. EMA12 vs EMA26 alignment       — direction (bull/bear/neutral)
-  2. ADX +DI/-DI dominance          — which side is actually in control
-  3. RSI(14) position                — overbought/oversold extremity
-  4. EMA12 bar-to-bar slope direction — is price actively still moving
-     that way right now?
+  EMA12/26 spread   30% — (ema12-ema26)/ema26, scaled through tanh
+  ADX + DI direction 25% — strength capped at 50, signed by +DI vs -DI
+  RSI(14)            25% — used directly, already a natural 0-100/50-center scale
+  EMA12 slope        20% — bar-to-bar % change of EMA12, scaled through tanh
 
-Each check is evaluated bar-by-bar over the LAST 3 BARS, not just the
-current one — a single-bar read is noisy (one wick or one bar's RSI
-blip flips it), so every check requires its own read to agree on all
-3 of the last 3 bars before it "votes" for a direction. Any check that
-flickers (doesn't read the same way on all 3 bars) contributes nothing
-that bar rather than forcing a guess — direction is only bull/bear once
-all 4 checks vote the same way *and* stay consistent for 3 bars running.
-
-Stage (only meaningful once bias is bull/bear):
-  early : ADX < 20 for the last 3 bars — move just getting going
-  mid   : trend confirmed (all 4 checks agree, 3-bar consistent),
-          RSI not yet extreme
-  late  : RSI extreme (>=70 bull / <=25 bear) held for the last 3 bars,
-          OR ADX >= 35 but not rising over the last 3 bars — exhaustion risk
-  n/a   : bias is neutral — no trend to stage
+Bands (symmetric around 50):
+  76-100  strong_bull      56-65  early_bull
+  66-75   bull             45-55  sideway
+                            35-44  early_bear
+                            25-34  bear
+                            0-24   strong_bear
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
 
 
-class TrendBias(str, Enum):
-    BULL    = "bull"
-    BEAR    = "bear"
-    NEUTRAL = "neutral"
-
-
-class TrendStage(str, Enum):
-    EARLY = "early"
-    MID   = "mid"
-    LATE  = "late"
-    NA    = "n/a"
+class TrendBand(str, Enum):
+    STRONG_BULL = "strong_bull"
+    BULL        = "bull"
+    EARLY_BULL  = "early_bull"
+    SIDEWAY     = "sideway"
+    EARLY_BEAR  = "early_bear"
+    BEAR        = "bear"
+    STRONG_BEAR = "strong_bear"
 
 
 @dataclass
 class TrendResult:
-    bias:  TrendBias
-    stage: TrendStage
-    adx:   float
-    rsi:   float
-    votes: dict = field(default_factory=dict)   # which of the 4 checks confirmed, and what
+    score: float           # 0-100, 50 = perfectly neutral
+    band:  TrendBand
+    sub_scores: dict = field(default_factory=dict)   # {"ema": .., "adx": .., "rsi": .., "slope": ..} last-bar values
     detail: dict = field(default_factory=dict)
 
     @property
     def label(self) -> str:
-        return f"{self.bias.value}-{self.stage.value}" if self.bias != TrendBias.NEUTRAL else "neutral"
+        return self.band.value
 
 
 class TrendEngine:
+    _WEIGHTS = {"ema": 0.30, "adx": 0.25, "rsi": 0.25, "slope": 0.20}
+
     def __init__(self, ema_fast: int = 12, ema_slow: int = 26,
                  adx_period: int = 14, rsi_period: int = 14,
-                 confirm_bars: int = 3):
+                 avg_bars: int = 3,
+                 ema_spread_sensitivity: float = 15.0,
+                 slope_sensitivity: float = 80.0):
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.adx_period = adx_period
         self.rsi_period = rsi_period
-        self.confirm_bars = confirm_bars
+        self.avg_bars = avg_bars
+        self.ema_spread_sensitivity = ema_spread_sensitivity
+        self.slope_sensitivity = slope_sensitivity
 
     def analyze(self, candles: list) -> TrendResult:
-        n = self.confirm_bars
+        n = self.avg_bars
         min_needed = max(self.ema_slow, self.adx_period * 2, self.rsi_period) + n + 5
         if len(candles) < min_needed:
-            return TrendResult(TrendBias.NEUTRAL, TrendStage.NA, 0.0, 50.0,
+            return TrendResult(50.0, TrendBand.SIDEWAY,
                                detail={"reason": f"need {min_needed}+ candles, have {len(candles)}"})
 
         closes = np.array([float(c.close) for c in candles], dtype=float)
@@ -88,81 +82,61 @@ class TrendEngine:
         adx_arr, pdi_arr, mdi_arr = self._adx(closes, highs, lows, self.adx_period)
         rsi_arr = self._rsi(closes, self.rsi_period)
 
-        # ── Per-bar reads for each of the 4 checks, over the last n bars ────
-        ema_dirs, adx_dirs, rsi_zones, slope_dirs = [], [], [], []
+        composites = []
+        last_subs = None
         for k in range(n):
             i = -1 - k  # -1, -2, -3, ...
-            c, ef, es = closes[i], ema_f[i], ema_s[i]
-            ema_dirs.append("bull" if c > ef > es else "bear" if c < ef < es else "neutral")
 
-            pdi, mdi = pdi_arr[i], mdi_arr[i]
-            if np.isnan(pdi) or np.isnan(mdi) or pdi == mdi:
-                adx_dirs.append("neutral")
-            else:
-                adx_dirs.append("bull" if pdi > mdi else "bear")
+            # ── EMA12/26 spread, tanh-scaled ──────────────────────────────
+            spread_pct = (ema_f[i] - ema_s[i]) / (abs(ema_s[i]) + 1e-9)
+            ema_score = 50.0 + 50.0 * math.tanh(self.ema_spread_sensitivity * spread_pct)
 
-            r = rsi_arr[i]
-            r = 50.0 if np.isnan(r) else r
-            rsi_zones.append("bull" if r >= 55 else "bear" if r <= 45 else "neutral")
+            # ── ADX strength, signed by +DI/-DI ───────────────────────────
+            adx_v = float(adx_arr[i]) if not np.isnan(adx_arr[i]) else 0.0
+            pdi_v = float(pdi_arr[i]) if not np.isnan(pdi_arr[i]) else 50.0
+            mdi_v = float(mdi_arr[i]) if not np.isnan(mdi_arr[i]) else 50.0
+            sign = 1.0 if pdi_v > mdi_v else (-1.0 if mdi_v > pdi_v else 0.0)
+            adx_score = 50.0 + sign * min(adx_v, 50.0)
 
+            # ── RSI, used directly (already a natural 0-100/50-center scale) ─
+            rsi_v = float(rsi_arr[i]) if not np.isnan(rsi_arr[i]) else 50.0
+            rsi_score = rsi_v
+
+            # ── EMA12 bar-to-bar slope, tanh-scaled ───────────────────────
             ef_prev = ema_f[i - 1]
-            slope_dirs.append("bull" if ef > ef_prev else "bear" if ef < ef_prev else "neutral")
+            slope_pct = (ema_f[i] - ef_prev) / (abs(ef_prev) + 1e-9)
+            slope_score = 50.0 + 50.0 * math.tanh(self.slope_sensitivity * slope_pct)
 
-        def _confirmed(reads: list) -> str | None:
-            """Only 'votes' if it read the SAME non-neutral direction on
-            every one of the last n bars — a check that flickers doesn't
-            get a say this bar."""
-            first = reads[0]
-            if first == "neutral":
-                return None
-            return first if all(r == first for r in reads) else None
+            subs = {"ema": ema_score, "adx": adx_score, "rsi": rsi_score, "slope": slope_score}
+            composite = sum(subs[k2] * w for k2, w in self._WEIGHTS.items())
+            composites.append(composite)
+            if k == 0:
+                last_subs = subs
 
-        votes = {
-            "ema_align":  _confirmed(ema_dirs),
-            "adx_dir":    _confirmed(adx_dirs),
-            "rsi_zone":   _confirmed(rsi_zones),
-            "ema_slope":  _confirmed(slope_dirs),
-        }
-        confirmed_votes = [v for v in votes.values() if v is not None]
-
-        # Bias only when every check that DID confirm agrees with each
-        # other, AND at least 3 of the 4 checks actually confirmed
-        # (not flickering) — this is what makes the read "accurate"
-        # instead of a single noisy bar deciding it.
-        if len(confirmed_votes) >= 3 and len(set(confirmed_votes)) == 1:
-            bias = TrendBias.BULL if confirmed_votes[0] == "bull" else TrendBias.BEAR
-        else:
-            bias = TrendBias.NEUTRAL
-
-        adx_val = float(adx_arr[-1]) if not np.isnan(adx_arr[-1]) else 0.0
-        rsi_val = float(rsi_arr[-1]) if not np.isnan(rsi_arr[-1]) else 50.0
-
-        adx_below_20_all    = all((adx_arr[-1 - k] if not np.isnan(adx_arr[-1 - k]) else 99) < 20 for k in range(n))
-        adx_high_flat_all   = all((adx_arr[-1 - k] if not np.isnan(adx_arr[-1 - k]) else 0) >= 35 for k in range(n)) \
-                              and adx_arr[-1] <= adx_arr[-n]
-        rsi_extreme_all_bull = all((rsi_arr[-1 - k] if not np.isnan(rsi_arr[-1 - k]) else 50) >= 70 for k in range(n))
-        rsi_extreme_all_bear = all((rsi_arr[-1 - k] if not np.isnan(rsi_arr[-1 - k]) else 50) <= 25 for k in range(n))
-
-        if bias == TrendBias.NEUTRAL:
-            stage = TrendStage.NA
-        elif adx_below_20_all:
-            stage = TrendStage.EARLY
-        elif (bias == TrendBias.BULL and rsi_extreme_all_bull) or (bias == TrendBias.BEAR and rsi_extreme_all_bear):
-            stage = TrendStage.LATE
-        elif adx_high_flat_all:
-            stage = TrendStage.LATE
-        else:
-            stage = TrendStage.MID
+        score = round(sum(composites) / len(composites), 1)
+        score = max(0.0, min(100.0, score))
+        band = self._classify(score)
 
         return TrendResult(
-            bias=bias, stage=stage, adx=round(adx_val, 1), rsi=round(rsi_val, 1),
-            votes=votes,
-            detail={
-                "confirmed_count": len(confirmed_votes),
-                "ema_dirs": ema_dirs, "adx_dirs": adx_dirs,
-                "rsi_zones": rsi_zones, "slope_dirs": slope_dirs,
-            },
+            score=score, band=band, sub_scores={k: round(v, 1) for k, v in last_subs.items()},
+            detail={"composites": [round(c, 1) for c in composites]},
         )
+
+    @staticmethod
+    def _classify(score: float) -> TrendBand:
+        if score >= 76:
+            return TrendBand.STRONG_BULL
+        if score >= 66:
+            return TrendBand.BULL
+        if score >= 56:
+            return TrendBand.EARLY_BULL
+        if score >= 45:
+            return TrendBand.SIDEWAY
+        if score >= 35:
+            return TrendBand.EARLY_BEAR
+        if score >= 25:
+            return TrendBand.BEAR
+        return TrendBand.STRONG_BEAR
 
     # ── Math helpers (same formulas as macro_trend_engine.py) ────────────────
 
