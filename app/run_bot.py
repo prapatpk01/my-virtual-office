@@ -12,6 +12,7 @@ Strategy modes (STRATEGY env var):
   ema_macd   — EMA12/26 cross + SMA50 filter (15m) + MACD 30m confirmation
   ema_sma    — EMA12/26 cross + SMA50 filter, pure 15m (no MACD confirmation)
   hma_macd_roc — HMA10/20 cross gate + MACD + ROC 3-bar confirmation (30m)
+  trend_confirm — SMA30+MACD trend gate + EMA5/10 cross entry (30m)
   mcdx       — Legacy MCDX strategy
   wt_adx     — Legacy WaveTrend + ADX strategy
 """
@@ -134,6 +135,9 @@ def _make_strategies(symbols: list, config: dict):
         elif mode == "hma_macd_roc":
             from trading.strategies.hma_macd_roc_strategy import HMAMacdROCStrategy
             strategies.append(HMAMacdROCStrategy(sym))
+        elif mode == "trend_confirm":
+            from trading.strategies.trend_confirm_strategy import TrendConfirmStrategy
+            strategies.append(TrendConfirmStrategy(sym))
         elif mode == "mcdx" or flags.get("mcdx", False):
             from trading.strategies.mcdx_strategy import MCDXStrategy
             strategies.append(MCDXStrategy(sym))
