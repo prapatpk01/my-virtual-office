@@ -80,9 +80,20 @@ def render_entry_chart(
         ema50 = df["Close"].ewm(span=50, adjust=False).mean()
         res_level, sup_level = _swing_levels(df, lookback=40)
 
+        macd_fast = df["Close"].ewm(span=12, adjust=False).mean()
+        macd_slow = df["Close"].ewm(span=26, adjust=False).mean()
+        macd_line = macd_fast - macd_slow
+        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - macd_signal
+        hist_colors = ["#22c55e" if v >= 0 else "#ef4444" for v in macd_hist]
+
         addplots = [
             mpf.make_addplot(ema20, color="#3b82f6", width=1.1),
             mpf.make_addplot(ema50, color="#f59e0b", width=1.1),
+            mpf.make_addplot(macd_hist, type="bar", panel=2, color=hist_colors,
+                             width=0.7, ylabel="MACD"),
+            mpf.make_addplot(macd_line, panel=2, color="#38bdf8", width=1.0),
+            mpf.make_addplot(macd_signal, panel=2, color="#f97316", width=1.0),
         ]
 
         hlines_prices  = []
@@ -144,10 +155,11 @@ def render_entry_chart(
             hlines=dict(hlines=hlines_prices, colors=hlines_colors,
                         linestyle=hlines_styles, linewidths=hlines_widths),
             volume=True,
+            panel_ratios=(3, 1, 1.2),
             title=title,
             ylabel="Price",
             ylabel_lower="Volume",
-            figsize=(10, 7),
+            figsize=(10, 8.5),
             returnfig=True,
         )
 
@@ -157,6 +169,7 @@ def render_entry_chart(
         legend_lines = [
             f"Entry {entry:,.2f}",
             f"EMA20 / EMA50",
+            f"MACD 12/26/9",
         ]
         if sl:
             legend_lines.append(f"SL {sl:,.2f}")
