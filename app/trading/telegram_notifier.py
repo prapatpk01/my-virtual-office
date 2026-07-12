@@ -209,67 +209,90 @@ class TelegramNotifier:
         else:
             self.notify(caption)
 
-    def notify_trade_closed(self, symbol: str, reason: str, exit_price: float,
-                            entry: float, sl, tp, stats: dict):
-        """Called when a position closes via SL or TP. Full detail + running stats."""
-        won   = reason == "take_profit"
-        emoji = "✅" if won else "❌"
-        label = "Take-Profit Hit" if won else "Stop-Loss Hit"
-        risk  = abs(entry - sl) if sl else 1.0
-        pnl_r = abs(exit_price - entry) / risk if won else -1.0
-        sign  = "+" if pnl_r >= 0 else ""
+    def _account_stats_block(self, stats: dict, title: str) -> str:
+        """Shared '📊 Paper Account' footer for close notifications."""
+        total     = stats.get("trades", 0)
+        wins      = stats.get("wins", 0)
+        losses    = stats.get("losses", 0)
+        wr        = stats.get("win_rate", 0)
+        pf        = stats.get("profit_factor", 0)
+        total_usd = stats.get("total_pnl_usd", 0.0)
+        ret_pct   = stats.get("return_pct", 0.0)
+        start_bal = stats.get("start_balance", 1000.0)
+        streak    = stats.get("streak", 0)
+        streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
+        tot_sign  = "+" if total_usd >= 0 else "-"
+        ret_sign  = "+" if ret_pct >= 0 else ""
+        return (
+            f"📊 *{title}* ({total} trades, start `${start_bal:,.0f}`)\n"
+            f"Win/Loss: `{wins}W / {losses}L` | WR: `{wr:.1f}%`\n"
+            f"Total P&L: `{tot_sign}${abs(total_usd):,.2f}` "
+            f"(`{ret_sign}{ret_pct:.2f}%`) | PF: `{pf:.2f}`\n"
+            f"Streak: `{streak_str}`"
+        )
+
+    def notify_trade_closed(self, symbol: str, outcome: dict, stats: dict):
+        """Called when a position closes. Reports the ACTUAL exit reason and
+        the real $ P&L booked into the $1000 paper account (5% margin × 20x)."""
+        won          = outcome.get("won", outcome.get("pnl_usd", 0) > 0)
+        result_emoji = "✅" if won else "❌"
+        label        = outcome.get("reason_label", "Position Closed")
+        reason_emoji = outcome.get("emoji", "")
+        raw_reason   = outcome.get("reason", "")
+        side         = (outcome.get("side") or "").upper()
+        entry        = outcome.get("entry", 0.0)
+        exit_price   = outcome.get("exit", 0.0)
+        sl           = outcome.get("sl")
+        tp           = outcome.get("tp")
+        pnl_usd      = outcome.get("pnl_usd", 0.0)
+        pnl_pct      = outcome.get("pnl_pct", 0.0)
+        pnl_r        = outcome.get("pnl_r", 0.0)
+        bal_after    = outcome.get("balance_after", stats.get("paper_balance", 0.0))
 
         sl_str = f"`{sl:,.4f}`" if sl else "—"
         tp_str = f"`{tp:,.4f}`" if tp else "—"
-
-        total   = stats.get("trades",    0)
-        wins    = stats.get("wins",      0)
-        losses  = stats.get("losses",    0)
-        wr      = stats.get("win_rate",  0)
-        pf      = stats.get("profit_factor", 0)
-        total_r = stats.get("total_r",   0)
-        streak  = stats.get("streak",    0)
-        sig_day = stats.get("signals_per_day", 0)
-        streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
-        sign_r = "+" if total_r >= 0 else ""
+        usd_sign = "+" if pnl_usd >= 0 else "-"
 
         text = (
-            f"{emoji} *{label}*\n"
-            f"`{symbol}`\n"
+            f"{result_emoji} *{label}* {reason_emoji}\n"
+            f"`{symbol}`  {side}\n"
             f"Entry: `{entry:,.4f}` → Exit: `{exit_price:,.4f}`\n"
             f"SL: {sl_str} | TP: {tp_str}\n"
-            f"Result: `{sign}{pnl_r:.1f}R`\n\n"
-            f"📊 *Backtest Stats* ({total} trades)\n"
-            f"Win/Loss: `{wins}W / {losses}L` | WR: `{wr:.1f}%`\n"
-            f"Profit Factor: `{pf:.2f}` | Total: `{sign_r}{total_r:.1f}R`\n"
-            f"Streak: `{streak_str}` | Avg signals/day: `{sig_day}`"
+            f"💵 P&L: `{usd_sign}${abs(pnl_usd):,.2f}`  "
+            f"(`{'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%`, `{pnl_r:+.2f}R`)\n"
+            f"💰 Balance: `${bal_after:,.2f}`\n"
+            f"_Reason: {raw_reason}_\n\n"
+            + self._account_stats_block(stats, "Paper Account")
         )
         self.notify(text)
 
-    def notify_virtual_closed(self, symbol: str, reason: str, exit_price: float, stats: dict):
+    def notify_virtual_closed(self, symbol: str, reason: str, exit_price: float,
+                              stats: dict, outcome: Optional[dict] = None):
         """Called when a virtual (signal-only / paper-0-balance) trade hits SL or TP."""
-        won   = reason == "take_profit"
-        emoji = "✅" if won else "❌"
-        label = "Take-Profit Hit" if won else "Stop-Loss Hit"
+        outcome = outcome or {}
+        won          = outcome.get("won", reason == "take_profit")
+        result_emoji = "✅" if won else "❌"
+        label        = outcome.get("reason_label",
+                                    "Take-Profit Hit" if won else "Stop-Loss Hit")
+        reason_emoji = outcome.get("emoji", "")
+        pnl_usd      = outcome.get("pnl_usd")
+        pnl_pct      = outcome.get("pnl_pct")
+        bal_after    = outcome.get("balance_after", stats.get("paper_balance", 0.0))
 
-        total   = stats.get("trades",           0)
-        wins    = stats.get("wins",             0)
-        losses  = stats.get("losses",           0)
-        wr      = stats.get("win_rate",         0)
-        pf      = stats.get("profit_factor",    0)
-        total_r = stats.get("total_r",          0)
-        streak  = stats.get("streak",           0)
-        sig_day = stats.get("signals_per_day",  0)
-        streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
-        sign_r = "+" if total_r >= 0 else ""
+        pnl_line = ""
+        if pnl_usd is not None:
+            usd_sign = "+" if pnl_usd >= 0 else "-"
+            pnl_line = (
+                f"💵 P&L: `{usd_sign}${abs(pnl_usd):,.2f}` "
+                f"(`{'+' if (pnl_pct or 0) >= 0 else ''}{pnl_pct:.2f}%`)\n"
+                f"💰 Balance: `${bal_after:,.2f}`\n"
+            )
 
         text = (
-            f"{emoji} *{label}* _(virtual)_\n"
-            f"`{symbol}` @ `{exit_price:,.4f}`\n\n"
-            f"📊 *Signal Stats* ({total} tracked)\n"
-            f"Win/Loss: `{wins}W / {losses}L` | WR: `{wr:.1f}%`\n"
-            f"Profit Factor: `{pf:.2f}` | Total: `{sign_r}{total_r:.1f}R`\n"
-            f"Streak: `{streak_str}` | Avg signals/day: `{sig_day}`"
+            f"{result_emoji} *{label}* {reason_emoji} _(virtual)_\n"
+            f"`{symbol}` @ `{exit_price:,.4f}`\n"
+            f"{pnl_line}\n"
+            + self._account_stats_block(stats, "Paper Account")
         )
         self.notify(text)
 
@@ -531,12 +554,18 @@ class TelegramNotifier:
             wr      = s.get("win_rate",        0.0)
             pf      = s.get("profit_factor",   0.0)
             total_r = s.get("total_r",         0.0)
+            total_usd = s.get("total_pnl_usd", 0.0)
+            paper_bal = s.get("paper_balance", 0.0)
+            start_bal = s.get("start_balance", 1000.0)
+            ret_pct   = s.get("return_pct",    0.0)
             streak  = s.get("streak",          0)
             recent  = s.get("recent",          [])
             breakdown = s.get("strategy_breakdown", {})
 
             streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
             sign_r = "+" if total_r >= 0 else ""
+            usd_sign = "+" if total_usd >= 0 else "-"
+            ret_sign = "+" if ret_pct >= 0 else ""
 
             lines = [f"📊 *Signal Stats — ย้อนหลัง 7 วัน*\n"]
 
@@ -560,9 +589,13 @@ class TelegramNotifier:
                 lines += [
                     f"Win Rate: `{wr:.1f}%`",
                     f"Profit Factor: `{pf:.2f}`",
-                    f"Total R: `{sign_r}{total_r:.1f}R`",
+                    f"Total P&L: `{usd_sign}${abs(total_usd):,.2f}` (`{sign_r}{total_r:.1f}R`)",
                     f"Streak: `{streak_str}`",
                 ]
+            lines += [
+                f"\n💰 *Paper Account*: `${paper_bal:,.2f}` "
+                f"(start `${start_bal:,.0f}`, `{ret_sign}{ret_pct:.2f}%`)",
+            ]
             if pending:
                 lines.append(f"Tracking open: `{pending}` virtual trades")
 
@@ -571,14 +604,21 @@ class TelegramNotifier:
                 lines.append("_(waiting for SL/TP to be hit)_")
             else:
                 for o in reversed(recent[-10:]):
-                    e     = "✅" if o["pnl_r"] > 0 else "❌"
-                    sr    = "+" if o["pnl_r"] >= 0 else ""
-                    label = "TP" if o["reason"] == "take_profit" else "SL"
+                    won   = o.get("won", o.get("pnl_r", 0) > 0)
+                    e     = "✅" if won else "❌"
+                    pu    = o.get("pnl_usd")
+                    if pu is not None:
+                        us  = "+" if pu >= 0 else "-"
+                        pnl_str = f"`{us}${abs(pu):,.2f}`"
+                    else:  # legacy outcome without $ figure
+                        sr = "+" if o.get("pnl_r", 0) >= 0 else ""
+                        pnl_str = f"`{sr}{o.get('pnl_r', 0):.1f}R`"
+                    label = o.get("emoji", "") or ("🎯" if won else "🛑")
                     strat = o.get("strategy", "")
                     strat_tag = f" [{strat}]" if strat else ""
                     lines.append(
                         f"{e} `{o['symbol']}` {o['side'].upper()} "
-                        f"`{sr}{o['pnl_r']:.1f}R` [{label}]{strat_tag}"
+                        f"{pnl_str} {label}{strat_tag}"
                     )
 
             await self._send("\n".join(lines))

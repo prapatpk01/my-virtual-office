@@ -18,6 +18,38 @@ logger = logging.getLogger("signal_state")
 _DEFAULT_PATH = os.environ.get("SIGNAL_STATE_FILE", "/app/signal_state.json")
 _PENDING_TTL_MS = 7 * 24 * 3600 * 1000  # 7 days
 
+# ── Paper-account model (mirrors how the live bot is asked to size) ──────
+#   start $1000, each trade uses 5% of the *current* balance as margin,
+#   opened at 20x leverage. Every closed trade books a real $ P&L into this
+#   account so notifications show money, not abstract R units.
+PAPER_START_BALANCE = float(os.environ.get("PAPER_START_BALANCE", "1000"))
+PAPER_MARGIN_PCT    = float(os.environ.get("PAPER_MARGIN_PCT", "0.05"))
+PAPER_LEVERAGE      = float(os.environ.get("PAPER_LEVERAGE", "20"))
+PAPER_TAKER_FEE     = float(os.environ.get("PAPER_TAKER_FEE", "0.0005"))  # per side
+
+
+def classify_exit_reason(reason: str, won: bool) -> tuple[str, str]:
+    """Map a raw exit-reason string to a human label + emoji.
+
+    The strategy emits many exit reasons (hard SL/TP, HMA cross-back,
+    trailed break-even stop, TP1 partial). The old code labelled anything
+    that wasn't literally ``take_profit`` as a "Stop-Loss Hit", which was
+    wrong for trend-exit and break-even closes. This inspects the reason
+    text and returns what actually happened.
+    """
+    r = (reason or "").lower()
+    if "partial" in r or "tp1" in r:
+        return ("Partial Take-Profit", "💰")
+    if "take_profit" in r or "tp2" in r or "hard_tp" in r or "take profit" in r:
+        return ("Take-Profit Hit", "🎯")
+    if "be+" in r or "break" in r or "trailed" in r or "trail" in r:
+        return ("Break-Even / Trailing Stop", "🟰")
+    if "stop_loss" in r or "hard_sl" in r or "stop loss" in r:
+        return ("Stop-Loss Hit", "🛑")
+    if "exit" in r or "hma" in r or "cross" in r or "trend" in r:
+        return ("Trend Exit (HMA cross-back)", "↩️")
+    return ("Position Closed", "☑️")
+
 
 class SignalState:
 
@@ -27,6 +59,7 @@ class SignalState:
         self._fired: list[dict] = []       # every signal alert sent
         self._outcomes: list[dict] = []    # closed trade results
         self._pending: dict[str, dict] = {}  # virtual open trades awaiting SL/TP
+        self._paper_balance: float = PAPER_START_BALANCE  # running paper account
         self._load()
 
     # ------------------------------------------------------------------
@@ -41,8 +74,10 @@ class SignalState:
             self._fired    = data.get("fired",     [])
             self._outcomes = data.get("outcomes",  [])
             self._pending  = data.get("pending",   {})
-            logger.info("Signal state loaded: %d locks, %d fired, %d outcomes, %d pending",
-                        len(self._active), len(self._fired), len(self._outcomes), len(self._pending))
+            self._paper_balance = float(data.get("paper_balance", PAPER_START_BALANCE))
+            logger.info("Signal state loaded: %d locks, %d fired, %d outcomes, %d pending, paper $%.2f",
+                        len(self._active), len(self._fired), len(self._outcomes),
+                        len(self._pending), self._paper_balance)
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -56,6 +91,7 @@ class SignalState:
                     "fired":    self._fired[-1000:],
                     "outcomes": self._outcomes[-500:],
                     "pending":  self._pending,
+                    "paper_balance": round(self._paper_balance, 2),
                 }, f, indent=2)
         except Exception as e:
             logger.warning("Could not save signal state: %s", e)
@@ -119,11 +155,11 @@ class SignalState:
         self._save()
         logger.info("Virtual trade registered: %s %s @ %.4f  SL=%.4f TP=%.4f", side, symbol, entry, sl, tp)
 
-    def check_and_resolve_pending(self, symbol: str, high: float, low: float) -> list[tuple[str, float]]:
+    def check_and_resolve_pending(self, symbol: str, high: float, low: float) -> list[tuple[str, float, dict]]:
         """
         Check all pending virtual trades for symbol against high/low prices.
         Resolves any that hit SL or TP: records the outcome and removes the entry.
-        Returns list of (reason, exit_price) for each resolved trade.
+        Returns list of (reason, exit_price, outcome) for each resolved trade.
         """
         resolved = []
         now = int(time.time() * 1000)
@@ -155,13 +191,13 @@ class SignalState:
             if hit:
                 del self._pending[key]
                 changed = True
-                self.record_outcome(
+                outcome = self.record_outcome(
                     symbol=symbol, side=side,
                     entry=entry, exit_price=exit_price,
                     sl=sl, tp=tp, reason=hit,
                     strategy=item.get("strategy", ""),
                 )
-                resolved.append((hit, exit_price))
+                resolved.append((hit, exit_price, outcome))
                 logger.info("Virtual %s %s → %s @ %.4f (entry %.4f)", side, symbol, hit, exit_price, entry)
         if changed and not resolved:  # record_outcome already saves when resolved
             self._save()
@@ -188,23 +224,60 @@ class SignalState:
     # Outcome recording
     # ------------------------------------------------------------------
 
+    @property
+    def paper_balance(self) -> float:
+        return self._paper_balance
+
     def record_outcome(self, symbol: str, side: str, entry: float,
-                       exit_price: float, sl, tp, reason: str, strategy: str = ""):
-        risk  = abs(entry - sl) if sl else abs(entry - exit_price) or 1.0
-        pnl_r = abs(exit_price - entry) / risk if reason == "take_profit" else -1.0
-        self._outcomes.append({
-            "symbol":   symbol,
-            "side":     side,
-            "entry":    round(entry, 4),
-            "exit":     round(exit_price, 4),
-            "sl":       sl,
-            "tp":       tp,
-            "pnl_r":    round(pnl_r, 2),
-            "reason":   reason,
-            "strategy": strategy,
-            "ts":       int(time.time() * 1000),
-        })
+                       exit_price: float, sl, tp, reason: str, strategy: str = "") -> dict:
+        """Book a closed trade into the paper account and log the outcome.
+
+        Computes the *actual* directional P&L (in $ and %) from a $1000
+        paper account sized at 5% margin × 20x leverage — for EVERY exit
+        reason, not just take-profits. Returns the outcome dict so callers
+        can hand it straight to the Telegram notifier.
+        """
+        is_long = side in ("buy", "long")
+        # Signed price move in the trade's favour (negative = adverse).
+        price_move = (exit_price - entry) if is_long else (entry - exit_price)
+        risk = abs(entry - sl) if sl else (abs(entry - exit_price) or 1.0)
+        pnl_r = price_move / risk if risk else 0.0
+
+        # ── Paper-account $ P&L (5% margin × 20x leverage on current balance) ──
+        bal_before = self._paper_balance
+        margin   = bal_before * PAPER_MARGIN_PCT
+        notional = margin * PAPER_LEVERAGE
+        amount   = (notional / entry) if entry else 0.0
+        gross    = price_move * amount
+        fees     = (entry + exit_price) * amount * PAPER_TAKER_FEE
+        pnl_usd  = gross - fees
+        self._paper_balance = bal_before + pnl_usd
+        pnl_pct  = (pnl_usd / bal_before * 100) if bal_before else 0.0
+
+        won = pnl_usd > 0
+        label, emoji = classify_exit_reason(reason, won)
+
+        outcome = {
+            "symbol":       symbol,
+            "side":         side,
+            "entry":        round(entry, 4),
+            "exit":         round(exit_price, 4),
+            "sl":           sl,
+            "tp":           tp,
+            "pnl_r":        round(pnl_r, 2),
+            "pnl_usd":      round(pnl_usd, 2),
+            "pnl_pct":      round(pnl_pct, 2),
+            "balance_after": round(self._paper_balance, 2),
+            "reason":       reason,
+            "reason_label": label,
+            "emoji":        emoji,
+            "won":          won,
+            "strategy":     strategy,
+            "ts":           int(time.time() * 1000),
+        }
+        self._outcomes.append(outcome)
         self._save()
+        return outcome
 
     # ------------------------------------------------------------------
     # Deep-dive learning analysis
@@ -244,7 +317,7 @@ class SignalState:
             s = o.get("strategy") or "unknown"
             if s not in data:
                 data[s] = {"signals": 0, "wins": 0, "losses": 0}
-            if o["pnl_r"] > 0:
+            if o.get("won", o.get("pnl_r", 0) > 0):
                 data[s]["wins"]   += 1
             else:
                 data[s]["losses"] += 1
@@ -274,26 +347,36 @@ class SignalState:
         out = self._outcomes
         total_fired = len(self._fired)
 
+        def _won(o):
+            return o.get("won", o.get("pnl_r", 0) > 0)
+
         if not out:
             return {
                 "trades": 0,
                 "pending": len(self._pending),
                 "total_signals": total_fired,
                 "signals_per_day": self.signals_per_day(),
+                "start_balance": round(PAPER_START_BALANCE, 2),
+                "paper_balance": round(self._paper_balance, 2),
+                "total_pnl_usd": 0.0,
+                "return_pct": round((self._paper_balance / PAPER_START_BALANCE - 1) * 100, 2)
+                              if PAPER_START_BALANCE else 0.0,
             }
 
-        wins       = [o for o in out if o["pnl_r"] > 0]
-        losses     = [o for o in out if o["pnl_r"] <= 0]
-        total_r    = sum(o["pnl_r"] for o in out)
-        gross_win  = sum(o["pnl_r"] for o in wins)
-        gross_loss = abs(sum(o["pnl_r"] for o in losses))
-        pf         = round(gross_win / gross_loss, 2) if gross_loss else 999.0
+        wins       = [o for o in out if _won(o)]
+        losses     = [o for o in out if not _won(o)]
+        total_r    = sum(o.get("pnl_r", 0) for o in out)
+        # Profit factor on real money (gross $ won / gross $ lost).
+        gross_win_usd  = sum(o.get("pnl_usd", 0) for o in wins)
+        gross_loss_usd = abs(sum(o.get("pnl_usd", 0) for o in losses))
+        pf         = round(gross_win_usd / gross_loss_usd, 2) if gross_loss_usd else 999.0
+        total_usd  = sum(o.get("pnl_usd", 0) for o in out)
 
         streak = 0
         if out:
-            sign = 1 if out[-1]["pnl_r"] > 0 else -1
+            sign = 1 if _won(out[-1]) else -1
             for o in reversed(out):
-                if (o["pnl_r"] > 0) == (sign == 1):
+                if _won(o) == (sign == 1):
                     streak += sign
                 else:
                     break
@@ -305,6 +388,11 @@ class SignalState:
             "win_rate":           round(len(wins) / len(out) * 100, 1),
             "profit_factor":      pf,
             "total_r":            round(total_r, 2),
+            "total_pnl_usd":      round(total_usd, 2),
+            "start_balance":      round(PAPER_START_BALANCE, 2),
+            "paper_balance":      round(self._paper_balance, 2),
+            "return_pct":         round((self._paper_balance / PAPER_START_BALANCE - 1) * 100, 2)
+                                  if PAPER_START_BALANCE else 0.0,
             "streak":             streak,
             "pending":            len(self._pending),
             "total_signals":      total_fired,

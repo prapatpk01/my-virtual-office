@@ -412,7 +412,7 @@ class TradingBot:
                     paper=self.connector.paper,
                 )
                 self._record_trade(trade)
-                self._sig.record_outcome(
+                _outcome = self._sig.record_outcome(
                     symbol=sym, side=pos_info["side"],
                     entry=pos_info["entry"], exit_price=price,
                     sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
@@ -423,13 +423,7 @@ class TradingBot:
                 self._on_position_closed(sym, strategy_name, price, trigger, strategy_inst)
                 logger.info("Position closed by %s: %s [%s]", trigger, sym, strategy_name)
                 if self.telegram:
-                    self.telegram.notify_trade_closed(
-                        sym, trigger, price,
-                        pos_info["entry"],
-                        pos_info.get("stop_loss"),
-                        pos_info.get("take_profit"),
-                        self._sig.summary(),
-                    )
+                    self.telegram.notify_trade_closed(sym, _outcome, self._sig.summary())
                 self._check_cooldown_trigger(pnl)
 
         # ── Periodic drift alert (every 50 ticks) ────────────────────────────
@@ -454,10 +448,11 @@ class TradingBot:
                     v_high = max(float(last_c.high), current_price)
                     v_low  = min(float(last_c.low),  current_price)
                     resolved = self._sig.check_and_resolve_pending(strategy.symbol, v_high, v_low)
-                    for v_reason, v_price in resolved:
+                    for v_reason, v_price, v_outcome in resolved:
                         if self.telegram:
                             self.telegram.notify_virtual_closed(
-                                strategy.symbol, v_reason, v_price, self._sig.summary()
+                                strategy.symbol, v_reason, v_price,
+                                self._sig.summary(), outcome=v_outcome,
                             )
 
                 mtf_candles = {}
@@ -700,7 +695,7 @@ class TradingBot:
                     strategy=strategy_name, reason=update.reason,
                     paper=self.connector.paper,
                 ))
-                self._sig.record_outcome(
+                _outcome = self._sig.record_outcome(
                     symbol=sym, side=pos_info["side"],
                     entry=pos_info["entry"], exit_price=price,
                     sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
@@ -714,13 +709,7 @@ class TradingBot:
                     strategy_name, sym, price, pnl, update.reason,
                 )
                 if self.telegram:
-                    self.telegram.notify_trade_closed(
-                        sym, update.reason, price,
-                        pos_info["entry"],
-                        pos_info.get("stop_loss"),
-                        pos_info.get("take_profit"),
-                        self._sig.summary(),
-                    )
+                    self.telegram.notify_trade_closed(sym, _outcome, self._sig.summary())
                 self._check_cooldown_trigger(pnl)
             except Exception as e:
                 logger.error("AI-driven close failed [%s %s]: %s", strategy_name, sym, e)
@@ -866,7 +855,7 @@ class TradingBot:
                     slot_name = pos["strategy"]
                     try:
                         await self.connector.create_order(sym, "sell", pos["amount"])
-                        self._sig.record_outcome(
+                        _outcome = self._sig.record_outcome(
                             symbol=sym, side="long",
                             entry=pos["entry"], exit_price=exit_price,
                             sl=pos.get("stop_loss"), tp=pos.get("take_profit"),
@@ -876,11 +865,7 @@ class TradingBot:
                         self.risk.close_position(sym, strategy=slot_name)
                         self._on_position_closed(sym, slot_name, exit_price, "sell_signal")
                         if self.telegram:
-                            self.telegram.notify_trade_closed(
-                                sym, "sell_signal", exit_price,
-                                pos["entry"], pos.get("stop_loss"),
-                                pos.get("take_profit"), self._sig.summary(),
-                            )
+                            self.telegram.notify_trade_closed(sym, _outcome, self._sig.summary())
                     except Exception as e:
                         logger.error("WT exit on SELL failed [%s]: %s", slot_name, e)
                 return
@@ -941,7 +926,7 @@ class TradingBot:
                             ticker     = await self.connector.fetch_ticker(sym)
                             exit_price = ticker["last"]
                             await self.connector.create_order(sym, "sell", existing["amount"])
-                            self._sig.record_outcome(
+                            _outcome = self._sig.record_outcome(
                                 symbol=sym, side="long",
                                 entry=existing["entry"], exit_price=exit_price,
                                 sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
@@ -954,11 +939,7 @@ class TradingBot:
                                 self._resolve_strategy_inst(strategy_name),
                             )
                             if self.telegram:
-                                self.telegram.notify_trade_closed(
-                                    sym, "sell_signal", exit_price,
-                                    existing["entry"], existing.get("stop_loss"),
-                                    existing.get("take_profit"), self._sig.summary(),
-                                )
+                                self.telegram.notify_trade_closed(sym, _outcome, self._sig.summary())
                         except Exception as e:
                             logger.error("Exit on SELL signal failed [%s]: %s", strategy_name, e)
             return
