@@ -1,86 +1,64 @@
 """
 3-Layer Trend-Confirmed Multi-TF Strategy.
 
-Layer 1 — Trend confirmation (TF30m):
-  SMA30      : candle opens above SMA30 -> up, below -> down
-  EMA10/20   : EMA10 > EMA20 -> up, EMA10 < EMA20 -> down
-  EMA20 slope: EMA20 higher than it was `ema_slope_lookback` bars ago -> up,
-               lower -> down
-  MACD       : raw MACD LINE (fast EMA - slow EMA) vs zero, the "MACD 4C"
-               zero-line read (not line-vs-signal) — matches the
-               user-supplied Pine script, sign only.
-  ALL FOUR must agree on the same direction, or there is no confirmed
-  trend at all (self._trend_state = None) and nothing below runs.
-  Tracked once per new 30m bar in self._trend_state, purely for
-  logging/gating — a confirmed trend does not expire on its own; it just
-  gets re-evaluated fresh every 30m bar.
+Layer 1 — Trend direction (TF30m):
+  Determines whether the market is currently in an uptrend or a
+  downtrend. FOUR checks must ALL agree on the same direction, or there
+  is no confirmed trend (self._trend_state = None) and nothing below runs:
+    SMA30      : candle opens above SMA30 -> up, below -> down
+    EMA10/20   : EMA10 > EMA20 -> up, EMA10 < EMA20 -> down
+    EMA20 slope: EMA20 higher than `ema_slope_lookback` bars ago -> up
+    MACD       : raw MACD LINE (fast EMA - slow EMA) vs zero ("MACD 4C"
+                 zero-line read, sign only).
+  Re-evaluated once per new 30m bar; a confirmed trend does not expire on
+  its own, it just gets re-read every 30m bar.
 
-Layer 2 — Bias + momentum: dynamic weighted score (TF15m + TF1H):
-  Replaces a stack of hard AND-gates with ai_expert's ConfidenceEngine
-  pattern — every sub-check contributes POINTS toward one 0-100 score,
-  so a weak reading on one component can be outweighed by strong
-  readings elsewhere instead of vetoing the trade outright. Must score
-  > `momentum_score_threshold` (default 45) to pass, computed in
-  _layer2_score():
-    Bias      30 pts — BaseStrategy.compute_mtf_bias() (same formula
-              ai_expert uses: close>EMA20/EMA20>EMA50/RSI lean, weighted
-              15m x1 + 1H x2, 4H excluded via w3=0), direction-aligned
-              and rescaled so the OLD hard threshold (bias_threshold,
-              default 60) is now where this component earns full credit.
-    ADX       20 pts — trend strength, 15m/1H weighted 1x/2x, full
-              credit at 2x adx_threshold (default 20).
-    Chop      20 pts — inverted Choppiness Index (low chop = high
-              score), 15m/1H weighted 1x/2x, full credit at
-              100-chop_threshold (default 61.8) points of "not choppy".
-    Volume    15 pts — volume/SMA20(volume) ratio, 15m/1H weighted
-              1x/2x, full credit at 2x volume_expansion_mult (default 1.0).
-    Sweep     15 pts — flat bonus if a liquidity sweep fired (see below),
-              0 otherwise. Not a hard requirement any more.
+Layer 2 — Trend quality: dynamic weighted score (TF15m + TF1H):
+  Scores HOW GOOD the confirmed trend is on each timeframe (0-100 per TF),
+  then combines them 15m x 65% + 1H x 35%. Must score > `layer2_threshold`
+  (default 60) to pass. Each per-TF quality score (in _tf_quality()) is:
+    Alignment 40 pts — 4 x 10 pts: close vs EMA20, EMA20 vs EMA50, RSI
+                       lean (>55 bull / <45 bear), MACD line sign — each
+                       agreeing with Layer 1's direction scores 10.
+    ADX       25 pts — trend strength, full credit at 2x adx_threshold (20).
+    Chop      20 pts — inverted Choppiness Index (low chop = high score),
+                       full credit at 100 - chop_threshold (61.8) points
+                       of "not choppy".
+    Volume    15 pts — volume / SMA20(volume), full credit at 2x
+                       volume_expansion_mult (1.0).
+  Soft point-scoring (ai_expert's ConfidenceEngine pattern): a weak
+  reading on one component can be outweighed by strong readings elsewhere
+  instead of vetoing the trade outright.
 
-  Liquidity sweep (15m, opposite-side, feeds the Sweep points above):
-  one of the last `sweep_recency` (default 5) 15m bars must have swept
-  the prior `sweep_lookback`-bar (default 20) swing extreme on the
-  STOP-HUNT side and closed back inside it — long looks for a swept
-  swing LOW (wick below the recent low, close back above it — sell-side
-  stops grabbed before the real move up); short looks for a swept swing
-  HIGH (mirror).
-
-Layer 3 — Entry (TF15m):
-  HMA10/HMA20 cross in the confirmed direction. Normally the cross must
-  fire on THIS bar going forward ("wait for the next cross") — but if
+Layer 3 — Entry (TF15m), always WITH Layer 1's confirmed trend:
+  LONG (only after Layer1+Layer2 confirm UP):
+    1. HMA10 crosses above HMA20
+    2. price (close) is above EMA10
+    3. price is within `max_dist_atr_mult` (default 1.5) x ATR(14) of EMA20
+  SHORT (only after Layer1+Layer2 confirm DOWN): the mirror —
+    1. HMA10 crosses below HMA20
+    2. price below EMA10
+    3. price within 1.5 x ATR of EMA20
+  The HMA cross normally has to fire on THIS bar going forward, but if
   Layer 1's trend JUST confirmed (within `fresh_trend_bars`, default 3,
-  bars of when it flipped), a cross that already fired up to
-  fresh_trend_bars ago still counts, catching the case where price
-  crossed right as the 30m trend was still forming instead of forcing a
-  second cross after the fact. Long only when Layer1+Layer2 both say
-  "up"; short only when both say "down". The cross timestamp is
-  consumed (reset to None) once it triggers an entry attempt (pass or
-  fail), so a stale old cross can't silently satisfy a future setup.
-  (EMA5/EMA10 is no longer part of the entry trigger — it's still
-  computed and shown in logs, but no longer used for the exit either.)
-
-  Chase-guard: even when the HMA cross fires, price must be within
-  `max_dist_atr_mult` (default 1.5) x ATR(14, 15m) of Layer1's
-  EMA20(30m) — the same trend reference Layer1 uses for its EMA10/20
-  and slope checks. If price already ran too far from it, the setup
-  fails outright (no entry) and waits for a pullback + fresh cross,
-  rather than chasing an already-extended move.
+  bars of when it flipped) a cross up to fresh_trend_bars old still counts
+  — catches a cross that fired right as the 30m trend was forming. The
+  cross timestamp is consumed (reset) once it triggers an entry attempt
+  (pass or fail), so a stale cross can't silently satisfy a later setup.
+  The EMA20 distance check is a chase-guard: no entry if price already ran
+  too far from the trend reference — wait for a pullback + fresh cross.
 
 Exit — OR logic, whichever fires first while SL/TP hasn't been hit yet:
   HMA10/20 cross-back  OR  candle opens on the wrong side of HMA20
   (long: open < HMA20, short: open > HMA20) -> close 100% immediately.
-  EMA5/10 no longer drives entry OR exit — it's still computed and
-  tracked purely for [SCAN] log diagnostics. The open-vs-HMA20 check is
-  a faster warning than waiting for HMA10 to actually cross back — the
-  open can already be on the wrong side while HMA10/HMA20 haven't
-  crossed yet. SL/TP
-  (ATR(14, 15m) x1.5, 1:1 R:R by default) remains the hard-stop safety
-  net checked by bot.py's risk-manager fallback underneath all of this.
+  The open-vs-HMA20 check is a faster warning than waiting for HMA10 to
+  actually cross back. SL/TP (ATR(14, 15m) x1.5, 1:1 R:R by default)
+  remains the hard-stop safety net checked by bot.py's risk-manager
+  fallback underneath all of this.
 
-Once closed (by either exit condition or the hard SL/TP stop), the very
-next bar where Layer1+Layer2 read confirmed again — same direction as
-before or a fresh flip — is eligible for a new Layer3 entry. No
-cooldown, no "used up this streak."
+Once closed (by either exit condition or the hard SL/TP stop), the next
+bar where Layer1+Layer2 read confirmed again is eligible for a new entry.
+No cooldown.
 
 Exits are evaluated in tick_open_position() (called by bot.py every tick for
 an open position), NOT by returning a SELL/BUY Signal from analyze() — in
@@ -88,13 +66,9 @@ hedge mode a SELL Signal always OPENS a new short rather than closing an
 open long. tick_open_position()'s PositionUpdate("close") always closes
 whichever position is actually open, regardless of hedge mode.
 
-TF30m candles for Layer 1 aren't fetched separately from the exchange —
-they're resampled from the 15m series this strategy already receives,
-and the last (possibly still-forming) 30m bucket is dropped so Layer 1
-only ever evaluates against a genuinely closed 30m bar. Layer 2/3 run
-directly on the raw 15m candles (and the 1H candles passed in via
-mtf_candles), matching how every other pure-TF15m strategy in this
-codebase evaluates crosses (no separate "closed 15m" bookkeeping).
+TF30m candles for Layer 1 are resampled from the 15m series this strategy
+receives (last, possibly-forming, 30m bucket dropped). Layer 2/3 run on
+the raw 15m candles and the 1H candles passed in via mtf_candles.
 """
 from __future__ import annotations
 
@@ -111,7 +85,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self,
         symbol: str,
         params: Optional[dict] = None,
-        # Layer 1 — trend confirmation (30m)
+        # Layer 1 — trend direction (30m)
         sma_trend: int = 30,
         ema1_period: int = 10,
         ema2_period: int = 20,
@@ -119,22 +93,26 @@ class TrendConfirmStrategy(BaseStrategy):
         macd_fast: int = 12,
         macd_slow: int = 26,
         macd_signal: int = 9,
-        # Layer 2 — bias/momentum filter (15m + 1H)
-        bias_threshold: float = 60.0,
+        # Layer 2 — trend quality (15m + 1H)
+        quality_ema_fast: int = 20,
+        quality_ema_slow: int = 50,
+        rsi_period: int = 14,
+        rsi_bull: float = 55.0,
+        rsi_bear: float = 45.0,
         adx_period: int = 14,
         adx_threshold: float = 20.0,
         chop_period: int = 14,
         chop_threshold: float = 61.8,
         volume_sma_period: int = 20,
         volume_expansion_mult: float = 1.0,
-        sweep_lookback: int = 20,
-        sweep_recency: int = 5,
-        momentum_score_threshold: float = 45.0,
+        tf_weight_15m: float = 0.65,
+        tf_weight_1h: float = 0.35,
+        layer2_threshold: float = 60.0,
         # Layer 3 — entry (15m)
-        ema_fast: int = 5,
-        ema_slow: int = 10,
         hma_fast: int = 10,
         hma_slow: int = 20,
+        entry_ema_ref: int = 10,    # price must be above (long) / below (short) this EMA
+        dist_ema_ref: int = 20,     # distance-to-trend chase-guard is measured vs this EMA
         fresh_trend_bars: int = 3,
         max_dist_atr_mult: float = 1.5,
         # Risk
@@ -153,21 +131,25 @@ class TrendConfirmStrategy(BaseStrategy):
         self.macd_slow = macd_slow
         self.macd_signal = macd_signal
 
-        self.bias_threshold = bias_threshold
+        self.quality_ema_fast = quality_ema_fast
+        self.quality_ema_slow = quality_ema_slow
+        self.rsi_period = rsi_period
+        self.rsi_bull = rsi_bull
+        self.rsi_bear = rsi_bear
         self.adx_period = adx_period
         self.adx_threshold = adx_threshold
         self.chop_period = chop_period
         self.chop_threshold = chop_threshold
         self.volume_sma_period = volume_sma_period
         self.volume_expansion_mult = volume_expansion_mult
-        self.sweep_lookback = sweep_lookback
-        self.sweep_recency = sweep_recency
-        self.momentum_score_threshold = momentum_score_threshold
+        self.tf_weight_15m = tf_weight_15m
+        self.tf_weight_1h = tf_weight_1h
+        self.layer2_threshold = layer2_threshold
 
-        self.ema_fast = ema_fast
-        self.ema_slow = ema_slow
         self.hma_fast = hma_fast
         self.hma_slow = hma_slow
+        self.entry_ema_ref = entry_ema_ref
+        self.dist_ema_ref = dist_ema_ref
         self.fresh_trend_bars = fresh_trend_bars
         self.max_dist_atr_mult = max_dist_atr_mult
 
@@ -180,8 +162,6 @@ class TrendConfirmStrategy(BaseStrategy):
         self._trend_confirmed_since_ts: Optional[int] = None  # bar_ts_15 when trend last CHANGED
         self._last_bar_ts_30: Optional[int] = None    # Layer 1 new-bar tracking
         self._last_bar_ts_15: Optional[int] = None     # Layer 3 new-bar tracking
-        self._last_ema_cross_up_ts: Optional[int] = None
-        self._last_ema_cross_down_ts: Optional[int] = None
         self._last_hma_cross_up_ts: Optional[int] = None
         self._last_hma_cross_down_ts: Optional[int] = None
         self._last_exit_bar_ts: Optional[int] = None  # owned by tick_open_position()
@@ -192,7 +172,7 @@ class TrendConfirmStrategy(BaseStrategy):
         mtf = mtf_candles or {}
         bar_ts_15 = candles[-1].timestamp
 
-        # ── Layer 1: Trend confirmation (30m) ──────────────────────────────
+        # ── Layer 1: Trend direction (30m) ─────────────────────────────────
         c30 = self._closed_30m_bars(candles)
         min_needed_30 = max(self.ema2_period + self.ema_slope_lookback, self.sma_trend,
                             self.macd_slow + self.macd_signal) + 5
@@ -214,20 +194,14 @@ class TrendConfirmStrategy(BaseStrategy):
 
         trend = self._trend_state
 
-        # ── Layer 3 cross tracking — runs on every new 15m bar REGARDLESS of
-        # Layer1/Layer2 gating below, so an HMA cross that fires before the
-        # trend confirms (or while a position is open) is still remembered.
-        # EMA5/10 is tracked too (still shown in logs), but it no longer
-        # gates entry or exit. ─────────────────────────────────────────────
+        # ── Layer 3 HMA-cross tracking — runs every new 15m bar regardless of
+        # Layer1/Layer2 gating, so an HMA cross that fires just before the
+        # trend confirms is still remembered within the fresh-trend window. ─
         is_new_bar_15 = bar_ts_15 != self._last_bar_ts_15
         l3 = self._layer3_indicators(candles)
         if is_new_bar_15:
             self._last_bar_ts_15 = bar_ts_15
             if l3 is not None:
-                if l3["ema_cross_up"]:
-                    self._last_ema_cross_up_ts = bar_ts_15
-                if l3["ema_cross_down"]:
-                    self._last_ema_cross_down_ts = bar_ts_15
                 if l3["hma_cross_up"]:
                     self._last_hma_cross_up_ts = bar_ts_15
                 if l3["hma_cross_down"]:
@@ -236,69 +210,44 @@ class TrendConfirmStrategy(BaseStrategy):
         def _bars_ago_15(ts: Optional[int]) -> Optional[int]:
             return (bar_ts_15 - ts) // (15 * 60_000) if ts is not None else None
 
-        ema_up_ago    = _bars_ago_15(self._last_ema_cross_up_ts)
-        ema_down_ago  = _bars_ago_15(self._last_ema_cross_down_ts)
-        hma_up_ago    = _bars_ago_15(self._last_hma_cross_up_ts)
-        hma_down_ago  = _bars_ago_15(self._last_hma_cross_down_ts)
+        hma_up_ago   = _bars_ago_15(self._last_hma_cross_up_ts)
+        hma_down_ago = _bars_ago_15(self._last_hma_cross_down_ts)
 
-        # Entry trigger is HMA10/20 cross alone. Normally it must fire on
-        # THIS bar going forward (0 bars ago — "wait for the next cross").
-        # If the trend JUST confirmed (within fresh_trend_bars of Layer1
-        # flipping), a cross that already fired up to fresh_trend_bars ago
-        # still counts — catches the case where price already crossed
-        # right as the 30m trend was forming, instead of forcing a second
-        # fresh cross after the fact.
         fb = self.fresh_trend_bars
         trend_age = _bars_ago_15(self._trend_confirmed_since_ts)
         is_fresh_trend = trend_age is not None and trend_age <= fb
         lookback = fb if is_fresh_trend else 0
-        dual_cross_up   = hma_up_ago is not None and hma_up_ago <= lookback
-        dual_cross_down = hma_down_ago is not None and hma_down_ago <= lookback
+        hma_cross_up   = hma_up_ago is not None and hma_up_ago <= lookback
+        hma_cross_down = hma_down_ago is not None and hma_down_ago <= lookback
 
-        # ── Layer 2: Bias/momentum — dynamic weighted score (ai_expert's
-        # ConfidenceEngine pattern) instead of a stack of hard AND-gates.
-        # Every sub-check contributes points toward a single 0-100 score;
-        # a weak reading on one component can still be outweighed by
-        # strong readings elsewhere, instead of vetoing the trade outright
-        # the way a hard boolean gate would. ────────────────────────────
+        # ── Layer 2: Trend quality — weighted 15m (65%) + 1H (35%) score ───
         c1h = mtf.get("1h", [])
-        bias_pct, bias_label = self.compute_mtf_bias(candles, {"1h": c1h}, w3=0.0)
-        bias_score = 50.0 + bias_pct / 2.0
-        l2_15m = self._layer2_indicators(candles)
-        l2_1h = self._layer2_indicators(c1h)
-        sweep_up = self._liquidity_sweep(candles, "up")
-        sweep_down = self._liquidity_sweep(candles, "down")
+        q15 = self._tf_quality(candles, trend) if trend else None
+        q1h = self._tf_quality(c1h, trend) if trend else None
+        l2_score = None
+        if q15 is not None and q1h is not None:
+            l2_score = q15["score"] * self.tf_weight_15m + q1h["score"] * self.tf_weight_1h
 
         close_price = candles[-1].close
-        dist_atr = (abs(close_price - l1["ema20_val"]) / l3["atr_val"]
+        dist_atr = (abs(close_price - l3["dist_ema_val"]) / l3["atr_val"]
                    if (l3 is not None and l3["atr_val"] > 0) else None)
-
-        l2s = None
-        if trend is not None:
-            l2s = self._layer2_score(trend, bias_score, l2_15m, l2_1h,
-                                     sweep_up if trend == "up" else sweep_down)
 
         def dbg(entry_status: str) -> dict:
             return {"trend_confirm": {
                 "sma_trend": l1["sma_dir"], "ema10_20_trend": l1["ema1020_dir"],
                 "ema20_slope": l1["slope_dir"], "macd_trend": l1["macd_dir"],
                 "confirmed": trend,
-                "bias_score": round(bias_score, 1),
-                "adx_15m": round(l2_15m["adx"], 1) if l2_15m else None,
-                "adx_1h": round(l2_1h["adx"], 1) if l2_1h else None,
-                "chop_15m": round(l2_15m["chop"], 1) if l2_15m else None,
-                "chop_1h": round(l2_1h["chop"], 1) if l2_1h else None,
-                "vol_ratio_15m": round(l2_15m["vol_ratio"], 2) if l2_15m else None,
-                "vol_ratio_1h": round(l2_1h["vol_ratio"], 2) if l2_1h else None,
-                "sweep_up": sweep_up, "sweep_down": sweep_down,
-                "momentum_score": l2s["score"] if l2s else None,
-                "momentum_score_threshold": self.momentum_score_threshold,
-                "momentum_breakdown": l2s["breakdown"] if l2s else None,
+                "q15": round(q15["score"], 1) if q15 else None,
+                "q1h": round(q1h["score"], 1) if q1h else None,
+                "q15_breakdown": q15["breakdown"] if q15 else None,
+                "q1h_breakdown": q1h["breakdown"] if q1h else None,
+                "layer2_score": round(l2_score, 1) if l2_score is not None else None,
+                "layer2_threshold": self.layer2_threshold,
                 "open_position": self._open_position,
                 "entry_status": entry_status,
                 "fresh_trend_bars": fb, "trend_age_bars": trend_age, "is_fresh_trend": is_fresh_trend,
-                "ema_cross_up_ago": ema_up_ago, "ema_cross_down_ago": ema_down_ago,
                 "hma_cross_up_ago": hma_up_ago, "hma_cross_down_ago": hma_down_ago,
+                "above_ema10": l3["above_ema_ref"] if l3 else None,
                 "dist_atr": round(dist_atr, 2) if dist_atr is not None else None,
                 "max_dist_atr": self.max_dist_atr_mult,
             }}
@@ -312,25 +261,17 @@ class TrendConfirmStrategy(BaseStrategy):
                 "Layer1: SMA30/EMA10-20/EMA20 slope/MACD not confirmed or conflicting",
                 metadata=dbg("no_trend"))
 
-        if l2_15m is None or l2_1h is None:
-            return self._hold(current_price, "Layer2: ADX/chop/volume indicators still warming up (15m/1H)",
+        if q15 is None or q1h is None:
+            return self._hold(current_price, "Layer2: quality indicators still warming up (15m/1H)",
                               metadata=dbg("no_trend"))
 
-        if l2s["score"] <= self.momentum_score_threshold:
-            b = l2s["breakdown"]
+        if l2_score <= self.layer2_threshold:
             return self._hold(current_price,
-                f"Layer2: momentum score {l2s['score']:.0f} <= {self.momentum_score_threshold:.0f} "
-                f"(bias {b['bias']:.0f} + adx {b['adx']:.0f} + chop {b['chop']:.0f} + "
-                f"vol {b['volume']:.0f} + sweep {b['sweep']:.0f})",
-                metadata=dbg("momentum_fail"))
+                f"Layer2: trend quality {l2_score:.0f} <= {self.layer2_threshold:.0f} "
+                f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + 1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})",
+                metadata=dbg("quality_fail"))
 
-        # ── Layer 3: Entry (15m) — HMA10/20 must have crossed in the
-        # confirmed direction (fresh cross now, or within fresh_trend_bars
-        # if the trend just confirmed), AND price must not have run more
-        # than max_dist_atr_mult x ATR(15m) away from Layer1's EMA20(30m) —
-        # a chase-guard: if the cross fires but price already ran too far
-        # from the trend reference, skip this setup and wait for a
-        # pullback + fresh cross instead of chasing. ───────────────────────
+        # ── Layer 3: Entry (15m), always with the confirmed trend ──────────
         if l3 is None:
             return self._hold(current_price, "Layer3: indicators still warming up (15m)", metadata=dbg("no_trend"))
 
@@ -338,65 +279,68 @@ class TrendConfirmStrategy(BaseStrategy):
         dist_disp = f"{dist_atr:.2f}" if dist_atr is not None else "n/a"
 
         if trend == "up":
-            if dual_cross_up and not dist_ok:
-                self._last_hma_cross_up_ts = None
+            if not hma_cross_up:
+                return self._hold(current_price, "Layer1+2 confirmed UP — waiting for HMA10↑HMA20 cross"
+                                  + (f" (trend fresh, within {fb} bars)" if is_fresh_trend else " (fresh cross only)"),
+                                  metadata=dbg("waiting_cross"))
+            # cross fired — consume it, then validate the two entry conditions
+            self._last_hma_cross_up_ts = None
+            if not l3["above_ema_ref"]:
                 return self._hold(current_price,
-                    f"Long setup FAILED: price {dist_disp}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
-                    f"— waiting for pullback + fresh cross",
+                    f"Long setup FAILED: price not above EMA{self.entry_ema_ref} — waiting for fresh cross",
+                    metadata=dbg("ema_ref_fail"))
+            if not dist_ok:
+                return self._hold(current_price,
+                    f"Long setup FAILED: price {dist_disp}xATR from EMA{self.dist_ema_ref} "
+                    f"(max {self.max_dist_atr_mult}x) — waiting for pullback + fresh cross",
                     metadata=dbg("cross_pass_distance_fail"))
-            if dual_cross_up:
-                sl, tp = self._compute_sl_tp("long", close_price, l3["atr_val"])
-                self._open_position = "long"
-                self._last_hma_cross_up_ts = None
-                meta = dbg("entered")
-                meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
-                return Signal(
-                    type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
-                    reason=f"Uptrend confirmed (Layer1 30m) + momentum score {l2s['score']:.0f} "
-                           f"(bias {bias_score:.0f}) (Layer2) + "
-                           f"HMA10↑HMA20 crossed {hma_up_ago} bar(s) ago, "
-                           f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
-                    confidence=1.0,
-                    metadata=meta,
-                )
-            return self._hold(current_price, "Layer1+2 confirmed UP — waiting for HMA10/20 cross"
-                              + (f" (trend fresh, within {fb} bars)" if is_fresh_trend else " (fresh cross only)"),
-                              metadata=dbg("waiting_cross"))
-
-        # trend == "down"
-        if dual_cross_down and not dist_ok:
-            self._last_hma_cross_down_ts = None
-            return self._hold(current_price,
-                f"Short setup FAILED: price {dist_disp}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
-                f"— waiting for pullback + fresh cross",
-                metadata=dbg("cross_pass_distance_fail"))
-        if dual_cross_down:
-            sl, tp = self._compute_sl_tp("short", close_price, l3["atr_val"])
-            self._open_position = "short"
-            self._last_hma_cross_down_ts = None
+            sl, tp = self._compute_sl_tp("long", close_price, l3["atr_val"])
+            self._open_position = "long"
             meta = dbg("entered")
             meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
             return Signal(
-                type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
-                reason=f"Downtrend confirmed (Layer1 30m) + momentum score {l2s['score']:.0f} "
-                       f"(bias {bias_score:.0f}) (Layer2) + "
-                       f"HMA10↓HMA20 crossed {hma_down_ago} bar(s) ago, "
-                       f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
+                type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
+                reason=f"Uptrend confirmed (Layer1 30m) + quality {l2_score:.0f} (Layer2) + "
+                       f"HMA10↑HMA20 {hma_up_ago}b ago, above EMA{self.entry_ema_ref}, "
+                       f"{dist_atr:.2f}xATR from EMA{self.dist_ema_ref} (Layer3)",
                 confidence=1.0,
                 metadata=meta,
             )
-        return self._hold(current_price, "Layer1+2 confirmed DOWN — waiting for HMA10/20 cross"
-                          + (f" (trend fresh, within {fb} bars)" if is_fresh_trend else " (fresh cross only)"),
-                          metadata=dbg("waiting_cross"))
+
+        # trend == "down"
+        if not hma_cross_down:
+            return self._hold(current_price, "Layer1+2 confirmed DOWN — waiting for HMA10↓HMA20 cross"
+                              + (f" (trend fresh, within {fb} bars)" if is_fresh_trend else " (fresh cross only)"),
+                              metadata=dbg("waiting_cross"))
+        self._last_hma_cross_down_ts = None
+        if not l3["below_ema_ref"]:
+            return self._hold(current_price,
+                f"Short setup FAILED: price not below EMA{self.entry_ema_ref} — waiting for fresh cross",
+                metadata=dbg("ema_ref_fail"))
+        if not dist_ok:
+            return self._hold(current_price,
+                f"Short setup FAILED: price {dist_disp}xATR from EMA{self.dist_ema_ref} "
+                f"(max {self.max_dist_atr_mult}x) — waiting for pullback + fresh cross",
+                metadata=dbg("cross_pass_distance_fail"))
+        sl, tp = self._compute_sl_tp("short", close_price, l3["atr_val"])
+        self._open_position = "short"
+        meta = dbg("entered")
+        meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
+        return Signal(
+            type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
+            reason=f"Downtrend confirmed (Layer1 30m) + quality {l2_score:.0f} (Layer2) + "
+                   f"HMA10↓HMA20 {hma_down_ago}b ago, below EMA{self.entry_ema_ref}, "
+                   f"{dist_atr:.2f}xATR from EMA{self.dist_ema_ref} (Layer3)",
+            confidence=1.0,
+            metadata=meta,
+        )
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
         """Exit = OR logic, whichever fires first, evaluated once per
         newly-formed 15m bar: HMA10/20 cross-back, OR the candle opens on
         the wrong side of HMA20 (a faster warning than waiting for the
-        cross itself — the open can flip against the position while
-        HMA10 hasn't crossed back yet). EMA5/10 is no longer part of the
-        exit (or the entry) — it's still computed and tracked purely for
-        [SCAN] log diagnostics. Hedge-mode-safe: always closes whichever
+        cross itself — the open can flip against the position while HMA10
+        hasn't crossed back yet). Hedge-mode-safe: always closes whichever
         position is actually open, never relies on signal.type semantics."""
         if self._open_position is None or not self._latest_candles:
             return None
@@ -426,9 +370,9 @@ class TrendConfirmStrategy(BaseStrategy):
 
     def record_closed_trade(self, exit_price: float, exit_reason: str, duration_min: float = 0.0) -> None:
         """Called by bot.py after ANY close, including the risk-manager's
-        hard SL/TP fallback firing before EMA5/10 or HMA10/20 crosses back —
-        without this, _open_position would stay set forever and analyze()
-        would refuse all future entries."""
+        hard SL/TP fallback firing before HMA10/20 crosses back — without
+        this, _open_position would stay set forever and analyze() would
+        refuse all future entries."""
         self._open_position = None
 
     def cancel_pending_entry(self, reason: str = "") -> None:
@@ -475,8 +419,7 @@ class TrendConfirmStrategy(BaseStrategy):
         sma_up, sma_down = last.open > sma_t[-1], last.open < sma_t[-1]
         ema1020_up, ema1020_down = ema1[-1] > ema2[-1], ema1[-1] < ema2[-1]
         slope_up, slope_down = ema2[-1] > ema2[-1 - lb], ema2[-1] < ema2[-1 - lb]
-        # "MACD 4C" trend read: raw MACD line vs zero, not vs its signal
-        # line — matches the user-supplied Pine script (sign only).
+        # "MACD 4C" trend read: raw MACD line vs zero, not vs its signal line.
         macd_up, macd_down = macd_line[-1] > 0, macd_line[-1] < 0
 
         trend_up = sma_up and ema1020_up and slope_up and macd_up
@@ -488,72 +431,66 @@ class TrendConfirmStrategy(BaseStrategy):
             "ema1020_dir": "up" if ema1020_up else "down" if ema1020_down else "flat",
             "slope_dir": "up" if slope_up else "down" if slope_down else "flat",
             "macd_dir": "up" if macd_up else "down" if macd_down else "flat",
-            "ema20_val": float(ema2[-1]),
         }
 
-    def _layer2_indicators(self, candles: list) -> Optional[dict]:
-        """Raw momentum readings feeding _layer2_score(): ADX (trend
-        strength), Choppiness Index (trending vs ranging), and a
-        volume-expansion ratio (current bar vs its recent average). Called
-        on both the 15m candles and the 1H candles from mtf_candles — both
-        feed into the weighted score, weighted 1H higher (see
-        _layer2_score)."""
-        min_needed = max(2 * self.adx_period + 2, self.chop_period + 1, self.volume_sma_period)
+    def _tf_quality(self, candles: list, trend: str) -> Optional[dict]:
+        """Per-timeframe 0-100 trend-quality score for the confirmed
+        direction: Alignment 40 + ADX 25 + Choppiness 20 + Volume 15.
+        Returns None if there aren't enough candles to compute everything
+        (e.g. the 1H series from mtf_candles is short) — the caller treats
+        that as 'still warming up'."""
+        min_needed = max(self.quality_ema_slow + 2, 2 * self.adx_period + 2,
+                         self.chop_period + 1, self.volume_sma_period, self.rsi_period + 1,
+                         self.macd_slow + self.macd_signal + 1)
         if len(candles) < min_needed:
             return None
-        adx_arr, _plus_di, _minus_di = self.adx(candles, self.adx_period)
-        if np.isnan(adx_arr[-1]):
-            return None
-        adx_val = float(adx_arr[-1])
 
+        closes = [c.close for c in candles]
+        ema_fast = self.ema(closes, self.quality_ema_fast)
+        ema_slow = self.ema(closes, self.quality_ema_slow)
+        rsi = self.rsi(closes, self.rsi_period)
+        macd_line, _sig, _hist = self.macd(closes, self.macd_fast, self.macd_slow, self.macd_signal)
+        adx_arr, _p, _m = self.adx(candles, self.adx_period)
         chop_val = self._choppiness(candles, self.chop_period)
-        if chop_val is None:
-            return None
-
         vols = [c.volume for c in candles]
         vol_sma = self.sma(vols, self.volume_sma_period)
-        if np.isnan(vol_sma[-1]) or vol_sma[-1] <= 0:
+
+        needed = [ema_fast[-1], ema_slow[-1], rsi[-1], macd_line[-1], adx_arr[-1], vol_sma[-1]]
+        if chop_val is None or any(np.isnan(x) for x in needed) or vol_sma[-1] <= 0:
             return None
-        vol_ratio = float(candles[-1].volume) / float(vol_sma[-1])
 
-        return {"adx": adx_val, "chop": chop_val, "vol_ratio": vol_ratio}
+        up = trend == "up"
+        c = closes[-1]
 
-    def _layer2_score(self, trend: str, bias_score: float, l2_15m: dict, l2_1h: dict,
-                       sweep_pass: bool) -> dict:
-        """Weighted 0-100 momentum/bias score — ai_expert's ConfidenceEngine
-        pattern (soft point-scoring) instead of a stack of hard AND-gates,
-        so a weak reading on one component can be outweighed by strong
-        readings elsewhere rather than vetoing the trade outright.
-        Points: bias 30, ADX 20, Choppiness 20, Volume 15, sweep 15 (=100).
-        ADX/Choppiness/Volume are weighted 15m x1 + 1H x2 (matches
-        compute_mtf_bias's own higher-TF weighting) before scoring.
-        Each threshold attribute (bias_threshold/adx_threshold/
-        chop_threshold/volume_expansion_mult) is now the point where that
-        component earns FULL credit, not a hard pass/fail line."""
-        bias_aligned = bias_score if trend == "up" else (100.0 - bias_score)
-        bias_span = max(1.0, self.bias_threshold - 50.0)
-        bias_pts = max(0.0, min(100.0, (bias_aligned - 50.0) / bias_span * 100.0)) / 100.0 * 30.0
+        # Alignment (40 pts) — 4 x 10, each check agreeing with Layer1 direction
+        checks = {
+            "px_ema20": (c > ema_fast[-1]) == up,
+            "ema20_50": (ema_fast[-1] > ema_slow[-1]) == up,
+            "rsi":      (rsi[-1] > self.rsi_bull) if up else (rsi[-1] < self.rsi_bear),
+            "macd":     (macd_line[-1] > 0) == up,
+        }
+        align_pts = sum(10.0 for v in checks.values() if v)
 
-        def _tf_weighted(key: str) -> float:
-            return (l2_15m[key] * 1.0 + l2_1h[key] * 2.0) / 3.0
+        # ADX (25 pts) — full credit at 2x threshold
+        adx_val = float(adx_arr[-1])
+        adx_pts = min(1.0, adx_val / max(1.0, self.adx_threshold * 2.0)) * 25.0
 
-        adx_avg = _tf_weighted("adx")
-        adx_pts = max(0.0, min(100.0, adx_avg / max(1.0, self.adx_threshold * 2.0) * 100.0)) / 100.0 * 20.0
-
-        chop_avg = _tf_weighted("chop")
+        # Choppiness (20 pts) — inverted (low chop = high score)
         chop_full_at = max(1.0, 100.0 - self.chop_threshold)
-        chop_pts = max(0.0, min(100.0, (100.0 - chop_avg) / chop_full_at * 100.0)) / 100.0 * 20.0
+        chop_pts = max(0.0, min(1.0, (100.0 - chop_val) / chop_full_at)) * 20.0
 
-        vol_avg = _tf_weighted("vol_ratio")
-        vol_pts = max(0.0, min(100.0, vol_avg / max(0.01, self.volume_expansion_mult * 2.0) * 100.0)) / 100.0 * 15.0
-
-        sweep_pts = 15.0 if sweep_pass else 0.0
+        # Volume (15 pts) — full credit at 2x expansion multiple
+        vol_ratio = float(candles[-1].volume) / float(vol_sma[-1])
+        vol_pts = min(1.0, vol_ratio / max(0.01, self.volume_expansion_mult * 2.0)) * 15.0
 
         breakdown = {
-            "bias": round(bias_pts, 1), "adx": round(adx_pts, 1), "chop": round(chop_pts, 1),
-            "volume": round(vol_pts, 1), "sweep": round(sweep_pts, 1),
+            "align": round(align_pts, 1), "adx": round(adx_pts, 1),
+            "chop": round(chop_pts, 1), "volume": round(vol_pts, 1),
+            "adx_val": round(adx_val, 1), "chop_val": round(chop_val, 1),
+            "vol_ratio": round(vol_ratio, 2),
         }
-        return {"score": round(sum(breakdown.values()), 1), "breakdown": breakdown}
+        score = align_pts + adx_pts + chop_pts + vol_pts
+        return {"score": round(score, 1), "breakdown": breakdown}
 
     @staticmethod
     def _choppiness(candles: list, period: int) -> Optional[float]:
@@ -576,53 +513,29 @@ class TrendConfirmStrategy(BaseStrategy):
             return None
         return 100.0 * math.log10(atr_sum / rng) / math.log10(period)
 
-    def _liquidity_sweep(self, candles: list, trend: str) -> bool:
-        """True if, within the last `sweep_recency` 15m bars, one bar wicked
-        beyond the `sweep_lookback`-bar swing extreme on the stop-hunt side
-        and closed back inside it — a liquidity sweep + reclaim.
-        trend="up"   -> looks for a swept swing LOW  (sell-side stops grabbed
-                        below the recent low, then price closed back above it)
-        trend="down" -> looks for a swept swing HIGH (mirror)."""
-        lb, rec = self.sweep_lookback, self.sweep_recency
-        if len(candles) < lb + rec + 1:
-            return False
-        for i in range(len(candles) - rec, len(candles)):
-            window = candles[i - lb:i]  # the lb bars strictly before candidate bar i
-            if len(window) < lb:
-                continue
-            bar = candles[i]
-            if trend == "up":
-                swing_low = min(c.low for c in window)
-                if bar.low < swing_low and bar.close > swing_low:
-                    return True
-            else:
-                swing_high = max(c.high for c in window)
-                if bar.high > swing_high and bar.close < swing_high:
-                    return True
-        return False
-
     def _layer3_indicators(self, candles: list) -> Optional[dict]:
         closes = [c.close for c in candles]
-        ema_f = self.ema(closes, self.ema_fast)
-        ema_s = self.ema(closes, self.ema_slow)
         hma_f = self.hma(closes, self.hma_fast)
         hma_s = self.hma(closes, self.hma_slow)
+        ema_ref = self.ema(closes, self.entry_ema_ref)
+        dist_ema = self.ema(closes, self.dist_ema_ref)
         atr_arr = self.atr(candles, self.atr_period)
 
-        needed = [ema_f[-1], ema_f[-2], ema_s[-1], ema_s[-2],
-                 hma_f[-1], hma_f[-2], hma_s[-1], hma_s[-2], atr_arr[-1]]
+        needed = [hma_f[-1], hma_f[-2], hma_s[-1], hma_s[-2],
+                 ema_ref[-1], dist_ema[-1], atr_arr[-1]]
         if any(np.isnan(x) for x in needed):
             return None
 
         last = candles[-1]
         return {
-            "ema_cross_up":   ema_f[-2] <= ema_s[-2] and ema_f[-1] > ema_s[-1],
-            "ema_cross_down": ema_f[-2] >= ema_s[-2] and ema_f[-1] < ema_s[-1],
             "hma_cross_up":   hma_f[-2] <= hma_s[-2] and hma_f[-1] > hma_s[-1],
             "hma_cross_down": hma_f[-2] >= hma_s[-2] and hma_f[-1] < hma_s[-1],
             "hma20_val": float(hma_s[-1]),
             "open_below_hma20": last.open < hma_s[-1],
             "open_above_hma20": last.open > hma_s[-1],
+            "above_ema_ref": last.close > ema_ref[-1],
+            "below_ema_ref": last.close < ema_ref[-1],
+            "dist_ema_val": float(dist_ema[-1]),
             "atr_val": float(atr_arr[-1]),
         }
 

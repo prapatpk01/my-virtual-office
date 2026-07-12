@@ -173,14 +173,11 @@ class TradingBot:
         """Pulls the actual MA/MACD periods a strategy trades on so the
         Telegram entry chart draws the SAME lines the strategy used to
         decide the trade, instead of a fixed generic EMA20/EMA50 that may
-        not match at all (e.g. trend_confirm trades EMA5/EMA10+SMA30, not
-        EMA20/EMA50). Falls back to ai_expert's EMA20/EMA50 defaults for
-        strategies that don't expose these attributes (ai_expert itself).
-        EMA takes priority over HMA when a strategy has both (trend_confirm's
-        Layer3 entry uses EMA5/10 AND HMA10/20 together — the chart can only
-        show one fast/slow pair, so it draws the EMA one; HMA is the same
-        idea and periods are close, so this is a minor display simplification,
-        not a difference in what the strategy actually trades on)."""
+        not match at all. Falls back to ai_expert's EMA20/EMA50 defaults
+        for strategies that don't expose these attributes (ai_expert
+        itself). A strategy exposing ema_fast/ema_slow draws those; one
+        exposing only hma_fast/hma_slow (e.g. trend_confirm, whose Layer3
+        entry triggers on HMA10/20) draws the HMA pair instead."""
         if strategy_inst is None:
             return {}
         kwargs: dict = {}
@@ -553,23 +550,21 @@ class TradingBot:
     def _log_scan_trend_confirm(self, symbol: str, strategy_name: str, price: float,
                                  signal: "Signal", tc: dict) -> None:
         """TrendConfirmStrategy-specific scan line for the 3-layer design:
-        Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree),
-        Layer2 (dynamic weighted 0-100 momentum score — bias+ADX+chop+
-        volume(15m/1H weighted)+liquidity-sweep, soft-scored ai_expert
-        ConfidenceEngine style rather than hard AND-gates), Layer3 (15m
-        HMA10/20 cross — fresh, or within fresh_trend_bars if the trend
-        just confirmed; EMA5/10 shown alongside for diagnostics only, it
-        no longer gates entry or exit) — instead of the ai_expert-only
-        fields (macro/context/mtf) that don't apply to this strategy."""
+        Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree on
+        up or down), Layer2 (trend-quality score — per-TF Align/ADX/Chop/
+        Volume, weighted 15m 65% + 1H 35%, must clear layer2_threshold),
+        Layer3 (15m HMA10/20 cross with-trend + price above/below EMA10 +
+        within 1.5xATR of EMA20) — instead of the ai_expert-only fields
+        (macro/context/mtf) that don't apply to this strategy."""
         sma_trend  = tc.get("sma_trend", "?")
         ema1020    = tc.get("ema10_20_trend", "?")
         slope      = tc.get("ema20_slope", "?")
         macd_trend = tc.get("macd_trend", "?")
         confirmed  = tc.get("confirmed") or "none"
-        bias_score = tc.get("bias_score")
-        mscore     = tc.get("momentum_score")
-        mscore_thr = tc.get("momentum_score_threshold")
-        breakdown  = tc.get("momentum_breakdown") or {}
+        q15        = tc.get("q15")
+        q1h        = tc.get("q1h")
+        l2_score   = tc.get("layer2_score")
+        l2_thr     = tc.get("layer2_threshold")
         open_pos   = tc.get("open_position") or "-"
         status     = tc.get("entry_status", "?")
         fb         = tc.get("fresh_trend_bars")
@@ -578,19 +573,17 @@ class TradingBot:
         _STATUS_LABEL = {
             "position_open":            "holding",
             "no_trend":                 "n/a (Layer1 not confirmed)",
-            "momentum_fail":            "n/a (Layer2 score too low)",
+            "quality_fail":             "n/a (Layer2 quality too low)",
             "waiting_cross":            "wait_hma_cross (Layer3)",
+            "ema_ref_fail":             "cross_ok/ema10_fail (Layer3)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3)",
             "entered":                  "entered",
         }
         entry_str = _STATUS_LABEL.get(status, status)
 
         l1_str = f"SMA={sma_trend} EMA10/20={ema1020} slope={slope} MACD={macd_trend}"
-        bias_str = f"{bias_score:.0f}" if bias_score is not None else "n/a"
-        if mscore is not None:
-            score_str = (f"{mscore:.0f}/{mscore_thr:.0f} (bias={breakdown.get('bias','?')} "
-                        f"adx={breakdown.get('adx','?')} chop={breakdown.get('chop','?')} "
-                        f"vol={breakdown.get('volume','?')} sweep={breakdown.get('sweep','?')})")
+        if l2_score is not None:
+            score_str = f"{l2_score:.0f}/{l2_thr:.0f} (15m={q15:.0f} 1h={q1h:.0f})"
         else:
             score_str = "n/a"
 
@@ -599,12 +592,14 @@ class TradingBot:
 
         fresh_str = f"fresh<{fb}b" if is_fresh else "steady"
         if confirmed == "up":
-            cross_str = f"EMA↑{_ago_str(tc.get('ema_cross_up_ago'))} HMA↑{_ago_str(tc.get('hma_cross_up_ago'))} ({fresh_str})"
+            cross_str = f"HMA↑{_ago_str(tc.get('hma_cross_up_ago'))} ({fresh_str})"
         elif confirmed == "down":
-            cross_str = f"EMA↓{_ago_str(tc.get('ema_cross_down_ago'))} HMA↓{_ago_str(tc.get('hma_cross_down_ago'))} ({fresh_str})"
+            cross_str = f"HMA↓{_ago_str(tc.get('hma_cross_down_ago'))} ({fresh_str})"
         else:
             cross_str = "n/a"
 
+        above = tc.get("above_ema10")
+        ema_str = ("above" if above else "below") if above is not None else "?"
         dist_atr = tc.get("dist_atr")
         max_dist = tc.get("max_dist_atr")
         dist_str = f"{dist_atr:.2f}/{max_dist:.1f}xATR" if dist_atr is not None else "n/a"
@@ -612,11 +607,11 @@ class TradingBot:
         reason = (signal.reason or "")[:90]
         logger.info(
             "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s "
-            "L2[bias=%s score=%s] pos=%-5s | "
-            "L3[%s dist=%s]=%s | %s",
+            "L2[quality=%s] pos=%-5s | "
+            "L3[%s ema10=%s dist=%s]=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
-            l1_str, confirmed, bias_str, score_str,
-            open_pos, cross_str, dist_str, entry_str, reason,
+            l1_str, confirmed, score_str,
+            open_pos, cross_str, ema_str, dist_str, entry_str, reason,
         )
 
     # ------------------------------------------------------------------
