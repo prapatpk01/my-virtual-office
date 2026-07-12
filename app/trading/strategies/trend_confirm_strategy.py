@@ -67,9 +67,12 @@ Exit — a 2-TP + break-even scheme managed in tick_open_position():
     `exit_hma20_confirm_bars` consecutive closes past HMA20 — off because
     a near-single bar past HMA20 kept whipsawing trades out before the
     trend developed (visible on low-volatility symbols like XAU).
-  SL/TP (ATR(14, 15m) x2.5 SL, 2:1 R:R by default) are the hard bounds
-  bot.py's risk manager checks underneath; TP1 fires the partial +
-  BE-move via a PositionUpdate("partial_tp", new_sl=...).
+  SL/TP (SL = wider of ATR(14,15m) x2.5 and min_sl_pct=0.5% of price;
+  2:1 R:R by default) are the hard bounds bot.py's risk manager checks
+  underneath; TP1 fires the partial + BE-move via a
+  PositionUpdate("partial_tp", new_sl=...). The 0.5% floor stops
+  low-volatility symbols (e.g. XAU, where 2.5xATR can be ~0.04%) from
+  getting a microscopic SL that noise trips instantly.
 
 Once closed (by either exit condition or the hard SL/TP stop), the next
 bar where Layer1+Layer2 read confirmed again is eligible for a new entry.
@@ -145,6 +148,9 @@ class TrendConfirmStrategy(BaseStrategy):
         atr_period: int = 14,
         sl_atr_mult: float = 2.5,           # wide enough that the signal exit, not noise, closes the trade
         rr_ratio: float = 2.0,              # final TP (TP2) at 2R so winners that reach a target aren't cut short
+        min_sl_pct: float = 0.005,          # floor the SL distance at 0.5% of price — on low-volatility symbols
+                                            #   (e.g. XAU) 2.5xATR can be ~0.04% and gets noise-stopped instantly;
+                                            #   R (and therefore TP1/TP2) is measured from the floored distance
     ):
         super().__init__(symbol, params)
         self.name = f"TrendConfirm({symbol})"
@@ -191,6 +197,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.atr_period = atr_period
         self.sl_atr_mult = sl_atr_mult
         self.rr_ratio = rr_ratio
+        self.min_sl_pct = min_sl_pct
 
         self._open_position: Optional[str] = None   # "long" | "short" | None
         self._trend_state: Optional[str] = None      # "up" | "down" | None — Layer 1 result
@@ -518,7 +525,10 @@ class TrendConfirmStrategy(BaseStrategy):
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _compute_sl_tp(self, direction: str, price: float, atr: float) -> tuple[float, float]:
-        dist = self.sl_atr_mult * atr
+        # R = the wider of 2.5xATR and the min_sl_pct floor (0.5% of price),
+        # so low-volatility symbols don't get a microscopic, noise-stopped SL.
+        # TP1/TP2 are measured from this same R (TP = R x rr_ratio).
+        dist = max(self.sl_atr_mult * atr, self.min_sl_pct * price)
         if direction == "long":
             sl = price - dist
             tp = price + dist * self.rr_ratio
