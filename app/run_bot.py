@@ -420,12 +420,16 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     # richer per-symbol asset-class metadata) — shared by min-SL-floor sizing
     # below and the session-control crypto-bypass check further down.
     _commodity_symbols = {"XAU", "XAG", "CL"}
-    # [MIN-SL FLOOR] Low-volatility instruments (gold/silver/oil) rarely move
-    # 2% intra-trade, so the old single global 2% floor routinely clamped
-    # their SL far wider than the ATR-based calc called for. Split per asset
-    # class instead — see TradingBot.min_sl_pct.
+    # [MIN-SL FLOOR] Originally split crypto vs commodity on the theory that
+    # gold/silver/oil rarely move 2% intra-trade — but 0.8% for XAU/XAG
+    # backtested WORSE (-$470 combined on real data) than the old uniform 2%:
+    # every XAU loss under 0.8% was a full -1R stop, consistent with 0.8%
+    # being tighter than gold's actual 15m ATR often calls for, getting
+    # stopped by normal noise before the trade develops. Both buckets now use
+    # the same 1.2% (the value that DID backtest better, +$343 on crypto) —
+    # see TradingBot.min_sl_pct.
     _min_sl_pct_crypto     = _env_float("ADAPTIVE_MIN_SL_PCT_CRYPTO", 0.012)
-    _min_sl_pct_commodity  = _env_float("ADAPTIVE_MIN_SL_PCT_COMMODITY", 0.008)
+    _min_sl_pct_commodity  = _env_float("ADAPTIVE_MIN_SL_PCT_COMMODITY", 0.012)
 
     for sym in symbols:
         safe_sym = sym.replace("/", "_").replace(":", "_")

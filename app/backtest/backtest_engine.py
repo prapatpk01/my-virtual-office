@@ -87,12 +87,15 @@ class BacktestConfig:
     min_sl_pct:     float = 0.020    # minimum SL distance = 2.0% — limits notional to ≤$5000 at 1% risk
     max_position_usd: float = 10_000  # max notional per trade (safety cap)
 
-    # [MIN-SL FLOOR] TradingBot.min_sl_pct's floor on the ATR-based SL —
-    # split per asset class (gold/silver/oil rarely move 2% intra-trade, so a
-    # single global floor routinely over-widened their SL). Picked per-symbol
-    # in SymbolBacktest.run() via _COMMODITY_SYMBOLS, matching run_bot.py.
+    # [MIN-SL FLOOR] TradingBot.min_sl_pct's floor on the ATR-based SL. Tried
+    # splitting commodity to 0.8% (gold/silver/oil rarely move 2% intra-
+    # trade) but that backtested WORSE than the uniform 2% (-$470 combined,
+    # every XAU loss a full -1R stop) — 0.8% was tighter than gold's actual
+    # ATR often calls for. Both buckets now share 1.2%, the value that DID
+    # backtest better on crypto (+$343). Picked per-symbol in
+    # SymbolBacktest.run() via _COMMODITY_SYMBOLS, matching run_bot.py.
     min_sl_pct_crypto:    float = 0.012
-    min_sl_pct_commodity: float = 0.008
+    min_sl_pct_commodity: float = 0.012
 
     # Fees & slippage
     commission_pct: float = 0.0005   # 0.05% taker (OKX SWAP)

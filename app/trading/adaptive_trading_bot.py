@@ -1048,7 +1048,12 @@ class TradingBot:
                  # for every symbol; low-volatility instruments (gold/silver/
                  # oil) rarely move 2% intra-trade, so it was routinely
                  # clamping their SL far wider than their own ATR called for.
-                 # Set per-symbol in run_bot.py (crypto=0.012, XAU/XAG/CL=0.008).
+                 # Set per-symbol in run_bot.py. Tried crypto=0.012/
+                 # commodity=0.008 (gold/silver/oil rarely move 2% intra-
+                 # trade) but 0.8% backtested WORSE for XAU/XAG than the old
+                 # uniform 2% (-$470 combined, every loss a full -1R stop) —
+                 # too tight for gold's actual ATR. Both buckets now share
+                 # 0.012 (the value that DID backtest better, +$343 on crypto).
                  min_sl_pct: float = 0.020):
         self.state: str = "SCANNING"
         self.entry_engine       = entry_engine
