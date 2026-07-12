@@ -33,8 +33,16 @@ Layer 3 — Entry (TF15m):
   other follows within the grace window (0 = same bar, up to
   cross_grace_bars apart either order). Long only when Layer1+Layer2
   both say "up"; short only when both say "down". Each side's cross
-  timestamp is consumed (reset to None) once it triggers an entry, so a
-  stale old cross can't silently satisfy a future setup.
+  timestamp is consumed (reset to None) once it triggers an entry
+  attempt (pass or fail), so a stale old cross can't silently satisfy a
+  future setup.
+
+  Chase-guard: even when the dual cross fires, price must be within
+  `max_dist_atr_mult` (default 1.5) x ATR(14, 15m) of Layer1's
+  EMA20(30m) — the same trend reference Layer1 uses for its EMA10/20
+  and slope checks. If price already ran too far from it, the setup
+  fails outright (no entry) and waits for a pullback + fresh cross,
+  rather than chasing an already-extended move.
 
 Exit — OR logic, whichever fires first while SL/TP hasn't been hit yet:
   EMA5/10 cross-back  OR  HMA10/20 cross-back  ->  close 100% immediately.
@@ -90,6 +98,7 @@ class TrendConfirmStrategy(BaseStrategy):
         hma_fast: int = 10,
         hma_slow: int = 20,
         cross_grace_bars: int = 2,
+        max_dist_atr_mult: float = 1.5,
         # Risk
         atr_period: int = 14,
         sl_atr_mult: float = 1.5,
@@ -113,6 +122,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.hma_fast = hma_fast
         self.hma_slow = hma_slow
         self.cross_grace_bars = cross_grace_bars
+        self.max_dist_atr_mult = max_dist_atr_mult
 
         self.atr_period = atr_period
         self.sl_atr_mult = sl_atr_mult
@@ -192,6 +202,10 @@ class TrendConfirmStrategy(BaseStrategy):
         bias_pct, bias_label = self.compute_mtf_bias(candles, {"1h": mtf.get("1h", [])}, w3=0.0)
         bias_score = 50.0 + bias_pct / 2.0
 
+        close_price = candles[-1].close
+        dist_atr = (abs(close_price - l1["ema20_val"]) / l3["atr_val"]
+                   if (l3 is not None and l3["atr_val"] > 0) else None)
+
         def dbg(entry_status: str) -> dict:
             return {"trend_confirm": {
                 "sma_trend": l1["sma_dir"], "ema10_20_trend": l1["ema1020_dir"],
@@ -203,6 +217,8 @@ class TrendConfirmStrategy(BaseStrategy):
                 "cross_grace_bars": gb,
                 "ema_cross_up_ago": ema_up_ago, "ema_cross_down_ago": ema_down_ago,
                 "hma_cross_up_ago": hma_up_ago, "hma_cross_down_ago": hma_down_ago,
+                "dist_atr": round(dist_atr, 2) if dist_atr is not None else None,
+                "max_dist_atr": self.max_dist_atr_mult,
             }}
 
         if self._open_position is not None:
@@ -227,13 +243,24 @@ class TrendConfirmStrategy(BaseStrategy):
 
         # ── Layer 3: Entry (15m) — EMA5/10 AND HMA10/20 must BOTH have
         # crossed in the confirmed direction within cross_grace_bars of
-        # each other (whichever fired first still counts) ─────────────────
+        # each other (whichever fired first still counts), AND price must
+        # not have run more than max_dist_atr_mult x ATR(15m) away from
+        # Layer1's EMA20(30m) — a chase-guard: if the cross fires but price
+        # already ran too far from the trend reference, skip this setup and
+        # wait for a pullback + fresh cross instead of chasing. ────────────
         if l3 is None:
             return self._hold(current_price, "Layer3: indicators still warming up (15m)", metadata=dbg("no_trend"))
 
-        close_price = candles[-1].close
+        dist_ok = dist_atr is not None and dist_atr <= self.max_dist_atr_mult
 
         if trend == "up":
+            if dual_cross_up and not dist_ok:
+                self._last_ema_cross_up_ts = None
+                self._last_hma_cross_up_ts = None
+                return self._hold(current_price,
+                    f"Long setup FAILED: price {dist_atr:.2f}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
+                    f"— waiting for pullback + fresh cross",
+                    metadata=dbg("cross_pass_distance_fail"))
             if dual_cross_up:
                 sl, tp = self._compute_sl_tp("long", close_price, l3["atr_val"])
                 self._open_position = "long"
@@ -244,7 +271,8 @@ class TrendConfirmStrategy(BaseStrategy):
                 return Signal(
                     type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                     reason=f"Uptrend confirmed (Layer1 30m) + bias {bias_score:.0f} (Layer2) + "
-                           f"EMA5↑EMA10 & HMA10↑HMA20 crossed within {gb} bar(s) of each other (Layer3)",
+                           f"EMA5↑EMA10 & HMA10↑HMA20 crossed within {gb} bar(s) of each other, "
+                           f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
                     confidence=1.0,
                     metadata=meta,
                 )
@@ -253,6 +281,13 @@ class TrendConfirmStrategy(BaseStrategy):
                               metadata=dbg("waiting_cross"))
 
         # trend == "down"
+        if dual_cross_down and not dist_ok:
+            self._last_ema_cross_down_ts = None
+            self._last_hma_cross_down_ts = None
+            return self._hold(current_price,
+                f"Short setup FAILED: price {dist_atr:.2f}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
+                f"— waiting for pullback + fresh cross",
+                metadata=dbg("cross_pass_distance_fail"))
         if dual_cross_down:
             sl, tp = self._compute_sl_tp("short", close_price, l3["atr_val"])
             self._open_position = "short"
@@ -263,7 +298,8 @@ class TrendConfirmStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
                 reason=f"Downtrend confirmed (Layer1 30m) + bias {bias_score:.0f} (Layer2) + "
-                       f"EMA5↓EMA10 & HMA10↓HMA20 crossed within {gb} bar(s) of each other (Layer3)",
+                       f"EMA5↓EMA10 & HMA10↓HMA20 crossed within {gb} bar(s) of each other, "
+                       f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
                 confidence=1.0,
                 metadata=meta,
             )
@@ -366,6 +402,7 @@ class TrendConfirmStrategy(BaseStrategy):
             "ema1020_dir": "up" if ema1020_up else "down" if ema1020_down else "flat",
             "slope_dir": "up" if slope_up else "down" if slope_down else "flat",
             "macd_dir": "up" if macd_up else "down" if macd_down else "flat",
+            "ema20_val": float(ema2[-1]),
         }
 
     def _layer3_indicators(self, candles: list) -> Optional[dict]:

@@ -570,11 +570,12 @@ class TradingBot:
         gb         = tc.get("cross_grace_bars")
 
         _STATUS_LABEL = {
-            "position_open":  "holding",
-            "no_trend":       "n/a (Layer1 not confirmed)",
-            "bias_fail":      "n/a (Layer2 bias fail)",
-            "waiting_cross":  "wait_dual_cross (Layer3)",
-            "entered":        "entered",
+            "position_open":            "holding",
+            "no_trend":                 "n/a (Layer1 not confirmed)",
+            "bias_fail":                "n/a (Layer2 bias fail)",
+            "waiting_cross":            "wait_dual_cross (Layer3)",
+            "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3)",
+            "entered":                  "entered",
         }
         entry_str = _STATUS_LABEL.get(status, status)
 
@@ -593,11 +594,16 @@ class TradingBot:
         else:
             cross_str = "n/a"
 
+        dist_atr = tc.get("dist_atr")
+        max_dist = tc.get("max_dist_atr")
+        dist_str = f"{dist_atr:.2f}/{max_dist:.1f}xATR" if dist_atr is not None else "n/a"
+
         reason = (signal.reason or "")[:90]
         logger.info(
-            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s L2[bias=%s] pos=%-5s | L3[%s]=%s | %s",
+            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s L2[bias=%s] pos=%-5s | "
+            "L3[%s dist=%s]=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
-            l1_str, confirmed, bias_str, open_pos, cross_str, entry_str, reason,
+            l1_str, confirmed, bias_str, open_pos, cross_str, dist_str, entry_str, reason,
         )
 
     # ------------------------------------------------------------------
