@@ -69,6 +69,9 @@ def render_entry_chart(
     macd_fast: int = 12,
     macd_slow: int = 26,
     macd_signal_period: int = 9,
+    dir_label: Optional[str] = None,        # overrides the default "LONG (+)"/"SHORT (-)" title text
+    indicator_status: Optional[str] = None,  # e.g. "SMA30=up  MACD=down  EMA5/10=no_cross" — shown in the legend box
+    entry_label: str = "Entry",             # e.g. "Price" when there's no actual entry (status-only chart)
 ) -> Optional[str]:
     """
     Render a candlestick chart using the SAME moving-average/MACD periods
@@ -146,8 +149,8 @@ def render_entry_chart(
         hlines_styles += ["dotted", "dotted"]
         hlines_widths += [0.8, 0.8]
 
-        dir_label = "LONG (+)" if direction == "long" else "SHORT (-)"
-        title = f"{symbol}  {dir_label}  |  {strategy or ''}".strip()
+        resolved_dir_label = dir_label or ("LONG (+)" if direction == "long" else "SHORT (-)")
+        title = f"{symbol}  {resolved_dir_label}  |  {strategy or ''}".strip()
 
         mc = mpf.make_marketcolors(
             up="#22c55e", down="#ef4444",
@@ -189,7 +192,7 @@ def render_entry_chart(
         # native legend, so annotate the price axis directly).
         ax = axes[0]
         legend_lines = [
-            f"Entry {entry:,.2f}",
+            f"{entry_label} {entry:,.2f}",
             f"{ma_label}{ema_fast} / {ma_label}{ema_slow}" + (f" / SMA{sma_period}" if sma_period else ""),
             f"MACD {macd_fast}/{macd_slow}/{macd_signal_period}",
         ]
@@ -199,6 +202,8 @@ def render_entry_chart(
             legend_lines.append(f"TP {tp:,.2f}")
         if macro_bias:
             legend_lines.append(f"Macro: {macro_bias}")
+        if indicator_status:
+            legend_lines.append(indicator_status)
         ax.text(
             0.01, 0.99, "\n".join(legend_lines),
             transform=ax.transAxes, va="top", ha="left",
