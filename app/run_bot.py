@@ -416,6 +416,17 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     _state_dir = _os.environ.get("BOT_STATE_DIR", "/tmp")
     _os.makedirs(_state_dir, exist_ok=True)
 
+    # Approximate, manually-maintained classification (this codebase has no
+    # richer per-symbol asset-class metadata) — shared by min-SL-floor sizing
+    # below and the session-control crypto-bypass check further down.
+    _commodity_symbols = {"XAU", "XAG", "CL"}
+    # [MIN-SL FLOOR] Low-volatility instruments (gold/silver/oil) rarely move
+    # 2% intra-trade, so the old single global 2% floor routinely clamped
+    # their SL far wider than the ATR-based calc called for. Split per asset
+    # class instead — see TradingBot.min_sl_pct.
+    _min_sl_pct_crypto     = _env_float("ADAPTIVE_MIN_SL_PCT_CRYPTO", 0.012)
+    _min_sl_pct_commodity  = _env_float("ADAPTIVE_MIN_SL_PCT_COMMODITY", 0.008)
+
     for sym in symbols:
         safe_sym = sym.replace("/", "_").replace(":", "_")
         state_file = _os.path.join(_state_dir, f"adaptive_{safe_sym}.json")
@@ -447,8 +458,12 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 return result
             return cb
 
+        _base_sym = sym.split("/")[0].upper()
+        _min_sl_pct = _min_sl_pct_commodity if _base_sym in _commodity_symbols else _min_sl_pct_crypto
+
         bot = AdaptiveBot(
             account_balance=cfg["adaptive_balance"],
+            min_sl_pct=_min_sl_pct,
             base_risk_pct=cfg["adaptive_risk_pct"],
             daily_loss_limit_pct=cfg["adaptive_daily_loss"],
             daily_profit_limit_pct=cfg["adaptive_daily_profit"],
@@ -565,11 +580,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 3.0),
     )
     _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", True)
-    # Approximate, manually-maintained classification (this codebase has no
-    # richer per-symbol asset-class metadata) — only consulted at all when
-    # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=false, to let crypto symbols opt out
-    # of the commodity schedule and trade 24/7 as before this feature.
-    _commodity_symbols = {"XAU", "XAG", "CL"}
+    # _commodity_symbols defined earlier (shared with the min-SL-floor split
+    # above) — only consulted here when FOLLOW_REFERENCE_SESSION_FOR_CRYPTO
+    # =false, to let crypto symbols opt out of the commodity schedule and
+    # trade 24/7 as before this feature.
     SESSION_LOG_SECS = _env_int("SESSION_LOG_SECONDS", 300)
     last_session_log = 0.0   # force an immediate log on the first loop tick
     last_session_state = None

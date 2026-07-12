@@ -35,6 +35,11 @@ from trading.connectors.base import OHLCV
 
 logger = logging.getLogger("backtest")
 
+# Approximate, manually-maintained classification (this codebase has no
+# richer per-symbol asset-class metadata) — matches run_bot.py's
+# _commodity_symbols, used for the min-SL-floor split below.
+_COMMODITY_SYMBOLS = {"XAU", "XAG", "CL"}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -81,6 +86,13 @@ class BacktestConfig:
     # Position sizing safety
     min_sl_pct:     float = 0.020    # minimum SL distance = 2.0% — limits notional to ≤$5000 at 1% risk
     max_position_usd: float = 10_000  # max notional per trade (safety cap)
+
+    # [MIN-SL FLOOR] TradingBot.min_sl_pct's floor on the ATR-based SL —
+    # split per asset class (gold/silver/oil rarely move 2% intra-trade, so a
+    # single global floor routinely over-widened their SL). Picked per-symbol
+    # in SymbolBacktest.run() via _COMMODITY_SYMBOLS, matching run_bot.py.
+    min_sl_pct_crypto:    float = 0.012
+    min_sl_pct_commodity: float = 0.008
 
     # Fees & slippage
     commission_pct: float = 0.0005   # 0.05% taker (OKX SWAP)
@@ -269,6 +281,9 @@ class SymbolBacktest:
 
         executor   = PaperExecutor(self.cfg.commission_pct, self.cfg.slippage_pct)
         ind_engine = IndicatorEngine()
+        _base_sym  = self.symbol.split("/")[0].upper()
+        _min_sl_pct = (self.cfg.min_sl_pct_commodity if _base_sym in _COMMODITY_SYMBOLS
+                      else self.cfg.min_sl_pct_crypto)
 
         bot = TradingBot(
             account_balance        = self.cfg.initial_balance,
@@ -280,6 +295,7 @@ class SymbolBacktest:
             tp1_close_pct          = self.cfg.tp1_close_pct,
             tp1_r                  = self.cfg.tp1_r,   # was a dead config field — now actually applied
             tp2_r                  = self.cfg.tp2_r,
+            min_sl_pct             = _min_sl_pct,
             state_file             = os.devnull,   # no disk I/O during backtest
             execution_callback     = executor.execute,
             startup_warmup_minutes = 0,            # backtest has no warmup — instant start

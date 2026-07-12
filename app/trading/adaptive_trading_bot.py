@@ -1039,12 +1039,23 @@ class TradingBot:
                  # independently. Pass None/None to restore the old EMA20/50
                  # behavior (IndicatorEngine's shared values, untouched).
                  macro_ema_fast: Optional[int] = 12,
-                 macro_ema_slow: Optional[int] = 26):
+                 macro_ema_slow: Optional[int] = 26,
+                 # [MIN-SL FLOOR] SL distance is never allowed to be tighter
+                 # than this fraction of entry price, regardless of what the
+                 # ATR-based calc in _compute_sl_price returned — guards
+                 # against an artificially-tiny ATR reading producing an
+                 # oversized position. 0.020 (2%) was a single global value
+                 # for every symbol; low-volatility instruments (gold/silver/
+                 # oil) rarely move 2% intra-trade, so it was routinely
+                 # clamping their SL far wider than their own ATR called for.
+                 # Set per-symbol in run_bot.py (crypto=0.012, XAU/XAG/CL=0.008).
+                 min_sl_pct: float = 0.020):
         self.state: str = "SCANNING"
         self.entry_engine       = entry_engine
         self.enable_early_trend = enable_early_trend
         self.macro_ema_fast     = macro_ema_fast
         self.macro_ema_slow     = macro_ema_slow
+        self.min_sl_pct         = min_sl_pct
         self.mtf_engine         = MTFConfluenceEngine()
         self.adaptive_engine    = AdaptiveEngine()
         self.health_calc        = PositionHealthCalculator()
@@ -2197,7 +2208,7 @@ class TradingBot:
         if sl_dist < 1e-8:
             sl_dist = entry_price * 0.01
 
-        min_sl_dist = entry_price * 0.020
+        min_sl_dist = entry_price * self.min_sl_pct
         if sl_dist < min_sl_dist:
             sl_dist = min_sl_dist
             pattern_sl = (entry_price - sl_dist if direction == "LONG"

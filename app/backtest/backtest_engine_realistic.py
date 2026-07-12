@@ -35,7 +35,7 @@ from trading.indicator_engine import IndicatorEngine
 
 from backtest.backtest_engine import (
     BacktestConfig, PaperExecutor, TradeRecord, SymbolBacktest,
-    compute_metrics, _load_csv_dir, _df_to_ohlcv,
+    compute_metrics, _load_csv_dir, _df_to_ohlcv, _COMMODITY_SYMBOLS,
 )
 from trading.adaptive_trading_bot import TradingBot, ExpectancyEngine
 
@@ -96,6 +96,9 @@ class RealisticSymbolBacktest(SymbolBacktest):
 
         executor   = PaperExecutor(self.cfg.commission_pct, self.cfg.slippage_pct)
         ind_engine = IndicatorEngine()
+        _base_sym  = self.symbol.split("/")[0].upper()
+        _min_sl_pct = (self.cfg.min_sl_pct_commodity if _base_sym in _COMMODITY_SYMBOLS
+                      else self.cfg.min_sl_pct_crypto)
 
         bot = TradingBot(
             account_balance        = self.cfg.initial_balance,
@@ -107,6 +110,7 @@ class RealisticSymbolBacktest(SymbolBacktest):
             tp1_close_pct          = self.cfg.tp1_close_pct,
             tp1_r                  = self.cfg.tp1_r,
             tp2_r                  = self.cfg.tp2_r,
+            min_sl_pct             = _min_sl_pct,
             state_file             = os.devnull,
             execution_callback     = executor.execute,
             startup_warmup_minutes = 0,
