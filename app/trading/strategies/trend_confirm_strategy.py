@@ -45,9 +45,13 @@ Layer 3 — Entry (TF15m):
   rather than chasing an already-extended move.
 
 Exit — OR logic, whichever fires first while SL/TP hasn't been hit yet:
-  EMA5/10 cross-back  OR  HMA10/20 cross-back  ->  close 100% immediately.
-  SL/TP (ATR(14, 15m) x1.5, 1:1 R:R by default) remains the hard-stop
-  safety net checked by bot.py's risk-manager fallback underneath this.
+  EMA5/10 cross-back  OR  HMA10/20 cross-back  OR  candle opens on the
+  wrong side of HMA20 (long: open < HMA20, short: open > HMA20) ->
+  close 100% immediately. The open-vs-HMA20 check is a faster warning
+  than waiting for HMA10 to actually cross back — the open can already
+  be on the wrong side while HMA10/HMA20 haven't crossed yet. SL/TP
+  (ATR(14, 15m) x1.5, 1:1 R:R by default) remains the hard-stop safety
+  net checked by bot.py's risk-manager fallback underneath all of this.
 
 Once closed (by either exit condition or the hard SL/TP stop), the very
 next bar where Layer1+Layer2 read confirmed again — same direction as
@@ -303,10 +307,13 @@ class TrendConfirmStrategy(BaseStrategy):
                           metadata=dbg("waiting_cross"))
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
-        """Exit = OR logic: EMA5/10 cross-back OR HMA10/20 cross-back,
-        whichever fires first, evaluated once per newly-formed 15m bar.
-        Hedge-mode-safe: always closes whichever position is actually
-        open, never relies on signal.type semantics."""
+        """Exit = OR logic, whichever fires first, evaluated once per
+        newly-formed 15m bar: EMA5/10 cross-back, OR HMA10/20 cross-back,
+        OR the candle opens on the wrong side of HMA20 (a faster warning
+        than waiting for the cross itself — the open can flip against the
+        position while HMA10 hasn't crossed back yet). Hedge-mode-safe:
+        always closes whichever position is actually open, never relies
+        on signal.type semantics."""
         if self._open_position is None or not self._latest_candles:
             return None
 
@@ -322,12 +329,22 @@ class TrendConfirmStrategy(BaseStrategy):
             return PositionUpdate(action="hold", reason="Indicators warming up (15m)")
         self._last_exit_bar_ts = bar_ts
 
-        if self._open_position == "long" and (l3["ema_cross_down"] or l3["hma_cross_down"]):
-            reason = "EMA5 crossed below EMA10" if l3["ema_cross_down"] else "HMA10 crossed below HMA20"
+        if self._open_position == "long" and (l3["ema_cross_down"] or l3["hma_cross_down"] or l3["open_below_hma20"]):
+            if l3["ema_cross_down"]:
+                reason = "EMA5 crossed below EMA10"
+            elif l3["hma_cross_down"]:
+                reason = "HMA10 crossed below HMA20"
+            else:
+                reason = "candle opened below HMA20"
             self._open_position = None
             return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} (15m)")
-        if self._open_position == "short" and (l3["ema_cross_up"] or l3["hma_cross_up"]):
-            reason = "EMA5 crossed above EMA10" if l3["ema_cross_up"] else "HMA10 crossed above HMA20"
+        if self._open_position == "short" and (l3["ema_cross_up"] or l3["hma_cross_up"] or l3["open_above_hma20"]):
+            if l3["ema_cross_up"]:
+                reason = "EMA5 crossed above EMA10"
+            elif l3["hma_cross_up"]:
+                reason = "HMA10 crossed above HMA20"
+            else:
+                reason = "candle opened above HMA20"
             self._open_position = None
             return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} (15m)")
 
@@ -413,11 +430,15 @@ class TrendConfirmStrategy(BaseStrategy):
         if any(np.isnan(x) for x in needed):
             return None
 
+        last = candles[-1]
         return {
             "ema_cross_up":   ema_f[-2] <= ema_s[-2] and ema_f[-1] > ema_s[-1],
             "ema_cross_down": ema_f[-2] >= ema_s[-2] and ema_f[-1] < ema_s[-1],
             "hma_cross_up":   hma_f[-2] <= hma_s[-2] and hma_f[-1] > hma_s[-1],
             "hma_cross_down": hma_f[-2] >= hma_s[-2] and hma_f[-1] < hma_s[-1],
+            "hma20_val": float(hma_s[-1]),
+            "open_below_hma20": last.open < hma_s[-1],
+            "open_above_hma20": last.open > hma_s[-1],
             "atr_val": float(atr_arr[-1]),
         }
 
