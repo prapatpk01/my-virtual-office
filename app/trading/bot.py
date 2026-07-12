@@ -1193,6 +1193,13 @@ class TradingBot:
             try:
                 meta = signal.metadata or {}
                 macro_info = meta.get("macro_trend", {})
+                early_trend = bool(meta.get("trend_confirm", {}).get("is_early_trend"))
+                dir_label = None
+                if early_trend:
+                    # plain-text tag for the chart title — matplotlib's font
+                    # has no emoji glyph, so keep the 🌱 to the TG caption only.
+                    dir_label = ("LONG (+) [EARLY]" if direction == "long"
+                                 else "SHORT (-) [EARLY]")
                 chart_path = None
                 if candles:
                     try:
@@ -1203,6 +1210,7 @@ class TradingBot:
                             candles, sym, direction, order.price,
                             sl=sl_p, tp=tp_p, strategy=strategy_name,
                             macro_bias=macro_info.get("bias", ""),
+                            dir_label=dir_label,
                             **chart_kwargs,
                         )
                     except Exception as e:
@@ -1218,6 +1226,7 @@ class TradingBot:
                     regime=meta.get("regime"),
                     direction=direction,
                     chart_path=chart_path,
+                    early_trend=early_trend,
                 )
             except Exception as e:
                 logger.warning("Telegram notify_order failed for %s %s (position is still open): %s", sym, direction, e)

@@ -149,16 +149,22 @@ class TelegramNotifier:
                             sl: float = None, tp: float = None,
                             macro_score: float = None, macro_bias: str = None,
                             selected_strategy: str = None, strategy_confidence: float = None,
-                            regime: str = None, direction: str = None) -> str:
+                            regime: str = None, direction: str = None,
+                            early_trend: bool = False) -> str:
         emoji = "🟢" if side == "buy" else "🔴"
         mode  = "📄 PAPER" if paper else "💰 LIVE"
         dir_label = f"LONG" if direction == "long" else "SHORT" if direction == "short" else side.upper()
+        if early_trend:
+            dir_label += " 🌱 EARLY"
 
         lines = [
             f"{emoji} *Order Executed* {mode}",
             f"`{symbol}` — *{dir_label}*",
             f"Entry: `{price:,.4f}`  |  Amount: `{amount}`",
         ]
+        if early_trend:
+            lines.append("🌱 _Early-trend entry: HMA crossed before the 30m trend confirmed "
+                         "(passed the stricter Layer2 quality gate)._")
 
         if sl and tp:
             risk   = abs(price - sl)
@@ -189,14 +195,14 @@ class TelegramNotifier:
                      macro_score: float = None, macro_bias: str = None,
                      selected_strategy: str = None, strategy_confidence: float = None,
                      regime: str = None, direction: str = None,
-                     chart_path: str = None):
+                     chart_path: str = None, early_trend: bool = False):
         """Send the order alert. If chart_path is given, sends it as a photo
         with the order details as caption; otherwise sends text only."""
         caption = self.build_order_caption(
             symbol, side, amount, price, strategy, paper,
             sl=sl, tp=tp, macro_score=macro_score, macro_bias=macro_bias,
             selected_strategy=selected_strategy, strategy_confidence=strategy_confidence,
-            regime=regime, direction=direction,
+            regime=regime, direction=direction, early_trend=early_trend,
         )
         if chart_path:
             self.notify_photo(chart_path, caption=caption)
