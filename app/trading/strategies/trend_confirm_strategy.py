@@ -252,13 +252,14 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price, "Layer3: indicators still warming up (15m)", metadata=dbg("no_trend"))
 
         dist_ok = dist_atr is not None and dist_atr <= self.max_dist_atr_mult
+        dist_disp = f"{dist_atr:.2f}" if dist_atr is not None else "n/a"
 
         if trend == "up":
             if dual_cross_up and not dist_ok:
                 self._last_ema_cross_up_ts = None
                 self._last_hma_cross_up_ts = None
                 return self._hold(current_price,
-                    f"Long setup FAILED: price {dist_atr:.2f}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
+                    f"Long setup FAILED: price {dist_disp}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
                     f"— waiting for pullback + fresh cross",
                     metadata=dbg("cross_pass_distance_fail"))
             if dual_cross_up:
@@ -285,7 +286,7 @@ class TrendConfirmStrategy(BaseStrategy):
             self._last_ema_cross_down_ts = None
             self._last_hma_cross_down_ts = None
             return self._hold(current_price,
-                f"Short setup FAILED: price {dist_atr:.2f}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
+                f"Short setup FAILED: price {dist_disp}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
                 f"— waiting for pullback + fresh cross",
                 metadata=dbg("cross_pass_distance_fail"))
         if dual_cross_down:
