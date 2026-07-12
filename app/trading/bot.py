@@ -175,17 +175,22 @@ class TradingBot:
         decide the trade, instead of a fixed generic EMA20/EMA50 that may
         not match at all (e.g. trend_confirm trades EMA5/EMA10+SMA30, not
         EMA20/EMA50). Falls back to ai_expert's EMA20/EMA50 defaults for
-        strategies that don't expose these attributes (ai_expert itself)."""
+        strategies that don't expose these attributes (ai_expert itself).
+        EMA takes priority over HMA when a strategy has both (trend_confirm's
+        Layer3 entry uses EMA5/10 AND HMA10/20 together — the chart can only
+        show one fast/slow pair, so it draws the EMA one; HMA is the same
+        idea and periods are close, so this is a minor display simplification,
+        not a difference in what the strategy actually trades on)."""
         if strategy_inst is None:
             return {}
         kwargs: dict = {}
-        if hasattr(strategy_inst, "hma_fast") and hasattr(strategy_inst, "hma_slow"):
+        if hasattr(strategy_inst, "ema_fast") and hasattr(strategy_inst, "ema_slow"):
+            kwargs["ema_fast"] = strategy_inst.ema_fast
+            kwargs["ema_slow"] = strategy_inst.ema_slow
+        elif hasattr(strategy_inst, "hma_fast") and hasattr(strategy_inst, "hma_slow"):
             kwargs["ma_type"] = "hma"
             kwargs["ema_fast"] = strategy_inst.hma_fast
             kwargs["ema_slow"] = strategy_inst.hma_slow
-        elif hasattr(strategy_inst, "ema_fast") and hasattr(strategy_inst, "ema_slow"):
-            kwargs["ema_fast"] = strategy_inst.ema_fast
-            kwargs["ema_slow"] = strategy_inst.ema_slow
         if hasattr(strategy_inst, "sma_trend"):
             kwargs["sma_period"] = strategy_inst.sma_trend
         if hasattr(strategy_inst, "macd_fast"):
@@ -547,49 +552,38 @@ class TradingBot:
 
     def _log_scan_trend_confirm(self, symbol: str, strategy_name: str, price: float,
                                  signal: "Signal", tc: dict) -> None:
-        """TrendConfirmStrategy-specific scan line — shows SMA30/MACD trend
-        reads directly and which side (if any) is confirmed, then the
-        entry-gate checklist status instead of the ai_expert-only fields
-        (macro/context/mtf) that don't apply to this strategy."""
+        """TrendConfirmStrategy-specific scan line for the 3-layer design:
+        Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree),
+        Layer2 (15m+1H bias score vs threshold), Layer3 (15m EMA5/10 +
+        HMA10/20 same-bar dual cross) — instead of the ai_expert-only
+        fields (macro/context/mtf) that don't apply to this strategy."""
         sma_trend  = tc.get("sma_trend", "?")
+        ema1020    = tc.get("ema10_20_trend", "?")
+        slope      = tc.get("ema20_slope", "?")
         macd_trend = tc.get("macd_trend", "?")
         confirmed  = tc.get("confirmed") or "none"
+        bias_score = tc.get("bias_score")
+        bias_thr   = tc.get("bias_threshold")
         open_pos   = tc.get("open_position") or "-"
         status     = tc.get("entry_status", "?")
 
         _STATUS_LABEL = {
-            "position_open":          "holding",
-            "waiting_next_bar":       "wait_bar_close",
-            "no_trend":               "n/a (no trend)",
-            "waiting_cross":          "wait_ema_cross",
-            "counter_cross_blocked":  "blocked (counter cross)",
-            "cross_pass_distance_fail": "cross_ok/dist_fail",
-            "entered":                "entered",
+            "position_open":  "holding",
+            "no_trend":       "n/a (Layer1 not confirmed)",
+            "bias_fail":      "n/a (Layer2 bias fail)",
+            "waiting_cross":  "wait_dual_cross (Layer3)",
+            "entered":        "entered",
         }
         entry_str = _STATUS_LABEL.get(status, status)
 
-        dist_atr = tc.get("dist_atr")
-        max_dist = tc.get("max_dist_atr")
-        if dist_atr is not None:
-            dist_str = f"{dist_atr:.2f}/{max_dist:.1f}xATR"
-        else:
-            dist_str = "n/a"
-
-        cross_check = "pass" if status in ("entered",) else (
-            "pass" if status == "cross_pass_distance_fail" else
-            ("n/a" if status in ("position_open", "waiting_next_bar", "no_trend") else "wait")
-        )
-        dist_check = "pass" if status == "entered" else (
-            "fail" if status == "cross_pass_distance_fail" else "n/a"
-        )
+        bias_str = f"{bias_score:.0f}/{bias_thr:.0f}" if bias_score is not None else "n/a"
+        l1_str = f"SMA={sma_trend} EMA10/20={ema1020} slope={slope} MACD={macd_trend}"
 
         reason = (signal.reason or "")[:90]
         logger.info(
-            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s SMA=%-4s MACD=%-4s confirm=%-5s pos=%-5s | "
-            "entry[cross=%-4s dist=%-4s(%s)]=%s | %s",
+            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s L2[bias=%s] pos=%-5s | L3=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
-            sma_trend, macd_trend, confirmed, open_pos,
-            cross_check, dist_check, dist_str, entry_str, reason,
+            l1_str, confirmed, bias_str, open_pos, entry_str, reason,
         )
 
     # ------------------------------------------------------------------
