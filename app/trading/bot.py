@@ -554,10 +554,11 @@ class TradingBot:
                                  signal: "Signal", tc: dict) -> None:
         """TrendConfirmStrategy-specific scan line for the 3-layer design:
         Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree),
-        Layer2 (15m+1H bias score vs threshold), Layer3 (15m EMA5/10 +
-        HMA10/20 cross, within cross_grace_bars of each other) — instead
-        of the ai_expert-only fields (macro/context/mtf) that don't apply
-        to this strategy."""
+        Layer2 (15m+1H bias score vs threshold), Layer3 (15m HMA10/20
+        cross within cross_grace_bars; EMA5/10 shown alongside for
+        diagnostics — it drives the exit but no longer gates entry) —
+        instead of the ai_expert-only fields (macro/context/mtf) that
+        don't apply to this strategy."""
         sma_trend  = tc.get("sma_trend", "?")
         ema1020    = tc.get("ema10_20_trend", "?")
         slope      = tc.get("ema20_slope", "?")
@@ -573,7 +574,7 @@ class TradingBot:
             "position_open":            "holding",
             "no_trend":                 "n/a (Layer1 not confirmed)",
             "bias_fail":                "n/a (Layer2 bias fail)",
-            "waiting_cross":            "wait_dual_cross (Layer3)",
+            "waiting_cross":            "wait_hma_cross (Layer3)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3)",
             "entered":                  "entered",
         }

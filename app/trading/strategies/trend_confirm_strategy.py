@@ -26,18 +26,18 @@ Layer 2 — Bias filter (TF15m + TF1H):
   Layer 1 confirmed but Layer 2 disagreeing/weak = no trade.
 
 Layer 3 — Entry (TF15m):
-  EMA5/EMA10 cross AND HMA10/HMA20 cross must BOTH fire, in the
-  confirmed direction, within `cross_grace_bars` (default 2) bars of
-  each other — HMA tends to cross a bar or two before/after EMA on the
-  same swing, so whichever fires first still counts as long as the
-  other follows within the grace window (0 = same bar, up to
-  cross_grace_bars apart either order). Long only when Layer1+Layer2
-  both say "up"; short only when both say "down". Each side's cross
-  timestamp is consumed (reset to None) once it triggers an entry
-  attempt (pass or fail), so a stale old cross can't silently satisfy a
-  future setup.
+  HMA10/HMA20 cross in the confirmed direction, within
+  `cross_grace_bars` (default 2) bars of when it fired — lets a cross
+  that happened a bar or two before Layer1/Layer2 finished confirming
+  still count, instead of requiring the cross on the exact same bar
+  the rest of the pipeline lines up. Long only when Layer1+Layer2 both
+  say "up"; short only when both say "down". The cross timestamp is
+  consumed (reset to None) once it triggers an entry attempt (pass or
+  fail), so a stale old cross can't silently satisfy a future setup.
+  (EMA5/EMA10 is no longer part of the entry trigger — it's still
+  computed and used for the exit below.)
 
-  Chase-guard: even when the dual cross fires, price must be within
+  Chase-guard: even when the HMA cross fires, price must be within
   `max_dist_atr_mult` (default 1.5) x ATR(14, 15m) of Layer1's
   EMA20(30m) — the same trend reference Layer1 uses for its EMA10/20
   and slope checks. If price already ran too far from it, the setup
@@ -164,12 +164,11 @@ class TrendConfirmStrategy(BaseStrategy):
         trend = self._trend_state
 
         # ── Layer 3 cross tracking — runs on every new 15m bar REGARDLESS of
-        # Layer1/Layer2 gating below, so a cross that fires before the trend
-        # confirms (or while a position is open) is still remembered within
-        # the grace window once everything else lines up. HMA tends to cross
-        # a bar or two before/after EMA on the same swing — cross_grace_bars
-        # lets whichever one fires first count, as long as the other follows
-        # within that many bars, instead of requiring the exact same bar. ──
+        # Layer1/Layer2 gating below, so an HMA cross that fires before the
+        # trend confirms (or while a position is open) is still remembered
+        # within cross_grace_bars once everything else lines up. EMA5/10 is
+        # tracked too (still used for the exit and shown in logs), but it no
+        # longer gates entry. ──────────────────────────────────────────────
         bar_ts_15 = candles[-1].timestamp
         is_new_bar_15 = bar_ts_15 != self._last_bar_ts_15
         l3 = self._layer3_indicators(candles)
@@ -193,10 +192,10 @@ class TrendConfirmStrategy(BaseStrategy):
         hma_up_ago    = _bars_ago_15(self._last_hma_cross_up_ts)
         hma_down_ago  = _bars_ago_15(self._last_hma_cross_down_ts)
         gb = self.cross_grace_bars
-        dual_cross_up   = (ema_up_ago is not None and ema_up_ago <= gb and
-                           hma_up_ago is not None and hma_up_ago <= gb)
-        dual_cross_down = (ema_down_ago is not None and ema_down_ago <= gb and
-                           hma_down_ago is not None and hma_down_ago <= gb)
+        # Entry trigger is HMA10/20 cross alone — EMA5/10 is tracked purely
+        # for logging/exit, no longer required to fire alongside it.
+        dual_cross_up   = hma_up_ago is not None and hma_up_ago <= gb
+        dual_cross_down = hma_down_ago is not None and hma_down_ago <= gb
 
         # ── Layer 2: Bias filter (15m + 1H) ────────────────────────────────
         bias_pct, bias_label = self.compute_mtf_bias(candles, {"1h": mtf.get("1h", [])}, w3=0.0)
@@ -241,10 +240,9 @@ class TrendConfirmStrategy(BaseStrategy):
                 f"{self.bias_threshold if trend == 'up' else 100 - self.bias_threshold:.0f})",
                 metadata=dbg("bias_fail"))
 
-        # ── Layer 3: Entry (15m) — EMA5/10 AND HMA10/20 must BOTH have
-        # crossed in the confirmed direction within cross_grace_bars of
-        # each other (whichever fired first still counts), AND price must
-        # not have run more than max_dist_atr_mult x ATR(15m) away from
+        # ── Layer 3: Entry (15m) — HMA10/20 must have crossed in the
+        # confirmed direction within cross_grace_bars, AND price must not
+        # have run more than max_dist_atr_mult x ATR(15m) away from
         # Layer1's EMA20(30m) — a chase-guard: if the cross fires but price
         # already ran too far from the trend reference, skip this setup and
         # wait for a pullback + fresh cross instead of chasing. ────────────
@@ -256,7 +254,6 @@ class TrendConfirmStrategy(BaseStrategy):
 
         if trend == "up":
             if dual_cross_up and not dist_ok:
-                self._last_ema_cross_up_ts = None
                 self._last_hma_cross_up_ts = None
                 return self._hold(current_price,
                     f"Long setup FAILED: price {dist_disp}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
@@ -265,25 +262,23 @@ class TrendConfirmStrategy(BaseStrategy):
             if dual_cross_up:
                 sl, tp = self._compute_sl_tp("long", close_price, l3["atr_val"])
                 self._open_position = "long"
-                self._last_ema_cross_up_ts = None
                 self._last_hma_cross_up_ts = None
                 meta = dbg("entered")
                 meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
                 return Signal(
                     type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                     reason=f"Uptrend confirmed (Layer1 30m) + bias {bias_score:.0f} (Layer2) + "
-                           f"EMA5↑EMA10 & HMA10↑HMA20 crossed within {gb} bar(s) of each other, "
+                           f"HMA10↑HMA20 crossed {hma_up_ago} bar(s) ago, "
                            f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
                     confidence=1.0,
                     metadata=meta,
                 )
-            return self._hold(current_price, "Layer1+2 confirmed UP — waiting for EMA5/10 + HMA10/20 cross "
-                              f"(within {gb} bars of each other)",
+            return self._hold(current_price, "Layer1+2 confirmed UP — waiting for HMA10/20 cross "
+                              f"(within {gb} bars)",
                               metadata=dbg("waiting_cross"))
 
         # trend == "down"
         if dual_cross_down and not dist_ok:
-            self._last_ema_cross_down_ts = None
             self._last_hma_cross_down_ts = None
             return self._hold(current_price,
                 f"Short setup FAILED: price {dist_disp}xATR from EMA20 (max {self.max_dist_atr_mult}x) "
@@ -292,20 +287,19 @@ class TrendConfirmStrategy(BaseStrategy):
         if dual_cross_down:
             sl, tp = self._compute_sl_tp("short", close_price, l3["atr_val"])
             self._open_position = "short"
-            self._last_ema_cross_down_ts = None
             self._last_hma_cross_down_ts = None
             meta = dbg("entered")
             meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
                 reason=f"Downtrend confirmed (Layer1 30m) + bias {bias_score:.0f} (Layer2) + "
-                       f"EMA5↓EMA10 & HMA10↓HMA20 crossed within {gb} bar(s) of each other, "
+                       f"HMA10↓HMA20 crossed {hma_down_ago} bar(s) ago, "
                        f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
                 confidence=1.0,
                 metadata=meta,
             )
-        return self._hold(current_price, "Layer1+2 confirmed DOWN — waiting for EMA5/10 + HMA10/20 cross "
-                          f"(within {gb} bars of each other)",
+        return self._hold(current_price, "Layer1+2 confirmed DOWN — waiting for HMA10/20 cross "
+                          f"(within {gb} bars)",
                           metadata=dbg("waiting_cross"))
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
