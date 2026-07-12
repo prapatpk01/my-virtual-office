@@ -24,13 +24,23 @@ Layer 2 — Bias + momentum filter (TF15m + TF1H):
     uptrend   needs bias_score > bias_threshold        (default 60)
     downtrend needs bias_score < 100 - bias_threshold  (default 40)
 
-  Momentum gates, all on 15m, all must pass alongside the bias score:
+  Momentum gates — ADX/Choppiness/Volume are each computed on BOTH 15m
+  AND 1H and must pass on both timeframes (not just one):
     ADX(14)        > adx_threshold (default 20)   — trend has real strength
     Choppiness(14) < chop_threshold (default 61.8) — market isn't ranging/chop
     Volume ratio   > volume_expansion_mult (default 1.0x recent SMA20 volume)
                                                     — the move has real participation
-  Any one of bias/ADX/chop/volume failing = no trade, regardless of
-  Layer 1.
+
+  Liquidity sweep (15m, opposite-side): before an entry is allowed, one
+  of the last `sweep_recency` (default 5) 15m bars must have swept the
+  prior `sweep_lookback`-bar (default 20) swing extreme on the STOP-HUNT
+  side and closed back inside it — long needs a swept swing LOW
+  (wick below the recent low, close back above it — sell-side stops
+  grabbed before the real move up); short needs a swept swing HIGH
+  (mirror). No sweep = no trade.
+
+  Any one of bias/ADX(15m or 1H)/chop(15m or 1H)/volume(15m or
+  1H)/liquidity-sweep failing = no trade, regardless of Layer 1.
 
 Layer 3 — Entry (TF15m):
   HMA10/HMA20 cross in the confirmed direction. Normally the cross must
@@ -114,6 +124,8 @@ class TrendConfirmStrategy(BaseStrategy):
         chop_threshold: float = 61.8,
         volume_sma_period: int = 20,
         volume_expansion_mult: float = 1.0,
+        sweep_lookback: int = 20,
+        sweep_recency: int = 5,
         # Layer 3 — entry (15m)
         ema_fast: int = 5,
         ema_slow: int = 10,
@@ -144,6 +156,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self.chop_threshold = chop_threshold
         self.volume_sma_period = volume_sma_period
         self.volume_expansion_mult = volume_expansion_mult
+        self.sweep_lookback = sweep_lookback
+        self.sweep_recency = sweep_recency
 
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
@@ -237,9 +251,13 @@ class TrendConfirmStrategy(BaseStrategy):
         dual_cross_down = hma_down_ago is not None and hma_down_ago <= lookback
 
         # ── Layer 2: Bias/momentum filter (15m + 1H) ───────────────────────
-        bias_pct, bias_label = self.compute_mtf_bias(candles, {"1h": mtf.get("1h", [])}, w3=0.0)
+        c1h = mtf.get("1h", [])
+        bias_pct, bias_label = self.compute_mtf_bias(candles, {"1h": c1h}, w3=0.0)
         bias_score = 50.0 + bias_pct / 2.0
-        l2 = self._layer2_indicators(candles)
+        l2_15m = self._layer2_indicators(candles)
+        l2_1h = self._layer2_indicators(c1h)
+        sweep_up = self._liquidity_sweep(candles, "up")
+        sweep_down = self._liquidity_sweep(candles, "down")
 
         close_price = candles[-1].close
         dist_atr = (abs(close_price - l1["ema20_val"]) / l3["atr_val"]
@@ -251,11 +269,16 @@ class TrendConfirmStrategy(BaseStrategy):
                 "ema20_slope": l1["slope_dir"], "macd_trend": l1["macd_dir"],
                 "confirmed": trend,
                 "bias_score": round(bias_score, 1), "bias_threshold": self.bias_threshold,
-                "adx": round(l2["adx"], 1) if l2 else None, "adx_threshold": self.adx_threshold,
-                "chop": round(l2["chop"], 1) if l2 and l2["chop"] is not None else None,
+                "adx_15m": round(l2_15m["adx"], 1) if l2_15m else None,
+                "adx_1h": round(l2_1h["adx"], 1) if l2_1h else None,
+                "adx_threshold": self.adx_threshold,
+                "chop_15m": round(l2_15m["chop"], 1) if l2_15m else None,
+                "chop_1h": round(l2_1h["chop"], 1) if l2_1h else None,
                 "chop_threshold": self.chop_threshold,
-                "vol_ratio": round(l2["vol_ratio"], 2) if l2 else None,
+                "vol_ratio_15m": round(l2_15m["vol_ratio"], 2) if l2_15m else None,
+                "vol_ratio_1h": round(l2_1h["vol_ratio"], 2) if l2_1h else None,
                 "vol_expansion_mult": self.volume_expansion_mult,
+                "sweep_up": sweep_up, "sweep_down": sweep_down,
                 "open_position": self._open_position,
                 "entry_status": entry_status,
                 "fresh_trend_bars": fb, "trend_age_bars": trend_age, "is_fresh_trend": is_fresh_trend,
@@ -285,21 +308,32 @@ class TrendConfirmStrategy(BaseStrategy):
                 f"{self.bias_threshold if trend == 'up' else 100 - self.bias_threshold:.0f})",
                 metadata=dbg("bias_fail"))
 
-        if l2 is None:
-            return self._hold(current_price, "Layer2: ADX/chop/volume indicators still warming up (15m)",
+        if l2_15m is None or l2_1h is None:
+            return self._hold(current_price, "Layer2: ADX/chop/volume indicators still warming up (15m/1H)",
                               metadata=dbg("no_trend"))
-        if not l2["adx_pass"]:
+        if not (l2_15m["adx_pass"] and l2_1h["adx_pass"]):
             return self._hold(current_price,
-                f"Layer2: ADX {l2['adx']:.1f} below {self.adx_threshold:.0f} — trend too weak",
+                f"Layer2: ADX 15m={l2_15m['adx']:.1f} 1H={l2_1h['adx']:.1f} below {self.adx_threshold:.0f} "
+                f"on at least one TF — trend too weak",
                 metadata=dbg("momentum_fail"))
-        if not l2["chop_pass"]:
+        if not (l2_15m["chop_pass"] and l2_1h["chop_pass"]):
             return self._hold(current_price,
-                f"Layer2: Choppiness {l2['chop']:.1f} above {self.chop_threshold:.1f} — market too choppy/ranging",
+                f"Layer2: Choppiness 15m={l2_15m['chop']:.1f} 1H={l2_1h['chop']:.1f} above {self.chop_threshold:.1f} "
+                f"on at least one TF — market too choppy/ranging",
                 metadata=dbg("momentum_fail"))
-        if not l2["vol_pass"]:
+        if not (l2_15m["vol_pass"] and l2_1h["vol_pass"]):
             return self._hold(current_price,
-                f"Layer2: volume {l2['vol_ratio']:.2f}x avg below {self.volume_expansion_mult:.2f}x — no volume expansion",
+                f"Layer2: volume 15m={l2_15m['vol_ratio']:.2f}x 1H={l2_1h['vol_ratio']:.2f}x below "
+                f"{self.volume_expansion_mult:.2f}x on at least one TF — no volume expansion",
                 metadata=dbg("momentum_fail"))
+
+        sweep_pass = sweep_up if trend == "up" else sweep_down
+        if not sweep_pass:
+            swept_what = "swing LOW" if trend == "up" else "swing HIGH"
+            return self._hold(current_price,
+                f"Layer2: no liquidity sweep of the recent {swept_what} in the last "
+                f"{self.sweep_recency} bars — no stop-hunt/reclaim confirming real participation",
+                metadata=dbg("sweep_fail"))
 
         # ── Layer 3: Entry (15m) — HMA10/20 must have crossed in the
         # confirmed direction (fresh cross now, or within fresh_trend_bars
@@ -329,8 +363,8 @@ class TrendConfirmStrategy(BaseStrategy):
                 meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
                 return Signal(
                     type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
-                    reason=f"Uptrend confirmed (Layer1 30m) + bias {bias_score:.0f}/ADX {l2['adx']:.0f}/"
-                           f"chop {l2['chop']:.0f}/vol {l2['vol_ratio']:.2f}x (Layer2) + "
+                    reason=f"Uptrend confirmed (Layer1 30m) + bias {bias_score:.0f}/ADX 15m={l2_15m['adx']:.0f} "
+                           f"1H={l2_1h['adx']:.0f}/sweep-low ok (Layer2) + "
                            f"HMA10↑HMA20 crossed {hma_up_ago} bar(s) ago, "
                            f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
                     confidence=1.0,
@@ -355,8 +389,8 @@ class TrendConfirmStrategy(BaseStrategy):
             meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
-                reason=f"Downtrend confirmed (Layer1 30m) + bias {bias_score:.0f}/ADX {l2['adx']:.0f}/"
-                       f"chop {l2['chop']:.0f}/vol {l2['vol_ratio']:.2f}x (Layer2) + "
+                reason=f"Downtrend confirmed (Layer1 30m) + bias {bias_score:.0f}/ADX 15m={l2_15m['adx']:.0f} "
+                       f"1H={l2_1h['adx']:.0f}/sweep-high ok (Layer2) + "
                        f"HMA10↓HMA20 crossed {hma_down_ago} bar(s) ago, "
                        f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
                 confidence=1.0,
@@ -469,10 +503,13 @@ class TrendConfirmStrategy(BaseStrategy):
         }
 
     def _layer2_indicators(self, candles: list) -> Optional[dict]:
-        """Momentum/bias context on top of the bias score: ADX (trend
-        strength), Choppiness Index (trending vs ranging), and a
-        volume-expansion ratio (current bar vs its recent average) — all
-        computed on the 15m candles passed into analyze()."""
+        """Momentum context on top of the bias score: ADX (trend strength),
+        Choppiness Index (trending vs ranging), and a volume-expansion
+        ratio (current bar vs its recent average). Called on both the 15m
+        candles and the 1H candles from mtf_candles — both must pass."""
+        min_needed = max(2 * self.adx_period + 2, self.chop_period + 1, self.volume_sma_period)
+        if len(candles) < min_needed:
+            return None
         adx_arr, _plus_di, _minus_di = self.adx(candles, self.adx_period)
         if np.isnan(adx_arr[-1]):
             return None
@@ -514,6 +551,31 @@ class TrendConfirmStrategy(BaseStrategy):
         if rng <= 0 or atr_sum <= 0:
             return None
         return 100.0 * math.log10(atr_sum / rng) / math.log10(period)
+
+    def _liquidity_sweep(self, candles: list, trend: str) -> bool:
+        """True if, within the last `sweep_recency` 15m bars, one bar wicked
+        beyond the `sweep_lookback`-bar swing extreme on the stop-hunt side
+        and closed back inside it — a liquidity sweep + reclaim.
+        trend="up"   -> looks for a swept swing LOW  (sell-side stops grabbed
+                        below the recent low, then price closed back above it)
+        trend="down" -> looks for a swept swing HIGH (mirror)."""
+        lb, rec = self.sweep_lookback, self.sweep_recency
+        if len(candles) < lb + rec + 1:
+            return False
+        for i in range(len(candles) - rec, len(candles)):
+            window = candles[i - lb:i]  # the lb bars strictly before candidate bar i
+            if len(window) < lb:
+                continue
+            bar = candles[i]
+            if trend == "up":
+                swing_low = min(c.low for c in window)
+                if bar.low < swing_low and bar.close > swing_low:
+                    return True
+            else:
+                swing_high = max(c.high for c in window)
+                if bar.high > swing_high and bar.close < swing_high:
+                    return True
+        return False
 
     def _layer3_indicators(self, candles: list) -> Optional[dict]:
         closes = [c.close for c in candles]
