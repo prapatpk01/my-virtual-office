@@ -294,10 +294,25 @@ class TrendConfirmStrategy(BaseStrategy):
                               metadata=dbg("no_trend"))
 
         if l2_score <= l2_thr:
-            early_note = " [early-trend, stricter gate]" if is_early_trend else ""
+            score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
+                          f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
+            # Early-trend fail is DEFINITIVE: an HMA cross led the confirm and
+            # the stricter gate rejected it — spend that cross so the same
+            # setup can't retry on a later bar. A fresh cross is required for
+            # another attempt. (An established-trend fail with no valid pending
+            # cross is just "waiting", so nothing to consume there.)
+            pending_cross = (trend == "up" and hma_cross_up) or (trend == "down" and hma_cross_down)
+            if is_early_trend and pending_cross:
+                if trend == "up":
+                    self._last_hma_cross_up_ts = None
+                else:
+                    self._last_hma_cross_down_ts = None
+                return self._hold(current_price,
+                    f"Layer2 FAIL (early trend): quality {l2_score:.0f} <= {l2_thr:.0f} — "
+                    f"early setup rejected, cross spent {score_note}",
+                    metadata=dbg("early_quality_fail"))
             return self._hold(current_price,
-                f"Layer2: trend quality {l2_score:.0f} <= {l2_thr:.0f}{early_note} "
-                f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + 1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})",
+                f"Layer2: trend quality {l2_score:.0f} <= {l2_thr:.0f} {score_note}",
                 metadata=dbg("quality_fail"))
 
         # ── Layer 3: Entry (15m), always with the confirmed trend ──────────
