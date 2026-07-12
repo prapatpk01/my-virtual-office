@@ -115,6 +115,9 @@ class TrendConfirmStrategy(BaseStrategy):
         dist_ema_ref: int = 20,     # distance-to-trend chase-guard is measured vs this EMA
         fresh_trend_bars: int = 3,
         max_dist_atr_mult: float = 1.5,
+        # Exit
+        exit_on_hma20_open: bool = True,   # close on a single bar opening past HMA20 (fast but twitchy)
+        exit_hma20_confirm_bars: int = 1,   # N consecutive closes past HMA20 required (1 = the plain open check)
         # Risk
         atr_period: int = 14,
         sl_atr_mult: float = 1.5,
@@ -152,6 +155,9 @@ class TrendConfirmStrategy(BaseStrategy):
         self.dist_ema_ref = dist_ema_ref
         self.fresh_trend_bars = fresh_trend_bars
         self.max_dist_atr_mult = max_dist_atr_mult
+
+        self.exit_on_hma20_open = exit_on_hma20_open
+        self.exit_hma20_confirm_bars = exit_hma20_confirm_bars
 
         self.atr_period = atr_period
         self.sl_atr_mult = sl_atr_mult
@@ -337,11 +343,13 @@ class TrendConfirmStrategy(BaseStrategy):
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
         """Exit = OR logic, whichever fires first, evaluated once per
-        newly-formed 15m bar: HMA10/20 cross-back, OR the candle opens on
-        the wrong side of HMA20 (a faster warning than waiting for the
-        cross itself — the open can flip against the position while HMA10
-        hasn't crossed back yet). Hedge-mode-safe: always closes whichever
-        position is actually open, never relies on signal.type semantics."""
+        newly-formed 15m bar: HMA10/20 cross-back (a genuine trend
+        reversal), OR — only when `exit_on_hma20_open` is set —
+        `exit_hma20_confirm_bars` consecutive closes on the wrong side of
+        HMA20 (a faster warning than a full cross, but the confirmation
+        window guards against a single whipsaw bar closing the trade
+        prematurely). Hedge-mode-safe: always closes whichever position is
+        actually open, never relies on signal.type semantics."""
         if self._open_position is None or not self._latest_candles:
             return None
 
@@ -357,16 +365,37 @@ class TrendConfirmStrategy(BaseStrategy):
             return PositionUpdate(action="hold", reason="Indicators warming up (15m)")
         self._last_exit_bar_ts = bar_ts
 
-        if self._open_position == "long" and (l3["hma_cross_down"] or l3["open_below_hma20"]):
-            reason = "HMA10 crossed below HMA20" if l3["hma_cross_down"] else "candle opened below HMA20"
-            self._open_position = None
-            return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} (15m)")
-        if self._open_position == "short" and (l3["hma_cross_up"] or l3["open_above_hma20"]):
-            reason = "HMA10 crossed above HMA20" if l3["hma_cross_up"] else "candle opened above HMA20"
-            self._open_position = None
-            return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} (15m)")
+        cb = self.exit_hma20_confirm_bars
+        if self._open_position == "long":
+            hma20_exit = self.exit_on_hma20_open and self._closes_past_hma20(candles, "long", cb)
+            if l3["hma_cross_down"] or hma20_exit:
+                reason = "HMA10 crossed below HMA20" if l3["hma_cross_down"] else f"{cb} close(s) below HMA20"
+                self._open_position = None
+                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} (15m)")
+        if self._open_position == "short":
+            hma20_exit = self.exit_on_hma20_open and self._closes_past_hma20(candles, "short", cb)
+            if l3["hma_cross_up"] or hma20_exit:
+                reason = "HMA10 crossed above HMA20" if l3["hma_cross_up"] else f"{cb} close(s) above HMA20"
+                self._open_position = None
+                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} (15m)")
 
         return PositionUpdate(action="hold", reason=f"Holding {self._open_position.upper()}")
+
+    def _closes_past_hma20(self, candles: list, side: str, n: int) -> bool:
+        """True if the last `n` bars ALL closed on the wrong side of HMA20
+        for the given position side (long: below, short: above)."""
+        closes = [c.close for c in candles]
+        hma_s = self.hma(closes, self.hma_slow)
+        if len(closes) < n:
+            return False
+        for k in range(1, n + 1):
+            if np.isnan(hma_s[-k]):
+                return False
+            if side == "long" and not (closes[-k] < hma_s[-k]):
+                return False
+            if side == "short" and not (closes[-k] > hma_s[-k]):
+                return False
+        return True
 
     def record_closed_trade(self, exit_price: float, exit_reason: str, duration_min: float = 0.0) -> None:
         """Called by bot.py after ANY close, including the risk-manager's
