@@ -34,11 +34,11 @@ Layer 2 — Trend quality: dynamic weighted score (TF15m + TF1H):
 
 Layer 3 — Entry (TF15m), always WITH Layer 1's confirmed trend:
   LONG (only after Layer1+Layer2 confirm UP):
-    1. HMA10 crosses above HMA20
+    1. HMA10 crosses above HMA16
     2. price (close) is above EMA10
     3. price is within `max_dist_atr_mult` (default 1.5) x ATR(14) of EMA20
   SHORT (only after Layer1+Layer2 confirm DOWN): the mirror —
-    1. HMA10 crosses below HMA20
+    1. HMA10 crosses below HMA16
     2. price below EMA10
     3. price within 1.5 x ATR of EMA20
   Early-trend window: HMA is faster than Layer 1's 30m confirmation, so
@@ -60,7 +60,7 @@ Exit — a 2-TP + break-even scheme managed in tick_open_position():
     1.25R final TP), take `tp1_close_pct` (50%) off and move SL to
     break-even + `be_offset_r` (BE + 0.1R — a small locked profit on the
     runner). Checked every tick, fires once.
-  Runner (remaining 50%): rides on until the HMA10/20 cross-back (a
+  Runner (remaining 50%): rides on until the HMA10/16 cross-back (a
     genuine trend reversal — the primary trend-following exit), the hard
     final TP (1.25R), or the trailed SL (BE+0.1R). An optional faster
     exit (`exit_on_hma20_open`, OFF by default) closes on
@@ -129,7 +129,7 @@ class TrendConfirmStrategy(BaseStrategy):
         layer2_threshold_early: float = 75.0,  # stricter quality gate for early-trend entries (HMA led the confirm)
         # Layer 3 — entry (15m)
         hma_fast: int = 10,
-        hma_slow: int = 20,
+        hma_slow: int = 16,
         entry_ema_ref: int = 10,    # price must be above (long) / below (short) this EMA
         dist_ema_ref: int = 20,     # distance-to-trend chase-guard is measured vs this EMA
         fresh_trend_bars: int = 2,  # HMA-cross lookback when the trend just confirmed (early trend)
@@ -350,7 +350,7 @@ class TrendConfirmStrategy(BaseStrategy):
 
         if trend == "up":
             if not hma_cross_up:
-                return self._hold(current_price, "Layer1+2 confirmed UP — waiting for HMA10↑HMA20 cross"
+                return self._hold(current_price, f"Layer1+2 confirmed UP — waiting for HMA{self.hma_fast}↑HMA{self.hma_slow} cross"
                                   + (f" (early trend, within {fb} bars)" if is_early_trend else " (fresh cross only)"),
                                   metadata=dbg("waiting_cross"))
             # cross fired — consume it, then validate the two entry conditions
@@ -373,7 +373,7 @@ class TrendConfirmStrategy(BaseStrategy):
                 type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                 reason=f"Uptrend confirmed (Layer1 30m) + quality {l2_score:.0f}"
                        f"{' [early]' if is_early_trend else ''} >{l2_thr:.0f} (Layer2) + "
-                       f"HMA10↑HMA20 {hma_up_ago}b ago, above EMA{self.entry_ema_ref}, "
+                       f"HMA{self.hma_fast}↑HMA{self.hma_slow} {hma_up_ago}b ago, above EMA{self.entry_ema_ref}, "
                        f"{dist_atr:.2f}xATR from EMA{self.dist_ema_ref} (Layer3)",
                 confidence=1.0,
                 metadata=meta,
@@ -381,7 +381,7 @@ class TrendConfirmStrategy(BaseStrategy):
 
         # trend == "down"
         if not hma_cross_down:
-            return self._hold(current_price, "Layer1+2 confirmed DOWN — waiting for HMA10↓HMA20 cross"
+            return self._hold(current_price, f"Layer1+2 confirmed DOWN — waiting for HMA{self.hma_fast}↓HMA{self.hma_slow} cross"
                               + (f" (early trend, within {fb} bars)" if is_early_trend else " (fresh cross only)"),
                               metadata=dbg("waiting_cross"))
         self._last_hma_cross_down_ts = None
@@ -403,7 +403,7 @@ class TrendConfirmStrategy(BaseStrategy):
             type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
             reason=f"Downtrend confirmed (Layer1 30m) + quality {l2_score:.0f}"
                    f"{' [early]' if is_early_trend else ''} >{l2_thr:.0f} (Layer2) + "
-                   f"HMA10↓HMA20 {hma_down_ago}b ago, below EMA{self.entry_ema_ref}, "
+                   f"HMA{self.hma_fast}↓HMA{self.hma_slow} {hma_down_ago}b ago, below EMA{self.entry_ema_ref}, "
                    f"{dist_atr:.2f}xATR from EMA{self.dist_ema_ref} (Layer3)",
             confidence=1.0,
             metadata=meta,
@@ -461,13 +461,15 @@ class TrendConfirmStrategy(BaseStrategy):
         if self._open_position == "long":
             hma20_exit = self.exit_on_hma20_open and self._closes_past_hma20(candles, "long", cb)
             if l3["hma_cross_down"] or hma20_exit:
-                reason = "HMA10 crossed below HMA20" if l3["hma_cross_down"] else f"{cb} close(s) below HMA20"
+                reason = (f"HMA{self.hma_fast} crossed below HMA{self.hma_slow}" if l3["hma_cross_down"]
+                          else f"{cb} close(s) below HMA{self.hma_slow}")
                 self._reset_position_state()
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} (15m)")
         if self._open_position == "short":
             hma20_exit = self.exit_on_hma20_open and self._closes_past_hma20(candles, "short", cb)
             if l3["hma_cross_up"] or hma20_exit:
-                reason = "HMA10 crossed above HMA20" if l3["hma_cross_up"] else f"{cb} close(s) above HMA20"
+                reason = (f"HMA{self.hma_fast} crossed above HMA{self.hma_slow}" if l3["hma_cross_up"]
+                          else f"{cb} close(s) above HMA{self.hma_slow}")
                 self._reset_position_state()
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} (15m)")
 
