@@ -15,32 +15,35 @@ Layer 1 — Trend confirmation (TF30m):
   logging/gating — a confirmed trend does not expire on its own; it just
   gets re-evaluated fresh every 30m bar.
 
-Layer 2 — Bias + momentum filter (TF15m + TF1H):
-  Bias score: BaseStrategy.compute_mtf_bias() (same formula ai_expert
-  uses: per-TF score from close>EMA20 / EMA20>EMA50 / RSI lean, weighted
-  15m x1 + 1H x2 — 4H excluded here via w3=0) is converted from its
-  native -100..+100 scale to 0-100 (50 = neutral) via `50 + pct/2`. Must
-  AGREE with and exceed Layer 1's confirmed direction:
-    uptrend   needs bias_score > bias_threshold        (default 60)
-    downtrend needs bias_score < 100 - bias_threshold  (default 40)
+Layer 2 — Bias + momentum: dynamic weighted score (TF15m + TF1H):
+  Replaces a stack of hard AND-gates with ai_expert's ConfidenceEngine
+  pattern — every sub-check contributes POINTS toward one 0-100 score,
+  so a weak reading on one component can be outweighed by strong
+  readings elsewhere instead of vetoing the trade outright. Must score
+  > `momentum_score_threshold` (default 45) to pass, computed in
+  _layer2_score():
+    Bias      30 pts — BaseStrategy.compute_mtf_bias() (same formula
+              ai_expert uses: close>EMA20/EMA20>EMA50/RSI lean, weighted
+              15m x1 + 1H x2, 4H excluded via w3=0), direction-aligned
+              and rescaled so the OLD hard threshold (bias_threshold,
+              default 60) is now where this component earns full credit.
+    ADX       20 pts — trend strength, 15m/1H weighted 1x/2x, full
+              credit at 2x adx_threshold (default 20).
+    Chop      20 pts — inverted Choppiness Index (low chop = high
+              score), 15m/1H weighted 1x/2x, full credit at
+              100-chop_threshold (default 61.8) points of "not choppy".
+    Volume    15 pts — volume/SMA20(volume) ratio, 15m/1H weighted
+              1x/2x, full credit at 2x volume_expansion_mult (default 1.0).
+    Sweep     15 pts — flat bonus if a liquidity sweep fired (see below),
+              0 otherwise. Not a hard requirement any more.
 
-  Momentum gates — ADX/Choppiness/Volume are each computed on BOTH 15m
-  AND 1H and must pass on both timeframes (not just one):
-    ADX(14)        > adx_threshold (default 20)   — trend has real strength
-    Choppiness(14) < chop_threshold (default 61.8) — market isn't ranging/chop
-    Volume ratio   > volume_expansion_mult (default 1.0x recent SMA20 volume)
-                                                    — the move has real participation
-
-  Liquidity sweep (15m, opposite-side): before an entry is allowed, one
-  of the last `sweep_recency` (default 5) 15m bars must have swept the
-  prior `sweep_lookback`-bar (default 20) swing extreme on the STOP-HUNT
-  side and closed back inside it — long needs a swept swing LOW
-  (wick below the recent low, close back above it — sell-side stops
-  grabbed before the real move up); short needs a swept swing HIGH
-  (mirror). No sweep = no trade.
-
-  Any one of bias/ADX(15m or 1H)/chop(15m or 1H)/volume(15m or
-  1H)/liquidity-sweep failing = no trade, regardless of Layer 1.
+  Liquidity sweep (15m, opposite-side, feeds the Sweep points above):
+  one of the last `sweep_recency` (default 5) 15m bars must have swept
+  the prior `sweep_lookback`-bar (default 20) swing extreme on the
+  STOP-HUNT side and closed back inside it — long looks for a swept
+  swing LOW (wick below the recent low, close back above it — sell-side
+  stops grabbed before the real move up); short looks for a swept swing
+  HIGH (mirror).
 
 Layer 3 — Entry (TF15m):
   HMA10/HMA20 cross in the confirmed direction. Normally the cross must
@@ -126,6 +129,7 @@ class TrendConfirmStrategy(BaseStrategy):
         volume_expansion_mult: float = 1.0,
         sweep_lookback: int = 20,
         sweep_recency: int = 5,
+        momentum_score_threshold: float = 45.0,
         # Layer 3 — entry (15m)
         ema_fast: int = 5,
         ema_slow: int = 10,
@@ -158,6 +162,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.volume_expansion_mult = volume_expansion_mult
         self.sweep_lookback = sweep_lookback
         self.sweep_recency = sweep_recency
+        self.momentum_score_threshold = momentum_score_threshold
 
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
@@ -250,7 +255,12 @@ class TrendConfirmStrategy(BaseStrategy):
         dual_cross_up   = hma_up_ago is not None and hma_up_ago <= lookback
         dual_cross_down = hma_down_ago is not None and hma_down_ago <= lookback
 
-        # ── Layer 2: Bias/momentum filter (15m + 1H) ───────────────────────
+        # ── Layer 2: Bias/momentum — dynamic weighted score (ai_expert's
+        # ConfidenceEngine pattern) instead of a stack of hard AND-gates.
+        # Every sub-check contributes points toward a single 0-100 score;
+        # a weak reading on one component can still be outweighed by
+        # strong readings elsewhere, instead of vetoing the trade outright
+        # the way a hard boolean gate would. ────────────────────────────
         c1h = mtf.get("1h", [])
         bias_pct, bias_label = self.compute_mtf_bias(candles, {"1h": c1h}, w3=0.0)
         bias_score = 50.0 + bias_pct / 2.0
@@ -263,22 +273,27 @@ class TrendConfirmStrategy(BaseStrategy):
         dist_atr = (abs(close_price - l1["ema20_val"]) / l3["atr_val"]
                    if (l3 is not None and l3["atr_val"] > 0) else None)
 
+        l2s = None
+        if trend is not None:
+            l2s = self._layer2_score(trend, bias_score, l2_15m, l2_1h,
+                                     sweep_up if trend == "up" else sweep_down)
+
         def dbg(entry_status: str) -> dict:
             return {"trend_confirm": {
                 "sma_trend": l1["sma_dir"], "ema10_20_trend": l1["ema1020_dir"],
                 "ema20_slope": l1["slope_dir"], "macd_trend": l1["macd_dir"],
                 "confirmed": trend,
-                "bias_score": round(bias_score, 1), "bias_threshold": self.bias_threshold,
+                "bias_score": round(bias_score, 1),
                 "adx_15m": round(l2_15m["adx"], 1) if l2_15m else None,
                 "adx_1h": round(l2_1h["adx"], 1) if l2_1h else None,
-                "adx_threshold": self.adx_threshold,
                 "chop_15m": round(l2_15m["chop"], 1) if l2_15m else None,
                 "chop_1h": round(l2_1h["chop"], 1) if l2_1h else None,
-                "chop_threshold": self.chop_threshold,
                 "vol_ratio_15m": round(l2_15m["vol_ratio"], 2) if l2_15m else None,
                 "vol_ratio_1h": round(l2_1h["vol_ratio"], 2) if l2_1h else None,
-                "vol_expansion_mult": self.volume_expansion_mult,
                 "sweep_up": sweep_up, "sweep_down": sweep_down,
+                "momentum_score": l2s["score"] if l2s else None,
+                "momentum_score_threshold": self.momentum_score_threshold,
+                "momentum_breakdown": l2s["breakdown"] if l2s else None,
                 "open_position": self._open_position,
                 "entry_status": entry_status,
                 "fresh_trend_bars": fb, "trend_age_bars": trend_age, "is_fresh_trend": is_fresh_trend,
@@ -297,43 +312,17 @@ class TrendConfirmStrategy(BaseStrategy):
                 "Layer1: SMA30/EMA10-20/EMA20 slope/MACD not confirmed or conflicting",
                 metadata=dbg("no_trend"))
 
-        bias_pass = (
-            (trend == "up" and bias_score > self.bias_threshold) or
-            (trend == "down" and bias_score < (100.0 - self.bias_threshold))
-        )
-        if not bias_pass:
-            return self._hold(current_price,
-                f"Layer2: bias score {bias_score:.0f} doesn't confirm {trend} "
-                f"(need {'>' if trend == 'up' else '<'}"
-                f"{self.bias_threshold if trend == 'up' else 100 - self.bias_threshold:.0f})",
-                metadata=dbg("bias_fail"))
-
         if l2_15m is None or l2_1h is None:
             return self._hold(current_price, "Layer2: ADX/chop/volume indicators still warming up (15m/1H)",
                               metadata=dbg("no_trend"))
-        if not (l2_15m["adx_pass"] and l2_1h["adx_pass"]):
-            return self._hold(current_price,
-                f"Layer2: ADX 15m={l2_15m['adx']:.1f} 1H={l2_1h['adx']:.1f} below {self.adx_threshold:.0f} "
-                f"on at least one TF — trend too weak",
-                metadata=dbg("momentum_fail"))
-        if not (l2_15m["chop_pass"] and l2_1h["chop_pass"]):
-            return self._hold(current_price,
-                f"Layer2: Choppiness 15m={l2_15m['chop']:.1f} 1H={l2_1h['chop']:.1f} above {self.chop_threshold:.1f} "
-                f"on at least one TF — market too choppy/ranging",
-                metadata=dbg("momentum_fail"))
-        if not (l2_15m["vol_pass"] and l2_1h["vol_pass"]):
-            return self._hold(current_price,
-                f"Layer2: volume 15m={l2_15m['vol_ratio']:.2f}x 1H={l2_1h['vol_ratio']:.2f}x below "
-                f"{self.volume_expansion_mult:.2f}x on at least one TF — no volume expansion",
-                metadata=dbg("momentum_fail"))
 
-        sweep_pass = sweep_up if trend == "up" else sweep_down
-        if not sweep_pass:
-            swept_what = "swing LOW" if trend == "up" else "swing HIGH"
+        if l2s["score"] <= self.momentum_score_threshold:
+            b = l2s["breakdown"]
             return self._hold(current_price,
-                f"Layer2: no liquidity sweep of the recent {swept_what} in the last "
-                f"{self.sweep_recency} bars — no stop-hunt/reclaim confirming real participation",
-                metadata=dbg("sweep_fail"))
+                f"Layer2: momentum score {l2s['score']:.0f} <= {self.momentum_score_threshold:.0f} "
+                f"(bias {b['bias']:.0f} + adx {b['adx']:.0f} + chop {b['chop']:.0f} + "
+                f"vol {b['volume']:.0f} + sweep {b['sweep']:.0f})",
+                metadata=dbg("momentum_fail"))
 
         # ── Layer 3: Entry (15m) — HMA10/20 must have crossed in the
         # confirmed direction (fresh cross now, or within fresh_trend_bars
@@ -363,8 +352,8 @@ class TrendConfirmStrategy(BaseStrategy):
                 meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
                 return Signal(
                     type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
-                    reason=f"Uptrend confirmed (Layer1 30m) + bias {bias_score:.0f}/ADX 15m={l2_15m['adx']:.0f} "
-                           f"1H={l2_1h['adx']:.0f}/sweep-low ok (Layer2) + "
+                    reason=f"Uptrend confirmed (Layer1 30m) + momentum score {l2s['score']:.0f} "
+                           f"(bias {bias_score:.0f}) (Layer2) + "
                            f"HMA10↑HMA20 crossed {hma_up_ago} bar(s) ago, "
                            f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
                     confidence=1.0,
@@ -389,8 +378,8 @@ class TrendConfirmStrategy(BaseStrategy):
             meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
             return Signal(
                 type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
-                reason=f"Downtrend confirmed (Layer1 30m) + bias {bias_score:.0f}/ADX 15m={l2_15m['adx']:.0f} "
-                       f"1H={l2_1h['adx']:.0f}/sweep-high ok (Layer2) + "
+                reason=f"Downtrend confirmed (Layer1 30m) + momentum score {l2s['score']:.0f} "
+                       f"(bias {bias_score:.0f}) (Layer2) + "
                        f"HMA10↓HMA20 crossed {hma_down_ago} bar(s) ago, "
                        f"{dist_atr:.2f}xATR from EMA20 (Layer3)",
                 confidence=1.0,
@@ -503,10 +492,12 @@ class TrendConfirmStrategy(BaseStrategy):
         }
 
     def _layer2_indicators(self, candles: list) -> Optional[dict]:
-        """Momentum context on top of the bias score: ADX (trend strength),
-        Choppiness Index (trending vs ranging), and a volume-expansion
-        ratio (current bar vs its recent average). Called on both the 15m
-        candles and the 1H candles from mtf_candles — both must pass."""
+        """Raw momentum readings feeding _layer2_score(): ADX (trend
+        strength), Choppiness Index (trending vs ranging), and a
+        volume-expansion ratio (current bar vs its recent average). Called
+        on both the 15m candles and the 1H candles from mtf_candles — both
+        feed into the weighted score, weighted 1H higher (see
+        _layer2_score)."""
         min_needed = max(2 * self.adx_period + 2, self.chop_period + 1, self.volume_sma_period)
         if len(candles) < min_needed:
             return None
@@ -525,11 +516,44 @@ class TrendConfirmStrategy(BaseStrategy):
             return None
         vol_ratio = float(candles[-1].volume) / float(vol_sma[-1])
 
-        return {
-            "adx": adx_val, "adx_pass": adx_val > self.adx_threshold,
-            "chop": chop_val, "chop_pass": chop_val < self.chop_threshold,
-            "vol_ratio": vol_ratio, "vol_pass": vol_ratio > self.volume_expansion_mult,
+        return {"adx": adx_val, "chop": chop_val, "vol_ratio": vol_ratio}
+
+    def _layer2_score(self, trend: str, bias_score: float, l2_15m: dict, l2_1h: dict,
+                       sweep_pass: bool) -> dict:
+        """Weighted 0-100 momentum/bias score — ai_expert's ConfidenceEngine
+        pattern (soft point-scoring) instead of a stack of hard AND-gates,
+        so a weak reading on one component can be outweighed by strong
+        readings elsewhere rather than vetoing the trade outright.
+        Points: bias 30, ADX 20, Choppiness 20, Volume 15, sweep 15 (=100).
+        ADX/Choppiness/Volume are weighted 15m x1 + 1H x2 (matches
+        compute_mtf_bias's own higher-TF weighting) before scoring.
+        Each threshold attribute (bias_threshold/adx_threshold/
+        chop_threshold/volume_expansion_mult) is now the point where that
+        component earns FULL credit, not a hard pass/fail line."""
+        bias_aligned = bias_score if trend == "up" else (100.0 - bias_score)
+        bias_span = max(1.0, self.bias_threshold - 50.0)
+        bias_pts = max(0.0, min(100.0, (bias_aligned - 50.0) / bias_span * 100.0)) / 100.0 * 30.0
+
+        def _tf_weighted(key: str) -> float:
+            return (l2_15m[key] * 1.0 + l2_1h[key] * 2.0) / 3.0
+
+        adx_avg = _tf_weighted("adx")
+        adx_pts = max(0.0, min(100.0, adx_avg / max(1.0, self.adx_threshold * 2.0) * 100.0)) / 100.0 * 20.0
+
+        chop_avg = _tf_weighted("chop")
+        chop_full_at = max(1.0, 100.0 - self.chop_threshold)
+        chop_pts = max(0.0, min(100.0, (100.0 - chop_avg) / chop_full_at * 100.0)) / 100.0 * 20.0
+
+        vol_avg = _tf_weighted("vol_ratio")
+        vol_pts = max(0.0, min(100.0, vol_avg / max(0.01, self.volume_expansion_mult * 2.0) * 100.0)) / 100.0 * 15.0
+
+        sweep_pts = 15.0 if sweep_pass else 0.0
+
+        breakdown = {
+            "bias": round(bias_pts, 1), "adx": round(adx_pts, 1), "chop": round(chop_pts, 1),
+            "volume": round(vol_pts, 1), "sweep": round(sweep_pts, 1),
         }
+        return {"score": round(sum(breakdown.values()), 1), "breakdown": breakdown}
 
     @staticmethod
     def _choppiness(candles: list, period: int) -> Optional[float]:

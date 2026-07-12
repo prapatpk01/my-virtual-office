@@ -554,8 +554,9 @@ class TradingBot:
                                  signal: "Signal", tc: dict) -> None:
         """TrendConfirmStrategy-specific scan line for the 3-layer design:
         Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree),
-        Layer2 (15m+1H bias score + ADX/chop/volume momentum gates on
-        BOTH 15m and 1H + a 15m liquidity-sweep check), Layer3 (15m
+        Layer2 (dynamic weighted 0-100 momentum score — bias+ADX+chop+
+        volume(15m/1H weighted)+liquidity-sweep, soft-scored ai_expert
+        ConfidenceEngine style rather than hard AND-gates), Layer3 (15m
         HMA10/20 cross — fresh, or within fresh_trend_bars if the trend
         just confirmed; EMA5/10 shown alongside for diagnostics only, it
         no longer gates entry or exit) — instead of the ai_expert-only
@@ -566,18 +567,9 @@ class TradingBot:
         macd_trend = tc.get("macd_trend", "?")
         confirmed  = tc.get("confirmed") or "none"
         bias_score = tc.get("bias_score")
-        bias_thr   = tc.get("bias_threshold")
-        adx_15m    = tc.get("adx_15m")
-        adx_1h     = tc.get("adx_1h")
-        adx_thr    = tc.get("adx_threshold")
-        chop_15m   = tc.get("chop_15m")
-        chop_1h    = tc.get("chop_1h")
-        chop_thr   = tc.get("chop_threshold")
-        vol_15m    = tc.get("vol_ratio_15m")
-        vol_1h     = tc.get("vol_ratio_1h")
-        vol_mult   = tc.get("vol_expansion_mult")
-        sweep_up   = tc.get("sweep_up")
-        sweep_down = tc.get("sweep_down")
+        mscore     = tc.get("momentum_score")
+        mscore_thr = tc.get("momentum_score_threshold")
+        breakdown  = tc.get("momentum_breakdown") or {}
         open_pos   = tc.get("open_position") or "-"
         status     = tc.get("entry_status", "?")
         fb         = tc.get("fresh_trend_bars")
@@ -586,22 +578,21 @@ class TradingBot:
         _STATUS_LABEL = {
             "position_open":            "holding",
             "no_trend":                 "n/a (Layer1 not confirmed)",
-            "bias_fail":                "n/a (Layer2 bias fail)",
-            "momentum_fail":            "n/a (Layer2 ADX/chop/vol fail)",
-            "sweep_fail":               "n/a (Layer2 no liquidity sweep)",
+            "momentum_fail":            "n/a (Layer2 score too low)",
             "waiting_cross":            "wait_hma_cross (Layer3)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3)",
             "entered":                  "entered",
         }
         entry_str = _STATUS_LABEL.get(status, status)
 
-        bias_str = f"{bias_score:.0f}/{bias_thr:.0f}" if bias_score is not None else "n/a"
         l1_str = f"SMA={sma_trend} EMA10/20={ema1020} slope={slope} MACD={macd_trend}"
-        adx_str = f"{adx_15m:.0f}|{adx_1h:.0f}/{adx_thr:.0f}" if adx_15m is not None else "n/a"
-        chop_str = f"{chop_15m:.0f}|{chop_1h:.0f}/{chop_thr:.0f}" if chop_15m is not None else "n/a"
-        vol_str = f"{vol_15m:.2f}|{vol_1h:.2f}x/{vol_mult:.2f}x" if vol_15m is not None else "n/a"
-        sweep_str = ("low✓" if sweep_up else "low✗") if confirmed == "up" else \
-                    ("high✓" if sweep_down else "high✗") if confirmed == "down" else "n/a"
+        bias_str = f"{bias_score:.0f}" if bias_score is not None else "n/a"
+        if mscore is not None:
+            score_str = (f"{mscore:.0f}/{mscore_thr:.0f} (bias={breakdown.get('bias','?')} "
+                        f"adx={breakdown.get('adx','?')} chop={breakdown.get('chop','?')} "
+                        f"vol={breakdown.get('volume','?')} sweep={breakdown.get('sweep','?')})")
+        else:
+            score_str = "n/a"
 
         def _ago_str(ago: Optional[int]) -> str:
             return f"{ago}b" if ago is not None else "-"
@@ -621,10 +612,10 @@ class TradingBot:
         reason = (signal.reason or "")[:90]
         logger.info(
             "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s "
-            "L2[bias=%s adx(15m|1h)=%s chop(15m|1h)=%s vol(15m|1h)=%s sweep=%s] pos=%-5s | "
+            "L2[bias=%s score=%s] pos=%-5s | "
             "L3[%s dist=%s]=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
-            l1_str, confirmed, bias_str, adx_str, chop_str, vol_str, sweep_str,
+            l1_str, confirmed, bias_str, score_str,
             open_pos, cross_str, dist_str, entry_str, reason,
         )
 
