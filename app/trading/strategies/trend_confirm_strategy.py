@@ -55,16 +55,21 @@ Layer 3 — Entry (TF15m), always WITH Layer 1's confirmed trend:
   check is a chase-guard: no entry if price already ran too far from the
   trend reference — wait for a pullback + fresh cross.
 
-Exit — primary is the HMA10/20 cross-back (a genuine trend reversal),
-  which lets a healthy trend run instead of being whipsawed out. An
-  optional faster exit (`exit_on_hma20_open`, OFF by default) closes on
-  `exit_hma20_confirm_bars` consecutive closes past HMA20 — it's off
-  because a single/near-single bar past HMA20 kept closing trades before
-  the trend developed (visible on low-volatility symbols like XAU where
-  ATR-tight stops + a twitchy exit stopped trades on noise). SL/TP
-  (ATR(14, 15m) x2.5 SL, 2:1 R:R by default — wide enough that the
-  signal exit, not noise, closes the trade) remains the hard-stop safety
-  net checked by bot.py's risk-manager fallback underneath all of this.
+Exit — a 2-TP + break-even scheme managed in tick_open_position():
+  TP1 (partial): when price reaches `tp1_r` (1R, halfway to the 2R final
+    TP), take `tp1_close_pct` (50%) off and move SL to break-even +
+    `be_offset_r` (BE + 0.1R — a small locked profit on the runner).
+    Checked every tick, fires once.
+  Runner (remaining 50%): rides on until the HMA10/20 cross-back (a
+    genuine trend reversal — the primary trend-following exit), the hard
+    final TP (2R), or the trailed SL (BE+0.1R). An optional faster exit
+    (`exit_on_hma20_open`, OFF by default) closes on
+    `exit_hma20_confirm_bars` consecutive closes past HMA20 — off because
+    a near-single bar past HMA20 kept whipsawing trades out before the
+    trend developed (visible on low-volatility symbols like XAU).
+  SL/TP (ATR(14, 15m) x2.5 SL, 2:1 R:R by default) are the hard bounds
+  bot.py's risk manager checks underneath; TP1 fires the partial +
+  BE-move via a PositionUpdate("partial_tp", new_sl=...).
 
 Once closed (by either exit condition or the hard SL/TP stop), the next
 bar where Layer1+Layer2 read confirmed again is eligible for a new entry.
@@ -131,10 +136,15 @@ class TrendConfirmStrategy(BaseStrategy):
                                             #   it whipsawed trades out before the trend developed; a real
                                             #   HMA10/20 cross-back is the primary exit)
         exit_hma20_confirm_bars: int = 2,   # N consecutive closes past HMA20 required when the above is on
+        # Partial take-profit + break-even (2-TP scheme)
+        use_partial_tp: bool = True,        # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
+        tp1_r: float = 1.0,                 # TP1 at 1R (halfway to the 2R final TP)
+        tp1_close_pct: float = 0.5,         # fraction closed at TP1
+        be_offset_r: float = 0.1,           # after TP1, SL -> entry +/- this many R (BE + 0.1R, a small locked profit)
         # Risk
         atr_period: int = 14,
         sl_atr_mult: float = 2.5,           # wide enough that the signal exit, not noise, closes the trade
-        rr_ratio: float = 2.0,              # TP at 2R so winners that reach a target aren't cut short at 1R
+        rr_ratio: float = 2.0,              # final TP (TP2) at 2R so winners that reach a target aren't cut short
     ):
         super().__init__(symbol, params)
         self.name = f"TrendConfirm({symbol})"
@@ -173,6 +183,11 @@ class TrendConfirmStrategy(BaseStrategy):
         self.exit_on_hma20_open = exit_on_hma20_open
         self.exit_hma20_confirm_bars = exit_hma20_confirm_bars
 
+        self.use_partial_tp = use_partial_tp
+        self.tp1_r = tp1_r
+        self.tp1_close_pct = tp1_close_pct
+        self.be_offset_r = be_offset_r
+
         self.atr_period = atr_period
         self.sl_atr_mult = sl_atr_mult
         self.rr_ratio = rr_ratio
@@ -186,6 +201,10 @@ class TrendConfirmStrategy(BaseStrategy):
         self._last_hma_cross_down_ts: Optional[int] = None
         self._last_exit_bar_ts: Optional[int] = None  # owned by tick_open_position()
         self._latest_candles: list = []
+        # Partial-TP tracking for the open position (owned by tick_open_position())
+        self._entry_price: Optional[float] = None
+        self._entry_sl: Optional[float] = None
+        self._tp1_done: bool = False
 
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
         self._latest_candles = candles  # cached for tick_open_position()
@@ -340,6 +359,7 @@ class TrendConfirmStrategy(BaseStrategy):
                     metadata=dbg("cross_pass_distance_fail"))
             sl, tp = self._compute_sl_tp("long", close_price, l3["atr_val"])
             self._open_position = "long"
+            self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
             meta = dbg("entered")
             meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
             return Signal(
@@ -369,6 +389,7 @@ class TrendConfirmStrategy(BaseStrategy):
                 metadata=dbg("cross_pass_distance_fail"))
         sl, tp = self._compute_sl_tp("short", close_price, l3["atr_val"])
         self._open_position = "short"
+        self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
         meta = dbg("entered")
         meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
         return Signal(
@@ -382,19 +403,42 @@ class TrendConfirmStrategy(BaseStrategy):
         )
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
-        """Exit = OR logic, whichever fires first, evaluated once per
-        newly-formed 15m bar: HMA10/20 cross-back (a genuine trend
-        reversal), OR — only when `exit_on_hma20_open` is set —
-        `exit_hma20_confirm_bars` consecutive closes on the wrong side of
-        HMA20 (a faster warning than a full cross, but the confirmation
-        window guards against a single whipsaw bar closing the trade
-        prematurely). Hedge-mode-safe: always closes whichever position is
-        actually open, never relies on signal.type semantics."""
+        """Position management, evaluated every tick:
+
+        1. TP1 partial (price-based, checked every tick): when price reaches
+           tp1_r (1R, halfway to the 2R final TP), close tp1_close_pct (50%)
+           and move SL to break-even + be_offset_r (BE + 0.1R). Fires once.
+        2. Exit the runner (bar-based): HMA10/20 cross-back (a genuine trend
+           reversal), OR — only when exit_on_hma20_open is set —
+           exit_hma20_confirm_bars consecutive closes past HMA20. The final
+           TP (2R) and the trailed SL are the hard bounds bot.py's risk
+           manager checks underneath.
+        Hedge-mode-safe: always closes whichever position is actually open,
+        never relies on signal.type semantics."""
         if self._open_position is None or not self._latest_candles:
             return None
 
         from ..engines.position_manager import PositionUpdate
 
+        # ── 1) TP1 partial take-profit + move SL to BE+offset (every tick) ──
+        if (self.use_partial_tp and not self._tp1_done
+                and self._entry_price is not None and self._entry_sl is not None):
+            r = abs(self._entry_price - self._entry_sl)
+            if r > 0:
+                if self._open_position == "long" and current_price >= self._entry_price + self.tp1_r * r:
+                    self._tp1_done = True
+                    new_sl = self._entry_price + self.be_offset_r * r
+                    return PositionUpdate(action="partial_tp", close_pct=self.tp1_close_pct, new_sl=new_sl,
+                                          reason=f"TP1 {self.tp1_r:.1f}R hit — took {self.tp1_close_pct*100:.0f}%, "
+                                                 f"SL -> BE+{self.be_offset_r:.1f}R")
+                if self._open_position == "short" and current_price <= self._entry_price - self.tp1_r * r:
+                    self._tp1_done = True
+                    new_sl = self._entry_price - self.be_offset_r * r
+                    return PositionUpdate(action="partial_tp", close_pct=self.tp1_close_pct, new_sl=new_sl,
+                                          reason=f"TP1 {self.tp1_r:.1f}R hit — took {self.tp1_close_pct*100:.0f}%, "
+                                                 f"SL -> BE+{self.be_offset_r:.1f}R")
+
+        # ── 2) Runner exit — HMA cross-back (bar-based) ─────────────────────
         candles = self._latest_candles
         bar_ts = candles[-1].timestamp
         if bar_ts == self._last_exit_bar_ts:
@@ -410,13 +454,13 @@ class TrendConfirmStrategy(BaseStrategy):
             hma20_exit = self.exit_on_hma20_open and self._closes_past_hma20(candles, "long", cb)
             if l3["hma_cross_down"] or hma20_exit:
                 reason = "HMA10 crossed below HMA20" if l3["hma_cross_down"] else f"{cb} close(s) below HMA20"
-                self._open_position = None
+                self._reset_position_state()
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} (15m)")
         if self._open_position == "short":
             hma20_exit = self.exit_on_hma20_open and self._closes_past_hma20(candles, "short", cb)
             if l3["hma_cross_up"] or hma20_exit:
                 reason = "HMA10 crossed above HMA20" if l3["hma_cross_up"] else f"{cb} close(s) above HMA20"
-                self._open_position = None
+                self._reset_position_state()
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} (15m)")
 
         return PositionUpdate(action="hold", reason=f"Holding {self._open_position.upper()}")
@@ -437,18 +481,24 @@ class TrendConfirmStrategy(BaseStrategy):
                 return False
         return True
 
+    def _reset_position_state(self) -> None:
+        self._open_position = None
+        self._entry_price = None
+        self._entry_sl = None
+        self._tp1_done = False
+
     def record_closed_trade(self, exit_price: float, exit_reason: str, duration_min: float = 0.0) -> None:
         """Called by bot.py after ANY close, including the risk-manager's
         hard SL/TP fallback firing before HMA10/20 crosses back — without
         this, _open_position would stay set forever and analyze() would
         refuse all future entries."""
-        self._open_position = None
+        self._reset_position_state()
 
     def cancel_pending_entry(self, reason: str = "") -> None:
         """Called by bot.py when a signal this strategy just emitted failed
         to actually open (rejected by risk/portfolio gates, insufficient
         balance, or an order error)."""
-        self._open_position = None
+        self._reset_position_state()
 
     def attach_existing_position(self, direction: str, entry_price: float,
                                   stop_loss: Optional[float] = None,
@@ -457,8 +507,13 @@ class TrendConfirmStrategy(BaseStrategy):
         already open on the exchange (from before a restart) — nothing in
         this strategy's in-memory state would otherwise know about it, so
         analyze() would try to open a duplicate and tick_open_position()
-        would never manage the exit."""
+        would never manage the exit. Seeds the partial-TP tracking from the
+        reconciled entry/SL so TP1 can still fire on the recovered position
+        (tp1_done left False — TP1 may not have triggered yet)."""
         self._open_position = direction
+        self._entry_price = entry_price
+        self._entry_sl = stop_loss
+        self._tp1_done = False
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
