@@ -56,19 +56,19 @@ Layer 3 — Entry (TF15m), always WITH Layer 1's confirmed trend:
   trend reference — wait for a pullback + fresh cross.
 
 Exit — a 2-TP + break-even scheme managed in tick_open_position():
-  TP1 (partial): when price reaches `tp1_r` (1R, halfway to the 2R final
-    TP), take `tp1_close_pct` (50%) off and move SL to break-even +
-    `be_offset_r` (BE + 0.1R — a small locked profit on the runner).
-    Checked every tick, fires once.
+  TP1 (partial): when price reaches `tp1_r` (0.625R, halfway to the
+    1.25R final TP), take `tp1_close_pct` (50%) off and move SL to
+    break-even + `be_offset_r` (BE + 0.1R — a small locked profit on the
+    runner). Checked every tick, fires once.
   Runner (remaining 50%): rides on until the HMA10/20 cross-back (a
     genuine trend reversal — the primary trend-following exit), the hard
-    final TP (2R), or the trailed SL (BE+0.1R). An optional faster exit
-    (`exit_on_hma20_open`, OFF by default) closes on
+    final TP (1.25R), or the trailed SL (BE+0.1R). An optional faster
+    exit (`exit_on_hma20_open`, OFF by default) closes on
     `exit_hma20_confirm_bars` consecutive closes past HMA20 — off because
     a near-single bar past HMA20 kept whipsawing trades out before the
     trend developed (visible on low-volatility symbols like XAU).
   SL/TP (SL = wider of ATR(14,15m) x2.5 and min_sl_pct=0.5% of price;
-  2:1 R:R by default) are the hard bounds bot.py's risk manager checks
+  1.25:1 R:R by default) are the hard bounds bot.py's risk manager checks
   underneath; TP1 fires the partial + BE-move via a
   PositionUpdate("partial_tp", new_sl=...). The 0.5% floor stops
   low-volatility symbols (e.g. XAU, where 2.5xATR can be ~0.04%) from
@@ -141,13 +141,13 @@ class TrendConfirmStrategy(BaseStrategy):
         exit_hma20_confirm_bars: int = 2,   # N consecutive closes past HMA20 required when the above is on
         # Partial take-profit + break-even (2-TP scheme)
         use_partial_tp: bool = True,        # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
-        tp1_r: float = 1.0,                 # TP1 at 1R (halfway to the 2R final TP)
+        tp1_r: float = 0.625,               # TP1 at 0.625R (halfway to the 1.25R final TP)
         tp1_close_pct: float = 0.5,         # fraction closed at TP1
         be_offset_r: float = 0.1,           # after TP1, SL -> entry +/- this many R (BE + 0.1R, a small locked profit)
         # Risk
         atr_period: int = 14,
         sl_atr_mult: float = 2.5,           # wide enough that the signal exit, not noise, closes the trade
-        rr_ratio: float = 2.0,              # final TP (TP2) at 2R so winners that reach a target aren't cut short
+        rr_ratio: float = 1.25,             # final TP (TP2) at 1.25R
         min_sl_pct: float = 0.005,          # floor the SL distance at 0.5% of price — on low-volatility symbols
                                             #   (e.g. XAU) 2.5xATR can be ~0.04% and gets noise-stopped instantly;
                                             #   R (and therefore TP1/TP2) is measured from the floored distance
@@ -413,12 +413,13 @@ class TrendConfirmStrategy(BaseStrategy):
         """Position management, evaluated every tick:
 
         1. TP1 partial (price-based, checked every tick): when price reaches
-           tp1_r (1R, halfway to the 2R final TP), close tp1_close_pct (50%)
-           and move SL to break-even + be_offset_r (BE + 0.1R). Fires once.
+           tp1_r (0.625R, halfway to the 1.25R final TP), close
+           tp1_close_pct (50%) and move SL to break-even + be_offset_r
+           (BE + 0.1R). Fires once.
         2. Exit the runner (bar-based): HMA10/20 cross-back (a genuine trend
            reversal), OR — only when exit_on_hma20_open is set —
            exit_hma20_confirm_bars consecutive closes past HMA20. The final
-           TP (2R) and the trailed SL are the hard bounds bot.py's risk
+           TP (1.25R) and the trailed SL are the hard bounds bot.py's risk
            manager checks underneath.
         Hedge-mode-safe: always closes whichever position is actually open,
         never relies on signal.type semantics."""
