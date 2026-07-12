@@ -568,7 +568,7 @@ class TradingBot:
         open_pos   = tc.get("open_position") or "-"
         status     = tc.get("entry_status", "?")
         fb         = tc.get("fresh_trend_bars")
-        is_fresh   = tc.get("is_fresh_trend")
+        is_early   = tc.get("is_early_trend")
 
         _STATUS_LABEL = {
             "position_open":            "holding",
@@ -583,14 +583,15 @@ class TradingBot:
 
         l1_str = f"SMA={sma_trend} EMA10/20={ema1020} slope={slope} MACD={macd_trend}"
         if l2_score is not None:
-            score_str = f"{l2_score:.0f}/{l2_thr:.0f} (15m={q15:.0f} 1h={q1h:.0f})"
+            early_tag = "early" if is_early else "estab"
+            score_str = f"{l2_score:.0f}/{l2_thr:.0f}[{early_tag}] (15m={q15:.0f} 1h={q1h:.0f})"
         else:
             score_str = "n/a"
 
         def _ago_str(ago: Optional[int]) -> str:
             return f"{ago}b" if ago is not None else "-"
 
-        fresh_str = f"fresh<{fb}b" if is_fresh else "steady"
+        fresh_str = f"early<{fb}b" if is_early else "steady"
         if confirmed == "up":
             cross_str = f"HMA↑{_ago_str(tc.get('hma_cross_up_ago'))} ({fresh_str})"
         elif confirmed == "down":
