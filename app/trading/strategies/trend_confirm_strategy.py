@@ -48,13 +48,16 @@ Layer 3 — Entry (TF15m), always WITH Layer 1's confirmed trend:
   The EMA20 distance check is a chase-guard: no entry if price already ran
   too far from the trend reference — wait for a pullback + fresh cross.
 
-Exit — OR logic, whichever fires first while SL/TP hasn't been hit yet:
-  HMA10/20 cross-back  OR  candle opens on the wrong side of HMA20
-  (long: open < HMA20, short: open > HMA20) -> close 100% immediately.
-  The open-vs-HMA20 check is a faster warning than waiting for HMA10 to
-  actually cross back. SL/TP (ATR(14, 15m) x1.5, 1:1 R:R by default)
-  remains the hard-stop safety net checked by bot.py's risk-manager
-  fallback underneath all of this.
+Exit — primary is the HMA10/20 cross-back (a genuine trend reversal),
+  which lets a healthy trend run instead of being whipsawed out. An
+  optional faster exit (`exit_on_hma20_open`, OFF by default) closes on
+  `exit_hma20_confirm_bars` consecutive closes past HMA20 — it's off
+  because a single/near-single bar past HMA20 kept closing trades before
+  the trend developed (visible on low-volatility symbols like XAU where
+  ATR-tight stops + a twitchy exit stopped trades on noise). SL/TP
+  (ATR(14, 15m) x2.5 SL, 2:1 R:R by default — wide enough that the
+  signal exit, not noise, closes the trade) remains the hard-stop safety
+  net checked by bot.py's risk-manager fallback underneath all of this.
 
 Once closed (by either exit condition or the hard SL/TP stop), the next
 bar where Layer1+Layer2 read confirmed again is eligible for a new entry.
@@ -116,12 +119,14 @@ class TrendConfirmStrategy(BaseStrategy):
         fresh_trend_bars: int = 3,
         max_dist_atr_mult: float = 1.5,
         # Exit
-        exit_on_hma20_open: bool = True,   # close on a single bar opening past HMA20 (fast but twitchy)
-        exit_hma20_confirm_bars: int = 1,   # N consecutive closes past HMA20 required (1 = the plain open check)
+        exit_on_hma20_open: bool = False,   # optional fast exit on N closes past HMA20 (off by default —
+                                            #   it whipsawed trades out before the trend developed; a real
+                                            #   HMA10/20 cross-back is the primary exit)
+        exit_hma20_confirm_bars: int = 2,   # N consecutive closes past HMA20 required when the above is on
         # Risk
         atr_period: int = 14,
-        sl_atr_mult: float = 1.5,
-        rr_ratio: float = 1.0,
+        sl_atr_mult: float = 2.5,           # wide enough that the signal exit, not noise, closes the trade
+        rr_ratio: float = 2.0,              # TP at 2R so winners that reach a target aren't cut short at 1R
     ):
         super().__init__(symbol, params)
         self.name = f"TrendConfirm({symbol})"
