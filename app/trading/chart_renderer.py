@@ -22,6 +22,7 @@ try:
     matplotlib.use("Agg")  # headless — no display server on the server/container
     import mplfinance as mpf
     import pandas as pd
+    from .strategies.base import BaseStrategy
     _CHARTS_AVAILABLE = True
 except ImportError:
     _CHARTS_AVAILABLE = False
@@ -61,10 +62,21 @@ def render_entry_chart(
     macro_bias: str = "",
     lookback: int = 100,
     out_dir: Optional[str] = None,
+    ma_type: str = "ema",           # "ema" | "hma" — matches the strategy that fired
+    ema_fast: int = 20,
+    ema_slow: int = 50,
+    sma_period: Optional[int] = None,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal_period: int = 9,
 ) -> Optional[str]:
     """
-    Render a candlestick chart with EMA20/EMA50, S/R lines, and entry/SL/TP
-    markers. Returns the path to the saved PNG, or None if charting is
+    Render a candlestick chart using the SAME moving-average/MACD periods
+    the firing strategy actually trades on (defaults are ai_expert's
+    EMA20/EMA50 — callers should pass their own strategy's periods, e.g.
+    trend_confirm's EMA5/EMA10+SMA30, ema_sma's EMA12/EMA26+SMA50, or
+    hma_macd_roc's HMA10/HMA20). S/R lines and entry/SL/TP markers as
+    before. Returns the path to the saved PNG, or None if charting is
     unavailable or fails (caller should degrade to text-only notification).
     """
     if not _CHARTS_AVAILABLE:
@@ -75,25 +87,35 @@ def render_entry_chart(
 
     try:
         df = _to_dataframe(candles[-lookback:])
+        closes = df["Close"].tolist()
 
-        ema20 = df["Close"].ewm(span=20, adjust=False).mean()
-        ema50 = df["Close"].ewm(span=50, adjust=False).mean()
+        ma_fn = BaseStrategy.hma if ma_type == "hma" else BaseStrategy.ema
+        ma1 = pd.Series(ma_fn(closes, ema_fast), index=df.index)
+        ma2 = pd.Series(ma_fn(closes, ema_slow), index=df.index)
+        ma_label = "HMA" if ma_type == "hma" else "EMA"
         res_level, sup_level = _swing_levels(df, lookback=40)
 
-        macd_fast = df["Close"].ewm(span=12, adjust=False).mean()
-        macd_slow = df["Close"].ewm(span=26, adjust=False).mean()
-        macd_line = macd_fast - macd_slow
-        macd_signal = macd_line.ewm(span=9, adjust=False).mean()
-        macd_hist = macd_line - macd_signal
-        hist_colors = ["#22c55e" if v >= 0 else "#ef4444" for v in macd_hist]
-
         addplots = [
-            mpf.make_addplot(ema20, color="#3b82f6", width=1.1),
-            mpf.make_addplot(ema50, color="#f59e0b", width=1.1),
+            mpf.make_addplot(ma1, color="#3b82f6", width=1.1),
+            mpf.make_addplot(ma2, color="#f59e0b", width=1.1),
+        ]
+        if sma_period:
+            sma_line = pd.Series(BaseStrategy.sma(closes, sma_period), index=df.index)
+            addplots.append(mpf.make_addplot(sma_line, color="#a855f7", width=1.1, linestyle="dashed"))
+
+        macd_line_arr, macd_signal_arr, macd_hist_arr = BaseStrategy.macd(
+            closes, macd_fast, macd_slow, macd_signal_period,
+        )
+        macd_line = pd.Series(macd_line_arr, index=df.index)
+        macd_sig  = pd.Series(macd_signal_arr, index=df.index)
+        macd_hist = pd.Series(macd_hist_arr, index=df.index)
+        hist_colors = ["#22c55e" if (v == v and v >= 0) else "#ef4444" for v in macd_hist]
+
+        addplots += [
             mpf.make_addplot(macd_hist, type="bar", panel=2, color=hist_colors,
                              width=0.7, ylabel="MACD"),
             mpf.make_addplot(macd_line, panel=2, color="#38bdf8", width=1.0),
-            mpf.make_addplot(macd_signal, panel=2, color="#f97316", width=1.0),
+            mpf.make_addplot(macd_sig, panel=2, color="#f97316", width=1.0),
         ]
 
         hlines_prices  = []
@@ -168,8 +190,8 @@ def render_entry_chart(
         ax = axes[0]
         legend_lines = [
             f"Entry {entry:,.2f}",
-            f"EMA20 / EMA50",
-            f"MACD 12/26/9",
+            f"{ma_label}{ema_fast} / {ma_label}{ema_slow}" + (f" / SMA{sma_period}" if sma_period else ""),
+            f"MACD {macd_fast}/{macd_slow}/{macd_signal_period}",
         ]
         if sl:
             legend_lines.append(f"SL {sl:,.2f}")

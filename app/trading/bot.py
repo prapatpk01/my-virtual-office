@@ -168,6 +168,34 @@ class TradingBot:
             except Exception as e:
                 logger.warning("cancel_pending_entry failed [%s]: %s", strategy_name, e)
 
+    @staticmethod
+    def _chart_ma_kwargs(strategy_inst: Optional[BaseStrategy]) -> dict:
+        """Pulls the actual MA/MACD periods a strategy trades on so the
+        Telegram entry chart draws the SAME lines the strategy used to
+        decide the trade, instead of a fixed generic EMA20/EMA50 that may
+        not match at all (e.g. trend_confirm trades EMA5/EMA10+SMA30, not
+        EMA20/EMA50). Falls back to ai_expert's EMA20/EMA50 defaults for
+        strategies that don't expose these attributes (ai_expert itself)."""
+        if strategy_inst is None:
+            return {}
+        kwargs: dict = {}
+        if hasattr(strategy_inst, "hma_fast") and hasattr(strategy_inst, "hma_slow"):
+            kwargs["ma_type"] = "hma"
+            kwargs["ema_fast"] = strategy_inst.hma_fast
+            kwargs["ema_slow"] = strategy_inst.hma_slow
+        elif hasattr(strategy_inst, "ema_fast") and hasattr(strategy_inst, "ema_slow"):
+            kwargs["ema_fast"] = strategy_inst.ema_fast
+            kwargs["ema_slow"] = strategy_inst.ema_slow
+        if hasattr(strategy_inst, "sma_trend"):
+            kwargs["sma_period"] = strategy_inst.sma_trend
+        if hasattr(strategy_inst, "macd_fast"):
+            kwargs["macd_fast"] = strategy_inst.macd_fast
+        if hasattr(strategy_inst, "macd_slow"):
+            kwargs["macd_slow"] = strategy_inst.macd_slow
+        if hasattr(strategy_inst, "macd_signal"):
+            kwargs["macd_signal_period"] = strategy_inst.macd_signal
+        return kwargs
+
     async def _reconcile_positions(self) -> None:
         """Runs once, right before the first tick of every (re)start.
 
@@ -1146,10 +1174,13 @@ class TradingBot:
                 if candles:
                     try:
                         from .chart_renderer import render_entry_chart
+                        strategy_inst = self._resolve_strategy_inst(strategy_name)
+                        chart_kwargs = self._chart_ma_kwargs(strategy_inst)
                         chart_path = render_entry_chart(
                             candles, sym, direction, order.price,
                             sl=sl_p, tp=tp_p, strategy=strategy_name,
                             macro_bias=macro_info.get("bias", ""),
+                            **chart_kwargs,
                         )
                     except Exception as e:
                         logger.warning("Chart render failed for %s: %s", sym, e)
