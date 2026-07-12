@@ -45,11 +45,13 @@ Layer 3 — Entry (TF15m):
   rather than chasing an already-extended move.
 
 Exit — OR logic, whichever fires first while SL/TP hasn't been hit yet:
-  EMA5/10 cross-back  OR  HMA10/20 cross-back  OR  candle opens on the
-  wrong side of HMA20 (long: open < HMA20, short: open > HMA20) ->
-  close 100% immediately. The open-vs-HMA20 check is a faster warning
-  than waiting for HMA10 to actually cross back — the open can already
-  be on the wrong side while HMA10/HMA20 haven't crossed yet. SL/TP
+  HMA10/20 cross-back  OR  candle opens on the wrong side of HMA20
+  (long: open < HMA20, short: open > HMA20) -> close 100% immediately.
+  EMA5/10 no longer drives entry OR exit — it's still computed and
+  tracked purely for [SCAN] log diagnostics. The open-vs-HMA20 check is
+  a faster warning than waiting for HMA10 to actually cross back — the
+  open can already be on the wrong side while HMA10/HMA20 haven't
+  crossed yet. SL/TP
   (ATR(14, 15m) x1.5, 1:1 R:R by default) remains the hard-stop safety
   net checked by bot.py's risk-manager fallback underneath all of this.
 
@@ -308,12 +310,13 @@ class TrendConfirmStrategy(BaseStrategy):
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
         """Exit = OR logic, whichever fires first, evaluated once per
-        newly-formed 15m bar: EMA5/10 cross-back, OR HMA10/20 cross-back,
-        OR the candle opens on the wrong side of HMA20 (a faster warning
-        than waiting for the cross itself — the open can flip against the
-        position while HMA10 hasn't crossed back yet). Hedge-mode-safe:
-        always closes whichever position is actually open, never relies
-        on signal.type semantics."""
+        newly-formed 15m bar: HMA10/20 cross-back, OR the candle opens on
+        the wrong side of HMA20 (a faster warning than waiting for the
+        cross itself — the open can flip against the position while
+        HMA10 hasn't crossed back yet). EMA5/10 is no longer part of the
+        exit (or the entry) — it's still computed and tracked purely for
+        [SCAN] log diagnostics. Hedge-mode-safe: always closes whichever
+        position is actually open, never relies on signal.type semantics."""
         if self._open_position is None or not self._latest_candles:
             return None
 
@@ -329,22 +332,12 @@ class TrendConfirmStrategy(BaseStrategy):
             return PositionUpdate(action="hold", reason="Indicators warming up (15m)")
         self._last_exit_bar_ts = bar_ts
 
-        if self._open_position == "long" and (l3["ema_cross_down"] or l3["hma_cross_down"] or l3["open_below_hma20"]):
-            if l3["ema_cross_down"]:
-                reason = "EMA5 crossed below EMA10"
-            elif l3["hma_cross_down"]:
-                reason = "HMA10 crossed below HMA20"
-            else:
-                reason = "candle opened below HMA20"
+        if self._open_position == "long" and (l3["hma_cross_down"] or l3["open_below_hma20"]):
+            reason = "HMA10 crossed below HMA20" if l3["hma_cross_down"] else "candle opened below HMA20"
             self._open_position = None
             return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} (15m)")
-        if self._open_position == "short" and (l3["ema_cross_up"] or l3["hma_cross_up"] or l3["open_above_hma20"]):
-            if l3["ema_cross_up"]:
-                reason = "EMA5 crossed above EMA10"
-            elif l3["hma_cross_up"]:
-                reason = "HMA10 crossed above HMA20"
-            else:
-                reason = "candle opened above HMA20"
+        if self._open_position == "short" and (l3["hma_cross_up"] or l3["open_above_hma20"]):
+            reason = "HMA10 crossed above HMA20" if l3["hma_cross_up"] else "candle opened above HMA20"
             self._open_position = None
             return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} (15m)")
 
