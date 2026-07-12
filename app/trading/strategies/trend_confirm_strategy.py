@@ -200,6 +200,9 @@ class TrendConfirmStrategy(BaseStrategy):
                 "bias_score": round(bias_score, 1), "bias_threshold": self.bias_threshold,
                 "open_position": self._open_position,
                 "entry_status": entry_status,
+                "cross_grace_bars": gb,
+                "ema_cross_up_ago": ema_up_ago, "ema_cross_down_ago": ema_down_ago,
+                "hma_cross_up_ago": hma_up_ago, "hma_cross_down_ago": hma_down_ago,
             }}
 
         if self._open_position is not None:

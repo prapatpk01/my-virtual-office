@@ -555,8 +555,9 @@ class TradingBot:
         """TrendConfirmStrategy-specific scan line for the 3-layer design:
         Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree),
         Layer2 (15m+1H bias score vs threshold), Layer3 (15m EMA5/10 +
-        HMA10/20 same-bar dual cross) — instead of the ai_expert-only
-        fields (macro/context/mtf) that don't apply to this strategy."""
+        HMA10/20 cross, within cross_grace_bars of each other) — instead
+        of the ai_expert-only fields (macro/context/mtf) that don't apply
+        to this strategy."""
         sma_trend  = tc.get("sma_trend", "?")
         ema1020    = tc.get("ema10_20_trend", "?")
         slope      = tc.get("ema20_slope", "?")
@@ -566,6 +567,7 @@ class TradingBot:
         bias_thr   = tc.get("bias_threshold")
         open_pos   = tc.get("open_position") or "-"
         status     = tc.get("entry_status", "?")
+        gb         = tc.get("cross_grace_bars")
 
         _STATUS_LABEL = {
             "position_open":  "holding",
@@ -579,11 +581,23 @@ class TradingBot:
         bias_str = f"{bias_score:.0f}/{bias_thr:.0f}" if bias_score is not None else "n/a"
         l1_str = f"SMA={sma_trend} EMA10/20={ema1020} slope={slope} MACD={macd_trend}"
 
+        def _ago_str(ago: Optional[int]) -> str:
+            return f"{ago}b" if ago is not None else "-"
+
+        if confirmed == "up":
+            cross_str = (f"EMA↑{_ago_str(tc.get('ema_cross_up_ago'))} "
+                        f"HMA↑{_ago_str(tc.get('hma_cross_up_ago'))} (grace={gb})")
+        elif confirmed == "down":
+            cross_str = (f"EMA↓{_ago_str(tc.get('ema_cross_down_ago'))} "
+                        f"HMA↓{_ago_str(tc.get('hma_cross_down_ago'))} (grace={gb})")
+        else:
+            cross_str = "n/a"
+
         reason = (signal.reason or "")[:90]
         logger.info(
-            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s L2[bias=%s] pos=%-5s | L3=%s | %s",
+            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s L2[bias=%s] pos=%-5s | L3[%s]=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
-            l1_str, confirmed, bias_str, open_pos, entry_str, reason,
+            l1_str, confirmed, bias_str, open_pos, cross_str, entry_str, reason,
         )
 
     # ------------------------------------------------------------------
