@@ -554,11 +554,12 @@ class TradingBot:
                                  signal: "Signal", tc: dict) -> None:
         """TrendConfirmStrategy-specific scan line for the 3-layer design:
         Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree),
-        Layer2 (15m+1H bias score vs threshold), Layer3 (15m HMA10/20
-        cross within cross_grace_bars; EMA5/10 shown alongside for
-        diagnostics — it drives the exit but no longer gates entry) —
-        instead of the ai_expert-only fields (macro/context/mtf) that
-        don't apply to this strategy."""
+        Layer2 (15m+1H bias score + ADX/chop/volume momentum gates),
+        Layer3 (15m HMA10/20 cross — fresh, or within fresh_trend_bars if
+        the trend just confirmed; EMA5/10 shown alongside for diagnostics
+        only, it no longer gates entry or exit) — instead of the
+        ai_expert-only fields (macro/context/mtf) that don't apply to
+        this strategy."""
         sma_trend  = tc.get("sma_trend", "?")
         ema1020    = tc.get("ema10_20_trend", "?")
         slope      = tc.get("ema20_slope", "?")
@@ -566,14 +567,22 @@ class TradingBot:
         confirmed  = tc.get("confirmed") or "none"
         bias_score = tc.get("bias_score")
         bias_thr   = tc.get("bias_threshold")
+        adx        = tc.get("adx")
+        adx_thr    = tc.get("adx_threshold")
+        chop       = tc.get("chop")
+        chop_thr   = tc.get("chop_threshold")
+        vol_ratio  = tc.get("vol_ratio")
+        vol_mult   = tc.get("vol_expansion_mult")
         open_pos   = tc.get("open_position") or "-"
         status     = tc.get("entry_status", "?")
-        gb         = tc.get("cross_grace_bars")
+        fb         = tc.get("fresh_trend_bars")
+        is_fresh   = tc.get("is_fresh_trend")
 
         _STATUS_LABEL = {
             "position_open":            "holding",
             "no_trend":                 "n/a (Layer1 not confirmed)",
             "bias_fail":                "n/a (Layer2 bias fail)",
+            "momentum_fail":            "n/a (Layer2 ADX/chop/vol fail)",
             "waiting_cross":            "wait_hma_cross (Layer3)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3)",
             "entered":                  "entered",
@@ -582,16 +591,18 @@ class TradingBot:
 
         bias_str = f"{bias_score:.0f}/{bias_thr:.0f}" if bias_score is not None else "n/a"
         l1_str = f"SMA={sma_trend} EMA10/20={ema1020} slope={slope} MACD={macd_trend}"
+        adx_str = f"{adx:.0f}/{adx_thr:.0f}" if adx is not None else "n/a"
+        chop_str = f"{chop:.0f}/{chop_thr:.0f}" if chop is not None else "n/a"
+        vol_str = f"{vol_ratio:.2f}x/{vol_mult:.2f}x" if vol_ratio is not None else "n/a"
 
         def _ago_str(ago: Optional[int]) -> str:
             return f"{ago}b" if ago is not None else "-"
 
+        fresh_str = f"fresh<{fb}b" if is_fresh else "steady"
         if confirmed == "up":
-            cross_str = (f"EMA↑{_ago_str(tc.get('ema_cross_up_ago'))} "
-                        f"HMA↑{_ago_str(tc.get('hma_cross_up_ago'))} (grace={gb})")
+            cross_str = f"EMA↑{_ago_str(tc.get('ema_cross_up_ago'))} HMA↑{_ago_str(tc.get('hma_cross_up_ago'))} ({fresh_str})"
         elif confirmed == "down":
-            cross_str = (f"EMA↓{_ago_str(tc.get('ema_cross_down_ago'))} "
-                        f"HMA↓{_ago_str(tc.get('hma_cross_down_ago'))} (grace={gb})")
+            cross_str = f"EMA↓{_ago_str(tc.get('ema_cross_down_ago'))} HMA↓{_ago_str(tc.get('hma_cross_down_ago'))} ({fresh_str})"
         else:
             cross_str = "n/a"
 
@@ -601,10 +612,10 @@ class TradingBot:
 
         reason = (signal.reason or "")[:90]
         logger.info(
-            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s L2[bias=%s] pos=%-5s | "
+            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s L2[bias=%s adx=%s chop=%s vol=%s] pos=%-5s | "
             "L3[%s dist=%s]=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
-            l1_str, confirmed, bias_str, open_pos, cross_str, dist_str, entry_str, reason,
+            l1_str, confirmed, bias_str, adx_str, chop_str, vol_str, open_pos, cross_str, dist_str, entry_str, reason,
         )
 
     # ------------------------------------------------------------------
