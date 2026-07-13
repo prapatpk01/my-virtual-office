@@ -589,6 +589,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     # =false, to let crypto symbols opt out of the commodity schedule and
     # trade 24/7 as before this feature.
     last_session_state = None
+    last_allow_new_positions = None
 
     _HEALTH_EMOJI = {
         "STRONG":   "✅",
@@ -669,16 +670,24 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     while not stop_event.is_set():
         # [SESSION CONTROL] One evaluation per loop pass, shared by every
         # symbol this iteration — the weekly session is a single global fact.
-        # Logged/sent ONLY on an actual state transition (session opening,
-        # closing, or erroring) — not on a fixed cadence. The status is
-        # otherwise unremarkable minute-to-minute and repeating it every
-        # SESSION_LOG_SECONDS was pure noise; check_price_protection/on_tick
-        # still consult session_gate_open on every tick regardless of
-        # whether anything gets logged here.
+        # check_price_protection/on_tick consult session_gate_open every
+        # tick regardless of whether anything gets logged/sent here.
+        #
+        # Telegram is reserved for the two moments the user actually cares
+        # about — allow_new_positions flipping True->False (entering
+        # SLEEP_MODE for the weekend) or False->True (trading resumes,
+        # PRE_OPEN_EXTENSION starting) — not every internal state-label
+        # change (PRE_OPEN_EXTENSION->ACTIVE and ACTIVE->POST_CLOSE_EXTENSION
+        # both keep allow_new_positions=True the whole time, so neither is a
+        # user-visible change). The Railway log line is more permissive
+        # (every state-label transition) since that's for debugging, not
+        # a push notification.
         session = session_engine.evaluate()
-        if session.state.value != last_session_state:
-            if last_session_state is not None and telegram:
+        if session.allow_new_positions != last_allow_new_positions:
+            if last_allow_new_positions is not None and telegram:
                 telegram.send(session.view_log_message)
+            last_allow_new_positions = session.allow_new_positions
+        if session.state.value != last_session_state:
             last_session_state = session.state.value
             logger.info(session.view_log_message)
 
