@@ -270,7 +270,7 @@ class Bot:
                        symbol, r.label, sig.bias.direction if sig.bias else "-",
                        e.passed_count, e.reason)
         elif layer == "CONFIRM":
-            logger.info("[%s] regime=%s dir=%s(bias)  AWAITING 5M/15M CONFIRMATION — %s",
+            logger.info("[%s] regime=%s dir=%s(bias)  L3.2 ACCEL-CONFIRM WAIT — %s",
                        symbol, r.label, sig.bias.direction if sig.bias else "-", sig.reason)
         else:
             logger.debug("[%s] no trade: %s", symbol, sig.reason)

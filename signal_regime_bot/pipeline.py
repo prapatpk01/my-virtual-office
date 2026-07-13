@@ -2,7 +2,7 @@
 Decision Pipeline — the single orchestrator both main.py (live) and
 backtest.py call, so the two can never diverge in logic.
 
-    Regime -> Bias -> Direction -> Entry -> Execution
+    Regime -> Bias -> Direction -> Entry -> [Accel confirm] -> Execution
 
 "Directional Trading Architecture, not Signal-Driven Trading":
   - Layer 1 (Regime, 4H+1H) ONLY classifies market state. It never opens a
@@ -13,6 +13,12 @@ backtest.py call, so the two can never diverge in logic.
   - Layer 3 (Entry, 30M) ONLY times the trigger. It receives the fixed
     direction and searches exclusively for a trigger on that side — it has
     no right to open the opposite side even if one appears.
+  - Layer 3.2 (Accel confirm, 15M+5M) is a CONDITIONAL gate: if price/
+    volatility is normal, a valid Layer-3 trigger enters IMMEDIATELY, no
+    extra check. ONLY when excessive prior acceleration is detected (last
+    4x15M / 10x5M) does it hold and require 1-2 wait rounds of fast-TF
+    follow-through before entry — don't chase a violent burst that may
+    snap back. See the wait-round machine below.
 
 Context Engine was tried here as a post-Entry quality filter and REMOVED:
 measured on the local BTC/XAU backtest (Jan-May 2026), it cut trade volume
