@@ -588,8 +588,6 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     # above) — only consulted here when FOLLOW_REFERENCE_SESSION_FOR_CRYPTO
     # =false, to let crypto symbols opt out of the commodity schedule and
     # trade 24/7 as before this feature.
-    SESSION_LOG_SECS = _env_int("SESSION_LOG_SECONDS", 300)
-    last_session_log = 0.0   # force an immediate log on the first loop tick
     last_session_state = None
 
     _HEALTH_EMOJI = {
@@ -671,14 +669,16 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     while not stop_event.is_set():
         # [SESSION CONTROL] One evaluation per loop pass, shared by every
         # symbol this iteration — the weekly session is a single global fact.
+        # Logged/sent ONLY on an actual state transition (session opening,
+        # closing, or erroring) — not on a fixed cadence. The status is
+        # otherwise unremarkable minute-to-minute and repeating it every
+        # SESSION_LOG_SECONDS was pure noise; check_price_protection/on_tick
+        # still consult session_gate_open on every tick regardless of
+        # whether anything gets logged here.
         session = session_engine.evaluate()
-        if (_time.time() - last_session_log >= SESSION_LOG_SECS
-                or session.state.value != last_session_state):
-            last_session_log = _time.time()
-            if session.state.value != last_session_state and last_session_state is not None:
-                # State transition — worth a Telegram ping, not just a log line.
-                if telegram:
-                    telegram.send(session.view_log_message)
+        if session.state.value != last_session_state:
+            if last_session_state is not None and telegram:
+                telegram.send(session.view_log_message)
             last_session_state = session.state.value
             logger.info(session.view_log_message)
 
