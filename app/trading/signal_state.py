@@ -60,6 +60,7 @@ class SignalState:
         self._outcomes: list[dict] = []    # closed trade results
         self._pending: dict[str, dict] = {}  # virtual open trades awaiting SL/TP
         self._paper_balance: float = PAPER_START_BALANCE  # running paper account
+        self._paper_positions: dict[str, dict] = {}  # symbol||strategy -> open paper pos
         self._load()
 
     # ------------------------------------------------------------------
@@ -75,6 +76,7 @@ class SignalState:
             self._outcomes = data.get("outcomes",  [])
             self._pending  = data.get("pending",   {})
             self._paper_balance = float(data.get("paper_balance", PAPER_START_BALANCE))
+            self._paper_positions = data.get("paper_positions", {})
             logger.info("Signal state loaded: %d locks, %d fired, %d outcomes, %d pending, paper $%.2f",
                         len(self._active), len(self._fired), len(self._outcomes),
                         len(self._pending), self._paper_balance)
@@ -92,6 +94,7 @@ class SignalState:
                     "outcomes": self._outcomes[-500:],
                     "pending":  self._pending,
                     "paper_balance": round(self._paper_balance, 2),
+                    "paper_positions": self._paper_positions,
                 }, f, indent=2)
         except Exception as e:
             logger.warning("Could not save signal state: %s", e)
@@ -228,31 +231,96 @@ class SignalState:
     def paper_balance(self) -> float:
         return self._paper_balance
 
+    def _paper_key(self, symbol: str, strategy: str) -> str:
+        return f"{symbol}||{strategy}"
+
+    def open_paper_position(self, symbol: str, side: str, entry: float,
+                            sl, strategy: str = "") -> None:
+        """Snapshot a paper position at entry so partial TPs and the final
+        close book consistently against one fixed size (5% margin × 20x of the
+        balance at open), instead of re-sizing off the balance at close time."""
+        if not entry:
+            return
+        margin   = self._paper_balance * PAPER_MARGIN_PCT
+        notional = margin * PAPER_LEVERAGE
+        amount   = notional / entry
+        self._paper_positions[self._paper_key(symbol, strategy)] = {
+            "side":       side,
+            "entry":      entry,
+            "sl":         sl,
+            "amount":     amount,       # remaining size (shrinks on partials)
+            "init_amount": amount,      # original size (for R computation)
+            "risk_price": abs(entry - sl) if sl else 0.0,
+            "realized":   0.0,          # net $ already banked from partials
+            "ts":         int(time.time() * 1000),
+        }
+        self._save()
+
+    def record_paper_partial(self, symbol: str, exit_price: float,
+                             close_frac: float, strategy: str = "") -> dict | None:
+        """Book a partial close (e.g. TP1 taking 50%) into the paper account.
+        Returns {pnl_usd, pnl_pct, balance_after} for the notifier, or None if
+        no paper position is tracked (e.g. reconciled/legacy positions)."""
+        pp = self._paper_positions.get(self._paper_key(symbol, strategy))
+        if not pp or pp["amount"] <= 0:
+            return None
+        is_long = pp["side"] in ("buy", "long")
+        amt   = pp["amount"] * close_frac
+        entry = pp["entry"]
+        gross = (exit_price - entry) * amt if is_long else (entry - exit_price) * amt
+        fees  = (entry + exit_price) * amt * PAPER_TAKER_FEE
+        pnl   = gross - fees
+        base  = self._paper_balance
+        self._paper_balance += pnl
+        pp["realized"] += pnl
+        pp["amount"]   -= amt
+        self._save()
+        return {
+            "pnl_usd": round(pnl, 2),
+            "pnl_pct": round((pnl / base * 100) if base else 0.0, 2),
+            "balance_after": round(self._paper_balance, 2),
+        }
+
     def record_outcome(self, symbol: str, side: str, entry: float,
                        exit_price: float, sl, tp, reason: str, strategy: str = "") -> dict:
         """Book a closed trade into the paper account and log the outcome.
 
         Computes the *actual* directional P&L (in $ and %) from a $1000
         paper account sized at 5% margin × 20x leverage — for EVERY exit
-        reason, not just take-profits. Returns the outcome dict so callers
-        can hand it straight to the Telegram notifier.
+        reason, not just take-profits. If a paper position was snapshotted at
+        entry (open_paper_position), the remaining size is closed at `exit`
+        and any banked partial (`realized`) is folded into the trade's total
+        so the balance stays coherent. Returns the outcome dict.
         """
         is_long = side in ("buy", "long")
-        # Signed price move in the trade's favour (negative = adverse).
-        price_move = (exit_price - entry) if is_long else (entry - exit_price)
-        risk = abs(entry - sl) if sl else (abs(entry - exit_price) or 1.0)
-        pnl_r = price_move / risk if risk else 0.0
+        pp = self._paper_positions.pop(self._paper_key(symbol, strategy), None)
 
-        # ── Paper-account $ P&L (5% margin × 20x leverage on current balance) ──
-        bal_before = self._paper_balance
-        margin   = bal_before * PAPER_MARGIN_PCT
-        notional = margin * PAPER_LEVERAGE
-        amount   = (notional / entry) if entry else 0.0
-        gross    = price_move * amount
-        fees     = (entry + exit_price) * amount * PAPER_TAKER_FEE
-        pnl_usd  = gross - fees
-        self._paper_balance = bal_before + pnl_usd
-        pnl_pct  = (pnl_usd / bal_before * 100) if bal_before else 0.0
+        if pp is not None:
+            # Coherent close: use the snapshotted size + any banked partials.
+            entry_px = pp["entry"]
+            amt      = pp["amount"]
+            gross    = (exit_price - entry_px) * amt if is_long else (entry_px - exit_price) * amt
+            fees     = (entry_px + exit_price) * amt * PAPER_TAKER_FEE
+            leg_pnl  = gross - fees
+            pnl_usd  = pp["realized"] + leg_pnl
+            self._paper_balance += leg_pnl
+            init_risk = pp["init_amount"] * pp["risk_price"]
+            pnl_r    = (pnl_usd / init_risk) if init_risk > 0 else 0.0
+        else:
+            # Fallback (reconciled/legacy/virtual): size off the balance now.
+            price_move = (exit_price - entry) if is_long else (entry - exit_price)
+            risk = abs(entry - sl) if sl else (abs(entry - exit_price) or 1.0)
+            pnl_r = price_move / risk if risk else 0.0
+            margin   = self._paper_balance * PAPER_MARGIN_PCT
+            notional = margin * PAPER_LEVERAGE
+            amount   = (notional / entry) if entry else 0.0
+            gross    = price_move * amount
+            fees     = (entry + exit_price) * amount * PAPER_TAKER_FEE
+            pnl_usd  = gross - fees
+            self._paper_balance += pnl_usd
+
+        base_bal = self._paper_balance - pnl_usd
+        pnl_pct  = (pnl_usd / base_bal * 100) if base_bal else 0.0
 
         won = pnl_usd > 0
         label, emoji = classify_exit_reason(reason, won)

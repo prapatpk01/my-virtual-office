@@ -666,12 +666,26 @@ class TradingBot:
                         strategy_name, update.close_pct * 100, sym, price, pnl, update.reason,
                     )
                     self._check_cooldown_trigger(pnl)
+                    # Book the partial into the paper account (fixed entry-size).
+                    paper = self._sig.record_paper_partial(
+                        sym, price, update.close_pct, strategy=strategy_name,
+                    )
                     if self.telegram:
                         try:
+                            if paper:
+                                usd_sign = "+" if paper["pnl_usd"] >= 0 else "-"
+                                pnl_line = (
+                                    f"💵 P&L: `{usd_sign}${abs(paper['pnl_usd']):,.2f}` "
+                                    f"(`{'+' if paper['pnl_pct'] >= 0 else ''}{paper['pnl_pct']:.2f}%`)\n"
+                                    f"💰 Balance: `${paper['balance_after']:,.2f}`\n"
+                                )
+                            else:
+                                pnl_line = f"PnL: `{pnl:+.4f}` USDT\n"
                             self.telegram.notify(
-                                f"💰 *Partial TP* `{sym}` [{strategy_name}]\n"
+                                f"💰 *Partial Take-Profit* `{sym}` [{strategy_name}]\n"
                                 f"Closed *{update.close_pct*100:.0f}%* @ `{price:.4f}`\n"
-                                f"PnL: `{pnl:+.4f}` USDT\n_{update.reason}_"
+                                f"{pnl_line}"
+                                f"_{update.reason}_"
                             )
                         except Exception:
                             pass
@@ -1131,6 +1145,10 @@ class TradingBot:
             )
             self.risk.open_position(sym, direction, price, amount, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
+
+            # Snapshot the paper-account position at entry so partial TPs and
+            # the final close book against one fixed size (keeps $ coherent).
+            self._sig.open_paper_position(sym, direction, order.price, sl_p, strategy=strategy_name)
 
             # Track open time for learning engine duration calculation
             pos_key = f"{sym}||{strategy_name}"
