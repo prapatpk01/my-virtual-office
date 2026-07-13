@@ -69,53 +69,84 @@ class Pipeline:
 
     # ── Layer 3b helpers — 5M/15M micro-confirmation ─────────────────────────
     def _needs_micro_confirm(self, df_30m: pd.DataFrame, bias: BiasResult,
-                             side: str) -> tuple[bool, str]:
+                             side: str) -> tuple[bool, str, Optional[pd.Timestamp]]:
         """A trigger needs extra 5M/15M confirmation when it comes from a
-        one-bar volatility spike (a single impulsive bounce can satisfy every
+        volatility-spike 30M bar (a single impulsive bounce can satisfy every
         30M category and reverse the next bar — the ETH case) or when the
-        fast-TF bias is still ambiguous/two-sided despite clearing its floor."""
+        fast-TF bias is still ambiguous/two-sided despite clearing its floor.
+
+        Returns (need, why, after_ts). For a spike, after_ts is the SPIKE
+        BAR'S CLOSE TIME: only 5M/15M bars that closed after the spike count
+        as confirmation. Without this, the "confirmation" bars are the ones
+        INSIDE the spike itself — which by construction agree with it, so
+        the gate passes 100% of the time and proves nothing (measured: 37/37
+        flagged spikes all "passed" under the naive last-3-bars check).
+        The spike is searched over the whole freshness window, so entry ON
+        the spike bar is always blocked (zero post-spike bars yet) and the
+        NEXT 30M bar can still enter — but only if the fast-TF bars formed
+        after the spike actually held the direction.
+        """
         import indicators as ind
         c = self.cfg
         if not c.confirm_enabled:
-            return False, ""
-        # volatility spike: the 30M trigger bar's range vs its own ATR
-        atr30 = float(ind.atr(df_30m, c.sl_atr_period).iloc[-1])
-        rng = float(df_30m["high"].iloc[-1] - df_30m["low"].iloc[-1])
-        if atr30 > 0 and rng >= c.confirm_spike_atr_mult * atr30:
-            return True, f"trigger bar is a {rng/atr30:.1f}xATR spike"
+            return False, "", None
+        # volatility spike on any 30M bar inside the freshness window (the
+        # trigger could be 1 bar old — the spike is then at position -2)
+        atr_series = ind.atr(df_30m, c.sl_atr_period)
+        for back in range(0, min(c.entry_setup_window_bars, len(df_30m) - 1)):
+            i = -1 - back
+            atr_v = float(atr_series.iloc[i])
+            rng = float(df_30m["high"].iloc[i] - df_30m["low"].iloc[i])
+            if atr_v > 0 and rng >= c.confirm_spike_atr_mult * atr_v:
+                spike_close = df_30m.index[i] + pd.Timedelta(self.cfg.tf_entry)
+                return True, f"{rng/atr_v:.1f}xATR spike bar {back} bar(s) ago", spike_close
         # ambiguous fast bias: 5M inside the neutral zone (cleared its loose
         # floor but not actually leaning), or 5M leaning AGAINST the trade
-        # side while 15M leans with it (two-sided read)
+        # side while 15M leans with it (two-sided read). No event bar here,
+        # so the plain last-N-closed-bars check applies (after_ts=None).
         s5, s15 = bias.score_5m, bias.score_15m
         if c.confirm_ambig_lo <= s5 <= c.confirm_ambig_hi:
-            return True, f"5M bias ambiguous ({s5:.0f} in {c.confirm_ambig_lo:.0f}-{c.confirm_ambig_hi:.0f})"
+            return True, f"5M bias ambiguous ({s5:.0f} in {c.confirm_ambig_lo:.0f}-{c.confirm_ambig_hi:.0f})", None
         if side == LONG and s5 < 50 <= s15:
-            return True, f"5M ({s5:.0f}) leaning against LONG while 15M ({s15:.0f}) leans with"
+            return True, f"5M ({s5:.0f}) leaning against LONG while 15M ({s15:.0f}) leans with", None
         if side == SHORT and s5 > 50 >= s15:
-            return True, f"5M ({s5:.0f}) leaning against SHORT while 15M ({s15:.0f}) leans with"
-        return False, ""
+            return True, f"5M ({s5:.0f}) leaning against SHORT while 15M ({s15:.0f}) leans with", None
+        return False, "", None
 
     def _micro_confirm(self, df_15m: Optional[pd.DataFrame],
-                       df_5m: Optional[pd.DataFrame], side: str) -> tuple[bool, str]:
+                       df_5m: Optional[pd.DataFrame], side: str,
+                       after_ts: Optional[pd.Timestamp] = None) -> tuple[bool, str]:
         """Require >= confirm_min_agree of the last confirm_bars CLOSED bars
         on BOTH 15M and 5M to close in the trade direction — sustained follow-
-        through, not a single impulsive bounce. Missing frames fail closed
-        (no confirmation data -> wait) since this gate only runs when the
-        setup was already flagged as spike/ambiguous."""
+        through, not a single impulsive bounce.
+
+        With after_ts set (spike case), ONLY bars that opened at/after the
+        spike bar's close are counted; if fewer than confirm_min_agree such
+        bars exist yet, the answer is "wait" — this is what forces at least
+        one more 30M bar of patience after a spike. Missing frames fail
+        closed (no confirmation data -> wait) since this gate only runs when
+        the setup was already flagged as spike/ambiguous."""
         c = self.cfg
         n, need = c.confirm_bars, c.confirm_min_agree
         counts = {}
         for name, df in (("15m", df_15m), ("5m", df_5m)):
-            if df is None or len(df) < n:
+            if df is None or len(df) < 1:
                 return False, f"no {name} data for confirmation — wait"
-            closes = df["close"].iloc[-n:].values
-            opens = df["open"].iloc[-n:].values
+            sel = df[df.index >= after_ts] if after_ts is not None else df
+            sel = sel.iloc[-n:]
+            if len(sel) < need:
+                return False, (f"only {len(sel)} {name} bar(s) closed since the spike "
+                               f"(need >= {need}) — wait")
+            closes = sel["close"].values
+            opens = sel["open"].values
             fav = (closes > opens) if side == LONG else (closes < opens)
-            counts[name] = int(fav.sum())
-            if counts[name] < need:
-                return False, (f"{name} only {counts[name]}/{n} bars closed with {side} "
+            counts[name] = (int(fav.sum()), len(sel))
+            if counts[name][0] < need:
+                return False, (f"{name} only {counts[name][0]}/{counts[name][1]} bars closed with {side} "
                                f"(need >= {need}) — wait for follow-through")
-        return True, f"confirmed: 15m {counts['15m']}/{n}, 5m {counts['5m']}/{n} bars with {side}"
+        c15, c5 = counts["15m"], counts["5m"]
+        tag = "post-spike " if after_ts is not None else ""
+        return True, f"confirmed: {tag}15m {c15[0]}/{c15[1]}, 5m {c5[0]}/{c5[1]} bars with {side}"
 
     def evaluate(self, df_30m: pd.DataFrame, df_1h: pd.DataFrame,
                  df_4h: pd.DataFrame, df_15m: Optional[pd.DataFrame] = None,
@@ -144,10 +175,11 @@ class Pipeline:
 
         # ── Layer 3b — Micro-confirmation (5M/15M follow-through) ─────────────
         # Only for spike/ambiguous triggers: an impulsive one-bar bounce must
-        # show sustained fast-TF follow-through before it's tradeable.
-        need_confirm, why = self._needs_micro_confirm(df_30m, bias, side)
+        # show sustained fast-TF follow-through — measured AFTER the spike
+        # bar, never from the bars inside it — before it's tradeable.
+        need_confirm, why, after_ts = self._needs_micro_confirm(df_30m, bias, side)
         if need_confirm:
-            ok, detail = self._micro_confirm(df_15m, df_5m, side)
+            ok, detail = self._micro_confirm(df_15m, df_5m, side, after_ts)
             if not ok:
                 return PipelineResult(NONE, entry_score=entry.entry_score,
                                       blocked_layer="CONFIRM",
