@@ -316,7 +316,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
            or len(hist_15m) < cfg.min_bars or len(hist_5m) < cfg.min_bars:
             continue
 
-        sig = engine.evaluate(hist_30m, hist_1h, hist_4h, hist_15m, hist_5m)
+        sig = engine.evaluate(hist_30m, hist_1h, hist_4h, hist_15m, hist_5m, symbol=symbol)
         if sig.direction not in (LONG, SHORT):
             continue
 

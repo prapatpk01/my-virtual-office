@@ -65,6 +65,11 @@ class EntryResult:
     entry_score: float = 0.0   # passed_count/5 * 100, for logging/telegram compat
     adx: float = 0.0
     setup_age: Optional[int] = None    # bars since the earliest active momentum trigger
+    # categories + mandatory + ADX all pass, ignoring the freshness window —
+    # used by the pipeline's acceleration wait-rounds: a setup already in a
+    # confirmation round must not be killed as "stale" mid-round (the round
+    # machine is the timing authority there), but its core signal must hold.
+    core_ok: bool = False
 
 
 def _consecutive_true_run(values: np.ndarray, cap: int = 20) -> Optional[int]:
@@ -176,7 +181,8 @@ class EntryEngine:
             mandatory_cats.append("participation")
         mandatory_ok = all(categories[k] for k in mandatory_cats)
         adx_ok = (not c.entry_adx_gate_enabled) or adx_now >= c.entry_adx_min or adx_rising
-        allow = passed >= c.entry_min_categories and mandatory_ok and adx_ok and in_window
+        core_ok = passed >= c.entry_min_categories and mandatory_ok and adx_ok
+        allow = core_ok and in_window
         score = round(passed / 5.0 * 100.0, 1)
 
         if allow:
@@ -197,4 +203,5 @@ class EntryEngine:
             reason = f"{direction} trigger not ready: {passed}/5 categories (need >= {c.entry_min_categories}, setup_age={setup_age})"
 
         return EntryResult(direction if allow else NONE, allow, passed, categories, reason,
-                           price=price, entry_score=score, adx=adx_now, setup_age=setup_age)
+                           price=price, entry_score=score, adx=adx_now, setup_age=setup_age,
+                           core_ok=core_ok)

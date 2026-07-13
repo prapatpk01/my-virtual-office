@@ -154,7 +154,7 @@ class Bot:
         # Full pipeline computed once per symbol per tick and cached — reused by
         # the entry check below AND by the 5-minute status log, so the health
         # branch and the entry branch never re-run the layers separately.
-        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h, df_15m, df_5m)
+        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h, df_15m, df_5m, symbol=symbol)
         self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):

@@ -401,18 +401,21 @@ class Config:
     entry_min_categories: int = 3   # was 4, per user request
     entry_rel_vol_min: float = 1.2          # softer bar than bias_rel_vol_min — "elevated" for a trigger
 
-    # Layer 3b — Micro-confirmation (5M/15M follow-through), user request:
-    # a trigger that comes from a one-bar volatility spike, or whose fast-TF
-    # bias is still ambiguous/two-sided, must show sustained follow-through
-    # (>= confirm_min_agree of the last confirm_bars closed bars on BOTH 15M
-    # and 5M closing in the trade direction) before entry — don't buy a
-    # single impulsive bounce that reverses the next bar (the ETH case).
-    confirm_enabled: bool = True
-    confirm_spike_atr_mult: float = 2.0     # 30M trigger-bar range >= this x ATR -> needs confirmation
-    confirm_ambig_lo: float = 40.0          # 5M bias inside [lo, hi] -> ambiguous -> needs confirmation
-    confirm_ambig_hi: float = 60.0
-    confirm_bars: int = 3                   # look at the last N closed 15M/5M bars
-    confirm_min_agree: int = 2              # need >= this many closing in the trade direction, per TF
+    # Layer 3b — Prior-acceleration wait rounds (user spec): before entry,
+    # check the last accel_15m_window (4) closed 15M bars and the last
+    # accel_5m_window (10) closed 5M bars for excessive price acceleration
+    # (net move or a single bar beyond that TF's ATR). If flagged, DON'T
+    # enter — wait one round (the next 1x15M + 4x5M closed bars after the
+    # flag). Round holds the direction -> enter. Pullback / reversal ->
+    # wait a second round. Second round also fails (or the layers stop
+    # agreeing while waiting) -> the setup is abandoned; wait for the next.
+    accel_confirm_enabled: bool = True
+    accel_15m_window: int = 4               # lookback bars on 15M for the acceleration check
+    accel_5m_window: int = 10               # lookback bars on 5M
+    accel_net_atr_mult: float = 3.0         # net move across the window >= this x ATR -> flagged
+    accel_bar_atr_mult: float = 2.5         # any single bar's range >= this x ATR -> flagged
+    accel_round_5m_min: int = 3             # round passes if 15M bar favorable AND >= this of its 4 5M bars
+    accel_max_rounds: int = 2               # after this many failed rounds the setup is dead
 
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))
