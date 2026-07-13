@@ -269,6 +269,9 @@ class Bot:
             logger.info("[%s] regime=%s dir=%s(bias)  ENTRY NOT READY  %d/5 categories — %s",
                        symbol, r.label, sig.bias.direction if sig.bias else "-",
                        e.passed_count, e.reason)
+        elif layer == "CONFIRM":
+            logger.info("[%s] regime=%s dir=%s(bias)  AWAITING 5M/15M CONFIRMATION — %s",
+                       symbol, r.label, sig.bias.direction if sig.bias else "-", sig.reason)
         else:
             logger.debug("[%s] no trade: %s", symbol, sig.reason)
 

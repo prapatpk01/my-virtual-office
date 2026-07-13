@@ -401,6 +401,19 @@ class Config:
     entry_min_categories: int = 3   # was 4, per user request
     entry_rel_vol_min: float = 1.2          # softer bar than bias_rel_vol_min — "elevated" for a trigger
 
+    # Layer 3b — Micro-confirmation (5M/15M follow-through), user request:
+    # a trigger that comes from a one-bar volatility spike, or whose fast-TF
+    # bias is still ambiguous/two-sided, must show sustained follow-through
+    # (>= confirm_min_agree of the last confirm_bars closed bars on BOTH 15M
+    # and 5M closing in the trade direction) before entry — don't buy a
+    # single impulsive bounce that reverses the next bar (the ETH case).
+    confirm_enabled: bool = True
+    confirm_spike_atr_mult: float = 2.0     # 30M trigger-bar range >= this x ATR -> needs confirmation
+    confirm_ambig_lo: float = 40.0          # 5M bias inside [lo, hi] -> ambiguous -> needs confirmation
+    confirm_ambig_hi: float = 60.0
+    confirm_bars: int = 3                   # look at the last N closed 15M/5M bars
+    confirm_min_agree: int = 2              # need >= this many closing in the trade direction, per TF
+
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))
         # Hard cap from MAX_POSITIONS, independent of how many symbols are
