@@ -888,8 +888,8 @@ class TradingBot:
             self._sig.lock_strategy(sym, slot_key, signal.type.value)
             self._sig.record_signal(sym, signal.type.value, signal.price,
                                     signal.confidence, strategy=slot_key)
-            if self.telegram:
-                self.telegram.notify_signal(sig_dict)
+            # Notification (with chart) is sent from _execute_signal ONLY after
+            # the position actually opens — no pre-open signal spam.
             await self._execute_signal(signal, slot_key, candles=candles)
             return
 
@@ -909,8 +909,7 @@ class TradingBot:
                 self._sig.lock_strategy(sym, short_key, signal.type.value)
                 self._sig.record_signal(sym, signal.type.value, signal.price,
                                         signal.confidence, strategy=short_key)
-                if self.telegram:
-                    self.telegram.notify_signal(sig_dict)
+                # Notification (with chart) is sent post-open from _execute_signal.
                 await self._execute_signal(signal, short_key, direction="short", candles=candles)
             else:
                 # Normal mode: SELL closes existing long only
@@ -957,8 +956,7 @@ class TradingBot:
         self._sig.lock_strategy(sym, long_key, signal.type.value)
         self._sig.record_signal(sym, signal.type.value, signal.price,
                                 signal.confidence, strategy=long_key)
-        if self.telegram:
-            self.telegram.notify_signal(sig_dict)
+        # Notification (with chart) is sent post-open from _execute_signal.
         await self._execute_signal(signal, long_key, direction="long", candles=candles)
 
     async def _execute_signal(self, signal: Signal, strategy_name: str,
@@ -1209,6 +1207,7 @@ class TradingBot:
                     direction=direction,
                     chart_path=chart_path,
                     early_trend=early_trend,
+                    reason=signal.reason,
                 )
             except Exception as e:
                 logger.warning("Telegram notify_order failed for %s %s (position is still open): %s", sym, direction, e)

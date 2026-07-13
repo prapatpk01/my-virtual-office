@@ -150,7 +150,7 @@ class TelegramNotifier:
                             macro_score: float = None, macro_bias: str = None,
                             selected_strategy: str = None, strategy_confidence: float = None,
                             regime: str = None, direction: str = None,
-                            early_trend: bool = False) -> str:
+                            early_trend: bool = False, reason: str = None) -> str:
         emoji = "🟢" if side == "buy" else "🔴"
         mode  = "📄 PAPER" if paper else "💰 LIVE"
         dir_label = f"LONG" if direction == "long" else "SHORT" if direction == "short" else side.upper()
@@ -162,6 +162,8 @@ class TelegramNotifier:
             f"`{symbol}` — *{dir_label}*",
             f"Entry: `{price:,.4f}`  |  Amount: `{amount}`",
         ]
+        if reason:
+            lines.append(f"_{reason}_")
         if early_trend:
             lines.append("🌱 _Early-trend entry: HMA crossed before the 30m trend confirmed "
                          "(passed the stricter Layer2 quality gate)._")
@@ -195,7 +197,8 @@ class TelegramNotifier:
                      macro_score: float = None, macro_bias: str = None,
                      selected_strategy: str = None, strategy_confidence: float = None,
                      regime: str = None, direction: str = None,
-                     chart_path: str = None, early_trend: bool = False):
+                     chart_path: str = None, early_trend: bool = False,
+                     reason: str = None):
         """Send the order alert. If chart_path is given, sends it as a photo
         with the order details as caption; otherwise sends text only."""
         caption = self.build_order_caption(
@@ -203,6 +206,7 @@ class TelegramNotifier:
             sl=sl, tp=tp, macro_score=macro_score, macro_bias=macro_bias,
             selected_strategy=selected_strategy, strategy_confidence=strategy_confidence,
             regime=regime, direction=direction, early_trend=early_trend,
+            reason=reason,
         )
         if chart_path:
             self.notify_photo(chart_path, caption=caption)
