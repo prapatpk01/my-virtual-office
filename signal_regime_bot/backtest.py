@@ -45,6 +45,24 @@ SLIPPAGE = 0.0003
 _TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
 
 
+def _epoch_ms(index: pd.DatetimeIndex) -> np.ndarray:
+    """
+    Epoch-milliseconds for a DatetimeIndex of ANY unit resolution.
+
+    pandas 2.x stores DatetimeIndex at the source's resolution (datetime64[s/
+    ms/us/ns]) and .view("int64") returns raw ints in the INDEX'S OWN unit —
+    so `view // 1_000_000` is only milliseconds when the index happens to be
+    ns. With mixed-vintage CSVs (ms-headered + us-headerless) this silently
+    produced second- or kilosecond-scale numbers, making every HTF cutoff
+    searchsorted to the END of the dataset: the 15m/1h/4h/5m frames handed
+    to Regime/Bias were a STATIC end-of-data snapshot for the entire run.
+    Normalizing to ns first makes the math correct for every resolution.
+    """
+    if hasattr(index, "as_unit"):
+        return index.as_unit("ns").asi8 // 1_000_000
+    return index.view("int64") // 1_000_000
+
+
 # ── Historical data pagination ────────────────────────────────────────────────
 
 async def fetch_history(client: ExchangeClient, symbol: str, timeframe: str,
@@ -76,8 +94,8 @@ async def fetch_history(client: ExchangeClient, symbol: str, timeframe: str,
     df = df.drop_duplicates("ts").sort_values("ts")
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.set_index("ts")
-    df = df[(df.index.view("int64") // 1_000_000 >= start_ms) &
-           (df.index.view("int64") // 1_000_000 < end_ms)]
+    ms = _epoch_ms(df.index)
+    df = df[(ms >= start_ms) & (ms < end_ms)]
     return df.astype(float)
 
 
@@ -144,10 +162,10 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
     # Precompute HTF/LTF close-time arrays ONCE (O(log n) lookup per bar via
     # searchsorted, instead of an O(n) boolean scan every bar — this alone
     # turns an O(n_30m * n_tf) scan into O(n_30m * log n_tf)).
-    close_ms_1h = (df_1h.index.view("int64") // 1_000_000) + _TF_MS["1h"]
-    close_ms_4h = (df_4h.index.view("int64") // 1_000_000) + _TF_MS["4h"]
-    close_ms_15m = (df_15m.index.view("int64") // 1_000_000) + _TF_MS["15m"]
-    close_ms_5m = (df_5m.index.view("int64") // 1_000_000) + _TF_MS["5m"]
+    close_ms_1h = _epoch_ms(df_1h.index) + _TF_MS["1h"]
+    close_ms_4h = _epoch_ms(df_4h.index) + _TF_MS["4h"]
+    close_ms_15m = _epoch_ms(df_15m.index) + _TF_MS["15m"]
+    close_ms_5m = _epoch_ms(df_5m.index) + _TF_MS["5m"]
 
     # Bound every indicator computation to a trailing window matching what
     # live's DataEngine actually fetches (fetch_limit_entry/bias/regime/...).
@@ -165,10 +183,11 @@ def simulate_symbol(cfg: Config, symbol: str, df_30m: pd.DataFrame, df_1h: pd.Da
     w4h = cfg.fetch_limit_regime
     w15 = cfg.fetch_limit_fast
     w5 = cfg.fetch_limit_micro
+    open_ms_30m = _epoch_ms(df_30m.index)
 
     for i in range(warmup, n - 1):
         bar = df_30m.iloc[i]
-        bar_close_ms = int(df_30m.index[i].value // 1_000_000) + _TF_MS["30m"]
+        bar_close_ms = int(open_ms_30m[i]) + _TF_MS["30m"]
         hist_30m = df_30m.iloc[max(0, i + 1 - w30): i + 1]
 
         cutoff_1h = _closed_htf_cutoff(close_ms_1h, bar_close_ms)
