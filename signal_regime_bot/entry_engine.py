@@ -301,6 +301,7 @@ class EntryEngine:
         cur_f, cur_s = float(hma_f.iloc[-1]), float(hma_s.iloc[-1])
         atr_now = float(atr_s.iloc[-1]) if not np.isnan(atr_s.iloc[-1]) else 0.0
         close = float(df_15m["close"].iloc[-1])
+        open_px = float(df_15m["open"].iloc[-1])   # entry side-of-HMA16 test uses OPEN, per spec
         bar_ts = df_15m.index[-1]
         state = self._get_state(symbol)
 
@@ -315,7 +316,7 @@ class EntryEngine:
                    layer31_passed_count=l31.passed_count)
 
         aligned = (cur_f > cur_s) if is_long else (cur_f < cur_s)
-        close_ok = (close > cur_s) if is_long else (close < cur_s)
+        open_ok = (open_px > cur_s) if is_long else (open_px < cur_s)   # OPEN on the correct side of HMA16
         not_extended = extension_atr <= c.entry_max_distance_from_hma_atr
         cross_pending = (state.cross_direction == direction and not state.cross_used
                         and not state.waiting_for_new_cross)
@@ -342,10 +343,10 @@ class EntryEngine:
                                f"(window {c.entry_cross_window_bars}) — wait for a fresh cross", **base)
         if not aligned:
             return EntryResult(NONE, False, f"L3.3: {direction} blocked — HMA alignment not held", **base)
-        if not close_ok:
+        if not open_ok:
             return EntryResult(NONE, False,
-                               f"L3.3: {direction} blocked — close not past HMA{c.hma_slow_length} "
-                               f"({close:.6f} vs {cur_s:.6f})", **base)
+                               f"L3.3: {direction} blocked — open not past HMA{c.hma_slow_length} "
+                               f"(open {open_px:.6f} vs {cur_s:.6f})", **base)
         if not not_extended:
             return EntryResult(NONE, False,
                                f"L3.3 BLOCKED Reason=PRICE_TOO_EXTENDED ExtensionATR={extension_atr:.2f} "
@@ -405,21 +406,25 @@ class EntryEngine:
         cur_f, cur_s = float(hma_f.iloc[-1]), float(hma_s.iloc[-1])
         prev_f, prev_s = float(hma_f.iloc[-2]), float(hma_s.iloc[-2])
         atr_now = float(atr_s.iloc[-1]) if not np.isnan(atr_s.iloc[-1]) else 0.0
-        close = float(df_15m["close"].iloc[-1])
+        open_px = float(df_15m["open"].iloc[-1])   # price-failure test uses OPEN, per spec
         is_long = position_side == "long"
 
+        # Early exit: HMA cross-back OR the bar's OPEN closes on the wrong
+        # side of HMA16 (past exit_hma_buffer_atr). Using OPEN (= prior bar's
+        # close) makes the price-failure a 1-bar-confirmed break rather than a
+        # same-bar intrabar poke.
         if is_long:
             cross_back = prev_f >= prev_s and cur_f < cur_s
-            price_failure = atr_now > 0 and close < cur_s - atr_now * c.exit_hma_buffer_atr
+            price_failure = atr_now > 0 and open_px < cur_s - atr_now * c.exit_hma_buffer_atr
         else:
             cross_back = prev_f <= prev_s and cur_f > cur_s
-            price_failure = atr_now > 0 and close > cur_s + atr_now * c.exit_hma_buffer_atr
+            price_failure = atr_now > 0 and open_px > cur_s + atr_now * c.exit_hma_buffer_atr
 
         if cross_back:
             return ExitCheckResult(True, HMA_CROSS_REVERSAL,
                                    f"HMA{c.hma_fast_length} crossed back against {position_side}")
         if price_failure:
             return ExitCheckResult(True, PRICE_CLOSED_BEYOND_HMA,
-                                   f"close={close:.6f} HMA{c.hma_slow_length}={cur_s:.6f} "
+                                   f"open={open_px:.6f} HMA{c.hma_slow_length}={cur_s:.6f} "
                                    f"ATRBuffer={atr_now * c.exit_hma_buffer_atr:.6f}")
         return ExitCheckResult(False)
