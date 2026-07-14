@@ -145,6 +145,14 @@ class Config:
     hma_slow_length: int = 16
     entry_max_distance_from_hma_atr: float = 0.8   # anti-chase: reject if |close-HMA16|/ATR exceeds this
     exit_hma_buffer_atr: float = 0.10               # early-exit price-failure buffer past HMA16, in ATR
+    # Early-exit grace period: HMA cross-back / price-failure exits are
+    # SUPPRESSED for this many bars after entry, so the HMAs have time to
+    # separate. Entering AT the cross means HMA10 ~ HMA16 at entry — the
+    # point they're most likely to flip back on noise — so without a grace
+    # window ~70% of trades were exiting almost immediately before reaching
+    # TP (measured across 5 backtests). SL/TP stay active throughout; only
+    # the HMA early-exit waits. 0 disables the grace.
+    exit_grace_bars: int = 3
     # Layer 3.3 grace window: the entry may fire on the cross bar OR up to
     # this many bars after it — a 1-bar allowance so Layer 3.1 (quality) and
     # Layer 3.2 (acceleration confirm) have one extra bar to clear without the

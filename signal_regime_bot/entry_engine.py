@@ -395,9 +395,15 @@ class EntryEngine:
                            entry_score=100.0, layer32_status="clear", **base)
 
     # ── Early exit (shares the Layer 3.3 HMA/ATR computation) ────────────────
-    def check_exit(self, df_15m: pd.DataFrame, position_side: str) -> ExitCheckResult:
-        """position_side: 'long' | 'short' (Position.side casing)."""
+    def check_exit(self, df_15m: pd.DataFrame, position_side: str,
+                   bars_since_entry: Optional[int] = None) -> ExitCheckResult:
+        """position_side: 'long' | 'short' (Position.side casing). While
+        bars_since_entry < exit_grace_bars the HMA early-exit is suppressed
+        (the HMAs are still separating from the entry cross) — SL/TP handled
+        elsewhere are unaffected."""
         c = self.cfg
+        if bars_since_entry is not None and bars_since_entry < c.exit_grace_bars:
+            return ExitCheckResult(False)
         min_len = max(c.hma_slow_length * 2, 30) + 5
         if len(df_15m) < min_len:
             return ExitCheckResult(False)

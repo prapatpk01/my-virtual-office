@@ -57,6 +57,7 @@ class Position:
     regime_at_entry: str = ""
     bias_at_entry: str = ""
     entry_score: float = 0.0
+    entry_bar_ts: Optional[pd.Timestamp] = None             # 15m bar the entry was decided on (for exit grace)
     last_exit_check_bar_ts: Optional[pd.Timestamp] = None   # dedupe: one HMA exit check per closed 15m bar
 
 
@@ -264,6 +265,7 @@ class PositionManager:
             one_r=abs(price - sl), regime_at_entry=regime.name,
             bias_at_entry=(bias.bias if bias is not None else regime.style),
             entry_score=entry_score,
+            entry_bar_ts=(df_15m.index[-1] if len(df_15m) else None),
         )
         self._positions[symbol] = pos
         logger.info("[POS] OPENED %s %s @ %.6f  SL=%.6f TP1=%.6f TP2=%.6f  amount=%.6f",
@@ -407,7 +409,9 @@ class PositionManager:
             return None   # already evaluated this closed bar
         pos.last_exit_check_bar_ts = bar_ts
 
-        check = self.entry_engine.check_exit(df_15m, pos.side)
+        bars_since = (int((df_15m.index > pos.entry_bar_ts).sum())
+                     if pos.entry_bar_ts is not None else None)
+        check = self.entry_engine.check_exit(df_15m, pos.side, bars_since)
         if not check.should_exit:
             return None
 

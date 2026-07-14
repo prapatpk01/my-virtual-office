@@ -151,6 +151,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
     balance = initial_balance
     pos: Optional[BTTrade] = None
     tp1_hit = False
+    entry_fill_i = -1   # 15m bar index the open position filled on (for exit grace)
 
     n = len(df_15m)
     warmup = max(cfg.min_bars, 60)
@@ -249,7 +250,10 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
 
             # HMA early-exit check — every closed 15m bar (this loop already
             # IS the 15m cadence, so this runs once per bar naturally).
-            exit_check = engine.entry_engine.check_exit(hist_15m, pos.direction.lower())
+            # bars_since_entry = 0 on the fill bar; the exit grace suppresses
+            # the HMA exit until it reaches exit_grace_bars.
+            bars_since_entry = i - entry_fill_i if entry_fill_i >= 0 else None
+            exit_check = engine.entry_engine.check_exit(hist_15m, pos.direction.lower(), bars_since_entry)
             if exit_check.should_exit:
                 exit_px = float(bar["close"])
                 remaining = (1.0 - cfg.tp1_fraction) if tp1_hit else 1.0
@@ -312,6 +316,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
         pos.pnl_usd = -entry_fee
         balance -= entry_fee
         tp1_hit = False
+        entry_fill_i = i + 1   # fills at next bar's open
 
     return trades
 
