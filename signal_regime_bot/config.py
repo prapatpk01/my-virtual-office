@@ -132,7 +132,7 @@ class Config:
     bias_score_min: float = 60.0
 
     # ══ Entry Engine — 3 sequential sub-layers, per user spec ═══════════════
-    #   Layer 3.1  30M, 5-category quality pre-filter (>= entry_min_categories,
+    #   Layer 3.1  15M, 5-category quality pre-filter (>= entry_min_categories,
     #              Momentum+Structure mandatory) — NOT a timing trigger.
     #   Layer 3.2  15M+5M, prior-acceleration wait-rounds — holds (not
     #              rejects) a pending Layer 3.3 trigger if the market just
@@ -145,15 +145,20 @@ class Config:
     hma_slow_length: int = 16
     entry_max_distance_from_hma_atr: float = 0.8   # anti-chase: reject if |close-HMA16|/ATR exceeds this
     exit_hma_buffer_atr: float = 0.10               # early-exit price-failure buffer past HMA16, in ATR
+    # Layer 3.3 grace window: the entry may fire on the cross bar OR up to
+    # this many bars after it — a 1-bar allowance so Layer 3.1 (quality) and
+    # Layer 3.2 (acceleration confirm) have one extra bar to clear without the
+    # setup going stale. Past this, the cross is abandoned; wait for a new one.
+    entry_cross_window_bars: int = 1
     one_entry_per_cross: bool = True
     require_new_cross_after_exit: bool = True
     entry_on_closed_candle_only: bool = True
     exit_on_closed_candle_price_break: bool = True
 
-    # Layer 3.1 — 5-category check on 30M (Momentum/Trend/Structure/Liquidity/
+    # Layer 3.1 — 5-category check on 15M (Momentum/Trend/Structure/Liquidity/
     # Participation), needs >= entry_min_categories with Momentum + Structure
-    # mandatory. Uses the same HMA10/16 pair as Layer 3.3 (just on 30M) for
-    # its Trend category rather than a separate HMA period.
+    # mandatory. Uses the same HMA10/16 pair as Layer 3.3 for its Trend
+    # category rather than a separate HMA period.
     entry_min_categories: int = 3
     entry_roc_period: int = 9
     entry_ema_ref: int = 15
@@ -165,20 +170,24 @@ class Config:
     entry_vol_expansion_mult: float = 1.5
     entry_rel_vol_min: float = 1.2
 
-    # Layer 3.2 — prior-acceleration wait rounds: check the last
-    # accel_15m_window (4) closed 15M bars and the last accel_5m_window (10)
-    # closed 5M bars for excessive price acceleration (net move or a single
-    # bar beyond that TF's ATR). If flagged, HOLD the pending Layer 3.3
-    # trigger — wait one round (the next 1x15M + 4x5M closed bars after the
-    # flag). Round holds the direction -> enter. Pullback/reversal -> wait a
-    # second round. Second round also fails -> the setup is abandoned.
+    # Layer 3.2 — prior-acceleration wait rounds, tuned SHORT/FAST so a hold
+    # can confirm within the 1-bar Layer 3.3 grace window (entry_cross_window_bars).
+    # Detection: last accel_15m_window (3) closed 15M bars and accel_5m_window
+    # (6) closed 5M bars — flag if net move or a single bar exceeds that TF's
+    # ATR multiple. On a flag, HOLD the pending trigger for accel_max_rounds (1)
+    # confirmation round: round 1 = the 1x15M bar + accel_5m_per_round (3) 5M
+    # bars closed after the flag (3x5M = 15min = exactly one 15M bar, so it
+    # completes on the very next bar). Round holds direction (15M favorable AND
+    # >= accel_round_5m_min of its 5M bars) -> enter; otherwise the setup is
+    # abandoned (no second round — the grace window is only 1 bar).
     accel_confirm_enabled: bool = True
-    accel_15m_window: int = 4
-    accel_5m_window: int = 10
+    accel_15m_window: int = 3
+    accel_5m_window: int = 6
     accel_net_atr_mult: float = 3.0
     accel_bar_atr_mult: float = 2.5
-    accel_round_5m_min: int = 3
-    accel_max_rounds: int = 2
+    accel_5m_per_round: int = 3       # 5M bars judged per confirmation round (3 x 5m = 1 x 15m)
+    accel_round_5m_min: int = 2       # of those, how many must close in the trade direction
+    accel_max_rounds: int = 1         # single round — must confirm within the 1-bar window
 
     # ── Bias confidence (1H) ─────────────────────────────────────────────────
     # Confidence 0-100 from: 1H ADX, RSI slope, EMA20 slope, volume confirm,

@@ -23,19 +23,18 @@ and may only search for a trigger matching that side.
              the final round abandons the setup.
 
   Layer 3.3  15M — HMA10/HMA16 fresh-cross timing trigger. HMA Cross is an
-             EVENT — the entry fires ONLY on the bar the cross occurred
-             (LONG: bullish cross this bar + close > HMA16; SHORT: bearish
-             cross this bar + close < HMA16). It does NOT wait for a later
-             pullback: if the quality/acceleration layers aren't satisfied
-             on the cross bar itself the setup is skipped and the engine
-             waits for a genuinely NEW cross. One entry per cross; after a
+             EVENT (LONG: bullish cross + close > HMA16; SHORT: bearish
+             cross + close < HMA16). The entry fires on the cross bar OR up
+             to entry_cross_window_bars (1) bars after it — a bounded grace
+             window so Layers 3.1/3.2 have one extra bar to confirm. Past
+             the window the cross is abandoned and the engine waits for a
+             genuinely NEW cross (it does NOT chase a late pullback like the
+             old unbounded armed cycle did). One entry per cross; after a
              close the engine won't fire again until the next cross (which
              is mathematically the opposite direction, since HMA10/16 must
              cross back before it can cross forward again). Also enforces
              HMA alignment, the correct close side, and the anti-chase
-             extension cap (|close-HMA16|/ATR <= 0.8). The ONLY sanctioned
-             post-cross-bar delay is an active Layer 3.2 acceleration hold,
-             whose confirmation window is bounded to accel_max_rounds bars.
+             extension cap (|close-HMA16|/ATR <= 0.8).
 
 This module also owns the HMA-based EARLY EXIT check (`check_exit`) — same
 HMA10/HMA16/ATR values as Layer 3.3, so it lives next to the entry logic
@@ -251,21 +250,22 @@ class EntryEngine:
     def _judge_accel_round(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
                            side: str, flag_ts: pd.Timestamp, rnd: int) -> tuple[Optional[bool], str]:
         c = self.cfg
-        need15, need5 = rnd, 4 * rnd
+        per = c.accel_5m_per_round
+        need15, need5 = rnd, per * rnd
         b15 = df_15m[df_15m.index >= flag_ts]
         b5 = df_5m[df_5m.index >= flag_ts]
         if len(b15) < need15 or len(b5) < need5:
             return None, (f"round {rnd}: waiting for post-flag bars "
                           f"(15m {len(b15)}/{need15}, 5m {len(b5)}/{need5})")
         r15 = b15.iloc[need15 - 1]
-        r5 = b5.iloc[4 * (rnd - 1): 4 * rnd]
+        r5 = b5.iloc[per * (rnd - 1): per * rnd]
         fav15 = (float(r15["close"]) > float(r15["open"])) if side == LONG \
             else (float(r15["close"]) < float(r15["open"]))
         fav5 = ((r5["close"].values > r5["open"].values) if side == LONG
                 else (r5["close"].values < r5["open"].values))
         n5 = int(fav5.sum())
         ok = fav15 and n5 >= c.accel_round_5m_min
-        detail = f"round {rnd}: 15m {'with' if fav15 else 'against'} {side}, 5m {n5}/4 with {side}"
+        detail = f"round {rnd}: 15m {'with' if fav15 else 'against'} {side}, 5m {n5}/{per} with {side}"
         return ok, detail
 
     # ── shared HMA/ATR computation (Layer 3.3 + check_exit) ──────────────────
@@ -319,17 +319,15 @@ class EntryEngine:
         not_extended = extension_atr <= c.entry_max_distance_from_hma_atr
         cross_pending = (state.cross_direction == direction and not state.cross_used
                         and not state.waiting_for_new_cross)
-        # Enter AT the cross: the trigger fires ONLY on the bar the HMA10/HMA16
-        # cross actually occurred (state.cross_id == this closed bar), NOT on a
-        # later pullback. state.cross_id is only ever set to bar_ts by observe()
-        # on a bar where a fresh cross fired, so this equality IS "fresh cross
-        # this bar". The single sanctioned delay is an active Layer 3.2
-        # acceleration hold for THIS cross — its bounded confirmation window
-        # (<= accel_max_rounds bars) is the only case an entry lands after the
-        # cross bar.
-        fresh_cross = state.cross_id == bar_ts and state.cross_direction == direction
-        accel_active = (symbol in self._accel_wait
-                        and self._accel_wait[symbol].get("cross_id") == state.cross_id)
+        # Grace window: the entry fires on the cross bar OR up to
+        # entry_cross_window_bars bars after it — giving Layer 3.1 (quality)
+        # and Layer 3.2 (acceleration confirm) one extra bar to clear without
+        # the setup going stale. bars_since=0 is the cross bar itself. Past the
+        # window, the cross is abandoned; wait for a new one (this is what
+        # bounds it — NOT the old unbounded armed cycle that chased pullbacks).
+        bars_since = (int((df_15m.index > state.cross_id).sum())
+                     if state.cross_id is not None else None)
+        in_window = bars_since is not None and bars_since <= c.entry_cross_window_bars
 
         # ── Layer 3.3 checks ────────────────────────────────────────────────────
         if not cross_pending:
@@ -338,10 +336,10 @@ class EntryEngine:
             else:
                 reason = f"L3.3: {direction} blocked — no pending HMA{c.hma_fast_length}xHMA{c.hma_slow_length} cross"
             return EntryResult(NONE, False, reason, **base)
-        if not (fresh_cross or accel_active):
+        if not in_window:
             return EntryResult(NONE, False,
-                               f"L3.3: {direction} blocked — HMA cross was on an earlier bar; "
-                               f"enter only AT the cross — waiting for a fresh cross", **base)
+                               f"L3.3: {direction} blocked — cross was {bars_since} bar(s) ago "
+                               f"(window {c.entry_cross_window_bars}) — wait for a fresh cross", **base)
         if not aligned:
             return EntryResult(NONE, False, f"L3.3: {direction} blocked — HMA alignment not held", **base)
         if not close_ok:
