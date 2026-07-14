@@ -21,14 +21,19 @@ and may only search for a trigger matching that side.
              the final round abandons the setup.
 
   Layer 3.3  15M — HMA10/HMA16 fresh-cross timing trigger. HMA Cross is an
-             EVENT (one entry per cross cycle), not a continuously-valid
-             condition — tracked per-symbol so a position can only be
-             opened once per cross, and after a close the engine won't
-             fire again until a genuinely NEW cross occurs (mathematically
-             guaranteed to be the opposite direction, since HMA10/16 must
+             EVENT — the entry fires ONLY on the bar the cross occurred
+             (LONG: bullish cross this bar + close > HMA16; SHORT: bearish
+             cross this bar + close < HMA16). It does NOT wait for a later
+             pullback: if the quality/acceleration layers aren't satisfied
+             on the cross bar itself the setup is skipped and the engine
+             waits for a genuinely NEW cross. One entry per cross; after a
+             close the engine won't fire again until the next cross (which
+             is mathematically the opposite direction, since HMA10/16 must
              cross back before it can cross forward again). Also enforces
-             HMA alignment, close on the correct side of HMA16, and the
-             anti-chase extension cap (|close-HMA16|/ATR <= 0.8).
+             HMA alignment, the correct close side, and the anti-chase
+             extension cap (|close-HMA16|/ATR <= 0.8). The ONLY sanctioned
+             post-cross-bar delay is an active Layer 3.2 acceleration hold,
+             whose confirmation window is bounded to accel_max_rounds bars.
 
 This module also owns the HMA-based EARLY EXIT check (`check_exit`) — same
 HMA10/HMA16/ATR values as Layer 3.3, so it lives next to the entry logic
@@ -312,6 +317,17 @@ class EntryEngine:
         not_extended = extension_atr <= c.entry_max_distance_from_hma_atr
         cross_pending = (state.cross_direction == direction and not state.cross_used
                         and not state.waiting_for_new_cross)
+        # Enter AT the cross: the trigger fires ONLY on the bar the HMA10/HMA16
+        # cross actually occurred (state.cross_id == this closed bar), NOT on a
+        # later pullback. state.cross_id is only ever set to bar_ts by observe()
+        # on a bar where a fresh cross fired, so this equality IS "fresh cross
+        # this bar". The single sanctioned delay is an active Layer 3.2
+        # acceleration hold for THIS cross — its bounded confirmation window
+        # (<= accel_max_rounds bars) is the only case an entry lands after the
+        # cross bar.
+        fresh_cross = state.cross_id == bar_ts and state.cross_direction == direction
+        accel_active = (symbol in self._accel_wait
+                        and self._accel_wait[symbol].get("cross_id") == state.cross_id)
 
         # ── Layer 3.3 checks ────────────────────────────────────────────────────
         if not cross_pending:
@@ -320,6 +336,10 @@ class EntryEngine:
             else:
                 reason = f"L3.3: {direction} blocked — no pending HMA{c.hma_fast_length}xHMA{c.hma_slow_length} cross"
             return EntryResult(NONE, False, reason, **base)
+        if not (fresh_cross or accel_active):
+            return EntryResult(NONE, False,
+                               f"L3.3: {direction} blocked — HMA cross was on an earlier bar; "
+                               f"enter only AT the cross — waiting for a fresh cross", **base)
         if not aligned:
             return EntryResult(NONE, False, f"L3.3: {direction} blocked — HMA alignment not held", **base)
         if not close_ok:
