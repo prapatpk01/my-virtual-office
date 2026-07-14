@@ -190,6 +190,11 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
 
         # ── Manage open position against THIS bar's OHLC ────────────────────
         if pos is not None:
+            # Keep cross bookkeeping alive while in a position — live's
+            # evaluate() runs every tick regardless of position state, so the
+            # backtest must observe crosses here too or the two would diverge
+            # on which cross events the cycle state has seen.
+            engine.entry_engine.observe(hist_15m, symbol)
             is_long = pos.direction == LONG
             hi, lo = float(bar["high"]), float(bar["low"])
 

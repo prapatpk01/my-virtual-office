@@ -119,6 +119,45 @@ class EntryEngine:
         self._state.pop(symbol, None)
         self._accel_wait.pop(symbol, None)
 
+    def observe(self, df_15m: pd.DataFrame, symbol: str) -> None:
+        """Record any fresh HMA cross on the last closed 15M bar into the
+        per-symbol cycle state. MUST be called once per closed bar regardless
+        of what Bias/L3.1 decide on that bar — cross events are structural
+        facts, and skipping them (e.g. because a quality filter failed that
+        bar, or a position was open) leaves waiting_for_new_cross stuck long
+        after a genuine new cross occurred, silently blocking valid entries.
+
+        Idempotent per bar (keyed on the bar timestamp): live re-evaluates
+        every ~30s inside the same 15M bar, and without the key guard each
+        tick would re-fire the detection and reset cross_used /
+        waiting_for_new_cross — allowing a second entry on the same cross if
+        a position opened and closed quickly within one bar."""
+        c = self.cfg
+        min_len = max(c.hma_slow_length * 2, 30) + 5
+        if df_15m is None or len(df_15m) < min_len:
+            return
+        state = self._get_state(symbol)
+        bar_ts = df_15m.index[-1]
+        if state.cross_id == bar_ts:
+            return   # this bar's cross already recorded — never re-process
+        closes = df_15m["close"]
+        hma_f = ind.hma(closes, c.hma_fast_length)
+        hma_s = ind.hma(closes, c.hma_slow_length)
+        cur_f, cur_s = float(hma_f.iloc[-1]), float(hma_s.iloc[-1])
+        prev_f, prev_s = float(hma_f.iloc[-2]), float(hma_s.iloc[-2])
+        long_cross = prev_f <= prev_s and cur_f > cur_s
+        short_cross = prev_f >= prev_s and cur_f < cur_s
+        if not (long_cross or short_cross):
+            return
+        state.cross_direction = LONG if long_cross else SHORT
+        state.cross_id = bar_ts
+        state.cross_used = False
+        state.waiting_for_new_cross = False
+        # a brand new cross invalidates any Layer 3.2 wait tied to an older one
+        old_wait = self._accel_wait.get(symbol)
+        if old_wait is not None and old_wait.get("cross_id") != bar_ts:
+            self._accel_wait.pop(symbol, None)
+
     # ── Layer 3.1 — 5-category quality pre-filter (30M) ──────────────────────
     def _layer31(self, df_30m: pd.DataFrame, direction: str) -> Layer31Result:
         c = self.cfg
@@ -238,6 +277,10 @@ class EntryEngine:
         if direction not in (LONG, SHORT):
             return EntryResult(NONE, False, "no direction from Bias layer — nothing to time")
 
+        # Cross bookkeeping first — a structural fact, recorded regardless of
+        # what the quality layers decide on this bar (idempotent per bar).
+        self.observe(df_15m, symbol)
+
         # ── Layer 3.1 ──────────────────────────────────────────────────────────
         l31 = self._layer31(df_30m, direction)
         if not l31.passed:
@@ -249,24 +292,10 @@ class EntryEngine:
 
         hma_f, hma_s, atr_s = self._hma_atr(df_15m, c)
         cur_f, cur_s = float(hma_f.iloc[-1]), float(hma_s.iloc[-1])
-        prev_f, prev_s = float(hma_f.iloc[-2]), float(hma_s.iloc[-2])
         atr_now = float(atr_s.iloc[-1]) if not np.isnan(atr_s.iloc[-1]) else 0.0
         close = float(df_15m["close"].iloc[-1])
         bar_ts = df_15m.index[-1]
-
-        long_cross = prev_f <= prev_s and cur_f > cur_s
-        short_cross = prev_f >= prev_s and cur_f < cur_s
-
         state = self._get_state(symbol)
-        if long_cross or short_cross:
-            state.cross_direction = LONG if long_cross else SHORT
-            state.cross_id = bar_ts
-            state.cross_used = False
-            state.waiting_for_new_cross = False
-            # a brand new cross invalidates any Layer 3.2 wait tied to the old one
-            old_wait = self._accel_wait.get(symbol)
-            if old_wait is not None and old_wait.get("cross_id") != state.cross_id:
-                self._accel_wait.pop(symbol, None)
 
         if atr_now <= 0 or np.isnan(atr_now):
             return EntryResult(NONE, False, "ATR unavailable", price=close, hma_fast=cur_f,

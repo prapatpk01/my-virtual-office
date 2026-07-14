@@ -70,6 +70,13 @@ class Pipeline:
         has_15m = df_15m is not None and len(df_15m)
         price = float(df_15m["close"].iloc[-1]) if has_15m else 0.0
 
+        # HMA cross bookkeeping runs on EVERY evaluation, before any layer can
+        # short-circuit — a cross that fires while Bias reads NO TRADE is
+        # still a real cross event, and missing it would leave the Layer 3.3
+        # cycle state (waiting_for_new_cross) stuck. Idempotent per bar.
+        if has_15m:
+            self.entry_engine.observe(df_15m, symbol)
+
         # ── Layer 1 — Regime (classification only) ────────────────────────────
         regime = self.regime_engine.analyze(df_4h, df_1h)
         base = dict(price=price, regime=regime)
