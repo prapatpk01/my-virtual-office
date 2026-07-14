@@ -2,7 +2,7 @@
 Decision Pipeline — the single orchestrator both main.py (live) and
 backtest.py call, so the two can never diverge in logic.
 
-    Regime -> Bias -> Direction -> Entry -> Execution
+    Regime -> Bias -> Direction -> Entry (3.1 -> 3.2 -> 3.3) -> Execution
 
 "Directional Trading Architecture, not Signal-Driven Trading":
   - Layer 1 (Regime, 4H+1H) ONLY classifies market state. It never opens a
@@ -10,10 +10,13 @@ backtest.py call, so the two can never diverge in logic.
   - Layer 2 (Bias, 1H+15M+5M) ONLY picks Trading Direction (Long Only /
     Short Only / No Trade) via a Dynamic Combined Bias Score. After this
     layer, no other layer may change direction.
-  - Layer 3 (Entry, 15M) ONLY times the trigger, via an HMA10/HMA16
-    fresh-cross cycle (see entry_engine.py) — it receives the fixed
-    direction and searches exclusively for a trigger on that side. It has
-    no right to open the opposite side even if one appears.
+  - Layer 3 (Entry) receives the fixed direction and searches exclusively
+    for a trigger on that side — it has no right to open the opposite
+    side even if one appears. Three sequential sub-layers, all must clear
+    (see entry_engine.py for the full detail):
+      3.1  30M 5-category quality pre-filter
+      3.2  15M+5M prior-acceleration wait-rounds
+      3.3  15M HMA10/HMA16 fresh-cross timing trigger + anti-chase
 
 Each layer can only narrow what the next sees. The first block short-
 circuits the rest and records which layer blocked, with its reason, so the
@@ -53,7 +56,7 @@ class PipelineResult:
 
 
 class Pipeline:
-    """Regime (classify) -> Bias (direction) -> Entry (15M HMA cross timing)."""
+    """Regime (classify) -> Bias (direction) -> Entry (3.1 -> 3.2 -> 3.3)."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -61,8 +64,9 @@ class Pipeline:
         self.bias_engine = BiasEngine(cfg)
         self.entry_engine = EntryEngine(cfg)
 
-    def evaluate(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame, df_15m: pd.DataFrame,
-                 df_5m: Optional[pd.DataFrame] = None, symbol: str = "") -> PipelineResult:
+    def evaluate(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame, df_30m: pd.DataFrame,
+                 df_15m: pd.DataFrame, df_5m: Optional[pd.DataFrame] = None,
+                 symbol: str = "") -> PipelineResult:
         has_15m = df_15m is not None and len(df_15m)
         price = float(df_15m["close"].iloc[-1]) if has_15m else 0.0
 
@@ -78,11 +82,11 @@ class Pipeline:
 
         side = LONG if bias.direction == B_LONG else SHORT
 
-        # ── Layer 3 — Entry (15M HMA10/HMA16 fresh-cross cycle) ───────────────
-        if not has_15m:
-            entry = EntryResult(NONE, False, "no 15m frame available for entry")
+        # ── Layer 3 — Entry (3.1 30M pre-filter -> 3.2 accel wait -> 3.3 HMA) ──
+        if not has_15m or df_30m is None or not len(df_30m):
+            entry = EntryResult(NONE, False, "missing 30m/15m frame for entry")
         else:
-            entry = self.entry_engine.analyze(df_15m, side, symbol)
+            entry = self.entry_engine.analyze(df_30m, df_15m, df_5m, side, symbol)
         common = dict(bias=bias, entry=entry, **base)
 
         if entry.allow_entry:

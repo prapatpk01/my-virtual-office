@@ -86,9 +86,8 @@ class Config:
     max_positions_env: int   = field(default_factory=lambda: _env_int("MAX_POSITIONS", 2))
 
     # ── Timeframes (ENV, default per spec) ───────────────────────────────────
-    # tf_entry/TIMEFRAME_ENTRY is no longer fetched or used — Entry moved to
-    # 15M (entry_timeframe, below). Kept only so an existing Railway env var
-    # of that name doesn't error; not read anywhere.
+    # tf_entry/TIMEFRAME_ENTRY = Entry Layer 3.1's quality pre-filter
+    # timeframe; the actual timing trigger (Layer 3.3) runs on tf_fast (15M).
     tf_entry: str  = field(default_factory=lambda: os.environ.get("TIMEFRAME_ENTRY", "30m"))
     tf_bias: str   = field(default_factory=lambda: os.environ.get("TIMEFRAME_BIAS", "1h"))
     tf_regime: str = field(default_factory=lambda: os.environ.get("TIMEFRAME_REGIME", "4h"))
@@ -132,11 +131,15 @@ class Config:
     bias_structure_right: int = 3
     bias_score_min: float = 60.0
 
-    # ══ Entry Engine (15M) — HMA10/HMA16 fresh-cross cycle ══════════════════
-    # Replaces the earlier 5-category/ADX-gate/freshness-window system and
-    # the Layer 3.2 acceleration wait-rounds (both removed) per explicit
-    # user spec: HMA cross is an EVENT (one entry per cross cycle), not a
-    # continuously-valid condition. See entry_engine.py.
+    # ══ Entry Engine — 3 sequential sub-layers, per user spec ═══════════════
+    #   Layer 3.1  30M, 5-category quality pre-filter (>= entry_min_categories,
+    #              Momentum+Structure mandatory) — NOT a timing trigger.
+    #   Layer 3.2  15M+5M, prior-acceleration wait-rounds — holds (not
+    #              rejects) a pending Layer 3.3 trigger if the market just
+    #              moved too violently, until follow-through confirms it.
+    #   Layer 3.3  15M, HMA10/HMA16 fresh-cross timing trigger + anti-chase +
+    #              one-entry-per-cross state machine. Decides WHEN, once 3.1
+    #              and 3.2 clear.
     entry_timeframe: str = "15m"
     hma_fast_length: int = 10
     hma_slow_length: int = 16
@@ -146,6 +149,36 @@ class Config:
     require_new_cross_after_exit: bool = True
     entry_on_closed_candle_only: bool = True
     exit_on_closed_candle_price_break: bool = True
+
+    # Layer 3.1 — 5-category check on 30M (Momentum/Trend/Structure/Liquidity/
+    # Participation), needs >= entry_min_categories with Momentum + Structure
+    # mandatory. Uses the same HMA10/16 pair as Layer 3.3 (just on 30M) for
+    # its Trend category rather than a separate HMA period.
+    entry_min_categories: int = 3
+    entry_roc_period: int = 9
+    entry_ema_ref: int = 15
+    entry_macd_fast: int = 12
+    entry_macd_slow: int = 26
+    entry_macd_signal: int = 9
+    entry_sweep_lookback: int = 10
+    entry_wick_reject_frac: float = 0.5
+    entry_vol_expansion_mult: float = 1.5
+    entry_rel_vol_min: float = 1.2
+
+    # Layer 3.2 — prior-acceleration wait rounds: check the last
+    # accel_15m_window (4) closed 15M bars and the last accel_5m_window (10)
+    # closed 5M bars for excessive price acceleration (net move or a single
+    # bar beyond that TF's ATR). If flagged, HOLD the pending Layer 3.3
+    # trigger — wait one round (the next 1x15M + 4x5M closed bars after the
+    # flag). Round holds the direction -> enter. Pullback/reversal -> wait a
+    # second round. Second round also fails -> the setup is abandoned.
+    accel_confirm_enabled: bool = True
+    accel_15m_window: int = 4
+    accel_5m_window: int = 10
+    accel_net_atr_mult: float = 3.0
+    accel_bar_atr_mult: float = 2.5
+    accel_round_5m_min: int = 3
+    accel_max_rounds: int = 2
 
     # ── Bias confidence (1H) ─────────────────────────────────────────────────
     # Confidence 0-100 from: 1H ADX, RSI slope, EMA20 slope, volume confirm,

@@ -2,13 +2,14 @@
 Signal Regime Bias Strategy — live bot entry point.
 
 Loop: every `poll_interval_sec`, for each symbol —
-  1. fetch 5m/15m/1h/4h closed bars (skip symbol if any TF has < min_bars)
+  1. fetch 5m/15m/30m/1h/4h closed bars (skip symbol if any TF has < min_bars)
   2. if a position is open: check SL/TP1/TP2 against the live ticker every
      tick; run the HMA10/HMA16 early-exit check once per newly-closed 15m bar
   3. else: once per newly-closed 15m bar, evaluate SignalEngine (Regime 4H+1H
-     -> Bias 1H+15M+5M -> Entry 15M HMA cross) and open a position if the
-     pipeline clears and risk manager allows a new entry (no cooldown, no
-     daily limit breach)
+     -> Bias 1H+15M+5M -> Entry: 3.1 30M 5-category pre-filter -> 3.2 15M/5M
+     acceleration wait-rounds -> 3.3 15M HMA10/16 cross) and open a position
+     if the pipeline clears and risk manager allows a new entry (no cooldown,
+     no daily limit breach)
 
 Every branch that mutates state is wrapped so one symbol's exception can
 never kill the loop or leave an order half-placed with silent failure.
@@ -150,13 +151,14 @@ class Bot:
 
         df_1h = frames[self.cfg.tf_bias]
         df_4h = frames[self.cfg.tf_regime]
+        df_30m = frames[self.cfg.tf_entry]
         df_15m = frames[self.cfg.tf_fast]
         df_5m = frames[self.cfg.tf_micro]
 
         # Full pipeline computed once per symbol per tick and cached — reused by
         # the entry check below AND by the 5-minute status log, so the exit
         # branch and the entry branch never re-run the layers separately.
-        sig = self.signal_engine.evaluate(df_1h, df_4h, df_15m, df_5m, symbol=symbol)
+        sig = self.signal_engine.evaluate(df_1h, df_4h, df_30m, df_15m, df_5m, symbol=symbol)
         self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):
@@ -265,8 +267,9 @@ class Bot:
                        b.score_1h, b.score_15m, b.score_5m, b.reason)
         elif layer == "ENTRY" and sig.entry is not None:
             e = sig.entry
-            logger.info("[%s] regime=%s dir=%s(bias)  NO ENTRY  HMA%d=%.6f HMA%d=%.6f ext=%.2fATR — %s",
-                       symbol, r.label, sig.bias.direction if sig.bias else "-",
+            logger.info("[%s] regime=%s dir=%s(bias)  NO ENTRY  L3.1=%d/5  HMA%d=%.6f HMA%d=%.6f "
+                       "ext=%.2fATR — %s",
+                       symbol, r.label, sig.bias.direction if sig.bias else "-", e.layer31_passed_count,
                        self.cfg.hma_fast_length, e.hma_fast, self.cfg.hma_slow_length, e.hma_slow,
                        e.extension_atr, e.reason)
         else:
@@ -449,7 +452,8 @@ class Bot:
                     bias_str = f"`{b.direction}` 1H`{b.score_1h:.0f}` 15M`{b.score_15m:.0f}` 5M`{b.score_5m:.0f}`"
                 else:
                     bias_str = "`—`"
-                entry_str = f"`ext={sig.entry.extension_atr:.2f}ATR`" if sig.entry is not None else "`-`"
+                entry_str = (f"`L3.1={sig.entry.layer31_passed_count}/5 ext={sig.entry.extension_atr:.2f}ATR`"
+                            if sig.entry is not None else "`-`")
                 lines.append(
                     f"`{sym}` {pos_label}\n"
                     f"  regime `{sig.regime.label}`\n"
@@ -511,7 +515,8 @@ class Bot:
                 bias_label = f"{sig.bias.direction}(1H={sig.bias.score_1h:.0f},15M={sig.bias.score_15m:.0f},5M={sig.bias.score_5m:.0f})"
             else:
                 bias_label = "—"
-            entry_label = f"ext={sig.entry.extension_atr:.2f}ATR" if sig.entry is not None else "-"
+            entry_label = (f"L3.1={sig.entry.layer31_passed_count}/5 ext={sig.entry.extension_atr:.2f}ATR"
+                          if sig.entry is not None else "-")
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(
                 "  %-16s %-24s regime=%-20s bias=%-40s entry=%-5s dir=%s%s%s",
