@@ -548,9 +548,10 @@ class TradingBot:
         Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree on
         up or down), Layer2 (trend-quality score — per-TF Align/ADX/Chop/
         Volume, weighted 15m 65% + 1H 35%, must clear layer2_threshold),
-        Layer3 (15m HMA10/20 cross with-trend + price above/below EMA10 +
-        within 1.5xATR of EMA20) — instead of the ai_expert-only fields
-        (macro/context/mtf) that don't apply to this strategy."""
+        Layer3 (15m HMA10/16 cross with-trend + location/structure-room
+        filter + price above/below EMA10 + within 1.5xATR of EMA20) —
+        instead of the ai_expert-only fields (macro/context/mtf) that don't
+        apply to this strategy."""
         sma_trend  = tc.get("sma_trend", "?")
         ema1020    = tc.get("ema10_20_trend", "?")
         slope      = tc.get("ema20_slope", "?")
@@ -573,9 +574,21 @@ class TradingBot:
             "waiting_cross":            "wait_hma_cross (Layer3)",
             "ema_ref_fail":             "cross_ok/ema10_fail (Layer3)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3)",
+            "location_reject":          "cross_ok/location_fail (Layer3)",
             "entered":                  "entered",
         }
         entry_str = _STATUS_LABEL.get(status, status)
+
+        loc = tc.get("location") or {}
+        loc_str = ""
+        if loc.get("location_type") not in (None, "UNKNOWN"):
+            room_r = loc.get("structure_room_r")
+            room_s = f"{room_r:.2f}R" if room_r is not None else "n/a"
+            loc_str = f" loc={loc.get('location_type')} room={room_s}"
+            if not loc.get("valid"):
+                loc_str += f" REJECT({loc.get('reason')})"
+            elif loc.get("penalize"):
+                loc_str += " penalized"
 
         l1_str = f"SMA={sma_trend} EMA10/20={ema1020} slope={slope} MACD={macd_trend}"
         if l2_score is not None:
@@ -605,10 +618,10 @@ class TradingBot:
         logger.info(
             "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s "
             "L2[quality=%s] pos=%-5s | "
-            "L3[%s ema10=%s dist=%s]=%s | %s",
+            "L3[%s ema10=%s dist=%s]%s=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
             l1_str, confirmed, score_str,
-            open_pos, cross_str, ema_str, dist_str, entry_str, reason,
+            open_pos, cross_str, ema_str, dist_str, loc_str, entry_str, reason,
         )
 
     # ------------------------------------------------------------------

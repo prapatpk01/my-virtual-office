@@ -134,10 +134,21 @@ class TrendConfirmStrategy(BaseStrategy):
         dist_ema_ref: int = 20,     # distance-to-trend chase-guard is measured vs this EMA
         fresh_trend_bars: int = 2,  # HMA-cross lookback when the trend just confirmed (early trend)
         max_dist_atr_mult: float = 1.5,
+        # Location & structure-room filter (lightweight; avoids late/blocked HMA crosses)
+        use_location_filter: bool = True,
+        structure_pivot_left: int = 2,
+        structure_pivot_right: int = 2,
+        zone_width_atr_1h: float = 0.20,
+        zone_width_atr_4h: float = 0.25,
+        hard_zone_distance_atr: float = 0.35,
+        min_structure_room_r: float = 0.70,
+        preferred_structure_room_r: float = 1.00,
+        location_threshold_penalty: float = 5.0,
+        reject_midrange_when_choppy: bool = True,
         # Exit
         exit_on_hma20_open: bool = False,   # optional fast exit on N closes past HMA20 (off by default —
                                             #   it whipsawed trades out before the trend developed; a real
-                                            #   HMA10/20 cross-back is the primary exit)
+                                            #   HMA10/16 cross-back is the primary exit)
         exit_hma20_confirm_bars: int = 2,   # N consecutive closes past HMA20 required when the above is on
         # Partial take-profit + break-even (2-TP scheme)
         use_partial_tp: bool = True,        # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
@@ -185,6 +196,17 @@ class TrendConfirmStrategy(BaseStrategy):
         self.dist_ema_ref = dist_ema_ref
         self.fresh_trend_bars = fresh_trend_bars
         self.max_dist_atr_mult = max_dist_atr_mult
+
+        self.use_location_filter = use_location_filter
+        self.structure_pivot_left = structure_pivot_left
+        self.structure_pivot_right = structure_pivot_right
+        self.zone_width_atr_1h = zone_width_atr_1h
+        self.zone_width_atr_4h = zone_width_atr_4h
+        self.hard_zone_distance_atr = hard_zone_distance_atr
+        self.min_structure_room_r = min_structure_room_r
+        self.preferred_structure_room_r = preferred_structure_room_r
+        self.location_threshold_penalty = location_threshold_penalty
+        self.reject_midrange_when_choppy = reject_midrange_when_choppy
 
         self.exit_on_hma20_open = exit_on_hma20_open
         self.exit_hma20_confirm_bars = exit_hma20_confirm_bars
@@ -286,6 +308,23 @@ class TrendConfirmStrategy(BaseStrategy):
         dist_atr = (abs(close_price - l3["dist_ema_val"]) / l3["atr_val"]
                    if (l3 is not None and l3["atr_val"] > 0) else None)
 
+        c4h = mtf.get("4h", [])
+        location = self._location_context(
+            direction=trend,
+            entry_price=close_price,
+            atr_15m=l3["atr_val"] if l3 is not None else 0.0,
+            candles_15m=candles,
+            candles_1h=c1h,
+            candles_4h=c4h,
+            q15=q15,
+        ) if (self.use_location_filter and trend and l3 is not None) else self._neutral_location_context()
+
+        # Mildly poor location raises the quality threshold instead of rejecting.
+        # Only strong structure conflicts or critically low room are hard rejects.
+        location_adjusted_l2_thr = l2_thr + (
+            self.location_threshold_penalty if location["penalize"] else 0.0
+        )
+
         def dbg(entry_status: str) -> dict:
             return {"trend_confirm": {
                 "sma_trend": l1["sma_dir"], "ema10_20_trend": l1["ema1020_dir"],
@@ -296,7 +335,9 @@ class TrendConfirmStrategy(BaseStrategy):
                 "q15_breakdown": q15["breakdown"] if q15 else None,
                 "q1h_breakdown": q1h["breakdown"] if q1h else None,
                 "layer2_score": round(l2_score, 1) if l2_score is not None else None,
-                "layer2_threshold": l2_thr,
+                "layer2_threshold": location_adjusted_l2_thr,
+                "base_layer2_threshold": l2_thr,
+                "location": location,
                 "open_position": self._open_position,
                 "entry_status": entry_status,
                 "fresh_trend_bars": fb, "trend_age_bars": trend_age, "is_early_trend": is_early_trend,
@@ -319,7 +360,7 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price, "Layer2: quality indicators still warming up (15m/1H)",
                               metadata=dbg("no_trend"))
 
-        if l2_score <= l2_thr:
+        if l2_score <= location_adjusted_l2_thr:
             score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
                           f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
             # Early-trend fail is DEFINITIVE: an HMA cross led the confirm and
@@ -334,16 +375,23 @@ class TrendConfirmStrategy(BaseStrategy):
                 else:
                     self._last_hma_cross_down_ts = None
                 return self._hold(current_price,
-                    f"Layer2 FAIL (early trend): quality {l2_score:.0f} <= {l2_thr:.0f} — "
+                    f"Layer2 FAIL (early trend): quality {l2_score:.0f} <= {location_adjusted_l2_thr:.0f} — "
                     f"early setup rejected, cross spent {score_note}",
                     metadata=dbg("early_quality_fail"))
             return self._hold(current_price,
-                f"Layer2: trend quality {l2_score:.0f} <= {l2_thr:.0f} {score_note}",
+                f"Layer2: trend quality {l2_score:.0f} <= {location_adjusted_l2_thr:.0f} {score_note}",
                 metadata=dbg("quality_fail"))
 
         # ── Layer 3: Entry (15m), always with the confirmed trend ──────────
         if l3 is None:
             return self._hold(current_price, "Layer3: indicators still warming up (15m)", metadata=dbg("no_trend"))
+
+        if self.use_location_filter and not location["valid"]:
+            return self._hold(
+                current_price,
+                f"Location/Structure REJECT: {location['reason']}",
+                metadata=dbg("location_reject"),
+            )
 
         dist_ok = dist_atr is not None and dist_atr <= self.max_dist_atr_mult
         dist_disp = f"{dist_atr:.2f}" if dist_atr is not None else "n/a"
@@ -368,11 +416,13 @@ class TrendConfirmStrategy(BaseStrategy):
             self._open_position = "long"
             self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
             meta = dbg("entered")
-            meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
+            meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio,
+                         "structure_room_r": location.get("structure_room_r"),
+                         "nearest_opposing_zone": location.get("nearest_opposing_zone")})
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                 reason=f"Uptrend confirmed (Layer1 30m) + quality {l2_score:.0f}"
-                       f"{' [early]' if is_early_trend else ''} >{l2_thr:.0f} (Layer2) + "
+                       f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} (Layer2) + "
                        f"HMA{self.hma_fast}↑HMA{self.hma_slow} {hma_up_ago}b ago, above EMA{self.entry_ema_ref}, "
                        f"{dist_atr:.2f}xATR from EMA{self.dist_ema_ref} (Layer3)",
                 confidence=1.0,
@@ -398,11 +448,13 @@ class TrendConfirmStrategy(BaseStrategy):
         self._open_position = "short"
         self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
         meta = dbg("entered")
-        meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio})
+        meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio,
+                     "structure_room_r": location.get("structure_room_r"),
+                     "nearest_opposing_zone": location.get("nearest_opposing_zone")})
         return Signal(
             type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
             reason=f"Downtrend confirmed (Layer1 30m) + quality {l2_score:.0f}"
-                   f"{' [early]' if is_early_trend else ''} >{l2_thr:.0f} (Layer2) + "
+                   f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} (Layer2) + "
                    f"HMA{self.hma_fast}↓HMA{self.hma_slow} {hma_down_ago}b ago, below EMA{self.entry_ema_ref}, "
                    f"{dist_atr:.2f}xATR from EMA{self.dist_ema_ref} (Layer3)",
             confidence=1.0,
@@ -416,7 +468,7 @@ class TrendConfirmStrategy(BaseStrategy):
            tp1_r (0.625R, halfway to the 1.25R final TP), close
            tp1_close_pct (50%) and move SL to break-even + be_offset_r
            (BE + 0.1R). Fires once.
-        2. Exit the runner (bar-based): HMA10/20 cross-back (a genuine trend
+        2. Exit the runner (bar-based): HMA10/16 cross-back (a genuine trend
            reversal), OR — only when exit_on_hma20_open is set —
            exit_hma20_confirm_bars consecutive closes past HMA20. The final
            TP (1.25R) and the trailed SL are the hard bounds bot.py's risk
@@ -499,7 +551,7 @@ class TrendConfirmStrategy(BaseStrategy):
 
     def record_closed_trade(self, exit_price: float, exit_reason: str, duration_min: float = 0.0) -> None:
         """Called by bot.py after ANY close, including the risk-manager's
-        hard SL/TP fallback firing before HMA10/20 crosses back — without
+        hard SL/TP fallback firing before HMA10/16 crosses back — without
         this, _open_position would stay set forever and analyze() would
         refuse all future entries."""
         self._reset_position_state()
@@ -526,6 +578,165 @@ class TrendConfirmStrategy(BaseStrategy):
         self._tp1_done = False
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _neutral_location_context(self) -> dict:
+        return {
+            "valid": True, "penalize": False, "reason": "filter_off_or_no_context",
+            "structure_room_r": None, "nearest_opposing_zone": None,
+            "location_type": "UNKNOWN", "structure_1h": "UNKNOWN",
+            "bearish_sweep": False, "bullish_sweep": False,
+        }
+
+    def _location_context(self, direction: str, entry_price: float, atr_15m: float,
+                          candles_15m: list, candles_1h: list, candles_4h: list,
+                          q15: Optional[dict] = None) -> dict:
+        """Lightweight location and structure-room filter.
+
+        It rejects only obvious conflicts: entering directly into an active HTF
+        opposing pivot zone, confirmed opposite 1H swing structure, wrong-side
+        liquidity sweep, or critically insufficient room. Borderline location
+        merely raises Layer-2's threshold so trade frequency is preserved.
+        """
+        if atr_15m <= 0:
+            return self._neutral_location_context()
+
+        p1h = self._confirmed_pivots(candles_1h, self.structure_pivot_left, self.structure_pivot_right)
+        p4h = self._confirmed_pivots(candles_4h, self.structure_pivot_left, self.structure_pivot_right)
+        structure_1h = self._swing_structure(p1h)
+
+        # Strong opposite 1H structure is a hard conflict. A single lower high
+        # is not enough; both highs and lows must confirm the opposing sequence.
+        if direction == "up" and structure_1h == "bear":
+            return {**self._neutral_location_context(), "valid": False,
+                    "reason": "1H confirmed LH/LL structure", "structure_1h": structure_1h}
+        if direction == "down" and structure_1h == "bull":
+            return {**self._neutral_location_context(), "valid": False,
+                    "reason": "1H confirmed HH/HL structure", "structure_1h": structure_1h}
+
+        levels = []
+        for tf, piv, bars, mult in (("1h", p1h, candles_1h, self.zone_width_atr_1h),
+                                    ("4h", p4h, candles_4h, self.zone_width_atr_4h)):
+            tf_atr = self._last_atr(bars, self.atr_period)
+            width = max((tf_atr or atr_15m) * mult, atr_15m * 0.15)
+            wanted = "high" if direction == "up" else "low"
+            for pivot in piv:
+                if pivot["type"] == wanted:
+                    levels.append({"timeframe": tf, "price": pivot["price"], "width": width})
+
+        if direction == "up":
+            opposing = [z for z in levels if z["price"] > entry_price]
+            nearest = min(opposing, key=lambda z: z["price"] - entry_price, default=None)
+            room = (nearest["price"] - nearest["width"] - entry_price) if nearest else None
+        else:
+            opposing = [z for z in levels if z["price"] < entry_price]
+            nearest = min(opposing, key=lambda z: entry_price - z["price"], default=None)
+            room = (entry_price - (nearest["price"] + nearest["width"])) if nearest else None
+
+        estimated_risk = max(self.sl_atr_mult * atr_15m, self.min_sl_pct * entry_price)
+        room_r = room / estimated_risk if (room is not None and estimated_risk > 0) else None
+        zone_distance_atr = room / atr_15m if room is not None else None
+
+        sweep = self._wrong_side_liquidity_sweep(candles_15m, direction, nearest)
+        if sweep:
+            return {**self._neutral_location_context(), "valid": False,
+                    "reason": "wrong-side liquidity sweep/rejection at opposing zone",
+                    "structure_1h": structure_1h, "nearest_opposing_zone": nearest,
+                    "structure_room_r": round(room_r, 2) if room_r is not None else None,
+                    "bearish_sweep": direction == "up", "bullish_sweep": direction == "down"}
+
+        if nearest is not None and zone_distance_atr is not None and zone_distance_atr < self.hard_zone_distance_atr:
+            return {**self._neutral_location_context(), "valid": False,
+                    "reason": f"entry directly into {nearest['timeframe']} opposing zone",
+                    "structure_1h": structure_1h, "nearest_opposing_zone": nearest,
+                    "structure_room_r": round(room_r, 2) if room_r is not None else None}
+
+        if room_r is not None and room_r < self.min_structure_room_r:
+            return {**self._neutral_location_context(), "valid": False,
+                    "reason": f"structure room {room_r:.2f}R below {self.min_structure_room_r:.2f}R",
+                    "structure_1h": structure_1h, "nearest_opposing_zone": nearest,
+                    "structure_room_r": round(room_r, 2)}
+
+        midrange = self._is_midrange(candles_1h, entry_price)
+        chop_val = (q15 or {}).get("breakdown", {}).get("chop_val")
+        choppy_midrange = bool(self.reject_midrange_when_choppy and midrange and
+                               chop_val is not None and chop_val >= self.chop_threshold - 3.0)
+
+        penalize = choppy_midrange or (room_r is not None and room_r < self.preferred_structure_room_r)
+        location_type = "MID_RANGE" if midrange else "EDGE_OR_TREND_LOCATION"
+        reason = "acceptable location"
+        if choppy_midrange:
+            reason = "mid-range in choppy conditions; higher quality required"
+        elif penalize:
+            reason = f"limited room {room_r:.2f}R; higher quality required"
+
+        return {
+            "valid": True, "penalize": penalize, "reason": reason,
+            "structure_room_r": round(room_r, 2) if room_r is not None else None,
+            "nearest_opposing_zone": nearest, "location_type": location_type,
+            "structure_1h": structure_1h, "bearish_sweep": False, "bullish_sweep": False,
+        }
+
+    @staticmethod
+    def _confirmed_pivots(candles: list, left: int, right: int) -> list[dict]:
+        if len(candles) < left + right + 3:
+            return []
+        out: list[dict] = []
+        # Stop at len-right: pivots are only known after right-side bars close.
+        for i in range(left, len(candles) - right):
+            h = candles[i].high
+            l = candles[i].low
+            if all(h > candles[j].high for j in range(i-left, i)) and \
+               all(h >= candles[j].high for j in range(i+1, i+right+1)):
+                out.append({"type": "high", "price": float(h), "timestamp": candles[i].timestamp})
+            if all(l < candles[j].low for j in range(i-left, i)) and \
+               all(l <= candles[j].low for j in range(i+1, i+right+1)):
+                out.append({"type": "low", "price": float(l), "timestamp": candles[i].timestamp})
+        return out[-20:]
+
+    @staticmethod
+    def _swing_structure(pivots: list[dict]) -> str:
+        highs = [p["price"] for p in pivots if p["type"] == "high"]
+        lows = [p["price"] for p in pivots if p["type"] == "low"]
+        if len(highs) < 2 or len(lows) < 2:
+            return "neutral"
+        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+            return "bull"
+        if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+            return "bear"
+        return "transition"
+
+    def _last_atr(self, candles: list, period: int) -> Optional[float]:
+        if len(candles) < period + 2:
+            return None
+        arr = self.atr(candles, period)
+        val = arr[-1]
+        return None if np.isnan(val) or val <= 0 else float(val)
+
+    @staticmethod
+    def _is_midrange(candles_1h: list, price: float, lookback: int = 20) -> bool:
+        if len(candles_1h) < lookback:
+            return False
+        window = candles_1h[-lookback:]
+        hi = max(c.high for c in window)
+        lo = min(c.low for c in window)
+        if hi <= lo:
+            return False
+        pos = (price - lo) / (hi - lo)
+        return 0.38 <= pos <= 0.62
+
+    @staticmethod
+    def _wrong_side_liquidity_sweep(candles_15m: list, direction: str, nearest: Optional[dict]) -> bool:
+        if nearest is None or len(candles_15m) < 2:
+            return False
+        c = candles_15m[-1]
+        level = nearest["price"]
+        width = nearest["width"]
+        body = abs(c.close - c.open)
+        rng = max(c.high - c.low, 1e-12)
+        if direction == "up":
+            # Price probes resistance but closes back below with a meaningful upper wick.
+            return c.high >= level - width and c.close < level - width * 0.25 and (c.high - max(c.open, c.close)) >= body * 1.2 and body / rng >= 0.15
+        return c.low <= level + width and c.close > level + width * 0.25 and (min(c.open, c.close) - c.low) >= body * 1.2 and body / rng >= 0.15
 
     def _compute_sl_tp(self, direction: str, price: float, atr: float) -> tuple[float, float]:
         # R = the wider of 2.5xATR and the min_sl_pct floor (0.5% of price),
