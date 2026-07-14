@@ -86,12 +86,14 @@ class Config:
     max_positions_env: int   = field(default_factory=lambda: _env_int("MAX_POSITIONS", 2))
 
     # ── Timeframes (ENV, default per spec) ───────────────────────────────────
+    # tf_entry/TIMEFRAME_ENTRY is no longer fetched or used — Entry moved to
+    # 15M (entry_timeframe, below). Kept only so an existing Railway env var
+    # of that name doesn't error; not read anywhere.
     tf_entry: str  = field(default_factory=lambda: os.environ.get("TIMEFRAME_ENTRY", "30m"))
     tf_bias: str   = field(default_factory=lambda: os.environ.get("TIMEFRAME_BIAS", "1h"))
     tf_regime: str = field(default_factory=lambda: os.environ.get("TIMEFRAME_REGIME", "4h"))
-    tf_context: str = "30m"   # Context Engine timeframe
-    tf_fast: str    = "15m"   # Bias secondary timeframe
-    tf_micro: str   = "5m"    # Bias tertiary timeframe (strict 3-layer architecture)
+    tf_fast: str    = "15m"   # Bias secondary + Entry timeframe
+    tf_micro: str   = "5m"    # Bias tertiary timeframe
 
     # ── Hardcoded strategy constants (not exposed as ENV) ───────────────────
     market_type: str = "swap"
@@ -130,46 +132,20 @@ class Config:
     bias_structure_right: int = 3
     bias_score_min: float = 60.0
 
-    # Entry engine (30m)
-    entry_hma_fast: int = 10
-    entry_hma_slow: int = 20
-    entry_hma_slope_lookback: int = 2
-    entry_roc_period: int = 9
-    entry_ema_ref: int = 15
-    entry_macd_fast: int = 12
-    entry_macd_slow: int = 26
-    entry_macd_signal: int = 9
-    entry_score_min: float = 70.0
-    # ── Setup freshness window ───────────────────────────────────────────────
-    # A setup opens on whichever of {ROC>0, MACD favorable, HMA cross} turns
-    # true FIRST in the trade direction; full category confirmation (>=4/5)
-    # is only accepted within this many bars of that first trigger, or the
-    # setup is stale and skipped (wait for a fresh trigger rather than
-    # chasing an old one). MEASURED on the local BTC/XAU set: 2 is a local
-    # optimum — 3 gave PF 0.685, 2 gave PF 0.821-0.841 (with ADX gate), 1
-    # gave PF 0.722-0.800 (WORSE than 2 — tighter isn't always better).
-    entry_setup_window_bars: int = 2
-    # Anti-chase: block entry if price is already this many ATRs away from
-    # EMA15 — a spike/capitulation candle already happened and the "meat" of
-    # the move is behind us, not ahead.
-    entry_max_ext_atr: float = 1.5
-    # Market-structure confirmation (reduce false triggers): at least this many
-    # of {break prev candle high/low, volume expansion, wick rejection,
-    # liquidity sweep} must be present in the trade direction. 0 disables.
-    entry_structure_confirm_min: int = 1
-    entry_vol_expansion_mult: float = 1.5   # volume > this x vol_ma20 = expansion
-    entry_wick_reject_frac: float = 0.5     # wick >= this fraction of bar range
-    entry_sweep_lookback: int = 10          # bars for liquidity-sweep prior low/high
-    # Optional hard gates on top of the 5-category >=4/5 check. MEASURED on
-    # the local BTC/XAU set: ADX gate alone improved every metric (PF
-    # 0.637->0.670, WR 63.8%->65.2%, net -18102->-16022, avg_R -0.153->-0.136)
-    # -> enabled. entry_participation_mandatory measured WORSE (PF->0.598)
-    # -> stays off.
-    entry_adx_gate_enabled: bool = True
-    # Per user request: 18-or-rising (matches Regime's own "adx_trending"
-    # style: adx >= min OR adx rising) instead of a flat >=25 bar.
-    entry_adx_min: float = 18.0             # 30M ADX must clear this OR be rising when the gate is on
-    entry_participation_mandatory: bool = False  # require volume/participation, not just optional
+    # ══ Entry Engine (15M) — HMA10/HMA16 fresh-cross cycle ══════════════════
+    # Replaces the earlier 5-category/ADX-gate/freshness-window system and
+    # the Layer 3.2 acceleration wait-rounds (both removed) per explicit
+    # user spec: HMA cross is an EVENT (one entry per cross cycle), not a
+    # continuously-valid condition. See entry_engine.py.
+    entry_timeframe: str = "15m"
+    hma_fast_length: int = 10
+    hma_slow_length: int = 16
+    entry_max_distance_from_hma_atr: float = 0.8   # anti-chase: reject if |close-HMA16|/ATR exceeds this
+    exit_hma_buffer_atr: float = 0.10               # early-exit price-failure buffer past HMA16, in ATR
+    one_entry_per_cross: bool = True
+    require_new_cross_after_exit: bool = True
+    entry_on_closed_candle_only: bool = True
+    exit_on_closed_candle_price_break: bool = True
 
     # ── Bias confidence (1H) ─────────────────────────────────────────────────
     # Confidence 0-100 from: 1H ADX, RSI slope, EMA20 slope, volume confirm,
@@ -225,17 +201,9 @@ class Config:
     # reverted, sl_tighten_mult back to 1.0 (untightened). tp2_r set to 1.2R
     # per user request.
     tp2_r: float = 1.2
-    # Trailing runner code retained but DISABLED (config-gated). It's here to
-    # re-test on other data/regimes, but it hurt on the measured set.
-    trail_enabled: bool = False
-    trail_atr_mult: float = 2.0
     swing_lookback_left: int = 3
     swing_lookback_right: int = 3
 
-    # Position / health monitor
-    weak_confirm_bars: int = 3     # consecutive WEAK 30m-bar-close reads before force exit
-    health_score_min: float = 55.0
-    health_check_on_closed_bar_only: bool = True
     symbol_cooldown_min: int = 30  # no new entry on a symbol for this long after it closes
 
     # ── SpikeGuard (fast 5m/15m reversal-spike protection) ───────────────────
@@ -395,27 +363,6 @@ class Config:
     bias_w15m_default: float = 0.40
     bias_w5m_default: float = 0.15
     bias_threshold_default: float = 60.0
-
-    # Layer 3 — Entry: 5-category trigger, >= entry_min_categories with
-    # Momentum + Structure mandatory regardless of the total count.
-    entry_min_categories: int = 3   # was 4, per user request
-    entry_rel_vol_min: float = 1.2          # softer bar than bias_rel_vol_min — "elevated" for a trigger
-
-    # Layer 3b — Prior-acceleration wait rounds (user spec): before entry,
-    # check the last accel_15m_window (4) closed 15M bars and the last
-    # accel_5m_window (10) closed 5M bars for excessive price acceleration
-    # (net move or a single bar beyond that TF's ATR). If flagged, DON'T
-    # enter — wait one round (the next 1x15M + 4x5M closed bars after the
-    # flag). Round holds the direction -> enter. Pullback / reversal ->
-    # wait a second round. Second round also fails (or the layers stop
-    # agreeing while waiting) -> the setup is abandoned; wait for the next.
-    accel_confirm_enabled: bool = True
-    accel_15m_window: int = 4               # lookback bars on 15M for the acceleration check
-    accel_5m_window: int = 10               # lookback bars on 5M
-    accel_net_atr_mult: float = 3.0         # net move across the window >= this x ATR -> flagged
-    accel_bar_atr_mult: float = 2.5         # any single bar's range >= this x ATR -> flagged
-    accel_round_5m_min: int = 3             # round passes if 15M bar favorable AND >= this of its 4 5M bars
-    accel_max_rounds: int = 2               # after this many failed rounds the setup is dead
 
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))

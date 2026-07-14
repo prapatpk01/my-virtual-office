@@ -20,25 +20,26 @@ import indicators as ind
 logger = logging.getLogger("chart_engine")
 
 
-def build_entry_chart(symbol: str, df_30m: pd.DataFrame, direction: str,
+def build_entry_chart(symbol: str, df_15m: pd.DataFrame, direction: str,
                       entry: float, sl: float, tp1: float, tp2: float,
-                      out_dir: Optional[str] = None) -> Optional[str]:
+                      out_dir: Optional[str] = None,
+                      hma_fast_len: int = 10, hma_slow_len: int = 16) -> Optional[str]:
     """Save a candlestick chart with overlays; return the file path, or None on failure."""
     try:
-        plot_df = df_30m.tail(120).copy()
+        plot_df = df_15m.tail(120).copy()
         if plot_df.empty:
             return None
 
         closes = plot_df["close"]
         ema15 = ind.ema(closes, 15)
-        hma10 = ind.hma(closes, 10)
-        hma20 = ind.hma(closes, 20)
+        hma_fast = ind.hma(closes, hma_fast_len)
+        hma_slow = ind.hma(closes, hma_slow_len)
         swing_high, swing_low = ind.recent_swing_levels(plot_df["high"], plot_df["low"], 3, 3)
 
         addplots = [
             mpf.make_addplot(ema15, color="#f0b90b", width=1.1),
-            mpf.make_addplot(hma10, color="#00d4ff", width=1.0),
-            mpf.make_addplot(hma20, color="#ff5d8f", width=1.0),
+            mpf.make_addplot(hma_fast, color="#00d4ff", width=1.0),
+            mpf.make_addplot(hma_slow, color="#ff5d8f", width=1.0),
         ]
 
         hlines = dict(

@@ -2,12 +2,13 @@
 Signal Regime Bias Strategy — live bot entry point.
 
 Loop: every `poll_interval_sec`, for each symbol —
-  1. fetch 30m/1h/4h closed bars (skip symbol if any TF has < min_bars)
+  1. fetch 5m/15m/1h/4h closed bars (skip symbol if any TF has < min_bars)
   2. if a position is open: check SL/TP1/TP2 against the live ticker every
-     tick; run the 3-bar-confirm health monitor once per newly-closed 30m bar
-  3. else: once per newly-closed 30m bar, evaluate SignalEngine and open a
-     position if regime/bias/entry all clear their thresholds and risk
-     manager allows a new entry (no cooldown, no daily limit breach)
+     tick; run the HMA10/HMA16 early-exit check once per newly-closed 15m bar
+  3. else: once per newly-closed 15m bar, evaluate SignalEngine (Regime 4H+1H
+     -> Bias 1H+15M+5M -> Entry 15M HMA cross) and open a position if the
+     pipeline clears and risk manager allows a new entry (no cooldown, no
+     daily limit breach)
 
 Every branch that mutates state is wrapped so one symbol's exception can
 never kill the loop or leave an order half-placed with silent failure.
@@ -30,6 +31,7 @@ from position_manager import PositionManager
 from telegram_notifier import TelegramNotifier
 from chart_engine import build_entry_chart
 from spike_guard import check_spike, CLOSE as SPIKE_CLOSE
+from entry_engine import HMA_CROSS_REVERSAL, PRICE_CLOSED_BEYOND_HMA
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,7 +52,8 @@ class Bot:
         self.data = DataEngine(self.cfg, self.client)
         self.signal_engine = Pipeline(self.cfg)
         self.risk = RiskManager(self.cfg)
-        self.positions = PositionManager(self.cfg, self.client, self.risk)
+        self.positions = PositionManager(self.cfg, self.client, self.risk,
+                                         self.signal_engine.entry_engine)
         self.telegram = TelegramNotifier(self.cfg.telegram_bot_token, self.cfg.telegram_chat_id)
 
         self._last_entry_bar: dict[str, pd.Timestamp] = {}
@@ -145,24 +148,23 @@ class Bot:
                         symbol, self.cfg.min_bars)
             return
 
-        df_30m = frames[self.cfg.tf_entry]
         df_1h = frames[self.cfg.tf_bias]
         df_4h = frames[self.cfg.tf_regime]
         df_15m = frames[self.cfg.tf_fast]
         df_5m = frames[self.cfg.tf_micro]
 
         # Full pipeline computed once per symbol per tick and cached — reused by
-        # the entry check below AND by the 5-minute status log, so the health
+        # the entry check below AND by the 5-minute status log, so the exit
         # branch and the entry branch never re-run the layers separately.
-        sig = self.signal_engine.evaluate(df_30m, df_1h, df_4h, df_15m, df_5m, symbol=symbol)
+        sig = self.signal_engine.evaluate(df_1h, df_4h, df_15m, df_5m, symbol=symbol)
         self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):
-            await self._manage_open_position(symbol, df_30m, df_1h, df_4h, df_15m, df_5m)
+            await self._manage_open_position(symbol, df_15m)
         else:
-            await self._look_for_entry(symbol, df_30m, sig)
+            await self._look_for_entry(symbol, df_15m, sig)
 
-    async def _manage_open_position(self, symbol: str, df_30m, df_1h, df_4h, df_15m, df_5m):
+    async def _manage_open_position(self, symbol: str, df_15m):
         pos = self.positions.get(symbol)
         try:
             ticker = await self.client.fetch_ticker(symbol)
@@ -174,7 +176,7 @@ class Bot:
         event = await self.positions.check_exits_live(symbol, price)
         if event:
             await self._handle_event(event)
-            return   # position fully or partially closed this tick — health check waits for next
+            return   # position fully or partially closed this tick — exit check waits for next
 
         # SpikeGuard — EVERY tick, 5m/15m closed bars + live price. The fast
         # layer: force-close before a V-reversal eats the full SL (+slippage).
@@ -184,14 +186,10 @@ class Bot:
                 await self._handle_event(spike_event)
                 return
 
-        # Health monitor — once per newly-closed 30m bar only (the slow layer).
-        bar_ts = df_30m.index[-1] if len(df_30m) else None
-        if bar_ts is not None and pos.last_health_bar_ts != bar_ts:
-            regime = self.signal_engine.regime_engine.analyze(df_4h, df_1h)
-            bias = self.signal_engine.bias_engine.analyze(df_1h, df_15m, df_5m, regime.label)
-            hevent = await self.positions.process_closed_bar_health(symbol, df_30m, regime, bias)
-            if hevent:
-                await self._handle_event(hevent)
+        # HMA early-exit check — once per newly-closed 15m bar only.
+        eevent = await self.positions.process_closed_bar_exit_check(symbol, df_15m)
+        if eevent:
+            await self._handle_event(eevent)
 
     async def _check_spike_guard(self, symbol: str, pos, price: float):
         """Fetch 5m/15m closed bars and run the spike check. Non-fatal on data errors."""
@@ -216,8 +214,8 @@ class Bot:
             event["spike_reason"] = result.reason
         return event
 
-    async def _look_for_entry(self, symbol: str, df_30m, sig):
-        bar_ts = df_30m.index[-1] if len(df_30m) else None
+    async def _look_for_entry(self, symbol: str, df_15m, sig):
+        bar_ts = df_15m.index[-1] if len(df_15m) else None
         if bar_ts is None or self._last_entry_bar.get(symbol) == bar_ts:
             return   # already evaluated this closed bar
         self._last_entry_bar[symbol] = bar_ts
@@ -240,12 +238,13 @@ class Bot:
 
         risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
         chart_path = build_entry_chart(
-            symbol, df_30m, sig.direction, sig.price,
-            *self._preview_sl_tp(sig, df_30m),
+            symbol, df_15m, sig.direction, sig.price,
+            *self._preview_sl_tp(sig, df_15m),
+            hma_fast_len=self.cfg.hma_fast_length, hma_slow_len=self.cfg.hma_slow_length,
         )
 
         pos = await self.positions.open_position(
-            symbol, sig.direction, sig.price, df_30m, sig.regime, sig.bias, sig.entry_score)
+            symbol, sig.direction, sig.price, df_15m, sig.regime, sig.bias, sig.entry_score)
         if pos is None:
             return
 
@@ -266,23 +265,21 @@ class Bot:
                        b.score_1h, b.score_15m, b.score_5m, b.reason)
         elif layer == "ENTRY" and sig.entry is not None:
             e = sig.entry
-            logger.info("[%s] regime=%s dir=%s(bias)  ENTRY NOT READY  %d/5 categories — %s",
+            logger.info("[%s] regime=%s dir=%s(bias)  NO ENTRY  HMA%d=%.6f HMA%d=%.6f ext=%.2fATR — %s",
                        symbol, r.label, sig.bias.direction if sig.bias else "-",
-                       e.passed_count, e.reason)
-        elif layer == "CONFIRM":
-            logger.info("[%s] regime=%s dir=%s(bias)  L3.2 ACCEL-CONFIRM WAIT — %s",
-                       symbol, r.label, sig.bias.direction if sig.bias else "-", sig.reason)
+                       self.cfg.hma_fast_length, e.hma_fast, self.cfg.hma_slow_length, e.hma_slow,
+                       e.extension_atr, e.reason)
         else:
             logger.debug("[%s] no trade: %s", symbol, sig.reason)
 
-    def _preview_sl_tp(self, sig, df_30m) -> tuple[float, float, float]:
+    def _preview_sl_tp(self, sig, df_15m) -> tuple[float, float, float]:
         """Compute SL/TP1/TP2 for the chart BEFORE the order is placed (same math as open_position)."""
         import indicators as ind
         from position_manager import calc_stop_loss, calc_take_profits
         c = self.cfg
-        atr_val = float(ind.atr(df_30m, c.sl_atr_period).iloc[-1])
+        atr_val = float(ind.atr(df_15m, c.sl_atr_period).iloc[-1])
         swing_high, swing_low = ind.recent_swing_levels(
-            df_30m["high"], df_30m["low"], c.swing_lookback_left, c.swing_lookback_right)
+            df_15m["high"], df_15m["low"], c.swing_lookback_left, c.swing_lookback_right)
         side = "long" if sig.direction == LONG else "short"
         sl = calc_stop_loss(side, sig.price, atr_val, c.sl_atr_mult, swing_high, swing_low,
                            c.sl_min_pct, c.sl_max_pct, c.sl_tighten_mult)
@@ -292,8 +289,8 @@ class Bot:
     # Events that fully close the position (as opposed to TP1_HIT, which only
     # partially closes and leaves the runner open) — each one starts this
     # symbol's post-close cooldown.
-    _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", "HEALTH_CLOSE",
-                        "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD"}
+    _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", HMA_CROSS_REVERSAL,
+                        PRICE_CLOSED_BEYOND_HMA, "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD"}
 
     async def _handle_event(self, event: dict):
         ev = event.get("event")
@@ -306,9 +303,9 @@ class Bot:
             await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=False)
         elif ev == "BE_HIT":
             await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=True)
-        elif ev == "HEALTH_CLOSE":
-            await self.telegram.health_close(symbol, event["price"], event["pnl"],
-                                             event.get("health_score", 0.0), event.get("weak_count", 0))
+        elif ev in (HMA_CROSS_REVERSAL, PRICE_CLOSED_BEYOND_HMA):
+            await self.telegram.early_exit(symbol, event["price"], event["pnl"],
+                                           ev, event.get("exit_detail", ""))
         elif ev == "SPIKE_GUARD":
             await self.telegram.spike_guard(symbol, event["price"], event["pnl"],
                                             event.get("spike_reason", ""))
@@ -319,8 +316,6 @@ class Bot:
             await self.telegram.tp2_hit(symbol, event["price"], event["pnl"])
         elif ev == "ERROR":
             await self.telegram.error(symbol, event.get("detail", "unknown error"))
-        # HEALTH_OK / HEALTH_WEAK (not yet confirmed) are logged only, not alerted —
-        # avoids spamming Telegram every 30m bar while a position rides normally.
 
         if ev in self._TERMINAL_EVENTS and symbol:
             cooldown_sec = self.cfg.symbol_cooldown_min * 60
@@ -454,7 +449,7 @@ class Bot:
                     bias_str = f"`{b.direction}` 1H`{b.score_1h:.0f}` 15M`{b.score_15m:.0f}` 5M`{b.score_5m:.0f}`"
                 else:
                     bias_str = "`—`"
-                entry_str = f"`{sig.entry.passed_count}/5`" if sig.entry is not None else "`-`"
+                entry_str = f"`ext={sig.entry.extension_atr:.2f}ATR`" if sig.entry is not None else "`-`"
                 lines.append(
                     f"`{sym}` {pos_label}\n"
                     f"  regime `{sig.regime.label}`\n"
@@ -516,7 +511,7 @@ class Bot:
                 bias_label = f"{sig.bias.direction}(1H={sig.bias.score_1h:.0f},15M={sig.bias.score_15m:.0f},5M={sig.bias.score_5m:.0f})"
             else:
                 bias_label = "—"
-            entry_label = f"{sig.entry.passed_count}/5" if sig.entry is not None else "-"
+            entry_label = f"ext={sig.entry.extension_atr:.2f}ATR" if sig.entry is not None else "-"
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(
                 "  %-16s %-24s regime=%-20s bias=%-40s entry=%-5s dir=%s%s%s",

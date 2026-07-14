@@ -1,16 +1,19 @@
 """
 Position Manager.
 
-Design: the SL/TP math and the health-monitor scoring are PURE functions
-(no exchange calls) so backtest.py can import and reuse them exactly —
-live and backtest can never compute a different stop or a different health
-verdict from the same inputs. `PositionManager` wraps those pure functions
-with the actual order-execution side (live only).
+Design: the SL/TP math is a set of PURE functions (no exchange calls) so
+backtest.py can import and reuse them exactly — live and backtest can
+never compute a different stop from the same inputs. `PositionManager`
+wraps those pure functions with the actual order-execution side (live
+only).
 
-Health monitor rewrite (per spec): built FROM the strategy's own engines
-(regime + bias re-evaluation), NOT a separate ad-hoc guard stack. A single
-WEAK tier — no immediate "strong weak" — requires `weak_confirm_bars`
-(default 3) CONSECUTIVE closed-30m-bar weak reads before force-closing.
+Early-exit logic lives in entry_engine.py (EntryEngine.check_exit) —
+it shares the HMA10/HMA16/ATR computation with the entry side rather than
+duplicating it here. Callers (main.py, backtest.py) call check_exit()
+once per closed 15M bar for any open position and, if it fires, close the
+position via `_close_full` / the backtest equivalent — this module doesn't
+need to know about HMA at all, only how to close a position and notify
+the Entry Engine's cross-cycle state (`on_position_closed`) once it does.
 """
 from __future__ import annotations
 
@@ -26,8 +29,8 @@ import indicators as ind
 from config import Config
 from exchange_client import ExchangeClient
 from risk_manager import RiskManager
-from regime_engine import RegimeResult, BULL_LABELS, BEAR_LABELS
-from bias_engine import BiasResult, BIAS_BULL, BIAS_BEAR
+from regime_engine import RegimeResult
+from bias_engine import BiasResult
 
 logger = logging.getLogger("position_manager")
 
@@ -54,8 +57,7 @@ class Position:
     regime_at_entry: str = ""
     bias_at_entry: str = ""
     entry_score: float = 0.0
-    weak_count: int = 0
-    last_health_bar_ts: Optional[pd.Timestamp] = None
+    last_exit_check_bar_ts: Optional[pd.Timestamp] = None   # dedupe: one HMA exit check per closed 15m bar
 
 
 # ── Pure SL/TP math (shared with backtest.py) ────────────────────────────────
@@ -99,54 +101,17 @@ def calc_take_profits(direction: str, entry: float, sl: float,
     return entry - tp1_r * one_r, entry - tp2_r * one_r
 
 
-# ── Health monitor (pure) ─────────────────────────────────────────────────────
-
-@dataclass
-class HealthResult:
-    score: float
-    label: str          # 'HEALTHY' | 'WEAK'
-    components: dict = field(default_factory=dict)
-
-
-def evaluate_health(pos: Position, df_30m: pd.DataFrame, bias: BiasResult,
-                    regime: RegimeResult, cfg: Config) -> HealthResult:
-    is_long = pos.side == LONG
-    comps = {}
-
-    bias_ok = (bias.bias == BIAS_BULL) if is_long else (bias.bias == BIAS_BEAR)
-    comps["bias_aligned"] = 40.0 if bias_ok else 0.0
-
-    regime_ok = regime.label in (BULL_LABELS if is_long else BEAR_LABELS)
-    comps["regime_ok"] = 30.0 if regime_ok else 0.0
-
-    macd_ok = False
-    ema_ok = False
-    if len(df_30m) >= max(cfg.entry_macd_slow, cfg.entry_ema_ref) + 5:
-        closes = df_30m["close"]
-        _, _, hist = ind.macd(closes, cfg.entry_macd_fast, cfg.entry_macd_slow, cfg.entry_macd_signal)
-        h_now = float(hist.iloc[-1]) if not np.isnan(hist.iloc[-1]) else 0.0
-        h_prev = float(hist.iloc[-2]) if not np.isnan(hist.iloc[-2]) else 0.0
-        macd_ok = (h_now > h_prev) if is_long else (h_now < h_prev)
-
-        e15 = float(ind.ema(closes, cfg.entry_ema_ref).iloc[-1])
-        price = float(closes.iloc[-1])
-        ema_ok = (price > e15) if is_long else (price < e15)
-
-    comps["macd_favorable"] = 15.0 if macd_ok else 0.0
-    comps["ema15_favorable"] = 15.0 if ema_ok else 0.0
-
-    score = sum(comps.values())
-    label = "HEALTHY" if score >= cfg.health_score_min else "WEAK"
-    return HealthResult(score=score, label=label, components=comps)
-
-
 # ── Live position manager ─────────────────────────────────────────────────────
 
 class PositionManager:
-    def __init__(self, cfg: Config, client: ExchangeClient, risk: RiskManager):
+    def __init__(self, cfg: Config, client: ExchangeClient, risk: RiskManager, entry_engine):
         self.cfg = cfg
         self.client = client
         self.risk = risk
+        # Notified on every FULL close (SL/TP2/BE/early-exit/externally-synced)
+        # so its cross-cycle state machine knows to wait for a new HMA cross
+        # before allowing re-entry — see entry_engine.EntryEngine.on_position_closed.
+        self.entry_engine = entry_engine
         self._positions: dict[str, Position] = {}   # key: symbol (1 position per symbol, either side)
 
     def get(self, symbol: str) -> Optional[Position]:
@@ -244,7 +209,7 @@ class PositionManager:
         return adopted
 
     async def open_position(self, symbol: str, direction: str, price: float,
-                            df_30m: pd.DataFrame, regime: RegimeResult, bias: BiasResult,
+                            df_15m: pd.DataFrame, regime: RegimeResult, bias: BiasResult,
                             entry_score: float) -> Optional[Position]:
         c = self.cfg
         if self.has_position(symbol):
@@ -254,12 +219,14 @@ class PositionManager:
             return None
 
         side = LONG if direction == "LONG" else SHORT
-        atr_val = float(ind.atr(df_30m, c.sl_atr_period).iloc[-1])
+        # ATR/swing levels now come from the Entry timeframe (15M), matching
+        # the entry_extension_atr the Entry Engine itself used for anti-chase.
+        atr_val = float(ind.atr(df_15m, c.sl_atr_period).iloc[-1])
         if np.isnan(atr_val) or atr_val <= 0:
             logger.warning("[POS] %s ATR unavailable — skip entry", symbol)
             return None
         swing_high, swing_low = ind.recent_swing_levels(
-            df_30m["high"], df_30m["low"], c.swing_lookback_left, c.swing_lookback_right)
+            df_15m["high"], df_15m["low"], c.swing_lookback_left, c.swing_lookback_right)
 
         sl = calc_stop_loss(side, price, atr_val, c.sl_atr_mult, swing_high, swing_low,
                            c.sl_min_pct, c.sl_max_pct, c.sl_tighten_mult)
@@ -356,6 +323,7 @@ class PositionManager:
         balance = await self.client.fetch_balance_usdt()
         self.risk.register_trade_result(pnl, balance, time.time())
         del self._positions[pos.symbol]
+        self.entry_engine.on_position_closed(pos.symbol)
         logger.info("[POS] %s %s: confirmed closed externally (exchange algo) — "
                    "synced internal state, pnl≈%.2f (approximate, exact fill unknown)",
                    pos.symbol, reason, pnl)
@@ -418,36 +386,32 @@ class PositionManager:
         self.risk.register_trade_result(pnl, balance, time.time())
 
         del self._positions[pos.symbol]
+        self.entry_engine.on_position_closed(pos.symbol)
         return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": price,
                "pnl": pnl, "trade_pnl": pos.realized_pnl + pnl, "tp1_hit": pos.tp1_hit,
                "entry_price": pos.entry_price, "position": pos}
 
-    async def process_closed_bar_health(self, symbol: str, df_30m: pd.DataFrame,
-                                        regime: RegimeResult, bias: BiasResult) -> Optional[dict]:
+    async def process_closed_bar_exit_check(self, symbol: str, df_15m: pd.DataFrame) -> Optional[dict]:
         """
-        Call ONCE per newly-closed 30m bar per symbol. Evaluates health and
-        force-closes only after `weak_confirm_bars` CONSECUTIVE weak reads.
+        Call ONCE per newly-closed 15m bar per symbol. Runs the Entry
+        Engine's HMA-based early-exit check (EntryEngine.check_exit) and
+        force-closes on HMA_CROSS_REVERSAL or PRICE_CLOSED_BEYOND_HMA. This
+        does NOT replace the hard SL/TP (checked every tick elsewhere) — an
+        additional, faster path evaluated on each closed 15M candle.
         """
         pos = self._positions.get(symbol)
-        if pos is None or len(df_30m) == 0:
+        if pos is None or len(df_15m) == 0:
             return None
-        bar_ts = df_30m.index[-1]
-        if pos.last_health_bar_ts is not None and bar_ts <= pos.last_health_bar_ts:
+        bar_ts = df_15m.index[-1]
+        if pos.last_exit_check_bar_ts is not None and bar_ts <= pos.last_exit_check_bar_ts:
             return None   # already evaluated this closed bar
-        pos.last_health_bar_ts = bar_ts
+        pos.last_exit_check_bar_ts = bar_ts
 
-        result = evaluate_health(pos, df_30m, bias, regime, self.cfg)
-        if result.label == "HEALTHY":
-            pos.weak_count = 0
-            return {"event": "HEALTH_OK", "symbol": symbol, "score": result.score}
+        check = self.entry_engine.check_exit(df_15m, pos.side)
+        if not check.should_exit:
+            return None
 
-        pos.weak_count += 1
-        if pos.weak_count < self.cfg.weak_confirm_bars:
-            return {"event": "HEALTH_WEAK", "symbol": symbol, "score": result.score,
-                   "weak_count": pos.weak_count, "confirm_needed": self.cfg.weak_confirm_bars}
-
-        price = float(df_30m["close"].iloc[-1])
-        ev = await self._close_full(pos, price, "HEALTH_CLOSE")
-        ev["health_score"] = result.score
-        ev["weak_count"] = pos.weak_count
+        price = float(df_15m["close"].iloc[-1])
+        ev = await self._close_full(pos, price, check.reason)
+        ev["exit_detail"] = check.detail
         return ev

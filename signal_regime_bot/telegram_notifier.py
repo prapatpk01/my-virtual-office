@@ -167,11 +167,12 @@ class TelegramNotifier:
             f"Price: `{price:.6f}`\nPnL: `{pnl:+.2f}` USDT"
         )
 
-    async def health_close(self, symbol: str, price: float, pnl: float,
-                           health_score: float, weak_count: int):
+    async def early_exit(self, symbol: str, price: float, pnl: float,
+                         reason: str, detail: str = ""):
+        label = "HMA Cross Reversal" if reason == "HMA_CROSS_REVERSAL" else "Price Closed Beyond HMA16"
         await self._send_message(
-            f"⚠️ *Health Close* `{symbol}`\n\n"
-            f"Closed after {weak_count} consecutive WEAK reads (score={health_score:.0f})\n"
+            f"⚠️ *Early Exit — {label}* `{symbol}`\n\n"
+            f"`{detail}`\n"
             f"Price: `{price:.6f}`\nPnL: `{pnl:+.2f}` USDT"
         )
 
