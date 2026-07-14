@@ -4,11 +4,13 @@ on the same evaluation for an entry to fire. This layer has NO right to
 pick Long or Short: it receives a fixed `direction` from the Bias layer
 and may only search for a trigger matching that side.
 
-  Layer 3.1  30M — 5-category quality pre-filter (Momentum/Trend/Structure/
+  Layer 3.1  15M — 5-category quality pre-filter (Momentum/Trend/Structure/
              Liquidity/Participation), needs >= entry_min_categories (3/5)
              with Momentum + Structure mandatory. A QUALITY CHECK, not a
              timing trigger — it doesn't decide WHEN, only whether the
-             setup is good enough to consider at all.
+             setup is good enough to consider at all. On 15M (same bar the
+             3.3 cross fires) so the quality read is synchronized with the
+             trigger — no stale higher-TF value.
 
   Layer 3.2  15M+5M — prior-acceleration check. Looks at the last
              accel_15m_window closed 15M bars and accel_5m_window closed 5M
@@ -163,13 +165,13 @@ class EntryEngine:
         if old_wait is not None and old_wait.get("cross_id") != bar_ts:
             self._accel_wait.pop(symbol, None)
 
-    # ── Layer 3.1 — 5-category quality pre-filter (30M) ──────────────────────
-    def _layer31(self, df_30m: pd.DataFrame, direction: str) -> Layer31Result:
+    # ── Layer 3.1 — 5-category quality pre-filter (15M) ──────────────────────
+    def _layer31(self, df_15m: pd.DataFrame, direction: str) -> Layer31Result:
         c = self.cfg
-        if len(df_30m) < max(c.hma_slow_length, c.entry_macd_slow) + 10:
-            return Layer31Result(False, 0, {}, "L3.1: insufficient 30m history")
+        if len(df_15m) < max(c.hma_slow_length, c.entry_macd_slow) + 10:
+            return Layer31Result(False, 0, {}, "L3.1: insufficient 15m history")
 
-        closes, opens = df_30m["close"], df_30m["open"]
+        closes, opens = df_15m["close"], df_15m["open"]
         price = float(closes.iloc[-1])
         is_long = direction == LONG
 
@@ -183,13 +185,13 @@ class EntryEngine:
         macd_cross_up = h_prev <= 0 and h_now > 0
         macd_cross_dn = h_prev >= 0 and h_now < 0
 
-        sflags = ind.structure_flags(df_30m["high"], df_30m["low"],
+        sflags = ind.structure_flags(df_15m["high"], df_15m["low"],
                                      c.bias_structure_left, c.bias_structure_right)
         side = "LONG" if is_long else "SHORT"
-        bos, choch = pa.bos_choch(df_30m, side, c.bias_structure_left, c.bias_structure_right)
+        bos, choch = pa.bos_choch(df_15m, side, c.bias_structure_left, c.bias_structure_right)
 
-        vol_now = float(df_30m["volume"].iloc[-1])
-        vol_ma20 = float(df_30m["volume"].iloc[-21:-1].mean()) if len(df_30m) >= 21 else 0.0
+        vol_now = float(df_15m["volume"].iloc[-1])
+        vol_ma20 = float(df_15m["volume"].iloc[-21:-1].mean()) if len(df_15m) >= 21 else 0.0
         rel_vol = (vol_now / vol_ma20) if vol_ma20 > 0 else 1.0
 
         if is_long:
@@ -198,9 +200,9 @@ class EntryEngine:
                 "trend":         (float(hma_f.iloc[-1]) > float(hma_s.iloc[-1])) or
                                   (price > float(e_ref.iloc[-1])),
                 "structure":     bos or choch or sflags["higher_low"],
-                "liquidity":     pa.liquidity_sweep(df_30m, "LONG", c.entry_sweep_lookback) or
-                                  pa.rejection_candle(df_30m, "LONG", c.entry_wick_reject_frac),
-                "participation": pa.volume_expansion(df_30m, c.entry_vol_expansion_mult) or
+                "liquidity":     pa.liquidity_sweep(df_15m, "LONG", c.entry_sweep_lookback) or
+                                  pa.rejection_candle(df_15m, "LONG", c.entry_wick_reject_frac),
+                "participation": pa.volume_expansion(df_15m, c.entry_vol_expansion_mult) or
                                   rel_vol >= c.entry_rel_vol_min,
             }
         else:
@@ -209,9 +211,9 @@ class EntryEngine:
                 "trend":         (float(hma_f.iloc[-1]) < float(hma_s.iloc[-1])) or
                                   (price < float(e_ref.iloc[-1])),
                 "structure":     bos or choch or sflags["lower_high"],
-                "liquidity":     pa.liquidity_sweep(df_30m, "SHORT", c.entry_sweep_lookback) or
-                                  pa.rejection_candle(df_30m, "SHORT", c.entry_wick_reject_frac),
-                "participation": pa.volume_expansion(df_30m, c.entry_vol_expansion_mult) or
+                "liquidity":     pa.liquidity_sweep(df_15m, "SHORT", c.entry_sweep_lookback) or
+                                  pa.rejection_candle(df_15m, "SHORT", c.entry_wick_reject_frac),
+                "participation": pa.volume_expansion(df_15m, c.entry_vol_expansion_mult) or
                                   rel_vol >= c.entry_rel_vol_min,
             }
 
@@ -276,7 +278,7 @@ class EntryEngine:
         return hma_f, hma_s, atr_s
 
     # ── combined entry decision ──────────────────────────────────────────────
-    def analyze(self, df_30m: pd.DataFrame, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
+    def analyze(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
                direction: str, symbol: str) -> EntryResult:
         c = self.cfg
         if direction not in (LONG, SHORT):
@@ -286,8 +288,8 @@ class EntryEngine:
         # what the quality layers decide on this bar (idempotent per bar).
         self.observe(df_15m, symbol)
 
-        # ── Layer 3.1 ──────────────────────────────────────────────────────────
-        l31 = self._layer31(df_30m, direction)
+        # ── Layer 3.1 (15M) ────────────────────────────────────────────────────
+        l31 = self._layer31(df_15m, direction)
         if not l31.passed:
             return EntryResult(NONE, False, l31.reason, layer31_passed_count=l31.passed_count)
 

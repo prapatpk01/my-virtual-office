@@ -8,7 +8,7 @@ and bookkeeping. This guarantees backtest results reflect what the live
 bot actually does.
 
 No-lookahead contract:
-  - A 15m decision at bar i uses ONLY 15m bars [0..i], 1h/4h/30m/5m bars
+  - A 15m decision at bar i uses ONLY 15m bars [0..i], 1h/4h/5m bars
     whose CLOSE time <= bar i's close time (searchsorted cutoff).
   - Entries fill at bar i+1's OPEN (next bar), never at bar i's close.
   - SL/TP/exit checks against a bar use that bar's own OHLC, evaluated
@@ -143,7 +143,7 @@ def _closed_htf_cutoff(close_ms_sorted: np.ndarray, as_of_close_ms: int) -> int:
 
 
 def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.DataFrame,
-                    df_4h: pd.DataFrame, df_30m: pd.DataFrame, df_5m: pd.DataFrame,
+                    df_4h: pd.DataFrame, df_5m: pd.DataFrame,
                     initial_balance: float) -> list[BTTrade]:
     engine = SignalEngine(cfg)
     risk = RiskManager(cfg)
@@ -159,7 +159,6 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
     # searchsorted, instead of an O(n) boolean scan every bar).
     close_ms_1h = _epoch_ms(df_1h.index) + _TF_MS["1h"]
     close_ms_4h = _epoch_ms(df_4h.index) + _TF_MS["4h"]
-    close_ms_30m = _epoch_ms(df_30m.index) + _TF_MS["30m"]
     close_ms_5m = _epoch_ms(df_5m.index) + _TF_MS["5m"]
     open_ms_15m = _epoch_ms(df_15m.index)
 
@@ -171,7 +170,6 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
     w15 = cfg.fetch_limit_fast
     w1h = cfg.fetch_limit_bias
     w4h = cfg.fetch_limit_regime
-    w30 = cfg.fetch_limit_entry
     w5 = cfg.fetch_limit_micro
 
     for i in range(warmup, n - 1):
@@ -183,8 +181,6 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
         hist_1h = df_1h.iloc[max(0, cutoff_1h - w1h): cutoff_1h]
         cutoff_4h = _closed_htf_cutoff(close_ms_4h, bar_close_ms)
         hist_4h = df_4h.iloc[max(0, cutoff_4h - w4h): cutoff_4h]
-        cutoff_30m = _closed_htf_cutoff(close_ms_30m, bar_close_ms)
-        hist_30m = df_30m.iloc[max(0, cutoff_30m - w30): cutoff_30m]
         cutoff_5m = _closed_htf_cutoff(close_ms_5m, bar_close_ms)
         hist_5m = df_5m.iloc[max(0, cutoff_5m - w5): cutoff_5m]
 
@@ -278,10 +274,10 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
         if not can_open:
             continue
         if len(hist_15m) < cfg.min_bars or len(hist_1h) < cfg.min_bars or len(hist_4h) < cfg.min_bars \
-           or len(hist_30m) < cfg.min_bars or len(hist_5m) < cfg.min_bars:
+           or len(hist_5m) < cfg.min_bars:
             continue
 
-        sig = engine.evaluate(hist_1h, hist_4h, hist_30m, hist_15m, hist_5m, symbol=symbol)
+        sig = engine.evaluate(hist_1h, hist_4h, hist_15m, hist_5m, symbol=symbol)
         if sig.direction not in (LONG, SHORT):
             continue
 
@@ -332,15 +328,14 @@ async def run_backtest(symbols: list[str], start_ms: int, end_ms: int,
             df_15m = await fetch_history(client, symbol, cfg.tf_fast, start_ms, end_ms)
             df_1h = await fetch_history(client, symbol, cfg.tf_bias, start_ms, end_ms)
             df_4h = await fetch_history(client, symbol, cfg.tf_regime, start_ms, end_ms)
-            df_30m = await fetch_history(client, symbol, cfg.tf_entry, start_ms, end_ms)
             df_5m = await fetch_history(client, symbol, cfg.tf_micro, start_ms, end_ms)
-            logger.info("  %s: 5m=%d 15m=%d 30m=%d 1h=%d 4h=%d bars",
-                       symbol, len(df_5m), len(df_15m), len(df_30m), len(df_1h), len(df_4h))
+            logger.info("  %s: 5m=%d 15m=%d 1h=%d 4h=%d bars",
+                       symbol, len(df_5m), len(df_15m), len(df_1h), len(df_4h))
             if len(df_15m) < cfg.min_bars or len(df_1h) < cfg.min_bars or len(df_4h) < cfg.min_bars \
-               or len(df_30m) < cfg.min_bars or len(df_5m) < cfg.min_bars:
+               or len(df_5m) < cfg.min_bars:
                 logger.warning("  %s: insufficient history — skipped", symbol)
                 continue
-            trades = simulate_symbol(cfg, symbol, df_15m, df_1h, df_4h, df_30m, df_5m, initial_balance)
+            trades = simulate_symbol(cfg, symbol, df_15m, df_1h, df_4h, df_5m, initial_balance)
             logger.info("  %s: %d trades  PnL=%+.2f", symbol, len(trades),
                        sum(t.pnl_usd for t in trades))
             all_trades.extend(trades)

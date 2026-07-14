@@ -14,7 +14,7 @@ backtest.py call, so the two can never diverge in logic.
     for a trigger on that side — it has no right to open the opposite
     side even if one appears. Three sequential sub-layers, all must clear
     (see entry_engine.py for the full detail):
-      3.1  30M 5-category quality pre-filter
+      3.1  15M 5-category quality pre-filter
       3.2  15M+5M prior-acceleration wait-rounds
       3.3  15M HMA10/HMA16 fresh-cross timing trigger + anti-chase
 
@@ -64,7 +64,7 @@ class Pipeline:
         self.bias_engine = BiasEngine(cfg)
         self.entry_engine = EntryEngine(cfg)
 
-    def evaluate(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame, df_30m: pd.DataFrame,
+    def evaluate(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
                  df_15m: pd.DataFrame, df_5m: Optional[pd.DataFrame] = None,
                  symbol: str = "") -> PipelineResult:
         has_15m = df_15m is not None and len(df_15m)
@@ -89,11 +89,11 @@ class Pipeline:
 
         side = LONG if bias.direction == B_LONG else SHORT
 
-        # ── Layer 3 — Entry (3.1 30M pre-filter -> 3.2 accel wait -> 3.3 HMA) ──
-        if not has_15m or df_30m is None or not len(df_30m):
-            entry = EntryResult(NONE, False, "missing 30m/15m frame for entry")
+        # ── Layer 3 — Entry (3.1 15M pre-filter -> 3.2 accel wait -> 3.3 HMA) ──
+        if not has_15m:
+            entry = EntryResult(NONE, False, "missing 15m frame for entry")
         else:
-            entry = self.entry_engine.analyze(df_30m, df_15m, df_5m, side, symbol)
+            entry = self.entry_engine.analyze(df_15m, df_5m, side, symbol)
         common = dict(bias=bias, entry=entry, **base)
 
         if entry.allow_entry:
