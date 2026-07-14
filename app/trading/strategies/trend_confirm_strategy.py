@@ -126,7 +126,7 @@ class TrendConfirmStrategy(BaseStrategy):
         tf_weight_15m: float = 0.65,
         tf_weight_1h: float = 0.35,
         layer2_threshold: float = 60.0,        # established-trend entries
-        layer2_threshold_early: float = 75.0,  # stricter quality gate for early-trend entries (HMA led the confirm)
+        layer2_threshold_early: float = 68.0,  # stricter quality gate for early-trend entries (HMA led the confirm)
         # Layer 3 — entry (15m)
         hma_fast: int = 10,
         hma_slow: int = 16,
@@ -138,12 +138,12 @@ class TrendConfirmStrategy(BaseStrategy):
         use_location_filter: bool = True,
         structure_pivot_left: int = 2,
         structure_pivot_right: int = 2,
-        zone_width_atr_1h: float = 0.20,
-        zone_width_atr_4h: float = 0.25,
-        hard_zone_distance_atr: float = 0.35,
+        zone_width_atr_1h: float = 0.18,
+        zone_width_atr_4h: float = 0.22,
+        hard_zone_distance_atr: float = 0.30,
         min_structure_room_r: float = 0.70,
-        preferred_structure_room_r: float = 1.00,
-        location_threshold_penalty: float = 5.0,
+        preferred_structure_room_r: float = 0.95,
+        location_threshold_penalty: float = 4.0,
         reject_midrange_when_choppy: bool = True,
         # Exit
         exit_on_hma20_open: bool = False,   # optional fast exit on N closes past HMA20 (off by default —
@@ -307,23 +307,19 @@ class TrendConfirmStrategy(BaseStrategy):
         close_price = candles[-1].close
         dist_atr = (abs(close_price - l3["dist_ema_val"]) / l3["atr_val"]
                    if (l3 is not None and l3["atr_val"] > 0) else None)
-
         c4h = mtf.get("4h", [])
-        location = self._location_context(
-            direction=trend,
-            entry_price=close_price,
-            atr_15m=l3["atr_val"] if l3 is not None else 0.0,
-            candles_15m=candles,
-            candles_1h=c1h,
-            candles_4h=c4h,
-            q15=q15,
-        ) if (self.use_location_filter and trend and l3 is not None) else self._neutral_location_context()
 
-        # Mildly poor location raises the quality threshold instead of rejecting.
-        # Only strong structure conflicts or critically low room are hard rejects.
-        location_adjusted_l2_thr = l2_thr + (
-            self.location_threshold_penalty if location["penalize"] else 0.0
-        )
+        # Location & structure-room are only meaningful once there's an actual
+        # entry candidate (trend confirmed AND its HMA cross just fired) — no
+        # point walking 1h/4h pivots on every bar while just waiting for a
+        # cross. Defaults here cover the early-return paths below; the real
+        # location is computed inline (see _evaluate_location) once a
+        # candidate exists, and reassigns these two closed-over variables so
+        # dbg() reports the real values from that point on.
+        has_long_candidate = trend == "up" and hma_cross_up
+        has_short_candidate = trend == "down" and hma_cross_down
+        location = self._neutral_location_context()
+        location_adjusted_l2_thr = l2_thr
 
         def dbg(entry_status: str) -> dict:
             return {"trend_confirm": {
@@ -360,48 +356,88 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price, "Layer2: quality indicators still warming up (15m/1H)",
                               metadata=dbg("no_trend"))
 
-        if l2_score <= location_adjusted_l2_thr:
+        if l2_score <= l2_thr:
             score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
                           f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
             # Early-trend fail is DEFINITIVE: an HMA cross led the confirm and
-            # the stricter gate rejected it — spend that cross so the same
-            # setup can't retry on a later bar. A fresh cross is required for
-            # another attempt. (An established-trend fail with no valid pending
-            # cross is just "waiting", so nothing to consume there.)
-            pending_cross = (trend == "up" and hma_cross_up) or (trend == "down" and hma_cross_down)
+            # quality didn't even clear the base gate — spend that cross so
+            # the same setup can't retry on a later bar. A fresh cross is
+            # required for another attempt. (An established-trend fail with
+            # no valid pending cross is just "waiting", so nothing to consume.
+            # Location isn't computed here — the base gate alone already
+            # disqualifies, so location wouldn't change the outcome.)
+            pending_cross = has_long_candidate or has_short_candidate
             if is_early_trend and pending_cross:
                 if trend == "up":
                     self._last_hma_cross_up_ts = None
                 else:
                     self._last_hma_cross_down_ts = None
                 return self._hold(current_price,
-                    f"Layer2 FAIL (early trend): quality {l2_score:.0f} <= {location_adjusted_l2_thr:.0f} — "
+                    f"Layer2 FAIL (early trend): quality {l2_score:.0f} <= {l2_thr:.0f} — "
                     f"early setup rejected, cross spent {score_note}",
                     metadata=dbg("early_quality_fail"))
             return self._hold(current_price,
-                f"Layer2: trend quality {l2_score:.0f} <= {location_adjusted_l2_thr:.0f} {score_note}",
+                f"Layer2: trend quality {l2_score:.0f} <= {l2_thr:.0f} {score_note}",
                 metadata=dbg("quality_fail"))
 
         # ── Layer 3: Entry (15m), always with the confirmed trend ──────────
         if l3 is None:
             return self._hold(current_price, "Layer3: indicators still warming up (15m)", metadata=dbg("no_trend"))
 
-        if self.use_location_filter and not location["valid"]:
-            return self._hold(
-                current_price,
-                f"Location/Structure REJECT: {location['reason']}",
-                metadata=dbg("location_reject"),
-            )
-
         dist_ok = dist_atr is not None and dist_atr <= self.max_dist_atr_mult
         dist_disp = f"{dist_atr:.2f}" if dist_atr is not None else "n/a"
 
+        def _evaluate_location(direction: str) -> Optional[Signal]:
+            """Only called once a live candidate exists (trend confirmed +
+            fresh HMA cross). Computes the location/structure-room filter for
+            THIS candidate, applies its quality-threshold penalty, and
+            returns a hold Signal if it rejects — or None to let the caller
+            proceed to the EMA/distance checks. Reassigns the enclosing
+            `location`/`location_adjusted_l2_thr` so dbg() reports the real
+            values from here on."""
+            nonlocal location, location_adjusted_l2_thr
+            location = self._location_context(
+                direction=direction, entry_price=close_price,
+                atr_15m=l3["atr_val"], candles_15m=candles,
+                candles_1h=c1h, candles_4h=c4h, q15=q15,
+            ) if self.use_location_filter else self._neutral_location_context()
+            location_adjusted_l2_thr = l2_thr + (
+                self.location_threshold_penalty if location["penalize"] else 0.0
+            )
+            if l2_score <= location_adjusted_l2_thr:
+                score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
+                              f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
+                if is_early_trend:
+                    if direction == "up":
+                        self._last_hma_cross_up_ts = None
+                    else:
+                        self._last_hma_cross_down_ts = None
+                    return self._hold(current_price,
+                        f"Layer2 FAIL (early trend, location-adjusted): quality {l2_score:.0f} <= "
+                        f"{location_adjusted_l2_thr:.0f} — early setup rejected, cross spent {score_note}",
+                        metadata=dbg("early_quality_fail"))
+                return self._hold(current_price,
+                    f"Layer2: trend quality {l2_score:.0f} <= {location_adjusted_l2_thr:.0f} "
+                    f"(location-adjusted) {score_note}",
+                    metadata=dbg("location_quality_fail"))
+            if self.use_location_filter and not location["valid"]:
+                return self._hold(
+                    current_price,
+                    f"Location/Structure REJECT: {location['reason']}",
+                    metadata=dbg("location_reject"),
+                )
+            return None
+
         if trend == "up":
-            if not hma_cross_up:
+            if not has_long_candidate:
                 return self._hold(current_price, f"Layer1+2 confirmed UP — waiting for HMA{self.hma_fast}↑HMA{self.hma_slow} cross"
                                   + (f" (early trend, within {fb} bars)" if is_early_trend else " (fresh cross only)"),
                                   metadata=dbg("waiting_cross"))
-            # cross fired — consume it, then validate the two entry conditions
+            rejected = _evaluate_location("up")
+            if rejected is not None:
+                return rejected
+            # cross cleared quality+location — consume it, then validate the
+            # two entry conditions
             self._last_hma_cross_up_ts = None
             if not l3["above_ema_ref"]:
                 return self._hold(current_price,
@@ -430,10 +466,13 @@ class TrendConfirmStrategy(BaseStrategy):
             )
 
         # trend == "down"
-        if not hma_cross_down:
+        if not has_short_candidate:
             return self._hold(current_price, f"Layer1+2 confirmed DOWN — waiting for HMA{self.hma_fast}↓HMA{self.hma_slow} cross"
                               + (f" (early trend, within {fb} bars)" if is_early_trend else " (fresh cross only)"),
                               metadata=dbg("waiting_cross"))
+        rejected = _evaluate_location("down")
+        if rejected is not None:
+            return rejected
         self._last_hma_cross_down_ts = None
         if not l3["below_ema_ref"]:
             return self._hold(current_price,
@@ -620,7 +659,7 @@ class TrendConfirmStrategy(BaseStrategy):
             width = max((tf_atr or atr_15m) * mult, atr_15m * 0.15)
             wanted = "high" if direction == "up" else "low"
             for pivot in piv:
-                if pivot["type"] == wanted:
+                if pivot["type"] == wanted and self._pivot_still_active(bars, pivot, direction, width):
                     levels.append({"timeframe": tf, "price": pivot["price"], "width": width})
 
         if direction == "up":
@@ -694,6 +733,21 @@ class TrendConfirmStrategy(BaseStrategy):
         return out[-20:]
 
     @staticmethod
+    def _pivot_still_active(candles: list, pivot: dict, direction: str, width: float) -> bool:
+        """A pivot only still gates entries as live resistance/support if the
+        market hasn't already closed decisively through it since it formed —
+        an old high/low price has broken and moved on from shouldn't keep
+        rejecting entries as though it were still a wall."""
+        bars_after = [c for c in candles if c.timestamp > pivot["timestamp"]]
+        if not bars_after:
+            return True
+        if direction == "up":
+            # pivot is a resistance HIGH; broken once a close clears it + width
+            return not any(c.close > pivot["price"] + width for c in bars_after)
+        # pivot is a support LOW; broken once a close clears it - width
+        return not any(c.close < pivot["price"] - width for c in bars_after)
+
+    @staticmethod
     def _swing_structure(pivots: list[dict]) -> str:
         highs = [p["price"] for p in pivots if p["type"] == "high"]
         lows = [p["price"] for p in pivots if p["type"] == "low"]
@@ -726,17 +780,39 @@ class TrendConfirmStrategy(BaseStrategy):
 
     @staticmethod
     def _wrong_side_liquidity_sweep(candles_15m: list, direction: str, nearest: Optional[dict]) -> bool:
-        if nearest is None or len(candles_15m) < 2:
+        """True if the last 2 bars show a stop-hunt at the opposing zone that
+        hasn't since been reclaimed. Checking 2 bars (not just the latest)
+        catches a sweep that fired the bar BEFORE the HMA cross; but a sweep
+        1 bar back that the market has already reclaimed (closed cleanly back
+        on the trade's own side) is a false alarm, not a live rejection —
+        don't let it block an otherwise-good entry."""
+        if nearest is None or len(candles_15m) < 3:
             return False
-        c = candles_15m[-1]
         level = nearest["price"]
         width = nearest["width"]
-        body = abs(c.close - c.open)
-        rng = max(c.high - c.low, 1e-12)
-        if direction == "up":
-            # Price probes resistance but closes back below with a meaningful upper wick.
-            return c.high >= level - width and c.close < level - width * 0.25 and (c.high - max(c.open, c.close)) >= body * 1.2 and body / rng >= 0.15
-        return c.low <= level + width and c.close > level + width * 0.25 and (min(c.open, c.close) - c.low) >= body * 1.2 and body / rng >= 0.15
+
+        def is_sweep(c) -> bool:
+            body = abs(c.close - c.open)
+            rng = max(c.high - c.low, 1e-12)
+            if direction == "up":
+                # Price probes resistance but closes back below with a meaningful upper wick.
+                return (c.high >= level - width and c.close < level - width * 0.25
+                        and (c.high - max(c.open, c.close)) >= body * 1.2 and body / rng >= 0.15)
+            return (c.low <= level + width and c.close > level + width * 0.25
+                    and (min(c.open, c.close) - c.low) >= body * 1.2 and body / rng >= 0.15)
+
+        last = candles_15m[-1]
+        for idx in (-1, -2):
+            c = candles_15m[idx]
+            if not is_sweep(c):
+                continue
+            if idx == -2:
+                reclaimed = (last.close > level + width if direction == "up"
+                            else last.close < level - width)
+                if reclaimed:
+                    continue
+            return True
+        return False
 
     def _compute_sl_tp(self, direction: str, price: float, atr: float) -> tuple[float, float]:
         # R = the wider of 2.5xATR and the min_sl_pct floor (0.5% of price),

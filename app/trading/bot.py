@@ -570,10 +570,11 @@ class TradingBot:
             "position_open":            "holding",
             "no_trend":                 "n/a (Layer1 not confirmed)",
             "quality_fail":             "n/a (Layer2 quality too low)",
-            "early_quality_fail":       "FAIL (early trend <75, cross spent)",
+            "early_quality_fail":       "FAIL (early trend, cross spent)",
             "waiting_cross":            "wait_hma_cross (Layer3)",
             "ema_ref_fail":             "cross_ok/ema10_fail (Layer3)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3)",
+            "location_quality_fail":    "cross_ok/location_quality_fail (Layer3)",
             "location_reject":          "cross_ok/location_fail (Layer3)",
             "entered":                  "entered",
         }
