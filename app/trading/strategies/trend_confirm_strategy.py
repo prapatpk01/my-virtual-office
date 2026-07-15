@@ -846,7 +846,11 @@ class TrendConfirmStrategy(BaseStrategy):
         across 4 dimensions (sum of the weights = 100):
 
           BIAS     (bias_weight, 30) — structural direction: close vs EMA20,
-                     EMA20 vs EMA50, close vs EMA50 (each agreeing = 1/3).
+                     EMA20 vs EMA50, EMA50 slope (each agreeing = 1/3). The
+                     3rd is the EMA50's DIRECTION (rising/falling over
+                     ema_slope_lookback bars), not price-vs-EMA50 — the level
+                     check lagged badly on fresh trends (price hadn't reached
+                     the slow EMA yet), the slope turns much sooner.
           TREND    (trend_weight, 30) — is there a real trend, not a range:
                      ADX strength (60%) + inverted Choppiness (40%).
           MOMENTUM (momentum_weight, 25) — push in the trend's direction:
@@ -856,7 +860,7 @@ class TrendConfirmStrategy(BaseStrategy):
         Each dimension is scored 0..1 then multiplied by its weight, so a weak
         dimension can be outweighed by strong ones (soft scoring). Returns None
         if there aren't enough candles (caller treats that as 'warming up')."""
-        min_needed = max(self.quality_ema_slow + 2, 2 * self.adx_period + 2,
+        min_needed = max(self.quality_ema_slow + self.ema_slope_lookback + 2, 2 * self.adx_period + 2,
                          self.chop_period + 1, self.volume_sma_period, self.rsi_period + 1,
                          self.macd_slow + self.macd_signal + 1)
         if len(candles) < min_needed:
@@ -872,8 +876,9 @@ class TrendConfirmStrategy(BaseStrategy):
         vols = [c.volume for c in candles]
         vol_sma = self.sma(vols, self.volume_sma_period)
 
-        needed = [ema_fast[-1], ema_slow[-1], rsi[-1], macd_line[-1], macd_sig[-1],
-                  adx_arr[-1], vol_sma[-1]]
+        lb = self.ema_slope_lookback
+        needed = [ema_fast[-1], ema_slow[-1], ema_slow[-1 - lb], rsi[-1], macd_line[-1],
+                  macd_sig[-1], adx_arr[-1], vol_sma[-1]]
         if chop_val is None or any(np.isnan(x) for x in needed) or vol_sma[-1] <= 0:
             return None
 
@@ -882,9 +887,9 @@ class TrendConfirmStrategy(BaseStrategy):
 
         # ── BIAS (0..1): 3 structural checks, each agreeing with the trend ──
         bias_checks = [
-            (c > ema_fast[-1]) == up,               # price vs EMA20
-            (ema_fast[-1] > ema_slow[-1]) == up,    # EMA20 vs EMA50
-            (c > ema_slow[-1]) == up,               # price vs EMA50
+            (c > ema_fast[-1]) == up,                     # price vs EMA20
+            (ema_fast[-1] > ema_slow[-1]) == up,          # EMA20 vs EMA50
+            (ema_slow[-1] > ema_slow[-1 - lb]) == up,     # EMA50 slope (less lag than price-vs-EMA50)
         ]
         bias01 = sum(1 for v in bias_checks if v) / 3.0
 
