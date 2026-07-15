@@ -1,0 +1,48 @@
+{
+  "symbol": "ETH",
+  "total_trades": 63,
+  "win_rate": 0.7301587301587301,
+  "profit_factor": 1.047,
+  "net_pnl": 65.63,
+  "net_pnl_pct": 0.66,
+  "avg_win": 31.64,
+  "avg_loss": -81.75,
+  "avg_rr": 0.387,
+  "max_drawdown_pct": 3.47,
+  "sharpe": 0.313,
+  "final_balance": 10065.63,
+  "avg_bars_held": 1.0,
+  "total_commission": 404.91,
+  "by_market_state": {
+    "Range": {
+      "wins": 19,
+      "losses": 12,
+      "pnl": -441.71794384212774,
+      "win_rate": 0.6129032258064516,
+      "total": 31
+    },
+    "Trend": {
+      "wins": 24,
+      "losses": 2,
+      "pnl": 683.7842469789622,
+      "win_rate": 0.9230769230769231,
+      "total": 26
+    },
+    "Breakout": {
+      "wins": 3,
+      "losses": 2,
+      "pnl": -92.89155963777347,
+      "win_rate": 0.6,
+      "total": 5
+    },
+    "Reversal": {
+      "wins": 0,
+      "losses": 1,
+      "pnl": -83.5495466951663,
+      "win_rate": 0.0,
+      "total": 1
+    }
+  },
+  "longs": 33,
+  "shorts": 30
+}

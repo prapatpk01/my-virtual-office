@@ -1,0 +1,48 @@
+{
+  "symbol": "BTC",
+  "total_trades": 79,
+  "win_rate": 0.7848101265822784,
+  "profit_factor": 1.368,
+  "net_pnl": 608.36,
+  "net_pnl_pct": 6.08,
+  "avg_win": 36.48,
+  "avg_loss": -97.25,
+  "avg_rr": 0.375,
+  "max_drawdown_pct": 2.48,
+  "sharpe": 2.128,
+  "final_balance": 10608.36,
+  "avg_bars_held": 1.0,
+  "total_commission": 601.74,
+  "by_market_state": {
+    "Range": {
+      "wins": 24,
+      "losses": 6,
+      "pnl": 245.1092982223925,
+      "win_rate": 0.8,
+      "total": 30
+    },
+    "Trend": {
+      "wins": 33,
+      "losses": 9,
+      "pnl": 343.38590391789603,
+      "win_rate": 0.7857142857142857,
+      "total": 42
+    },
+    "Breakout": {
+      "wins": 3,
+      "losses": 2,
+      "pnl": -36.32857589744177,
+      "win_rate": 0.6,
+      "total": 5
+    },
+    "Reversal": {
+      "wins": 2,
+      "losses": 0,
+      "pnl": 56.195719871150764,
+      "win_rate": 1.0,
+      "total": 2
+    }
+  },
+  "longs": 49,
+  "shorts": 30
+}

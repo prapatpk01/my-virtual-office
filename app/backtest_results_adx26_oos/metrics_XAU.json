@@ -1,0 +1,48 @@
+{
+  "symbol": "XAU",
+  "total_trades": 49,
+  "win_rate": 0.673469387755102,
+  "profit_factor": 0.86,
+  "net_pnl": -171.86,
+  "net_pnl_pct": -1.72,
+  "avg_win": 31.92,
+  "avg_loss": -76.59,
+  "avg_rr": 0.417,
+  "max_drawdown_pct": 2.84,
+  "sharpe": -1.072,
+  "final_balance": 9828.14,
+  "avg_bars_held": 1.0,
+  "total_commission": 301.0,
+  "by_market_state": {
+    "Range": {
+      "wins": 8,
+      "losses": 1,
+      "pnl": 142.85892079829028,
+      "win_rate": 0.8888888888888888,
+      "total": 9
+    },
+    "Reversal": {
+      "wins": 0,
+      "losses": 3,
+      "pnl": -211.96753726365063,
+      "win_rate": 0.0,
+      "total": 3
+    },
+    "Trend": {
+      "wins": 25,
+      "losses": 8,
+      "pnl": 256.6145981619381,
+      "win_rate": 0.7575757575757576,
+      "total": 33
+    },
+    "Breakout": {
+      "wins": 0,
+      "losses": 4,
+      "pnl": -359.36808248581457,
+      "win_rate": 0.0,
+      "total": 4
+    }
+  },
+  "longs": 30,
+  "shorts": 19
+}
