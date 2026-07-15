@@ -193,6 +193,10 @@ def build_config() -> dict:
         # Whipsaw guard: minutes since the last OPEN on a symbol before a new
         # entry is allowed there (0 = disabled).
         "adaptive_entry_spacing_min": _env_int("ADAPTIVE_ENTRY_SPACING_MIN", 60),
+        # Startup warmup — no new entries until this many minutes after
+        # process start (indicators need a few closed bars to stabilize
+        # after a fresh restart). Was hardcoded 45; lowered to 10 by request.
+        "adaptive_warmup_min": _env_int("ADAPTIVE_WARMUP_MIN", 10),
         # [FIXED-$ SIZING] (live default): every trade opens the same
         # notional = ADAPTIVE_MARGIN_USDT × LEVERAGE, regardless of signal
         # quality or account balance — e.g. $30 margin × 20x = $600 notional
@@ -505,6 +509,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             daily_profit_limit_pct=cfg["adaptive_daily_profit"],
             cooldown_minutes=cfg["adaptive_cooldown_min"],
             max_loss_streak=cfg["adaptive_max_loss_streak"],
+            startup_warmup_minutes=cfg.get("adaptive_warmup_min", 10),
             state_file=state_file,
             execution_callback=_make_callback(sym, okx),
             enable_swing_reversal=cfg["strategies"].get("swing_reversal_pro", True),
@@ -551,7 +556,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             f"Adaptive Bot Started\n"
             f"Symbols: {', '.join(symbols)}\n"
             f"Mode: {'PAPER' if cfg['paper'] else 'LIVE'}\n"
-            f"Warmup: 45m — no new entries until indicators stabilize"
+            f"Warmup: {cfg.get('adaptive_warmup_min', 10)}m — "
+            f"no new entries until indicators stabilize"
         )
 
     import time as _time
