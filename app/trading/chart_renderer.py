@@ -65,7 +65,9 @@ def render_entry_chart(
     ma_type: str = "ema",           # "ema" | "hma" — matches the strategy that fired
     ema_fast: int = 20,
     ema_slow: int = 50,
+    extra_ema: Optional[int] = None,  # optional third EMA line (e.g. trend_confirm's EMA50 SL reference)
     sma_period: Optional[int] = None,
+    tf_label: Optional[str] = None,   # timeframe of `candles`, shown in the title (e.g. "5m")
     macd_fast: int = 12,
     macd_slow: int = 26,
     macd_signal_period: int = 9,
@@ -102,6 +104,9 @@ def render_entry_chart(
             mpf.make_addplot(ma1, color="#3b82f6", width=1.1),
             mpf.make_addplot(ma2, color="#f59e0b", width=1.1),
         ]
+        if extra_ema:
+            ema3 = pd.Series(BaseStrategy.ema(closes, extra_ema), index=df.index)
+            addplots.append(mpf.make_addplot(ema3, color="#a855f7", width=1.1))
         if sma_period:
             sma_line = pd.Series(BaseStrategy.sma(closes, sma_period), index=df.index)
             addplots.append(mpf.make_addplot(sma_line, color="#a855f7", width=1.1, linestyle="dashed"))
@@ -150,7 +155,8 @@ def render_entry_chart(
         hlines_widths += [0.8, 0.8]
 
         resolved_dir_label = dir_label or ("LONG (+)" if direction == "long" else "SHORT (-)")
-        title = f"{symbol}  {resolved_dir_label}  |  {strategy or ''}".strip()
+        _tf = f"  [{tf_label}]" if tf_label else ""
+        title = f"{symbol}{_tf}  {resolved_dir_label}  |  {strategy or ''}".strip()
 
         mc = mpf.make_marketcolors(
             up="#22c55e", down="#ef4444",
@@ -193,7 +199,9 @@ def render_entry_chart(
         ax = axes[0]
         legend_lines = [
             f"{entry_label} {entry:,.2f}",
-            f"{ma_label}{ema_fast} / {ma_label}{ema_slow}" + (f" / SMA{sma_period}" if sma_period else ""),
+            f"{ma_label}{ema_fast} / {ma_label}{ema_slow}"
+            + (f" / EMA{extra_ema}" if extra_ema else "")
+            + (f" / SMA{sma_period}" if sma_period else ""),
             f"MACD {macd_fast}/{macd_slow}/{macd_signal_period}",
         ]
         if sl:

@@ -188,7 +188,13 @@ class TradingBot:
             kwargs["ma_type"] = "hma"
             kwargs["ema_fast"] = strategy_inst.hma_fast
             kwargs["ema_slow"] = strategy_inst.hma_slow
-        if hasattr(strategy_inst, "sma_trend"):
+        # trend_confirm's entry runs on 5m — draw its EMA50 stop reference and
+        # label the timeframe, and skip the 30m SMA30 (meaningless on a 5m
+        # chart). Everything else keeps SMA30 as before.
+        if hasattr(strategy_inst, "entry_tf") and hasattr(strategy_inst, "sl_ema_ref"):
+            kwargs["extra_ema"] = strategy_inst.sl_ema_ref
+            kwargs["tf_label"] = strategy_inst.entry_tf
+        elif hasattr(strategy_inst, "sma_trend"):
             kwargs["sma_period"] = strategy_inst.sma_trend
         if hasattr(strategy_inst, "macd_fast"):
             kwargs["macd_fast"] = strategy_inst.macd_fast
@@ -1218,13 +1224,17 @@ class TradingBot:
                     dir_label = ("LONG (+) [EARLY]" if direction == "long"
                                  else "SHORT (-) [EARLY]")
                 chart_path = None
-                if candles:
+                strategy_inst = self._resolve_strategy_inst(strategy_name)
+                # Render on the timeframe the strategy actually entered on: if
+                # it exposes a finer entry series (trend_confirm's 5m), chart
+                # THAT so the EMA lines match the trade; else the base candles.
+                chart_candles = getattr(strategy_inst, "_latest_5m", None) or candles
+                if chart_candles:
                     try:
                         from .chart_renderer import render_entry_chart
-                        strategy_inst = self._resolve_strategy_inst(strategy_name)
                         chart_kwargs = self._chart_ma_kwargs(strategy_inst)
                         chart_path = render_entry_chart(
-                            candles, sym, direction, order.price,
+                            chart_candles, sym, direction, order.price,
                             sl=sl_p, tp=tp_p, strategy=strategy_name,
                             macro_bias=macro_info.get("bias", ""),
                             dir_label=dir_label,
