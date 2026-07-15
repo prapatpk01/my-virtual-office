@@ -240,7 +240,7 @@ class Config:
     # only adds re-entry churn and fee drag without reducing risk. Reverted
     # to 1.0 (no tightening).
     sl_tighten_mult: float = 1.0
-    tp1_r: float = 0.5
+    tp1_r: float = 0.6   # was 0.5 (per user request)
     # Fraction of the position closed at TP1 (remainder rides to TP2/SL-at-BE).
     # Swept against the live 6-symbol backtest (BTC/ETH/SOL/XAU/XAG, Jan-Jun
     # 2026): the TP2 bucket is the strategy's only real profit source, so a
