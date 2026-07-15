@@ -129,6 +129,11 @@ class TrendConfirmStrategy(BaseStrategy):
         chop_threshold: float = 61.8,
         volume_sma_period: int = 20,
         volume_expansion_mult: float = 1.0,
+        # Layer 2a quality is scored across 4 dimensions (sum = 100):
+        bias_weight: float = 30.0,       # structural direction (price vs EMA20/50)
+        trend_weight: float = 30.0,      # trend strength / not choppy (ADX + Choppiness)
+        momentum_weight: float = 25.0,   # RSI lean + MACD histogram in-trend
+        volume_weight: float = 15.0,     # volume expansion vs its SMA
         tf_weight_15m: float = 0.65,
         tf_weight_1h: float = 0.35,
         layer2_threshold: float = 60.0,        # established-trend entries
@@ -189,6 +194,10 @@ class TrendConfirmStrategy(BaseStrategy):
         self.chop_threshold = chop_threshold
         self.volume_sma_period = volume_sma_period
         self.volume_expansion_mult = volume_expansion_mult
+        self.bias_weight = bias_weight
+        self.trend_weight = trend_weight
+        self.momentum_weight = momentum_weight
+        self.volume_weight = volume_weight
         self.tf_weight_15m = tf_weight_15m
         self.tf_weight_1h = tf_weight_1h
         self.layer2_threshold = layer2_threshold
@@ -833,11 +842,20 @@ class TrendConfirmStrategy(BaseStrategy):
         }
 
     def _tf_quality(self, candles: list, trend: str) -> Optional[dict]:
-        """Per-timeframe 0-100 trend-quality score for the confirmed
-        direction: Alignment 40 + ADX 25 + Choppiness 20 + Volume 15.
-        Returns None if there aren't enough candles to compute everything
-        (e.g. the 1H series from mtf_candles is short) — the caller treats
-        that as 'still warming up'."""
+        """Per-timeframe 0-100 trend-quality score for the confirmed direction,
+        across 4 dimensions (sum of the weights = 100):
+
+          BIAS     (bias_weight, 30) — structural direction: close vs EMA20,
+                     EMA20 vs EMA50, close vs EMA50 (each agreeing = 1/3).
+          TREND    (trend_weight, 30) — is there a real trend, not a range:
+                     ADX strength (60%) + inverted Choppiness (40%).
+          MOMENTUM (momentum_weight, 25) — push in the trend's direction:
+                     RSI lean scaled (48%) + MACD histogram in-trend (52%).
+          VOLUME   (volume_weight, 15) — participation: volume / SMA20(volume).
+
+        Each dimension is scored 0..1 then multiplied by its weight, so a weak
+        dimension can be outweighed by strong ones (soft scoring). Returns None
+        if there aren't enough candles (caller treats that as 'warming up')."""
         min_needed = max(self.quality_ema_slow + 2, 2 * self.adx_period + 2,
                          self.chop_period + 1, self.volume_sma_period, self.rsi_period + 1,
                          self.macd_slow + self.macd_signal + 1)
@@ -848,47 +866,60 @@ class TrendConfirmStrategy(BaseStrategy):
         ema_fast = self.ema(closes, self.quality_ema_fast)
         ema_slow = self.ema(closes, self.quality_ema_slow)
         rsi = self.rsi(closes, self.rsi_period)
-        macd_line, _sig, _hist = self.macd(closes, self.macd_fast, self.macd_slow, self.macd_signal)
+        macd_line, macd_sig, _hist = self.macd(closes, self.macd_fast, self.macd_slow, self.macd_signal)
         adx_arr, _p, _m = self.adx(candles, self.adx_period)
         chop_val = self._choppiness(candles, self.chop_period)
         vols = [c.volume for c in candles]
         vol_sma = self.sma(vols, self.volume_sma_period)
 
-        needed = [ema_fast[-1], ema_slow[-1], rsi[-1], macd_line[-1], adx_arr[-1], vol_sma[-1]]
+        needed = [ema_fast[-1], ema_slow[-1], rsi[-1], macd_line[-1], macd_sig[-1],
+                  adx_arr[-1], vol_sma[-1]]
         if chop_val is None or any(np.isnan(x) for x in needed) or vol_sma[-1] <= 0:
             return None
 
         up = trend == "up"
         c = closes[-1]
 
-        # Alignment (40 pts) — 4 x 10, each check agreeing with Layer1 direction
-        checks = {
-            "px_ema20": (c > ema_fast[-1]) == up,
-            "ema20_50": (ema_fast[-1] > ema_slow[-1]) == up,
-            "rsi":      (rsi[-1] > self.rsi_bull) if up else (rsi[-1] < self.rsi_bear),
-            "macd":     (macd_line[-1] > 0) == up,
-        }
-        align_pts = sum(10.0 for v in checks.values() if v)
+        # ── BIAS (0..1): 3 structural checks, each agreeing with the trend ──
+        bias_checks = [
+            (c > ema_fast[-1]) == up,               # price vs EMA20
+            (ema_fast[-1] > ema_slow[-1]) == up,    # EMA20 vs EMA50
+            (c > ema_slow[-1]) == up,               # price vs EMA50
+        ]
+        bias01 = sum(1 for v in bias_checks if v) / 3.0
 
-        # ADX (25 pts) — full credit at 2x threshold
+        # ── TREND (0..1): ADX strength (60%) + inverted Choppiness (40%) ────
         adx_val = float(adx_arr[-1])
-        adx_pts = min(1.0, adx_val / max(1.0, self.adx_threshold * 2.0)) * 25.0
-
-        # Choppiness (20 pts) — inverted (low chop = high score)
+        adx01 = min(1.0, adx_val / max(1.0, self.adx_threshold * 2.0))
         chop_full_at = max(1.0, 100.0 - self.chop_threshold)
-        chop_pts = max(0.0, min(1.0, (100.0 - chop_val) / chop_full_at)) * 20.0
+        chop01 = max(0.0, min(1.0, (100.0 - chop_val) / chop_full_at))
+        trend01 = 0.60 * adx01 + 0.40 * chop01
 
-        # Volume (15 pts) — full credit at 2x expansion multiple
+        # ── MOMENTUM (0..1): RSI lean (48%) + MACD histogram in-trend (52%) ─
+        if up:
+            rsi01 = max(0.0, min(1.0, (rsi[-1] - 50.0) / max(1.0, self.rsi_bull + 15.0 - 50.0)))
+        else:
+            rsi01 = max(0.0, min(1.0, (50.0 - rsi[-1]) / max(1.0, 50.0 - (self.rsi_bear - 15.0))))
+        hist = macd_line[-1] - macd_sig[-1]
+        macd01 = 1.0 if ((hist > 0) == up) else 0.0
+        mom01 = 0.48 * rsi01 + 0.52 * macd01
+
+        # ── VOLUME (0..1): volume vs its SMA, full at 2x expansion multiple ─
         vol_ratio = float(candles[-1].volume) / float(vol_sma[-1])
-        vol_pts = min(1.0, vol_ratio / max(0.01, self.volume_expansion_mult * 2.0)) * 15.0
+        vol01 = min(1.0, vol_ratio / max(0.01, self.volume_expansion_mult * 2.0))
+
+        bias_pts = bias01 * self.bias_weight
+        trend_pts = trend01 * self.trend_weight
+        mom_pts = mom01 * self.momentum_weight
+        vol_pts = vol01 * self.volume_weight
 
         breakdown = {
-            "align": round(align_pts, 1), "adx": round(adx_pts, 1),
-            "chop": round(chop_pts, 1), "volume": round(vol_pts, 1),
+            "bias": round(bias_pts, 1), "trend": round(trend_pts, 1),
+            "momentum": round(mom_pts, 1), "volume": round(vol_pts, 1),
             "adx_val": round(adx_val, 1), "chop_val": round(chop_val, 1),
-            "vol_ratio": round(vol_ratio, 2),
+            "rsi_val": round(float(rsi[-1]), 1), "vol_ratio": round(vol_ratio, 2),
         }
-        score = align_pts + adx_pts + chop_pts + vol_pts
+        score = bias_pts + trend_pts + mom_pts + vol_pts
         return {"score": round(score, 1), "breakdown": breakdown}
 
     @staticmethod
