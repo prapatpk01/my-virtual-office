@@ -118,6 +118,23 @@ def _format_close_msg(order_type: str, sym: str, trade_info: dict) -> str:
     )
 
 
+def _translate_scan_reason(reason: str) -> str:
+    """Turn one direction's raw _scan_info string into a plain-English
+    pass/fail/pending line for the [View] log block. Same underlying data
+    TradingBot._generate_signal already writes — this only relabels it."""
+    if not reason:
+        return "no signal evaluated yet"
+    if reason.startswith("veto:"):
+        return f"✗ blocked — {reason[len('veto:'):]}"
+    if reason.startswith("strategy_fail"):
+        return f"✗ blocked — no strategy scored high enough ({reason})"
+    if reason.startswith("total "):
+        if "→ SIGNAL" in reason:
+            return f"✅ READY TO ENTER — {reason.replace(' → SIGNAL', '')}"
+        return f"⏳ passed all vetoes, score not high enough yet — {reason}"
+    return reason
+
+
 # ---------------------------------------------------------------------------
 # Build config
 # ---------------------------------------------------------------------------
@@ -969,8 +986,12 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                         status["market_state"], status["regime_score"],
                         status["session_state"],
                     )
-                    # analysis detail: last per-direction evaluation (scores vs
-                    # threshold, or which veto blocked) so the scan shows WHY.
+                    # [VIEW LOG] Human-readable "what's the trend, what's
+                    # passed, what's it waiting on" block — same underlying
+                    # per-direction _scan_info data as before, just laid out
+                    # multi-line (a single "|"-joined line was truncating on
+                    # mobile log viewers) with the regime/4H-macro direction
+                    # up front and each veto/score translated to plain English.
                     # _scan_info stops being written once the bot enters
                     # COOLDOWN/BLOCKED (signal generation isn't reached there),
                     # so without this check the log could show a stale
@@ -978,8 +999,16 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     scan = status.get("scan_info") or {}
                     if scan and not status["position_open"] \
                             and status["state"] not in ("COOLDOWN", "BLOCKED"):
-                        parts = [f"{d}: {v}" for d, v in scan.items()]
-                        logger.info("[Scan][%s] %s", sym, " | ".join(parts))
+                        lines = [
+                            f"[View][{sym}]",
+                            f"  Regime   : {status['market_state']}",
+                            f"  4H Macro : {status['regime_bias']} ({status['regime_score']:.0f}/100)",
+                            f"  Session  : {status['session_state']}",
+                        ]
+                        for d in ("LONG", "SHORT"):
+                            if d in scan:
+                                lines.append(f"  {d:5s}: {_translate_scan_reason(scan[d])}")
+                        logger.info("\n".join(lines))
                 except Exception as e:
                     logger.warning("[Adaptive][%s] scan log failed: %s", sym, e)
 
