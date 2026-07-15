@@ -247,10 +247,9 @@ class Config:
     # SMALLER TP1 take (bigger runner) improves expected value — 40% beat
     # both 50% (previous default) and 70%/60%@0.6R.
     tp1_fraction: float = 0.6
-    # MEASURED WORSE at 1.0R paired with sl_tighten_mult=0.85 (see above) —
-    # reverted, sl_tighten_mult back to 1.0 (untightened). tp2_r set to 1.2R
-    # per user request.
-    tp2_r: float = 1.2
+    # tp2_r = 1.5R (per user request). Paired with TP1 0.6R / 60% closed then
+    # SL to breakeven — the 40% runner now targets 1.5R instead of 1.2R.
+    tp2_r: float = 1.5
     swing_lookback_left: int = 3
     swing_lookback_right: int = 3
 
