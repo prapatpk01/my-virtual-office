@@ -129,7 +129,7 @@ def build_config() -> dict:
         "api_secret":      os.environ.get("EXCHANGE_API_SECRET", ""),
         "api_passphrase":  os.environ.get("EXCHANGE_PASSPHRASE", ""),
         "paper":           _env_bool("PAPER_TRADING", False),
-        "leverage":        _env_int("LEVERAGE", 10),
+        "leverage":        _env_int("LEVERAGE", 20),
         "symbols":         _env_list("SYMBOLS", "BTC/USDT:USDT"),
         "candle_tf":       os.environ.get("CANDLE_TF", "15m"),
         "candle_limit":    _env_int("CANDLE_LIMIT", 400),
@@ -176,19 +176,22 @@ def build_config() -> dict:
         # Whipsaw guard: minutes since the last OPEN on a symbol before a new
         # entry is allowed there (0 = disabled).
         "adaptive_entry_spacing_min": _env_int("ADAPTIVE_ENTRY_SPACING_MIN", 60),
-        # [LEVEL 1 — ADAPTIVE RISK] Confidence-weighted %-of-balance sizing
-        # (live default): position size scales between MIN and MAX% of
-        # balance based on the bot's own conviction (score headroom above
-        # this state's entry bar, penalized by any historically-bad
-        # condition tags present — see ConditionLearningEngine). Set both to
-        # 0 to fall back to legacy fixed-$ sizing (ADAPTIVE_MARGIN_USDT), or
-        # all three to 0 for classic risk-%-of-balance (ADAPTIVE_RISK_PCT).
-        "adaptive_margin_pct_min": _env_float("ADAPTIVE_MARGIN_PCT_MIN", 0.08),
-        "adaptive_margin_pct_max": _env_float("ADAPTIVE_MARGIN_PCT_MAX", 0.15),
-        # Legacy fixed-margin sizing override: notional = ADAPTIVE_MARGIN_USDT
-        # × LEVERAGE for every trade regardless of quality. 0 = disabled
-        # (default — adaptive %-of-balance above takes over instead).
-        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 0.0),
+        # [FIXED-$ SIZING] (live default): every trade opens the same
+        # notional = ADAPTIVE_MARGIN_USDT × LEVERAGE, regardless of signal
+        # quality or account balance — e.g. $30 margin × 20x = $600 notional
+        # per position. This takes precedence whenever set (>0); to switch
+        # back to confidence-weighted %-of-balance sizing, set
+        # ADAPTIVE_MARGIN_USDT=0 and ADAPTIVE_MARGIN_PCT_MIN/MAX to nonzero
+        # bounds (e.g. 0.08/0.15) instead.
+        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 30.0),
+        # [LEVEL 1 — ADAPTIVE RISK] Confidence-weighted %-of-balance sizing —
+        # position size scales between MIN and MAX% of balance based on the
+        # bot's own conviction (score headroom above this state's entry bar,
+        # penalized by any historically-bad condition tags — see
+        # ConditionLearningEngine). 0/0 (default) disables this in favor of
+        # the fixed-$ sizing above; set both nonzero to switch modes.
+        "adaptive_margin_pct_min": _env_float("ADAPTIVE_MARGIN_PCT_MIN", 0.0),
+        "adaptive_margin_pct_max": _env_float("ADAPTIVE_MARGIN_PCT_MAX", 0.0),
         # [MTF-CONFLUENCE] "adaptive" (default) = V9.2 L1/L2/L3/StrategyScorer
         # pipeline. "mtf_confluence" = deterministic 4H+1H trend-alignment +
         # 15m 3-signal confluence entry engine (see mtf_confluence_engine.py)
