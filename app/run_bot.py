@@ -135,6 +135,36 @@ def _translate_scan_reason(reason: str) -> str:
     return reason
 
 
+def _view_waiting_reason(status: dict, tradeable_regimes) -> str:
+    """Why a symbol produced no per-direction verdict this cycle — derived
+    from bot status (the bot was blocked before signal generation, so
+    _scan_info is empty). Checked in the same order the gates actually fire
+    in TradingBot._check_global_gates so the FIRST real blocker is shown."""
+    if status.get("position_open"):
+        d = status.get("direction") or "?"
+        return f"in a {d} position — managing it (no new entry while open)"
+    warm = status.get("warmup_remaining_m", 0)
+    if warm and warm > 0:
+        return f"⏳ startup warmup — {warm}m left before entries are allowed"
+    st = status.get("state")
+    if st == "COOLDOWN":
+        return "cooldown after a loss streak (waits for the cooldown to expire)"
+    if st == "BLOCKED":
+        return "daily PnL limit hit — blocked until the next trading day"
+    if not status.get("session_gate_open", True):
+        return (f"session {status.get('session_state')} — new entries paused "
+                f"(commodity weekend; crypto is unaffected)")
+    regime = status.get("market_state")
+    if regime not in tradeable_regimes:
+        return (f"regime is {regime}, not tradeable — the bot only opens in "
+                f"{'/'.join(sorted(tradeable_regimes))} (waiting for the market to trend)")
+    if status.get("regime_bias") == "NEUTRAL":
+        return (f"regime is Trend but the 4H macro is NEUTRAL "
+                f"({status.get('regime_score', 50):.0f}/100) — no higher-timeframe "
+                f"direction behind it yet")
+    return "evaluating — no direction scored this cycle yet"
+
+
 # ---------------------------------------------------------------------------
 # Build config
 # ---------------------------------------------------------------------------
@@ -333,7 +363,8 @@ def _make_telegram(cfg: dict):
 # ---------------------------------------------------------------------------
 
 async def _run_adaptive(cfg, connector, telegram, stop_event):
-    from trading.adaptive_trading_bot import TradingBot as AdaptiveBot, ExpectancyEngine
+    from trading.adaptive_trading_bot import (
+        TradingBot as AdaptiveBot, ExpectancyEngine, _TRADEABLE_REGIMES)
     from trading.indicator_engine import IndicatorEngine
     from trading.chart_renderer import render_entry_chart
 
@@ -993,28 +1024,30 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                         status["session_state"],
                     )
                     # [VIEW LOG] Human-readable "what's the trend, what's
-                    # passed, what's it waiting on" block — same underlying
-                    # per-direction _scan_info data as before, just laid out
-                    # multi-line (a single "|"-joined line was truncating on
-                    # mobile log viewers) with the regime/4H-macro direction
-                    # up front and each veto/score translated to plain English.
-                    # _scan_info stops being written once the bot enters
-                    # COOLDOWN/BLOCKED (signal generation isn't reached there),
-                    # so without this check the log could show a stale
-                    # snapshot from hours before a since-started cooldown.
+                    # passed, what's it waiting on" block — ALWAYS printed
+                    # (one per symbol per scan cycle). When the bot got far
+                    # enough to score a direction, _scan_info carries the
+                    # per-LONG/SHORT verdict; when it was blocked earlier
+                    # (warmup / untradeable regime / session pause / cooldown /
+                    # already in a position), _view_waiting_reason() derives
+                    # the actual gate from status so the block is never blank —
+                    # that empty case (the common one) is exactly what the old
+                    # `if scan and ...` guard was hiding.
+                    lines = [
+                        f"[View][{sym}]",
+                        f"  Regime   : {status['market_state']}",
+                        f"  4H Macro : {status['regime_bias']} ({status['regime_score']:.0f}/100)",
+                        f"  Session  : {status['session_state']}",
+                    ]
                     scan = status.get("scan_info") or {}
-                    if scan and not status["position_open"] \
+                    scored = [d for d in ("LONG", "SHORT") if d in scan]
+                    if scored and not status["position_open"] \
                             and status["state"] not in ("COOLDOWN", "BLOCKED"):
-                        lines = [
-                            f"[View][{sym}]",
-                            f"  Regime   : {status['market_state']}",
-                            f"  4H Macro : {status['regime_bias']} ({status['regime_score']:.0f}/100)",
-                            f"  Session  : {status['session_state']}",
-                        ]
-                        for d in ("LONG", "SHORT"):
-                            if d in scan:
-                                lines.append(f"  {d:5s}: {_translate_scan_reason(scan[d])}")
-                        logger.info("\n".join(lines))
+                        for d in scored:
+                            lines.append(f"  {d:5s}: {_translate_scan_reason(scan[d])}")
+                    else:
+                        lines.append(f"  Waiting  : {_view_waiting_reason(status, _TRADEABLE_REGIMES)}")
+                    logger.info("\n".join(lines))
                 except Exception as e:
                     logger.warning("[Adaptive][%s] scan log failed: %s", sym, e)
 
