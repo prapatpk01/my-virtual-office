@@ -472,6 +472,13 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
         _base_sym = sym.split("/")[0].upper()
         _min_sl_pct = _min_sl_pct_commodity if _base_sym in _commodity_symbols else _min_sl_pct_crypto
+        # [PER-SYMBOL SIZING] Fixed-$ margin defaults to ADAPTIVE_MARGIN_USDT
+        # for every symbol; ADAPTIVE_MARGIN_USDT_<BASE_SYM> overrides just
+        # that one symbol. BTC defaults to $50 (a bigger position than the
+        # $30 baseline) — set ADAPTIVE_MARGIN_USDT_BTC to change it, or add
+        # ADAPTIVE_MARGIN_USDT_<SYM> for any other symbol the same way.
+        _per_symbol_margin_default = {"BTC": 50.0}.get(_base_sym, cfg.get("adaptive_margin_usdt", 0.0))
+        _margin_usdt = _env_float(f"ADAPTIVE_MARGIN_USDT_{_base_sym}", _per_symbol_margin_default)
 
         bot = AdaptiveBot(
             account_balance=cfg["adaptive_balance"],
@@ -491,7 +498,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             entry_spacing_min=cfg.get("adaptive_entry_spacing_min", 60),
             margin_pct_min=cfg.get("adaptive_margin_pct_min", 0.08),
             margin_pct_max=cfg.get("adaptive_margin_pct_max", 0.15),
-            margin_usdt=cfg.get("adaptive_margin_usdt", 0.0),
+            margin_usdt=_margin_usdt,
             sizing_leverage=cfg.get("leverage", 10),
             expectancy_engine=shared_expectancy,
             entry_engine=cfg.get("adaptive_entry_engine", "adaptive"),
