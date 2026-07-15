@@ -1017,37 +1017,26 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             for sym, (bot, _sf) in bots.items():
                 try:
                     status = bot.get_status()
-                    logger.info(
-                        "[Adaptive][%s] state=%s pos=%s market=%s regime=%.0f session=%s",
-                        sym, status["state"], status["position_open"],
-                        status["market_state"], status["regime_score"],
-                        status["session_state"],
-                    )
-                    # [VIEW LOG] Human-readable "what's the trend, what's
-                    # passed, what's it waiting on" block — ALWAYS printed
-                    # (one per symbol per scan cycle). When the bot got far
-                    # enough to score a direction, _scan_info carries the
-                    # per-LONG/SHORT verdict; when it was blocked earlier
-                    # (warmup / untradeable regime / session pause / cooldown /
-                    # already in a position), _view_waiting_reason() derives
-                    # the actual gate from status so the block is never blank —
-                    # that empty case (the common one) is exactly what the old
-                    # `if scan and ...` guard was hiding.
-                    lines = [
-                        f"[View][{sym}]",
-                        f"  Regime   : {status['market_state']}",
-                        f"  4H Macro : {status['regime_bias']} ({status['regime_score']:.0f}/100)",
-                        f"  Session  : {status['session_state']}",
-                    ]
+                    # [VIEW LOG] ONE single-line entry per symbol per scan
+                    # cycle. Kept to a single line ON PURPOSE: Railway's log
+                    # viewer splits any "\n" into separate timestamped rows,
+                    # so a multi-line block showed up as 5 disconnected
+                    # entries. The trend/macro/session header plus the verdict
+                    # (per-direction score when the bot reached scoring, else
+                    # _view_waiting_reason's derived gate) all go on one line
+                    # joined by " · " so it stays a single log record.
+                    head = (f"[View][{sym}] regime={status['market_state']} "
+                            f"macro={status['regime_bias']}({status['regime_score']:.0f}) "
+                            f"session={status['session_state']}")
                     scan = status.get("scan_info") or {}
                     scored = [d for d in ("LONG", "SHORT") if d in scan]
                     if scored and not status["position_open"] \
                             and status["state"] not in ("COOLDOWN", "BLOCKED"):
-                        for d in scored:
-                            lines.append(f"  {d:5s}: {_translate_scan_reason(scan[d])}")
+                        verdict = " · ".join(
+                            f"{d}: {_translate_scan_reason(scan[d])}" for d in scored)
                     else:
-                        lines.append(f"  Waiting  : {_view_waiting_reason(status, _TRADEABLE_REGIMES)}")
-                    logger.info("\n".join(lines))
+                        verdict = f"waiting: {_view_waiting_reason(status, _TRADEABLE_REGIMES)}"
+                    logger.info("%s · %s", head, verdict)
                 except Exception as e:
                     logger.warning("[Adaptive][%s] scan log failed: %s", sym, e)
 
