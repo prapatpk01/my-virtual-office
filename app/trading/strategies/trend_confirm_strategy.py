@@ -35,11 +35,11 @@ Layer 2 — Trend quality: dynamic weighted score (TF15m + TF1H):
 Layer 3 — Entry (TF5m), always WITH Layer 1's confirmed trend:
   LONG (only after Layer1+Layer2 confirm UP):
     1. EMA5 crosses above EMA9 (5m)
-    2. price (close) is above EMA5 (5m)
+    2. price (close) is above EMA9 (5m) — the same line the cross + exit use
     3. price is within `max_dist_atr_mult` (default 1.5) x ATR(14,5m) of EMA50
   SHORT (only after Layer1+Layer2 confirm DOWN): the mirror —
     1. EMA5 crosses below EMA9 (5m)
-    2. price below EMA5 (5m)
+    2. price below EMA9 (5m)
     3. price within 1.5 x ATR of EMA50
   Early-trend window: the 5m EMA5/9 cross is faster than Layer 1's 30m
   confirmation, so the cross that starts a move often fires a bar or two
@@ -130,7 +130,7 @@ class TrendConfirmStrategy(BaseStrategy):
         entry_tf: str = "5m",       # timeframe (mtf key) the entry cross + exit run on
         ema_fast: int = 5,          # entry-cross fast EMA (5m)
         ema_slow: int = 9,          # entry-cross slow EMA (5m); also the "close past" exit reference
-        entry_ema_ref: int = 5,     # price must be above (long) / below (short) this EMA (5m)
+        entry_ema_ref: int = 9,     # price must be above (long) / below (short) this EMA (5m) — EMA9, same line the cross + exit use
         sl_ema_ref: int = 50,       # SL sits at this EMA (5m)
         chase_ema_ref: int = 50,    # chase-guard distance is measured vs this EMA (5m); decoupled from sl_ema_ref
         fresh_trend_bars: int = 2,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)

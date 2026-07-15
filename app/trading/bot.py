@@ -583,7 +583,7 @@ class TradingBot:
             "quality_fail":             "n/a (Layer2 quality too low)",
             "early_quality_fail":       "FAIL (early trend, cross spent)",
             "waiting_cross":            "wait_ema_cross (Layer3 5m)",
-            "ema_ref_fail":             "cross_ok/ema5_fail (Layer3 5m)",
+            "ema_ref_fail":             "cross_ok/ema9_fail (Layer3 5m)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3 5m)",
             "location_quality_fail":    "cross_ok/location_quality_fail (Layer3)",
             "location_reject":          "cross_ok/location_fail (Layer3)",
