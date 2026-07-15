@@ -580,6 +580,7 @@ class TradingBot:
         _STATUS_LABEL = {
             "position_open":            "holding",
             "no_trend":                 "n/a (Layer1 not confirmed)",
+            "sideways_veto":            "n/a (Layer2 SIDEWAYS veto)",
             "quality_fail":             "n/a (Layer2a quality too low)",
             "early_quality_fail":       "FAIL (early trend, cross spent)",
             "location_reject":          "n/a (Layer2b location reject)",

@@ -158,6 +158,16 @@ class TrendConfirmStrategy(BaseStrategy):
         preferred_structure_room_r: float = 0.95,
         location_threshold_penalty: float = 4.0,
         reject_midrange_when_choppy: bool = True,
+        # Sideways / range veto (Layer 2) — hard-block entries when the 15m
+        # context looks like a range, not a trend. Designed NOT to kill early
+        # trends: it leans on EMA compression + high chop (which stay range-y
+        # even as ADX lags), and only counts "really weak" ADX (< sideways_adx_max,
+        # stricter than adx_threshold) so a fresh trend at ADX ~18 isn't vetoed.
+        use_sideways_filter: bool = True,
+        sideways_ema_compression_atr: float = 0.5,  # |EMA20-EMA50| < this x ATR = tangled/flat
+        sideways_adx_max: float = 15.0,             # ADX below this = "really weak" (< adx_threshold on purpose)
+        sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
+        sideways_min_signals: int = 2,              # how many of the 4 signals must fire to veto
         # Exit (5m): EMA5/9 cross-back OR a 5m close past EMA9 closes the runner
         # Partial take-profit + break-even (2-TP scheme)
         use_partial_tp: bool = True,        # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
@@ -222,6 +232,11 @@ class TrendConfirmStrategy(BaseStrategy):
         self.preferred_structure_room_r = preferred_structure_room_r
         self.location_threshold_penalty = location_threshold_penalty
         self.reject_midrange_when_choppy = reject_midrange_when_choppy
+        self.use_sideways_filter = use_sideways_filter
+        self.sideways_ema_compression_atr = sideways_ema_compression_atr
+        self.sideways_adx_max = sideways_adx_max
+        self.sideways_range_atr = sideways_range_atr
+        self.sideways_min_signals = sideways_min_signals
 
         self.use_partial_tp = use_partial_tp
         self.tp1_r = tp1_r
@@ -334,6 +349,8 @@ class TrendConfirmStrategy(BaseStrategy):
         has_short_candidate = trend == "down" and ema_cross_down
         location = self._neutral_location_context()
         location_adjusted_l2_thr = l2_thr
+        sideways = (self._sideways_context(candles) if self.use_sideways_filter
+                    else {"is_sideways": False, "signals": 0, "detail": {}})
 
         def dbg(entry_status: str) -> dict:
             return {"trend_confirm": {
@@ -348,6 +365,7 @@ class TrendConfirmStrategy(BaseStrategy):
                 "layer2_threshold": location_adjusted_l2_thr,
                 "base_layer2_threshold": l2_thr,
                 "location": location,
+                "sideways": sideways,
                 "open_position": self._open_position,
                 "entry_status": entry_status,
                 "fresh_trend_bars": fb, "trend_age_bars": trend_age, "is_early_trend": is_early_trend,
@@ -388,6 +406,22 @@ class TrendConfirmStrategy(BaseStrategy):
             else:
                 self._last_ema_cross_down_ts = None
             return True
+
+        # ── Layer 2 — sideways / range veto (hard) ────────────────────────
+        # A trend-follower bleeds in ranges, so an explicit range read gets a
+        # hard veto here regardless of the quality score (a range can still
+        # score >60 on a bounce). Tuned not to fire on fresh trends (see
+        # _sideways_context). Definitive for early-trend crosses.
+        if sideways["is_sideways"]:
+            spent = _spend_cross_if_early()
+            d = sideways["detail"]
+            fired = [k for k in ("ema_compressed", "high_chop", "tight_range", "weak_adx") if d.get(k)]
+            tag = "FAIL (early trend, cross spent): " if spent else ""
+            return self._hold(current_price,
+                f"Layer2 {tag}SIDEWAYS veto ({sideways['signals']} signals: {', '.join(fired)}) — "
+                f"EMA-gap {d.get('ema_gap_atr')}xATR, chop {d.get('chop')}, ADX {d.get('adx')}, "
+                f"range {d.get('range_atr')}xATR",
+                metadata=dbg("early_quality_fail" if spent else "sideways_veto"))
 
         # ── Layer 2a: base trend quality ──────────────────────────────────
         if l2_score <= l2_thr:
@@ -810,6 +844,52 @@ class TrendConfirmStrategy(BaseStrategy):
             sl = price + dist
             tp = price - dist * self.rr_ratio
         return sl, tp
+
+    def _sideways_context(self, candles: list) -> dict:
+        """Range / sideways detector on the 15m context. Returns
+        {is_sideways, signals, detail}. Fires up to 4 independent range
+        signals; `sideways_min_signals` (default 2) of them = veto.
+
+        Deliberately weighted toward signals that STAY range-y while ADX is
+        still lagging at the start of a trend (EMA compression, high chop,
+        tight price range), so a fresh/early trend isn't mistaken for a range.
+        The ADX signal only counts when ADX is *really* weak (< sideways_adx_max,
+        stricter than adx_threshold) for the same reason."""
+        n = 20
+        min_needed = max(self.quality_ema_slow + 2, self.adx_period * 2 + 2,
+                         self.chop_period + 1, n + 1)
+        if len(candles) < min_needed:
+            return {"is_sideways": False, "signals": 0, "detail": {}}
+
+        closes = [c.close for c in candles]
+        ema20 = self.ema(closes, self.quality_ema_fast)
+        ema50 = self.ema(closes, self.quality_ema_slow)
+        atr_arr = self.atr(candles, self.atr_period)
+        adx_arr, _p, _m = self.adx(candles, self.adx_period)
+        chop_val = self._choppiness(candles, self.chop_period)
+        atr = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0.0
+        if atr <= 0 or np.isnan(ema20[-1]) or np.isnan(ema50[-1]):
+            return {"is_sideways": False, "signals": 0, "detail": {}}
+
+        ema_gap_atr = abs(ema20[-1] - ema50[-1]) / atr
+        window = candles[-n:]
+        rng_atr = (max(c.high for c in window) - min(c.low for c in window)) / atr
+        adx_val = float(adx_arr[-1]) if not np.isnan(adx_arr[-1]) else 100.0
+
+        sig = {
+            "ema_compressed": ema_gap_atr < self.sideways_ema_compression_atr,
+            "high_chop":      chop_val is not None and chop_val > self.chop_threshold,
+            "tight_range":    rng_atr < self.sideways_range_atr,
+            "weak_adx":       adx_val < self.sideways_adx_max,
+        }
+        count = sum(1 for v in sig.values() if v)
+        return {
+            "is_sideways": count >= self.sideways_min_signals,
+            "signals": count,
+            "detail": {**sig, "ema_gap_atr": round(ema_gap_atr, 2),
+                       "range_atr": round(rng_atr, 2), "adx": round(adx_val, 1),
+                       "chop": round(chop_val, 1) if chop_val is not None else None},
+        }
 
     def _layer1_indicators(self, c30: list) -> Optional[dict]:
         closes = [c.close for c in c30]
