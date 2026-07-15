@@ -589,11 +589,14 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 3.0),
         post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 3.0),
     )
-    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", True)
+    # Default FALSE: the weekend/session gate applies ONLY to commodities
+    # (XAU/XAG/CL); crypto trades 24/7 as usual. Set
+    # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=true to also pause crypto on the
+    # commodity weekend.
+    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", False)
     # _commodity_symbols defined earlier (shared with the min-SL-floor split
-    # above) — only consulted here when FOLLOW_REFERENCE_SESSION_FOR_CRYPTO
-    # =false, to let crypto symbols opt out of the commodity schedule and
-    # trade 24/7 as before this feature.
+    # above) — with the default above, this is the ONLY set the session gate
+    # touches; crypto's session_gate_open stays True regardless of session.
     last_session_state = None
     last_allow_new_positions = None
 
@@ -691,7 +694,19 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         session = session_engine.evaluate()
         if session.allow_new_positions != last_allow_new_positions:
             if last_allow_new_positions is not None and telegram:
-                telegram.send(session.view_log_message)
+                # Scope note: with crypto exempt (the default), this gate
+                # only pauses commodities — say so, otherwise the message's
+                # "New Positions: DISABLED" reads as a full stop.
+                if _follow_session_for_crypto:
+                    scope = "Applies to: ALL symbols (crypto + commodities)"
+                else:
+                    _commodity_syms_here = sorted(
+                        s.split("/")[0].upper() for s in symbols
+                        if s.split("/")[0].upper() in _commodity_symbols)
+                    scope = ("Applies to: COMMODITIES ONLY "
+                             f"({', '.join(_commodity_syms_here) or 'none configured'}) "
+                             "— crypto keeps trading 24/7")
+                telegram.send(session.view_log_message + "\n" + scope)
             last_allow_new_positions = session.allow_new_positions
         if session.state.value != last_session_state:
             last_session_state = session.state.value
