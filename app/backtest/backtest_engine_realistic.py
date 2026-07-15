@@ -110,6 +110,7 @@ class RealisticSymbolBacktest(SymbolBacktest):
             tp1_close_pct          = self.cfg.tp1_close_pct,
             tp1_r                  = self.cfg.tp1_r,
             tp2_r                  = self.cfg.tp2_r,
+            breakeven_lock_r       = self.cfg.breakeven_lock_r,
             min_sl_pct             = _min_sl_pct,
             max_15m_adx_trend      = self.cfg.max_15m_adx_trend,
             state_file             = os.devnull,

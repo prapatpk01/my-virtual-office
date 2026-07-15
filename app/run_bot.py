@@ -207,7 +207,7 @@ def build_config() -> dict:
         "telegram_chat_id":    os.environ.get("TELEGRAM_CHAT_ID", ""),
         "use_adaptive": _env_bool("USE_ADAPTIVE", False),
         "adaptive_balance": _env_float("ADAPTIVE_BALANCE", 10000.0),
-        "adaptive_risk_pct": _env_float("ADAPTIVE_RISK_PCT", 0.025),
+        "adaptive_risk_pct": _env_float("ADAPTIVE_RISK_PCT", 0.05),
         "adaptive_daily_loss": _env_float("ADAPTIVE_DAILY_LOSS_PCT", -3.0),
         "adaptive_daily_profit": _env_float("ADAPTIVE_DAILY_PROFIT_PCT", 8.0),
         "adaptive_cooldown_min": _env_int("ADAPTIVE_COOLDOWN_MIN", 30),
@@ -217,6 +217,10 @@ def build_config() -> dict:
         # ADAPTIVE_TP1_R raises win-rate at the cost of average win size.
         "adaptive_tp1_r": (_env_float("ADAPTIVE_TP1_R", 0.0) or None),
         "adaptive_tp2_r": (_env_float("ADAPTIVE_TP2_R", 0.0) or None),
+        # T1's SL-move locks in this many R of profit instead of a flat
+        # scratch at exactly entry (0R) — e.g. 0.15 means the worst case
+        # after T1 is +0.15R, not breakeven.
+        "adaptive_breakeven_lock_r": _env_float("ADAPTIVE_BREAKEVEN_LOCK_R", 0.15),
         # Fake-signal chop-zone filter (None = default 0.8). Higher = stricter,
         # higher WR, fewer trades (~1.2 pushes WR toward 56%).
         "adaptive_min_ema_dist_atr": (_env_float("ADAPTIVE_MIN_EMA_DIST_ATR", 0.0) or None),
@@ -227,20 +231,15 @@ def build_config() -> dict:
         # process start (indicators need a few closed bars to stabilize
         # after a fresh restart). Was hardcoded 45; lowered to 10 by request.
         "adaptive_warmup_min": _env_int("ADAPTIVE_WARMUP_MIN", 10),
-        # [FIXED-$ SIZING] (live default): every trade opens the same
-        # notional = ADAPTIVE_MARGIN_USDT × LEVERAGE, regardless of signal
-        # quality or account balance — e.g. $30 margin × 20x = $600 notional
-        # per position. This takes precedence whenever set (>0); to switch
-        # back to confidence-weighted %-of-balance sizing, set
-        # ADAPTIVE_MARGIN_USDT=0 and ADAPTIVE_MARGIN_PCT_MIN/MAX to nonzero
-        # bounds (e.g. 0.08/0.15) instead.
-        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 30.0),
-        # [LEVEL 1 — ADAPTIVE RISK] Confidence-weighted %-of-balance sizing —
-        # position size scales between MIN and MAX% of balance based on the
-        # bot's own conviction (score headroom above this state's entry bar,
-        # penalized by any historically-bad condition tags — see
-        # ConditionLearningEngine). 0/0 (default) disables this in favor of
-        # the fixed-$ sizing above; set both nonzero to switch modes.
+        # [SIZING MODE] Back to classic risk-%-of-balance (live default,
+        # ADAPTIVE_RISK_PCT above = 5%): position size is derived from the
+        # SL distance so that a full stop-out loses exactly risk_pct of
+        # current balance, regardless of leverage/notional. This is the
+        # ORIGINAL sizing mode — active whenever both of the following are
+        # 0 (the default). Set ADAPTIVE_MARGIN_USDT>0 for fixed-$ sizing
+        # instead, or both ADAPTIVE_MARGIN_PCT_MIN/MAX>0 for confidence-
+        # weighted %-of-balance sizing (Level 1 Adaptive Risk).
+        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 0.0),
         "adaptive_margin_pct_min": _env_float("ADAPTIVE_MARGIN_PCT_MIN", 0.0),
         "adaptive_margin_pct_max": _env_float("ADAPTIVE_MARGIN_PCT_MAX", 0.0),
         # [MTF-CONFLUENCE] "adaptive" (default) = V9.2 L1/L2/L3/StrategyScorer
@@ -525,12 +524,12 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         _base_sym = sym.split("/")[0].upper()
         _min_sl_pct = _min_sl_pct_commodity if _base_sym in _commodity_symbols else _min_sl_pct_crypto
         # [PER-SYMBOL SIZING] Fixed-$ margin defaults to ADAPTIVE_MARGIN_USDT
-        # for every symbol; ADAPTIVE_MARGIN_USDT_<BASE_SYM> overrides just
-        # that one symbol. BTC defaults to $50 (a bigger position than the
-        # $30 baseline) — set ADAPTIVE_MARGIN_USDT_BTC to change it, or add
-        # ADAPTIVE_MARGIN_USDT_<SYM> for any other symbol the same way.
-        _per_symbol_margin_default = {"BTC": 50.0}.get(_base_sym, cfg.get("adaptive_margin_usdt", 0.0))
-        _margin_usdt = _env_float(f"ADAPTIVE_MARGIN_USDT_{_base_sym}", _per_symbol_margin_default)
+        # for every symbol (0 = disabled, the current default — see the
+        # [SIZING MODE] comment above; risk_pct-of-balance is active
+        # instead). ADAPTIVE_MARGIN_USDT_<BASE_SYM> still overrides just one
+        # symbol if fixed-$ sizing is ever turned back on.
+        _margin_usdt = _env_float(f"ADAPTIVE_MARGIN_USDT_{_base_sym}",
+                                  cfg.get("adaptive_margin_usdt", 0.0))
 
         bot = AdaptiveBot(
             account_balance=cfg["adaptive_balance"],
@@ -547,6 +546,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             enable_mean_reversion=cfg["strategies"].get("mean_reversion", False),
             tp1_r=cfg.get("adaptive_tp1_r"),
             tp2_r=cfg.get("adaptive_tp2_r"),
+            breakeven_lock_r=cfg.get("adaptive_breakeven_lock_r"),
             min_ema_dist_atr=cfg.get("adaptive_min_ema_dist_atr"),
             entry_spacing_min=cfg.get("adaptive_entry_spacing_min", 60),
             margin_pct_min=cfg.get("adaptive_margin_pct_min", 0.08),

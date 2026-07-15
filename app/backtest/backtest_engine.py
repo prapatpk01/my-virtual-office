@@ -55,6 +55,7 @@ class BacktestConfig:
     # TP/SL structure (must match live bot)
     tp1_r:           float = 0.5           # TP1 at 0.5R
     tp2_r:           float = 1.0           # [V9.2] TP2 at 1.0R (was 1.2R)
+    breakeven_lock_r: float = 0.15         # T1's SL-move locks in this much R (was flat 0R)
 
     # Risk limits
     daily_loss_pct:   float = -3.0
@@ -302,6 +303,7 @@ class SymbolBacktest:
             tp1_close_pct          = self.cfg.tp1_close_pct,
             tp1_r                  = self.cfg.tp1_r,   # was a dead config field — now actually applied
             tp2_r                  = self.cfg.tp2_r,
+            breakeven_lock_r       = self.cfg.breakeven_lock_r,
             min_sl_pct             = _min_sl_pct,
             max_15m_adx_trend      = self.cfg.max_15m_adx_trend,
             state_file             = os.devnull,   # no disk I/O during backtest

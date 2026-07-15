@@ -1006,6 +1006,7 @@ class TradingBot:
                  tp1_close_pct: float = 0.75,
                  tp1_r: Optional[float] = None,
                  tp2_r: Optional[float] = None,
+                 breakeven_lock_r: Optional[float] = None,
                  min_ema_dist_atr: Optional[float] = None,
                  entry_spacing_min: int = 60,
                  margin_usdt: float = 0.0,
@@ -1101,6 +1102,8 @@ class TradingBot:
             self.TP1_R = tp1_r
         if tp2_r is not None:
             self.TP2_R = tp2_r
+        if breakeven_lock_r is not None:
+            self.BREAKEVEN_LOCK_R = breakeven_lock_r
         # Fake-signal chop-zone filter (env-tunable): higher = stricter, more
         # WR, fewer trades. 0.8 default; ~1.2 pushes WR toward 56%.
         if min_ema_dist_atr is not None:
@@ -1518,8 +1521,10 @@ class TradingBot:
     # TP geometry in R-multiples — TP1_R/TP2_R remain the env-tunable
     # endpoints. Unified 2-target structure (user-designed): T1 takes a
     # partial (self.tp1_close_pct, constructor-configurable — see __init__)
-    # and moves the stop to breakeven, T2 closes what's left (matches the
+    # and moves the stop to BREAKEVEN_LOCK_R (locks in a small win instead of
+    # a flat scratch at exactly entry), T2 closes what's left (matches the
     # exchange-attached TP2, unchanged).
+    BREAKEVEN_LOCK_R: float = 0.15
     # [V9.2] T2 pulled in from 1.2R: clean-run data showed only 39.7% of
     # trades that reached T1 went on to 1.2R (≈ the 41.7% random baseline);
     # at 1.0R the same leg has ~50% odds, and with 75% already banked at T1
@@ -1554,7 +1559,7 @@ class TradingBot:
             tp2_r = clamped
         close_pct = float(np.clip(self.tp1_close_pct, 0.0, 0.99))
         return [
-            (tp1_r, close_pct, 0.0),   # T1: partial close, SL -> breakeven
+            (tp1_r, close_pct, self.BREAKEVEN_LOCK_R),  # T1: partial close, SL -> BE+lock
             (tp2_r, 1.0,       None),  # T2: full close of what's left
         ]
 
@@ -2532,9 +2537,10 @@ class TradingBot:
                 t["sl"] = min(t["sl"], current_price + atr_trail)
         elif health >= 40:
             if not t["break_even_triggered"] and tp1_hit:
-                t["sl"] = t["entry"]
+                dir_mult_be = 1 if direction == "LONG" else -1
+                t["sl"] = t["entry"] + t["sl_dist"] * self.BREAKEVEN_LOCK_R * dir_mult_be
                 t["break_even_triggered"] = True
-                self._log_event(f"Health {health:.0f} → forced breakeven (post-TP1)")
+                self._log_event(f"Health {health:.0f} → forced breakeven+lock (post-TP1)")
         elif health >= 20:
             if t["remaining_size"] > 0 and tp1_hit:
                 # [MIN-LOT] a 50% reduce below one contract would floor up and
