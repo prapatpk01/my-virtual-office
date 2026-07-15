@@ -56,16 +56,17 @@ Layer 3 — Entry (TF5m), always WITH Layer 1's confirmed trend:
   cross.
 
 Exit — a 2-TP + break-even scheme managed in tick_open_position():
-  TP1 (partial): when price reaches `tp1_r` (1.25R, halfway to the 2.5R
+  TP1 (partial): when price reaches `tp1_r` (0.75R, halfway to the 1.5R
     final TP), take `tp1_close_pct` (50%) off and move SL to break-even +
     `be_offset_r` (BE + 0.1R — a small locked profit on the runner). Checked
     every tick, fires once.
   Runner (remaining 50%): rides on until, on the 5m TF, EITHER the EMA5/9
     cross-back (long: EMA5 crosses below EMA9) OR a close past EMA9 (long:
-    5m close below EMA9) — mirror for shorts — the hard final TP (2.5R), or
+    5m close below EMA9) — mirror for shorts — the hard final TP (1.5R), or
     the trailed SL (BE+0.1R).
   SL sits at the 5m EMA50 (the chase-guard keeps price within 1.5x ATR of it,
-  so max risk ~1.5 ATR). Its distance from entry is R; TP2 = 2.5R. The
+  so max risk ~1.5 ATR). Its distance from entry is R; TP2 = 1.5R (2.5R put
+  the target too far — it was rarely hit). The
   distance is floored at min_sl_pct (0.5% of price) so an EMA50 sitting right
   at price can't produce a microscopic noise-stop. These are the hard bounds
   bot.py's risk manager checks underneath; TP1 fires the partial + BE-move
@@ -130,9 +131,10 @@ class TrendConfirmStrategy(BaseStrategy):
         ema_fast: int = 5,          # entry-cross fast EMA (5m)
         ema_slow: int = 9,          # entry-cross slow EMA (5m); also the "close past" exit reference
         entry_ema_ref: int = 5,     # price must be above (long) / below (short) this EMA (5m)
-        sl_ema_ref: int = 50,       # SL sits at this EMA (5m); chase-guard distance is measured vs it
+        sl_ema_ref: int = 50,       # SL sits at this EMA (5m)
+        chase_ema_ref: int = 50,    # chase-guard distance is measured vs this EMA (5m); decoupled from sl_ema_ref
         fresh_trend_bars: int = 2,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
-        max_dist_atr_mult: float = 1.5,  # max distance from EMA50 in ATR(5m) — also caps the SL distance
+        max_dist_atr_mult: float = 1.5,  # max distance from the chase EMA in ATR(5m)
         # Location & structure-room filter (lightweight; avoids late/blocked entries)
         use_location_filter: bool = True,
         structure_pivot_left: int = 2,
@@ -147,12 +149,13 @@ class TrendConfirmStrategy(BaseStrategy):
         # Exit (5m): EMA5/9 cross-back OR a 5m close past EMA9 closes the runner
         # Partial take-profit + break-even (2-TP scheme)
         use_partial_tp: bool = True,        # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
-        tp1_r: float = 1.25,                # TP1 at 1.25R (halfway to the 2.5R final TP)
+        tp1_r: float = 0.75,                # TP1 at 0.75R (halfway to the 1.5R final TP)
         tp1_close_pct: float = 0.5,         # fraction closed at TP1
         be_offset_r: float = 0.1,           # after TP1, SL -> entry +/- this many R (BE + 0.1R, a small locked profit)
         # Risk
         atr_period: int = 14,               # ATR(5m) for the chase guard / min-distance sanity
-        rr_ratio: float = 2.5,              # final TP (TP2) at 2.5R (R = |entry - EMA50(5m)|)
+        rr_ratio: float = 1.5,              # final TP (TP2) at 1.5R (R = |entry - EMA50(5m)|) — 2.5R was too far,
+                                            #   ~30% WR at 1.5R vs ~21% at 2.5R for ~the same $ return (backtest)
         min_sl_pct: float = 0.005,          # floor the SL distance at 0.5% of price — if EMA50 sits right at
                                             #   price the raw SL would be a microscopic noise-stop; R (and TP)
                                             #   is measured from the floored distance
@@ -189,6 +192,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.ema_slow = ema_slow
         self.entry_ema_ref = entry_ema_ref
         self.sl_ema_ref = sl_ema_ref
+        self.chase_ema_ref = chase_ema_ref
         self.fresh_trend_bars = fresh_trend_bars
         self.max_dist_atr_mult = max_dist_atr_mult
 
@@ -934,10 +938,11 @@ class TrendConfirmStrategy(BaseStrategy):
         ema_s = self.ema(closes, self.ema_slow)
         ema_ref = self.ema(closes, self.entry_ema_ref)
         sl_ema = self.ema(closes, self.sl_ema_ref)
+        chase_ema = self.ema(closes, self.chase_ema_ref)
         atr_arr = self.atr(candles, self.atr_period)
 
         needed = [ema_f[-1], ema_f[-2], ema_s[-1], ema_s[-2],
-                 ema_ref[-1], sl_ema[-1], atr_arr[-1]]
+                 ema_ref[-1], sl_ema[-1], chase_ema[-1], atr_arr[-1]]
         if any(np.isnan(x) for x in needed):
             return None
 
@@ -951,7 +956,7 @@ class TrendConfirmStrategy(BaseStrategy):
             "above_ema_ref": last.close > ema_ref[-1],
             "below_ema_ref": last.close < ema_ref[-1],
             "sl_ema_val": float(sl_ema[-1]),
-            "dist_ema_val": float(sl_ema[-1]),
+            "dist_ema_val": float(chase_ema[-1]),   # chase-guard reference
             "atr_val": float(atr_arr[-1]),
         }
 
