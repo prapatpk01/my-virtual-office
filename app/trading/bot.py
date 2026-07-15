@@ -175,9 +175,9 @@ class TradingBot:
         decide the trade, instead of a fixed generic EMA20/EMA50 that may
         not match at all. Falls back to ai_expert's EMA20/EMA50 defaults
         for strategies that don't expose these attributes (ai_expert
-        itself). A strategy exposing ema_fast/ema_slow draws those; one
-        exposing only hma_fast/hma_slow (e.g. trend_confirm, whose Layer3
-        entry triggers on HMA10/20) draws the HMA pair instead."""
+        itself). A strategy exposing ema_fast/ema_slow draws those (e.g.
+        trend_confirm, whose Layer3 entry triggers on EMA5/9); one exposing
+        only hma_fast/hma_slow draws the HMA pair instead."""
         if strategy_inst is None:
             return {}
         kwargs: dict = {}
@@ -457,11 +457,16 @@ class TradingBot:
 
                 mtf_candles = {}
                 _base_tf = os.getenv("CANDLE_TF", "15m")
-                _mtf_tfs = [t for t in ("1h", "4h") if t != _base_tf]
-                for tf in _mtf_tfs:
+                _mtf_specs = [(t, 100) for t in ("1h", "4h") if t != _base_tf]
+                # trend_confirm runs its Layer3 entry/SL/TP/exit on 5m — fetch
+                # enough 5m bars for EMA50 + cross history. Harmless extra data
+                # for strategies that don't read it.
+                if _base_tf != "5m":
+                    _mtf_specs.append(("5m", 200))
+                for tf, _lim in _mtf_specs:
                     try:
                         mtf_candles[tf] = await self.connector.fetch_ohlcv(
-                            strategy.symbol, timeframe=tf, limit=100
+                            strategy.symbol, timeframe=tf, limit=_lim
                         )
                     except Exception:
                         pass
@@ -548,10 +553,10 @@ class TradingBot:
         Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree on
         up or down), Layer2 (trend-quality score — per-TF Align/ADX/Chop/
         Volume, weighted 15m 65% + 1H 35%, must clear layer2_threshold),
-        Layer3 (15m HMA10/16 cross with-trend + location/structure-room
-        filter + price above/below EMA10 + within 1.5xATR of EMA20) —
-        instead of the ai_expert-only fields (macro/context/mtf) that don't
-        apply to this strategy."""
+        Layer3 (5m EMA5/9 cross with-trend + location/structure-room filter +
+        price above/below EMA5 + within 1.5xATR of EMA50) — instead of the
+        ai_expert-only fields (macro/context/mtf) that don't apply to this
+        strategy."""
         sma_trend  = tc.get("sma_trend", "?")
         ema1020    = tc.get("ema10_20_trend", "?")
         slope      = tc.get("ema20_slope", "?")
@@ -571,9 +576,9 @@ class TradingBot:
             "no_trend":                 "n/a (Layer1 not confirmed)",
             "quality_fail":             "n/a (Layer2 quality too low)",
             "early_quality_fail":       "FAIL (early trend, cross spent)",
-            "waiting_cross":            "wait_hma_cross (Layer3)",
-            "ema_ref_fail":             "cross_ok/ema10_fail (Layer3)",
-            "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3)",
+            "waiting_cross":            "wait_ema_cross (Layer3 5m)",
+            "ema_ref_fail":             "cross_ok/ema5_fail (Layer3 5m)",
+            "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3 5m)",
             "location_quality_fail":    "cross_ok/location_quality_fail (Layer3)",
             "location_reject":          "cross_ok/location_fail (Layer3)",
             "entered":                  "entered",
@@ -603,13 +608,13 @@ class TradingBot:
 
         fresh_str = f"early<{fb}b" if is_early else "steady"
         if confirmed == "up":
-            cross_str = f"HMA↑{_ago_str(tc.get('hma_cross_up_ago'))} ({fresh_str})"
+            cross_str = f"EMA↑{_ago_str(tc.get('ema_cross_up_ago'))} ({fresh_str})"
         elif confirmed == "down":
-            cross_str = f"HMA↓{_ago_str(tc.get('hma_cross_down_ago'))} ({fresh_str})"
+            cross_str = f"EMA↓{_ago_str(tc.get('ema_cross_down_ago'))} ({fresh_str})"
         else:
             cross_str = "n/a"
 
-        above = tc.get("above_ema10")
+        above = tc.get("above_ema_ref")
         ema_str = ("above" if above else "below") if above is not None else "?"
         dist_atr = tc.get("dist_atr")
         max_dist = tc.get("max_dist_atr")
@@ -619,7 +624,7 @@ class TradingBot:
         logger.info(
             "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s "
             "L2[quality=%s] pos=%-5s | "
-            "L3[%s ema10=%s dist=%s]%s=%s | %s",
+            "L3[5m %s ema5=%s dist=%s]%s=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
             l1_str, confirmed, score_str,
             open_pos, cross_str, ema_str, dist_str, loc_str, entry_str, reason,
