@@ -13,26 +13,33 @@ Layer 1 — Trend direction (TF30m):
   Re-evaluated once per new 30m bar; a confirmed trend does not expire on
   its own, it just gets re-read every 30m bar.
 
-Layer 2 — Trend quality: dynamic weighted score (TF15m + TF1H):
-  Scores HOW GOOD the confirmed trend is on each timeframe (0-100 per TF),
-  then combines them 15m x 65% + 1H x 35%. Must score > `layer2_threshold`
-  (default 60) for an established-trend entry, or > `layer2_threshold_early`
-  (default 75, stricter) for an early-trend entry (see Layer 3). Each
-  per-TF quality score (in _tf_quality()) is:
-    Alignment 40 pts — 4 x 10 pts: close vs EMA20, EMA20 vs EMA50, RSI
-                       lean (>55 bull / <45 bear), MACD line sign — each
-                       agreeing with Layer 1's direction scores 10.
-    ADX       25 pts — trend strength, full credit at 2x adx_threshold (20).
-    Chop      20 pts — inverted Choppiness Index (low chop = high score),
-                       full credit at 100 - chop_threshold (61.8) points
-                       of "not choppy".
-    Volume    15 pts — volume / SMA20(volume), full credit at 2x
-                       volume_expansion_mult (1.0).
-  Soft point-scoring (ai_expert's ConfidenceEngine pattern): a weak
-  reading on one component can be outweighed by strong readings elsewhere
-  instead of vetoing the trade outright.
+Layer 2 — Trade CONTEXT: trend quality (2a) + location/structure (2b).
+  Both must pass before Layer 3 even waits for the cross.
 
-Layer 3 — Entry (TF5m), always WITH Layer 1's confirmed trend:
+  2a) Trend quality — dynamic weighted score (TF15m + TF1H):
+    Scores HOW GOOD the confirmed trend is on each timeframe (0-100 per TF),
+    then combines them 15m x 65% + 1H x 35%. Must score > `layer2_threshold`
+    (default 60) established, or > `layer2_threshold_early` (68, stricter) for
+    an early-trend entry. Each per-TF quality score (in _tf_quality()) is:
+      Alignment 40 pts — 4 x 10 pts: close vs EMA20, EMA20 vs EMA50, RSI
+                         lean (>55 bull / <45 bear), MACD line sign — each
+                         agreeing with Layer 1's direction scores 10.
+      ADX       25 pts — trend strength, full credit at 2x adx_threshold (20).
+      Chop      20 pts — inverted Choppiness Index (low chop = high score),
+                         full credit at 100 - chop_threshold (61.8) points.
+      Volume    15 pts — volume / SMA20(volume), full credit at 2x
+                         volume_expansion_mult (1.0).
+    Soft point-scoring (ai_expert's ConfidenceEngine pattern): a weak reading
+    on one component can be outweighed by strong readings elsewhere.
+
+  2b) Location & structure-room filter (see _location_context()):
+    Hard-rejects entering into an active HTF opposing pivot zone, opposite 1H
+    swing structure, a wrong-side liquidity sweep, or critically low room.
+    Borderline location doesn't reject — it raises 2a's threshold by
+    `location_threshold_penalty` (+4). Only evaluated once 2a passes and the
+    5m EMA50 stop reference (l3) is available.
+
+Layer 3 — Entry TIMING (TF5m), reached only after Layer1 + Layer2 both pass:
   LONG (only after Layer1+Layer2 confirm UP):
     1. EMA5 crosses above EMA9 (5m)
     2. price (close) is above EMA9 (5m) — the same line the cross + exit use
@@ -311,13 +318,9 @@ class TrendConfirmStrategy(BaseStrategy):
                    if (l3 is not None and l3["atr_val"] > 0) else None)
         c4h = mtf.get("4h", [])
 
-        # Location & structure-room are only meaningful once there's an actual
-        # entry candidate (trend confirmed AND its 5m EMA cross just fired) —
-        # no point walking 1h/4h pivots on every bar while just waiting for a
-        # cross. Defaults here cover the early-return paths below; the real
-        # location is computed inline (see _evaluate_location) once a
-        # candidate exists, and reassigns these two closed-over variables so
-        # dbg() reports the real values from that point on.
+        # Location/structure defaults — overwritten in the Layer 2b block once
+        # trend + base quality pass and l3 is available (location is evaluated
+        # as part of Layer2, before Layer3 waits for the cross).
         has_long_candidate = trend == "up" and ema_cross_up
         has_short_candidate = trend == "down" and ema_cross_down
         location = self._neutral_location_context()
@@ -359,93 +362,75 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price, "Layer2: quality indicators still warming up (15m/1H)",
                               metadata=dbg("no_trend"))
 
-        if l2_score <= l2_thr:
-            score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
-                          f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
-            # Early-trend fail is DEFINITIVE: a 5m EMA cross led the confirm and
-            # quality didn't even clear the base gate — spend that cross so
-            # the same setup can't retry on a later bar. A fresh cross is
-            # required for another attempt. (An established-trend fail with
-            # no valid pending cross is just "waiting", so nothing to consume.
-            # Location isn't computed here — the base gate alone already
-            # disqualifies, so location wouldn't change the outcome.)
-            pending_cross = has_long_candidate or has_short_candidate
-            if is_early_trend and pending_cross:
-                if trend == "up":
-                    self._last_ema_cross_up_ts = None
-                else:
-                    self._last_ema_cross_down_ts = None
-                return self._hold(current_price,
-                    f"Layer2 FAIL (early trend): quality {l2_score:.0f} <= {l2_thr:.0f} — "
-                    f"early setup rejected, cross spent {score_note}",
-                    metadata=dbg("early_quality_fail"))
-            return self._hold(current_price,
-                f"Layer2: trend quality {l2_score:.0f} <= {l2_thr:.0f} {score_note}",
-                metadata=dbg("quality_fail"))
+        pending_cross = has_long_candidate or has_short_candidate
+        score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
+                      f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
 
-        # ── Layer 3: Entry (5m), always with the confirmed trend ───────────
+        def _spend_cross_if_early() -> bool:
+            """Early-trend fail is DEFINITIVE: a 5m EMA cross led the confirm
+            but Layer2 rejected the setup — spend that leading cross so the
+            same setup can't retry on a later bar (a fresh cross is required
+            for another attempt). No-op unless we're in the early window with
+            a pending cross."""
+            if not (is_early_trend and pending_cross):
+                return False
+            if trend == "up":
+                self._last_ema_cross_up_ts = None
+            else:
+                self._last_ema_cross_down_ts = None
+            return True
+
+        # ── Layer 2a: base trend quality ──────────────────────────────────
+        if l2_score <= l2_thr:
+            spent = _spend_cross_if_early()
+            tag = "FAIL (early trend, cross spent): " if spent else ""
+            return self._hold(current_price,
+                f"Layer2 {tag}trend quality {l2_score:.0f} <= {l2_thr:.0f} {score_note}",
+                metadata=dbg("early_quality_fail" if spent else "quality_fail"))
+
+        # ── Layer 2b: location & structure-room filter ────────────────────
+        # Location is part of Layer2: the trade CONTEXT (trend quality AND
+        # where we'd be entering vs HTF structure) must both be good before
+        # Layer3 even waits for the cross. Needs the 5m EMA50 stop reference
+        # for the room-R estimate, so it requires l3.
+        if self.use_location_filter and l3 is not None:
+            entry_risk = max(abs(close_price - l3["sl_ema_val"]), self.min_sl_pct * close_price)
+            location = self._location_context(
+                direction=trend, entry_price=close_price,
+                atr_15m=self._last_atr(candles, self.atr_period) or l3["atr_val"],
+                estimated_risk=entry_risk, candles_15m=candles,
+                candles_1h=c1h, candles_4h=c4h, q15=q15,
+            )
+            location_adjusted_l2_thr = l2_thr + (
+                self.location_threshold_penalty if location["penalize"] else 0.0)
+            if not location["valid"]:
+                return self._hold(current_price,
+                    f"Layer2 Location/Structure REJECT: {location['reason']}",
+                    metadata=dbg("location_reject"))
+            if l2_score <= location_adjusted_l2_thr:
+                spent = _spend_cross_if_early()
+                tag = "FAIL (early trend, cross spent): " if spent else ""
+                return self._hold(current_price,
+                    f"Layer2 {tag}quality {l2_score:.0f} <= {location_adjusted_l2_thr:.0f} "
+                    f"(location-adjusted) {score_note}",
+                    metadata=dbg("early_quality_fail" if spent else "location_quality_fail"))
+
+        # ── Layer 3: Entry timing (5m) — wait for the EMA5/9 cross ─────────
+        # Reached only after Layer1 (trend) AND Layer2 (quality + location)
+        # both pass. Layer3 just waits for the precise cross and confirms the
+        # entry candle sits on the right side of EMA9, not too far from EMA50.
         if l3 is None:
             return self._hold(current_price, "Layer3: 5m indicators still warming up", metadata=dbg("no_trend"))
 
         dist_ok = dist_atr is not None and dist_atr <= self.max_dist_atr_mult
         dist_disp = f"{dist_atr:.2f}" if dist_atr is not None else "n/a"
-        # The real $ risk of this candidate = distance from entry to the EMA50
-        # SL (floored), used so the structure-room-R estimate matches the
-        # actual stop rather than a fixed ATR multiple.
-        entry_risk = max(abs(close_price - l3["sl_ema_val"]), self.min_sl_pct * close_price)
-
-        def _evaluate_location(direction: str) -> Optional[Signal]:
-            """Only called once a live candidate exists (trend confirmed +
-            fresh 5m EMA cross). Computes the location/structure-room filter
-            for THIS candidate, applies its quality-threshold penalty, and
-            returns a hold Signal if it rejects — or None to let the caller
-            proceed to the EMA/distance checks. Reassigns the enclosing
-            `location`/`location_adjusted_l2_thr` so dbg() reports the real
-            values from here on."""
-            nonlocal location, location_adjusted_l2_thr
-            location = self._location_context(
-                direction=direction, entry_price=close_price,
-                atr_15m=self._last_atr(candles, self.atr_period) or l3["atr_val"],
-                estimated_risk=entry_risk, candles_15m=candles,
-                candles_1h=c1h, candles_4h=c4h, q15=q15,
-            ) if self.use_location_filter else self._neutral_location_context()
-            location_adjusted_l2_thr = l2_thr + (
-                self.location_threshold_penalty if location["penalize"] else 0.0
-            )
-            if l2_score <= location_adjusted_l2_thr:
-                score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
-                              f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
-                if is_early_trend:
-                    if direction == "up":
-                        self._last_ema_cross_up_ts = None
-                    else:
-                        self._last_ema_cross_down_ts = None
-                    return self._hold(current_price,
-                        f"Layer2 FAIL (early trend, location-adjusted): quality {l2_score:.0f} <= "
-                        f"{location_adjusted_l2_thr:.0f} — early setup rejected, cross spent {score_note}",
-                        metadata=dbg("early_quality_fail"))
-                return self._hold(current_price,
-                    f"Layer2: trend quality {l2_score:.0f} <= {location_adjusted_l2_thr:.0f} "
-                    f"(location-adjusted) {score_note}",
-                    metadata=dbg("location_quality_fail"))
-            if self.use_location_filter and not location["valid"]:
-                return self._hold(
-                    current_price,
-                    f"Location/Structure REJECT: {location['reason']}",
-                    metadata=dbg("location_reject"),
-                )
-            return None
 
         if trend == "up":
             if not has_long_candidate:
-                return self._hold(current_price, f"Layer1+2 confirmed UP — waiting for EMA{self.ema_fast}↑EMA{self.ema_slow} cross (5m)"
+                return self._hold(current_price, f"Layer1+2 passed — waiting for EMA{self.ema_fast}↑EMA{self.ema_slow} cross (5m)"
                                   + (f" (early trend, within {fb} bars)" if is_early_trend else " (fresh cross only)"),
                                   metadata=dbg("waiting_cross"))
-            rejected = _evaluate_location("up")
-            if rejected is not None:
-                return rejected
-            # cross cleared quality+location — consume it, then validate the
-            # two entry conditions
+            # cross fired — consume it, then validate the two entry conditions
             self._last_ema_cross_up_ts = None
             if not l3["above_ema_ref"]:
                 return self._hold(current_price,
@@ -466,7 +451,7 @@ class TrendConfirmStrategy(BaseStrategy):
             return Signal(
                 type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
                 reason=f"Uptrend confirmed (Layer1 30m) + quality {l2_score:.0f}"
-                       f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} (Layer2) + "
+                       f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} + location OK (Layer2) + "
                        f"EMA{self.ema_fast}↑EMA{self.ema_slow} {ema_up_ago}b ago, above EMA{self.entry_ema_ref}, "
                        f"{dist_atr:.2f}xATR from EMA{self.sl_ema_ref} (Layer3 5m)",
                 confidence=1.0,
@@ -475,12 +460,9 @@ class TrendConfirmStrategy(BaseStrategy):
 
         # trend == "down"
         if not has_short_candidate:
-            return self._hold(current_price, f"Layer1+2 confirmed DOWN — waiting for EMA{self.ema_fast}↓EMA{self.ema_slow} cross (5m)"
+            return self._hold(current_price, f"Layer1+2 passed — waiting for EMA{self.ema_fast}↓EMA{self.ema_slow} cross (5m)"
                               + (f" (early trend, within {fb} bars)" if is_early_trend else " (fresh cross only)"),
                               metadata=dbg("waiting_cross"))
-        rejected = _evaluate_location("down")
-        if rejected is not None:
-            return rejected
         self._last_ema_cross_down_ts = None
         if not l3["below_ema_ref"]:
             return self._hold(current_price,
@@ -501,7 +483,7 @@ class TrendConfirmStrategy(BaseStrategy):
         return Signal(
             type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
             reason=f"Downtrend confirmed (Layer1 30m) + quality {l2_score:.0f}"
-                   f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} (Layer2) + "
+                   f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} + location OK (Layer2) + "
                    f"EMA{self.ema_fast}↓EMA{self.ema_slow} {ema_down_ago}b ago, below EMA{self.entry_ema_ref}, "
                    f"{dist_atr:.2f}xATR from EMA{self.sl_ema_ref} (Layer3 5m)",
             confidence=1.0,

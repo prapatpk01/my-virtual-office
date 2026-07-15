@@ -580,13 +580,13 @@ class TradingBot:
         _STATUS_LABEL = {
             "position_open":            "holding",
             "no_trend":                 "n/a (Layer1 not confirmed)",
-            "quality_fail":             "n/a (Layer2 quality too low)",
+            "quality_fail":             "n/a (Layer2a quality too low)",
             "early_quality_fail":       "FAIL (early trend, cross spent)",
+            "location_reject":          "n/a (Layer2b location reject)",
+            "location_quality_fail":    "n/a (Layer2b location-adjusted quality)",
             "waiting_cross":            "wait_ema_cross (Layer3 5m)",
             "ema_ref_fail":             "cross_ok/ema9_fail (Layer3 5m)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3 5m)",
-            "location_quality_fail":    "cross_ok/location_quality_fail (Layer3)",
-            "location_reject":          "cross_ok/location_fail (Layer3)",
             "entered":                  "entered",
         }
         entry_str = _STATUS_LABEL.get(status, status)
