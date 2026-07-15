@@ -97,6 +97,10 @@ class BacktestConfig:
     min_sl_pct_crypto:    float = 0.012
     min_sl_pct_commodity: float = 0.012
 
+    # [PULLBACK FILTER] max 15m ADX for a Trend entry (None = TradingBot's
+    # class default of 22). The single biggest entry-frequency knob.
+    max_15m_adx_trend: Optional[float] = None
+
     # Fees & slippage
     commission_pct: float = 0.0005   # 0.05% taker (OKX SWAP)
     slippage_pct:   float = 0.0002   # 0.02% slippage
@@ -299,6 +303,7 @@ class SymbolBacktest:
             tp1_r                  = self.cfg.tp1_r,   # was a dead config field — now actually applied
             tp2_r                  = self.cfg.tp2_r,
             min_sl_pct             = _min_sl_pct,
+            max_15m_adx_trend      = self.cfg.max_15m_adx_trend,
             state_file             = os.devnull,   # no disk I/O during backtest
             execution_callback     = executor.execute,
             startup_warmup_minutes = 0,            # backtest has no warmup — instant start

@@ -1054,13 +1054,25 @@ class TradingBot:
                  # uniform 2% (-$470 combined, every loss a full -1R stop) —
                  # too tight for gold's actual ATR. Both buckets now share
                  # 0.012 (the value that DID backtest better, +$343 on crypto).
-                 min_sl_pct: float = 0.020):
+                 min_sl_pct: float = 0.020,
+                 # [PULLBACK FILTER] Max 15m ADX for a Trend entry — above
+                 # this, the leg is treated as already-extended (chasing) and
+                 # vetoed. None = use the class default (MAX_15M_ADX_TREND).
+                 # This is the single biggest entry blocker (41-55% of all
+                 # Trend-regime checks in a 14-day live-config replay), so it's
+                 # the main knob for trade frequency vs entry quality.
+                 max_15m_adx_trend: Optional[float] = None):
         self.state: str = "SCANNING"
         self.entry_engine       = entry_engine
         self.enable_early_trend = enable_early_trend
         self.macro_ema_fast     = macro_ema_fast
         self.macro_ema_slow     = macro_ema_slow
         self.min_sl_pct         = min_sl_pct
+        # Shadow the class constant on this instance when an override is
+        # given — every `self.MAX_15M_ADX_TREND` read (the veto comparison
+        # and its log string) then picks it up automatically.
+        if max_15m_adx_trend is not None:
+            self.MAX_15M_ADX_TREND = float(max_15m_adx_trend)
         self.mtf_engine         = MTFConfluenceEngine()
         self.adaptive_engine    = AdaptiveEngine()
         self.health_calc        = PositionHealthCalculator()

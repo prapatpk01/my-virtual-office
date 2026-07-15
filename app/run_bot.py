@@ -208,6 +208,11 @@ def build_config() -> dict:
         # old EMA20/50-only behavior.
         "adaptive_macro_ema_fast": (_env_int("ADAPTIVE_MACRO_EMA_FAST", 12) or None),
         "adaptive_macro_ema_slow": (_env_int("ADAPTIVE_MACRO_EMA_SLOW", 26) or None),
+        # [PULLBACK FILTER] Max 15m ADX for a Trend entry — the single biggest
+        # entry-frequency knob (blocked 41-55% of Trend-regime checks at the
+        # old 22). Raised to 26 to trade more often; higher = more trades but
+        # risks chasing extended legs (backtest: ADX>30 ran only ~47% WR).
+        "adaptive_max_15m_adx_trend": _env_float("ADAPTIVE_MAX_15M_ADX_TREND", 26.0),
     }
 
 
@@ -490,6 +495,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             enable_early_trend=cfg.get("adaptive_early_trend", False),
             macro_ema_fast=cfg.get("adaptive_macro_ema_fast"),
             macro_ema_slow=cfg.get("adaptive_macro_ema_slow"),
+            max_15m_adx_trend=cfg.get("adaptive_max_15m_adx_trend"),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)

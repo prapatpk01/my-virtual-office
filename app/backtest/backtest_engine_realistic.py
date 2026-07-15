@@ -111,6 +111,7 @@ class RealisticSymbolBacktest(SymbolBacktest):
             tp1_r                  = self.cfg.tp1_r,
             tp2_r                  = self.cfg.tp2_r,
             min_sl_pct             = _min_sl_pct,
+            max_15m_adx_trend      = self.cfg.max_15m_adx_trend,
             state_file             = os.devnull,
             execution_callback     = executor.execute,
             startup_warmup_minutes = 0,
@@ -407,6 +408,9 @@ if __name__ == "__main__":
                              "backtested improvement over EMA20/50)")
     parser.add_argument("--macro-ema-off", action="store_true",
                         help="restore the old EMA20/50-only behavior (no override)")
+    parser.add_argument("--max-adx", type=float, default=None,
+                        help="max 15m ADX for a Trend entry (default 22 — raise "
+                             "to trade more, at the risk of chasing extended legs)")
     args = parser.parse_args()
 
     macro_ema_fast = macro_ema_slow = None
@@ -422,6 +426,7 @@ if __name__ == "__main__":
         enable_early_trend=args.early_trend,
         macro_ema_fast=macro_ema_fast,
         macro_ema_slow=macro_ema_slow,
+        max_15m_adx_trend=args.max_adx,
     )
     syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
     engine = RealisticBacktestEngine(data_root=args.data_root, output_dir=args.output_dir, cfg=cfg)
