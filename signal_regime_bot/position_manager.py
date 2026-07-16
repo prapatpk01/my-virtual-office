@@ -211,7 +211,7 @@ class PositionManager:
 
     async def open_position(self, symbol: str, direction: str, price: float,
                             df_15m: pd.DataFrame, regime: RegimeResult, bias: BiasResult,
-                            entry_score: float) -> Optional[Position]:
+                            entry_score: float, df_5m: Optional[pd.DataFrame] = None) -> Optional[Position]:
         c = self.cfg
         if self.has_position(symbol):
             logger.debug("[POS] %s already has a tracked position — skip", symbol)
@@ -265,7 +265,10 @@ class PositionManager:
             one_r=abs(price - sl), regime_at_entry=regime.name,
             bias_at_entry=(bias.bias if bias is not None else regime.style),
             entry_score=entry_score,
-            entry_bar_ts=(df_15m.index[-1] if len(df_15m) else None),
+            # entry_bar_ts is the 5M bar the entry fired on — the early-exit
+            # grace counts closed 5M bars since it.
+            entry_bar_ts=(df_5m.index[-1] if df_5m is not None and len(df_5m)
+                         else (df_15m.index[-1] if len(df_15m) else None)),
         )
         self._positions[symbol] = pos
         logger.info("[POS] OPENED %s %s @ %.6f  SL=%.6f TP1=%.6f TP2=%.6f  amount=%.6f",
@@ -402,29 +405,29 @@ class PositionManager:
                "pnl": pnl, "trade_pnl": pos.realized_pnl + pnl, "tp1_hit": pos.tp1_hit,
                "entry_price": pos.entry_price, "position": pos}
 
-    async def process_closed_bar_exit_check(self, symbol: str, df_15m: pd.DataFrame) -> Optional[dict]:
+    async def process_closed_bar_exit_check(self, symbol: str, df_5m: pd.DataFrame) -> Optional[dict]:
         """
-        Call ONCE per newly-closed 15m bar per symbol. Runs the Entry
-        Engine's HMA-based early-exit check (EntryEngine.check_exit) and
-        force-closes on HMA_CROSS_REVERSAL or PRICE_CLOSED_BEYOND_HMA. This
-        does NOT replace the hard SL/TP (checked every tick elsewhere) — an
-        additional, faster path evaluated on each closed 15M candle.
+        Call ONCE per newly-closed 5m bar per symbol. Runs the Entry Engine's
+        EMA-based early-exit check (EntryEngine.check_exit) and force-closes on
+        EMA_CROSS_REVERSAL or PRICE_OPEN_BEYOND_EMA. This does NOT replace the
+        hard SL/TP (checked every tick elsewhere) — an additional, faster path
+        evaluated on each closed 5M candle.
         """
         pos = self._positions.get(symbol)
-        if pos is None or len(df_15m) == 0:
+        if pos is None or df_5m is None or len(df_5m) == 0:
             return None
-        bar_ts = df_15m.index[-1]
+        bar_ts = df_5m.index[-1]
         if pos.last_exit_check_bar_ts is not None and bar_ts <= pos.last_exit_check_bar_ts:
             return None   # already evaluated this closed bar
         pos.last_exit_check_bar_ts = bar_ts
 
-        bars_since = (int((df_15m.index > pos.entry_bar_ts).sum())
+        bars_since = (int((df_5m.index > pos.entry_bar_ts).sum())
                      if pos.entry_bar_ts is not None else None)
-        check = self.entry_engine.check_exit(df_15m, pos.side, bars_since)
+        check = self.entry_engine.check_exit(df_5m, pos.side, bars_since)
         if not check.should_exit:
             return None
 
-        price = float(df_15m["close"].iloc[-1])
+        price = float(df_5m["close"].iloc[-1])
         ev = await self._close_full(pos, price, check.reason)
         ev["exit_detail"] = check.detail
         return ev

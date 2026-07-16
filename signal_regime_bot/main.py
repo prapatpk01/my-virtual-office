@@ -32,7 +32,7 @@ from position_manager import PositionManager
 from telegram_notifier import TelegramNotifier
 from chart_engine import build_entry_chart
 from spike_guard import check_spike, CLOSE as SPIKE_CLOSE
-from entry_engine import HMA_CROSS_REVERSAL, PRICE_CLOSED_BEYOND_HMA
+from entry_engine import EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,11 +162,11 @@ class Bot:
         self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):
-            await self._manage_open_position(symbol, df_15m)
+            await self._manage_open_position(symbol, df_15m, df_5m)
         else:
-            await self._look_for_entry(symbol, df_15m, sig)
+            await self._look_for_entry(symbol, df_15m, df_5m, sig)
 
-    async def _manage_open_position(self, symbol: str, df_15m):
+    async def _manage_open_position(self, symbol: str, df_15m, df_5m):
         pos = self.positions.get(symbol)
         try:
             ticker = await self.client.fetch_ticker(symbol)
@@ -188,8 +188,8 @@ class Bot:
                 await self._handle_event(spike_event)
                 return
 
-        # HMA early-exit check — once per newly-closed 15m bar only.
-        eevent = await self.positions.process_closed_bar_exit_check(symbol, df_15m)
+        # EMA early-exit check — once per newly-closed 5m bar only.
+        eevent = await self.positions.process_closed_bar_exit_check(symbol, df_5m)
         if eevent:
             await self._handle_event(eevent)
 
@@ -216,7 +216,7 @@ class Bot:
             event["spike_reason"] = result.reason
         return event
 
-    async def _look_for_entry(self, symbol: str, df_15m, sig):
+    async def _look_for_entry(self, symbol: str, df_15m, df_5m, sig):
         bar_ts = df_15m.index[-1] if len(df_15m) else None
         if bar_ts is None or self._last_entry_bar.get(symbol) == bar_ts:
             return   # already evaluated this closed bar
@@ -246,7 +246,8 @@ class Bot:
         )
 
         pos = await self.positions.open_position(
-            symbol, sig.direction, sig.price, df_15m, sig.regime, sig.bias, sig.entry_score)
+            symbol, sig.direction, sig.price, df_15m, sig.regime, sig.bias, sig.entry_score,
+            df_5m=df_5m)
         if pos is None:
             return
 
@@ -267,11 +268,11 @@ class Bot:
                        b.score_1h, b.score_15m, b.score_5m, b.reason)
         elif layer == "ENTRY" and sig.entry is not None:
             e = sig.entry
-            logger.info("[%s] regime=%s dir=%s(bias)  NO ENTRY  L3.1=%d/5  HMA%d=%.6f HMA%d=%.6f "
-                       "ext=%.2fATR — %s",
-                       symbol, r.label, sig.bias.direction if sig.bias else "-", e.layer31_passed_count,
-                       self.cfg.hma_fast_length, e.hma_fast, self.cfg.hma_slow_length, e.hma_slow,
-                       e.extension_atr, e.reason)
+            logger.info("[%s] regime=%s dir=%s(bias)  NO ENTRY  EMA%d=%.6f EMA%d=%.6f "
+                       "MACDhist=%+.6f — %s",
+                       symbol, r.label, sig.bias.direction if sig.bias else "-",
+                       self.cfg.entry_ema_fast, e.ema_fast, self.cfg.entry_ema_slow, e.ema_slow,
+                       e.macd_hist, e.reason)
         elif layer == "MARKET":
             logger.info("[%s] MARKET CLOSED — %s", symbol, sig.reason)
         else:
@@ -294,8 +295,8 @@ class Bot:
     # Events that fully close the position (as opposed to TP1_HIT, which only
     # partially closes and leaves the runner open) — each one starts this
     # symbol's post-close cooldown.
-    _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", HMA_CROSS_REVERSAL,
-                        PRICE_CLOSED_BEYOND_HMA, "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD"}
+    _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", EMA_CROSS_REVERSAL,
+                        PRICE_OPEN_BEYOND_EMA, "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD"}
 
     async def _handle_event(self, event: dict):
         ev = event.get("event")
@@ -308,7 +309,7 @@ class Bot:
             await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=False)
         elif ev == "BE_HIT":
             await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=True)
-        elif ev in (HMA_CROSS_REVERSAL, PRICE_CLOSED_BEYOND_HMA):
+        elif ev in (EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA):
             await self.telegram.early_exit(symbol, event["price"], event["pnl"],
                                            ev, event.get("exit_detail", ""))
         elif ev == "SPIKE_GUARD":
@@ -454,7 +455,8 @@ class Bot:
                     bias_str = f"`{b.direction}` 1H`{b.score_1h:.0f}` 15M`{b.score_15m:.0f}` 5M`{b.score_5m:.0f}`"
                 else:
                     bias_str = "`—`"
-                entry_str = (f"`L3.1={sig.entry.layer31_passed_count}/5 ext={sig.entry.extension_atr:.2f}ATR`"
+                entry_str = (f"`EMA5={sig.entry.ema_fast:.4f} EMA9={sig.entry.ema_slow:.4f} "
+                             f"hist={sig.entry.macd_hist:+.4f}`"
                             if sig.entry is not None else "`-`")
                 lines.append(
                     f"`{sym}` {pos_label}\n"
@@ -517,7 +519,8 @@ class Bot:
                 bias_label = f"{sig.bias.direction}(1H={sig.bias.score_1h:.0f},15M={sig.bias.score_15m:.0f},5M={sig.bias.score_5m:.0f})"
             else:
                 bias_label = "—"
-            entry_label = (f"L3.1={sig.entry.layer31_passed_count}/5 ext={sig.entry.extension_atr:.2f}ATR"
+            entry_label = (f"EMA5={sig.entry.ema_fast:.4f}/EMA9={sig.entry.ema_slow:.4f} "
+                          f"hist={sig.entry.macd_hist:+.4f}"
                           if sig.entry is not None else "-")
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(

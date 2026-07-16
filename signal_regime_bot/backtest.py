@@ -154,17 +154,21 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
     balance = initial_balance
     pos: Optional[BTTrade] = None
     tp1_hit = False
-    entry_fill_i = -1   # 15m bar index the open position filled on (for exit grace)
+    entry_fill_i = -1   # 5m bar index the open position filled on (for exit grace)
 
-    n = len(df_15m)
+    # The entry system is TF5M (EMA5/9 + MACD), so the simulation STEPS on 5M
+    # bars — a decision/exit-check on every closed 5m candle, exactly like live.
+    # 15m/1h/4h are sliced by close-time cutoff so a 5m decision only ever sees
+    # higher-TF bars that had already closed by then (no lookahead).
+    n = len(df_5m)
     warmup = max(cfg.min_bars, 60)
 
     # Precompute HTF close-time arrays ONCE (O(log n) lookup per bar via
     # searchsorted, instead of an O(n) boolean scan every bar).
+    close_ms_15m = _epoch_ms(df_15m.index) + _TF_MS["15m"]
     close_ms_1h = _epoch_ms(df_1h.index) + _TF_MS["1h"]
     close_ms_4h = _epoch_ms(df_4h.index) + _TF_MS["4h"]
-    close_ms_5m = _epoch_ms(df_5m.index) + _TF_MS["5m"]
-    open_ms_15m = _epoch_ms(df_15m.index)
+    open_ms_5m = _epoch_ms(df_5m.index)
 
     # Bound every indicator computation to a trailing window matching what
     # live's DataEngine actually fetches — see the equivalent note in a
@@ -177,24 +181,24 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
     w5 = cfg.fetch_limit_micro
 
     for i in range(warmup, n - 1):
-        bar = df_15m.iloc[i]
-        bar_close_ms = int(open_ms_15m[i]) + _TF_MS["15m"]
-        hist_15m = df_15m.iloc[max(0, i + 1 - w15): i + 1]
+        bar = df_5m.iloc[i]
+        bar_close_ms = int(open_ms_5m[i]) + _TF_MS["5m"]
+        hist_5m = df_5m.iloc[max(0, i + 1 - w5): i + 1]
 
+        cutoff_15m = _closed_htf_cutoff(close_ms_15m, bar_close_ms)
+        hist_15m = df_15m.iloc[max(0, cutoff_15m - w15): cutoff_15m]
         cutoff_1h = _closed_htf_cutoff(close_ms_1h, bar_close_ms)
         hist_1h = df_1h.iloc[max(0, cutoff_1h - w1h): cutoff_1h]
         cutoff_4h = _closed_htf_cutoff(close_ms_4h, bar_close_ms)
         hist_4h = df_4h.iloc[max(0, cutoff_4h - w4h): cutoff_4h]
-        cutoff_5m = _closed_htf_cutoff(close_ms_5m, bar_close_ms)
-        hist_5m = df_5m.iloc[max(0, cutoff_5m - w5): cutoff_5m]
 
-        # ── Manage open position against THIS bar's OHLC ────────────────────
+        # ── Manage open position against THIS 5m bar's OHLC ─────────────────
         if pos is not None:
             # Keep cross bookkeeping alive while in a position — live's
             # evaluate() runs every tick regardless of position state, so the
-            # backtest must observe crosses here too or the two would diverge
-            # on which cross events the cycle state has seen.
-            engine.entry_engine.observe(hist_15m, symbol)
+            # backtest must observe 5m crosses here too or the two would
+            # diverge on which cross events the cycle state has seen.
+            engine.entry_engine.observe(hist_5m, symbol)
             is_long = pos.direction == LONG
             hi, lo = float(bar["high"]), float(bar["low"])
 
@@ -207,7 +211,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
                     / pos.entry_price * notional * pos.entry_price
                 pnl -= _exit_fee(notional * exit_px)
                 pos.pnl_usd += pnl
-                pos.exit_price, pos.exit_time = exit_px, df_15m.index[i]
+                pos.exit_price, pos.exit_time = exit_px, df_5m.index[i]
                 pos.exit_reason = "SL" if not tp1_hit else "BE"
                 pos.tp1_hit = tp1_hit
                 balance += pnl
@@ -240,7 +244,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
                     / pos.entry_price * part * pos.entry_price
                 pnl -= _exit_fee(part * pos.tp2)
                 pos.pnl_usd += pnl
-                pos.exit_price, pos.exit_time = pos.tp2, df_15m.index[i]
+                pos.exit_price, pos.exit_time = pos.tp2, df_5m.index[i]
                 pos.exit_reason = "TP2"
                 pos.tp1_hit = True
                 balance += pnl
@@ -251,12 +255,12 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
                 pos, tp1_hit = None, False
                 continue
 
-            # HMA early-exit check — every closed 15m bar (this loop already
-            # IS the 15m cadence, so this runs once per bar naturally).
-            # bars_since_entry = 0 on the fill bar; the exit grace suppresses
-            # the HMA exit until it reaches exit_grace_bars.
+            # EMA early-exit check — every closed 5m bar (this loop IS the 5m
+            # cadence, so this runs once per bar naturally). bars_since_entry
+            # = 0 on the fill bar; the exit grace suppresses it until
+            # exit_grace_bars closed 5m bars have passed.
             bars_since_entry = i - entry_fill_i if entry_fill_i >= 0 else None
-            exit_check = engine.entry_engine.check_exit(hist_15m, pos.direction.lower(), bars_since_entry)
+            exit_check = engine.entry_engine.check_exit(hist_5m, pos.direction.lower(), bars_since_entry)
             if exit_check.should_exit:
                 exit_px = float(bar["close"])
                 remaining = (1.0 - cfg.tp1_fraction) if tp1_hit else 1.0
@@ -265,7 +269,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
                       (pos.entry_price - exit_px)) / pos.entry_price * notional * pos.entry_price
                 pnl -= _exit_fee(notional * exit_px)
                 pos.pnl_usd += pnl
-                pos.exit_price, pos.exit_time = exit_px, df_15m.index[i]
+                pos.exit_price, pos.exit_time = exit_px, df_5m.index[i]
                 pos.exit_reason = exit_check.reason
                 pos.tp1_hit = tp1_hit
                 balance += pnl
@@ -288,7 +292,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
         if sig.direction not in (LONG, SHORT):
             continue
 
-        entry_px = float(df_15m["open"].iloc[i + 1])
+        entry_px = float(df_5m["open"].iloc[i + 1])
         entry_px *= (1 + SLIPPAGE) if sig.direction == LONG else (1 - SLIPPAGE)
 
         atr_val = float(ind.atr(hist_15m, cfg.sl_atr_period).iloc[-1])
@@ -310,7 +314,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
             continue
 
         pos = BTTrade(
-            symbol=symbol, direction=sig.direction, entry_time=df_15m.index[i + 1],
+            symbol=symbol, direction=sig.direction, entry_time=df_5m.index[i + 1],
             entry_price=entry_px, sl=sl, tp1=tp1, tp2=tp2, amount=amount,
             risk_amount=risk_amount, regime_at_entry=sig.regime.name,
             bias_at_entry=(sig.bias.bias if sig.bias is not None else sig.regime.style),
@@ -319,7 +323,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
         pos.pnl_usd = -entry_fee
         balance -= entry_fee
         tp1_hit = False
-        entry_fill_i = i + 1   # fills at next bar's open
+        entry_fill_i = i + 1   # fills at next 5m bar's open
 
     return trades
 

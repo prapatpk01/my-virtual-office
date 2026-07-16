@@ -1,76 +1,52 @@
 """
-Layer 3 — Entry Engine. Three sequential sub-layers; ALL THREE must clear
-on the same evaluation for an entry to fire. This layer has NO right to
-pick Long or Short: it receives a fixed `direction` from the Bias layer
-and may only search for a trigger matching that side.
+Layer 3 — Entry Engine (TF5M EMA5/9 + MACD timing trigger).
 
-  Layer 3.1  15M — 5-category quality pre-filter (Momentum/Trend/Structure/
-             Liquidity/Participation), needs >= entry_min_categories (3/5)
-             with Momentum + Structure mandatory. A QUALITY CHECK, not a
-             timing trigger — it doesn't decide WHEN, only whether the
-             setup is good enough to consider at all. On 15M (same bar the
-             3.3 cross fires) so the quality read is synchronized with the
-             trigger — no stale higher-TF value.
+Regime (4H+1H) and Bias (1H+15M+5M) decide the SIDE. This layer receives
+that fixed `direction` and only searches for a 5-minute entry trigger on
+that side — it never picks Long vs Short. Everything below is evaluated on
+the last CLOSED 5M bar (no intrabar cross).
 
-  Layer 3.2  15M+5M — prior-acceleration check. Looks at the last
-             accel_15m_window closed 15M bars and accel_5m_window closed 5M
-             bars for excessive price acceleration (net move or a single
-             bar beyond that TF's ATR). If flagged, a pending Layer 3.3
-             trigger is HELD (not rejected) for up to accel_max_rounds
-             confirmation rounds — round N judges the Nth 15M bar + 4 5M
-             bars closed after the flag; holding the direction confirms,
-             a pullback/reversal extends to the next round, and failing
-             the final round abandons the setup.
+LONG entry — all must hold:
+  1. direction == LONG            (bullish regime + bias, from upstream)
+  2. EMA5 crossed above EMA9 within the last entry_ema_cross_lookback bars,
+     and EMA5 > EMA9 now
+  3. MACD line > signal now, OR a bullish MACD cross within the last
+     entry_macd_cross_lookback bars
+  4. MACD histogram > 0
+  5. MACD histogram rising: hist[-1] > hist[-2]
+  6. bar OPEN or CLOSE above EMA9
+SHORT mirrors every clause.
 
-  Layer 3.3  15M — HMA10/HMA16 fresh-cross timing trigger. HMA Cross is an
-             EVENT (LONG: bullish cross + close > HMA16; SHORT: bearish
-             cross + close < HMA16). The entry fires on the cross bar OR up
-             to entry_cross_window_bars (1) bars after it — a bounded grace
-             window so Layers 3.1/3.2 have one extra bar to confirm. Past
-             the window the cross is abandoned and the engine waits for a
-             genuinely NEW cross (it does NOT chase a late pullback like the
-             old unbounded armed cycle did). One entry per cross; after a
-             close the engine won't fire again until the next cross (which
-             is mathematically the opposite direction, since HMA10/16 must
-             cross back before it can cross forward again). Also enforces
-             HMA alignment, the correct close side, and the anti-chase
-             extension cap (|close-HMA16|/ATR <= 0.8).
+One entry per EMA cross; after a full close the engine waits for a
+genuinely new cross before re-entering (cross-cycle guard, per symbol).
 
-This module also owns the HMA-based EARLY EXIT check (`check_exit`) — same
-HMA10/HMA16/ATR values as Layer 3.3, so it lives next to the entry logic
-instead of duplicating the indicator computation:
-    HMA_CROSS_REVERSAL      — HMA crosses back against the position
-    PRICE_CLOSED_BEYOND_HMA — signal bar closes exit_hma_buffer_atr past
-                               HMA16 against the position
-Early exit does NOT replace the hard SL/TP — an additional, faster path
-evaluated once per closed 15M bar.
+Early exit (`check_exit`) — HARD exits only, so noise doesn't shake us out:
+    EMA_CROSS_REVERSAL     — EMA5 crosses back against the position
+    PRICE_OPEN_BEYOND_EMA  — bar OPEN on the wrong side of EMA9
+MACD weakening (line cross-back / histogram flip) is a WARNING only and
+never closes the position. Suppressed for exit_grace_bars closed 5M bars
+after entry so the EMAs can separate. Does NOT replace the hard SL/TP — an
+additional, faster path evaluated once per closed 5M bar.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 import indicators as ind
-import price_action as pa
 from config import Config
 
 LONG  = "LONG"
 SHORT = "SHORT"
 NONE  = "NONE"
 
-HMA_CROSS_REVERSAL = "HMA_CROSS_REVERSAL"
-PRICE_CLOSED_BEYOND_HMA = "PRICE_CLOSED_BEYOND_HMA"
-
-
-@dataclass
-class Layer31Result:
-    passed: bool
-    passed_count: int
-    categories: dict = field(default_factory=dict)
-    reason: str = ""
+# Exit reason identifiers (kept as stable strings consumed by main.py,
+# report.py and telegram_notifier.py).
+EMA_CROSS_REVERSAL = "EMA_CROSS_REVERSAL"
+PRICE_OPEN_BEYOND_EMA = "PRICE_OPEN_BEYOND_EMA"
 
 
 @dataclass
@@ -79,27 +55,24 @@ class EntryResult:
     allow_entry: bool
     reason: str = ""
     price: float = 0.0
-    hma_fast: float = 0.0
-    hma_slow: float = 0.0
-    atr: float = 0.0
-    extension_atr: float = 0.0
+    ema_fast: float = 0.0
+    ema_slow: float = 0.0
+    macd_hist: float = 0.0
     cross_id: object = None
     entry_score: float = 0.0   # 100 on a valid trigger, 0 otherwise — telegram/log compat
-    layer31_passed_count: int = 0
-    layer32_status: str = ""   # "" (not applicable) | "waiting" | "failed" | "clear"
 
 
 @dataclass
 class ExitCheckResult:
     should_exit: bool
-    reason: str = ""           # HMA_CROSS_REVERSAL | PRICE_CLOSED_BEYOND_HMA | ""
+    reason: str = ""           # EMA_CROSS_REVERSAL | PRICE_OPEN_BEYOND_EMA | ""
     detail: str = ""
 
 
 @dataclass
 class _CrossState:
-    """Layer 3.3 — one-entry-per-cross cycle, per symbol."""
-    cross_direction: Optional[str] = None    # LONG | SHORT | None — direction of the LAST detected cross
+    """One-entry-per-EMA-cross cycle, per symbol."""
+    cross_direction: Optional[str] = None    # LONG | SHORT | None — direction of the LAST EMA5/9 cross
     cross_id: object = None                  # closed-bar timestamp of that cross
     cross_used: bool = False                 # an entry was already opened from this cross
     waiting_for_new_cross: bool = False       # set True on any full close; cleared on the next fresh cross
@@ -108,49 +81,68 @@ class _CrossState:
 class EntryEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._state: dict[str, _CrossState] = {}     # Layer 3.3 cross-cycle, per symbol
-        self._accel_wait: dict[str, dict] = {}        # Layer 3.2 wait-round state, per symbol
+        self._state: dict[str, _CrossState] = {}
 
     # ── per-symbol state ──────────────────────────────────────────────────────
     def _get_state(self, symbol: str) -> _CrossState:
         return self._state.setdefault(symbol, _CrossState())
 
     def on_position_closed(self, symbol: str) -> None:
-        """Call whenever a position FULLY closes (TP2/SL/BE/early-exit) —
-        NOT on a TP1 partial. Blocks re-entry until a genuinely new cross."""
-        self._get_state(symbol).waiting_for_new_cross = True
+        """Call whenever a position FULLY closes (TP2/SL/BE/early-exit) — NOT
+        on a TP1 partial. Blocks re-entry until a genuinely new EMA cross."""
+        st = self._get_state(symbol)
+        st.waiting_for_new_cross = True
+        st.cross_used = True
 
     def reset_symbol(self, symbol: str) -> None:
-        """Drop all cross-cycle/accel-wait memory for a symbol (e.g. manual flat)."""
+        """Drop all cross-cycle memory for a symbol (e.g. manual flat)."""
         self._state.pop(symbol, None)
-        self._accel_wait.pop(symbol, None)
 
-    def observe(self, df_15m: pd.DataFrame, symbol: str) -> None:
-        """Record any fresh HMA cross on the last closed 15M bar into the
-        per-symbol cycle state. MUST be called once per closed bar regardless
-        of what Bias/L3.1 decide on that bar — cross events are structural
-        facts, and skipping them (e.g. because a quality filter failed that
-        bar, or a position was open) leaves waiting_for_new_cross stuck long
-        after a genuine new cross occurred, silently blocking valid entries.
-
-        Idempotent per bar (keyed on the bar timestamp): live re-evaluates
-        every ~30s inside the same 15M bar, and without the key guard each
-        tick would re-fire the detection and reset cross_used /
-        waiting_for_new_cross — allowing a second entry on the same cross if
-        a position opened and closed quickly within one bar."""
+    # ── indicators (shared by analyze + check_exit) ──────────────────────────
+    def _emas(self, df: pd.DataFrame):
         c = self.cfg
-        min_len = max(c.hma_slow_length * 2, 30) + 5
-        if df_15m is None or len(df_15m) < min_len:
+        close = df["close"]
+        return ind.ema(close, c.entry_ema_fast), ind.ema(close, c.entry_ema_slow)
+
+    def _macd(self, df: pd.DataFrame):
+        c = self.cfg
+        return ind.macd(df["close"], c.entry_macd_fast, c.entry_macd_slow, c.entry_macd_signal)
+
+    @staticmethod
+    def _crossed(fast: pd.Series, slow: pd.Series, lookback: int, bullish: bool) -> bool:
+        """True if `fast` crossed `slow` in the given direction on any of the
+        last `lookback` closed-bar transitions (the most recent transition is
+        k=1: prev bar -> current bar)."""
+        n = min(lookback, len(fast) - 1)
+        for k in range(1, n + 1):
+            pf, ps = float(fast.iloc[-k - 1]), float(slow.iloc[-k - 1])
+            cf, cs = float(fast.iloc[-k]), float(slow.iloc[-k])
+            if bullish and pf <= ps and cf > cs:
+                return True
+            if (not bullish) and pf >= ps and cf < cs:
+                return True
+        return False
+
+    def _min_len(self) -> int:
+        c = self.cfg
+        return max(c.entry_macd_slow + c.entry_macd_signal, c.entry_ema_slow) + 5
+
+    # ── cross bookkeeping ─────────────────────────────────────────────────────
+    def observe(self, df_5m: pd.DataFrame, symbol: str) -> None:
+        """Record any fresh EMA5/9 cross on the last closed 5M bar into the
+        per-symbol cycle state. Called once per closed bar regardless of what
+        Regime/Bias decide, so a cross that fires while Bias reads NO TRADE
+        still clears waiting_for_new_cross. Idempotent per bar (keyed on the
+        bar timestamp) — live re-evaluates every ~30s inside the same bar."""
+        if df_5m is None or len(df_5m) < self._min_len():
             return
         state = self._get_state(symbol)
-        bar_ts = df_15m.index[-1]
+        bar_ts = df_5m.index[-1]
         if state.cross_id == bar_ts:
             return   # this bar's cross already recorded — never re-process
-        closes = df_15m["close"]
-        hma_f = ind.hma(closes, c.hma_fast_length)
-        hma_s = ind.hma(closes, c.hma_slow_length)
-        cur_f, cur_s = float(hma_f.iloc[-1]), float(hma_s.iloc[-1])
-        prev_f, prev_s = float(hma_f.iloc[-2]), float(hma_s.iloc[-2])
+        ema_f, ema_s = self._emas(df_5m)
+        cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
+        prev_f, prev_s = float(ema_f.iloc[-2]), float(ema_s.iloc[-2])
         long_cross = prev_f <= prev_s and cur_f > cur_s
         short_cross = prev_f >= prev_s and cur_f < cur_s
         if not (long_cross or short_cross):
@@ -159,123 +151,6 @@ class EntryEngine:
         state.cross_id = bar_ts
         state.cross_used = False
         state.waiting_for_new_cross = False
-        # a brand new cross invalidates any Layer 3.2 wait tied to an older one
-        old_wait = self._accel_wait.get(symbol)
-        if old_wait is not None and old_wait.get("cross_id") != bar_ts:
-            self._accel_wait.pop(symbol, None)
-
-    # ── Layer 3.1 — 5-category quality pre-filter (15M) ──────────────────────
-    def _layer31(self, df_15m: pd.DataFrame, direction: str) -> Layer31Result:
-        c = self.cfg
-        if len(df_15m) < max(c.hma_slow_length, c.entry_macd_slow) + 10:
-            return Layer31Result(False, 0, {}, "L3.1: insufficient 15m history")
-
-        closes, opens = df_15m["close"], df_15m["open"]
-        price = float(closes.iloc[-1])
-        is_long = direction == LONG
-
-        hma_f = ind.hma(closes, c.hma_fast_length)
-        hma_s = ind.hma(closes, c.hma_slow_length)
-        e_ref = ind.ema(closes, c.entry_ema_ref)
-        roc_v = float(ind.roc(closes, c.entry_roc_period).iloc[-1] or 0.0)
-        _, _, hist = ind.macd(closes, c.entry_macd_fast, c.entry_macd_slow, c.entry_macd_signal)
-        h_now = float(hist.iloc[-1]) if not np.isnan(hist.iloc[-1]) else 0.0
-        h_prev = float(hist.iloc[-2]) if not np.isnan(hist.iloc[-2]) else 0.0
-        macd_cross_up = h_prev <= 0 and h_now > 0
-        macd_cross_dn = h_prev >= 0 and h_now < 0
-
-        sflags = ind.structure_flags(df_15m["high"], df_15m["low"],
-                                     c.bias_structure_left, c.bias_structure_right)
-        side = "LONG" if is_long else "SHORT"
-        bos, choch = pa.bos_choch(df_15m, side, c.bias_structure_left, c.bias_structure_right)
-
-        vol_now = float(df_15m["volume"].iloc[-1])
-        vol_ma20 = float(df_15m["volume"].iloc[-21:-1].mean()) if len(df_15m) >= 21 else 0.0
-        rel_vol = (vol_now / vol_ma20) if vol_ma20 > 0 else 1.0
-
-        if is_long:
-            categories = {
-                "momentum":      macd_cross_up or (h_now > h_prev) or (roc_v > 0),
-                "trend":         (float(hma_f.iloc[-1]) > float(hma_s.iloc[-1])) or
-                                  (price > float(e_ref.iloc[-1])),
-                "structure":     bos or choch or sflags["higher_low"],
-                "liquidity":     pa.liquidity_sweep(df_15m, "LONG", c.entry_sweep_lookback) or
-                                  pa.rejection_candle(df_15m, "LONG", c.entry_wick_reject_frac),
-                "participation": pa.volume_expansion(df_15m, c.entry_vol_expansion_mult) or
-                                  rel_vol >= c.entry_rel_vol_min,
-            }
-        else:
-            categories = {
-                "momentum":      macd_cross_dn or (h_now < h_prev) or (roc_v < 0),
-                "trend":         (float(hma_f.iloc[-1]) < float(hma_s.iloc[-1])) or
-                                  (price < float(e_ref.iloc[-1])),
-                "structure":     bos or choch or sflags["lower_high"],
-                "liquidity":     pa.liquidity_sweep(df_15m, "SHORT", c.entry_sweep_lookback) or
-                                  pa.rejection_candle(df_15m, "SHORT", c.entry_wick_reject_frac),
-                "participation": pa.volume_expansion(df_15m, c.entry_vol_expansion_mult) or
-                                  rel_vol >= c.entry_rel_vol_min,
-            }
-
-        passed = sum(categories.values())
-        mandatory_ok = categories["momentum"] and categories["structure"]
-        ok = passed >= c.entry_min_categories and mandatory_ok
-        if ok:
-            reason = f"L3.1 pass: {passed}/5 ({', '.join(k for k, v in categories.items() if v)})"
-        elif not mandatory_ok:
-            missing = [k for k in ("momentum", "structure") if not categories[k]]
-            reason = f"L3.1 fail: mandatory {'/'.join(missing)} not met ({passed}/5 passed)"
-        else:
-            reason = f"L3.1 fail: {passed}/5 categories (need >= {c.entry_min_categories})"
-        return Layer31Result(ok, passed, categories, reason)
-
-    # ── Layer 3.2 — prior-acceleration wait rounds (15M+5M) ──────────────────
-    def _recent_acceleration(self, df_15m: pd.DataFrame, df_5m: Optional[pd.DataFrame]) -> tuple[bool, str]:
-        c = self.cfg
-        for name, df, win in (("15m", df_15m, c.accel_15m_window),
-                              ("5m", df_5m, c.accel_5m_window)):
-            if df is None or len(df) < win + 15:
-                continue
-            atr_v = float(ind.atr(df, 14).iloc[-1])
-            if not np.isfinite(atr_v) or atr_v <= 0:
-                continue
-            seg = df.iloc[-win:]
-            net = abs(float(seg["close"].iloc[-1]) - float(seg["open"].iloc[0]))
-            max_rng = float((seg["high"] - seg["low"]).max())
-            if net >= c.accel_net_atr_mult * atr_v:
-                return True, f"{name} net move {net/atr_v:.1f}xATR over last {win} bars"
-            if max_rng >= c.accel_bar_atr_mult * atr_v:
-                return True, f"{name} bar range {max_rng/atr_v:.1f}xATR within last {win} bars"
-        return False, ""
-
-    def _judge_accel_round(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
-                           side: str, flag_ts: pd.Timestamp, rnd: int) -> tuple[Optional[bool], str]:
-        c = self.cfg
-        per = c.accel_5m_per_round
-        need15, need5 = rnd, per * rnd
-        b15 = df_15m[df_15m.index >= flag_ts]
-        b5 = df_5m[df_5m.index >= flag_ts]
-        if len(b15) < need15 or len(b5) < need5:
-            return None, (f"round {rnd}: waiting for post-flag bars "
-                          f"(15m {len(b15)}/{need15}, 5m {len(b5)}/{need5})")
-        r15 = b15.iloc[need15 - 1]
-        r5 = b5.iloc[per * (rnd - 1): per * rnd]
-        fav15 = (float(r15["close"]) > float(r15["open"])) if side == LONG \
-            else (float(r15["close"]) < float(r15["open"]))
-        fav5 = ((r5["close"].values > r5["open"].values) if side == LONG
-                else (r5["close"].values < r5["open"].values))
-        n5 = int(fav5.sum())
-        ok = fav15 and n5 >= c.accel_round_5m_min
-        detail = f"round {rnd}: 15m {'with' if fav15 else 'against'} {side}, 5m {n5}/{per} with {side}"
-        return ok, detail
-
-    # ── shared HMA/ATR computation (Layer 3.3 + check_exit) ──────────────────
-    @staticmethod
-    def _hma_atr(df_15m: pd.DataFrame, cfg: Config):
-        closes = df_15m["close"]
-        hma_f = ind.hma(closes, cfg.hma_fast_length)
-        hma_s = ind.hma(closes, cfg.hma_slow_length)
-        atr_s = ind.atr(df_15m, cfg.sl_atr_period)
-        return hma_f, hma_s, atr_s
 
     # ── combined entry decision ──────────────────────────────────────────────
     def analyze(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
@@ -285,152 +160,113 @@ class EntryEngine:
             return EntryResult(NONE, False, "no direction from Bias layer — nothing to time")
 
         # Cross bookkeeping first — a structural fact, recorded regardless of
-        # what the quality layers decide on this bar (idempotent per bar).
-        self.observe(df_15m, symbol)
+        # what the trigger decides on this bar (idempotent per bar).
+        self.observe(df_5m, symbol)
 
-        # ── Layer 3.1 (15M) ────────────────────────────────────────────────────
-        l31 = self._layer31(df_15m, direction)
-        if not l31.passed:
-            return EntryResult(NONE, False, l31.reason, layer31_passed_count=l31.passed_count)
+        if df_5m is None or len(df_5m) < self._min_len():
+            return EntryResult(NONE, False, "insufficient 5m history")
 
-        min_len = max(c.hma_slow_length * 2, 30) + 5
-        if len(df_15m) < min_len:
-            return EntryResult(NONE, False, "insufficient 15m history", layer31_passed_count=l31.passed_count)
-
-        hma_f, hma_s, atr_s = self._hma_atr(df_15m, c)
-        cur_f, cur_s = float(hma_f.iloc[-1]), float(hma_s.iloc[-1])
-        atr_now = float(atr_s.iloc[-1]) if not np.isnan(atr_s.iloc[-1]) else 0.0
-        close = float(df_15m["close"].iloc[-1])
-        open_px = float(df_15m["open"].iloc[-1])   # entry side-of-HMA16 test uses OPEN, per spec
-        bar_ts = df_15m.index[-1]
-        state = self._get_state(symbol)
-
-        if atr_now <= 0 or np.isnan(atr_now):
-            return EntryResult(NONE, False, "ATR unavailable", price=close, hma_fast=cur_f,
-                               hma_slow=cur_s, layer31_passed_count=l31.passed_count)
-
-        extension_atr = abs(close - cur_s) / atr_now
         is_long = direction == LONG
-        base = dict(price=close, hma_fast=cur_f, hma_slow=cur_s, atr=atr_now,
-                   extension_atr=extension_atr, cross_id=state.cross_id,
-                   layer31_passed_count=l31.passed_count)
+        ema_f, ema_s = self._emas(df_5m)
+        line, sig, hist = self._macd(df_5m)
+        cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
+        h_now = float(hist.iloc[-1]) if not np.isnan(hist.iloc[-1]) else 0.0
+        h_prev = float(hist.iloc[-2]) if not np.isnan(hist.iloc[-2]) else 0.0
+        l_now, s_now = float(line.iloc[-1]), float(sig.iloc[-1])
+        open_px = float(df_5m["open"].iloc[-1])
+        close_px = float(df_5m["close"].iloc[-1])
+        state = self._get_state(symbol)
+        base = dict(price=close_px, ema_fast=cur_f, ema_slow=cur_s,
+                    macd_hist=h_now, cross_id=state.cross_id)
 
-        aligned = (cur_f > cur_s) if is_long else (cur_f < cur_s)
-        open_ok = (open_px > cur_s) if is_long else (open_px < cur_s)   # OPEN on the correct side of HMA16
-        not_extended = extension_atr <= c.entry_max_distance_from_hma_atr
+        # ── condition 2 — EMA5 crossed the right way within the window, still aligned
         cross_pending = (state.cross_direction == direction and not state.cross_used
                         and not state.waiting_for_new_cross)
-        # Grace window: the entry fires on the cross bar OR up to
-        # entry_cross_window_bars bars after it — giving Layer 3.1 (quality)
-        # and Layer 3.2 (acceleration confirm) one extra bar to clear without
-        # the setup going stale. bars_since=0 is the cross bar itself. Past the
-        # window, the cross is abandoned; wait for a new one (this is what
-        # bounds it — NOT the old unbounded armed cycle that chased pullbacks).
-        bars_since = (int((df_15m.index > state.cross_id).sum())
+        bars_since = (int((df_5m.index > state.cross_id).sum())
                      if state.cross_id is not None else None)
-        in_window = bars_since is not None and bars_since <= c.entry_cross_window_bars
+        in_window = bars_since is not None and bars_since <= c.entry_ema_cross_lookback
+        aligned = (cur_f > cur_s) if is_long else (cur_f < cur_s)
 
-        # ── Layer 3.3 checks ────────────────────────────────────────────────────
         if not cross_pending:
-            if state.waiting_for_new_cross:
-                reason = f"L3.3: {direction} blocked — waiting for a new cross after prior exit"
-            else:
-                reason = f"L3.3: {direction} blocked — no pending HMA{c.hma_fast_length}xHMA{c.hma_slow_length} cross"
+            reason = (f"L3: {direction} blocked — waiting for a new EMA cross after prior exit"
+                      if state.waiting_for_new_cross else
+                      f"L3: {direction} blocked — no pending EMA{c.entry_ema_fast}x{c.entry_ema_slow} cross")
             return EntryResult(NONE, False, reason, **base)
         if not in_window:
             return EntryResult(NONE, False,
-                               f"L3.3: {direction} blocked — cross was {bars_since} bar(s) ago "
-                               f"(window {c.entry_cross_window_bars}) — wait for a fresh cross", **base)
+                               f"L3: {direction} blocked — EMA cross was {bars_since} bar(s) ago "
+                               f"(window {c.entry_ema_cross_lookback}) — wait for a fresh cross", **base)
         if not aligned:
-            return EntryResult(NONE, False, f"L3.3: {direction} blocked — HMA alignment not held", **base)
-        if not open_ok:
-            return EntryResult(NONE, False,
-                               f"L3.3: {direction} blocked — open not past HMA{c.hma_slow_length} "
-                               f"(open {open_px:.6f} vs {cur_s:.6f})", **base)
-        if not not_extended:
-            return EntryResult(NONE, False,
-                               f"L3.3 BLOCKED Reason=PRICE_TOO_EXTENDED ExtensionATR={extension_atr:.2f} "
-                               f"Maximum={c.entry_max_distance_from_hma_atr:.2f}", **base)
+            return EntryResult(NONE, False, f"L3: {direction} blocked — EMA{c.entry_ema_fast}/"
+                               f"{c.entry_ema_slow} alignment not held", **base)
 
-        # ── Layer 3.2 — gates this now-pending Layer 3.3 trigger ────────────────
-        if c.accel_confirm_enabled:
-            accel_state = self._accel_wait.get(symbol)
-            if accel_state is None:
-                flag, why = self._recent_acceleration(df_15m, df_5m)
-                if flag:
-                    self._accel_wait[symbol] = {
-                        "cross_id": state.cross_id, "side": direction, "round": 1,
-                        "last_bar": bar_ts, "flag_ts": bar_ts + pd.Timedelta(c.tf_fast),
-                    }
-                    return EntryResult(NONE, False, f"L3.2 WAIT round 1: {why}",
-                                       layer32_status="waiting", **base)
-            else:
-                if accel_state["last_bar"] == bar_ts:
-                    return EntryResult(NONE, False,
-                                       f"L3.2 WAIT round {accel_state['round']} pending (same bar)",
-                                       layer32_status="waiting", **base)
-                accel_state["last_bar"] = bar_ts
-                verdict, detail = self._judge_accel_round(
-                    df_15m, df_5m, direction, accel_state["flag_ts"], accel_state["round"])
-                if verdict is None:
-                    return EntryResult(NONE, False, f"L3.2 WAIT: {detail}",
-                                       layer32_status="waiting", **base)
-                if not verdict:
-                    if accel_state["round"] >= c.accel_max_rounds:
-                        self._accel_wait.pop(symbol, None)
-                        return EntryResult(NONE, False,
-                                           f"L3.2 FAILED both rounds ({detail}) — setup abandoned",
-                                           layer32_status="failed", **base)
-                    accel_state["round"] += 1
-                    return EntryResult(NONE, False, f"L3.2 WAIT round {accel_state['round']}: {detail}",
-                                       layer32_status="waiting", **base)
-                self._accel_wait.pop(symbol, None)
+        # ── condition 3 — MACD line above signal, or crossed within window
+        macd_side = (l_now > s_now) if is_long else (l_now < s_now)
+        macd_cross = self._crossed(line, sig, c.entry_macd_cross_lookback, bullish=is_long)
+        if not (macd_side or macd_cross):
+            return EntryResult(NONE, False,
+                               f"L3: {direction} blocked — MACD line not {'>' if is_long else '<'} signal "
+                               f"and no cross within {c.entry_macd_cross_lookback} bars", **base)
 
-        # ── all three layers cleared — fire ──────────────────────────────────────
+        # ── condition 4 — histogram on the right side of zero
+        hist_side = (h_now > 0) if is_long else (h_now < 0)
+        if not hist_side:
+            return EntryResult(NONE, False,
+                               f"L3: {direction} blocked — MACD histogram {h_now:+.6f} wrong side of 0", **base)
+
+        # ── condition 5 — histogram building in the trade direction
+        hist_building = (h_now > h_prev) if is_long else (h_now < h_prev)
+        if not hist_building:
+            return EntryResult(NONE, False,
+                               f"L3: {direction} blocked — MACD histogram not "
+                               f"{'rising' if is_long else 'falling'} ({h_prev:+.6f}->{h_now:+.6f})", **base)
+
+        # ── condition 6 — price (open OR close) on the correct side of EMA9
+        price_ok = ((open_px > cur_s or close_px > cur_s) if is_long
+                    else (open_px < cur_s or close_px < cur_s))
+        if not price_ok:
+            return EntryResult(NONE, False,
+                               f"L3: {direction} blocked — neither open nor close past EMA{c.entry_ema_slow} "
+                               f"(o={open_px:.6f} c={close_px:.6f} vs {cur_s:.6f})", **base)
+
+        # ── all conditions clear — fire (one entry per cross) ─────────────────
         state.cross_used = True
         return EntryResult(direction, True,
-                           f"ENTRY {direction}  L3.1={l31.passed_count}/5  "
-                           f"L3.3 HMA{c.hma_fast_length}xHMA{c.hma_slow_length} ext={extension_atr:.2f}  "
-                           f"CrossID={state.cross_id}",
-                           entry_score=100.0, layer32_status="clear", **base)
+                           f"ENTRY {direction}  EMA{c.entry_ema_fast}x{c.entry_ema_slow} cross "
+                           f"{bars_since}b ago  MACD hist={h_now:+.5f} rising  CrossID={state.cross_id}",
+                           entry_score=100.0, **base)
 
-    # ── Early exit (shares the Layer 3.3 HMA/ATR computation) ────────────────
-    def check_exit(self, df_15m: pd.DataFrame, position_side: str,
+    # ── Early exit (EMA hard-exit; MACD is warning-only) ─────────────────────
+    def check_exit(self, df_5m: pd.DataFrame, position_side: str,
                    bars_since_entry: Optional[int] = None) -> ExitCheckResult:
         """position_side: 'long' | 'short' (Position.side casing). While
-        bars_since_entry < exit_grace_bars the HMA early-exit is suppressed
-        (the HMAs are still separating from the entry cross) — SL/TP handled
-        elsewhere are unaffected."""
+        bars_since_entry < exit_grace_bars the HARD exit is suppressed so the
+        EMAs can separate from the entry cross. SL/TP handled elsewhere are
+        unaffected. Only EMA cross-back and an OPEN on the wrong side of EMA9
+        close a position — MACD weakening is deliberately NOT an exit."""
         c = self.cfg
         if bars_since_entry is not None and bars_since_entry < c.exit_grace_bars:
             return ExitCheckResult(False)
-        min_len = max(c.hma_slow_length * 2, 30) + 5
-        if len(df_15m) < min_len:
+        if df_5m is None or len(df_5m) < self._min_len():
             return ExitCheckResult(False)
 
-        hma_f, hma_s, atr_s = self._hma_atr(df_15m, c)
-        cur_f, cur_s = float(hma_f.iloc[-1]), float(hma_s.iloc[-1])
-        prev_f, prev_s = float(hma_f.iloc[-2]), float(hma_s.iloc[-2])
-        atr_now = float(atr_s.iloc[-1]) if not np.isnan(atr_s.iloc[-1]) else 0.0
-        open_px = float(df_15m["open"].iloc[-1])   # price-failure test uses OPEN, per spec
+        ema_f, ema_s = self._emas(df_5m)
+        cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
+        prev_f, prev_s = float(ema_f.iloc[-2]), float(ema_s.iloc[-2])
+        open_px = float(df_5m["open"].iloc[-1])
         is_long = position_side == "long"
 
-        # Early exit: HMA cross-back OR the bar's OPEN closes on the wrong
-        # side of HMA16 (past exit_hma_buffer_atr). Using OPEN (= prior bar's
-        # close) makes the price-failure a 1-bar-confirmed break rather than a
-        # same-bar intrabar poke.
         if is_long:
             cross_back = prev_f >= prev_s and cur_f < cur_s
-            price_failure = atr_now > 0 and open_px < cur_s - atr_now * c.exit_hma_buffer_atr
+            open_wrong = open_px < cur_s
         else:
             cross_back = prev_f <= prev_s and cur_f > cur_s
-            price_failure = atr_now > 0 and open_px > cur_s + atr_now * c.exit_hma_buffer_atr
+            open_wrong = open_px > cur_s
 
         if cross_back:
-            return ExitCheckResult(True, HMA_CROSS_REVERSAL,
-                                   f"HMA{c.hma_fast_length} crossed back against {position_side}")
-        if price_failure:
-            return ExitCheckResult(True, PRICE_CLOSED_BEYOND_HMA,
-                                   f"open={open_px:.6f} HMA{c.hma_slow_length}={cur_s:.6f} "
-                                   f"ATRBuffer={atr_now * c.exit_hma_buffer_atr:.6f}")
+            return ExitCheckResult(True, EMA_CROSS_REVERSAL,
+                                   f"EMA{c.entry_ema_fast} crossed back against {position_side}")
+        if open_wrong:
+            return ExitCheckResult(True, PRICE_OPEN_BEYOND_EMA,
+                                   f"open={open_px:.6f} EMA{c.entry_ema_slow}={cur_s:.6f}")
         return ExitCheckResult(False)

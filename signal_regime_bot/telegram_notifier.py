@@ -169,7 +169,7 @@ class TelegramNotifier:
 
     async def early_exit(self, symbol: str, price: float, pnl: float,
                          reason: str, detail: str = ""):
-        label = "HMA Cross Reversal" if reason == "HMA_CROSS_REVERSAL" else "Price Closed Beyond HMA16"
+        label = "EMA Cross Reversal" if reason == "EMA_CROSS_REVERSAL" else "Price Opened Beyond EMA9"
         await self._send_message(
             f"⚠️ *Early Exit — {label}* `{symbol}`\n\n"
             f"`{detail}`\n"

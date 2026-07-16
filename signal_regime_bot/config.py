@@ -140,62 +140,40 @@ class Config:
     #   Layer 3.3  15M, HMA10/HMA16 fresh-cross timing trigger + anti-chase +
     #              one-entry-per-cross state machine. Decides WHEN, once 3.1
     #              and 3.2 clear.
-    entry_timeframe: str = "15m"
-    hma_fast_length: int = 10
-    hma_slow_length: int = 16
-    entry_max_distance_from_hma_atr: float = 0.8   # anti-chase: reject if |close-HMA16|/ATR exceeds this
-    exit_hma_buffer_atr: float = 0.10               # early-exit price-failure buffer past HMA16, in ATR
-    # Early-exit grace period: HMA cross-back / price-failure exits are
-    # SUPPRESSED for this many bars after entry, so the HMAs have time to
-    # separate. Entering AT the cross means HMA10 ~ HMA16 at entry — the
-    # point they're most likely to flip back on noise — so without a grace
-    # window ~70% of trades were exiting almost immediately before reaching
-    # TP (measured across 5 backtests). SL/TP stay active throughout; only
-    # the HMA early-exit waits. 0 disables the grace.
+    # ── Entry (Layer 3) — TF5M EMA5/9 + MACD timing trigger ─────────────────
+    # Regime (4H+1H) and Bias (1H+15M+5M) fix the SIDE; this layer only times
+    # the entry on the last CLOSED 5M bar. EMA5/9 cross is the trigger, MACD
+    # confirms momentum, and price must sit on the right side of EMA9.
+    entry_timeframe: str = "5m"
+    entry_ema_fast: int = 5
+    entry_ema_slow: int = 9
+    entry_ema_cross_lookback: int = 2   # EMA5/9 cross must have fired within the last N closed bars
+    entry_macd_fast: int = 12
+    entry_macd_slow: int = 26
+    entry_macd_signal: int = 9
+    entry_macd_cross_lookback: int = 2  # for the "MACD line>signal OR crossed within N bars" clause
+    # Early-exit grace: HARD exits (EMA cross-back / open past EMA9) are
+    # SUPPRESSED for this many closed 5M bars after entry so the EMAs can
+    # separate from the entry cross. SL/TP stay active throughout. 0 disables.
     exit_grace_bars: int = 3
-    # Layer 3.3 grace window: the entry may fire on the cross bar OR up to
-    # this many bars after it — a 1-bar allowance so Layer 3.1 (quality) and
-    # Layer 3.2 (acceleration confirm) have one extra bar to clear without the
-    # setup going stale. Past this, the cross is abandoned; wait for a new one.
-    entry_cross_window_bars: int = 1
     one_entry_per_cross: bool = True
     require_new_cross_after_exit: bool = True
     entry_on_closed_candle_only: bool = True
     exit_on_closed_candle_price_break: bool = True
 
-    # Layer 3.1 — 5-category check on 15M (Momentum/Trend/Structure/Liquidity/
-    # Participation), needs >= entry_min_categories with Momentum + Structure
-    # mandatory. Uses the same HMA10/16 pair as Layer 3.3 for its Trend
-    # category rather than a separate HMA period.
+    # Retained field names from the retired HMA / 5-category / accel entry
+    # (Layer 3.1/3.2/3.3) — no longer used by the entry logic, kept as inert
+    # defaults so env overrides, the chart HMA overlay, and the dead
+    # context/style/booster modules don't error. Safe to prune later.
+    hma_fast_length: int = 10
+    hma_slow_length: int = 16
+    entry_ema_ref: int = 15
     entry_min_categories: int = 3
     entry_roc_period: int = 9
-    entry_ema_ref: int = 15
-    entry_macd_fast: int = 12
-    entry_macd_slow: int = 26
-    entry_macd_signal: int = 9
     entry_sweep_lookback: int = 10
     entry_wick_reject_frac: float = 0.5
     entry_vol_expansion_mult: float = 1.5
     entry_rel_vol_min: float = 1.2
-
-    # Layer 3.2 — prior-acceleration wait rounds, tuned SHORT/FAST so a hold
-    # can confirm within the 1-bar Layer 3.3 grace window (entry_cross_window_bars).
-    # Detection: last accel_15m_window (3) closed 15M bars and accel_5m_window
-    # (6) closed 5M bars — flag if net move or a single bar exceeds that TF's
-    # ATR multiple. On a flag, HOLD the pending trigger for accel_max_rounds (1)
-    # confirmation round: round 1 = the 1x15M bar + accel_5m_per_round (3) 5M
-    # bars closed after the flag (3x5M = 15min = exactly one 15M bar, so it
-    # completes on the very next bar). Round holds direction (15M favorable AND
-    # >= accel_round_5m_min of its 5M bars) -> enter; otherwise the setup is
-    # abandoned (no second round — the grace window is only 1 bar).
-    accel_confirm_enabled: bool = True
-    accel_15m_window: int = 3
-    accel_5m_window: int = 6
-    accel_net_atr_mult: float = 3.0
-    accel_bar_atr_mult: float = 2.5
-    accel_5m_per_round: int = 3       # 5M bars judged per confirmation round (3 x 5m = 1 x 15m)
-    accel_round_5m_min: int = 2       # of those, how many must close in the trade direction
-    accel_max_rounds: int = 1         # single round — must confirm within the 1-bar window
 
     # ── Bias confidence (1H) ─────────────────────────────────────────────────
     # Confidence 0-100 from: 1H ADX, RSI slope, EMA20 slope, volume confirm,

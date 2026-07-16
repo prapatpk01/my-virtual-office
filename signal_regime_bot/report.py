@@ -62,7 +62,7 @@ def compute_stats(trades: list, initial_balance: float) -> dict:
         "be_count": sum(1 for t in trades if t.exit_reason == "BE"),
         "tp2_count": sum(1 for t in trades if t.exit_reason == "TP2"),
         "early_exit_count": sum(1 for t in trades if t.exit_reason in
-                                ("HMA_CROSS_REVERSAL", "PRICE_CLOSED_BEYOND_HMA")),
+                                ("EMA_CROSS_REVERSAL", "PRICE_OPEN_BEYOND_EMA")),
     }
 
 
