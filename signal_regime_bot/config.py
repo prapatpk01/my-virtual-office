@@ -218,10 +218,33 @@ class Config:
     # brake instead.
     daily_loss_limit_enabled: bool = False
     daily_loss_limit_pct: float = 0.03    # halt new entries: day PnL <= -3% (only if enabled above)
-    daily_profit_lock_pct: float = 0.08   # halt new entries: day PnL >= +8%
+    # Disabled by user request ("trade continuously, no waiting for the next
+    # UTC day") — a +10.8% day tripped the +8% lock and idled the bot ~13h.
+    # Loss-streak cooldown below remains the only pause.
+    daily_profit_lock_enabled: bool = False
+    daily_profit_lock_pct: float = 0.08   # halt new entries: day PnL >= +8% (only if enabled above)
     loss_streak_limit: int = 3            # 3 consecutive losses ->
     loss_streak_cooldown_min: int = 180   # -> 3-hour cooldown (was 30 min)
     max_open_positions: int = 0  # set in __post_init__ from MAX_POSITIONS (default 2)
+
+    # ── Fees ─────────────────────────────────────────────────────────────────
+    # OKX charges 0.10% per fill on this account — open, close, TP and SL all
+    # pay it. Used by live/paper PnL accounting AND the backtest, so the two
+    # can never disagree on fee drag.
+    fee_rate: float = 0.001
+
+    # ── Commodity market hours (XAU / XAG) ──────────────────────────────────
+    # The underlying metals market is closed on weekends — the OKX perp still
+    # quotes, but it's illiquid/frozen and signals are garbage. Block NEW
+    # entries for symbols matching these keywords from Friday
+    # commodity_halt_hour_utc (17:00 UTC = Sat 00:00 Asia/Bangkok) until
+    # Sunday commodity_resume_hour_utc (21:00 UTC = Mon 04:00 ICT — exactly 3
+    # hours before the Mon 07:00 ICT market open the user referenced).
+    # Open positions keep being managed (SL/TP/exits) throughout.
+    commodity_weekend_block_enabled: bool = True
+    commodity_symbol_keywords: tuple = ("XAU", "XAG")
+    commodity_halt_hour_utc: int = 17     # Friday >= this hour UTC -> halted
+    commodity_resume_hour_utc: int = 21   # Sunday < this hour UTC -> still halted
 
     # Stop loss / take profit
     sl_atr_period: int = 14

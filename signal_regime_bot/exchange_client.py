@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -56,10 +57,12 @@ class Balance:
 
 class ExchangeClient:
     def __init__(self, api_key: str, api_secret: str, passphrase: str,
-                paper: bool, leverage: int = 20, margin_mode: str = "isolated"):
+                paper: bool, leverage: int = 20, margin_mode: str = "isolated",
+                fee_rate: float = 0.001):
         self.paper = paper
         self._leverage = leverage
         self._margin_mode = margin_mode
+        self._fee_rate = fee_rate          # 0.10% per fill (open/close/TP/SL)
         self._leverage_set: set[str] = set()
         self._hedge_confirmed = False
         self._paper_balance: dict[str, float] = {"USDT": 10_000.0}
@@ -117,8 +120,9 @@ class ExchangeClient:
             raise
 
     async def contract_size(self, symbol: str) -> float:
-        if self.paper:
-            return _OKX_CONTRACT_SIZE.get(symbol, 0.0) or 1.0
+        # Try real market metadata FIRST even in paper mode — paper still
+        # talks to the live public API for tickers, so metadata is usually
+        # loadable and paper sizing then matches live exactly.
         try:
             market = self._exchange.market(symbol)
             sz = market.get("contractSize")
@@ -126,7 +130,44 @@ class ExchangeClient:
                 return float(sz)
         except Exception:
             pass
-        return _OKX_CONTRACT_SIZE.get(symbol, 0.0)
+        fallback = _OKX_CONTRACT_SIZE.get(symbol, 0.0)
+        if self.paper:
+            return fallback or 1.0
+        return fallback
+
+    async def quantize_amount(self, symbol: str, base_amount: float) -> tuple[float, float]:
+        """
+        Convert a desired BASE-asset amount into (contracts, effective_base)
+        exactly as OKX will fill it: floored to whole lot steps of the
+        contract, NEVER rounded up (rounding up silently oversizes risk at
+        20x). Returns (0.0, 0.0) if the amount is below one tradeable lot.
+
+        This is the single source of truth for order sizing — live orders,
+        paper fills, and the Position bookkeeping all use the value returned
+        here, so the size the bot reports is byte-for-byte the size OKX
+        actually trades (the old int(round(...)) path could differ from the
+        recorded amount by up to half a contract).
+        """
+        ct = await self.contract_size(symbol)
+        if not ct or ct <= 0:
+            raise ValueError(f"Cannot resolve contract size for {symbol} — refusing to size")
+        lot = 1.0      # lot step, in contracts (OKX lotSz; often 1, sometimes 0.1/0.01)
+        min_ct = 1.0   # minimum order, in contracts (OKX minSz)
+        try:
+            market = self._exchange.market(symbol)
+            prec = (market.get("precision") or {}).get("amount")
+            if prec:
+                lot = float(prec)
+            mn = ((market.get("limits") or {}).get("amount") or {}).get("min")
+            if mn:
+                min_ct = float(mn)
+        except Exception:
+            pass
+        steps = math.floor(base_amount / ct / lot + 1e-9)
+        contracts = steps * lot
+        if contracts < max(min_ct, lot) - 1e-9:
+            return 0.0, 0.0
+        return contracts, contracts * ct
 
     # ── Market data ───────────────────────────────────────────────────────────
 
@@ -249,18 +290,15 @@ class ExchangeClient:
 
         await self._ensure_leverage(symbol)
 
-        ct_val = await self.contract_size(symbol)
-        if not ct_val or ct_val <= 0:
+        contracts, effective_base = await self.quantize_amount(symbol, amount)
+        if contracts <= 0:
             raise ValueError(
-                f"Cannot resolve contract size for {symbol} — refusing order "
-                f"(guessing risks a massively oversized position at {self._leverage}x)."
+                f"Order too small for {symbol}: {amount:.6f} base is below one "
+                f"tradeable lot. Increase risk_per_trade or balance."
             )
-        contracts = int(round(amount / ct_val))
-        if contracts < 1:
-            raise ValueError(
-                f"Order too small: {amount:.6f} = {amount/ct_val:.3f} contracts "
-                f"(min 1 = {ct_val}). Increase risk_per_trade or balance."
-            )
+        if abs(effective_base - amount) / max(amount, 1e-12) > 0.005:
+            logger.info("[ORDER] %s quantized %.8f -> %.8f base (%.4g contracts)",
+                       symbol, amount, effective_base, contracts)
 
         params: dict = {"tdMode": self._margin_mode, "posSide": pos_side}
         if reduce_only:
@@ -288,7 +326,7 @@ class ExchangeClient:
 
         return OrderResult(
             order_id=str(raw.get("id", uuid.uuid4())), symbol=symbol, side=side,
-            amount=float(contracts) * ct_val, price=raw.get("price") or 0.0,
+            amount=effective_base, price=raw.get("price") or 0.0,
             status=raw.get("status", "open"),
         )
 
@@ -360,27 +398,39 @@ class ExchangeClient:
 
     async def _paper_order(self, symbol: str, side: str, amount: float, pos_side: str,
                            tp_price, sl_price) -> OrderResult:
+        """Paper fills mirror live exactly: the amount is quantized to OKX
+        contract lots (same quantize_amount as live orders) and every fill
+        pays fee_rate on its notional — open, close, TP and SL alike."""
         ticker = await self.fetch_ticker(symbol)
         price = float(ticker["last"])
         key = f"{symbol}||{pos_side}"
         is_close = (pos_side == "long" and side == "sell") or (pos_side == "short" and side == "buy")
 
+        contracts, eff_amount = await self.quantize_amount(symbol, amount)
+
         if is_close:
             pos = self._paper_positions.get(key)
+            closed_amt = 0.0
             if pos:
-                closed_amt = min(amount, pos["amount"])
+                closed_amt = min(eff_amount if eff_amount > 0 else pos["amount"], pos["amount"])
                 pnl_mult = 1 if pos_side == "long" else -1
                 pnl = pnl_mult * (price - pos["entry"]) * closed_amt
-                self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0.0) + pnl
+                fee = closed_amt * price * self._fee_rate
+                self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0.0) + pnl - fee
                 pos["amount"] -= closed_amt
                 if pos["amount"] <= 1e-9:
                     del self._paper_positions[key]
-            return OrderResult(str(uuid.uuid4()), symbol, side, amount, price, "closed")
+            return OrderResult(str(uuid.uuid4()), symbol, side, closed_amt, price, "closed")
 
+        if eff_amount <= 0:
+            raise ValueError(
+                f"Order too small for {symbol}: {amount:.6f} base is below one tradeable lot.")
+        open_fee = eff_amount * price * self._fee_rate
+        self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0.0) - open_fee
         existing = self._paper_positions.get(key)
         if existing:
-            existing["amount"] += amount
+            existing["amount"] += eff_amount
         else:
-            self._paper_positions[key] = {"entry": price, "amount": amount,
+            self._paper_positions[key] = {"entry": price, "amount": eff_amount,
                                           "tp": tp_price, "sl": sl_price}
-        return OrderResult(str(uuid.uuid4()), symbol, side, amount, price, "open")
+        return OrderResult(str(uuid.uuid4()), symbol, side, eff_amount, price, "open")

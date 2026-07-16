@@ -322,12 +322,13 @@ class PositionManager:
 
         pnl_mult = 1 if pos.side == LONG else -1
         pnl = pnl_mult * (price - pos.entry_price) * pos.amount
+        pnl -= (pos.entry_price + price) * pos.amount * self.cfg.fee_rate
         balance = await self.client.fetch_balance_usdt()
         self.risk.register_trade_result(pnl, balance, time.time())
         del self._positions[pos.symbol]
         self.entry_engine.on_position_closed(pos.symbol)
         logger.info("[POS] %s %s: confirmed closed externally (exchange algo) — "
-                   "synced internal state, pnl≈%.2f (approximate, exact fill unknown)",
+                   "synced internal state, pnl≈%.2f incl fees (approximate, exact fill unknown)",
                    pos.symbol, reason, pnl)
         return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": price,
                "pnl": pnl, "trade_pnl": pos.realized_pnl + pnl, "tp1_hit": pos.tp1_hit,
@@ -338,8 +339,8 @@ class PositionManager:
         close_amt = min(close_amt, pos.amount)
         okx_side = "sell" if pos.side == LONG else "buy"
         try:
-            await self.client.create_order(pos.symbol, okx_side, close_amt,
-                                           pos_side=pos.side, reduce_only=True)
+            res = await self.client.create_order(pos.symbol, okx_side, close_amt,
+                                                 pos_side=pos.side, reduce_only=True)
         except Exception as e:
             if self._is_no_position_error(e):
                 # The exchange-side algo closed the FULL position before our TP1
@@ -352,11 +353,17 @@ class PositionManager:
             logger.warning("[POS] %s TP1 partial close failed, retry next tick: %s", pos.symbol, e)
             return {"event": "ERROR", "symbol": pos.symbol, "detail": f"TP1 close failed: {e}"}
 
+        # Use the ACTUAL filled amount (contract-quantized), not the requested
+        # one — the two can differ by up to a lot, and pnl/pos.amount must
+        # track what really happened on the exchange.
+        filled = min(res.amount if res.amount > 0 else close_amt, pos.amount)
         pnl_mult = 1 if pos.side == LONG else -1
-        pnl = pnl_mult * (price - pos.entry_price) * close_amt
+        pnl = pnl_mult * (price - pos.entry_price) * filled
+        # fees: this leg pays open fee (its share) + close fee, fee_rate per fill
+        pnl -= (pos.entry_price + price) * filled * self.cfg.fee_rate
         self.risk.register_trade_result(pnl, await self.client.fetch_balance_usdt(), time.time())
 
-        pos.amount = round(pos.amount - close_amt, 8)
+        pos.amount = round(pos.amount - filled, 8)
         pos.tp1_hit = True
         pos.realized_pnl += pnl
         pos.stop_loss = pos.entry_price   # exact breakeven
@@ -384,6 +391,8 @@ class PositionManager:
 
         pnl_mult = 1 if pos.side == LONG else -1
         pnl = pnl_mult * (price - pos.entry_price) * pos.amount
+        # fees: this leg's share of the open fee + its close fill fee
+        pnl -= (pos.entry_price + price) * pos.amount * self.cfg.fee_rate
         balance = await self.client.fetch_balance_usdt()
         self.risk.register_trade_result(pnl, balance, time.time())
 

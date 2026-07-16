@@ -81,6 +81,26 @@ class Pipeline:
         regime = self.regime_engine.analyze(df_4h, df_1h)
         base = dict(price=price, regime=regime)
 
+        # ── Commodity weekend halt (XAU/XAG): the underlying metals market is
+        # closed — the OKX perp still quotes but it's illiquid, so NEW entries
+        # are blocked from Fri commodity_halt_hour_utc until Sun
+        # commodity_resume_hour_utc (= 3h before the Monday session open the
+        # user referenced). Open positions keep being managed elsewhere; the
+        # observe() above already kept cross bookkeeping alive. Uses the bar's
+        # CLOSE time so live and backtest gate identically.
+        c = self.cfg
+        if (c.commodity_weekend_block_enabled and has_15m
+                and any(k in symbol.upper() for k in c.commodity_symbol_keywords)):
+            bar_close = df_15m.index[-1] + pd.Timedelta(c.tf_fast)
+            wd, hr = bar_close.weekday(), bar_close.hour
+            halted = ((wd == 4 and hr >= c.commodity_halt_hour_utc) or wd == 5
+                     or (wd == 6 and hr < c.commodity_resume_hour_utc))
+            if halted:
+                return PipelineResult(NONE, entry_score=0.0, blocked_layer="MARKET",
+                                      reason=f"commodity weekend halt ({bar_close.strftime('%a %H:%M')} UTC; "
+                                             f"entries resume Sun {c.commodity_resume_hour_utc:02d}:00 UTC)",
+                                      **base)
+
         # ── Layer 2 — Bias (Trading Direction, Dynamic Combined Bias Score) ───
         bias = self.bias_engine.analyze(df_1h, df_15m, df_5m, regime.label)
         if bias.direction not in (B_LONG, B_SHORT):

@@ -37,8 +37,11 @@ from position_manager import calc_stop_loss, calc_take_profits, Position
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("backtest")
 
-TAKER_FEE = 0.0005
-MAKER_FEE = 0.0002
+# 0.10% per fill (open, close, TP, SL — OKX charges every fill on this
+# account). Kept in sync with Config.fee_rate; the module constants exist so
+# the pure helpers below don't need a cfg reference.
+TAKER_FEE = 0.001
+MAKER_FEE = 0.001
 SLIPPAGE = 0.0003
 
 _TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}

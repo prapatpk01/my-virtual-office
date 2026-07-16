@@ -49,6 +49,7 @@ class Bot:
             api_key=self.cfg.okx_api_key, api_secret=self.cfg.okx_secret,
             passphrase=self.cfg.okx_passphrase, paper=self.cfg.paper,
             leverage=self.cfg.leverage, margin_mode=self.cfg.margin_mode,
+            fee_rate=self.cfg.fee_rate,
         )
         self.data = DataEngine(self.cfg, self.client)
         self.signal_engine = Pipeline(self.cfg)
@@ -271,6 +272,8 @@ class Bot:
                        symbol, r.label, sig.bias.direction if sig.bias else "-", e.layer31_passed_count,
                        self.cfg.hma_fast_length, e.hma_fast, self.cfg.hma_slow_length, e.hma_slow,
                        e.extension_atr, e.reason)
+        elif layer == "MARKET":
+            logger.info("[%s] MARKET CLOSED — %s", symbol, sig.reason)
         else:
             logger.debug("[%s] no trade: %s", symbol, sig.reason)
 

@@ -78,7 +78,9 @@ class RiskManager:
         # intended brake now: 3 consecutive losses -> pause, not 1 bad trade.
         if self.cfg.daily_loss_limit_enabled and pnl_pct <= -self.cfg.daily_loss_limit_pct:
             return False, f"Daily loss limit hit: {pnl_pct*100:.1f}% <= -{self.cfg.daily_loss_limit_pct*100:.0f}%"
-        if pnl_pct >= self.cfg.daily_profit_lock_pct:
+        # Profit lock disabled by default (user: trade continuously) — gate kept
+        # so it can be re-enabled from config without a code change.
+        if self.cfg.daily_profit_lock_enabled and pnl_pct >= self.cfg.daily_profit_lock_pct:
             return False, f"Daily profit lock hit: {pnl_pct*100:.1f}% >= +{self.cfg.daily_profit_lock_pct*100:.0f}%"
         return True, "ok"
 
