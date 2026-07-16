@@ -55,12 +55,16 @@ Layer 3 — Entry TIMING (TF5m), reached only after Layer1 + Layer2 both pass:
   a cross up to fresh_trend_bars ago — which may predate the confirmation.
   Entering this early is riskier, so it must clear the STRICTER
   `layer2_threshold_early` (68) instead of the normal 60. Outside that window
-  (established trend) the cross must be on the current 5m bar and only the
-  normal 60 threshold applies. The cross timestamp is consumed (reset) once
-  it triggers an entry attempt (pass or fail), so a stale cross can't
-  silently satisfy a later setup. The EMA50 distance check is a chase-guard:
-  no entry if price already ran too far from it — wait for a pullback + fresh
-  cross.
+  (established trend) only the normal 60 threshold applies.
+  Cross validity: a cross stays usable for `cross_valid_bars` (default 3) 5m
+  bars — the Layer2 gates (quality/location) often clear a bar or two AFTER
+  the cross fires, and requiring both on the exact same bar silently wasted
+  almost every signal. The price-position and chase-guard checks always run
+  on the CURRENT bar, so a windowed cross can't produce a stale entry. The
+  cross timestamp is consumed (reset) once it triggers an entry attempt
+  (pass or fail), so one cross can't satisfy a later setup twice. The EMA50
+  distance check is a chase-guard: no entry if price already ran too far
+  from it — wait for a pullback + fresh cross.
 
 Exit — a 2-TP + break-even scheme managed in tick_open_position():
   TP1 (partial): when price reaches `tp1_r` (0.75R, halfway to the 1.5R
@@ -146,6 +150,10 @@ class TrendConfirmStrategy(BaseStrategy):
         sl_ema_ref: int = 50,       # SL sits at this EMA (5m)
         chase_ema_ref: int = 50,    # chase-guard distance is measured vs this EMA (5m); decoupled from sl_ema_ref
         fresh_trend_bars: int = 2,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
+        cross_valid_bars: int = 3,  # how many 5m bars a cross stays usable while Layer2 gates settle —
+                                    #   without this, a cross was only good on the exact bar every gate was
+                                    #   already open (quality/location often clear 1-2 bars AFTER the cross,
+                                    #   which silently wasted almost every signal)
         max_dist_atr_mult: float = 1.5,  # max distance from the chase EMA in ATR(5m)
         # Location & structure-room filter (lightweight; avoids late/blocked entries)
         use_location_filter: bool = True,
@@ -220,6 +228,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.sl_ema_ref = sl_ema_ref
         self.chase_ema_ref = chase_ema_ref
         self.fresh_trend_bars = fresh_trend_bars
+        self.cross_valid_bars = cross_valid_bars
         self.max_dist_atr_mult = max_dist_atr_mult
 
         self.use_location_filter = use_location_filter
@@ -323,7 +332,12 @@ class TrendConfirmStrategy(BaseStrategy):
         fb = self.fresh_trend_bars
         trend_age = _bars_ago_5(self._trend_confirmed_since_ts)
         is_early_trend = trend_age is not None and trend_age <= fb
-        lookback = fb if is_early_trend else 0
+        # A cross stays usable for cross_valid_bars while the Layer2 gates
+        # settle (quality/location often clear 1-2 bars AFTER the cross; with
+        # lookback 0 those crosses were silently wasted and the bot barely
+        # traded). In the early-trend window the cross may additionally
+        # predate the 30m confirmation by up to fresh_trend_bars.
+        lookback = max(self.cross_valid_bars, fb) if is_early_trend else self.cross_valid_bars
         ema_cross_up   = ema_up_ago is not None and ema_up_ago <= lookback
         ema_cross_down = ema_down_ago is not None and ema_down_ago <= lookback
         l2_thr = self.layer2_threshold_early if is_early_trend else self.layer2_threshold
@@ -471,7 +485,7 @@ class TrendConfirmStrategy(BaseStrategy):
         if trend == "up":
             if not has_long_candidate:
                 return self._hold(current_price, f"Layer1+2 passed — waiting for EMA{self.ema_fast}↑EMA{self.ema_slow} cross (5m)"
-                                  + (f" (early trend, within {fb} bars)" if is_early_trend else " (fresh cross only)"),
+                                  + (f" (early trend, within {fb} bars)" if is_early_trend else f" (cross valid {self.cross_valid_bars} bars)"),
                                   metadata=dbg("waiting_cross"))
             # cross fired — consume it, then validate the two entry conditions
             self._last_ema_cross_up_ts = None
@@ -504,7 +518,7 @@ class TrendConfirmStrategy(BaseStrategy):
         # trend == "down"
         if not has_short_candidate:
             return self._hold(current_price, f"Layer1+2 passed — waiting for EMA{self.ema_fast}↓EMA{self.ema_slow} cross (5m)"
-                              + (f" (early trend, within {fb} bars)" if is_early_trend else " (fresh cross only)"),
+                              + (f" (early trend, within {fb} bars)" if is_early_trend else f" (cross valid {self.cross_valid_bars} bars)"),
                               metadata=dbg("waiting_cross"))
         self._last_ema_cross_down_ts = None
         if not l3["below_ema_ref"]:
