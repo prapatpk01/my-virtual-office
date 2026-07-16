@@ -12,9 +12,10 @@ backtest.py call, so the two can never diverge in logic.
     layer, no other layer may change direction.
   - Layer 3 (Entry) receives the fixed direction and searches exclusively
     for a trigger on that side — it has no right to open the opposite
-    side even if one appears. Entry is a single TF5M timing trigger
-    (see entry_engine.py for the full detail):
-      EMA5/9 cross (within window) + MACD confirm + price past EMA9
+    side even if one appears. Entry is a 3-layer multi-timeframe cross
+    confluence (see entry_engine.py for the full detail):
+      L3a HMA10/16 30M + L3b EMA5/9 15M + L3c EMA10/20 5M;
+      >= 2 crossing the bias direction within 45 min -> enter
 
 Each layer can only narrow what the next sees. The first block short-
 circuits the rest and records which layer blocked, with its reason, so the
@@ -64,16 +65,17 @@ class Pipeline:
 
     def evaluate(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
                  df_15m: pd.DataFrame, df_5m: Optional[pd.DataFrame] = None,
+                 df_30m: Optional[pd.DataFrame] = None,
                  symbol: str = "") -> PipelineResult:
         has_15m = df_15m is not None and len(df_15m)
         price = float(df_15m["close"].iloc[-1]) if has_15m else 0.0
 
-        # EMA5/9 cross bookkeeping runs on EVERY evaluation, before any layer
-        # can short-circuit — a cross that fires while Bias reads NO TRADE is
-        # still a real cross event, and missing it would leave the entry
-        # cycle state (waiting_for_new_cross) stuck. Idempotent per 5M bar.
+        # Cross bookkeeping (all 3 layers) runs on EVERY evaluation, before any
+        # layer can short-circuit — a cross that fires while Bias reads NO TRADE
+        # is still a real cross event, and dropping it would leave the
+        # confluence state blind to it. Idempotent per (layer, bar).
         if df_5m is not None and len(df_5m):
-            self.entry_engine.observe(df_5m, symbol)
+            self.entry_engine.observe(df_30m, df_15m, df_5m, symbol)
 
         # ── Layer 1 — Regime (classification only) ────────────────────────────
         regime = self.regime_engine.analyze(df_4h, df_1h)
@@ -107,11 +109,11 @@ class Pipeline:
 
         side = LONG if bias.direction == B_LONG else SHORT
 
-        # ── Layer 3 — Entry (TF5M EMA5/9 cross + MACD confirm + price vs EMA9) ──
+        # ── Layer 3 — Entry (3-layer cross confluence: L3a 30M + L3b 15M + L3c 5M) ──
         if df_5m is None or not len(df_5m):
             entry = EntryResult(NONE, False, "missing 5m frame for entry")
         else:
-            entry = self.entry_engine.analyze(df_15m, df_5m, side, symbol)
+            entry = self.entry_engine.analyze(df_30m, df_15m, df_5m, side, symbol)
         common = dict(bias=bias, entry=entry, **base)
 
         if entry.allow_entry:

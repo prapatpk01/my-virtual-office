@@ -140,33 +140,52 @@ class Config:
     #   Layer 3.3  15M, HMA10/HMA16 fresh-cross timing trigger + anti-chase +
     #              one-entry-per-cross state machine. Decides WHEN, once 3.1
     #              and 3.2 clear.
-    # ── Entry (Layer 3) — TF5M EMA5/9 + MACD timing trigger ─────────────────
-    # Regime (4H+1H) and Bias (1H+15M+5M) fix the SIDE; this layer only times
-    # the entry on the last CLOSED 5M bar. EMA5/9 cross is the trigger, MACD
-    # confirms momentum, and price must sit on the right side of EMA9.
-    entry_timeframe: str = "5m"
-    entry_ema_fast: int = 5
-    entry_ema_slow: int = 9
-    entry_ema_cross_lookback: int = 2   # EMA5/9 cross must have fired within the last N closed bars
-    entry_macd_fast: int = 12
-    entry_macd_slow: int = 26
-    entry_macd_signal: int = 9
-    entry_macd_cross_lookback: int = 2  # for the "MACD line>signal OR crossed within N bars" clause
-    # Early-exit grace: HARD exits (EMA cross-back / open past EMA9) are
-    # SUPPRESSED for this many closed 5M bars after entry so the EMAs can
-    # separate from the entry cross. SL/TP stay active throughout. 0 disables.
+    # ── Entry (Layer 3) — 3-layer multi-timeframe cross confluence ──────────
+    # Regime (4H+1H) and Bias (1H+15M+5M) fix the SIDE. Three cross layers,
+    # each on its own timeframe, watch for a cross in the bias direction:
+    #   L3a — HMA10/16 cross on 30M
+    #   L3b — EMA5/9  cross on 15M
+    #   L3c — EMA10/20 cross on 5M   (also the hard-exit layer)
+    # Any single cross ARMS a setup; the entry fires once >= entry_confluence_min
+    # (2) of the three layers have crossed the SAME (bias) direction within
+    # entry_confluence_window_min (45) minutes of each other. If a second layer
+    # doesn't confirm within the window, the first cross ages out -> setup fails,
+    # wait for a new one. One entry per setup (needs a genuinely newer cross to
+    # re-arm after a fill/close).
+    entry_confluence_min: int = 2
+    entry_confluence_window_min: int = 45
+    # L3a — HMA cross, 30M
+    l3a_tf: str = "30m"
+    l3a_hma_fast: int = 10
+    l3a_hma_slow: int = 16
+    # L3b — EMA cross, 15M
+    l3b_tf: str = "15m"
+    l3b_ema_fast: int = 5
+    l3b_ema_slow: int = 9
+    # L3c — EMA cross, 5M (entry confluence member AND the hard-exit gate)
+    l3c_tf: str = "5m"
+    l3c_ema_fast: int = 10
+    l3c_ema_slow: int = 20
+    # Early-exit grace: the L3c hard exit (EMA10/20 cross-back / open past
+    # EMA20 on 5M) is SUPPRESSED for this many closed 5M bars after entry so
+    # the EMAs can separate. SL/TP stay active throughout. 0 disables.
     exit_grace_bars: int = 3
     one_entry_per_cross: bool = True
     require_new_cross_after_exit: bool = True
     entry_on_closed_candle_only: bool = True
     exit_on_closed_candle_price_break: bool = True
 
-    # Retained field names from the retired HMA / 5-category / accel entry
-    # (Layer 3.1/3.2/3.3) — no longer used by the entry logic, kept as inert
-    # defaults so env overrides, the chart HMA overlay, and the dead
-    # context/style/booster modules don't error. Safe to prune later.
+    # Retained field names from earlier entry systems — no longer used by the
+    # entry logic, kept as inert defaults so env overrides, the chart HMA
+    # overlay, and the dead context/style/booster modules don't error.
+    entry_timeframe: str = "5m"
     hma_fast_length: int = 10
     hma_slow_length: int = 16
+    entry_ema_fast: int = 5
+    entry_ema_slow: int = 9
+    entry_macd_fast: int = 12
+    entry_macd_slow: int = 26
+    entry_macd_signal: int = 9
     entry_ema_ref: int = 15
     entry_min_categories: int = 3
     entry_roc_period: int = 9

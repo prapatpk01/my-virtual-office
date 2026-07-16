@@ -1,39 +1,34 @@
 """
-Layer 3 — Entry Engine (TF5M EMA5/9 + MACD timing trigger).
+Layer 3 — Entry Engine (3-layer multi-timeframe cross confluence).
 
 Regime (4H+1H) and Bias (1H+15M+5M) decide the SIDE. This layer receives
-that fixed `direction` and only searches for a 5-minute entry trigger on
-that side — it never picks Long vs Short. Everything below is evaluated on
-the last CLOSED 5M bar (no intrabar cross).
+that fixed `direction` and only searches for a timing trigger on that side.
+Three cross layers, each on its own timeframe, watch for a cross in the
+bias direction:
 
-LONG entry — all must hold:
-  1. direction == LONG            (bullish regime + bias, from upstream)
-  2. EMA5 crossed above EMA9 within the last entry_ema_cross_lookback bars,
-     and EMA5 > EMA9 now
-  3. MACD line > signal now, OR a bullish MACD cross within the last
-     entry_macd_cross_lookback bars
-  4. MACD histogram > 0
-  5. MACD histogram rising: hist[-1] > hist[-2]
-  6. bar OPEN or CLOSE above EMA9
-SHORT mirrors every clause.
+    L3a — HMA(l3a_hma_fast)/HMA(l3a_hma_slow) cross on 30M
+    L3b — EMA(l3b_ema_fast)/EMA(l3b_ema_slow) cross on 15M
+    L3c — EMA(l3c_ema_fast)/EMA(l3c_ema_slow) cross on 5M  (also the exit gate)
 
-One entry per EMA cross; after a full close the engine waits for a
-genuinely new cross before re-entering (cross-cycle guard, per symbol).
+Any single cross ARMS a setup. The entry fires once >= entry_confluence_min
+(2) of the three layers have crossed the SAME (bias) direction within
+entry_confluence_window_min (45) minutes of "now" (the latest closed 5M
+bar). If a second layer never confirms, the first cross ages out of the
+window -> the setup fails and the engine waits for a new one. One entry per
+setup: re-arming needs a genuinely newer cross than the one that last fired.
 
-Early exit (`check_exit`) — HARD exits only, so noise doesn't shake us out:
-    EMA_CROSS_REVERSAL     — EMA5 crosses back against the position
-    PRICE_OPEN_BEYOND_EMA  — bar OPEN on the wrong side of EMA9
-MACD weakening (line cross-back / histogram flip) is a WARNING only and
-never closes the position. Suppressed for exit_grace_bars closed 5M bars
-after entry so the EMAs can separate. Does NOT replace the hard SL/TP — an
-additional, faster path evaluated once per closed 5M bar.
+Early exit (`check_exit`) — the HARD gate uses L3c (5M) only, so noise on
+the slower layers can't shake us out:
+    EMA_CROSS_REVERSAL     — L3c fast EMA crosses back against the position
+    PRICE_OPEN_BEYOND_EMA  — bar OPEN on the wrong side of the L3c slow EMA
+Suppressed for exit_grace_bars closed 5M bars after entry. Does NOT replace
+the hard SL/TP — an additional, faster path evaluated once per closed 5M bar.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 import indicators as ind
@@ -43,10 +38,11 @@ LONG  = "LONG"
 SHORT = "SHORT"
 NONE  = "NONE"
 
-# Exit reason identifiers (kept as stable strings consumed by main.py,
-# report.py and telegram_notifier.py).
 EMA_CROSS_REVERSAL = "EMA_CROSS_REVERSAL"
 PRICE_OPEN_BEYOND_EMA = "PRICE_OPEN_BEYOND_EMA"
+
+# TF label -> minutes, for cross-freshness math across layers.
+_TF_MIN = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
 
 
 @dataclass
@@ -55,11 +51,11 @@ class EntryResult:
     allow_entry: bool
     reason: str = ""
     price: float = 0.0
-    ema_fast: float = 0.0
-    ema_slow: float = 0.0
-    macd_hist: float = 0.0
+    ema_fast: float = 0.0      # L3c fast EMA (for logging/telegram)
+    ema_slow: float = 0.0      # L3c slow EMA
+    macd_hist: float = 0.0     # repurposed: # of layers confirming (for log compat)
     cross_id: object = None
-    entry_score: float = 0.0   # 100 on a valid trigger, 0 otherwise — telegram/log compat
+    entry_score: float = 0.0   # 100 on a valid trigger, 0 otherwise
 
 
 @dataclass
@@ -70,187 +66,159 @@ class ExitCheckResult:
 
 
 @dataclass
-class _CrossState:
-    """One-entry-per-EMA-cross cycle, per symbol."""
-    cross_direction: Optional[str] = None    # LONG | SHORT | None — direction of the LAST EMA5/9 cross
-    cross_id: object = None                  # closed-bar timestamp of that cross
-    cross_used: bool = False                 # an entry was already opened from this cross
-    waiting_for_new_cross: bool = False       # set True on any full close; cleared on the next fresh cross
+class _LayerCross:
+    """Most recent cross seen on ONE layer."""
+    direction: Optional[str] = None      # LONG | SHORT | None
+    close_ts: Optional[pd.Timestamp] = None   # close time of the bar the cross fired on
+    bar_ts: Optional[pd.Timestamp] = None     # open ts of that bar (dedupe guard)
+
+
+@dataclass
+class _SetupState:
+    """Per-symbol confluence state."""
+    layers: dict = field(default_factory=lambda: {"L3a": _LayerCross(),
+                                                   "L3b": _LayerCross(),
+                                                   "L3c": _LayerCross()})
+    last_entry_ts: Optional[pd.Timestamp] = None   # newest cross ts consumed by the last entry
 
 
 class EntryEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._state: dict[str, _CrossState] = {}
+        self._state: dict[str, _SetupState] = {}
 
     # ── per-symbol state ──────────────────────────────────────────────────────
-    def _get_state(self, symbol: str) -> _CrossState:
-        return self._state.setdefault(symbol, _CrossState())
+    def _get_state(self, symbol: str) -> _SetupState:
+        return self._state.setdefault(symbol, _SetupState())
 
     def on_position_closed(self, symbol: str) -> None:
-        """Call whenever a position FULLY closes (TP2/SL/BE/early-exit) — NOT
-        on a TP1 partial. Blocks re-entry until a genuinely new EMA cross."""
-        st = self._get_state(symbol)
-        st.waiting_for_new_cross = True
-        st.cross_used = True
+        """Call whenever a position FULLY closes. last_entry_ts already blocks
+        re-entry until a cross NEWER than it appears, so nothing else is
+        needed — kept for API parity with callers."""
+        # no-op: last_entry_ts is the re-arm guard.
+        self._get_state(symbol)
 
     def reset_symbol(self, symbol: str) -> None:
-        """Drop all cross-cycle memory for a symbol (e.g. manual flat)."""
         self._state.pop(symbol, None)
 
-    # ── indicators (shared by analyze + check_exit) ──────────────────────────
-    def _emas(self, df: pd.DataFrame):
+    # ── indicators ────────────────────────────────────────────────────────────
+    def _l3c_emas(self, df_5m: pd.DataFrame):
         c = self.cfg
-        close = df["close"]
-        return ind.ema(close, c.entry_ema_fast), ind.ema(close, c.entry_ema_slow)
-
-    def _macd(self, df: pd.DataFrame):
-        c = self.cfg
-        return ind.macd(df["close"], c.entry_macd_fast, c.entry_macd_slow, c.entry_macd_signal)
+        close = df_5m["close"]
+        return ind.ema(close, c.l3c_ema_fast), ind.ema(close, c.l3c_ema_slow)
 
     @staticmethod
-    def _crossed(fast: pd.Series, slow: pd.Series, lookback: int, bullish: bool) -> bool:
-        """True if `fast` crossed `slow` in the given direction on any of the
-        last `lookback` closed-bar transitions (the most recent transition is
-        k=1: prev bar -> current bar)."""
-        n = min(lookback, len(fast) - 1)
-        for k in range(1, n + 1):
-            pf, ps = float(fast.iloc[-k - 1]), float(slow.iloc[-k - 1])
-            cf, cs = float(fast.iloc[-k]), float(slow.iloc[-k])
-            if bullish and pf <= ps and cf > cs:
-                return True
-            if (not bullish) and pf >= ps and cf < cs:
-                return True
-        return False
+    def _tf_min(tf: str) -> int:
+        return _TF_MIN.get(tf, 5)
 
-    def _min_len(self) -> int:
-        c = self.cfg
-        return max(c.entry_macd_slow + c.entry_macd_signal, c.entry_ema_slow) + 5
+    def _detect_cross(self, df: pd.DataFrame, fast: pd.Series, slow: pd.Series,
+                      tf: str) -> Optional[tuple]:
+        """Return (direction, close_ts, bar_ts) if the LAST closed bar of `df`
+        is a fresh fast/slow cross, else None."""
+        if df is None or len(df) < 2:
+            return None
+        cur_f, cur_s = float(fast.iloc[-1]), float(slow.iloc[-1])
+        prev_f, prev_s = float(fast.iloc[-2]), float(slow.iloc[-2])
+        bar_ts = df.index[-1]
+        close_ts = bar_ts + pd.Timedelta(minutes=self._tf_min(tf))
+        if prev_f <= prev_s and cur_f > cur_s:
+            return LONG, close_ts, bar_ts
+        if prev_f >= prev_s and cur_f < cur_s:
+            return SHORT, close_ts, bar_ts
+        return None
 
     # ── cross bookkeeping ─────────────────────────────────────────────────────
-    def observe(self, df_5m: pd.DataFrame, symbol: str) -> None:
-        """Record any fresh EMA5/9 cross on the last closed 5M bar into the
-        per-symbol cycle state. Called once per closed bar regardless of what
-        Regime/Bias decide, so a cross that fires while Bias reads NO TRADE
-        still clears waiting_for_new_cross. Idempotent per bar (keyed on the
-        bar timestamp) — live re-evaluates every ~30s inside the same bar."""
-        if df_5m is None or len(df_5m) < self._min_len():
-            return
+    def observe(self, df_30m: pd.DataFrame, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
+                symbol: str) -> None:
+        """Record any fresh cross on each layer's last closed bar. Called once
+        per evaluation, regardless of Regime/Bias. Idempotent per (layer, bar)."""
+        c = self.cfg
         state = self._get_state(symbol)
-        bar_ts = df_5m.index[-1]
-        if state.cross_id == bar_ts:
-            return   # this bar's cross already recorded — never re-process
-        ema_f, ema_s = self._emas(df_5m)
-        cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
-        prev_f, prev_s = float(ema_f.iloc[-2]), float(ema_s.iloc[-2])
-        long_cross = prev_f <= prev_s and cur_f > cur_s
-        short_cross = prev_f >= prev_s and cur_f < cur_s
-        if not (long_cross or short_cross):
-            return
-        state.cross_direction = LONG if long_cross else SHORT
-        state.cross_id = bar_ts
-        state.cross_used = False
-        state.waiting_for_new_cross = False
+        specs = (
+            ("L3a", df_30m, c.l3a_tf, ind.hma, c.l3a_hma_fast, c.l3a_hma_slow),
+            ("L3b", df_15m, c.l3b_tf, ind.ema, c.l3b_ema_fast, c.l3b_ema_slow),
+            ("L3c", df_5m,  c.l3c_tf, ind.ema, c.l3c_ema_fast, c.l3c_ema_slow),
+        )
+        for name, df, tf, fn, pf, ps in specs:
+            if df is None or len(df) < max(ps * 2, 5):
+                continue
+            lc = state.layers[name]
+            bar_ts = df.index[-1]
+            if lc.bar_ts == bar_ts:
+                continue   # this bar already processed for this layer
+            fast = fn(df["close"], pf)
+            slow = fn(df["close"], ps)
+            hit = self._detect_cross(df, fast, slow, tf)
+            # advance the per-layer "seen" marker even when there's no cross, so
+            # we don't re-scan the same bar every tick.
+            if hit is None:
+                lc.bar_ts = bar_ts
+                continue
+            lc.direction, lc.close_ts, lc.bar_ts = hit
 
     # ── combined entry decision ──────────────────────────────────────────────
-    def analyze(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
+    def analyze(self, df_30m: pd.DataFrame, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
                direction: str, symbol: str) -> EntryResult:
         c = self.cfg
         if direction not in (LONG, SHORT):
             return EntryResult(NONE, False, "no direction from Bias layer — nothing to time")
 
-        # Cross bookkeeping first — a structural fact, recorded regardless of
-        # what the trigger decides on this bar (idempotent per bar).
-        self.observe(df_5m, symbol)
+        self.observe(df_30m, df_15m, df_5m, symbol)
 
-        if df_5m is None or len(df_5m) < self._min_len():
+        if df_5m is None or len(df_5m) < max(c.l3c_ema_slow * 2, 20):
             return EntryResult(NONE, False, "insufficient 5m history")
 
-        is_long = direction == LONG
-        ema_f, ema_s = self._emas(df_5m)
-        line, sig, hist = self._macd(df_5m)
-        cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
-        h_now = float(hist.iloc[-1]) if not np.isnan(hist.iloc[-1]) else 0.0
-        h_prev = float(hist.iloc[-2]) if not np.isnan(hist.iloc[-2]) else 0.0
-        l_now, s_now = float(line.iloc[-1]), float(sig.iloc[-1])
-        open_px = float(df_5m["open"].iloc[-1])
-        close_px = float(df_5m["close"].iloc[-1])
         state = self._get_state(symbol)
+        now = df_5m.index[-1] + pd.Timedelta(minutes=self._tf_min(c.l3c_tf))
+        window = pd.Timedelta(minutes=c.entry_confluence_window_min)
+
+        ema_f, ema_s = self._l3c_emas(df_5m)
+        cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
+        close_px = float(df_5m["close"].iloc[-1])
+
+        # layers that crossed in `direction` and are still within the 45-min window
+        active = []
+        for name, lc in state.layers.items():
+            if (lc.direction == direction and lc.close_ts is not None
+                    and (now - lc.close_ts) <= window and (now - lc.close_ts) >= pd.Timedelta(0)):
+                active.append((name, lc.close_ts))
+        n_active = len(active)
         base = dict(price=close_px, ema_fast=cur_f, ema_slow=cur_s,
-                    macd_hist=h_now, cross_id=state.cross_id)
+                    macd_hist=float(n_active), cross_id=state.last_entry_ts)
 
-        # ── condition 2 — EMA5 crossed the right way within the window, still aligned
-        cross_pending = (state.cross_direction == direction and not state.cross_used
-                        and not state.waiting_for_new_cross)
-        bars_since = (int((df_5m.index > state.cross_id).sum())
-                     if state.cross_id is not None else None)
-        in_window = bars_since is not None and bars_since <= c.entry_ema_cross_lookback
-        aligned = (cur_f > cur_s) if is_long else (cur_f < cur_s)
-
-        if not cross_pending:
-            reason = (f"L3: {direction} blocked — waiting for a new EMA cross after prior exit"
-                      if state.waiting_for_new_cross else
-                      f"L3: {direction} blocked — no pending EMA{c.entry_ema_fast}x{c.entry_ema_slow} cross")
-            return EntryResult(NONE, False, reason, **base)
-        if not in_window:
+        if n_active < c.entry_confluence_min:
+            armed = ",".join(n for n, _ in active) if active else "none"
             return EntryResult(NONE, False,
-                               f"L3: {direction} blocked — EMA cross was {bars_since} bar(s) ago "
-                               f"(window {c.entry_ema_cross_lookback}) — wait for a fresh cross", **base)
-        if not aligned:
-            return EntryResult(NONE, False, f"L3: {direction} blocked — EMA{c.entry_ema_fast}/"
-                               f"{c.entry_ema_slow} alignment not held", **base)
+                               f"L3: {direction} setup {n_active}/{c.entry_confluence_min} "
+                               f"layers in {c.entry_confluence_window_min}m window (armed: {armed})", **base)
 
-        # ── condition 3 — MACD line above signal, or crossed within window
-        macd_side = (l_now > s_now) if is_long else (l_now < s_now)
-        macd_cross = self._crossed(line, sig, c.entry_macd_cross_lookback, bullish=is_long)
-        if not (macd_side or macd_cross):
+        newest_ts = max(ts for _, ts in active)
+        # one entry per setup — require a cross newer than the last one consumed
+        if state.last_entry_ts is not None and newest_ts <= state.last_entry_ts:
             return EntryResult(NONE, False,
-                               f"L3: {direction} blocked — MACD line not {'>' if is_long else '<'} signal "
-                               f"and no cross within {c.entry_macd_cross_lookback} bars", **base)
+                               f"L3: {direction} confluence {n_active}/3 but no new cross since last "
+                               f"entry — waiting for a fresh setup", **base)
 
-        # ── condition 4 — histogram on the right side of zero
-        hist_side = (h_now > 0) if is_long else (h_now < 0)
-        if not hist_side:
-            return EntryResult(NONE, False,
-                               f"L3: {direction} blocked — MACD histogram {h_now:+.6f} wrong side of 0", **base)
-
-        # ── condition 5 — histogram building in the trade direction
-        hist_building = (h_now > h_prev) if is_long else (h_now < h_prev)
-        if not hist_building:
-            return EntryResult(NONE, False,
-                               f"L3: {direction} blocked — MACD histogram not "
-                               f"{'rising' if is_long else 'falling'} ({h_prev:+.6f}->{h_now:+.6f})", **base)
-
-        # ── condition 6 — price (open OR close) on the correct side of EMA9
-        price_ok = ((open_px > cur_s or close_px > cur_s) if is_long
-                    else (open_px < cur_s or close_px < cur_s))
-        if not price_ok:
-            return EntryResult(NONE, False,
-                               f"L3: {direction} blocked — neither open nor close past EMA{c.entry_ema_slow} "
-                               f"(o={open_px:.6f} c={close_px:.6f} vs {cur_s:.6f})", **base)
-
-        # ── all conditions clear — fire (one entry per cross) ─────────────────
-        state.cross_used = True
+        state.last_entry_ts = newest_ts
+        names = "+".join(sorted(n for n, _ in active))
         return EntryResult(direction, True,
-                           f"ENTRY {direction}  EMA{c.entry_ema_fast}x{c.entry_ema_slow} cross "
-                           f"{bars_since}b ago  MACD hist={h_now:+.5f} rising  CrossID={state.cross_id}",
-                           entry_score=100.0, **base)
+                           f"ENTRY {direction}  confluence {n_active}/3 ({names}) within "
+                           f"{c.entry_confluence_window_min}m", entry_score=100.0, **base)
 
-    # ── Early exit (EMA hard-exit; MACD is warning-only) ─────────────────────
+    # ── Early exit — L3c (5M EMA10/20) hard gate ─────────────────────────────
     def check_exit(self, df_5m: pd.DataFrame, position_side: str,
                    bars_since_entry: Optional[int] = None) -> ExitCheckResult:
-        """position_side: 'long' | 'short' (Position.side casing). While
-        bars_since_entry < exit_grace_bars the HARD exit is suppressed so the
-        EMAs can separate from the entry cross. SL/TP handled elsewhere are
-        unaffected. Only EMA cross-back and an OPEN on the wrong side of EMA9
-        close a position — MACD weakening is deliberately NOT an exit."""
+        """position_side: 'long' | 'short'. While bars_since_entry <
+        exit_grace_bars the hard exit is suppressed so the L3c EMAs can
+        separate from entry. Only an L3c EMA cross-back or an OPEN on the wrong
+        side of the L3c slow EMA closes a position — nothing on L3a/L3b."""
         c = self.cfg
         if bars_since_entry is not None and bars_since_entry < c.exit_grace_bars:
             return ExitCheckResult(False)
-        if df_5m is None or len(df_5m) < self._min_len():
+        if df_5m is None or len(df_5m) < max(c.l3c_ema_slow * 2, 20):
             return ExitCheckResult(False)
 
-        ema_f, ema_s = self._emas(df_5m)
+        ema_f, ema_s = self._l3c_emas(df_5m)
         cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
         prev_f, prev_s = float(ema_f.iloc[-2]), float(ema_s.iloc[-2])
         open_px = float(df_5m["open"].iloc[-1])
@@ -265,8 +233,8 @@ class EntryEngine:
 
         if cross_back:
             return ExitCheckResult(True, EMA_CROSS_REVERSAL,
-                                   f"EMA{c.entry_ema_fast} crossed back against {position_side}")
+                                   f"L3c EMA{c.l3c_ema_fast} crossed back against {position_side}")
         if open_wrong:
             return ExitCheckResult(True, PRICE_OPEN_BEYOND_EMA,
-                                   f"open={open_px:.6f} EMA{c.entry_ema_slow}={cur_s:.6f}")
+                                   f"open={open_px:.6f} L3c EMA{c.l3c_ema_slow}={cur_s:.6f}")
         return ExitCheckResult(False)

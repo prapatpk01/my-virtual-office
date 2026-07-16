@@ -152,13 +152,14 @@ class Bot:
 
         df_1h = frames[self.cfg.tf_bias]
         df_4h = frames[self.cfg.tf_regime]
+        df_30m = frames[self.cfg.tf_entry]
         df_15m = frames[self.cfg.tf_fast]
         df_5m = frames[self.cfg.tf_micro]
 
         # Full pipeline computed once per symbol per tick and cached — reused by
         # the entry check below AND by the 5-minute status log, so the exit
         # branch and the entry branch never re-run the layers separately.
-        sig = self.signal_engine.evaluate(df_1h, df_4h, df_15m, df_5m, symbol=symbol)
+        sig = self.signal_engine.evaluate(df_1h, df_4h, df_15m, df_5m, df_30m=df_30m, symbol=symbol)
         self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):
@@ -268,11 +269,11 @@ class Bot:
                        b.score_1h, b.score_15m, b.score_5m, b.reason)
         elif layer == "ENTRY" and sig.entry is not None:
             e = sig.entry
-            logger.info("[%s] regime=%s dir=%s(bias)  NO ENTRY  EMA%d=%.6f EMA%d=%.6f "
-                       "MACDhist=%+.6f — %s",
+            logger.info("[%s] regime=%s dir=%s(bias)  NO ENTRY  L3c EMA%d=%.6f EMA%d=%.6f "
+                       "confluence=%.0f/%d — %s",
                        symbol, r.label, sig.bias.direction if sig.bias else "-",
-                       self.cfg.entry_ema_fast, e.ema_fast, self.cfg.entry_ema_slow, e.ema_slow,
-                       e.macd_hist, e.reason)
+                       self.cfg.l3c_ema_fast, e.ema_fast, self.cfg.l3c_ema_slow, e.ema_slow,
+                       e.macd_hist, self.cfg.entry_confluence_min, e.reason)
         elif layer == "MARKET":
             logger.info("[%s] MARKET CLOSED — %s", symbol, sig.reason)
         else:
@@ -455,8 +456,8 @@ class Bot:
                     bias_str = f"`{b.direction}` 1H`{b.score_1h:.0f}` 15M`{b.score_15m:.0f}` 5M`{b.score_5m:.0f}`"
                 else:
                     bias_str = "`—`"
-                entry_str = (f"`EMA5={sig.entry.ema_fast:.4f} EMA9={sig.entry.ema_slow:.4f} "
-                             f"hist={sig.entry.macd_hist:+.4f}`"
+                entry_str = (f"`confluence {sig.entry.macd_hist:.0f}/{self.cfg.entry_confluence_min} "
+                             f"L3c {sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
                             if sig.entry is not None else "`-`")
                 lines.append(
                     f"`{sym}` {pos_label}\n"
@@ -519,8 +520,8 @@ class Bot:
                 bias_label = f"{sig.bias.direction}(1H={sig.bias.score_1h:.0f},15M={sig.bias.score_15m:.0f},5M={sig.bias.score_5m:.0f})"
             else:
                 bias_label = "—"
-            entry_label = (f"EMA5={sig.entry.ema_fast:.4f}/EMA9={sig.entry.ema_slow:.4f} "
-                          f"hist={sig.entry.macd_hist:+.4f}"
+            entry_label = (f"confl={sig.entry.macd_hist:.0f}/{self.cfg.entry_confluence_min} "
+                          f"L3c={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
                           if sig.entry is not None else "-")
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(

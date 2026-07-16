@@ -146,7 +146,7 @@ def _closed_htf_cutoff(close_ms_sorted: np.ndarray, as_of_close_ms: int) -> int:
 
 
 def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.DataFrame,
-                    df_4h: pd.DataFrame, df_5m: pd.DataFrame,
+                    df_4h: pd.DataFrame, df_5m: pd.DataFrame, df_30m: pd.DataFrame,
                     initial_balance: float) -> list[BTTrade]:
     engine = SignalEngine(cfg)
     risk = RiskManager(cfg)
@@ -166,6 +166,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
     # Precompute HTF close-time arrays ONCE (O(log n) lookup per bar via
     # searchsorted, instead of an O(n) boolean scan every bar).
     close_ms_15m = _epoch_ms(df_15m.index) + _TF_MS["15m"]
+    close_ms_30m = _epoch_ms(df_30m.index) + _TF_MS["30m"]
     close_ms_1h = _epoch_ms(df_1h.index) + _TF_MS["1h"]
     close_ms_4h = _epoch_ms(df_4h.index) + _TF_MS["4h"]
     open_ms_5m = _epoch_ms(df_5m.index)
@@ -176,6 +177,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
     # converge well within a few hundred bars) and guarantees backtest can't
     # silently diverge from live by seeing history live never had access to.
     w15 = cfg.fetch_limit_fast
+    w30 = cfg.fetch_limit_entry
     w1h = cfg.fetch_limit_bias
     w4h = cfg.fetch_limit_regime
     w5 = cfg.fetch_limit_micro
@@ -187,6 +189,8 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
 
         cutoff_15m = _closed_htf_cutoff(close_ms_15m, bar_close_ms)
         hist_15m = df_15m.iloc[max(0, cutoff_15m - w15): cutoff_15m]
+        cutoff_30m = _closed_htf_cutoff(close_ms_30m, bar_close_ms)
+        hist_30m = df_30m.iloc[max(0, cutoff_30m - w30): cutoff_30m]
         cutoff_1h = _closed_htf_cutoff(close_ms_1h, bar_close_ms)
         hist_1h = df_1h.iloc[max(0, cutoff_1h - w1h): cutoff_1h]
         cutoff_4h = _closed_htf_cutoff(close_ms_4h, bar_close_ms)
@@ -198,7 +202,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
             # evaluate() runs every tick regardless of position state, so the
             # backtest must observe 5m crosses here too or the two would
             # diverge on which cross events the cycle state has seen.
-            engine.entry_engine.observe(hist_5m, symbol)
+            engine.entry_engine.observe(hist_30m, hist_15m, hist_5m, symbol)
             is_long = pos.direction == LONG
             hi, lo = float(bar["high"]), float(bar["low"])
 
@@ -288,7 +292,7 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
            or len(hist_5m) < cfg.min_bars:
             continue
 
-        sig = engine.evaluate(hist_1h, hist_4h, hist_15m, hist_5m, symbol=symbol)
+        sig = engine.evaluate(hist_1h, hist_4h, hist_15m, hist_5m, df_30m=hist_30m, symbol=symbol)
         if sig.direction not in (LONG, SHORT):
             continue
 
@@ -338,16 +342,17 @@ async def run_backtest(symbols: list[str], start_ms: int, end_ms: int,
         for symbol in symbols:
             logger.info("Fetching history for %s...", symbol)
             df_15m = await fetch_history(client, symbol, cfg.tf_fast, start_ms, end_ms)
+            df_30m = await fetch_history(client, symbol, cfg.tf_entry, start_ms, end_ms)
             df_1h = await fetch_history(client, symbol, cfg.tf_bias, start_ms, end_ms)
             df_4h = await fetch_history(client, symbol, cfg.tf_regime, start_ms, end_ms)
             df_5m = await fetch_history(client, symbol, cfg.tf_micro, start_ms, end_ms)
-            logger.info("  %s: 5m=%d 15m=%d 1h=%d 4h=%d bars",
-                       symbol, len(df_5m), len(df_15m), len(df_1h), len(df_4h))
+            logger.info("  %s: 5m=%d 15m=%d 30m=%d 1h=%d 4h=%d bars",
+                       symbol, len(df_5m), len(df_15m), len(df_30m), len(df_1h), len(df_4h))
             if len(df_15m) < cfg.min_bars or len(df_1h) < cfg.min_bars or len(df_4h) < cfg.min_bars \
-               or len(df_5m) < cfg.min_bars:
+               or len(df_5m) < cfg.min_bars or len(df_30m) < cfg.min_bars:
                 logger.warning("  %s: insufficient history — skipped", symbol)
                 continue
-            trades = simulate_symbol(cfg, symbol, df_15m, df_1h, df_4h, df_5m, initial_balance)
+            trades = simulate_symbol(cfg, symbol, df_15m, df_1h, df_4h, df_5m, df_30m, initial_balance)
             logger.info("  %s: %d trades  PnL=%+.2f", symbol, len(trades),
                        sum(t.pnl_usd for t in trades))
             all_trades.extend(trades)

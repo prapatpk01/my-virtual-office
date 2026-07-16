@@ -63,8 +63,9 @@ class DataEngine:
         now_ms = int(time.time() * 1000)
         out = {}
         for tf, limit_attr in (
-            (c.tf_micro, "fetch_limit_micro"),      # 5M  — Bias tertiary + Entry Layer 3.2
-            (c.tf_fast, "fetch_limit_fast"),        # 15M — Bias secondary + Entry Layers 3.1/3.2/3.3
+            (c.tf_micro, "fetch_limit_micro"),      # 5M  — Bias tertiary + Entry L3c (EMA10/20) + exit
+            (c.tf_fast, "fetch_limit_fast"),        # 15M — Bias secondary + Entry L3b (EMA5/9)
+            (c.tf_entry, "fetch_limit_entry"),      # 30M — Entry L3a (HMA10/16)
             (c.tf_bias, "fetch_limit_bias"),        # 1H  — Regime mid + Bias primary
             (c.tf_regime, "fetch_limit_regime"),    # 4H  — Regime macro
         ):
