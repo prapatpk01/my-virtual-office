@@ -177,6 +177,13 @@ class TrendConfirmStrategy(BaseStrategy):
         sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
         sideways_min_signals: int = 2,              # how many of the 4 signals must fire to veto
         # Exit (5m): EMA5/9 cross-back OR a 5m close past EMA9 closes the runner
+        use_close_past_exit: bool = True,   # enable the "close past EMA9" exit at all (cross-back always on)
+        exit_close_confirm_bars: int = 1,   # N consecutive 5m closes past EMA9 required for that exit
+        signal_exit_requires_tp1: bool = True,   # no signal exits before TP1 — only the hard SL (EMA50) / TP
+                                                 #   bounds manage the trade until then. On 5m the single-close
+                                                 #   EMA9 exits killed 75% of trades at ~-0.3R before TP1; arming
+                                                 #   them only on the runner nearly doubled WR (25->62% BTC,
+                                                 #   41->60% SOL) and cut losses ~2-3x in backtest
         # Partial take-profit + break-even (2-TP scheme)
         use_partial_tp: bool = True,        # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
         tp1_r: float = 0.75,                # TP1 at 0.75R (halfway to the 1.5R final TP)
@@ -246,6 +253,10 @@ class TrendConfirmStrategy(BaseStrategy):
         self.sideways_adx_max = sideways_adx_max
         self.sideways_range_atr = sideways_range_atr
         self.sideways_min_signals = sideways_min_signals
+
+        self.use_close_past_exit = use_close_past_exit
+        self.exit_close_confirm_bars = exit_close_confirm_bars
+        self.signal_exit_requires_tp1 = signal_exit_requires_tp1
 
         self.use_partial_tp = use_partial_tp
         self.tp1_r = tp1_r
@@ -595,20 +606,49 @@ class TrendConfirmStrategy(BaseStrategy):
             return PositionUpdate(action="hold", reason="Indicators warming up (5m)")
         self._last_exit_bar_ts = bar_ts
 
+        # Optionally hold all signal exits until TP1 has banked — before that,
+        # only the hard SL (EMA50) / TP bounds manage the trade. Cuts the
+        # noise exits that killed trades at ~-0.3R before they could develop.
+        if self.signal_exit_requires_tp1 and not self._tp1_done:
+            return PositionUpdate(action="hold",
+                                  reason=f"Holding {self._open_position.upper()} — signal exits armed after TP1")
+
+        cb = self.exit_close_confirm_bars
         if self._open_position == "long":
-            if l3["ema_cross_down"] or l3["close_below_ema_slow"]:
+            close_exit = (self.use_close_past_exit
+                          and self._closes_past_ema_slow(candles, "long", cb))
+            if l3["ema_cross_down"] or close_exit:
                 reason = (f"EMA{self.ema_fast} crossed below EMA{self.ema_slow}" if l3["ema_cross_down"]
-                          else f"close below EMA{self.ema_slow}")
+                          else f"{cb} close(s) below EMA{self.ema_slow}")
                 self._reset_position_state()
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} (5m)")
         if self._open_position == "short":
-            if l3["ema_cross_up"] or l3["close_above_ema_slow"]:
+            close_exit = (self.use_close_past_exit
+                          and self._closes_past_ema_slow(candles, "short", cb))
+            if l3["ema_cross_up"] or close_exit:
                 reason = (f"EMA{self.ema_fast} crossed above EMA{self.ema_slow}" if l3["ema_cross_up"]
-                          else f"close above EMA{self.ema_slow}")
+                          else f"{cb} close(s) above EMA{self.ema_slow}")
                 self._reset_position_state()
                 return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} (5m)")
 
         return PositionUpdate(action="hold", reason=f"Holding {self._open_position.upper()}")
+
+    def _closes_past_ema_slow(self, candles: list, side: str, n: int) -> bool:
+        """True if the last `n` 5m bars ALL closed on the wrong side of EMA9
+        for the position (long: below, short: above). n=1 reproduces the
+        original single-close exit."""
+        closes = [c.close for c in candles]
+        ema_s = self.ema(closes, self.ema_slow)
+        if len(closes) < n:
+            return False
+        for k in range(1, n + 1):
+            if np.isnan(ema_s[-k]):
+                return False
+            if side == "long" and not (closes[-k] < ema_s[-k]):
+                return False
+            if side == "short" and not (closes[-k] > ema_s[-k]):
+                return False
+        return True
 
     def _reset_position_state(self) -> None:
         self._open_position = None
