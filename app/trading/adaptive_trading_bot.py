@@ -2707,6 +2707,9 @@ class TradingBot:
             # final close — direct evidence for fake-vs-real diagnosis
             # (e.g. "no targets hit -> SL" vs "T1,T2 hit then reversed").
             "targets_hit":         list(t.get("targets_hit", [])),
+            # [STATS] closed-trade wall-clock time — /stats "last N trades"
+            # sorts/labels by this (ISO strings sort correctly as text).
+            "closed_at":           (self._bar_now or datetime.datetime.now(datetime.timezone.utc)).isoformat(),
             # [LEVEL 0/2/3] why this loss likely happened — populated below
             "loss_tags":           [],
         }
@@ -3235,6 +3238,12 @@ class TradingBot:
             # [MTF-CONFLUENCE] in-flight setup state (bar-window based, so a
             # restart mid-collection would otherwise silently drop it)
             "mtf_engine":           self.mtf_engine.to_dict(),
+            # [STATS] Closed-trade history — was never persisted, so every
+            # restart (redeploy, crash, manual restart) silently wiped
+            # /stats back to 0 trades even though trades had actually
+            # closed. Capped at the most recent 200 to keep the state file
+            # bounded; /stats only ever needs recent history anyway.
+            "trade_journal":        self.trade_journal[-200:],
             "saved_at":             datetime.datetime.now().isoformat(),
         }
         tmp_path = f"{path}.tmp"
@@ -3322,6 +3331,8 @@ class TradingBot:
         self._pending_target_alerts = data.get("pending_target_alerts", [])
 
         self.mtf_engine.load_dict(data.get("mtf_engine"))
+
+        self.trade_journal = data.get("trade_journal", [])
 
         self._log_event(
             f"State loaded | state={self.state} pos={self.position_open} "

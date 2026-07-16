@@ -1,5 +1,6 @@
 """Telegram notifier and command handler for the trading bot."""
 import asyncio
+import datetime
 import logging
 import time
 from typing import Callable, Optional
@@ -10,6 +11,27 @@ logger = logging.getLogger("telegram_notifier")
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 _BOT_START_TIME = time.time()
+
+
+def _time_ago(iso_str: Optional[str]) -> str:
+    """'2h ago' / '35m ago' style label for a trade_journal 'closed_at'
+    ISO timestamp. Falls back to '?' for older entries saved before that
+    field existed (state files from before this feature)."""
+    if not iso_str:
+        return "?"
+    try:
+        closed = datetime.datetime.fromisoformat(iso_str)
+        if closed.tzinfo is None:
+            closed = closed.replace(tzinfo=datetime.timezone.utc)
+        delta = datetime.datetime.now(datetime.timezone.utc) - closed
+        secs = max(delta.total_seconds(), 0)
+        if secs < 3600:
+            return f"{int(secs // 60)}m ago"
+        if secs < 86400:
+            return f"{secs / 3600:.1f}h ago"
+        return f"{secs / 86400:.1f}d ago"
+    except (ValueError, TypeError):
+        return "?"
 
 
 class TelegramNotifier:
@@ -206,6 +228,8 @@ class TelegramNotifier:
         total_losses = 0
         balance      = 0.0
         open_lines   = []
+        all_trades: list = []   # every closed trade across every symbol, for
+                                 # the TP1/TP2 breakdown + "last 5" section below
 
         for sym, (bot, _) in bots.items():
             try:
@@ -240,6 +264,9 @@ class TelegramNotifier:
                         f"{sym} {direction} entry={entry:,.4f} "
                         f"SL={sl:,.4f} TP1={tp1:,.4f} TP2={tp2:,.4f}"
                     )
+
+                for tr in getattr(bot, "trade_journal", []) or []:
+                    all_trades.append({**tr, "_symbol": sym})
             except Exception as e:
                 lines.append(f"{sym}: error ({e})")
 
@@ -252,6 +279,33 @@ class TelegramNotifier:
             f"\n📈 Total: {total_trades} trades | "
             f"{total_wins}W/{total_losses}L | Net PnL: ${total_pnl:+,.2f}"
         )
+
+        # [TP1/TP2 BREAKDOWN] which ladder level each closed trade actually
+        # reached — "SL only" (never got a partial banked) vs T1-then-
+        # reversed vs the full T1->T2 run, across every symbol combined.
+        if all_trades:
+            tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
+            tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
+            sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
+            n_all = len(all_trades)
+            lines.append(
+                f"\n🎯 TP1 hit: {tp1_n}/{n_all} ({tp1_n/n_all*100:.0f}%) | "
+                f"TP2 hit: {tp2_n}/{n_all} ({tp2_n/n_all*100:.0f}%) | "
+                f"SL only: {sl_only_n}/{n_all} ({sl_only_n/n_all*100:.0f}%)"
+            )
+
+            # [LAST 5] most recent closed trades across all symbols, newest
+            # first — closed_at is an ISO string so it sorts correctly as text.
+            recent = sorted(all_trades, key=lambda tr: tr.get("closed_at") or "", reverse=True)[:5]
+            lines.append("\n📋 Last 5 trades:")
+            for i, tr in enumerate(recent, 1):
+                result_emoji = "✅" if tr.get("win_loss") == "WIN" else "❌"
+                targets = ",".join(tr.get("targets_hit") or []) or "SL"
+                lines.append(
+                    f"{i}. {result_emoji} {tr['_symbol']} {tr.get('direction', '?')} "
+                    f"{tr.get('realized_r', 0):+.2f}R (${tr.get('pnl', 0):+.2f}) "
+                    f"[{targets}] — {_time_ago(tr.get('closed_at'))}"
+                )
         await self._send("\n".join(lines))
 
     async def _cmd_log(self, n: int = 15):
