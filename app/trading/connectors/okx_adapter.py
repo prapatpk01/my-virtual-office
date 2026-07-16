@@ -476,10 +476,15 @@ class OKXAdapter(BaseConnector):
         logger.info("[OKX] OPEN %s %s qty=%.4f SL=%s TP2=%s → order_id=%s",
                     pos_side.upper(), sym, amount, sl, tp2, order_id)
 
-        filled, fill_price = self._await_fill_sync(sym, order_id)
+        filled, fill_price, fill_fields = self._await_fill_sync(sym, order_id)
         raw["_filled"]       = filled
         raw["_fill_price"]   = fill_price
         raw["_filled_coins"] = filled * ct_val   # actual size in coins for bot accounting
+        # [OKX FILL DATA] entry-side avgPx/fee — stashed so the bot can later
+        # allocate this fee proportionally across each partial close.
+        raw["_entry_avg_px"] = fill_fields.get("avg_px") or fill_price
+        raw["_entry_fee"]    = fill_fields.get("fee", 0.0)
+        raw["_entry_fee_ccy"] = fill_fields.get("fee_ccy", "")
 
         # [SL AMEND] Locate the attached SL/TP algo order's id so later ladder
         # SL-ratchets (T1-T3) can amend the REAL exchange-side stop, not just
@@ -678,18 +683,68 @@ class OKXAdapter(BaseConnector):
         logger.info("[OKX] CLOSE(%s) %s %s qty=%.4f → order_id=%s",
                     trade_info.get("reason", ""), pos_side.upper(), sym, amount, order_id)
 
-        filled, fill_price = self._await_fill_sync(sym, order_id)
+        filled, fill_price, fill_fields = self._await_fill_sync(sym, order_id)
         raw["_filled"]     = filled
         raw["_fill_price"] = fill_price
+        # [OKX FILL DATA] ground truth for this close, used by the bot to
+        # build the Telegram Net PnL figure instead of its own pre-fill
+        # estimate (computed from the last candle close before the market
+        # order actually executed) — see Net PnL formula in _close_position.
+        raw["_exit_avg_px"]    = fill_fields.get("avg_px") or fill_price
+        # NOTE: OKX's raw fillSz (like ccxt's `filled`) is in CONTRACTS for a
+        # SWAP instrument, not base-currency coins — convert with ct_val the
+        # same way _sync_open converts _filled_coins, rather than trusting
+        # fillSz's units directly.
+        raw["_exit_fill_sz"]   = filled * ct_val
+        raw["_exit_fee"]       = fill_fields.get("fee", 0.0)
+        raw["_exit_fee_ccy"]   = fill_fields.get("fee_ccy", "")
+        raw["_realized_pnl"]   = fill_fields.get("realized_pnl", 0.0)
         return raw
 
     # ── Fill confirmation ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _extract_fill_fields(order: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Pull OKX's own post-fill figures out of a ccxt order dict — avgPx,
+        fillSz, fee, realized pnl — straight from the raw OKX v5 fields in
+        order['info'] (avgPx/fillSz/fee/pnl), falling back to ccxt's unified
+        fields (average/filled/fee.cost) when the raw ones are absent. These
+        are ground truth from the exchange, not the bot's own pre-fill
+        estimate computed from the last candle close — Telegram alerts use
+        this instead of that estimate whenever it's available.
+
+        OKX reports `fee` as a negative number (a debit) — normalize to a
+        positive cost. `pnl` is OKX's own realized-PnL calc for this fill
+        (uses their server-side average cost basis) and is only meaningful
+        on a reduce-only/closing order; it's "0" on an opening fill.
+        """
+        info = order.get("info") or {}
+        avg_px = float(info.get("avgPx") or order.get("average") or order.get("price") or 0.0)
+        fill_sz = float(info.get("fillSz") or order.get("filled") or 0.0)
+        fee_raw = info.get("fee")
+        if fee_raw is not None:
+            fee = abs(float(fee_raw))
+            fee_ccy = info.get("feeCcy") or ""
+        else:
+            fee_info = order.get("fee") or {}
+            fee = abs(float(fee_info.get("cost") or 0.0))
+            fee_ccy = fee_info.get("currency") or ""
+        realized_pnl = float(info.get("pnl") or 0.0)
+        return {
+            "avg_px": avg_px, "fill_sz": fill_sz,
+            "fee": fee, "fee_ccy": fee_ccy,
+            "realized_pnl": realized_pnl,
+        }
+
     def _await_fill_sync(self, symbol: str,
-                         order_id: str) -> Tuple[float, float]:
-        """Poll order status until filled or timeout. Returns (filled_qty, avg_price)."""
+                         order_id: str) -> Tuple[float, float, Dict[str, Any]]:
+        """Poll order status until filled or timeout.
+        Returns (filled_qty, avg_price, fill_fields) — fill_fields is
+        _extract_fill_fields()'s dict (avg_px/fill_sz/fee/fee_ccy/realized_pnl),
+        {} on timeout/no-fill."""
         if not order_id:
-            return 0.0, 0.0
+            return 0.0, 0.0, {}
         deadline = time.monotonic() + self.FILL_POLL_TIMEOUT
         while time.monotonic() < deadline:
             try:
@@ -701,15 +756,15 @@ class OKXAdapter(BaseConnector):
                 filled = float(o.get("filled") or 0)
                 price  = float(o.get("average") or o.get("price") or 0)
                 if status == "closed" or filled > 0:
-                    return filled, price
+                    return filled, price, self._extract_fill_fields(o)
                 if status == "canceled":
                     logger.warning("[OKX] order %s was canceled", order_id)
-                    return 0.0, 0.0
+                    return 0.0, 0.0, {}
             except Exception as e:
                 logger.debug("[OKX] fill poll error (order=%s): %s", order_id, e)
             time.sleep(self.FILL_POLL_INTERVAL)
         logger.warning("[OKX] fill confirmation timeout for order %s", order_id)
-        return 0.0, 0.0
+        return 0.0, 0.0, {}
 
     async def _await_fill_async(self, symbol: str,
                                  order_id: str) -> Tuple[float, float]:

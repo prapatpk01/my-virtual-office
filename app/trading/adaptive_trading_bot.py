@@ -1983,12 +1983,16 @@ class TradingBot:
 
     def _queue_target_alert(self, label: str, price: float,
                             old_sl: Optional[float], new_sl: Optional[float],
-                            final: bool = False, close_pct: float = 0.0) -> None:
-        """Queue a Telegram-ready dict for the runner to format/send."""
+                            final: bool = False, close_pct: float = 0.0,
+                            fill: Optional[Dict] = None) -> None:
+        """Queue a Telegram-ready dict for the runner to format/send. `fill`
+        is current_trade["last_fill"] (see _close_position) — the OKX-
+        verified avgPx/fee/realizedPnl/net_pnl for THIS close, or None on
+        paper/backtest executors that don't report it."""
         self._pending_target_alerts.append({
             "label": label, "price": price,
             "old_sl": old_sl, "new_sl": new_sl, "final": final,
-            "close_pct": close_pct,
+            "close_pct": close_pct, "fill": fill,
         })
 
     def pop_target_alerts(self) -> List[Dict]:
@@ -2066,7 +2070,8 @@ class TradingBot:
                 t["tp1_hit"] = True   # legacy flags some downstream logic reads
                 t["tp2_hit"] = True
                 self.state = "EXITING"
-                self._queue_target_alert(label, level_price, None, None, final=True)
+                self._queue_target_alert(label, level_price, None, None, final=True,
+                                         fill=t.get("last_fill"))
                 actions.append(f"{label}_HIT(close) @ {level_price:.4f}")
                 self.save_state(self._state_file)
                 return " | ".join(actions)
@@ -2078,7 +2083,8 @@ class TradingBot:
                 f"{effective_close_pct*100:.0f}% | SL {old_sl:.4f} → {t['sl']:.4f}"
             )
             self._send_amend_sl(t["sl"])
-            self._queue_target_alert(label, level_price, old_sl, t["sl"], close_pct=effective_close_pct)
+            self._queue_target_alert(label, level_price, old_sl, t["sl"], close_pct=effective_close_pct,
+                                     fill=t.get("last_fill"))
             actions.append(
                 f"{label} @ {level_price:.4f} close={effective_close_pct*100:.0f}% SL→{t['sl']:.4f}"
             )
@@ -2440,7 +2446,18 @@ class TradingBot:
                     f"[FILL SYNC] requested {position_size:.6f} → filled {_fc:.6f} coins"
                 )
                 self.current_trade["remaining_size"] = _fc
+                # "size" is the ORIGINAL full-position denominator later used
+                # to allocate the entry fee across each partial close — keep
+                # it matched to what actually filled, not what was requested.
+                self.current_trade["size"] = _fc
             self.current_trade["sl_algo_id"] = _open_result.get("_sl_algo_id")
+            # [OKX FILL DATA] entry-side avgPx/fee, ground truth from the
+            # exchange — used by _close_position to compute each close's Net
+            # PnL (see the formula there). None on paper/backtest executors,
+            # which don't return these fields — Telegram then falls back to
+            # the bot's own pre-fill estimate.
+            self.current_trade["entry_fee"]    = float(_open_result.get("_entry_fee") or 0.0)
+            self.current_trade["entry_avg_px"] = float(_open_result.get("_entry_avg_px") or entry_price)
 
         self.position_open         = True
         self._position_entry_bar   = self._bar_count
@@ -2597,13 +2614,41 @@ class TradingBot:
         if t["sl_dist"] > 0:
             t["final_rr"] = pnl_per_unit / t["sl_dist"]
 
-        self._send_order("CLOSE_PARTIAL" if portion < 1.0 else "CLOSE_FULL", {
+        _close_result = self._send_order("CLOSE_PARTIAL" if portion < 1.0 else "CLOSE_FULL", {
             "reason":    reason,
             "price":     float(price),
             "size":      close_size,
             "pnl":       pnl,
             "direction": direction,
         })
+
+        # [OKX FILL RECONCILIATION] Telegram should report what the exchange
+        # actually filled/charged, not this pre-fill estimate (computed above
+        # from the target/SL trigger price, before the market order actually
+        # executed). Only populated on a live OKX close (paper/backtest
+        # executors don't return these fields) — callers fall back to the
+        # local pnl/price estimate above when this is None.
+        #   Net PnL = Realized Trading PnL (OKX) - Entry Fee Allocation - Exit Fee
+        # Entry Fee Allocation = entry_fee * (this close's size / the
+        # original full position size) — this close only "used up" its
+        # proportional share of the one fee paid when the position opened.
+        t["last_fill"] = None
+        if isinstance(_close_result, dict) and _close_result.get("_exit_avg_px"):
+            _exit_fee     = float(_close_result.get("_exit_fee") or 0.0)
+            _exit_avg_px  = float(_close_result.get("_exit_avg_px") or price)
+            _exit_fill_sz = float(_close_result.get("_exit_fill_sz") or close_size)
+            _realized_okx = float(_close_result.get("_realized_pnl") or 0.0)
+            _entry_fee    = float(t.get("entry_fee") or 0.0)
+            _orig_size    = float(t.get("size") or close_size)
+            _entry_fee_alloc = _entry_fee * (_exit_fill_sz / max(_orig_size, 1e-9))
+            t["last_fill"] = {
+                "avg_px":          _exit_avg_px,
+                "fill_sz":         _exit_fill_sz,
+                "fee":             _exit_fee,
+                "realized_pnl":    _realized_okx,
+                "entry_fee_alloc": _entry_fee_alloc,
+                "net_pnl":         _realized_okx - _entry_fee_alloc - _exit_fee,
+            }
 
         # FIX-#4: if order failed (state=ERROR), don't mark local position as closed —
         # exchange still holds the real position.

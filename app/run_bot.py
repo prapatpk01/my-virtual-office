@@ -106,8 +106,32 @@ def _format_open_msg(order_type: str, sym: str, trade_info: dict) -> str:
     return "\n".join(lines)
 
 
-def _format_close_msg(order_type: str, sym: str, trade_info: dict) -> str:
-    pnl   = float(trade_info.get("pnl") or 0)
+def _format_fill_block(fill) -> str:
+    """OKX post-fill ground truth (avgPx/fillSz/fee/realizedPnl) + the
+    computed Net PnL, for appending to a close/target-hit alert. Empty
+    string when `fill` is None (paper/backtest executors, or the OKX call
+    didn't return fill data) — callers show only the pre-fill estimate
+    they already had in that case.
+    Net PnL = Realized Trading PnL (OKX) - Entry Fee Allocation - Exit Fee."""
+    if not fill:
+        return ""
+    return (
+        f"\n\nOKX Fill\n"
+        f"avgPx : {fill['avg_px']:.4f}\n"
+        f"fillSz : {fill['fill_sz']:.6f}\n"
+        f"fee : {fill['fee']:.4f}\n"
+        f"Realized PnL : {fill['realized_pnl']:+.4f}\n"
+        f"Entry fee alloc : -{fill['entry_fee_alloc']:.4f}\n"
+        f"Exit fee : -{fill['fee']:.4f}\n"
+        f"Net PnL : {fill['net_pnl']:+.4f}"
+    )
+
+
+def _format_close_msg(order_type: str, sym: str, trade_info: dict, fill=None) -> str:
+    # Prefer the OKX-verified Net PnL over the bot's own pre-fill estimate
+    # (computed from the SL/target trigger price before the market order
+    # actually executed) whenever a real fill is available.
+    pnl   = float(fill["net_pnl"]) if fill else float(trade_info.get("pnl") or 0)
     emoji = "✅" if pnl > 0 else ("⚪" if pnl == 0 else "❌")
     return (
         f"{emoji} [Adaptive] {order_type} {sym} "
@@ -115,6 +139,7 @@ def _format_close_msg(order_type: str, sym: str, trade_info: dict) -> str:
         f"direction={trade_info.get('direction', '?')} "
         f"price={_fmt_px(trade_info.get('price'))}\n"
         f"pnl={pnl:+.2f} size={float(trade_info.get('size') or 0):.4f}"
+        f"{_format_fill_block(fill)}"
     )
 
 
@@ -521,7 +546,15 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             if not sent:
                                 telegram.send(_format_open_msg(order_type, s, trade_info))
                         else:
-                            telegram.send(_format_close_msg(order_type, s, trade_info))
+                            # [OKX FILL] current_trade still holds this
+                            # close's "last_fill" (set in _close_position,
+                            # synchronously just before this callback runs) —
+                            # None on paper/backtest executors, or if OKX
+                            # didn't return fill data for some reason.
+                            bot_ref = bots.get(s, (None, None))[0]
+                            fill = (getattr(bot_ref, "current_trade", {}) or {}).get("last_fill") \
+                                   if bot_ref else None
+                            telegram.send(_format_close_msg(order_type, s, trade_info, fill=fill))
                     except Exception:
                         pass
                 return result
@@ -710,14 +743,16 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         """Pop and forward any queued target-hit alerts (T1/T2) to Telegram,
         in the exact format requested: symbol / "TargetN Hit" / price /
         partial-close % + SL move to breakeven (or "Take Profit" + close for
-        the final level)."""
+        the final level), plus the OKX-verified fill/PnL block when available."""
         for alert in bot.pop_target_alerts():
+            fill_block = _format_fill_block(alert.get("fill"))
             if alert["final"]:
                 msg = (
                     f"🎯 {sym}\n"
                     f"Target {alert['label'][1:]} Hit — Take Profit\n\n"
                     f"Price : {alert['price']:.4f}\n"
                     f"Position closed"
+                    f"{fill_block}"
                 )
             else:
                 # Arrow reflects the actual SL move direction: tighter-for-LONG
@@ -735,6 +770,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     f"{alert['old_sl']:.4f}\n"
                     f"{arrow}\n"
                     f"{alert['new_sl']:.4f}"
+                    f"{fill_block}"
                 )
             logger.info("[Target][%s] %s", sym, alert["label"])
             if telegram:
