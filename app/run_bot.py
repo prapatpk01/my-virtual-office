@@ -221,6 +221,12 @@ def build_config() -> dict:
         # scratch at exactly entry (0R) — e.g. 0.15 means the worst case
         # after T1 is +0.15R, not breakeven.
         "adaptive_breakeven_lock_r": _env_float("ADAPTIVE_BREAKEVEN_LOCK_R", 0.15),
+        # Fraction of the position closed at T1 (rest runs to T2). Was
+        # documented as ADAPTIVE_TP1_CLOSE_PCT in .env.example but never
+        # actually wired here — the live bot always used the class default
+        # (75%) regardless of that env var. Now genuinely configurable;
+        # default lowered to 60% per request (leaves a bigger 40% runner).
+        "adaptive_tp1_close_pct": _env_float("ADAPTIVE_TP1_CLOSE_PCT", 0.60),
         # Fake-signal chop-zone filter (None = default 0.8). Higher = stricter,
         # higher WR, fewer trades (~1.2 pushes WR toward 56%).
         "adaptive_min_ema_dist_atr": (_env_float("ADAPTIVE_MIN_EMA_DIST_ATR", 0.0) or None),
@@ -534,6 +540,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         bot = AdaptiveBot(
             account_balance=cfg["adaptive_balance"],
             min_sl_pct=_min_sl_pct,
+            tp1_close_pct=cfg.get("adaptive_tp1_close_pct", 0.60),
             base_risk_pct=cfg["adaptive_risk_pct"],
             daily_loss_limit_pct=cfg["adaptive_daily_loss"],
             daily_profit_limit_pct=cfg["adaptive_daily_profit"],
