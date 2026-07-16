@@ -154,8 +154,8 @@ class TrendConfirmStrategy(BaseStrategy):
         zone_width_atr_1h: float = 0.18,
         zone_width_atr_4h: float = 0.22,
         hard_zone_distance_atr: float = 0.30,
-        min_structure_room_r: float = 0.70,
-        preferred_structure_room_r: float = 0.95,
+        min_structure_room_r: float = 0.50,   # hard-reject below this many R of room to the opposing zone
+        preferred_structure_room_r: float = 0.75,  # below this (but >= min) just penalizes the quality gate
         location_threshold_penalty: float = 4.0,
         reject_midrange_when_choppy: bool = True,
         # Sideways / range veto (Layer 2) — hard-block entries when the 15m
