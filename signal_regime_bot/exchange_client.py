@@ -42,9 +42,12 @@ class OrderResult:
     order_id: str
     symbol: str
     side: str
-    amount: float
-    price: float
+    amount: float          # base-asset size actually filled
+    price: float           # legacy: same as avg_price (kept for callers)
     status: str
+    avg_price: float = 0.0     # OKX avgPx — the ACTUAL average fill price
+    fee_cost: float = 0.0      # OKX fee for THIS fill, as a positive USDT cost
+    realized_pnl: float = 0.0  # OKX realized trading PnL for THIS order (pre-fee); 0 on opens
 
 
 @dataclass
@@ -324,11 +327,47 @@ class ExchangeClient:
             logger.error("[ORDER] create_order failed %s %s %s: %s", symbol, side, pos_side, e)
             raise
 
+        order_id = str(raw.get("id") or uuid.uuid4())
+        avg, fee_cost, realized, filled_base = await self._resolve_fill(symbol, order_id, raw, ct_val)
         return OrderResult(
-            order_id=str(raw.get("id", uuid.uuid4())), symbol=symbol, side=side,
-            amount=effective_base, price=raw.get("price") or 0.0,
+            order_id=order_id, symbol=symbol, side=side,
+            amount=(filled_base or effective_base),
+            price=avg or (raw.get("price") or 0.0),
             status=raw.get("status", "open"),
+            avg_price=avg, fee_cost=fee_cost, realized_pnl=realized,
         )
+
+    async def _resolve_fill(self, symbol: str, order_id: str, raw: dict,
+                            ct_val: float) -> tuple[float, float, float, float]:
+        """Read the ACTUAL fill back from OKX: (avg_price, fee_cost>=0,
+        realized_pnl, filled_base). A market order's create response often
+        lacks avgPx/fee/pnl, so re-fetch the settled order when they're
+        missing. All values fall back to 0.0 on any failure — the caller
+        then uses its own estimate rather than crashing."""
+        def _extract(o: dict) -> tuple[float, float, float, float]:
+            info = o.get("info") or {}
+            avg = float(o.get("average") or info.get("avgPx") or 0.0) or 0.0
+            filled_ct = float(o.get("filled") or info.get("accFillSz") or 0.0) or 0.0
+            fee_obj = o.get("fee") or {}
+            fee_cost = fee_obj.get("cost")
+            if fee_cost is None:
+                fee_cost = info.get("fee")
+            fee_cost = abs(float(fee_cost)) if fee_cost not in (None, "") else 0.0
+            realized = info.get("pnl")
+            realized = float(realized) if realized not in (None, "") else 0.0
+            return avg, fee_cost, realized, filled_ct * ct_val
+
+        avg, fee_cost, realized, filled_base = _extract(raw)
+        if avg > 0 and fee_cost > 0:
+            return avg, fee_cost, realized, filled_base
+        # settle: re-fetch the order once (market fills are near-instant)
+        try:
+            o = await self._exchange.fetch_order(order_id, symbol)
+            a2, f2, r2, b2 = _extract(o)
+            return (a2 or avg), (f2 or fee_cost), (r2 or realized), (b2 or filled_base)
+        except Exception as e:
+            logger.warning("[ORDER] fill re-fetch failed for %s %s: %s", symbol, order_id, e)
+            return avg, fee_cost, realized, filled_base
 
     async def move_sl_to_breakeven(self, symbol: str, pos_side: str, entry_price: float,
                                    remaining_amount: float,
@@ -411,16 +450,18 @@ class ExchangeClient:
         if is_close:
             pos = self._paper_positions.get(key)
             closed_amt = 0.0
+            pnl = fee = 0.0
             if pos:
                 closed_amt = min(eff_amount if eff_amount > 0 else pos["amount"], pos["amount"])
                 pnl_mult = 1 if pos_side == "long" else -1
-                pnl = pnl_mult * (price - pos["entry"]) * closed_amt
+                pnl = pnl_mult * (price - pos["entry"]) * closed_amt   # realized (pre-fee)
                 fee = closed_amt * price * self._fee_rate
                 self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0.0) + pnl - fee
                 pos["amount"] -= closed_amt
                 if pos["amount"] <= 1e-9:
                     del self._paper_positions[key]
-            return OrderResult(str(uuid.uuid4()), symbol, side, closed_amt, price, "closed")
+            return OrderResult(str(uuid.uuid4()), symbol, side, closed_amt, price, "closed",
+                               avg_price=price, fee_cost=fee, realized_pnl=pnl)
 
         if eff_amount <= 0:
             raise ValueError(
@@ -433,4 +474,5 @@ class ExchangeClient:
         else:
             self._paper_positions[key] = {"entry": price, "amount": eff_amount,
                                           "tp": tp_price, "sl": sl_price}
-        return OrderResult(str(uuid.uuid4()), symbol, side, eff_amount, price, "open")
+        return OrderResult(str(uuid.uuid4()), symbol, side, eff_amount, price, "open",
+                           avg_price=price, fee_cost=open_fee, realized_pnl=0.0)

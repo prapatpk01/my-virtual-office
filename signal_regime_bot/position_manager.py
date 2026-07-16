@@ -57,7 +57,8 @@ class Position:
     regime_at_entry: str = ""
     bias_at_entry: str = ""
     entry_score: float = 0.0
-    entry_bar_ts: Optional[pd.Timestamp] = None             # 15m bar the entry was decided on (for exit grace)
+    entry_fee: float = 0.0                                  # ACTUAL open fee from OKX (positive USDT)
+    entry_bar_ts: Optional[pd.Timestamp] = None             # 5m bar the entry was decided on (for exit grace)
     last_exit_check_bar_ts: Optional[pd.Timestamp] = None   # dedupe: one HMA exit check per closed 15m bar
 
 
@@ -259,20 +260,25 @@ class PositionManager:
             logger.error("[POS] %s open order failed: %s", symbol, e)
             return None
 
+        # Use the ACTUAL average fill price and open fee from OKX (avgPx/fee),
+        # not the signal price / an estimate — the entry price anchors every
+        # PnL number reported afterwards.
+        fill_price = order.avg_price if order.avg_price > 0 else price
         pos = Position(
-            symbol=symbol, side=side, entry_price=price, amount=order.amount,
+            symbol=symbol, side=side, entry_price=fill_price, amount=order.amount,
             full_amount=order.amount, stop_loss=sl, tp1=tp1, tp2=tp2,
-            one_r=abs(price - sl), regime_at_entry=regime.name,
+            one_r=abs(fill_price - sl), regime_at_entry=regime.name,
             bias_at_entry=(bias.bias if bias is not None else regime.style),
-            entry_score=entry_score,
+            entry_score=entry_score, entry_fee=order.fee_cost,
             # entry_bar_ts is the 5M bar the entry fired on — the early-exit
             # grace counts closed 5M bars since it.
             entry_bar_ts=(df_5m.index[-1] if df_5m is not None and len(df_5m)
                          else (df_15m.index[-1] if len(df_15m) else None)),
         )
         self._positions[symbol] = pos
-        logger.info("[POS] OPENED %s %s @ %.6f  SL=%.6f TP1=%.6f TP2=%.6f  amount=%.6f",
-                   symbol, side.upper(), price, sl, tp1, tp2, order.amount)
+        logger.info("[POS] OPENED %s %s @ %.6f (signal %.6f)  SL=%.6f TP1=%.6f TP2=%.6f  "
+                   "amount=%.6f  openFee=%.6f",
+                   symbol, side.upper(), fill_price, price, sl, tp1, tp2, order.amount, order.fee_cost)
         return pos
 
     async def check_exits_live(self, symbol: str, current_price: float) -> Optional[dict]:
@@ -323,19 +329,45 @@ class PositionManager:
                            "%.6f open — treating as transient, will retry", pos.symbol, reason, actual)
             return None
 
-        pnl_mult = 1 if pos.side == LONG else -1
-        pnl = pnl_mult * (price - pos.entry_price) * pos.amount
-        pnl -= (pos.entry_price + price) * pos.amount * self.cfg.fee_rate
+        # No fill object available (the algo closed it) — estimate net with the
+        # last known price via the shared formula (entry-fee alloc + est. exit fee).
+        leg = self._leg_net_pnl(pos, None, price, pos.amount)
+        pnl = leg["net"]
         balance = await self.client.fetch_balance_usdt()
         self.risk.register_trade_result(pnl, balance, time.time())
         del self._positions[pos.symbol]
         self.entry_engine.on_position_closed(pos.symbol)
         logger.info("[POS] %s %s: confirmed closed externally (exchange algo) — "
-                   "synced internal state, pnl≈%.2f incl fees (approximate, exact fill unknown)",
+                   "synced internal state, net≈%.2f incl fees (approximate, exact fill unknown)",
                    pos.symbol, reason, pnl)
         return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": price,
-               "pnl": pnl, "trade_pnl": pos.realized_pnl + pnl, "tp1_hit": pos.tp1_hit,
-               "entry_price": pos.entry_price, "position": pos, "approximate": True}
+               "pnl": pnl, "realized": leg["realized"], "exit_fee": leg["exit_fee"],
+               "entry_fee_alloc": leg["entry_fee_alloc"], "trade_pnl": pos.realized_pnl + pnl,
+               "tp1_hit": pos.tp1_hit, "entry_price": pos.entry_price, "position": pos,
+               "approximate": True}
+
+    def _leg_net_pnl(self, pos: Position, order, ticker_price: float, filled: float) -> dict:
+        """NET PnL for ONE closing leg, from OKX post-fill actuals:
+
+            Net = Realized Trading PnL (OKX)  -  Entry Fee Allocation  -  Exit Fee
+
+        Realized PnL and both fees are read from OKX (avgPx/fee/pnl); the
+        entry fee is allocated to this leg by its share of the full position.
+        Falls back to a price-based estimate only if OKX returned no fill data
+        (avg_price == 0)."""
+        pnl_mult = 1 if pos.side == LONG else -1
+        if order is not None and order.avg_price > 0:
+            exit_price = order.avg_price
+            realized = order.realized_pnl
+            exit_fee = order.fee_cost
+        else:
+            exit_price = ticker_price
+            realized = pnl_mult * (exit_price - pos.entry_price) * filled
+            exit_fee = exit_price * filled * self.cfg.fee_rate
+        entry_fee_alloc = pos.entry_fee * (filled / pos.full_amount) if pos.full_amount else 0.0
+        net = realized - exit_fee - entry_fee_alloc
+        return {"net": net, "realized": realized, "exit_fee": exit_fee,
+                "entry_fee_alloc": entry_fee_alloc, "exit_price": exit_price}
 
     async def _close_partial_tp1(self, pos: Position, price: float) -> dict:
         close_amt = round(pos.full_amount * self.cfg.tp1_fraction, 8)
@@ -360,10 +392,8 @@ class PositionManager:
         # one — the two can differ by up to a lot, and pnl/pos.amount must
         # track what really happened on the exchange.
         filled = min(res.amount if res.amount > 0 else close_amt, pos.amount)
-        pnl_mult = 1 if pos.side == LONG else -1
-        pnl = pnl_mult * (price - pos.entry_price) * filled
-        # fees: this leg pays open fee (its share) + close fee, fee_rate per fill
-        pnl -= (pos.entry_price + price) * filled * self.cfg.fee_rate
+        leg = self._leg_net_pnl(pos, res, price, filled)
+        pnl = leg["net"]
         self.risk.register_trade_result(pnl, await self.client.fetch_balance_usdt(), time.time())
 
         pos.amount = round(pos.amount - filled, 8)
@@ -375,15 +405,18 @@ class PositionManager:
             pos.symbol, pos.side, pos.entry_price, pos.amount, tp_price=pos.tp2)
 
         return {
-            "event": "TP1_HIT", "symbol": pos.symbol, "side": pos.side, "price": price,
-            "pnl": pnl, "sl_moved": sl_ok, "new_sl": pos.stop_loss, "position": pos,
+            "event": "TP1_HIT", "symbol": pos.symbol, "side": pos.side,
+            "price": leg["exit_price"], "pnl": pnl, "realized": leg["realized"],
+            "exit_fee": leg["exit_fee"], "entry_fee_alloc": leg["entry_fee_alloc"],
+            "sl_moved": sl_ok, "new_sl": pos.stop_loss, "position": pos,
         }
 
     async def _close_full(self, pos: Position, price: float, reason: str) -> dict:
         okx_side = "sell" if pos.side == LONG else "buy"
+        filled = pos.amount
         try:
-            await self.client.create_order(pos.symbol, okx_side, pos.amount,
-                                           pos_side=pos.side, reduce_only=True)
+            res = await self.client.create_order(pos.symbol, okx_side, pos.amount,
+                                                 pos_side=pos.side, reduce_only=True)
         except Exception as e:
             if self._is_no_position_error(e):
                 synced = await self._sync_closed_externally(pos, price, reason)
@@ -392,18 +425,19 @@ class PositionManager:
             logger.warning("[POS] %s %s close failed: %s", pos.symbol, reason, e)
             return {"event": "ERROR", "symbol": pos.symbol, "detail": f"{reason} close failed: {e}"}
 
-        pnl_mult = 1 if pos.side == LONG else -1
-        pnl = pnl_mult * (price - pos.entry_price) * pos.amount
-        # fees: this leg's share of the open fee + its close fill fee
-        pnl -= (pos.entry_price + price) * pos.amount * self.cfg.fee_rate
+        if res.amount > 0:
+            filled = min(res.amount, pos.amount)
+        leg = self._leg_net_pnl(pos, res, price, filled)
+        pnl = leg["net"]
         balance = await self.client.fetch_balance_usdt()
         self.risk.register_trade_result(pnl, balance, time.time())
 
         del self._positions[pos.symbol]
         self.entry_engine.on_position_closed(pos.symbol)
-        return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": price,
-               "pnl": pnl, "trade_pnl": pos.realized_pnl + pnl, "tp1_hit": pos.tp1_hit,
-               "entry_price": pos.entry_price, "position": pos}
+        return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": leg["exit_price"],
+               "pnl": pnl, "realized": leg["realized"], "exit_fee": leg["exit_fee"],
+               "entry_fee_alloc": leg["entry_fee_alloc"], "trade_pnl": pos.realized_pnl + pnl,
+               "tp1_hit": pos.tp1_hit, "entry_price": pos.entry_price, "position": pos}
 
     async def process_closed_bar_exit_check(self, symbol: str, df_5m: pd.DataFrame) -> Optional[dict]:
         """

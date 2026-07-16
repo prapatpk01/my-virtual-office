@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
 import aiohttp
 
@@ -138,42 +139,55 @@ class TelegramNotifier:
             f"SL: `{sl:.6f}` | TP1: `{tp1:.6f}` | TP2: `{tp2:.6f}`"
         )
 
-    async def tp1_hit(self, symbol: str, price: float, pnl: float, new_sl: float):
+    @staticmethod
+    def _net_block(pnl: float, ev: Optional[dict] = None) -> str:
+        """PnL line. When OKX fill actuals are present (realized + fees), show
+        the exact Net = Realized - openFeeAlloc - closeFee breakdown."""
+        if ev and ev.get("realized") is not None:
+            return (f"Net PnL: `{pnl:+.4f}` USDT\n"
+                    f"  realized `{ev['realized']:+.4f}` − openFee "
+                    f"`{ev.get('entry_fee_alloc', 0.0):.4f}` − closeFee `{ev.get('exit_fee', 0.0):.4f}`")
+        return f"PnL: `{pnl:+.2f}` USDT"
+
+    async def tp1_hit(self, symbol: str, price: float, pnl: float, new_sl: float,
+                      ev: Optional[dict] = None):
         await self._send_message(
             f"🎯 *TP1 Hit* `{symbol}`\n\n"
             f"Price: `{price:.6f}`\n"
-            f"PnL (50%): `{pnl:+.2f}` USDT\n"
+            f"{self._net_block(pnl, ev)}\n"
             f"SL moved to Breakeven: `{new_sl:.6f}`"
         )
 
-    async def tp2_hit(self, symbol: str, price: float, pnl: float):
+    async def tp2_hit(self, symbol: str, price: float, pnl: float, ev: Optional[dict] = None):
         await self._send_message(
             f"🏁 *TP2 Hit — Position Closed* `{symbol}`\n\n"
-            f"Price: `{price:.6f}`\nPnL: `{pnl:+.2f}` USDT"
+            f"Price: `{price:.6f}`\n{self._net_block(pnl, ev)}"
         )
 
-    async def sl_hit(self, symbol: str, price: float, pnl: float, at_breakeven: bool = False):
+    async def sl_hit(self, symbol: str, price: float, pnl: float, at_breakeven: bool = False,
+                     ev: Optional[dict] = None):
         label = "Breakeven Stop" if at_breakeven else "Stop Loss Hit"
         await self._send_message(
             f"🛑 *{label}* `{symbol}`\n\n"
-            f"Price: `{price:.6f}`\nPnL: `{pnl:+.2f}` USDT"
+            f"Price: `{price:.6f}`\n{self._net_block(pnl, ev)}"
         )
 
-    async def spike_guard(self, symbol: str, price: float, pnl: float, reason: str):
+    async def spike_guard(self, symbol: str, price: float, pnl: float, reason: str,
+                          ev: Optional[dict] = None):
         await self._send_message(
             f"⚡️ *Spike Guard — Emergency Close* `{symbol}`\n\n"
             f"Reversal spike detected — closed before full SL.\n"
             f"`{reason}`\n"
-            f"Price: `{price:.6f}`\nPnL: `{pnl:+.2f}` USDT"
+            f"Price: `{price:.6f}`\n{self._net_block(pnl, ev)}"
         )
 
     async def early_exit(self, symbol: str, price: float, pnl: float,
-                         reason: str, detail: str = ""):
-        label = "EMA Cross Reversal" if reason == "EMA_CROSS_REVERSAL" else "Price Opened Beyond EMA9"
+                         reason: str, detail: str = "", ev: Optional[dict] = None):
+        label = "EMA Cross Reversal" if reason == "EMA_CROSS_REVERSAL" else "Price Opened Beyond EMA20"
         await self._send_message(
             f"⚠️ *Early Exit — {label}* `{symbol}`\n\n"
             f"`{detail}`\n"
-            f"Price: `{price:.6f}`\nPnL: `{pnl:+.2f}` USDT"
+            f"Price: `{price:.6f}`\n{self._net_block(pnl, ev)}"
         )
 
     async def daily_loss_limit(self, day_pnl_pct: float):

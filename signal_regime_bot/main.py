@@ -303,24 +303,24 @@ class Bot:
         ev = event.get("event")
         symbol = event.get("symbol", "")
         if ev == "TP1_HIT":
-            await self.telegram.tp1_hit(symbol, event["price"], event["pnl"], event["new_sl"])
+            await self.telegram.tp1_hit(symbol, event["price"], event["pnl"], event["new_sl"], ev=event)
         elif ev == "TP2_HIT":
-            await self.telegram.tp2_hit(symbol, event["price"], event["pnl"])
+            await self.telegram.tp2_hit(symbol, event["price"], event["pnl"], ev=event)
         elif ev == "SL_HIT":
-            await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=False)
+            await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=False, ev=event)
         elif ev == "BE_HIT":
-            await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=True)
+            await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=True, ev=event)
         elif ev in (EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA):
             await self.telegram.early_exit(symbol, event["price"], event["pnl"],
-                                           ev, event.get("exit_detail", ""))
+                                           ev, event.get("exit_detail", ""), ev=event)
         elif ev == "SPIKE_GUARD":
             await self.telegram.spike_guard(symbol, event["price"], event["pnl"],
-                                            event.get("spike_reason", ""))
+                                            event.get("spike_reason", ""), ev=event)
         elif ev == "TP1_THEN_EXTERNAL_CLOSE":
             # The exchange-side algo closed the FULL position before our TP1
             # partial fired — no separate TP1 leg happened, just note the
             # approximate total pnl for the trade.
-            await self.telegram.tp2_hit(symbol, event["price"], event["pnl"])
+            await self.telegram.tp2_hit(symbol, event["price"], event["pnl"], ev=event)
         elif ev == "ERROR":
             await self.telegram.error(symbol, event.get("detail", "unknown error"))
 
