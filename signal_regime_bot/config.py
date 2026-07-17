@@ -170,6 +170,31 @@ class Config:
     # EMA20 on 5M) is SUPPRESSED for this many closed 5M bars after entry so
     # the EMAs can separate. SL/TP stay active throughout. 0 disables.
     exit_grace_bars: int = 3
+    # TP1-gated exit (ported from TrendConfirm): the L3c signal early-exit is
+    # ARMED ONLY AFTER TP1 has banked — before that, only the hard SL/TP (and
+    # SpikeGuard) manage the trade. TrendConfirm's backtest note: single-close
+    # EMA exits killed 75% of trades at ~-0.3R before TP1; arming them only on
+    # the runner nearly doubled WR (25->62% BTC, 41->60% SOL).
+    signal_exit_requires_tp1: bool = True
+
+    # ── Sideways / range veto (ported from TrendConfirm) ─────────────────────
+    # Hard-block NEW entries when the 15M context reads as a range. 4 signals;
+    # >= sideways_min_signals of them = veto. Weighted toward signals that stay
+    # range-y while ADX lags at trend starts (compression/chop/tight range);
+    # ADX only counts when REALLY weak so a fresh trend at ADX ~18 isn't vetoed.
+    sideways_filter_enabled: bool = True
+    sideways_ema_compression_atr: float = 0.5   # |EMA20-EMA50| < this x ATR(15m)
+    sideways_chop_threshold: float = 61.8       # choppiness(14) above = high chop
+    sideways_range_atr: float = 1.2             # 20-bar high-low range < this x ATR
+    sideways_adx_max: float = 15.0              # ADX below this = really weak
+    sideways_min_signals: int = 2
+
+    # ── Chase guard (ported from TrendConfirm) ───────────────────────────────
+    # No entry if price already ran too far from the 5M reference EMA — wait
+    # for a pullback + fresh setup instead of chasing.
+    chase_guard_enabled: bool = True
+    chase_ema_ref: int = 50                     # EMA period on the 5M frame
+    chase_max_dist_atr: float = 1.5             # max |close-EMA50| in ATR(5m)
     one_entry_per_cross: bool = True
     require_new_cross_after_exit: bool = True
     entry_on_closed_candle_only: bool = True

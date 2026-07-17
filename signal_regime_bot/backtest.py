@@ -262,7 +262,10 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
             # EMA early-exit check — every closed 5m bar (this loop IS the 5m
             # cadence, so this runs once per bar naturally). bars_since_entry
             # = 0 on the fill bar; the exit grace suppresses it until
-            # exit_grace_bars closed 5m bars have passed.
+            # exit_grace_bars closed 5m bars have passed. TP1-gated (mirrors
+            # live): signal exits are armed only on the runner after TP1.
+            if cfg.signal_exit_requires_tp1 and not tp1_hit:
+                continue
             bars_since_entry = i - entry_fill_i if entry_fill_i >= 0 else None
             exit_check = engine.entry_engine.check_exit(hist_5m, pos.direction.lower(), bars_since_entry)
             if exit_check.should_exit:

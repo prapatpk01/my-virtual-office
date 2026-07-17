@@ -483,6 +483,13 @@ class PositionManager:
         pos = self._positions.get(symbol)
         if pos is None or df_5m is None or len(df_5m) == 0:
             return None
+        # TP1-gated exit (ported from TrendConfirm): signal exits are armed
+        # ONLY on the runner (after TP1 banked + SL at breakeven). Before
+        # that, the hard SL/TP and SpikeGuard alone manage the trade — the
+        # single-bar EMA exits were killing trades at ~-0.3R before they
+        # could develop.
+        if self.cfg.signal_exit_requires_tp1 and not pos.tp1_hit:
+            return None
         bar_ts = df_5m.index[-1]
         if pos.last_exit_check_bar_ts is not None and bar_ts <= pos.last_exit_check_bar_ts:
             return None   # already evaluated this closed bar

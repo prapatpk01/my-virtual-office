@@ -199,6 +199,28 @@ class EntryEngine:
                                f"L3: {direction} confluence {n_active}/3 but no new cross since last "
                                f"entry — waiting for a fresh setup", **base)
 
+        # ── Sideways veto (ported from TrendConfirm) — a trend system bleeds
+        # in ranges, and a range can still produce cross confluence on a
+        # bounce. 4 independent range reads on 15M; >= min_signals = veto.
+        vetoed, side_detail = self._sideways_context(df_15m)
+        if vetoed:
+            return EntryResult(NONE, False,
+                               f"L3: {direction} blocked — SIDEWAYS veto ({side_detail})", **base)
+
+        # ── Chase guard (ported from TrendConfirm) — never buy a move that
+        # already left: entry must be within chase_max_dist_atr of the 5M
+        # reference EMA, else wait for a pullback + fresh setup.
+        if c.chase_guard_enabled and len(df_5m) >= c.chase_ema_ref + 5:
+            ema_ref = float(ind.ema(df_5m["close"], c.chase_ema_ref).iloc[-1])
+            atr5 = float(ind.atr(df_5m, 14).iloc[-1])
+            if atr5 > 0:
+                dist_atr = abs(close_px - ema_ref) / atr5
+                if dist_atr > c.chase_max_dist_atr:
+                    return EntryResult(NONE, False,
+                                       f"L3: {direction} blocked — CHASE guard: "
+                                       f"{dist_atr:.2f}xATR from EMA{c.chase_ema_ref} (5m) "
+                                       f"(max {c.chase_max_dist_atr:.2f}) — wait for pullback", **base)
+
         # Do NOT consume the setup here: analyze() runs on EVERY poll tick, but
         # the actual open can still be blocked downstream (symbol cooldown, max
         # positions, a daily/streak limit, a balance-read blip, open_position
@@ -210,6 +232,44 @@ class EntryEngine:
                            f"ENTRY {direction}  confluence {n_active}/3 ({names}) within "
                            f"{c.entry_confluence_window_min}m", entry_score=100.0,
                            **{**base, "cross_id": newest_ts})
+
+    def _sideways_context(self, df_15m: pd.DataFrame) -> tuple:
+        """Range detector on 15M (ported from TrendConfirm). Returns
+        (vetoed, detail). Signals lean on EMA compression / high chop / tight
+        range — which stay range-y while ADX lags at trend starts — and ADX
+        only counts when REALLY weak (< sideways_adx_max), so a fresh trend
+        at ADX ~18 isn't mistaken for a range."""
+        c = self.cfg
+        if not c.sideways_filter_enabled:
+            return False, ""
+        n = 20
+        min_needed = max(50 + 2, 14 * 2 + 2, n + 1)
+        if df_15m is None or len(df_15m) < min_needed:
+            return False, ""
+        closes = df_15m["close"]
+        ema20 = float(ind.ema(closes, 20).iloc[-1])
+        ema50 = float(ind.ema(closes, 50).iloc[-1])
+        atr15 = float(ind.atr(df_15m, 14).iloc[-1])
+        if not (atr15 > 0) or pd.isna(ema20) or pd.isna(ema50):
+            return False, ""
+        adx_s, _, _ = ind.adx(df_15m, 14)
+        adx_v = float(adx_s.iloc[-1]) if not pd.isna(adx_s.iloc[-1]) else 100.0
+        chop_v = float(ind.choppiness_index(df_15m, 14).iloc[-1])
+        window = df_15m.iloc[-n:]
+        rng_atr = float((window["high"].max() - window["low"].min()) / atr15)
+        ema_gap_atr = abs(ema20 - ema50) / atr15
+
+        sig = {
+            "ema_compressed": ema_gap_atr < c.sideways_ema_compression_atr,
+            "high_chop": (not pd.isna(chop_v)) and chop_v > c.sideways_chop_threshold,
+            "tight_range": rng_atr < c.sideways_range_atr,
+            "weak_adx": adx_v < c.sideways_adx_max,
+        }
+        count = sum(1 for v in sig.values() if v)
+        fired = ",".join(k for k, v in sig.items() if v)
+        detail = (f"{count} signals: {fired} | gap={ema_gap_atr:.2f}ATR "
+                  f"chop={chop_v:.0f} adx={adx_v:.0f} range={rng_atr:.2f}ATR")
+        return count >= c.sideways_min_signals, detail
 
     def confirm_entry(self, symbol: str, cross_ts) -> None:
         """Mark the confluence setup that produced `cross_ts` (EntryResult.cross_id)
