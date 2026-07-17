@@ -8,3 +8,6 @@ __pycache__/
 app/vo-config.json
 app/default-office-config.json.bak
 lessons_state.json
+
+# Trading bot runtime state (per-symbol SymbolState, journal, trade log)
+state/
