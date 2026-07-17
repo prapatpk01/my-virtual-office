@@ -284,11 +284,23 @@ class Bot:
         if pos is None:
             return
 
-        await self.telegram.entry_signal(
-            symbol, sig.direction, pos.entry_price, pos.stop_loss, pos.tp1, pos.tp2,
-            sig.regime, sig.bias, sig.entry_score, risk_pct, self.cfg.leverage, chart_path)
-        await self.telegram.order_opened(
-            symbol, sig.direction, pos.entry_price, pos.amount, pos.stop_loss, pos.tp1, pos.tp2)
+        # The position is OPEN and tracked — the alerts below must NOT be able
+        # to raise back into the caller (which would look like an entry
+        # failure) or let one broken message suppress the others. Send the
+        # simple, always-valid "Order Opened" text FIRST, then the richer
+        # chart signal; isolate and loudly log each.
+        logger.info("[%s] position opened — notifying Telegram", symbol)
+        try:
+            await self.telegram.order_opened(
+                symbol, sig.direction, pos.entry_price, pos.amount, pos.stop_loss, pos.tp1, pos.tp2)
+        except Exception as e:
+            logger.error("[%s] order_opened notify failed: %s", symbol, e, exc_info=True)
+        try:
+            await self.telegram.entry_signal(
+                symbol, sig.direction, pos.entry_price, pos.stop_loss, pos.tp1, pos.tp2,
+                sig.regime, sig.bias, sig.entry_score, risk_pct, self.cfg.leverage, chart_path)
+        except Exception as e:
+            logger.error("[%s] entry_signal notify failed: %s", symbol, e, exc_info=True)
 
     def _log_pipeline_block(self, symbol: str, sig):
         """Explain WHICH layer stopped the trade — never a generic 'no signal'."""

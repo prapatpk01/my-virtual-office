@@ -25,18 +25,27 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.token and self.chat_id)
 
-    async def _send_message(self, text: str) -> bool:
+    async def _send_message(self, text: str, _markdown: bool = True) -> bool:
         if not self.enabled:
             return False
         url = API.format(token=self.token, method="sendMessage")
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"}
+        payload = {"chat_id": self.chat_id, "text": text}
+        if _markdown:
+            payload["parse_mode"] = "Markdown"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload,
                                         timeout=aiohttp.ClientTimeout(total=10)) as r:
                     if r.status != 200:
                         body = await r.text()
-                        logger.warning("[TG] sendMessage %s: %s", r.status, body[:200])
+                        logger.warning("[TG] sendMessage %s (markdown=%s): %s",
+                                       r.status, _markdown, body[:200])
+                        # A 400 is almost always a Markdown parse error (an
+                        # unbalanced `*`/`_`/backtick in a symbol or reason
+                        # string). Retry ONCE as plain text so the alert still
+                        # lands instead of vanishing silently.
+                        if r.status == 400 and _markdown:
+                            return await self._send_message(text, _markdown=False)
                         return False
                     return True
         except Exception as e:
@@ -44,6 +53,8 @@ class TelegramNotifier:
             return False
 
     async def _send_photo(self, path: str, caption: str) -> bool:
+        # A missing/broken chart must NEVER cost us the alert — fall back to the
+        # caption as a text message on any failure.
         if not self.enabled:
             return False
         url = API.format(token=self.token, method="sendPhoto")
@@ -59,12 +70,12 @@ class TelegramNotifier:
                                         timeout=aiohttp.ClientTimeout(total=30)) as r:
                     if r.status != 200:
                         body = await r.text()
-                        logger.warning("[TG] sendPhoto %s: %s", r.status, body[:200])
-                        return False
+                        logger.warning("[TG] sendPhoto %s: %s — falling back to text", r.status, body[:200])
+                        return await self._send_message(caption)
                     return True
         except Exception as e:
-            logger.warning("[TG] sendPhoto failed: %s", e)
-            return False
+            logger.warning("[TG] sendPhoto failed: %s — falling back to text", e)
+            return await self._send_message(caption)
 
     async def send_text(self, text: str) -> bool:
         """Plain reply for the command interface."""
