@@ -84,6 +84,9 @@ class Bot:
 
         self.locks = {s: asyncio.Lock() for s in c.symbols}
         self._running = False
+        self._last_view_log = 0.0
+        self._tg_offset = 0
+        self._cmd_task = None
 
     # ── per-symbol pipeline (spec §34 pseudocode, faithfully) ────────────────
 
@@ -153,10 +156,6 @@ class Bot:
                 liq = self.liquidity.evaluate(candles_15m, candles_1h,
                                               swings_15m, swings_1h, zones)
 
-                self.diag.set_view(symbol,
-                    f"{_sym(symbol)} | {state.status} | 4H={macro_ctx.classification} | "
-                    f"1H={bias.bias} | 15M={regime.confirmed_regime}")
-
                 if state.has_open_position:
                     await self.positions.manage(symbol, state, ind_15m, structure_15m,
                                                 structure_1h, macro_ctx, candle_ctx, zones)
@@ -174,6 +173,9 @@ class Bot:
                                                regime, structure_15m, structure_1h,
                                                zones, patterns, candle_ctx, liq, sd,
                                                shock_locked, exchange_state)
+
+                self._build_view(symbol, state, macro_ctx, bias, regime,
+                                 exchange_state)
 
                 state.last_processed_candle = candle_key
                 state.previous_regime = regime.confirmed_regime
@@ -271,6 +273,80 @@ class Bot:
         if opened:
             self.diag.count("positions_opened")
 
+    def _build_view(self, symbol, state, macro_ctx, bias, regime, exchange_state) -> None:
+        """Regime-bot-style view line: what passed, what each engine is
+        waiting to confirm, or live position state."""
+        sym = _sym(symbol)
+        head = (f"{sym} | 4H={macro_ctx.classification}({macro_ctx.score:.0f}) "
+                f"1H={bias.bias}(L{bias.score_long:.0f}/S{bias.score_short:.0f}) "
+                f"15M={regime.confirmed_regime}")
+        if state.has_open_position:
+            price = exchange_state.last_price or (state.actual_entry or 0.0)
+            entry = state.actual_entry or price
+            risk = state.initial_risk or 1e-9
+            long = state.setup_direction == "LONG"
+            r_now = ((price - entry) / risk) if long else ((entry - price) / risk)
+            tp1s = "TP1✓" if state.tp1_done else ("BE✓" if state.breakeven_moved else "TP1 waiting")
+            self.diag.set_view(symbol,
+                f"{sym} | {state.setup_direction}_OPEN {state.setup_type} | "
+                f"R={r_now:+.2f} MFE={state.mfe_r:+.2f} | {tp1s} | "
+                f"SL={state.active_stop:.6g} TP={state.active_target:.6g}"
+                if state.active_stop and state.active_target else
+                f"{sym} | {state.setup_direction}_OPEN {state.setup_type} | R={r_now:+.2f}")
+            return
+        if state.cooldown_active(self.exchange.now_ms(), None):
+            self.diag.set_view(symbol, f"{sym} | COOLDOWN | Resume=Next Candle")
+            return
+        # flat: show the dominant-bias side's block reason per engine
+        side = "LONG" if bias.score_long >= bias.score_short else "SHORT"
+        pb = (self.pullback.last_block.get(symbol) or {}).get(side, "-")
+        mo = (self.momentum.last_block.get(symbol) or {}).get(side, "-")
+        self.diag.set_view(symbol, f"{head} | PB[{side[0]}]→{pb} | MO[{side[0]}]→{mo}")
+
+    async def _maybe_view_log(self) -> None:
+        now = time.time()
+        if now - self._last_view_log < self.cfg.view_log_interval_sec:
+            return
+        self._last_view_log = now
+        lines = self.diag.view_lines()
+        if lines:
+            logger.info("VIEW ┃ %s", " ┃ ".join([""]))
+            for ln in lines:
+                logger.info("VIEW ┃ %s", ln)
+            top = self.diag.top_reasons(5)
+            if top:
+                logger.info("VIEW ┃ top rejects: %s",
+                            ", ".join(f"{k}x{v}" for k, v in top))
+
+    async def _command_loop(self) -> None:
+        """Telegram /status and /stats — same operator UX as the regime bot."""
+        while self._running:
+            try:
+                updates = await self.notifier.get_updates(self._tg_offset, timeout=25)
+                for u in updates:
+                    self._tg_offset = max(self._tg_offset, int(u.get("update_id", 0)) + 1)
+                    msg = u.get("message") or {}
+                    if str((msg.get("chat") or {}).get("id", "")) != str(self.cfg.telegram_chat_id):
+                        continue
+                    text = (msg.get("text") or "").strip().lower()
+                    if text.startswith("/status"):
+                        lines = self.diag.view_lines() or ["no data yet"]
+                        await self.notifier.info("📡 *Status*\n```\n" + "\n".join(lines) + "\n```")
+                    elif text.startswith("/stats"):
+                        r = self.perf.full_report()
+                        l30 = r["last_30"]
+                        await self.notifier.info(
+                            "📊 *Stats (last 30)*\n"
+                            f"trades `{l30.get('trades', 0)}`  WR `{100*l30.get('win_rate', 0):.0f}%`  "
+                            f"PF `{l30.get('profit_factor', '-')}`  exp `{l30.get('expectancy_r', 0):+.2f}R`\n"
+                            f"PB module `{r['module_status'].get('FAST_PULLBACK')}`  "
+                            f"MO module `{r['module_status'].get('MOMENTUM')}`")
+                    elif text.startswith("/help"):
+                        await self.notifier.info("commands: /status /stats /help")
+            except Exception as e:
+                logger.warning("[TG] command loop error: %s", e)
+                await asyncio.sleep(5)
+
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -288,6 +364,8 @@ class Bot:
 
     async def run_forever(self) -> None:
         await self.start()
+        if self.notifier.enabled:
+            self._cmd_task = asyncio.create_task(self._command_loop())
         while self._running:
             self.market_data.new_tick()
             for symbol in self.cfg.symbols:
@@ -295,6 +373,7 @@ class Bot:
                     await self.process_symbol(symbol)
                 except Exception as e:      # never let one symbol kill the loop
                     logger.error("[%s] loop error: %s", symbol, e, exc_info=True)
+            await self._maybe_view_log()
             await asyncio.sleep(self.cfg.poll_interval_sec)
 
     async def stop(self) -> None:

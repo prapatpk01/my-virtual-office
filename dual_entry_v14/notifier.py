@@ -72,6 +72,13 @@ class Notifier:
             f"Actual RR: `{abs(plan.target_price - fill_price) / max(plan.effective_risk_distance, 1e-9):.2f}`\n"
             f"Slippage: `{slip_atr:.2f} ATR`")
 
+    async def tp1(self, symbol: str, setup: str, fraction: float, pnl: float,
+                  new_sl: float, r: float) -> None:
+        await self._send(
+            f"🎯 *TP1 HIT* `{symbol}`\nSetup: `{setup}`\n"
+            f"Closed: `{fraction*100:.0f}%`  Net PnL: `{pnl:+.4f}` USDT\n"
+            f"SL -> `{new_sl:.6f}` (entry+lock)\nRunner rides to TP2  |  R now: `{r:+.2f}R`")
+
     async def breakeven(self, symbol: str, setup: str, new_sl: float, r: float) -> None:
         await self._send(
             f"🔒 *BREAK-EVEN MOVED* `{symbol}`\nSetup: `{setup}`\n"
@@ -95,3 +102,23 @@ class Notifier:
 
     async def info(self, text: str) -> None:
         await self._send(text)
+
+    async def get_updates(self, offset: int, timeout: int = 25) -> list:
+        """Long-poll Telegram for commands (/status, /stats). [] on error."""
+        import asyncio as _a
+        if not self.enabled:
+            await _a.sleep(timeout)
+            return []
+        try:
+            async with aiohttp.ClientSession() as s_:
+                async with s_.get(API.format(token=self.token, method="getUpdates"),
+                                  params={"offset": offset, "timeout": timeout,
+                                          "allowed_updates": '["message"]'},
+                                  timeout=aiohttp.ClientTimeout(total=timeout + 15)) as r:
+                    if r.status != 200:
+                        await _a.sleep(3)
+                        return []
+                    data = await r.json()
+                    return data.get("result", []) if data.get("ok") else []
+        except Exception:
+            return []

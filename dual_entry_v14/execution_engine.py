@@ -73,6 +73,8 @@ class ExecutionEngine:
         state.position_id = None
         state.pending_order_id = None
         state.breakeven_moved = False
+        state.tp1_done = False
+        state.tp1_realized = 0.0
         state.early_exit_sent = False
         state.holding_bars = 0
         state.mfe_r = 0.0
@@ -179,6 +181,8 @@ class ExecutionEngine:
         state.pending_order_id = None
         state.position_id = res.order_id
         state.breakeven_moved = False
+        state.tp1_done = False
+        state.tp1_realized = 0.0
         state.early_exit_sent = False
         state.holding_bars = 0
         self.store.save_atomic(symbol, state)

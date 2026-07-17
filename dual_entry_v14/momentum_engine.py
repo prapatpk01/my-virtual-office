@@ -21,6 +21,7 @@ from .swing_engine import swings_of
 class MomentumEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.last_block: dict = {}   # symbol -> {direction: why} — view-log diagnostics
 
     def evaluate(self, symbol: str, state: SymbolState,
                  indicators_15m: Optional[EntryIndicators], bias, macro_context,
@@ -40,6 +41,10 @@ class MomentumEngine:
     def _side(self, direction, symbol, state, i, bias, macro, regime, s15, s1h,
               zones, patterns, candle_ctx, shock_lockout):
         c = self.cfg
+
+        def blk(why: str):
+            self.last_block.setdefault(symbol, {})[direction] = why
+            return None
         long = direction == "LONG"
         price = i.val(i.closes)
         a = i.last_atr or EPS
@@ -53,40 +58,40 @@ class MomentumEngine:
         # ── breakout event detection (any one) ───────────────────────────────
         event, level, major = self._breakout_event(direction, i, s15, s1h, zones, patterns)
         if event is None:
-            return None
+            return blk("no_breakout_event")
 
         # entry timing: breakout candle or next bar only
         bars_since_break = self._bars_since_break(direction, i, level)
         if bars_since_break is None or bars_since_break > c.momentum_expiry_bars:
-            return None
+            return blk(f"break_expired({event})")
         retest_mode = bars_since_break == 1
         if retest_mode:
             # next bar must not close back inside
             if (last_close <= level) if long else (last_close >= level):
-                return None
+                return blk("retest_closed_back_inside")
 
         # ── volatility shock lockout (unless high-quality breakout allowed) ──
         if shock_lockout:
             hq = (body_atr >= c.strong_breakout_body_atr and close_q >= c.strong_breakout_close_quality
                   and major and c.allow_high_quality_shock_breakout)
             if not hq:
-                return None
+                return blk("shock_lockout")
 
         # ── hard core gates ──────────────────────────────────────────────────
         if regime.is_chop:
-            return None
+            return blk("CHOP")
         wick_only = (last_close <= level) if long else (last_close >= level)
         if wick_only:
-            return None
+            return blk("wick_only_break")
         if s1h.recent_choch_against(direction, TF_MS[c.bias_timeframe] * 8, now_ts):
-            return None
+            return blk("1H_OPP_CHOCH")
         conflict = macro.conflict_for(direction, price, zones, StructureView("4h", macro.structure_state))
         if conflict == ConflictLevel.STRONG:
-            return None
+            return blk("4H_STRONG_CONFLICT")
         allowed, bias_risk_mod, bias_why = bias.allows(
             direction, s15, zones, price, s1h, now_ts, TF_MS[c.bias_timeframe])
         if not allowed:
-            return None
+            return blk(f"bias:{bias_why}")
 
         # extension (measured vs breakout level when near, else HMA16)
         dist_level = abs(last_close - level) / a
@@ -95,7 +100,7 @@ class MomentumEngine:
         max_ext = c.strong_trend_extension_atr if "STRONG" in regime.confirmed_regime \
             else c.momentum_max_extension_atr
         if ext > max_ext:
-            return None
+            return blk(f"extended_{ext:.1f}ATR")
 
         # indicator support — flexible 2 of 4 (1 of 4 for major+strong displacement)
         hf, hs = i.val(i.hma_fast), i.val(i.hma_slow)
@@ -108,26 +113,26 @@ class MomentumEngine:
         strong_disp = body_atr >= c.strong_breakout_body_atr and close_q >= c.strong_breakout_close_quality
         need = 1 if (major and strong_disp) else 2
         if sup < need:
-            return None
+            return blk(f"indicator_support_{sup}/{need}")
 
         # candle quality sets (standard / strong / retest)
         std_ok = body_atr >= c.std_breakout_body_atr and close_q >= c.std_breakout_close_quality
         strong_ok = strong_disp and (i.volume_ratio >= c.momentum_volume_ratio or body_atr >= 0.35)
         retest_ok = retest_mode and ((last_close > level) if long else (last_close < level))
         if not (std_ok or strong_ok or retest_ok):
-            return None
+            return blk("weak_breakout_candle")
 
         # false breakout check on the prior bar
         if s15.last_false_bos is not None and s15.last_false_bos.direction != direction \
                 and now_ts - s15.last_false_bos.confirmed_at <= bar_ms * 3:
-            return None
+            return blk("recent_false_bos")
 
         # ── stop candidates & structure room ─────────────────────────────────
         stop_cands = self._stop_candidates(direction, i, level, s15, patterns)
         prelim_stop = stop_cands[0][1] if stop_cands else (price - a if long else price + a)
         risk_dist = abs(price - prelim_stop)
         if risk_dist <= 0:
-            return None
+            return blk("no_stop_structure")
         opp = nearest_opposing_zone(zones, direction, price, min_score=c.zone_min_score)
         if opp is not None:
             room = (opp.lower_price - price) if long else (price - opp.upper_price)
@@ -135,7 +140,7 @@ class MomentumEngine:
         else:
             room_r = 99.0
         if room_r < c.momentum_min_structure_room_r:
-            return None
+            return blk(f"room_{room_r:.1f}R")
 
         # ── breakout quality score (0-30) ────────────────────────────────────
         bq = 0.0
@@ -150,7 +155,7 @@ class MomentumEngine:
         breakout_quality_high = bq >= 20.0
 
         if not regime.allows_momentum(direction, breakout_quality_high, confirmed_breakout=True):
-            return None
+            return blk(f"regime={regime.confirmed_regime}_bq{bq:.0f}")
 
         # ── momentum score (0-100, spec 19.7) ────────────────────────────────
         score = 0.0
@@ -182,10 +187,11 @@ class MomentumEngine:
             thr += c.mod_opposing_near
         thr = float(np.clip(thr, c.momentum_threshold_min, c.momentum_threshold_max))
         if score < thr:
-            return None
+            return blk(f"score_{score:.0f}<{thr:.0f}")
         if room_r < c.momentum_hq_room_r and not breakout_quality_high:
-            return None
+            return blk(f"room_{room_r:.1f}R_needs_bq")
 
+        self.last_block.setdefault(symbol, {})[direction] = f"READY score={score:.0f}"
         risk_mod = bias_risk_mod * (0.85 if conflict == ConflictLevel.MILD else 1.0)
         target_ref = (opp.lower_price - a * c.target_buffer_atr) if (long and opp is not None) else \
                      (opp.upper_price + a * c.target_buffer_atr) if (not long and opp is not None) else \

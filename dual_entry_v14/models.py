@@ -340,6 +340,8 @@ class SymbolState:
     mae_r: float = 0.0
 
     breakeven_moved: bool = False
+    tp1_done: bool = False
+    tp1_realized: float = 0.0
     early_exit_sent: bool = False
 
     pending_order_id: Optional[str] = None

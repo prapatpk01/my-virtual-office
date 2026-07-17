@@ -21,6 +21,7 @@ from .support_resistance_engine import nearest_opposing_zone, zones_at_price
 class PullbackEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.last_block: dict = {}   # symbol -> {direction: why} — view-log diagnostics
 
     # ── public ───────────────────────────────────────────────────────────────
     def evaluate(self, symbol: str, state: SymbolState,
@@ -43,6 +44,10 @@ class PullbackEngine:
     def _evaluate_side(self, direction, symbol, state, i, bias, macro, regime,
                        s15, s1h, zones, patterns, candle_ctx, liq, sd_zones):
         c = self.cfg
+
+        def blk(why: str):
+            self.last_block.setdefault(symbol, {})[direction] = why
+            return None
         long = direction == "LONG"
         price = i.val(i.closes)
         a = i.last_atr or EPS
@@ -51,33 +56,33 @@ class PullbackEngine:
 
         # ── regime gate (hard: chop / wrong regime) ──────────────────────────
         if regime.is_chop:
-            return None
+            return blk("CHOP")
         if not regime.allows_pullback(direction):
-            return None
+            return blk(f"regime={regime.confirmed_regime}")
 
         # ── bias soft-mode gate ──────────────────────────────────────────────
         allowed, bias_risk_mod, bias_why = bias.allows(
             direction, s15, zones, price, s1h, now_ts, TF_MS[c.bias_timeframe])
         if not allowed:
-            return None
+            return blk(f"bias:{bias_why}")
 
         # ── 4H conflict ──────────────────────────────────────────────────────
         conflict = macro.conflict_for(direction, price, zones, self._macro_view(macro, s1h))
         if conflict == ConflictLevel.STRONG:
-            return None
+            return blk("4H_STRONG_CONFLICT")
         # 1H confirmed opposite CHOCH (hard)
         if s1h.recent_choch_against(direction, TF_MS[c.bias_timeframe] * 8, now_ts):
-            return None
+            return blk("1H_OPP_CHOCH")
 
         # ── prior context (A structure / B displacement / C momentum) ───────
         prior_ok, prior_detail = self._prior_context(direction, i, s15)
         if not prior_ok:
-            return None
+            return blk("no_prior_context")
 
         # ── location ─────────────────────────────────────────────────────────
         loc = self._location(direction, i, zones, sd_zones, liq, s15, patterns)
         if loc is None:
-            return None
+            return blk("waiting_location")
         pb_type, zone, zone_score, loc_score = loc
 
         # deep pullback allowance check
@@ -93,19 +98,19 @@ class PullbackEngine:
                      or self._reclaimed(direction, i))
             )
             if not ok_deep:
-                return None
+                return blk("deep_pb_unconfirmed")
             pb_type = PullbackType.DEEP_PULLBACK.value
 
         # ── trigger (tier 1 fast / tier 2 confirmed) ─────────────────────────
         trig = self._trigger(direction, i, candle_ctx, liq, zone_score, s15)
         if trig is None:
-            return None
+            return blk(f"waiting_trigger@{pb_type}")
         trigger_name, trigger_tier, trig_pts = trig
 
         # extension guard: don't buy a pullback that already rebounded too far
         ext = i.long_extension_atr if long else i.short_extension_atr
         if ext > c.pullback_max_extension_atr:
-            return None
+            return blk(f"extended_{ext:.1f}ATR")
 
         # ── stops & structure room (hard gates) ──────────────────────────────
         stop_cands = self._stop_candidates(direction, i, state, zone, liq, s15)
@@ -116,14 +121,14 @@ class PullbackEngine:
             price - a if long else price + a)
         risk_dist = abs(entry_ref - prelim_stop)
         if risk_dist <= 0:
-            return None
+            return blk("no_stop_structure")
         if opp is not None:
             room = (opp.lower_price - entry_ref) if long else (entry_ref - opp.upper_price)
             room_r = room / risk_dist
         else:
             room_r = 99.0
         if room_r < c.pullback_min_structure_room_r:
-            return None
+            return blk(f"room_{room_r:.1f}R")
 
         # ── score (spec 18.10) ───────────────────────────────────────────────
         score = 0.0
@@ -156,11 +161,12 @@ class PullbackEngine:
             score = min(100.0, score + 3.0)
         thr = float(np.clip(thr, c.pullback_threshold_min, c.pullback_threshold_max))
         if score < thr:
-            return None
+            return blk(f"score_{score:.0f}<{thr:.0f}")
         # 1.00-1.10R room passes only for high-quality setups
         if room_r < c.pullback_hq_room_r and score < thr + 4:
-            return None
+            return blk(f"room_{room_r:.1f}R_needs_hq")
 
+        self.last_block.setdefault(symbol, {})[direction] = f"READY score={score:.0f}"
         risk_mod = bias_risk_mod
         if pb_type == PullbackType.DEEP_PULLBACK.value:
             risk_mod *= 0.8

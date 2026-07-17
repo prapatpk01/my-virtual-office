@@ -136,9 +136,13 @@ class PositionManager:
             return True
         return False
 
-    # ── break-even ───────────────────────────────────────────────────────────
+    # ── TP1 partial + break-even (2-TP scheme, like the regime bot) ──────────
 
     async def _maybe_breakeven(self, symbol, state, r_now, entry, risk, long) -> None:
+        """At the setup-specific trigger R: close tp1_fraction (60%) as TP1,
+        move the stop to entry +/- be_lock_r, and let the runner ride to TP2
+        (the plan target). With use_partial_tp=False this degrades to the old
+        pure break-even move."""
         c = self.cfg
         if state.breakeven_moved:
             return
@@ -146,6 +150,22 @@ class PositionManager:
                    else c.pullback_be_trigger_r)
         if r_now < trigger:
             return
+
+        tp1_pnl = 0.0
+        closed_qty = 0.0
+        if c.use_partial_tp and state.actual_quantity:
+            close_qty = state.actual_quantity * c.tp1_fraction
+            res = await self.x.close_position(symbol, state.setup_direction, close_qty)
+            if res.status == "filled" and res.filled_qty > 0:
+                closed_qty = res.filled_qty
+                exit_px = res.avg_price or entry
+                gross = (exit_px - entry) * closed_qty if long else (entry - exit_px) * closed_qty
+                tp1_pnl = (res.realized_pnl or gross) - res.fee_cost \
+                    - state.entry_fee * (closed_qty / max((state.actual_quantity), 1e-12))
+                state.actual_quantity = max(0.0, state.actual_quantity - closed_qty)
+                state.tp1_realized += tp1_pnl
+                state.tp1_done = True
+
         new_sl = entry + c.be_lock_r * risk if long else entry - c.be_lock_r * risk
         ok = await self.x.amend_protection(symbol, state.setup_direction,
                                            state.actual_quantity or 0.0,
@@ -153,8 +173,14 @@ class PositionManager:
         if ok:
             state.breakeven_moved = True
             state.active_stop = new_sl
-            self.store.journal(symbol, "BREAKEVEN_MOVED", {"new_sl": new_sl, "r": r_now})
-            if self.notifier:
+        self.store.journal(symbol, "TP1_PARTIAL" if closed_qty > 0 else "BREAKEVEN_MOVED",
+                           {"new_sl": new_sl, "r": r_now, "closed_qty": closed_qty,
+                            "tp1_pnl": tp1_pnl})
+        if self.notifier:
+            if closed_qty > 0:
+                await self.notifier.tp1(symbol, state.setup_type, c.tp1_fraction,
+                                        tp1_pnl, new_sl, r_now)
+            else:
                 await self.notifier.breakeven(symbol, state.setup_type, new_sl, r_now)
 
     # ── close + cooldown + record ────────────────────────────────────────────
@@ -170,7 +196,11 @@ class PositionManager:
         long = state.setup_direction == "LONG"
         gross = (exit_px - entry) * qty if long else (entry - exit_px) * qty
         fees = state.entry_fee + res.fee_cost
-        pnl = (res.realized_pnl or gross) - res.fee_cost - state.entry_fee
+        runner_fee_share = state.entry_fee * (0.0 if not state.tp1_done else (1.0 - self.cfg.tp1_fraction))
+        entry_fee_leg = state.entry_fee if not state.tp1_done else runner_fee_share
+        pnl = (res.realized_pnl or gross) - res.fee_cost - entry_fee_leg
+        # whole-trade totals include the TP1 leg banked earlier
+        pnl += state.tp1_realized
         result_r = ((exit_px - entry) / risk) if long else ((entry - exit_px) / risk)
 
         if self.perf is not None:

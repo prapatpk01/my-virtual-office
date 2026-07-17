@@ -184,8 +184,14 @@ class Config:
     signal_expiry_bars: int = 1                 # candidate valid this bar + next
 
     # ── Position management ─────────────────────────────────────────────────
-    pullback_be_trigger_r: float = 0.65
-    momentum_be_trigger_r: float = 0.75
+    # 2-TP scheme (like the regime bot, per user): when the setup-specific
+    # trigger R is reached, TP1 closes tp1_fraction of the position AND the
+    # stop moves to entry +/- be_lock_r; the runner rides to TP2 (the plan
+    # target). Set use_partial_tp=False for the old single-target behavior.
+    use_partial_tp: bool = True
+    tp1_fraction: float = 0.60
+    pullback_be_trigger_r: float = 0.65   # TP1 trigger (R) for FAST_PULLBACK
+    momentum_be_trigger_r: float = 0.75   # TP1 trigger (R) for MOMENTUM
     be_lock_r: float = 0.10   # BE move locks entry +/- 0.1R (was 0.05, per user)
     min_hold_bars_soft_exit: int = 2
 
@@ -231,6 +237,7 @@ class Config:
 
     # ── Ops ─────────────────────────────────────────────────────────────────
     poll_interval_sec: int = 20
+    view_log_interval_sec: int = 300   # regime-style periodic view log (Railway logs)
     reconcile_every_loops: int = 1
     state_dir: str = "state"
     enable_advanced_patterns_live: bool = False
