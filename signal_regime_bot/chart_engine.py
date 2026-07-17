@@ -20,26 +20,27 @@ import indicators as ind
 logger = logging.getLogger("chart_engine")
 
 
-def build_entry_chart(symbol: str, df_15m: pd.DataFrame, direction: str,
+def build_entry_chart(symbol: str, df: pd.DataFrame, direction: str,
                       entry: float, sl: float, tp1: float, tp2: float,
                       out_dir: Optional[str] = None,
-                      hma_fast_len: int = 10, hma_slow_len: int = 16) -> Optional[str]:
-    """Save a candlestick chart with overlays; return the file path, or None on failure."""
+                      ema_fast_len: int = 10, ema_slow_len: int = 20,
+                      tf_label: str = "5M") -> Optional[str]:
+    """Save a candlestick chart of the L3c timeframe (5M) with the EMA10/20
+    pair that both times the entry and gates the exit, plus entry/SL/TP lines.
+    Returns the file path, or None on failure."""
     try:
-        plot_df = df_15m.tail(120).copy()
+        plot_df = df.tail(120).copy()
         if plot_df.empty:
             return None
 
         closes = plot_df["close"]
-        ema15 = ind.ema(closes, 15)
-        hma_fast = ind.hma(closes, hma_fast_len)
-        hma_slow = ind.hma(closes, hma_slow_len)
+        ema_fast = ind.ema(closes, ema_fast_len)
+        ema_slow = ind.ema(closes, ema_slow_len)
         swing_high, swing_low = ind.recent_swing_levels(plot_df["high"], plot_df["low"], 3, 3)
 
         addplots = [
-            mpf.make_addplot(ema15, color="#f0b90b", width=1.1),
-            mpf.make_addplot(hma_fast, color="#00d4ff", width=1.0),
-            mpf.make_addplot(hma_slow, color="#ff5d8f", width=1.0),
+            mpf.make_addplot(ema_fast, color="#00d4ff", width=1.1),   # EMA10 (L3c fast)
+            mpf.make_addplot(ema_slow, color="#ff5d8f", width=1.1),   # EMA20 (L3c slow)
         ]
 
         hlines = dict(
@@ -70,7 +71,7 @@ def build_entry_chart(symbol: str, df_15m: pd.DataFrame, direction: str,
         fname = f"{symbol.replace('/', '_').replace(':', '_')}_{int(time.time())}.png"
         path = os.path.join(out_dir, fname)
 
-        title = f"{symbol}  {direction}  entry={entry:.4f}"
+        title = f"{symbol}  {direction}  {tf_label} EMA{ema_fast_len}/{ema_slow_len}  entry={entry:.4f}"
         mpf.plot(plot_df, type="candle", style=style, addplot=addplots, hlines=hlines,
                  volume=True, title=title, savefig=dict(fname=path, dpi=130, bbox_inches="tight"))
         return path

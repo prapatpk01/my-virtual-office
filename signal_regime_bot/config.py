@@ -390,6 +390,7 @@ class Config:
     # Loop timing
     poll_interval_sec: int = 30    # how often main.py checks for a newly-closed 30m bar
     reconcile_interval_sec: int = 60   # how often to sweep OKX for untracked positions and adopt them
+    reconcile_settle_grace_sec: int = 90   # after a close, don't re-adopt this symbol until OKX settles to zero
     status_log_interval_sec: int = 300  # per-symbol regime/bias/entry status log cadence
     fetch_limit_entry: int = 300
     fetch_limit_bias: int = 300

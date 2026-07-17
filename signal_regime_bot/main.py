@@ -102,7 +102,8 @@ class Bot:
                 f"🤖 *Bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT\n"
-                f"Architecture: Regime → Bias → Entry (strict 3-layer)"
+                f"Architecture: Regime → Bias → Entry (3-TF cross confluence: "
+                f"30M HMA / 15M EMA5-9 / 5M EMA10-20, ≥2 within 45m)"
             )
 
     async def stop(self):
@@ -272,10 +273,13 @@ class Bot:
             return
 
         risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
+        # Chart the L3c timeframe (5M) with its EMA10/20 — the layer that times
+        # the entry and gates the exit — so the signal image matches the system.
         chart_path = build_entry_chart(
-            symbol, df_15m, sig.direction, sig.price,
+            symbol, df_5m, sig.direction, sig.price,
             *self._preview_sl_tp(sig, df_15m),
-            hma_fast_len=self.cfg.hma_fast_length, hma_slow_len=self.cfg.hma_slow_length,
+            ema_fast_len=self.cfg.l3c_ema_fast, ema_slow_len=self.cfg.l3c_ema_slow,
+            tf_label=self.cfg.l3c_tf.upper(),
         )
 
         pos = await self.positions.open_position(

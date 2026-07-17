@@ -115,9 +115,13 @@ class PositionManager:
         # before allowing re-entry — see entry_engine.EntryEngine.on_position_closed.
         self.entry_engine = entry_engine
         self._positions: dict[str, Position] = {}   # key: symbol (1 position per symbol, either side)
+        self._recently_closed: dict[str, float] = {}   # symbol -> close wall-time, to block re-adopting an unsettled close
 
     def get(self, symbol: str) -> Optional[Position]:
         return self._positions.get(symbol)
+
+    def _mark_closed(self, symbol: str) -> None:
+        self._recently_closed[symbol] = time.time()
 
     def has_position(self, symbol: str) -> bool:
         return symbol in self._positions
@@ -163,8 +167,14 @@ class PositionManager:
         """
         c = self.cfg
         adopted = []
+        now = time.time()
         for symbol in symbols:
             if self.has_position(symbol):
+                continue
+            # Don't re-adopt a position the bot just closed but OKX hasn't
+            # settled to zero yet — that would resurrect a phantom.
+            closed_at = self._recently_closed.get(symbol)
+            if closed_at is not None and now - closed_at < c.reconcile_settle_grace_sec:
                 continue
             for side in (LONG, SHORT):
                 details = await self.client.fetch_position_details(symbol, side)
@@ -336,6 +346,7 @@ class PositionManager:
         balance = await self.client.fetch_balance_usdt()
         self.risk.register_trade_result(pnl, balance, time.time())
         del self._positions[pos.symbol]
+        self._mark_closed(pos.symbol)
         self.entry_engine.on_position_closed(pos.symbol)
         logger.info("[POS] %s %s: confirmed closed externally (exchange algo) — "
                    "synced internal state, net≈%.2f incl fees (approximate, exact fill unknown)",
@@ -433,6 +444,7 @@ class PositionManager:
         self.risk.register_trade_result(pnl, balance, time.time())
 
         del self._positions[pos.symbol]
+        self._mark_closed(pos.symbol)
         self.entry_engine.on_position_closed(pos.symbol)
         return {"event": reason, "symbol": pos.symbol, "side": pos.side, "price": leg["exit_price"],
                "pnl": pnl, "realized": leg["realized"], "exit_fee": leg["exit_fee"],
