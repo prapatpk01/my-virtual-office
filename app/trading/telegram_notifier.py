@@ -221,15 +221,19 @@ class TelegramNotifier:
                 await self._send("No bots connected.")
             return
 
-        lines = ["📊 Adaptive Bot Stats\n"]
+        DIVIDER = "――――――――――――――――"
+
         total_pnl    = 0.0
         total_trades = 0
         total_wins   = 0
         total_losses = 0
         balance      = 0.0
         open_lines   = []
-        all_trades: list = []   # every closed trade across every symbol, for
-                                 # the TP1/TP2 breakdown + "last 5" section below
+        # per-symbol trade stats for SECTION 2 — separate from all_trades
+        # (which is per-CLOSED-TRADE, flattened, for the TP1/TP2 breakdown
+        # and last-5 list) so a symbol with 0 trades still gets its own row.
+        per_symbol: list = []
+        all_trades: list = []   # every closed trade across every symbol
 
         for sym, (bot, _) in bots.items():
             try:
@@ -243,15 +247,7 @@ class TelegramNotifier:
                 total_wins   += perf.get("wins", 0)
                 total_losses += perf.get("losses", 0)
                 balance = st.get("account_balance", balance)
-
-                regime = st.get("market_state", "?")
-                pos = "IN_POS" if st.get("position_open") else st.get("state", "?")
-                warmup = st.get("warmup_remaining_m", 0)
-                warmup_str = f" | WARMUP {warmup}m" if warmup > 0 else ""
-                lines.append(
-                    f"{sym}: {pos} | {regime} | "
-                    f"{n}T {wr:.0f}%WR ${pnl:+.0f}{warmup_str}"
-                )
+                per_symbol.append((sym, n, wr, pnl))
 
                 if st.get("position_open"):
                     t = getattr(bot, "current_trade", {}) or {}
@@ -268,44 +264,62 @@ class TelegramNotifier:
                 for tr in getattr(bot, "trade_journal", []) or []:
                     all_trades.append({**tr, "_symbol": sym})
             except Exception as e:
-                lines.append(f"{sym}: error ({e})")
+                per_symbol.append((sym, None, None, None))
+                logger.warning("[stats] %s: %s", sym, e)
 
-        lines.append(f"\n💰 Balance: ${balance:,.2f}")
+        n_all = len(all_trades)
+        tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
+        tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
+        sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
+        overall_wr = total_wins / total_trades * 100 if total_trades else 0.0
+
+        lines = ["📊 Adaptive Bot Stats", ""]
+        lines.append(f"💰 Balance: ${balance:,.2f}")
         if open_lines:
-            lines.append("\n📌 Open Positions:\n" + "\n".join(open_lines))
+            lines.append("📌 Open: " + " | ".join(open_lines))
         else:
-            lines.append("\n📌 No open positions")
-        lines.append(
-            f"\n📈 Total: {total_trades} trades | "
-            f"{total_wins}W/{total_losses}L | Net PnL: ${total_pnl:+,.2f}"
-        )
+            lines.append("📌 No open positions")
 
-        # [TP1/TP2 BREAKDOWN] which ladder level each closed trade actually
-        # reached — "SL only" (never got a partial banked) vs T1-then-
-        # reversed vs the full T1->T2 run, across every symbol combined.
-        if all_trades:
-            tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
-            tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
-            sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
-            n_all = len(all_trades)
+        # ── SECTION 1: overall win rate + TP1/TP2/SL breakdown + PnL ─────────
+        lines += ["", DIVIDER, "OVERALL", DIVIDER]
+        lines.append(f"Trades   : {total_trades}  ({total_wins}W / {total_losses}L)")
+        lines.append(f"Win rate : {overall_wr:.0f}%")
+        if n_all:
             lines.append(
-                f"\n🎯 TP1 hit: {tp1_n}/{n_all} ({tp1_n/n_all*100:.0f}%) | "
-                f"TP2 hit: {tp2_n}/{n_all} ({tp2_n/n_all*100:.0f}%) | "
-                f"SL only: {sl_only_n}/{n_all} ({sl_only_n/n_all*100:.0f}%)"
+                f"TP1 hit  : {tp1_n}/{n_all} ({tp1_n/n_all*100:.0f}%)   "
+                f"TP2 hit : {tp2_n}/{n_all} ({tp2_n/n_all*100:.0f}%)   "
+                f"SL only : {sl_only_n}/{n_all} ({sl_only_n/n_all*100:.0f}%)"
             )
+        lines.append(f"Net PnL  : ${total_pnl:+,.2f}")
 
-            # [LAST 5] most recent closed trades across all symbols, newest
-            # first — closed_at is an ISO string so it sorts correctly as text.
+        # ── SECTION 2: per-symbol trade count + win rate ─────────────────────
+        lines += ["", DIVIDER, "BY SYMBOL", DIVIDER]
+        for sym, n, wr, pnl in per_symbol:
+            base = sym.split("/")[0]
+            if n is None:
+                lines.append(f"{base:6s} error reading stats")
+            elif n == 0:
+                lines.append(f"{base:6s}  0 trades")
+            else:
+                lines.append(f"{base:6s}  {n} trades  {wr:.0f}%WR  ${pnl:+.2f}")
+
+        # ── SECTION 3: last 5 closed trades across every symbol ──────────────
+        lines += ["", DIVIDER, "LAST 5 TRADES", DIVIDER]
+        if not all_trades:
+            lines.append("No closed trades yet")
+        else:
+            # closed_at is an ISO string so it sorts correctly as text.
             recent = sorted(all_trades, key=lambda tr: tr.get("closed_at") or "", reverse=True)[:5]
-            lines.append("\n📋 Last 5 trades:")
             for i, tr in enumerate(recent, 1):
                 result_emoji = "✅" if tr.get("win_loss") == "WIN" else "❌"
                 targets = ",".join(tr.get("targets_hit") or []) or "SL"
+                base = tr["_symbol"].split("/")[0]
                 lines.append(
-                    f"{i}. {result_emoji} {tr['_symbol']} {tr.get('direction', '?')} "
+                    f"{i}. {result_emoji} {base} {tr.get('direction', '?')} "
                     f"{tr.get('realized_r', 0):+.2f}R (${tr.get('pnl', 0):+.2f}) "
                     f"[{targets}] — {_time_ago(tr.get('closed_at'))}"
                 )
+
         await self._send("\n".join(lines))
 
     async def _cmd_log(self, n: int = 15):
