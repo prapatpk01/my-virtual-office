@@ -188,9 +188,28 @@ class Bot:
             finally:
                 self.state_store.save_atomic(symbol, state)
 
+    def _commodity_halted(self, symbol: str) -> bool:
+        """XAU/XAG weekend halt: no NEW entries Fri 17:00 UTC -> Sun 21:00 UTC
+        (= Sat 00:00 -> Mon 04:00 Asia/Bangkok, 3h before the Mon 07:00 open).
+        Uses exchange.now_ms() so backtests replay the same gate."""
+        c = self.cfg
+        if not c.commodity_weekend_block:
+            return False
+        if not any(k in symbol.upper() for k in c.commodity_symbol_keywords):
+            return False
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(self.exchange.now_ms() / 1000, tz=timezone.utc)
+        wd, hr = dt.weekday(), dt.hour
+        return ((wd == 4 and hr >= c.commodity_halt_hour_utc) or wd == 5
+                or (wd == 6 and hr < c.commodity_resume_hour_utc))
+
     async def _look_for_entry(self, symbol, state, ind_15m, bias, macro_ctx, regime,
                               s15, s1h, zones, patterns, candle_ctx, liq, sd,
                               shock_locked, exchange_state) -> None:
+        if self._commodity_halted(symbol):
+            self.diag.record_rejection(symbol, [ReasonCode.REJECT_MARKET_CLOSED.value])
+            self.diag.set_view(symbol, f"{_sym(symbol)} | NO TRADE | Reason=MARKET_CLOSED (weekend)")
+            return
         pb = self.pullback.evaluate(symbol, state, ind_15m, bias, macro_ctx, regime,
                                     s15, s1h, zones, patterns, candle_ctx, liq, sd)
         mo = self.momentum.evaluate(symbol, state, ind_15m, bias, macro_ctx, regime,

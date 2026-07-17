@@ -216,6 +216,17 @@ class Config:
     mod_major_breakout: float = -2.0
     mod_reduced_module: float = 2.0
 
+    # ── Commodity market hours (XAU/XAG) ────────────────────────────────────
+    # Underlying metals market closes on weekends — the OKX perp still quotes
+    # but it's illiquid. Block NEW entries for matching symbols from Friday
+    # commodity_halt_hour_utc (17:00 UTC = Sat 00:00 Asia/Bangkok) until
+    # Sunday commodity_resume_hour_utc (21:00 UTC = Mon 04:00 ICT, 3h before
+    # the Mon 07:00 ICT open). Open positions keep being managed throughout.
+    commodity_weekend_block: bool = True
+    commodity_symbol_keywords: tuple = ("XAU", "XAG")
+    commodity_halt_hour_utc: int = 17
+    commodity_resume_hour_utc: int = 21
+
     # ── Ops ─────────────────────────────────────────────────────────────────
     poll_interval_sec: int = 20
     reconcile_every_loops: int = 1
