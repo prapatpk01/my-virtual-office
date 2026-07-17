@@ -61,3 +61,5 @@ and trade statistics would reset on every deploy.
   (shadow mode keeps evaluating it; it re-opens only on improvement).
 - Emergency protection: if SL/TP can't be attached after retries, the
   position is closed immediately and a CRITICAL alert is sent.
+
+<!-- deploy marker: V1.4 default since commit 95d5f47 -->
