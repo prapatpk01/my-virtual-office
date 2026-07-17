@@ -731,6 +731,16 @@ class TradingBot:
                     if update.new_sl is not None:
                         self.risk.update_stop_loss(sym, update.new_sl, strategy=strategy_name)
                         logger.info("[%s] SL moved to BE=%.4f after TP1", strategy_name, update.new_sl)
+                        # Re-place the exchange SL/TP on the REMAINING size at BE,
+                        # so OKX enforces break-even + the original target.
+                        remaining = max(0.0, pos_info["amount"] - fill["exit_sz"])
+                        if remaining > 0:
+                            try:
+                                await self.connector.set_position_tpsl(
+                                    sym, pos_info["side"], remaining,
+                                    sl=update.new_sl, tp=pos_info.get("take_profit"))
+                            except Exception as e:
+                                logger.warning("[TPSL] BE update failed for %s: %s", sym, e)
                     self._record_trade(TradeRecord(
                         timestamp=int(time.time() * 1000),
                         symbol=sym, side=close_side,
@@ -770,6 +780,12 @@ class TradingBot:
             close_side = "sell" if pos_info["side"] == "long" else "buy"
             pos_side = pos_info["side"] if self._hedge_mode else None
             try:
+                # Clear the exchange SL/TP first so no reduce-only algo lingers
+                # after we close the position ourselves.
+                try:
+                    await self.connector.set_position_tpsl(sym, pos_info["side"], 0.0)
+                except Exception:
+                    pass
                 close_order = await self.connector.create_order(sym, close_side, pos_info["amount"], pos_side=pos_side)
                 fill = self._close_fill_info(f"{sym}||{strategy_name}", close_order, price,
                                              pos_info["amount"], 1.0, final=True)
@@ -1242,6 +1258,16 @@ class TradingBot:
                 "avg_px": entry_px, "size": entry_sz,
                 "fee": getattr(order, "fee", 0.0) or 0.0, "fee_frac_left": 1.0,
             }
+
+            # Attach the hard SL/TP on the exchange itself (OKX algo orders), so
+            # the stop/target are enforced even if the bot loop stalls. No-op in
+            # paper/spot; failure is logged and never blocks the open position.
+            if sl_p or tp_p:
+                try:
+                    await self.connector.set_position_tpsl(
+                        sym, direction, entry_sz, sl=sl_p, tp=tp_p)
+                except Exception as e:
+                    logger.warning("[TPSL] set on open failed for %s: %s", sym, e)
 
             # Register position in portfolio engine
             self._portfolio.add_position(

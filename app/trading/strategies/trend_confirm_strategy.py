@@ -154,7 +154,12 @@ class TrendConfirmStrategy(BaseStrategy):
                                     #   without this, a cross was only good on the exact bar every gate was
                                     #   already open (quality/location often clear 1-2 bars AFTER the cross,
                                     #   which silently wasted almost every signal)
-        max_dist_atr_mult: float = 1.5,  # max distance from the chase EMA in ATR(5m)
+        max_dist_atr_mult: float = 1.8,  # max distance from the chase EMA in ATR(5m)
+        # Position sizing (emitted in the signal so bot.py sizes live orders the
+        # same way the paper account does): margin = margin_pct of balance,
+        # notional = margin x leverage. e.g. $100 x 5% = $5 x 20 = $100 notional.
+        sizing_mode: str = "margin",
+        margin_pct: float = 0.05,
         # Location & structure-room filter (lightweight; avoids late/blocked entries)
         use_location_filter: bool = True,
         structure_pivot_left: int = 2,
@@ -236,6 +241,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self.chase_ema_ref = chase_ema_ref
         self.fresh_trend_bars = fresh_trend_bars
         self.cross_valid_bars = cross_valid_bars
+        self.sizing_mode = sizing_mode
+        self.margin_pct = margin_pct
         self.max_dist_atr_mult = max_dist_atr_mult
 
         self.use_location_filter = use_location_filter
@@ -514,6 +521,7 @@ class TrendConfirmStrategy(BaseStrategy):
             self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
             meta = dbg("entered")
             meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio,
+                         "sizing_mode": self.sizing_mode, "margin_pct": self.margin_pct,
                          "structure_room_r": location.get("structure_room_r"),
                          "nearest_opposing_zone": location.get("nearest_opposing_zone")})
             return Signal(
@@ -546,6 +554,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
         meta = dbg("entered")
         meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio,
+                     "sizing_mode": self.sizing_mode, "margin_pct": self.margin_pct,
                      "structure_room_r": location.get("structure_room_r"),
                      "nearest_opposing_zone": location.get("nearest_opposing_zone")})
         return Signal(

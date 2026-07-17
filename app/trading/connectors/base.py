@@ -75,6 +75,12 @@ class BaseConnector(ABC):
     async def fetch_balance(self) -> list[Balance]:
         """Get account balances."""
 
+    async def set_position_tpsl(self, symbol: str, pos_side: str, amount: float,
+                                sl: Optional[float] = None, tp: Optional[float] = None) -> bool:
+        """Place/replace exchange-side reduce-only TP/SL for a position.
+        Default no-op for connectors that don't support it (paper/spot/forex)."""
+        return False
+
     @property
     def name(self) -> str:
         return self.__class__.__name__

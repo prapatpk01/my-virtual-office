@@ -302,6 +302,58 @@ class BinanceConnector(BaseConnector):
         self._paper_open_orders.append(order)
         return order
 
+    async def set_position_tpsl(
+        self,
+        symbol: str,
+        pos_side: str,          # 'long' | 'short'
+        amount: float,
+        sl: Optional[float] = None,
+        tp: Optional[float] = None,
+    ) -> bool:
+        """Place (or replace) reduce-only TP/SL algo orders on the exchange so
+        the stop/target are visible and enforced by OKX itself — not only by
+        the bot loop. Cancels any existing trigger orders for the symbol first,
+        then places a stop-market (SL) and a take-profit-market (TP), each sized
+        to `amount` and closing the position side. Used on entry (full size) and
+        again after TP1 (remaining size + break-even SL).
+
+        No-op in paper mode. Best-effort: a failure here is logged and swallowed
+        so it can never take down the actual position management."""
+        if self.paper or not self._futures:
+            return False
+        close_side = "sell" if pos_side == "long" else "buy"
+        params_base: dict = {"reduceOnly": True}
+        if self._hedge_mode:
+            params_base["posSide"] = pos_side
+        ok = True
+        # 1) clear existing trigger/algo orders for this symbol
+        try:
+            await self._exchange.cancel_all_orders(symbol, params={"trigger": True})
+        except Exception as e:
+            logger.debug("[TPSL] cancel existing trigger orders failed for %s: %s", symbol, e)
+        # 2) (re)place SL and TP as reduce-only trigger orders
+        if sl:
+            try:
+                await self._exchange.create_order(
+                    symbol, "market", close_side, amount,
+                    params={**params_base, "stopLossPrice": sl},
+                )
+                logger.info("[TPSL] SL set on %s %s @ %.6g (sz %.6g)", symbol, pos_side, sl, amount)
+            except Exception as e:
+                ok = False
+                logger.warning("[TPSL] failed to set SL on %s: %s", symbol, e)
+        if tp:
+            try:
+                await self._exchange.create_order(
+                    symbol, "market", close_side, amount,
+                    params={**params_base, "takeProfitPrice": tp},
+                )
+                logger.info("[TPSL] TP set on %s %s @ %.6g (sz %.6g)", symbol, pos_side, tp, amount)
+            except Exception as e:
+                ok = False
+                logger.warning("[TPSL] failed to set TP on %s: %s", symbol, e)
+        return ok
+
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         if self.paper:
             self._paper_open_orders = [o for o in self._paper_open_orders if o.order_id != order_id]
