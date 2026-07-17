@@ -163,7 +163,9 @@ class Config:
     momentum_expiry_bars: int = 1               # breakout candle or the next bar only
 
     # ── Risk manager ────────────────────────────────────────────────────────
-    risk_per_trade: float = 0.03
+    # 5% per user request (matches the legacy regime bot). The >2% warning
+    # still fires at startup — one stop-out costs this much equity.
+    risk_per_trade: float = 0.05
     risk_warning_level: float = 0.02
     min_stop_atr: float = 0.45
     max_stop_atr: float = 1.60
@@ -272,7 +274,7 @@ def load_config() -> Config:
         okx_passphrase=os.environ.get("OKX_PASSPHRASE", ""),
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
-        risk_per_trade=_env("RISK_PER_TRADE", 0.03, float),
+        risk_per_trade=_env("RISK_PER_TRADE", 0.05, float),
         max_positions=_env("MAX_POSITIONS", 2, int),
         state_dir=os.environ.get("STATE_DIR", "state"),
         poll_interval_sec=_env("POLL_INTERVAL_SEC", 20, int),
