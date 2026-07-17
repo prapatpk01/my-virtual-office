@@ -41,14 +41,14 @@ Layer 2 — Trade CONTEXT: trend quality (2a) + location/structure (2b).
 
 Layer 3 — Entry TIMING (TF5m), reached only after Layer1 + Layer2 both pass:
   LONG (only after Layer1+Layer2 confirm UP):
-    1. EMA5 crosses above EMA9 (5m)
-    2. price (close) is above EMA9 (5m) — the same line the cross + exit use
+    1. EMA10 crosses above EMA20 (5m)
+    2. price (close) is above EMA20 (5m) — the same line the cross + exit use
     3. price is within `max_dist_atr_mult` (default 1.5) x ATR(14,5m) of EMA50
   SHORT (only after Layer1+Layer2 confirm DOWN): the mirror —
-    1. EMA5 crosses below EMA9 (5m)
-    2. price below EMA9 (5m)
+    1. EMA10 crosses below EMA20 (5m)
+    2. price below EMA20 (5m)
     3. price within 1.5 x ATR of EMA50
-  Early-trend window: the 5m EMA5/9 cross is faster than Layer 1's 30m
+  Early-trend window: the 5m EMA10/20 cross is faster than Layer 1's 30m
   confirmation, so the cross that starts a move often fires a bar or two
   BEFORE the trend confirms. When Layer 1's trend JUST confirmed (within
   `fresh_trend_bars`, default 2, 5m bars of when it flipped) the entry counts
@@ -71,9 +71,9 @@ Exit — a 2-TP + break-even scheme managed in tick_open_position():
     final TP), take `tp1_close_pct` (50%) off and move SL to break-even +
     `be_offset_r` (BE + 0.1R — a small locked profit on the runner). Checked
     every tick, fires once.
-  Runner (remaining 50%): rides on until, on the 5m TF, EITHER the EMA5/9
-    cross-back (long: EMA5 crosses below EMA9) OR a close past EMA9 (long:
-    5m close below EMA9) — mirror for shorts — the hard final TP (1.5R), or
+  Runner (remaining 50%): rides on until, on the 5m TF, EITHER the EMA10/20
+    cross-back (long: EMA10 crosses below EMA20) OR a close past EMA20 (long:
+    5m close below EMA20) — mirror for shorts — the hard final TP (1.5R), or
     the trailed SL (BE+0.1R).
   SL sits at the 5m EMA50 (the chase-guard keeps price within 1.5x ATR of it,
   so max risk ~1.5 ATR). Its distance from entry is R; TP2 = 1.5R (2.5R put
@@ -142,11 +142,11 @@ class TrendConfirmStrategy(BaseStrategy):
         tf_weight_1h: float = 0.35,
         layer2_threshold: float = 60.0,        # established-trend entries
         layer2_threshold_early: float = 68.0,  # stricter quality gate for early-trend entries (5m cross led the confirm)
-        # Layer 3 — entry (5m): EMA5/9 cross, price above/below EMA5, within 1.5xATR of EMA50
+        # Layer 3 — entry (5m): EMA10/20 cross, price above/below EMA20, within 1.5xATR of EMA50
         entry_tf: str = "5m",       # timeframe (mtf key) the entry cross + exit run on
-        ema_fast: int = 5,          # entry-cross fast EMA (5m)
-        ema_slow: int = 9,          # entry-cross slow EMA (5m); also the "close past" exit reference
-        entry_ema_ref: int = 9,     # price must be above (long) / below (short) this EMA (5m) — EMA9, same line the cross + exit use
+        ema_fast: int = 10,         # entry-cross fast EMA (5m)
+        ema_slow: int = 20,         # entry-cross slow EMA (5m); also the "close past" exit reference
+        entry_ema_ref: int = 20,    # price must be above (long) / below (short) this EMA (5m) — EMA20, same line the cross + exit use
         sl_ema_ref: int = 50,       # SL sits at this EMA (5m)
         chase_ema_ref: int = 50,    # chase-guard distance is measured vs this EMA (5m); decoupled from sl_ema_ref
         fresh_trend_bars: int = 2,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
@@ -176,12 +176,12 @@ class TrendConfirmStrategy(BaseStrategy):
         sideways_adx_max: float = 15.0,             # ADX below this = "really weak" (< adx_threshold on purpose)
         sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
         sideways_min_signals: int = 2,              # how many of the 4 signals must fire to veto
-        # Exit (5m): EMA5/9 cross-back OR a 5m close past EMA9 closes the runner
-        use_close_past_exit: bool = True,   # enable the "close past EMA9" exit at all (cross-back always on)
-        exit_close_confirm_bars: int = 1,   # N consecutive 5m closes past EMA9 required for that exit
+        # Exit (5m): EMA10/20 cross-back OR a 5m close past EMA20 closes the runner
+        use_close_past_exit: bool = True,   # enable the "close past EMA20" exit at all (cross-back always on)
+        exit_close_confirm_bars: int = 1,   # N consecutive 5m closes past EMA20 required for that exit
         signal_exit_requires_tp1: bool = True,   # no signal exits before TP1 — only the hard SL (EMA50) / TP
                                                  #   bounds manage the trade until then. On 5m the single-close
-                                                 #   EMA9 exits killed 75% of trades at ~-0.3R before TP1; arming
+                                                 #   slow-EMA exits killed 75% of trades at ~-0.3R before TP1; arming
                                                  #   them only on the runner nearly doubled WR (25->62% BTC,
                                                  #   41->60% SOL) and cut losses ~2-3x in backtest
         # Partial take-profit + break-even (2-TP scheme)
@@ -313,7 +313,7 @@ class TrendConfirmStrategy(BaseStrategy):
 
         trend = self._trend_state
 
-        # ── Layer 3 EMA5/9-cross tracking (5m) — runs every new 5m bar
+        # ── Layer 3 EMA10/20-cross tracking (5m) — runs every new 5m bar
         # regardless of Layer1/Layer2 gating, so a cross that fires just
         # before the trend confirms is still remembered within the
         # fresh-trend window. ───────────────────────────────────────────────
@@ -334,7 +334,7 @@ class TrendConfirmStrategy(BaseStrategy):
         ema_down_ago = _bars_ago_5(self._last_ema_cross_down_ts)
 
         # "Early trend": the trend just confirmed (within fresh_trend_bars 5m
-        # bars). Because the 5m EMA5/9 cross is faster than Layer1's 30m
+        # bars). Because the 5m EMA10/20 cross is faster than Layer1's 30m
         # confirmation, the cross that kicks off the move often fires a bar or
         # two BEFORE the trend confirms — so in this window we count a cross up
         # to fresh_trend_bars ago (which can predate the confirmation).
@@ -483,10 +483,10 @@ class TrendConfirmStrategy(BaseStrategy):
                     f"(location-adjusted) {score_note}",
                     metadata=dbg("early_quality_fail" if spent else "location_quality_fail"))
 
-        # ── Layer 3: Entry timing (5m) — wait for the EMA5/9 cross ─────────
+        # ── Layer 3: Entry timing (5m) — wait for the EMA10/20 cross ─────────
         # Reached only after Layer1 (trend) AND Layer2 (quality + location)
         # both pass. Layer3 just waits for the precise cross and confirms the
-        # entry candle sits on the right side of EMA9, not too far from EMA50.
+        # entry candle sits on the right side of EMA20, not too far from EMA50.
         if l3 is None:
             return self._hold(current_price, "Layer3: 5m indicators still warming up", metadata=dbg("no_trend"))
 
@@ -564,9 +564,9 @@ class TrendConfirmStrategy(BaseStrategy):
         1. TP1 partial (price-based, checked every tick): when price reaches
            tp1_r (1.25R, halfway to the 2.5R final TP), close tp1_close_pct
            (50%) and move SL to break-even + be_offset_r (BE + 0.1R). Once.
-        2. Exit the runner (5m bar-based): EMA5/9 cross-back (a genuine trend
-           reversal) OR a 5m close past EMA9 (long: close below EMA9; short:
-           close above EMA9). The final TP (2.5R) and the trailed SL are the
+        2. Exit the runner (5m bar-based): EMA10/20 cross-back (a genuine trend
+           reversal) OR a 5m close past EMA20 (long: close below EMA20; short:
+           close above EMA20). The final TP (2.5R) and the trailed SL are the
            hard bounds bot.py's risk manager checks underneath.
         Hedge-mode-safe: always closes whichever position is actually open,
         never relies on signal.type semantics."""
@@ -593,7 +593,7 @@ class TrendConfirmStrategy(BaseStrategy):
                                           reason=f"TP1 {self.tp1_r:.1f}R hit — took {self.tp1_close_pct*100:.0f}%, "
                                                  f"SL -> BE+{self.be_offset_r:.1f}R")
 
-        # ── 2) Runner exit — EMA5/9 cross-back OR 5m close past EMA9 ─────────
+        # ── 2) Runner exit — EMA10/20 cross-back OR 5m close past EMA20 ──────
         candles = self._latest_5m
         if not candles:
             return PositionUpdate(action="hold", reason="Waiting for 5m data")
@@ -634,7 +634,7 @@ class TrendConfirmStrategy(BaseStrategy):
         return PositionUpdate(action="hold", reason=f"Holding {self._open_position.upper()}")
 
     def _closes_past_ema_slow(self, candles: list, side: str, n: int) -> bool:
-        """True if the last `n` 5m bars ALL closed on the wrong side of EMA9
+        """True if the last `n` 5m bars ALL closed on the wrong side of EMA20 (ema_slow)
         for the position (long: below, short: above). n=1 reproduces the
         original single-close exit."""
         closes = [c.close for c in candles]
@@ -1083,7 +1083,7 @@ class TrendConfirmStrategy(BaseStrategy):
         return 100.0 * math.log10(atr_sum / rng) / math.log10(period)
 
     def _layer3_indicators(self, candles: list) -> Optional[dict]:
-        """Entry/exit indicators on the 5m series: EMA5/9 cross, price vs the
+        """Entry/exit indicators on the 5m series: EMA10/20 cross, price vs the
         entry EMA, the EMA50 stop reference + chase-guard distance, and ATR."""
         closes = [c.close for c in candles]
         ema_f = self.ema(closes, self.ema_fast)

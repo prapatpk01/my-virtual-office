@@ -216,7 +216,7 @@ class TradingBot:
         not match at all. Falls back to ai_expert's EMA20/EMA50 defaults
         for strategies that don't expose these attributes (ai_expert
         itself). A strategy exposing ema_fast/ema_slow draws those (e.g.
-        trend_confirm, whose Layer3 entry triggers on EMA5/9); one exposing
+        trend_confirm, whose Layer3 entry triggers on EMA10/20); one exposing
         only hma_fast/hma_slow draws the HMA pair instead."""
         if strategy_inst is None:
             return {}
@@ -603,8 +603,8 @@ class TradingBot:
         Layer1 (30m: SMA30/EMA10-20/EMA20 slope/MACD, all must agree on
         up or down), Layer2 (trend-quality score — per-TF Align/ADX/Chop/
         Volume, weighted 15m 65% + 1H 35%, must clear layer2_threshold),
-        Layer3 (5m EMA5/9 cross with-trend + location/structure-room filter +
-        price above/below EMA5 + within 1.5xATR of EMA50) — instead of the
+        Layer3 (5m EMA10/20 cross with-trend + location/structure-room filter +
+        price above/below EMA20 + within 1.5xATR of EMA50) — instead of the
         ai_expert-only fields (macro/context/mtf) that don't apply to this
         strategy."""
         sma_trend  = tc.get("sma_trend", "?")
@@ -630,7 +630,7 @@ class TradingBot:
             "location_reject":          "n/a (Layer2b location reject)",
             "location_quality_fail":    "n/a (Layer2b location-adjusted quality)",
             "waiting_cross":            "wait_ema_cross (Layer3 5m)",
-            "ema_ref_fail":             "cross_ok/ema9_fail (Layer3 5m)",
+            "ema_ref_fail":             "cross_ok/ema_ref_fail (Layer3 5m)",
             "cross_pass_distance_fail": "cross_ok/dist_fail (Layer3 5m)",
             "entered":                  "entered",
         }
@@ -675,7 +675,7 @@ class TradingBot:
         logger.info(
             "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s L1[%s]=%-5s "
             "L2[quality=%s] pos=%-5s | "
-            "L3[5m %s ema5=%s dist=%s]%s=%s | %s",
+            "L3[5m %s ema_ref=%s dist=%s]%s=%s | %s",
             strategy_name, symbol, price, signal.type.value.upper(),
             l1_str, confirmed, score_str,
             open_pos, cross_str, ema_str, dist_str, loc_str, entry_str, reason,
