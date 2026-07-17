@@ -64,6 +64,7 @@ class Bot:
         self._daily_alert_sent = False
         self._cooldown_alert_sent = False
         self._last_status_log_ts = 0.0
+        self._last_reconcile_ts = 0.0         # periodic untracked-position safety net
         self._trade_log: list[dict] = []      # closed trades (for /stats, /trades)
         self._cmd_task = None                 # Telegram command polling task
         self._tg_offset = 0
@@ -88,20 +89,7 @@ class Bot:
         # Adopt any position that already exists on OKX but isn't tracked —
         # this bot's state is in-memory only, so a restart would otherwise
         # orphan every open position (no more SL/TP/health management for it).
-        adopted = await self.positions.reconcile_with_exchange(self.cfg.symbols)
-        if adopted:
-            logger.warning("[STARTUP] Adopted %d orphaned position(s) from a prior run: %s",
-                          len(adopted), adopted)
-            # TP1 status is inferred per-position from the attached SL (at
-            # entry = already hit, still a real distance away = recovered) —
-            # see reconcile_with_exchange for the detail; this alert just
-            # confirms adoption happened, the Railway log has the per-symbol mode.
-            await self.telegram.error(
-                "STARTUP",
-                f"Adopted {len(adopted)} orphaned position(s) from a prior run: "
-                f"{', '.join(adopted)}. TP1 status inferred from the attached "
-                f"stop (already hit -> single-TP mode; still wide -> TP1 recovered)."
-            )
+        await self._reconcile_positions(context="STARTUP")
 
         self._running = True
         if self.telegram.enabled:
@@ -130,6 +118,12 @@ class Bot:
 
     async def run_forever(self):
         while self._running:
+            # Safety net FIRST: adopt any position that exists on OKX but the
+            # bot isn't tracking (e.g. an order that filled but whose tracking
+            # was lost to a crash/timeout), BEFORE the entry logic runs — so a
+            # symbol that's actually in a position is never re-opened, and the
+            # user is always told about a live position within ~one cycle.
+            await self._maybe_reconcile()
             for symbol in self.cfg.symbols:
                 try:
                     await self._process_symbol(symbol)
@@ -139,6 +133,42 @@ class Bot:
             await self._check_global_alerts()
             await self._maybe_log_status()
             await asyncio.sleep(self.cfg.poll_interval_sec)
+
+    async def _maybe_reconcile(self):
+        now = time.time()
+        if now - self._last_reconcile_ts < self.cfg.reconcile_interval_sec:
+            return
+        self._last_reconcile_ts = now
+        try:
+            await self._reconcile_positions(context="SAFETY-NET")
+        except Exception as e:
+            logger.warning("[RECONCILE] periodic sweep failed: %s", e)
+
+    async def _reconcile_positions(self, context: str):
+        """Adopt untracked OKX positions and ALERT for each. Runs at startup
+        and every reconcile_interval_sec — the single guard against a position
+        living on OKX while the bot flies blind (no SL/TP management, no
+        notification, and — worst — re-opening because it thinks it's flat)."""
+        adopted = await self.positions.reconcile_with_exchange(self.cfg.symbols)
+        if not adopted:
+            return
+        logger.warning("[%s] Adopted %d untracked position(s): %s", context, len(adopted), adopted)
+        for entry in adopted:
+            # reconcile returns "SYMBOL SIDE" strings; _positions is keyed by
+            # the bare symbol (which itself contains no spaces).
+            sym = entry.rsplit(" ", 1)[0]
+            pos = self.positions.get(sym)
+            if pos is None:
+                continue
+            await self.telegram.send_text(
+                f"⚠️ *Adopted untracked position* `{sym}` ({context})\n\n"
+                f"This position was live on OKX but the bot wasn't tracking it — "
+                f"now managing SL/TP.\n"
+                f"Side: `{pos.side}`  Entry: `{pos.entry_price:.6f}`\n"
+                f"SL: `{pos.stop_loss:.6f}`  TP2: `{pos.tp2:.6f}`  "
+                f"TP1: `{pos.tp1 if pos.tp1 else 'hit'}`\n"
+                f"Amount: `{pos.amount:.6f}`"
+            )
 
     # ── Per-symbol processing ────────────────────────────────────────────────
 
@@ -218,7 +248,9 @@ class Bot:
         return event
 
     async def _look_for_entry(self, symbol: str, df_15m, df_5m, sig):
-        bar_ts = df_15m.index[-1] if len(df_15m) else None
+        # Entry is evaluated once per closed 5M bar (the confluence trigger's
+        # cadence) — keying on the 15M bar would skip 2 of every 3 chances.
+        bar_ts = df_5m.index[-1] if (df_5m is not None and len(df_5m)) else None
         if bar_ts is None or self._last_entry_bar.get(symbol) == bar_ts:
             return   # already evaluated this closed bar
         self._last_entry_bar[symbol] = bar_ts

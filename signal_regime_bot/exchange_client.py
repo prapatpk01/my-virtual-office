@@ -299,6 +299,7 @@ class ExchangeClient:
                 f"Order too small for {symbol}: {amount:.6f} base is below one "
                 f"tradeable lot. Increase risk_per_trade or balance."
             )
+        ct_val = effective_base / contracts   # base units per contract (for fill parsing)
         if abs(effective_base - amount) / max(amount, 1e-12) > 0.005:
             logger.info("[ORDER] %s quantized %.8f -> %.8f base (%.4g contracts)",
                        symbol, amount, effective_base, contracts)
@@ -327,8 +328,18 @@ class ExchangeClient:
             logger.error("[ORDER] create_order failed %s %s %s: %s", symbol, side, pos_side, e)
             raise
 
+        # The order is now LIVE on OKX. Resolving the fill details (avgPx/fee/
+        # pnl) is best-effort ONLY — it must NEVER raise, or the caller would
+        # treat a real, placed order as a failure and never track it (leaving a
+        # position on OKX the bot flies blind on). Any failure -> fall back to
+        # the placement response / estimates.
         order_id = str(raw.get("id") or uuid.uuid4())
-        avg, fee_cost, realized, filled_base = await self._resolve_fill(symbol, order_id, raw, ct_val)
+        try:
+            avg, fee_cost, realized, filled_base = await self._resolve_fill(symbol, order_id, raw, ct_val)
+        except Exception as e:
+            logger.warning("[ORDER] fill resolution failed for %s %s (order is placed) — "
+                          "using fallback: %s", symbol, order_id, e)
+            avg, fee_cost, realized, filled_base = 0.0, 0.0, 0.0, 0.0
         return OrderResult(
             order_id=order_id, symbol=symbol, side=side,
             amount=(filled_base or effective_base),
