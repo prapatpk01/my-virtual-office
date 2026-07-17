@@ -186,7 +186,7 @@ class Config:
     # ── Position management ─────────────────────────────────────────────────
     pullback_be_trigger_r: float = 0.65
     momentum_be_trigger_r: float = 0.75
-    be_lock_r: float = 0.05
+    be_lock_r: float = 0.10   # BE move locks entry +/- 0.1R (was 0.05, per user)
     min_hold_bars_soft_exit: int = 2
 
     # ── Cooldown ────────────────────────────────────────────────────────────
