@@ -328,6 +328,8 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
         balance -= entry_fee
         tp1_hit = False
         entry_fill_i = i + 1   # fills at next 5m bar's open
+        # mirror live: the setup is consumed only once the position opens
+        engine.entry_engine.confirm_entry(symbol, sig.entry.cross_id if sig.entry is not None else None)
 
     return trades
 

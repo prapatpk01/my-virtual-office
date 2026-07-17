@@ -176,10 +176,25 @@ class PositionManager:
             closed_at = self._recently_closed.get(symbol)
             if closed_at is not None and now - closed_at < c.reconcile_settle_grace_sec:
                 continue
+            # Collect every side OKX shows a live position on. _positions holds
+            # ONE position per symbol, so if OKX (hedge mode) has BOTH legs we
+            # must NOT let the second overwrite the first (that silently orphans
+            # a live leg forever). Adopt one, and loudly flag the other.
+            sides_open = []
             for side in (LONG, SHORT):
-                details = await self.client.fetch_position_details(symbol, side)
-                if not details or details["amount"] <= 0:
-                    continue
+                d = await self.client.fetch_position_details(symbol, side)
+                if d and d["amount"] > 0:
+                    sides_open.append((side, d))
+            if not sides_open:
+                continue
+            if len(sides_open) == 2:
+                keep, drop = sides_open[0][0], sides_open[1][0]
+                logger.error("[RECONCILE] %s has BOTH %s and %s open on OKX (hedge) — the bot "
+                             "manages one position per symbol. Adopting %s; the %s leg is LEFT "
+                             "UNMANAGED — close it manually.", symbol, keep, drop, keep, drop)
+                adopted.append(f"{symbol} ⚠️HEDGE — adopted {keep.upper()}, {drop.upper()} "
+                               f"UNMANAGED (close manually)")
+            for side, details in sides_open[:1]:
                 sl_price, tp_price = await self.client.fetch_attached_stops(symbol, side)
                 entry_price = details["entry_price"]
                 amount = details["amount"]
@@ -369,8 +384,14 @@ class PositionManager:
         pnl_mult = 1 if pos.side == LONG else -1
         if order is not None and order.avg_price > 0:
             exit_price = order.avg_price
-            realized = order.realized_pnl
             exit_fee = order.fee_cost
+            realized = order.realized_pnl
+            # OKX sometimes returns the fill price + fee but no realized pnl on
+            # the create response (and a settle re-fetch may have failed). Derive
+            # realized from the actual fill price so a close never books 0 pnl by
+            # accident — for a true breakeven this still yields ~0.
+            if realized == 0.0:
+                realized = pnl_mult * (exit_price - pos.entry_price) * filled
         else:
             exit_price = ticker_price
             realized = pnl_mult * (exit_price - pos.entry_price) * filled

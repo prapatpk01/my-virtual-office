@@ -199,11 +199,25 @@ class EntryEngine:
                                f"L3: {direction} confluence {n_active}/3 but no new cross since last "
                                f"entry — waiting for a fresh setup", **base)
 
-        state.last_entry_ts = newest_ts
+        # Do NOT consume the setup here: analyze() runs on EVERY poll tick, but
+        # the actual open can still be blocked downstream (symbol cooldown, max
+        # positions, a daily/streak limit, a balance-read blip, open_position
+        # returning None). Burning last_entry_ts now would discard a still-valid
+        # 45-min setup and make the bot wait for a brand-new cross. The caller
+        # calls confirm_entry() ONLY after a position really opened.
         names = "+".join(sorted(n for n, _ in active))
         return EntryResult(direction, True,
                            f"ENTRY {direction}  confluence {n_active}/3 ({names}) within "
-                           f"{c.entry_confluence_window_min}m", entry_score=100.0, **base)
+                           f"{c.entry_confluence_window_min}m", entry_score=100.0,
+                           **{**base, "cross_id": newest_ts})
+
+    def confirm_entry(self, symbol: str, cross_ts) -> None:
+        """Mark the confluence setup that produced `cross_ts` (EntryResult.cross_id)
+        as consumed — call ONLY after a position actually opened. A blocked or
+        failed open then leaves the setup armed for the rest of its 45-min window
+        instead of silently eating it."""
+        if cross_ts is not None:
+            self._get_state(symbol).last_entry_ts = cross_ts
 
     # ── Early exit — L3c (5M EMA10/20) hard gate ─────────────────────────────
     def check_exit(self, df_5m: pd.DataFrame, position_side: str,

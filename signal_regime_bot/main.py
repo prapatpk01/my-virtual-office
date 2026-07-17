@@ -160,6 +160,9 @@ class Bot:
             sym = entry.rsplit(" ", 1)[0]
             pos = self.positions.get(sym)
             if pos is None:
+                # e.g. a hedge-conflict warning string — surface it as-is so an
+                # unmanaged leg is never silently dropped.
+                await self.telegram.send_text(f"⚠️ *Reconcile* ({context})\n\n`{entry}`")
                 continue
             await self.telegram.send_text(
                 f"⚠️ *Adopted untracked position* `{sym}` ({context})\n\n"
@@ -287,6 +290,11 @@ class Bot:
             df_5m=df_5m)
         if pos is None:
             return
+
+        # Consume the confluence setup ONLY now that a position really opened —
+        # a blocked/failed open above leaves it armed within its 45-min window.
+        self.signal_engine.entry_engine.confirm_entry(
+            symbol, sig.entry.cross_id if sig.entry is not None else None)
 
         # The position is OPEN and tracked — the alerts below must NOT be able
         # to raise back into the caller (which would look like an entry
