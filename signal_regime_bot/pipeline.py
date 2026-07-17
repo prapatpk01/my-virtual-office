@@ -15,7 +15,7 @@ backtest.py call, so the two can never diverge in logic.
     side even if one appears. Entry is a 3-layer multi-timeframe cross
     confluence (see entry_engine.py for the full detail):
       L3a HMA10/16 30M + L3b EMA5/9 15M + L3c EMA10/20 5M;
-      >= 2 crossing the bias direction within 45 min -> enter
+      >= 2 crossing the bias direction within 15 min -> enter
 
 Each layer can only narrow what the next sees. The first block short-
 circuits the rest and records which layer blocked, with its reason, so the

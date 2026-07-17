@@ -12,7 +12,7 @@ bias direction:
 
 Any single cross ARMS a setup. The entry fires once >= entry_confluence_min
 (2) of the three layers have crossed the SAME (bias) direction within
-entry_confluence_window_min (45) minutes of "now" (the latest closed 5M
+entry_confluence_window_min (15) minutes of "now" (the latest closed 5M
 bar). If a second layer never confirms, the first cross ages out of the
 window -> the setup fails and the engine waits for a new one. One entry per
 setup: re-arming needs a genuinely newer cross than the one that last fired.

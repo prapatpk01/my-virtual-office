@@ -148,12 +148,12 @@ class Config:
     #   L3c — EMA10/20 cross on 5M   (also the hard-exit layer)
     # Any single cross ARMS a setup; the entry fires once >= entry_confluence_min
     # (2) of the three layers have crossed the SAME (bias) direction within
-    # entry_confluence_window_min (45) minutes of each other. If a second layer
+    # entry_confluence_window_min (15) minutes of each other. If a second layer
     # doesn't confirm within the window, the first cross ages out -> setup fails,
     # wait for a new one. One entry per setup (needs a genuinely newer cross to
     # re-arm after a fill/close).
     entry_confluence_min: int = 2
-    entry_confluence_window_min: int = 45
+    entry_confluence_window_min: int = 15   # 2nd confirming cross must land within 15m of the 1st (was 45)
     # L3a — HMA cross, 30M
     l3a_tf: str = "30m"
     l3a_hma_fast: int = 10

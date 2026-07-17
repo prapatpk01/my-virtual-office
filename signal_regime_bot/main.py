@@ -103,7 +103,7 @@ class Bot:
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT\n"
                 f"Architecture: Regime → Bias → Entry (3-TF cross confluence: "
-                f"30M HMA / 15M EMA5-9 / 5M EMA10-20, ≥2 within 45m)"
+                f"30M HMA / 15M EMA5-9 / 5M EMA10-20, ≥2 within 15m)"
             )
 
     async def stop(self):
