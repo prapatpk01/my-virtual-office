@@ -31,7 +31,7 @@ PAPER_TAKER_FEE     = float(os.environ.get("PAPER_TAKER_FEE", "0.0005"))  # per 
 def classify_exit_reason(reason: str, won: bool) -> tuple[str, str]:
     """Map a raw exit-reason string to a human label + emoji.
 
-    The strategy emits many exit reasons (hard SL/TP, HMA cross-back,
+    The strategy emits many exit reasons (hard SL/TP, EMA cross-back,
     trailed break-even stop, TP1 partial). The old code labelled anything
     that wasn't literally ``take_profit`` as a "Stop-Loss Hit", which was
     wrong for trend-exit and break-even closes. This inspects the reason
@@ -47,7 +47,7 @@ def classify_exit_reason(reason: str, won: bool) -> tuple[str, str]:
     if "stop_loss" in r or "hard_sl" in r or "stop loss" in r:
         return ("Stop-Loss Hit", "🛑")
     if "exit" in r or "hma" in r or "cross" in r or "trend" in r:
-        return ("Trend Exit (HMA cross-back)", "↩️")
+        return ("Trend Exit (EMA cross-back)", "↩️")
     return ("Position Closed", "☑️")
 
 
@@ -282,7 +282,8 @@ class SignalState:
         }
 
     def record_outcome(self, symbol: str, side: str, entry: float,
-                       exit_price: float, sl, tp, reason: str, strategy: str = "") -> dict:
+                       exit_price: float, sl, tp, reason: str, strategy: str = "",
+                       fill: dict | None = None) -> dict:
         """Book a closed trade into the paper account and log the outcome.
 
         Computes the *actual* directional P&L (in $ and %) from a $1000
@@ -322,7 +323,11 @@ class SignalState:
         base_bal = self._paper_balance - pnl_usd
         pnl_pct  = (pnl_usd / base_bal * 100) if base_bal else 0.0
 
-        won = pnl_usd > 0
+        # When the exchange's post-fill accounting is available (avgPx/fillSz/
+        # fee/realized pnl -> net_pnl), ITS sign decides win/loss — the real
+        # fill is the truth; the paper model above is just the running $1000
+        # simulation for stats.
+        won = (fill["net_pnl"] > 0) if (fill and fill.get("net_pnl") is not None) else pnl_usd > 0
         label, emoji = classify_exit_reason(reason, won)
 
         outcome = {
@@ -341,6 +346,7 @@ class SignalState:
             "emoji":        emoji,
             "won":          won,
             "strategy":     strategy,
+            "fill":         fill,
             "ts":           int(time.time() * 1000),
         }
         self._outcomes.append(outcome)

@@ -150,17 +150,21 @@ class TelegramNotifier:
                             macro_score: float = None, macro_bias: str = None,
                             selected_strategy: str = None, strategy_confidence: float = None,
                             regime: str = None, direction: str = None,
-                            early_trend: bool = False, reason: str = None) -> str:
+                            early_trend: bool = False, reason: str = None,
+                            fee: float = 0.0) -> str:
         emoji = "🟢" if side == "buy" else "🔴"
         mode  = "📄 PAPER" if paper else "💰 LIVE"
         dir_label = f"LONG" if direction == "long" else "SHORT" if direction == "short" else side.upper()
         if early_trend:
             dir_label += " 🌱 EARLY"
 
+        # price/amount here are the exchange's post-fill avgPx / fillSz —
+        # the actual fill, not the requested size.
         lines = [
             f"{emoji} *Order Executed* {mode}",
             f"`{symbol}` — *{dir_label}*",
-            f"Entry: `{price:,.4f}`  |  Amount: `{amount}`",
+            f"Fill: `{amount:.6g}` @ `{price:,.4f}`"
+            + (f"  |  Fee: `${fee:,.4f}`" if fee else ""),
         ]
         if reason:
             lines.append(f"_{reason}_")
@@ -198,7 +202,7 @@ class TelegramNotifier:
                      selected_strategy: str = None, strategy_confidence: float = None,
                      regime: str = None, direction: str = None,
                      chart_path: str = None, early_trend: bool = False,
-                     reason: str = None):
+                     reason: str = None, fee: float = 0.0):
         """Send the order alert. If chart_path is given, sends it as a photo
         with the order details as caption; otherwise sends text only."""
         caption = self.build_order_caption(
@@ -206,7 +210,7 @@ class TelegramNotifier:
             sl=sl, tp=tp, macro_score=macro_score, macro_bias=macro_bias,
             selected_strategy=selected_strategy, strategy_confidence=strategy_confidence,
             regime=regime, direction=direction, early_trend=early_trend,
-            reason=reason,
+            reason=reason, fee=fee,
         )
         if chart_path:
             self.notify_photo(chart_path, caption=caption)
@@ -236,8 +240,11 @@ class TelegramNotifier:
         )
 
     def notify_trade_closed(self, symbol: str, outcome: dict, stats: dict):
-        """Called when a position closes. Reports the ACTUAL exit reason and
-        the real $ P&L booked into the $1000 paper account (5% margin × 20x)."""
+        """Called when a position closes. Reports the ACTUAL exit reason.
+        When the exchange's post-fill data is present (outcome["fill"]:
+        avgPx/fillSz/fee/realized pnl), the trade result shown IS that data —
+        Net PnL = realized_pnl - entry_fee_alloc - exit_fee. The $1000
+        paper-account model remains as the running-stats footer."""
         won          = outcome.get("won", outcome.get("pnl_usd", 0) > 0)
         result_emoji = "✅" if won else "❌"
         label        = outcome.get("reason_label", "Position Closed")
@@ -252,19 +259,36 @@ class TelegramNotifier:
         pnl_pct      = outcome.get("pnl_pct", 0.0)
         pnl_r        = outcome.get("pnl_r", 0.0)
         bal_after    = outcome.get("balance_after", stats.get("paper_balance", 0.0))
+        fill         = outcome.get("fill") or {}
 
         sl_str = f"`{sl:,.4f}`" if sl else "—"
         tp_str = f"`{tp:,.4f}`" if tp else "—"
         usd_sign = "+" if pnl_usd >= 0 else "-"
+
+        # ── Trade result from the exchange fill (the real numbers) ─────────
+        if fill.get("net_pnl") is not None:
+            net = fill["net_pnl"]
+            n_sign = "+" if net >= 0 else "-"
+            fees_total = (fill.get("entry_fee_alloc") or 0) + (fill.get("exit_fee") or 0)
+            result_block = (
+                f"Fill: `{fill.get('exit_sz', 0):.6g}` @ `{fill.get('exit_avg_px', exit_price):,.4f}`\n"
+                f"💵 Net P&L: `{n_sign}${abs(net):,.4f}`\n"
+                f"Fees: entry `${fill.get('entry_fee_alloc', 0):,.4f}` + "
+                f"exit `${fill.get('exit_fee', 0):,.4f}` = `${fees_total:,.4f}`\n"
+            )
+        else:
+            result_block = (
+                f"💵 P&L: `{usd_sign}${abs(pnl_usd):,.2f}`  "
+                f"(`{'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%`, `{pnl_r:+.2f}R`)\n"
+                f"💰 Balance: `${bal_after:,.2f}`\n"
+            )
 
         text = (
             f"{result_emoji} *{label}* {reason_emoji}\n"
             f"`{symbol}`  {side}\n"
             f"Entry: `{entry:,.4f}` → Exit: `{exit_price:,.4f}`\n"
             f"SL: {sl_str} | TP: {tp_str}\n"
-            f"💵 P&L: `{usd_sign}${abs(pnl_usd):,.2f}`  "
-            f"(`{'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%`, `{pnl_r:+.2f}R`)\n"
-            f"💰 Balance: `${bal_after:,.2f}`\n"
+            + result_block +
             f"_Reason: {raw_reason}_\n\n"
             + self._account_stats_block(stats, "Paper Account")
         )

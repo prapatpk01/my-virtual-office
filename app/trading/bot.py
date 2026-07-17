@@ -119,6 +119,12 @@ class TradingBot:
 
         # Track when each position was opened to calculate trade duration
         self._position_open_times: dict[str, float] = {}  # key = "symbol||strategy_name"
+        # Actual ENTRY fill per open position (avg_px/size/fee from the
+        # exchange order, post-fill). Used to allocate the entry fee across
+        # partial/final closes:  Net PnL = realized_pnl - entry_fee_alloc -
+        # exit_fee.  fee_frac_left tracks how much of the entry fee is still
+        # unallocated after partial TPs. key = "symbol||strategy_name"
+        self._entry_fills: dict[str, dict] = {}
 
         # Portfolio-level risk engine (shared across all strategies)
         self._portfolio = PortfolioEngine(
@@ -167,6 +173,40 @@ class TradingBot:
                 strategy_inst.cancel_pending_entry(reason)
             except Exception as e:
                 logger.warning("cancel_pending_entry failed [%s]: %s", strategy_name, e)
+
+    def _close_fill_info(self, pos_key: str, order, fallback_price: float,
+                         close_amt: float, close_frac: float, final: bool) -> dict:
+        """Build the post-fill accounting for a close/reduce order from the
+        exchange's OWN numbers (avgPx, fillSz, fee, realized pnl) — never our
+        estimates.  Net PnL = realized_pnl - entry_fee_allocation - exit_fee,
+        where the entry fee is allocated by the fraction of the position this
+        order closed. Consumes that fraction from the tracked entry fill; on a
+        final close the remaining allocation is used and tracking is dropped.
+        Falls back gracefully (alloc 0, pnl None) for reconciled positions
+        whose entry fill was never seen."""
+        entry = self._entry_fills.get(pos_key)
+        if entry is not None:
+            frac = min(close_frac, entry.get("fee_frac_left", 1.0))
+            if final:
+                frac = entry.get("fee_frac_left", 1.0)
+            entry_fee_alloc = entry["fee"] * frac
+            entry["fee_frac_left"] = max(0.0, entry.get("fee_frac_left", 1.0) - frac)
+            if final:
+                self._entry_fills.pop(pos_key, None)
+        else:
+            entry_fee_alloc = 0.0
+        exit_fee = getattr(order, "fee", 0.0) or 0.0
+        realized = getattr(order, "realized_pnl", None)
+        net = (realized - entry_fee_alloc - exit_fee) if realized is not None else None
+        return {
+            "exit_avg_px": getattr(order, "price", 0.0) or fallback_price,
+            "exit_sz": getattr(order, "filled", 0.0) or close_amt,
+            "exit_fee": round(exit_fee, 6),
+            "entry_fee_alloc": round(entry_fee_alloc, 6),
+            "entry_avg_px": entry.get("avg_px") if entry else None,
+            "realized_pnl": realized,
+            "net_pnl": round(net, 6) if net is not None else None,
+        }
 
     @staticmethod
     def _chart_ma_kwargs(strategy_inst: Optional[BaseStrategy]) -> dict:
@@ -405,14 +445,18 @@ class TradingBot:
             if trigger:
                 side = "sell" if pos_info["side"] == "long" else "buy"
                 pos_side = pos_info["side"] if self._hedge_mode else None
-                await self.connector.create_order(sym, side, pos_info["amount"], pos_side=pos_side)
-                pnl = ((price - pos_info["entry"]) * pos_info["amount"]
-                       if pos_info["side"] == "long"
-                       else (pos_info["entry"] - price) * pos_info["amount"])
+                close_order = await self.connector.create_order(sym, side, pos_info["amount"], pos_side=pos_side)
+                fill = self._close_fill_info(f"{sym}||{strategy_name}", close_order, price,
+                                             pos_info["amount"], 1.0, final=True)
+                exit_px = fill["exit_avg_px"]
+                pnl = (fill["net_pnl"] if fill["net_pnl"] is not None else
+                       ((exit_px - pos_info["entry"]) * pos_info["amount"]
+                        if pos_info["side"] == "long"
+                        else (pos_info["entry"] - exit_px) * pos_info["amount"]))
                 trade = TradeRecord(
                     timestamp=int(time.time() * 1000),
                     symbol=sym, side=side,
-                    price=price, amount=pos_info["amount"],
+                    price=exit_px, amount=fill["exit_sz"],
                     pnl=round(pnl, 4),
                     strategy=strategy_name or "risk_manager", reason=trigger,
                     paper=self.connector.paper,
@@ -420,9 +464,9 @@ class TradingBot:
                 self._record_trade(trade)
                 _outcome = self._sig.record_outcome(
                     symbol=sym, side=pos_info["side"],
-                    entry=pos_info["entry"], exit_price=price,
+                    entry=pos_info["entry"], exit_price=exit_px,
                     sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
-                    reason=trigger, strategy=strategy_name,
+                    reason=trigger, strategy=strategy_name, fill=fill,
                 )
                 self._sig.unlock_strategy(sym, strategy_name)
                 self.risk.close_position(sym, strategy=strategy_name)
@@ -670,11 +714,19 @@ class TradingBot:
                 try:
                     close_side = "sell" if pos_info["side"] == "long" else "buy"
                     pos_side = pos_info["side"] if self._hedge_mode else None
-                    await self.connector.create_order(sym, close_side, close_amt, pos_side=pos_side)
-                    pnl = ((price - pos_info["entry"]) * close_amt
-                           if pos_info["side"] == "long"
-                           else (pos_info["entry"] - price) * close_amt)
-                    self.risk.reduce_position(sym, close_amt, strategy=strategy_name)
+                    close_order = await self.connector.create_order(sym, close_side, close_amt, pos_side=pos_side)
+                    pos_key = f"{sym}||{strategy_name}"
+                    entry_fill = self._entry_fills.get(pos_key)
+                    close_frac = (close_amt / entry_fill["size"]) if (entry_fill and entry_fill.get("size")) \
+                                 else update.close_pct
+                    fill = self._close_fill_info(pos_key, close_order, price, close_amt,
+                                                 close_frac, final=False)
+                    exit_px = fill["exit_avg_px"]
+                    pnl = (fill["net_pnl"] if fill["net_pnl"] is not None else
+                           ((exit_px - pos_info["entry"]) * close_amt
+                            if pos_info["side"] == "long"
+                            else (pos_info["entry"] - exit_px) * close_amt))
+                    self.risk.reduce_position(sym, fill["exit_sz"], strategy=strategy_name)
                     # Move SL to break-even when TP1 fires (new_sl is entry price)
                     if update.new_sl is not None:
                         self.risk.update_stop_loss(sym, update.new_sl, strategy=strategy_name)
@@ -682,35 +734,30 @@ class TradingBot:
                     self._record_trade(TradeRecord(
                         timestamp=int(time.time() * 1000),
                         symbol=sym, side=close_side,
-                        price=price, amount=close_amt,
+                        price=exit_px, amount=fill["exit_sz"],
                         pnl=round(pnl, 4),
                         strategy=strategy_name, reason=update.reason,
                         paper=self.connector.paper,
                     ))
                     logger.info(
-                        "[%s] Partial TP %.0f%% %s @ %.4f PnL=%.4f | %s",
-                        strategy_name, update.close_pct * 100, sym, price, pnl, update.reason,
+                        "[%s] Partial TP %.0f%% %s @ %.4f NetPnL=%.4f (fees in=%.4f out=%.4f) | %s",
+                        strategy_name, update.close_pct * 100, sym, exit_px, pnl,
+                        fill["entry_fee_alloc"], fill["exit_fee"], update.reason,
                     )
                     self._check_cooldown_trigger(pnl)
                     # Book the partial into the paper account (fixed entry-size).
-                    paper = self._sig.record_paper_partial(
-                        sym, price, update.close_pct, strategy=strategy_name,
+                    self._sig.record_paper_partial(
+                        sym, exit_px, update.close_pct, strategy=strategy_name,
                     )
                     if self.telegram:
                         try:
-                            if paper:
-                                usd_sign = "+" if paper["pnl_usd"] >= 0 else "-"
-                                pnl_line = (
-                                    f"💵 P&L: `{usd_sign}${abs(paper['pnl_usd']):,.2f}` "
-                                    f"(`{'+' if paper['pnl_pct'] >= 0 else ''}{paper['pnl_pct']:.2f}%`)\n"
-                                    f"💰 Balance: `${paper['balance_after']:,.2f}`\n"
-                                )
-                            else:
-                                pnl_line = f"PnL: `{pnl:+.4f}` USDT\n"
+                            sign = "+" if pnl >= 0 else "-"
+                            fees_total = fill["entry_fee_alloc"] + fill["exit_fee"]
                             self.telegram.notify(
                                 f"💰 *Partial Take-Profit* `{sym}` [{strategy_name}]\n"
-                                f"Closed *{update.close_pct*100:.0f}%* @ `{price:.4f}`\n"
-                                f"{pnl_line}"
+                                f"Fill: `{fill['exit_sz']:.6g}` @ `{exit_px:,.4f}`\n"
+                                f"💵 Net P&L: `{sign}${abs(pnl):,.4f}`  "
+                                f"(fees: `${fees_total:,.4f}`)\n"
                                 f"_{update.reason}_"
                             )
                         except Exception:
@@ -723,30 +770,34 @@ class TradingBot:
             close_side = "sell" if pos_info["side"] == "long" else "buy"
             pos_side = pos_info["side"] if self._hedge_mode else None
             try:
-                await self.connector.create_order(sym, close_side, pos_info["amount"], pos_side=pos_side)
-                pnl = ((price - pos_info["entry"]) * pos_info["amount"]
-                       if pos_info["side"] == "long"
-                       else (pos_info["entry"] - price) * pos_info["amount"])
+                close_order = await self.connector.create_order(sym, close_side, pos_info["amount"], pos_side=pos_side)
+                fill = self._close_fill_info(f"{sym}||{strategy_name}", close_order, price,
+                                             pos_info["amount"], 1.0, final=True)
+                exit_px = fill["exit_avg_px"]
+                pnl = (fill["net_pnl"] if fill["net_pnl"] is not None else
+                       ((exit_px - pos_info["entry"]) * pos_info["amount"]
+                        if pos_info["side"] == "long"
+                        else (pos_info["entry"] - exit_px) * pos_info["amount"]))
                 self._record_trade(TradeRecord(
                     timestamp=int(time.time() * 1000),
                     symbol=sym, side=close_side,
-                    price=price, amount=pos_info["amount"],
+                    price=exit_px, amount=fill["exit_sz"],
                     pnl=round(pnl, 4),
                     strategy=strategy_name, reason=update.reason,
                     paper=self.connector.paper,
                 ))
                 _outcome = self._sig.record_outcome(
                     symbol=sym, side=pos_info["side"],
-                    entry=pos_info["entry"], exit_price=price,
+                    entry=pos_info["entry"], exit_price=exit_px,
                     sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
-                    reason=update.reason, strategy=strategy_name,
+                    reason=update.reason, strategy=strategy_name, fill=fill,
                 )
                 self._sig.unlock_strategy(sym, strategy_name)
                 self.risk.close_position(sym, strategy=strategy_name)
-                self._on_position_closed(sym, strategy_name, price, update.reason, strategy_inst)
+                self._on_position_closed(sym, strategy_name, exit_px, update.reason, strategy_inst)
                 logger.info(
-                    "[%s] AI-driven CLOSE %s @ %.4f PnL=%.4f | %s",
-                    strategy_name, sym, price, pnl, update.reason,
+                    "[%s] AI-driven CLOSE %s @ %.4f NetPnL=%.4f | %s",
+                    strategy_name, sym, exit_px, pnl, update.reason,
                 )
                 if self.telegram:
                     self.telegram.notify_trade_closed(sym, _outcome, self._sig.summary())
@@ -894,12 +945,14 @@ class TradingBot:
                 for pos in list(wt_longs):
                     slot_name = pos["strategy"]
                     try:
-                        await self.connector.create_order(sym, "sell", pos["amount"])
+                        close_order = await self.connector.create_order(sym, "sell", pos["amount"])
+                        fill = self._close_fill_info(f"{sym}||{slot_name}", close_order, exit_price,
+                                                     pos["amount"], 1.0, final=True)
                         _outcome = self._sig.record_outcome(
                             symbol=sym, side="long",
-                            entry=pos["entry"], exit_price=exit_price,
+                            entry=pos["entry"], exit_price=fill["exit_avg_px"],
                             sl=pos.get("stop_loss"), tp=pos.get("take_profit"),
-                            reason="sell_signal", strategy=slot_name,
+                            reason="sell_signal", strategy=slot_name, fill=fill,
                         )
                         self._sig.unlock_strategy(sym, slot_name)
                         self.risk.close_position(sym, strategy=slot_name)
@@ -964,12 +1017,14 @@ class TradingBot:
                         try:
                             ticker     = await self.connector.fetch_ticker(sym)
                             exit_price = ticker["last"]
-                            await self.connector.create_order(sym, "sell", existing["amount"])
+                            close_order = await self.connector.create_order(sym, "sell", existing["amount"])
+                            fill = self._close_fill_info(f"{sym}||{strategy_name}", close_order, exit_price,
+                                                         existing["amount"], 1.0, final=True)
                             _outcome = self._sig.record_outcome(
                                 symbol=sym, side="long",
-                                entry=existing["entry"], exit_price=exit_price,
+                                entry=existing["entry"], exit_price=fill["exit_avg_px"],
                                 sl=existing.get("stop_loss"), tp=existing.get("take_profit"),
-                                reason="sell_signal", strategy=strategy_name,
+                                reason="sell_signal", strategy=strategy_name, fill=fill,
                             )
                             self._sig.unlock_strategy(sym, strategy_name)
                             self.risk.close_position(sym, strategy=strategy_name)
@@ -1169,28 +1224,36 @@ class TradingBot:
             order = await self.connector.create_order(
                 sym, order_side, amount, pos_side=pos_side
             )
-            self.risk.open_position(sym, direction, price, amount, strategy=strategy_name,
+            # From here on, sizes/prices come from the exchange's post-fill
+            # numbers (avgPx / fillSz / fee), not our request.
+            entry_px = order.price or price
+            entry_sz = order.filled or amount
+            self.risk.open_position(sym, direction, entry_px, entry_sz, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
 
             # Snapshot the paper-account position at entry so partial TPs and
             # the final close book against one fixed size (keeps $ coherent).
-            self._sig.open_paper_position(sym, direction, order.price, sl_p, strategy=strategy_name)
+            self._sig.open_paper_position(sym, direction, entry_px, sl_p, strategy=strategy_name)
 
             # Track open time for learning engine duration calculation
             pos_key = f"{sym}||{strategy_name}"
             self._position_open_times[pos_key] = time.time()
+            self._entry_fills[pos_key] = {
+                "avg_px": entry_px, "size": entry_sz,
+                "fee": getattr(order, "fee", 0.0) or 0.0, "fee_frac_left": 1.0,
+            }
 
             # Register position in portfolio engine
             self._portfolio.add_position(
                 symbol=sym, direction=direction,
-                entry_price=price, current_price=price,
-                amount=amount, stop_loss=effective_sl,
+                entry_price=entry_px, current_price=entry_px,
+                amount=entry_sz, stop_loss=effective_sl,
             )
 
             trade = TradeRecord(
                 timestamp=int(time.time() * 1000),
                 symbol=sym, side=order_side,
-                price=order.price, amount=amount,
+                price=entry_px, amount=entry_sz,
                 pnl=0.0, strategy=strategy_name, reason=signal.reason,
                 paper=self.connector.paper,
             )
@@ -1244,8 +1307,9 @@ class TradingBot:
                     except Exception as e:
                         logger.warning("Chart render failed for %s: %s", sym, e)
                 self.telegram.notify_order(
-                    sym, order_side, amount, order.price,
+                    sym, order_side, order.filled or amount, order.price,
                     strategy_name, self.connector.paper,
+                    fee=getattr(order, "fee", 0.0),
                     sl=sl_p, tp=tp_p,
                     macro_score=macro_info.get("score"),
                     macro_bias=macro_info.get("bias"),

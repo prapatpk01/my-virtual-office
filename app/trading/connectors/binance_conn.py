@@ -30,6 +30,8 @@ class BinanceConnector(BaseConnector):
         "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w",
     }
 
+    PAPER_TAKER_FEE = 0.0005  # 0.05% per side, simulated in paper mode
+
     def __init__(
         self,
         api_key: str = "",
@@ -139,14 +141,55 @@ class BinanceConnector(BaseConnector):
             kwargs["params"] = {"posSide": pos_side}
 
         raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
+        order_id = str(raw.get("id", uuid.uuid4()))
+
+        # Post-fill data — the create_order response on OKX carries little
+        # more than the id, so fetch the order back to get the ACTUAL fill:
+        # avgPx (average fill price), accFillSz (filled size), fee, and pnl
+        # (realized trading PnL on reduce/close orders, fees excluded).
+        # Notifications must report these real numbers, not our estimates.
+        avg_px = raw.get("average") or 0.0
+        fill_sz = raw.get("filled") or 0.0
+        fee_cost = 0.0
+        realized_pnl = None
+        status = raw.get("status", "open")
+        for attempt in range(4):
+            try:
+                o = await self._exchange.fetch_order(order_id, symbol)
+            except Exception as e:
+                logger.debug("fetch_order retry %d for %s: %s", attempt, order_id, e)
+                await asyncio.sleep(0.4)
+                continue
+            info = o.get("info") or {}
+            avg_px = o.get("average") or float(info.get("avgPx") or 0) or avg_px
+            fill_sz = o.get("filled") or float(info.get("accFillSz") or info.get("fillSz") or 0) or fill_sz
+            status = o.get("status") or status
+            fee_obj = o.get("fee") or {}
+            if fee_obj.get("cost") is not None:
+                fee_cost = abs(float(fee_obj["cost"]))
+            elif o.get("fees"):
+                fee_cost = sum(abs(float(f.get("cost") or 0)) for f in o["fees"])
+            elif info.get("fee") is not None:
+                fee_cost = abs(float(info["fee"]))  # OKX reports fees as negative
+            if info.get("pnl") not in (None, ""):
+                try:
+                    realized_pnl = float(info["pnl"])
+                except (TypeError, ValueError):
+                    pass
+            if status == "closed" and avg_px and fill_sz:
+                break
+            await asyncio.sleep(0.4)
+
         return OrderResult(
-            order_id=str(raw.get("id", uuid.uuid4())),
+            order_id=order_id,
             symbol=symbol,
             side=side,
             amount=amount,
-            price=raw.get("price") or price or 0.0,
-            filled=raw.get("filled", 0.0),
-            status=raw.get("status", "open"),
+            price=avg_px or raw.get("price") or price or 0.0,
+            filled=fill_sz,
+            status=status,
+            fee=fee_cost,
+            realized_pnl=realized_pnl,
         )
 
     async def _paper_order(
@@ -160,6 +203,10 @@ class BinanceConnector(BaseConnector):
     ) -> OrderResult:
         ticker = await self.fetch_ticker(symbol)
         exec_price = price if (order_type == "limit" and price) else ticker["last"]
+        # Simulate the taker fee so paper notifications carry the same
+        # post-fill fields (fee, realized_pnl) a live OKX order reports.
+        fee_cost = round(amount * exec_price * self.PAPER_TAKER_FEE, 6)
+        realized_pnl = None
 
         if self._futures:
             # side='buy'+pos_side='long' or side='sell'+pos_side='short' OPENS
@@ -173,12 +220,12 @@ class BinanceConnector(BaseConnector):
 
             if is_open:
                 margin = round((amount * exec_price) / max(self._leverage, 1), 4)
-                if self._paper_balance.get("USDT", 0) < margin:
+                if self._paper_balance.get("USDT", 0) < margin + fee_cost:
                     raise ValueError(
-                        f"[Paper/Futures] Insufficient USDT: need {margin:.2f}, "
+                        f"[Paper/Futures] Insufficient USDT: need {margin + fee_cost:.2f}, "
                         f"have {self._paper_balance.get('USDT', 0):.2f}"
                     )
-                self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) - margin
+                self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) - margin - fee_cost
                 self._paper_used["USDT"] = self._paper_used.get("USDT", 0) + margin
                 existing = self._paper_positions.get(pos_key)
                 if existing:
@@ -209,9 +256,10 @@ class BinanceConnector(BaseConnector):
                     close_amt = min(amount, pos["amount"])
                     entry     = pos["entry_price"]
                     pnl = ((exec_price - entry) if direction == "long" else (entry - exec_price)) * close_amt
+                    realized_pnl = round(pnl, 6)  # trading PnL, fees excluded (mirrors OKX `pnl`)
                     margin_released = pos["margin"] * (close_amt / pos["amount"])
 
-                    self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) + margin_released + pnl
+                    self._paper_balance["USDT"] = self._paper_balance.get("USDT", 0) + margin_released + pnl - fee_cost
                     self._paper_used["USDT"] = max(0.0, self._paper_used.get("USDT", 0) - margin_released)
 
                     pos["amount"] -= close_amt
@@ -248,6 +296,8 @@ class BinanceConnector(BaseConnector):
             price=exec_price,
             filled=amount,
             status="closed",
+            fee=fee_cost,
+            realized_pnl=realized_pnl,
         )
         self._paper_open_orders.append(order)
         return order

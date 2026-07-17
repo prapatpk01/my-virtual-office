@@ -21,10 +21,13 @@ class OrderResult:
     symbol: str
     side: str          # 'buy' | 'sell'
     amount: float
-    price: float
-    filled: float
+    price: float       # average FILL price (avgPx) when available, else requested/ticker price
+    filled: float      # actual filled size (fillSz/accFillSz) when available
     status: str        # 'open' | 'closed' | 'canceled'
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+    fee: float = 0.0                       # fee charged for THIS order, quote ccy, positive = cost
+    realized_pnl: Optional[float] = None   # exchange-reported trading PnL of a reduce/close order
+                                           #   (OKX `pnl`: excludes fees). None = not a close / unknown.
 
 
 @dataclass
