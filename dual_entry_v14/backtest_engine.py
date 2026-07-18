@@ -76,17 +76,29 @@ class SimulatedExchange(ExchangeInterface):
             return self._settle(symbol, tp, "TAKE_PROFIT")
         return None
 
-    def _settle(self, symbol: str, px: float, reason: str) -> dict:
-        p = self.positions.pop(symbol)
+    def _settle(self, symbol: str, px: float, reason: str,
+                qty: Optional[float] = None) -> dict:
+        """Settle `qty` of the position (default: all). A PARTIAL settle (TP1)
+        reduces the open qty and keeps the rest running; a full settle removes
+        it. Matches OKX's reduce-only close semantics so the 2-TP runner
+        behaves identically live and in backtest."""
+        p = self.positions.get(symbol)
         long = p["direction"] == "LONG"
-        pnl = (px - p["entry"]) * p["qty"] if long else (p["entry"] - px) * p["qty"]
-        fee = p["qty"] * px * self.cfg.fee_rate
+        close_qty = p["qty"] if qty is None else min(qty, p["qty"])
+        pnl = (px - p["entry"]) * close_qty if long else (p["entry"] - px) * close_qty
+        fee = close_qty * px * self.cfg.fee_rate
         self.balance += pnl - fee
+        # entry fee is a whole-position cost booked at open; attribute this
+        # leg's SHARE so per-trade grouping doesn't double-count it.
+        entry_fee_leg = p["entry_fee"] * (close_qty / max(p["qty0"], 1e-12))
         ev = {"symbol": symbol, "reason": reason, "exit": px, "pnl": pnl - fee,
-              "entry": p["entry"], "direction": p["direction"], "qty": p["qty"],
+              "entry": p["entry"], "direction": p["direction"], "qty": close_qty,
               "opened_ms": p["opened_ms"], "closed_ms": self.clock_ms,
-              "entry_fee": p["entry_fee"], "exit_fee": fee}
+              "entry_fee": entry_fee_leg, "exit_fee": fee}
         self.fills.append(ev)
+        p["qty"] -= close_qty
+        if p["qty"] <= 1e-12:
+            self.positions.pop(symbol, None)
         return ev
 
     # ── ExchangeInterface ────────────────────────────────────────────────────
@@ -122,8 +134,8 @@ class SimulatedExchange(ExchangeInterface):
         qty = contracts * rules.contract_size
         fee = qty * fill * self.cfg.fee_rate
         self.balance -= fee
-        self.positions[symbol] = {"direction": direction, "qty": qty, "entry": fill,
-                                  "sl": sl_price, "tp": tp_price,
+        self.positions[symbol] = {"direction": direction, "qty": qty, "qty0": qty,
+                                  "entry": fill, "sl": sl_price, "tp": tp_price,
                                   "opened_ms": self.clock_ms, "entry_fee": fee}
         res = OrderResult(uuid.uuid4().hex, client_order_id, symbol, side, "filled",
                           filled_qty=qty, avg_price=fill, fee_cost=fee)
@@ -147,7 +159,8 @@ class SimulatedExchange(ExchangeInterface):
         px = self._price(symbol)
         slip = self._atr(symbol) * self.slippage_atr
         px = px - slip if direction == "LONG" else px + slip
-        ev = self._settle(symbol, px, "MANUAL")
+        # honor the requested quantity (TP1 partial closes only its share)
+        ev = self._settle(symbol, px, "MANUAL", qty=quantity)
         return OrderResult(uuid.uuid4().hex, "", symbol,
                            "sell" if direction == "LONG" else "buy", "filled",
                            filled_qty=ev["qty"], avg_price=px, fee_cost=ev["exit_fee"],
