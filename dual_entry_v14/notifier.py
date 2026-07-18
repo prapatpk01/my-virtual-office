@@ -43,11 +43,36 @@ class Notifier:
             logger.warning("[TG] send failed: %s", e)
             return False
 
+    async def _send_photo(self, path: str, caption: str) -> bool:
+        # a broken/missing chart must never cost the alert -> fall back to text
+        if not self.enabled:
+            return False
+        try:
+            data = aiohttp.FormData()
+            data.add_field("chat_id", self.chat_id)
+            data.add_field("caption", caption[:1024])
+            data.add_field("parse_mode", "Markdown")
+            with open(path, "rb") as f:
+                data.add_field("photo", f.read(), filename="chart.png",
+                               content_type="image/png")
+            async with aiohttp.ClientSession() as s:
+                async with s.post(API.format(token=self.token, method="sendPhoto"),
+                                  data=data,
+                                  timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        logger.warning("[TG] sendPhoto %s: %s — text fallback", r.status, body[:150])
+                        return await self._send(caption)
+                    return True
+        except Exception as e:
+            logger.warning("[TG] sendPhoto failed: %s — text fallback", e)
+            return await self._send(caption)
+
     # ── message shapes (spec §32) ────────────────────────────────────────────
 
-    async def signal(self, cand, plan, risk_pct: float) -> None:
+    async def signal(self, cand, plan, risk_pct: float, chart_path=None) -> None:
         z = cand.active_zone
-        await self._send(
+        text = (
             f"{'🟢 LONG' if cand.direction == 'LONG' else '🔴 SHORT'} *SIGNAL*\n"
             f"Symbol: `{cand.symbol}`\nSetup: `{cand.setup_type}`\n"
             f"Score: `{cand.score:.0f}/100`  Threshold: `{cand.threshold:.0f}`  "

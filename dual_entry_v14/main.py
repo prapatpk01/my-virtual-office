@@ -267,8 +267,23 @@ class Bot:
             self.diag.record_rejection(symbol, eq.reason_codes)
             return
 
+        # technical chart for the alert (15M + HMA10/16 + EMA50 + entry/SL/TP +
+        # active/opposing zones) — matches the regime bot; fails soft to text.
+        chart_path = None
+        if self.cfg.entry_chart_enabled and self.notifier.enabled:
+            try:
+                from .chart_engine import build_entry_chart
+                chart_path = build_entry_chart(
+                    symbol, ind_15m, candidate.direction, candidate.entry_reference,
+                    plan.stop_price, plan.target_price,
+                    active_zone=candidate.active_zone,
+                    opposing_zone=(candidate.active_zone if candidate.setup_type == "MOMENTUM"
+                                   else None))
+            except Exception as e:
+                logger.warning("[%s] chart build failed: %s", symbol, e)
         await self.notifier.signal(candidate, plan,
-                                   self.cfg.risk_per_trade * plan.risk_modifier)
+                                   self.cfg.risk_per_trade * plan.risk_modifier,
+                                   chart_path=chart_path)
         opened = await self.execution.open_position(symbol, candidate, plan, state)
         if opened:
             self.diag.count("positions_opened")

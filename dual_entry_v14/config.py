@@ -238,6 +238,7 @@ class Config:
     # ── Ops ─────────────────────────────────────────────────────────────────
     poll_interval_sec: int = 20
     view_log_interval_sec: int = 300   # regime-style periodic view log (Railway logs)
+    entry_chart_enabled: bool = True   # send a technical chart with the entry alert
     reconcile_every_loops: int = 1
     state_dir: str = "state"
     enable_advanced_patterns_live: bool = False
