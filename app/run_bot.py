@@ -202,6 +202,15 @@ def build_crypto_bot(config: dict, telegram):
             "Connector: %s | paper=%s | futures=%s | leverage=%dx | hedge=%s",
             exchange, config["paper"], futures, leverage, hedge_mode,
         )
+        if futures and leverage < 5:
+            logger.warning(
+                "LEVERAGE=%dx is unusually low for futures trading — position "
+                "sizing (margin x leverage) will size trades ~%dx SMALLER than "
+                "intended if the exchange itself has a higher leverage set "
+                "(e.g. LEVERAGE env says %d but the OKX UI shows 20x). Check "
+                "the LEVERAGE env var if this isn't deliberate.",
+                leverage, max(1, 20 // max(leverage, 1)), leverage,
+            )
     else:
         connector = AlpacaConnector(
             api_key=config["api_key"], api_secret=config["api_secret"],
