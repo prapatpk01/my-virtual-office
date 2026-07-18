@@ -42,6 +42,11 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+def _sym(symbol: str) -> str:
+    """'BTC/USDT:USDT' -> 'BTC' for compact Telegram output."""
+    return symbol.split("/")[0]
+
+
 class Bot:
     def __init__(self):
         self.cfg = load_config()
@@ -450,7 +455,7 @@ class Bot:
             await self.telegram.send_text(
                 "🤖 *Signal Regime Bias Bot*\n\n"
                 "/help — รายการคำสั่ง\n"
-                "/stats — สถิติเทรด (winrate, TP1/TP2 rate)\n"
+                "/stats — สถิติเทรด (จาก OKX order history, post-fee)\n"
                 "/balance — ยอด USDT ปัจจุบัน\n"
                 "/positions — position ที่เปิดอยู่\n"
                 "/trades — 5 เทรดล่าสุด\n"
@@ -494,7 +499,7 @@ class Bot:
                     f"{t['reason']}  pnl `{t['pnl']:+.2f}`  {ts}")
             await self.telegram.send_text("🧾 *Last 5 Trades*\n\n" + "\n".join(lines))
         elif cmd == "/stats":
-            await self.telegram.send_text(self._stats_text())
+            await self.telegram.send_text(await self._build_stats_report())
         elif cmd == "/status":
             lines = []
             now = time.time()
@@ -524,30 +529,103 @@ class Bot:
         else:
             await self.telegram.send_text(f"unknown command: {cmd} — try /help")
 
-    def _stats_text(self) -> str:
-        trades = self._trade_log
-        total = len(trades)
-        if total == 0:
-            return "📈 *Stats*\n\nno closed trades yet"
+    def _merge_trade_history(self, okx_rows: list[dict]) -> list[dict]:
+        """Merge OKX's authoritative closed-position rows (exact symbol/side/
+        pnl/close-time) with THIS process's own live-captured classification
+        (reason / tp1_hit) — OKX's history has no such field, but the bot
+        decided every close itself, so borrow it by matching (symbol, close
+        time) within a 5-minute tolerance. An OKX row with no live match
+        (bot was down / redeployed when it closed) falls back to
+        reason=RECONCILED, tp1_hit=False — still counted, still OKX-exact
+        PnL, just without the TP1/TP2 breakdown for that one trade."""
+        live_by_symbol: dict[str, list[dict]] = {}
+        for t in self._trade_log:
+            live_by_symbol.setdefault(t["symbol"], []).append(t)
+        merged = []
+        for row in okx_rows:
+            close_sec = row["close_time_ms"] / 1000.0
+            best = None
+            for t in live_by_symbol.get(row["symbol"], []):
+                if abs(t["time"] - close_sec) <= 300:
+                    best = t
+                    break
+            if best is not None:
+                merged.append({"time": close_sec, "symbol": row["symbol"], "side": best["side"],
+                               "reason": best["reason"], "tp1_hit": best["tp1_hit"],
+                               "pnl": row["pnl"]})
+            else:
+                merged.append({"time": close_sec, "symbol": row["symbol"], "side": row["side"],
+                               "reason": "RECONCILED", "tp1_hit": False, "pnl": row["pnl"]})
+        return merged
+
+    async def _build_stats_report(self) -> str:
+        """/stats — sourced from OKX's own closed-position history (post-fee,
+        exact match to the OKX app) since `stats_since_date`, sectioned per
+        the requested layout: header, OVERALL, BY SYMBOL, LAST 5 TRADES.
+        Paper mode has no real OKX ledger to query, so it falls back to this
+        process's in-memory log (still filtered to the same since-date)."""
+        since_ms = self.cfg.stats_since_ms()
+        if self.cfg.paper:
+            trades = [t for t in self._trade_log if t["time"] * 1000 >= since_ms]
+        else:
+            try:
+                okx_rows = await self.client.fetch_trade_history(since_ms, self.cfg.symbols)
+                trades = self._merge_trade_history(okx_rows)
+            except Exception as e:
+                logger.warning("[STATS] OKX history fetch failed, using local log: %s", e)
+                trades = [t for t in self._trade_log if t["time"] * 1000 >= since_ms]
+
+        balance = await self.client.fetch_balance_usdt()
+        open_lines = [f"`{_sym(sym)}` {pos.side.upper()} @ `{pos.entry_price:.6g}`"
+                      for sym in self.cfg.symbols if (pos := self.positions.get(sym)) is not None]
+        header = f"💰 Balance: `${balance:.2f}`\n"
+        header += ("\n".join(f"📌 {ln}" for ln in open_lines) if open_lines
+                  else "📌 No open positions")
+
+        if not trades:
+            return header + f"\n\n_no closed trades since {self.cfg.stats_since_date}_"
+
+        sep = "――――――――――――――――――"
         # Win rule (per spec): TP1 hit then stopped at breakeven still counts
         # as a WIN — the trade banked the TP1 partial.
         wins = [t for t in trades if t["pnl"] > 0 or t["tp1_hit"]]
+        total = len(trades)
         losses = total - len(wins)
         tp1 = [t for t in trades if t["tp1_hit"]]
         tp2 = [t for t in trades if t["reason"] == "TP2_HIT"]
+        sl_only = [t for t in trades if not t["tp1_hit"] and t["pnl"] <= 0]
         net = sum(t["pnl"] for t in trades)
-        winrate = len(wins) / total * 100
-        tp1_of_wins = (len(tp1) / len(wins) * 100) if wins else 0.0
-        tp2_of_total = len(tp2) / total * 100
-        return (
-            "📈 *Stats*\n\n"
-            f"Trades: `{total}`  Win: `{len(wins)}`  Loss: `{losses}`\n"
-            f"Winrate: `{winrate:.0f}%` _(TP1→SL counts as win)_\n"
-            f"TP1 hit: `{len(tp1)}` — `{tp1_of_wins:.0f}%` of wins "
-            f"(win {len(wins)} tp1 {len(tp1)}={tp1_of_wins:.0f}%)\n"
-            f"TP2 hit: `{len(tp2)}` — `{tp2_of_total:.0f}%` of trades\n"
-            f"Net PnL: `{net:+.2f}` USDT"
-        )
+
+        lines = [header, "", sep, "*OVERALL (OKX)*", sep,
+            f"Trades : `{total}`  (`{len(wins)}W` / `{losses}L`)",
+            f"Win rate : `{len(wins)/total*100:.0f}%`",
+            f"TP1 hit : `{len(tp1)}/{total}` (`{len(tp1)/total*100:.0f}%`)   "
+            f"TP2 hit : `{len(tp2)}/{total}` (`{len(tp2)/total*100:.0f}%`)",
+            f"SL only : `{len(sl_only)}/{total}` (`{len(sl_only)/total*100:.0f}%`)",
+            f"Net PnL : `{net:+.2f}` USDT (post-fee, from OKX)",
+            "", sep, "*BY SYMBOL*", sep]
+
+        by_sym: dict[str, list[dict]] = {}
+        for t in trades:
+            by_sym.setdefault(t["symbol"], []).append(t)
+        for sym in self.cfg.symbols:
+            ts = by_sym.get(sym, [])
+            if not ts:
+                lines.append(f"`{_sym(sym)}`   0 trades")
+                continue
+            w = sum(1 for t in ts if t["pnl"] > 0 or t["tp1_hit"])
+            lines.append(f"`{_sym(sym)}`   {len(ts)} trades  {w/len(ts)*100:.0f}%WR  "
+                        f"`{sum(t['pnl'] for t in ts):+.2f}`")
+
+        lines += ["", sep, "*LAST 5 TRADES*", sep]
+        now = time.time()
+        for i, t in enumerate(sorted(trades, key=lambda x: -x["time"])[:5], 1):
+            age = now - t["time"]
+            age_lbl = f"{age/3600:.1f}h ago" if age < 86400 else f"{age/86400:.1f}d ago"
+            win = t["pnl"] > 0 or t["tp1_hit"]
+            lines.append(f"{i}. {'✅' if win else '❌'} `{_sym(t['symbol'])}` "
+                        f"{t['side'].upper()} `{t['pnl']:+.2f}` — {age_lbl}")
+        return "\n".join(lines)
 
     async def _maybe_log_status(self):
         """Per-symbol regime/bias/entry snapshot, every status_log_interval_sec

@@ -209,6 +209,74 @@ class ExchangeClient:
             logger.error("[DATA] fetch_balance failed: %s", e)
             raise
 
+    async def fetch_trade_history(self, since_ms: int, known_symbols: list[str]) -> list[dict]:
+        """Authoritative closed-trade history straight from OKX's own ledger
+        (GET /api/v5/account/positions-history) — one row per FULLY closed
+        position. `realizedPnl` there is OKX's own net figure = pnl + fee +
+        fundingFee (+liqPenalty), i.e. exactly what the OKX app shows as that
+        position's PnL. /stats must never compute this number itself — this
+        is the one place fee-accurate numbers can't drift from OKX, including
+        across a redeploy that wipes this process's in-memory trade log.
+        Returns [] in paper mode (no real OKX account to query) or on any
+        API failure — callers fall back to their own in-memory record."""
+        if self.paper:
+            return []
+        id_to_symbol: dict[str, str] = {}
+        for sym in known_symbols:
+            try:
+                id_to_symbol[self._exchange.market(sym)["id"]] = sym
+            except Exception:
+                continue
+        out: list[dict] = []
+        after: Optional[str] = None
+        for _ in range(20):   # 20 * 100 rows = far beyond any realistic backfill window
+            params: dict = {"limit": "100", "instType": "SWAP"}
+            if after:
+                params["after"] = after
+            try:
+                raw = await self._exchange.privateGetAccountPositionsHistory(params)
+            except Exception as e:
+                logger.warning("[STATS] positions-history fetch failed: %s", e)
+                break
+            rows = (raw or {}).get("data") or []
+            if not rows:
+                break
+            stop = False
+            for r in rows:
+                try:
+                    u_time = int(r.get("uTime") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if u_time < since_ms:
+                    stop = True
+                    continue
+                symbol = id_to_symbol.get(r.get("instId", ""))
+                if symbol is None:
+                    continue   # a symbol this bot doesn't currently track — skip
+                try:
+                    pnl = float(r.get("pnl") or 0.0)
+                    fee = float(r.get("fee") or 0.0)            # negative = cost
+                    funding = float(r.get("fundingFee") or 0.0)
+                    liq = float(r.get("liqPenalty") or 0.0)
+                    realized = r.get("realizedPnl")
+                    realized = (float(realized) if realized not in (None, "")
+                               else (pnl + fee + funding + liq))
+                    out.append({
+                        "symbol": symbol, "side": str(r.get("direction", "")),
+                        "open_avg_px": float(r.get("openAvgPx") or 0.0),
+                        "close_avg_px": float(r.get("closeAvgPx") or 0.0),
+                        "pnl": realized, "close_time_ms": u_time,
+                        "open_time_ms": int(r.get("cTime") or 0),
+                        "pos_id": str(r.get("posId", "")),
+                    })
+                except (TypeError, ValueError) as e:
+                    logger.warning("[STATS] skipping malformed positions-history row: %s", e)
+            after = rows[-1].get("uTime")
+            if stop or len(rows) < 100 or not after:
+                break
+        out.sort(key=lambda x: x["close_time_ms"])
+        return out
+
     async def fetch_position_amount(self, symbol: str, side: str) -> float:
         """Actual base-asset size of an open OKX position (0.0 if none). Ground truth."""
         if self.paper:

@@ -6,8 +6,11 @@ TrendContV2 bot).
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+
+logger = logging.getLogger("config")
 
 
 def _load_dotenv():
@@ -255,6 +258,13 @@ class Config:
     # can never disagree on fee drag.
     fee_rate: float = 0.001
 
+    # ── /stats ───────────────────────────────────────────────────────────────
+    # /stats is sourced live from OKX's own closed-position history (not this
+    # process's in-memory log, which is lost on every redeploy) so the numbers
+    # can never drift from what the OKX app itself shows. Only trades that
+    # closed on/after this UTC date count.
+    stats_since_date: str = field(default_factory=lambda: os.environ.get("STATS_SINCE_DATE", "2026-07-16"))
+
     # ── Commodity market hours (XAU / XAG) ──────────────────────────────────
     # The underlying metals market is closed on weekends — the OKX perp still
     # quotes, but it's illiquid/frozen and signals are garbage. Block NEW
@@ -466,6 +476,20 @@ class Config:
         # configured — trading 5 symbols with MAX_POSITIONS=2 still means at
         # most 2 concurrent positions total, not 5.
         self.max_open_positions = max(1, self.max_positions_env)
+
+    def stats_since_ms(self) -> int:
+        """UTC-midnight epoch ms for `stats_since_date` — /stats never counts
+        a trade that closed before this. Falls back to epoch 0 (no filter)
+        on a malformed date rather than crashing the command."""
+        import datetime
+        try:
+            y, m, d = (int(x) for x in self.stats_since_date.split("-"))
+            dt = datetime.datetime(y, m, d, tzinfo=datetime.timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except (ValueError, TypeError):
+            logger.warning("[CONFIG] STATS_SINCE_DATE '%s' unparsable — no since-filter applied",
+                           self.stats_since_date)
+            return 0
 
     def validate_live(self) -> list[str]:
         """Returns a list of missing/invalid settings that block LIVE trading."""
