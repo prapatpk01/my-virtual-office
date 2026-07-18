@@ -48,6 +48,25 @@ class Config:
     bias_timeframe: str = "1h"
     entry_timeframe: str = "15m"
 
+    # ── Entry engine mode ───────────────────────────────────────────────────
+    # "dual"       — FastPullback + Momentum scoring engines (V1.4 default)
+    # "confluence" — HYBRID: regime-style 3-TF cross confluence is the trigger,
+    #                Dual evaluates lightly (soft bias, structure stop, room)
+    #                and trades immediately when it passes (per user design).
+    entry_engine: str = "dual"
+    conf_hma_fast: int = 10                 # L3a HMA fast (30m)
+    conf_hma_slow: int = 16                 # L3a HMA slow (30m)
+    conf_ema_fast: int = 5                  # L3b EMA fast (15m)
+    conf_ema_slow: int = 9                  # L3b EMA slow (15m)
+    conf_l3c_fast: int = 10                 # L3c EMA fast (5m)
+    conf_l3c_slow: int = 20                 # L3c EMA slow (5m)
+    conf_window_min: int = 15               # confluence freshness window (minutes)
+    conf_min_layers: int = 2                # >= N layers within the window
+    conf_min_layer_candles: int = 40        # min closed candles per layer TF
+    conf_min_room_r: float = 1.00           # light structure-room gate
+    fetch_30m: int = 120
+    fetch_5m: int = 200
+
     # ── Data quality ────────────────────────────────────────────────────────
     min_15m_candles: int = 300
     min_1h_candles: int = 200
@@ -249,6 +268,8 @@ class Config:
         errs = []
         if not self.symbols:
             errs.append("SYMBOLS empty")
+        if self.entry_engine not in ("dual", "confluence"):
+            errs.append(f"entry_engine '{self.entry_engine}' not in (dual, confluence)")
         if not (0 < self.risk_per_trade <= 0.10):
             errs.append(f"risk_per_trade {self.risk_per_trade} out of (0, 0.10]")
         if self.risk_per_trade > self.risk_warning_level:
@@ -284,6 +305,7 @@ def load_config() -> Config:
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
         risk_per_trade=_env("RISK_PER_TRADE", 0.05, float),
         max_positions=_env("MAX_POSITIONS", 2, int),
+        entry_engine=os.environ.get("ENTRY_ENGINE", "dual").strip().lower(),
         state_dir=os.environ.get("STATE_DIR", "state"),
         poll_interval_sec=_env("POLL_INTERVAL_SEC", 20, int),
     )

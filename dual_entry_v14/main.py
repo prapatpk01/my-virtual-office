@@ -12,6 +12,7 @@ from typing import Optional
 
 from .bias_engine import BiasEngine
 from .candidate_selector import CandidateSelector
+from .confluence_engine import ConfluenceEngine
 from .candle_engine import CandleEngine
 from .config import Config, TF_MS, load_config
 from .data_quality_gate import DataQualityGate
@@ -72,6 +73,7 @@ class Bot:
         self.bias = BiasEngine(c)
         self.regime = RegimeEngine(c)
         self.pullback = PullbackEngine(c)
+        self.confluence = ConfluenceEngine(c)
         self.momentum = MomentumEngine(c)
         self.selector = CandidateSelector()
         self.portfolio = PortfolioRiskManager(c)
@@ -106,6 +108,13 @@ class Bot:
                     symbol, "1h", self.cfg.fetch_1h)
                 candles_4h = await self.market_data.get_closed_candles(
                     symbol, "4h", self.cfg.fetch_4h)
+                # hybrid confluence mode also watches 30m + 5m cross layers
+                candles_30m = candles_5m = []
+                if self.cfg.entry_engine == "confluence":
+                    candles_30m = await self.market_data.get_closed_candles(
+                        symbol, "30m", self.cfg.fetch_30m)
+                    candles_5m = await self.market_data.get_closed_candles(
+                        symbol, "5m", self.cfg.fetch_5m)
 
                 quality = self.quality_gate.evaluate(
                     symbol, candles_15m, candles_1h, candles_4h,
@@ -181,7 +190,8 @@ class Bot:
                     await self._look_for_entry(symbol, state, ind_15m, bias, macro_ctx,
                                                regime, structure_15m, structure_1h,
                                                zones, patterns, candle_ctx, liq, sd,
-                                               shock_locked, exchange_state)
+                                               shock_locked, exchange_state,
+                                               candles_30m, candles_15m, candles_5m)
 
                 self._build_view(symbol, state, macro_ctx, bias, regime,
                                  exchange_state)
@@ -217,35 +227,49 @@ class Bot:
 
     async def _look_for_entry(self, symbol, state, ind_15m, bias, macro_ctx, regime,
                               s15, s1h, zones, patterns, candle_ctx, liq, sd,
-                              shock_locked, exchange_state) -> None:
+                              shock_locked, exchange_state,
+                              candles_30m=None, candles_15m=None, candles_5m=None) -> None:
         if self._commodity_halted(symbol):
             self.diag.record_rejection(symbol, [ReasonCode.REJECT_MARKET_CLOSED.value])
             self.diag.set_view(symbol, f"{_sym(symbol)} | NO TRADE | Reason=MARKET_CLOSED (weekend)")
             return
-        pb = self.pullback.evaluate(symbol, state, ind_15m, bias, macro_ctx, regime,
-                                    s15, s1h, zones, patterns, candle_ctx, liq, sd)
-        mo = self.momentum.evaluate(symbol, state, ind_15m, bias, macro_ctx, regime,
-                                    s15, s1h, zones, patterns, candle_ctx,
-                                    shock_lockout=shock_locked)
-        # shock: pullback still allowed but only at valid structure + reduced risk
-        if shock_locked and pb is not None:
-            pb.risk_modifier *= 0.7
-        # module performance gate
-        for cand_name, cand in (("pb", pb), ("mo", mo)):
-            if cand is None:
-                continue
-            mod = self.perf.module_risk_modifier(cand.setup_type)
-            if mod is None:
-                self.perf.record_shadow(cand.setup_type, 0.0)   # counted; refined at close
-                self.diag.record_rejection(symbol, [ReasonCode.REJECT_MODULE_PAUSED.value])
-                if cand is pb:
-                    pb = None
-                else:
-                    mo = None
-            else:
-                cand.risk_modifier *= mod
 
-        candidate = self.selector.select(pb, mo, state)
+        if self.cfg.entry_engine == "confluence":
+            # HYBRID: 3-TF cross confluence is the trigger; Dual evaluates
+            # lightly inside the engine (soft bias, structure stop, room).
+            if state.has_open_position or state.has_pending_order:
+                return
+            candidate = self.confluence.evaluate(
+                symbol, state, ind_15m, bias, macro_ctx, regime, s15, s1h, zones,
+                candles_30m or [], candles_15m or [], candles_5m or [],
+                self.exchange.now_ms())
+            if shock_locked and candidate is not None:
+                candidate.risk_modifier *= 0.7
+        else:
+            pb = self.pullback.evaluate(symbol, state, ind_15m, bias, macro_ctx, regime,
+                                        s15, s1h, zones, patterns, candle_ctx, liq, sd)
+            mo = self.momentum.evaluate(symbol, state, ind_15m, bias, macro_ctx, regime,
+                                        s15, s1h, zones, patterns, candle_ctx,
+                                        shock_lockout=shock_locked)
+            # shock: pullback still allowed but only at valid structure + reduced risk
+            if shock_locked and pb is not None:
+                pb.risk_modifier *= 0.7
+            # module performance gate
+            for cand_name, cand in (("pb", pb), ("mo", mo)):
+                if cand is None:
+                    continue
+                mod = self.perf.module_risk_modifier(cand.setup_type)
+                if mod is None:
+                    self.perf.record_shadow(cand.setup_type, 0.0)   # counted; refined at close
+                    self.diag.record_rejection(symbol, [ReasonCode.REJECT_MODULE_PAUSED.value])
+                    if cand is pb:
+                        pb = None
+                    else:
+                        mo = None
+                else:
+                    cand.risk_modifier *= mod
+
+            candidate = self.selector.select(pb, mo, state)
         if candidate is None:
             self.diag.count("signals_evaluated")
             return
@@ -324,6 +348,10 @@ class Bot:
             return
         # flat: show the dominant-bias side's block reason per engine
         side = "LONG" if bias.score_long >= bias.score_short else "SHORT"
+        if self.cfg.entry_engine == "confluence":
+            cf = (self.confluence.last_block.get(symbol) or {}).get(side, "-")
+            self.diag.set_view(symbol, f"{head} | CONF[{side[0]}]→{cf}")
+            return
         pb = (self.pullback.last_block.get(symbol) or {}).get(side, "-")
         mo = (self.momentum.last_block.get(symbol) or {}).get(side, "-")
         self.diag.set_view(symbol, f"{head} | PB[{side[0]}]→{pb} | MO[{side[0]}]→{mo}")

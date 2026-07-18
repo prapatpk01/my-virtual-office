@@ -30,6 +30,7 @@ class Direction(str, Enum):
 class SetupType(str, Enum):
     FAST_PULLBACK = "FAST_PULLBACK"
     MOMENTUM = "MOMENTUM"
+    CONFLUENCE = "CONFLUENCE"          # hybrid mode: 3-TF cross trigger
 
 
 class PullbackType(str, Enum):
