@@ -1095,7 +1095,9 @@ class TradingBot:
 
         # ── Balance check (always fresh, right before sizing) ─────────────────
         balances      = await self.connector.fetch_balance()
-        quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
+        _quote = [b for b in balances if b.asset in ("USDT", "USD", "BUSD")]
+        quote_balance  = next((b.free for b in _quote), 0)          # spendable now
+        equity_balance = next((b.total for b in _quote), quote_balance)  # total account value
         ticker        = await self.connector.fetch_ticker(sym)
         price         = ticker["last"]
         meta          = signal.metadata or {}
@@ -1104,8 +1106,8 @@ class TradingBot:
 
         min_balance = float(os.getenv("MIN_BALANCE_USD", "10"))
         logger.info(
-            "[%s] Balance check: free=$%.2f  min_required=$%.2f  (paper=%s)",
-            strategy_name, quote_balance, min_balance, self.connector.paper,
+            "[%s] Balance check: equity=$%.2f  free=$%.2f  min_required=$%.2f  (paper=%s)",
+            strategy_name, equity_balance, quote_balance, min_balance, self.connector.paper,
         )
         if quote_balance < min_balance:
             logger.warning(
@@ -1128,15 +1130,18 @@ class TradingBot:
 
         if sizing_mode == "margin":
             # ── Margin-based sizing (opt-in via signal.metadata) ─────────────
-            # Position margin = balance × margin_pct, notional = margin × leverage.
-            # Note: this is NOT the same as risking margin_pct of balance — actual
-            # $ risk on a stop-out depends on SL distance, same as any leveraged size.
+            # Position margin = margin_pct of TOTAL account equity (so "5% of
+            # balance" stays consistent whether or not another position is
+            # already open), notional = margin × leverage. e.g. $100 equity ×
+            # 5% = $5 margin × 20x = $100 notional. The free-balance
+            # availability clamp below still stops us exceeding spendable cash.
             margin_pct = float(meta.get("margin_pct", 0.05))
-            margin = quote_balance * margin_pct
+            margin = equity_balance * margin_pct
             notional_target = margin * (leverage if is_futures else 1)
             amount = round(notional_target / price, 6) if price > 0 else 0
             risk_per_unit = abs(price - sl_p) if sl_p else 0
-            sizing_label = f"margin-based {margin_pct*100:.1f}% of balance (leverage {leverage}x)"
+            sizing_label = (f"margin-based {margin_pct*100:.1f}% of equity ${equity_balance:.2f} "
+                            f"→ margin ${margin:.2f} × {leverage}x = notional ${notional_target:.2f}")
         else:
             # ── Risk-based position sizing ───────────────────────────────────
             # amount is sized so that a full SL hit loses exactly RISK_PER_TRADE_PCT
