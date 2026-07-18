@@ -49,11 +49,13 @@ class Config:
     entry_timeframe: str = "15m"
 
     # ── Entry engine mode ───────────────────────────────────────────────────
-    # "dual"       — FastPullback + Momentum scoring engines (V1.4 default)
-    # "confluence" — HYBRID: regime-style 3-TF cross confluence is the trigger,
-    #                Dual evaluates lightly (soft bias, structure stop, room)
-    #                and trades immediately when it passes (per user design).
-    entry_engine: str = "dual"
+    # "confluence" — DEFAULT (per user): regime-style 3-TF cross confluence is
+    #                the trigger; Dual evaluates lightly (soft bias, structure
+    #                stop, room) and trades immediately when it passes.
+    #                MODE=regime stays the pure regime bot; MODE=dual = this.
+    # "dual"       — legacy FastPullback + Momentum scoring engines
+    #                (backtested PF < 0.5 on 6mo/8 symbols — kept for study).
+    entry_engine: str = "confluence"
     conf_hma_fast: int = 10                 # L3a HMA fast (30m)
     conf_hma_slow: int = 16                 # L3a HMA slow (30m)
     conf_ema_fast: int = 5                  # L3b EMA fast (15m)
@@ -305,7 +307,7 @@ def load_config() -> Config:
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
         risk_per_trade=_env("RISK_PER_TRADE", 0.05, float),
         max_positions=_env("MAX_POSITIONS", 2, int),
-        entry_engine=os.environ.get("ENTRY_ENGINE", "dual").strip().lower(),
+        entry_engine=os.environ.get("ENTRY_ENGINE", "confluence").strip().lower(),
         state_dir=os.environ.get("STATE_DIR", "state"),
         poll_interval_sec=_env("POLL_INTERVAL_SEC", 20, int),
     )
