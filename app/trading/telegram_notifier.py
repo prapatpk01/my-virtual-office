@@ -263,7 +263,14 @@ class TelegramNotifier:
                     # Size/Margin fields, not what the bot originally asked for.
                     size   = t.get("remaining_size", t.get("size", 0.0)) or 0.0
                     value  = t.get("entry_order_value", 0.0) or (size * entry)
-                    margin = t.get("entry_margin", 0.0)
+                    # entry_margin is only ever set by the bot's own OPEN
+                    # flow (_step5_risk_engine, from the real OKX fill) — a
+                    # position picked up by reconcile_with_exchange after a
+                    # restart never had that flow run, so fall back to
+                    # order_value / configured leverage (same formula OKX
+                    # itself uses for cross-margin display).
+                    margin = t.get("entry_margin", 0.0) or (
+                        value / max(getattr(bot, "sizing_leverage", 10) or 10, 1))
                     open_lines.append(
                         f"{sym} {direction} entry={entry:,.4f} "
                         f"SL={sl:,.4f} TP1={tp1:,.4f} TP2={tp2:,.4f} "

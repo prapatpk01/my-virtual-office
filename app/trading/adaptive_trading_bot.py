@@ -3526,6 +3526,12 @@ class TradingBot:
                 "tp1_pct": 0.50, "tp2_pct": 1.0,
                 "trail_atr_mult": 2.0,
                 "size": real_size, "remaining_size": real_size,
+                # Same fields the normal OPEN flow gets from the real OKX
+                # fill (_step5_risk_engine) — a reconciled position never ran
+                # that flow, so approximate from what's known here (Telegram
+                # /stats' "Open" line would otherwise show margin=$0).
+                "entry_order_value": entry_price * real_size,
+                "entry_margin": (entry_price * real_size) / max(self.sizing_leverage, 1),
                 "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
                 "break_even_triggered": False, "status": "OPEN",
                 "entry_time": datetime.datetime.now(datetime.timezone.utc),
