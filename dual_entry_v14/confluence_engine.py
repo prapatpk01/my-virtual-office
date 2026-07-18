@@ -138,19 +138,19 @@ class ConfluenceEngine:
             blk(direction, "no_new_cross_since_last_entry")
             return None
 
-        # ── light Dual evaluation (soft bias gate — the first filter) ───────
-        allowed, bias_risk_mod, bias_why = bias.allows(
-            direction, s15, s1h, TF_MS["1h"], now_ms)
-        if not allowed:
-            blk(direction, f"bias:{bias_why}")
-            return None
-
         long = direction == "LONG"
         i = ind_15m
         price = float(i.closes[-1])
         a = float(i.atr[-1]) if np.isfinite(i.atr[-1]) else 0.0
         if a <= 0 or price <= 0:
             blk(direction, "no_atr")
+            return None
+
+        # ── light Dual evaluation (soft bias gate — the first filter) ───────
+        allowed, bias_risk_mod, bias_why = bias.allows(
+            direction, s15, zones, price, s1h, now_ms, TF_MS["1h"])
+        if not allowed:
+            blk(direction, f"bias:{bias_why}")
             return None
 
         # structure stop candidates: recent 15M swing + ATR fallback
