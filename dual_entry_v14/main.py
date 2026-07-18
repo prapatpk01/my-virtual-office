@@ -129,7 +129,13 @@ class Bot:
                     self.diag.set_view(symbol, f"{_sym(symbol)} | DATA REJECT: {reason}")
                     return
 
-                candle_key = build_candle_key(symbol, "15m", candles_15m[-1])
+                # confluence mode reacts on every closed 5M bar (the cross
+                # layers live on 5M/15M/30M — waiting for the 15M close enters
+                # up to 15 min late, after the ignition move is spent).
+                if self.cfg.entry_engine == "confluence" and candles_5m:
+                    candle_key = build_candle_key(symbol, "5m", candles_5m[-1])
+                else:
+                    candle_key = build_candle_key(symbol, "15m", candles_15m[-1])
                 if candle_key == state.last_processed_candle:
                     return
                 bar_ts = int(candles_15m[-1].timestamp)

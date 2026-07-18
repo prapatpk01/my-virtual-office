@@ -79,6 +79,13 @@ class PositionManager:
         if state.setup_type == SetupType.MOMENTUM.value:
             if await self._momentum_early_exit(symbol, state, i, structure_15m, price, long):
                 return
+        elif state.setup_type == SetupType.CONFLUENCE.value:
+            # TP1-gated (like the regime bot's port the user requested):
+            # cross entries need room to breathe right after ignition — the
+            # soft weakness exit only arms once TP1 has banked profit.
+            if state.tp1_done and await self._pullback_early_exit(
+                    symbol, state, i, structure_15m, candle_context, price, long):
+                return
         else:
             if await self._pullback_early_exit(symbol, state, i, structure_15m,
                                                candle_context, price, long):
