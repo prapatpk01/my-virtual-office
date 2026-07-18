@@ -87,6 +87,10 @@ class Bot:
         self._last_view_log = 0.0
         self._tg_offset = 0
         self._cmd_task = None
+        # seed every configured symbol so the view log / status is never
+        # missing a symbol (each is replaced with real state on first eval).
+        for s in c.symbols:
+            self.diag.set_view(s, f"{_sym(s)} | starting…")
 
     # ── per-symbol pipeline (spec §34 pseudocode, faithfully) ────────────────
 
@@ -109,6 +113,11 @@ class Bot:
                     now_ms=self.exchange.now_ms())
                 if not quality.valid:
                     self.diag.record_rejection(symbol, quality.reason_codes)
+                    # keep the symbol visible in the view log with WHY it's not
+                    # evaluating (data length / gaps / staleness / spread) —
+                    # otherwise it vanishes from /status and the periodic dump.
+                    reason = quality.reason_codes[0] if quality.reason_codes else "data"
+                    self.diag.set_view(symbol, f"{_sym(symbol)} | DATA REJECT: {reason}")
                     return
 
                 candle_key = build_candle_key(symbol, "15m", candles_15m[-1])
@@ -183,6 +192,7 @@ class Bot:
                 state.candidate_regime_count = regime.candidate_count
             except Exception as exc:
                 self.diag.record_error(symbol, exc)
+                self.diag.set_view(symbol, f"{_sym(symbol)} | ERROR: {str(exc)[:60]}")
                 try:
                     await self.notifier.send_critical_error(symbol, exc)
                 except Exception:
@@ -325,7 +335,7 @@ class Bot:
         self._last_view_log = now
         lines = self.diag.view_lines()
         if lines:
-            logger.info("VIEW ┃ %s", " ┃ ".join([""]))
+            logger.info("VIEW ━━ %d symbols ━━", len(lines))
             for ln in lines:
                 logger.info("VIEW ┃ %s", ln)
             top = self.diag.top_reasons(5)
