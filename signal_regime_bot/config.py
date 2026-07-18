@@ -262,8 +262,10 @@ class Config:
     # /stats is sourced live from OKX's own closed-position history (not this
     # process's in-memory log, which is lost on every redeploy) so the numbers
     # can never drift from what the OKX app itself shows. Only trades that
-    # closed on/after this UTC date count.
+    # closed on/after this UTC date count. /restats moves this cursor forward
+    # to "now" at runtime (persisted to state_dir so it survives a restart).
     stats_since_date: str = field(default_factory=lambda: os.environ.get("STATS_SINCE_DATE", "2026-07-16"))
+    state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "state"))
 
     # ── Commodity market hours (XAU / XAG) ──────────────────────────────────
     # The underlying metals market is closed on weekends — the OKX perp still

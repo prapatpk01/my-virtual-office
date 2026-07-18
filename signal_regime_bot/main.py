@@ -17,7 +17,9 @@ never kill the loop or leave an order half-placed with silent failure.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import signal
 import time
 
@@ -47,6 +49,31 @@ def _sym(symbol: str) -> str:
     return symbol.split("/")[0]
 
 
+def _stats_reset_path(state_dir: str) -> str:
+    return os.path.join(state_dir, "stats_reset.json")
+
+
+def _load_stats_reset_ms(state_dir: str):
+    """The /restats cursor, if one was ever set — None means "use
+    STATS_SINCE_DATE". Missing/corrupt file is not an error, just no override."""
+    try:
+        with open(_stats_reset_path(state_dir)) as f:
+            return int(json.load(f)["since_ms"])
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError, TypeError):
+        return None
+
+
+def _save_stats_reset_ms(state_dir: str, since_ms: int) -> None:
+    """Atomic write so a crash mid-write can never leave a truncated/corrupt
+    marker file (same pattern as dual_entry_v14's state_store)."""
+    os.makedirs(state_dir, exist_ok=True)
+    path = _stats_reset_path(state_dir)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"since_ms": since_ms}, f)
+    os.replace(tmp, path)
+
+
 class Bot:
     def __init__(self):
         self.cfg = load_config()
@@ -71,6 +98,7 @@ class Bot:
         self._last_status_log_ts = 0.0
         self._last_reconcile_ts = 0.0         # periodic untracked-position safety net
         self._trade_log: list[dict] = []      # closed trades (for /stats, /trades)
+        self._stats_reset_ms = _load_stats_reset_ms(self.cfg.state_dir)   # /restats cursor override
         self._cmd_task = None                 # Telegram command polling task
         self._tg_offset = 0
         self._running = False
@@ -456,6 +484,7 @@ class Bot:
                 "🤖 *Signal Regime Bias Bot*\n\n"
                 "/help — รายการคำสั่ง\n"
                 "/stats — สถิติเทรด (จาก OKX order history, post-fee)\n"
+                "/restats — reset stats แล้วเริ่มนับใหม่จากตอนนี้\n"
                 "/balance — ยอด USDT ปัจจุบัน\n"
                 "/positions — position ที่เปิดอยู่\n"
                 "/trades — 5 เทรดล่าสุด\n"
@@ -500,6 +529,15 @@ class Bot:
             await self.telegram.send_text("🧾 *Last 5 Trades*\n\n" + "\n".join(lines))
         elif cmd == "/stats":
             await self.telegram.send_text(await self._build_stats_report())
+        elif cmd == "/restats":
+            now_ms = int(time.time() * 1000)
+            self._stats_reset_ms = now_ms
+            _save_stats_reset_ms(self.cfg.state_dir, now_ms)
+            self._trade_log = []   # this process's own log; OKX history is untouched
+            now_lbl = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(now_ms / 1000))
+            await self.telegram.send_text(
+                f"🔄 *Stats reset*\n\n/stats now counts trades closed on/after `{now_lbl}` only."
+            )
         elif cmd == "/status":
             lines = []
             now = time.time()
@@ -564,7 +602,8 @@ class Bot:
         the requested layout: header, OVERALL, BY SYMBOL, LAST 5 TRADES.
         Paper mode has no real OKX ledger to query, so it falls back to this
         process's in-memory log (still filtered to the same since-date)."""
-        since_ms = self.cfg.stats_since_ms()
+        since_ms = (self._stats_reset_ms if self._stats_reset_ms is not None
+                   else self.cfg.stats_since_ms())
         if self.cfg.paper:
             trades = [t for t in self._trade_log if t["time"] * 1000 >= since_ms]
         else:
@@ -583,7 +622,8 @@ class Bot:
                   else "📌 No open positions")
 
         if not trades:
-            return header + f"\n\n_no closed trades since {self.cfg.stats_since_date}_"
+            since_lbl = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(since_ms / 1000))
+            return header + f"\n\n_no closed trades since {since_lbl}_"
 
         sep = "――――――――――――――――――"
         # Win rule (per spec): TP1 hit then stopped at breakeven still counts
