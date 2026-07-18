@@ -2458,6 +2458,12 @@ class TradingBot:
             # the bot's own pre-fill estimate.
             self.current_trade["entry_fee"]    = float(_open_result.get("_entry_fee") or 0.0)
             self.current_trade["entry_avg_px"] = float(_open_result.get("_entry_avg_px") or entry_price)
+            # [REAL SIZE/MARGIN] ground truth from the exchange fill, for
+            # display (Telegram OPEN alert, /stats open-position line) —
+            # never re-derived from the pre-fill request, which can be far
+            # off when the exchange's min-lot floor rounds the size up.
+            self.current_trade["entry_order_value"] = float(_open_result.get("_entry_order_value") or 0.0)
+            self.current_trade["entry_margin"]      = float(_open_result.get("_entry_margin") or 0.0)
 
         self.position_open         = True
         self._position_entry_bar   = self._bar_count

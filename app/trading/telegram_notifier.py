@@ -256,9 +256,18 @@ class TelegramNotifier:
                     sl        = t.get("sl", 0.0)
                     tp1       = t.get("tp1", 0.0)
                     tp2       = t.get("tp2", 0.0)
+                    # Real post-fill size/order-value/margin (set from the
+                    # OKX fill, not the pre-fill request — see
+                    # TradingBot._step5_risk_engine's entry_order_value/
+                    # entry_margin) so this always matches OKX's own
+                    # Size/Margin fields, not what the bot originally asked for.
+                    size   = t.get("remaining_size", t.get("size", 0.0)) or 0.0
+                    value  = t.get("entry_order_value", 0.0) or (size * entry)
+                    margin = t.get("entry_margin", 0.0)
                     open_lines.append(
                         f"{sym} {direction} entry={entry:,.4f} "
-                        f"SL={sl:,.4f} TP1={tp1:,.4f} TP2={tp2:,.4f}"
+                        f"SL={sl:,.4f} TP1={tp1:,.4f} TP2={tp2:,.4f} "
+                        f"size={size:.4f}(${value:,.2f}) margin=${margin:,.2f}"
                     )
 
                 for tr in getattr(bot, "trade_journal", []) or []:

@@ -84,17 +84,37 @@ def _fmt_px(v) -> str:
         return str(v)
 
 
-def _format_open_msg(order_type: str, sym: str, trade_info: dict) -> str:
+def _open_fill_figures(trade_info: dict, result, leverage: float = 10.0) -> tuple:
+    """Real post-fill size/order-value/margin/fee when the exchange returned
+    them (result = the execution_callback's return dict — has _filled_coins /
+    _entry_avg_px / _entry_order_value / _entry_margin / _entry_fee); falls
+    back to the bot's pre-fill request otherwise (paper/backtest, or the
+    adapter didn't return fill data — margin is then approximated from
+    `leverage` since there's no real fill to derive it from). The exchange's
+    1-contract minimum can round the requested size up a lot on a small
+    balance, so the real fill is what should be shown, not the request."""
+    entry = float(trade_info.get("entry") or 0)
+    req_size = float(trade_info.get("size") or 0)
+    r = result if isinstance(result, dict) else {}
+    size = float(r.get("_filled_coins") or 0) or req_size
+    avg_px = float(r.get("_entry_avg_px") or 0) or entry
+    order_value = float(r.get("_entry_order_value") or 0) or (size * avg_px)
+    margin = float(r.get("_entry_margin") or 0) or (order_value / max(leverage, 1))
+    fee = float(r.get("_entry_fee") or 0.0)
+    return size, order_value, margin, fee
+
+
+def _format_open_msg(order_type: str, sym: str, trade_info: dict, result=None, leverage: float = 10.0) -> str:
     """OPEN notification: entry / size / SL / full T1-T2 target structure
     (last level = the TP actually attached on the exchange). Falls back to
     the old TP1/TP2 line if the ladder isn't in the payload."""
-    entry    = trade_info.get("entry")
-    size     = float(trade_info.get("size") or 0)
-    notional = size * float(entry or 0)
+    entry = trade_info.get("entry")
+    size, order_value, margin, fee = _open_fill_figures(trade_info, result, leverage=leverage)
     lines = [
         f"🟢 [Adaptive] {order_type} {sym}",
         f"Entry : {_fmt_px(entry)}",
-        f"Size : {size:.4f} (≈${notional:,.2f})",
+        f"Size : {size:.4f} (≈${order_value:,.2f})",
+        f"Margin : ${margin:,.2f}  Fee : ${fee:,.4f}",
         f"SL : {_fmt_px(trade_info.get('sl'))}",
     ]
     ladder = trade_info.get("ladder") or []
@@ -445,7 +465,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     # itself only receives the order payload, not market data).
     last_c15m_cache: dict = {}
 
-    def _send_open_chart_alert(sym: str, order_type: str, trade_info: dict) -> bool:
+    def _send_open_chart_alert(sym: str, order_type: str, trade_info: dict, result=None) -> bool:
         """Render an entry chart + HTML caption and send as a Telegram photo.
         Returns True when the photo was queued (send_photo itself falls back
         to a text message if the upload fails); False → caller sends the
@@ -458,7 +478,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         sl    = float(trade_info.get("sl") or 0)
         tp1   = float(trade_info.get("tp1") or 0)
         tp2   = float(trade_info.get("tp2") or 0)
-        size  = float(trade_info.get("size") or 0)
+        size, order_value, margin, fee = _open_fill_figures(
+            trade_info, result, leverage=cfg.get("leverage", 10))
 
         # Signal context lives on the bot (current_trade is set before the
         # OPEN order is sent), not in the order payload.
@@ -483,7 +504,6 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
         emoji    = "🟢" if direction == "LONG" else "🔴"
         sl_pct   = abs(sl - entry) / entry * 100 if entry else 0.0
-        notional = size * entry
         lines = [
             f"{emoji} <b>OPEN {direction}</b>  {sym}",
             "━━━━━━━━━━━━━━━",
@@ -491,7 +511,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             f"🛑 SL : <code>{_fmt_px(sl)}</code> (-{sl_pct:.2f}%)",
             f"🎯 T1 : <code>{_fmt_px(tp1)}</code> (0.5R · close {close_pct:.0%} · SL→BE)",
             f"🏁 T2 : <code>{_fmt_px(tp2)}</code> (1.0R · close rest)",
-            f"💰 Size : {size:.4f} (≈${notional:,.2f})",
+            f"💰 Size : {size:.4f} (≈${order_value:,.2f})",
+            f"📥 Margin : ${margin:,.2f}  Fee : ${fee:,.4f}",
         ]
         if strategy or regime:
             lines.append("━━━━━━━━━━━━━━━")
@@ -545,11 +566,13 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             # fallback when rendering isn't possible.
                             sent = False
                             try:
-                                sent = _send_open_chart_alert(s, order_type, trade_info)
+                                sent = _send_open_chart_alert(s, order_type, trade_info, result=result)
                             except Exception as ce:
                                 logger.warning("[Chart][%s] alert failed (%s) — text fallback", s, ce)
                             if not sent:
-                                telegram.send(_format_open_msg(order_type, s, trade_info))
+                                telegram.send(_format_open_msg(
+                                    order_type, s, trade_info, result=result,
+                                    leverage=cfg.get("leverage", 10)))
                         else:
                             # [OKX FILL] current_trade still holds this
                             # close's "last_fill" (set in _close_position,

@@ -543,6 +543,12 @@ class OKXAdapter(BaseConnector):
         raw["_entry_avg_px"] = fill_fields.get("avg_px") or fill_price
         raw["_entry_fee"]    = fill_fields.get("fee", 0.0)
         raw["_entry_fee_ccy"] = fill_fields.get("fee_ccy", "")
+        # [REAL SIZE/MARGIN] Ground truth for Telegram — the exchange's
+        # 1-contract minimum can round the requested size up a lot (small
+        # balance + high-priced symbol), so these must come from the actual
+        # fill, not the pre-fill request.
+        raw["_entry_order_value"] = raw["_filled_coins"] * raw["_entry_avg_px"]
+        raw["_entry_margin"] = raw["_entry_order_value"] / max(self.leverage, 1)
 
         # [SL AMEND] Locate the attached SL/TP algo order's id so later ladder
         # SL-ratchets (T1-T3) can amend the REAL exchange-side stop, not just
