@@ -366,6 +366,64 @@ class OKXAdapter(BaseConnector):
         raw = self._call(self._ex.fetch_balance, label="fetch_balance_sync")
         return float((raw.get("USDT") or {}).get("free", 0) or 0)
 
+    def fetch_closed_positions_history(
+        self,
+        since_ms: Optional[int] = None,
+        symbols: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Real closed-trade history straight from OKX (GET
+        /account/positions-history) — one row per full open→close round trip
+        (every partial close along the way, e.g. a T1 + T2 split, is folded
+        into a single row once the position is fully flat). 'realizedPnl' is
+        OKX's own number (trading pnl + trading fee + funding fee, fee/funding
+        already negative) — exactly what OKX shows for that position, so /stats
+        never has to re-derive or can drift from it.
+        Paginates back in time (cursor = oldest uTime seen so far) until a
+        short page comes back or every remaining row is older than since_ms.
+        """
+        if self.paper:
+            return []
+        out: List[Dict[str, Any]] = []
+        cursor_after = None
+        for _ in range(20):  # 20*100=2000 rows — far more than this account will ever need
+            params: Dict[str, Any] = {"instType": "SWAP"}
+            if cursor_after:
+                params["after"] = cursor_after
+            page = self._call(
+                self._ex.fetch_positions_history, None, None, 100, params,
+                label="fetch_positions_history",
+            )
+            if not page:
+                break
+            out.extend(page)
+            oldest = min(page, key=lambda p: p.get("lastUpdateTimestamp") or p.get("timestamp") or 0)
+            oldest_ts = oldest.get("lastUpdateTimestamp") or oldest.get("timestamp") or 0
+            cursor_after = (oldest.get("info") or {}).get("uTime")
+            if len(page) < 100 or not cursor_after or (since_ms and oldest_ts < since_ms):
+                break
+
+        if since_ms:
+            out = [p for p in out if (p.get("lastUpdateTimestamp") or p.get("timestamp") or 0) >= since_ms]
+        if symbols:
+            wanted = set(symbols)
+            out = [p for p in out if p.get("symbol") in wanted]
+
+        trades = [
+            {
+                "symbol": p.get("symbol"),
+                "side": p.get("side"),
+                "pnl": float(p.get("realizedPnl") or 0.0),
+                "entry_price": float(p.get("entryPrice") or 0.0),
+                "close_price": float(p.get("lastPrice") or 0.0),
+                "open_ts": int(p.get("timestamp") or 0),
+                "close_ts": int(p.get("lastUpdateTimestamp") or p.get("timestamp") or 0),
+            }
+            for p in out
+        ]
+        trades.sort(key=lambda t: t["close_ts"])
+        return trades
+
     def cancel_all_open_orders_sync(self, symbol: Optional[str] = None) -> None:
         sym = symbol or self.symbol
         orders = self._call(self._ex.fetch_open_orders, sym, label="fetch_open_orders_sync")

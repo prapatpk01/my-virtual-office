@@ -262,6 +262,11 @@ def build_config() -> dict:
         # process start (indicators need a few closed bars to stabilize
         # after a fresh restart). Was hardcoded 45; lowered to 10 by request.
         "adaptive_warmup_min": _env_int("ADAPTIVE_WARMUP_MIN", 10),
+        # /stats now sources trade count/win-rate/PnL straight from OKX's own
+        # post-fill positions-history (realizedPnl already nets OKX's trading
+        # + funding fee — no local re-derivation, so the numbers always match
+        # OKX exactly). Only trades closed on/after this date are counted.
+        "adaptive_stats_since": os.environ.get("ADAPTIVE_STATS_SINCE_DATE", "2026-07-16"),
         # [SIZING MODE] Back to classic risk-%-of-balance (live default,
         # ADAPTIVE_RISK_PCT above = 5%): position size is derived from the
         # SL distance so that a full stop-out loses exactly risk_pct of
@@ -618,6 +623,19 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
     if telegram:
         # Wire bots dict so /stats and /log commands work
         telegram.bots_dict = bots
+        # Wire the shared exchange adapter so /stats can pull real post-fill
+        # trade history straight from OKX (see fetch_closed_positions_history)
+        # instead of relying only on each bot's local trade_journal.
+        telegram.exchange = okx
+        try:
+            import datetime as _dt_stats
+            _since_str = cfg.get("adaptive_stats_since", "2026-07-16")
+            _since_dt = _dt_stats.datetime.strptime(_since_str, "%Y-%m-%d").replace(
+                tzinfo=_dt_stats.timezone.utc)
+            telegram.stats_since_ms = int(_since_dt.timestamp() * 1000)
+        except Exception as e:
+            logger.warning("[Stats] bad ADAPTIVE_STATS_SINCE_DATE (%s): %s — /stats will show all history", cfg.get("adaptive_stats_since"), e)
+            telegram.stats_since_ms = 0
         # Wire /stop command so it reaches the adaptive runner's stop_event
         telegram.stop_bot_fn = lambda: stop_event.set()
         # FIX-#8: start Telegram command polling in adaptive mode

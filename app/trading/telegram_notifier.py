@@ -13,6 +13,19 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 _BOT_START_TIME = time.time()
 
 
+def _time_ago_ms(ms: Optional[int]) -> str:
+    """Same 'Xm/Xh/Xd ago' label as _time_ago(), but for an epoch-ms
+    timestamp (what OKX's positions-history returns) instead of an ISO
+    string (what the bot's local trade_journal stores)."""
+    if not ms:
+        return "?"
+    try:
+        closed = datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
+        return _time_ago(closed.isoformat())
+    except (ValueError, TypeError, OSError, OverflowError):
+        return "?"
+
+
 def _time_ago(iso_str: Optional[str]) -> str:
     """'2h ago' / '35m ago' style label for a trade_journal 'closed_at'
     ISO timestamp. Falls back to '?' for older entries saved before that
@@ -49,6 +62,8 @@ class TelegramNotifier:
         self.bot: object = None          # TradingBot reference (legacy/non-adaptive)
         self.bots_dict: dict = {}        # symbol → AdaptiveTradingBot (adaptive mode)
         self.stop_bot_fn: Optional[Callable] = None
+        self.exchange: object = None     # shared OKXAdapter — /stats reads real post-fill history from it
+        self.stats_since_ms: int = 0     # /stats only counts OKX trades closed on/after this time
 
     # ------------------------------------------------------------------
     # Polling control
@@ -223,31 +238,16 @@ class TelegramNotifier:
 
         DIVIDER = "――――――――――――――――"
 
-        total_pnl    = 0.0
-        total_trades = 0
-        total_wins   = 0
-        total_losses = 0
         balance      = 0.0
         open_lines   = []
-        # per-symbol trade stats for SECTION 2 — separate from all_trades
-        # (which is per-CLOSED-TRADE, flattened, for the TP1/TP2 breakdown
-        # and last-5 list) so a symbol with 0 trades still gets its own row.
-        per_symbol: list = []
-        all_trades: list = []   # every closed trade across every symbol
+        # Local bot-tracked trades (for the TP1/TP2/SL breakdown line only —
+        # OKX's own history below doesn't carry that "which target" concept).
+        all_trades: list = []
 
         for sym, (bot, _) in bots.items():
             try:
                 st = bot.get_status()
-                perf = bot.get_performance_summary() if hasattr(bot, "get_performance_summary") else {}
-                n = st.get("total_trades", 0)
-                wr = perf.get("win_rate", 0) * 100 if n > 0 else 0.0
-                pnl = perf.get("net_pnl", 0.0)
-                total_pnl    += pnl
-                total_trades += n
-                total_wins   += perf.get("wins", 0)
-                total_losses += perf.get("losses", 0)
                 balance = st.get("account_balance", balance)
-                per_symbol.append((sym, n, wr, pnl))
 
                 if st.get("position_open"):
                     t = getattr(bot, "current_trade", {}) or {}
@@ -262,16 +262,24 @@ class TelegramNotifier:
                     )
 
                 for tr in getattr(bot, "trade_journal", []) or []:
-                    all_trades.append({**tr, "_symbol": sym})
+                    if (tr.get("closed_at") or "") >= self._stats_since_iso():
+                        all_trades.append({**tr, "_symbol": sym})
             except Exception as e:
-                per_symbol.append((sym, None, None, None))
                 logger.warning("[stats] %s: %s", sym, e)
 
-        n_all = len(all_trades)
-        tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
-        tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
-        sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
-        overall_wr = total_wins / total_trades * 100 if total_trades else 0.0
+        # ── Real post-fill trade history straight from OKX ───────────────────
+        # None = fetch failed/unavailable (paper mode, no exchange wired, API
+        # error) → fall back to the bot's local trade_journal so /stats still
+        # shows something; [] = fetched fine, genuinely zero trades yet.
+        okx_trades = None
+        if self.exchange is not None and hasattr(self.exchange, "fetch_closed_positions_history"):
+            try:
+                okx_trades = await asyncio.to_thread(
+                    self.exchange.fetch_closed_positions_history,
+                    self.stats_since_ms, list(bots.keys()),
+                )
+            except Exception as e:
+                logger.warning("[stats] OKX history fetch failed: %s", e)
 
         lines = ["📊 Adaptive Bot Stats", ""]
         lines.append(f"💰 Balance: ${balance:,.2f}")
@@ -280,47 +288,130 @@ class TelegramNotifier:
         else:
             lines.append("📌 No open positions")
 
-        # ── SECTION 1: overall win rate + TP1/TP2/SL breakdown + PnL ─────────
-        lines += ["", DIVIDER, "OVERALL", DIVIDER]
-        lines.append(f"Trades   : {total_trades}  ({total_wins}W / {total_losses}L)")
-        lines.append(f"Win rate : {overall_wr:.0f}%")
-        if n_all:
-            lines.append(
-                f"TP1 hit  : {tp1_n}/{n_all} ({tp1_n/n_all*100:.0f}%)   "
-                f"TP2 hit : {tp2_n}/{n_all} ({tp2_n/n_all*100:.0f}%)   "
-                f"SL only : {sl_only_n}/{n_all} ({sl_only_n/n_all*100:.0f}%)"
-            )
-        lines.append(f"Net PnL  : ${total_pnl:+,.2f}")
+        if okx_trades is not None:
+            # ── OKX-sourced numbers: Trades/Win-rate/PnL always match what
+            # OKX itself reports (realizedPnl is already net of trading +
+            # funding fee) — no local bookkeeping involved.
+            total_trades = len(okx_trades)
+            total_wins   = sum(1 for t in okx_trades if t["pnl"] > 0)
+            total_losses = total_trades - total_wins
+            total_pnl    = sum(t["pnl"] for t in okx_trades)
+            overall_wr   = total_wins / total_trades * 100 if total_trades else 0.0
 
-        # ── SECTION 2: per-symbol trade count + win rate ─────────────────────
-        lines += ["", DIVIDER, "BY SYMBOL", DIVIDER]
-        for sym, n, wr, pnl in per_symbol:
-            base = sym.split("/")[0]
-            if n is None:
-                lines.append(f"{base:6s} error reading stats")
-            elif n == 0:
-                lines.append(f"{base:6s}  0 trades")
-            else:
-                lines.append(f"{base:6s}  {n} trades  {wr:.0f}%WR  ${pnl:+.2f}")
+            n_all = len(all_trades)
+            tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
+            tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
+            sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
 
-        # ── SECTION 3: last 5 closed trades across every symbol ──────────────
-        lines += ["", DIVIDER, "LAST 5 TRADES", DIVIDER]
-        if not all_trades:
-            lines.append("No closed trades yet")
-        else:
-            # closed_at is an ISO string so it sorts correctly as text.
-            recent = sorted(all_trades, key=lambda tr: tr.get("closed_at") or "", reverse=True)[:5]
-            for i, tr in enumerate(recent, 1):
-                result_emoji = "✅" if tr.get("win_loss") == "WIN" else "❌"
-                targets = ",".join(tr.get("targets_hit") or []) or "SL"
-                base = tr["_symbol"].split("/")[0]
+            # ── SECTION 1: overall win rate + TP1/TP2/SL breakdown + PnL ─────
+            lines += ["", DIVIDER, "OVERALL (OKX)", DIVIDER]
+            lines.append(f"Trades   : {total_trades}  ({total_wins}W / {total_losses}L)")
+            lines.append(f"Win rate : {overall_wr:.0f}%")
+            if n_all:
                 lines.append(
-                    f"{i}. {result_emoji} {base} {tr.get('direction', '?')} "
-                    f"{tr.get('realized_r', 0):+.2f}R (${tr.get('pnl', 0):+.2f}) "
-                    f"[{targets}] — {_time_ago(tr.get('closed_at'))}"
+                    f"TP1 hit  : {tp1_n}/{n_all} ({tp1_n/n_all*100:.0f}%)   "
+                    f"TP2 hit : {tp2_n}/{n_all} ({tp2_n/n_all*100:.0f}%)   "
+                    f"SL only : {sl_only_n}/{n_all} ({sl_only_n/n_all*100:.0f}%)"
                 )
+            lines.append(f"Net PnL  : ${total_pnl:+,.2f}  (post-fee, from OKX)")
+
+            # ── SECTION 2: per-symbol trade count + win rate ─────────────────
+            per_symbol: dict = {}
+            for t in okx_trades:
+                row = per_symbol.setdefault(t["symbol"], {"n": 0, "wins": 0, "pnl": 0.0})
+                row["n"] += 1
+                row["wins"] += 1 if t["pnl"] > 0 else 0
+                row["pnl"] += t["pnl"]
+
+            lines += ["", DIVIDER, "BY SYMBOL", DIVIDER]
+            for sym in bots.keys():
+                base = sym.split("/")[0]
+                row = per_symbol.get(sym)
+                if not row or row["n"] == 0:
+                    lines.append(f"{base:6s}  0 trades")
+                else:
+                    wr = row["wins"] / row["n"] * 100
+                    lines.append(f"{base:6s}  {row['n']} trades  {wr:.0f}%WR  ${row['pnl']:+.2f}")
+
+            # ── SECTION 3: last 5 closed trades across every symbol ──────────
+            lines += ["", DIVIDER, "LAST 5 TRADES", DIVIDER]
+            if not okx_trades:
+                lines.append("No closed trades yet")
+            else:
+                recent = sorted(okx_trades, key=lambda t: t["close_ts"], reverse=True)[:5]
+                for i, t in enumerate(recent, 1):
+                    result_emoji = "✅" if t["pnl"] > 0 else "❌"
+                    base = t["symbol"].split("/")[0]
+                    side = (t.get("side") or "?").upper()
+                    lines.append(
+                        f"{i}. {result_emoji} {base} {side} "
+                        f"${t['pnl']:+.2f} — {_time_ago_ms(t['close_ts'])}"
+                    )
+        else:
+            # ── Fallback: OKX history unavailable — use local trade_journal ──
+            lines.append("⚠️ OKX history unavailable — showing bot-tracked data")
+            n_all = len(all_trades)
+            total_wins = sum(1 for tr in all_trades if tr.get("win_loss") == "WIN")
+            total_trades = n_all
+            total_pnl = sum(tr.get("pnl", 0.0) for tr in all_trades)
+            overall_wr = total_wins / total_trades * 100 if total_trades else 0.0
+            tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
+            tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
+            sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
+
+            lines += ["", DIVIDER, "OVERALL", DIVIDER]
+            lines.append(f"Trades   : {total_trades}  ({total_wins}W / {total_trades - total_wins}L)")
+            lines.append(f"Win rate : {overall_wr:.0f}%")
+            if n_all:
+                lines.append(
+                    f"TP1 hit  : {tp1_n}/{n_all} ({tp1_n/n_all*100:.0f}%)   "
+                    f"TP2 hit : {tp2_n}/{n_all} ({tp2_n/n_all*100:.0f}%)   "
+                    f"SL only : {sl_only_n}/{n_all} ({sl_only_n/n_all*100:.0f}%)"
+                )
+            lines.append(f"Net PnL  : ${total_pnl:+,.2f}")
+
+            lines += ["", DIVIDER, "BY SYMBOL", DIVIDER]
+            by_sym: dict = {}
+            for tr in all_trades:
+                row = by_sym.setdefault(tr["_symbol"], {"n": 0, "wins": 0, "pnl": 0.0})
+                row["n"] += 1
+                row["wins"] += 1 if tr.get("win_loss") == "WIN" else 0
+                row["pnl"] += tr.get("pnl", 0.0)
+            for sym in bots.keys():
+                base = sym.split("/")[0]
+                row = by_sym.get(sym)
+                if not row or row["n"] == 0:
+                    lines.append(f"{base:6s}  0 trades")
+                else:
+                    wr = row["wins"] / row["n"] * 100
+                    lines.append(f"{base:6s}  {row['n']} trades  {wr:.0f}%WR  ${row['pnl']:+.2f}")
+
+            lines += ["", DIVIDER, "LAST 5 TRADES", DIVIDER]
+            if not all_trades:
+                lines.append("No closed trades yet")
+            else:
+                recent = sorted(all_trades, key=lambda tr: tr.get("closed_at") or "", reverse=True)[:5]
+                for i, tr in enumerate(recent, 1):
+                    result_emoji = "✅" if tr.get("win_loss") == "WIN" else "❌"
+                    targets = ",".join(tr.get("targets_hit") or []) or "SL"
+                    base = tr["_symbol"].split("/")[0]
+                    lines.append(
+                        f"{i}. {result_emoji} {base} {tr.get('direction', '?')} "
+                        f"{tr.get('realized_r', 0):+.2f}R (${tr.get('pnl', 0):+.2f}) "
+                        f"[{targets}] — {_time_ago(tr.get('closed_at'))}"
+                    )
 
         await self._send("\n".join(lines))
+
+    def _stats_since_iso(self) -> str:
+        """ISO cutoff matching self.stats_since_ms, for filtering the local
+        trade_journal (closed_at is stored as an ISO string) to the same
+        window /stats uses for the OKX-sourced numbers."""
+        if not self.stats_since_ms:
+            return ""
+        return datetime.datetime.fromtimestamp(
+            self.stats_since_ms / 1000, tz=datetime.timezone.utc
+        ).isoformat()
 
     async def _cmd_log(self, n: int = 15):
         """Last N log lines from all adaptive bots."""
