@@ -45,9 +45,11 @@ class PerformanceEngine:
         self.cfg = cfg
         self.trades: list = []
         self.module_status = {SetupType.FAST_PULLBACK.value: ModuleStatus.ACTIVE.value,
-                              SetupType.MOMENTUM.value: ModuleStatus.ACTIVE.value}
+                              SetupType.MOMENTUM.value: ModuleStatus.ACTIVE.value,
+                              SetupType.CONFLUENCE.value: ModuleStatus.ACTIVE.value}
         self.shadow_counters = {SetupType.FAST_PULLBACK.value: deque(maxlen=50),
-                                SetupType.MOMENTUM.value: deque(maxlen=50)}
+                                SetupType.MOMENTUM.value: deque(maxlen=50),
+                                SetupType.CONFLUENCE.value: deque(maxlen=50)}
         self._path = os.path.join(state_dir, "trades.jsonl")
         os.makedirs(state_dir, exist_ok=True)
         self._load()
@@ -110,6 +112,8 @@ class PerformanceEngine:
 
     def _update_module_gate(self, setup_type: str) -> None:
         c = self.cfg
+        # never KeyError on a setup type registered after this state was built
+        self.module_status.setdefault(setup_type, ModuleStatus.ACTIVE.value)
         s50 = self.stats(c.module_min_trades_paused, setup_type)
         s30 = self.stats(c.module_min_trades_reduced, setup_type)
         if s50.get("trades", 0) >= c.module_min_trades_paused:
