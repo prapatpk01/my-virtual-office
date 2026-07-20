@@ -1,85 +1,117 @@
-"""
-Layer 3 — Entry Engine (3-layer multi-timeframe cross confluence).
+"""Layer 3: balanced dual-entry engine for 15-minute execution.
 
-Regime (4H+1H) and Bias (1H+15M+5M) decide the SIDE. This layer receives
-that fixed `direction` and only searches for a timing trigger on that side.
-Three cross layers, each on its own timeframe, watch for a cross in the
-bias direction:
+Two setup engines share the same fixed direction from Bias:
 
-    L3a — HMA(l3a_hma_fast)/HMA(l3a_hma_slow) cross on 30M
-    L3b — EMA(l3b_ema_fast)/EMA(l3b_ema_slow) cross on 15M
-    L3c — EMA(l3c_ema_fast)/EMA(l3c_ema_slow) cross on 5M  (also the exit gate)
+* FAST_PULLBACK: valid trend/location -> touch/arm -> reclaim or micro break.
+* MOMENTUM: confirmed structure breakout on the breakout candle when quality is
+  exceptional, otherwise a one-bar breakout-retest continuation.
 
-Any single cross ARMS a setup. The entry fires once >= entry_confluence_min
-(2) of the three layers have crossed the SAME (bias) direction within
-entry_confluence_window_min (15) minutes of "now" (the latest closed 5M
-bar). If a second layer never confirms, the first cross ages out of the
-window -> the setup fails and the engine waits for a new one. One entry per
-setup: re-arming needs a genuinely newer cross than the one that last fired.
-
-Early exit (`check_exit`) — the HARD gate uses L3c (5M) only, so noise on
-the slower layers can't shake us out:
-    EMA_CROSS_REVERSAL     — L3c fast EMA crosses back against the position
-    PRICE_OPEN_BEYOND_EMA  — bar OPEN on the wrong side of the L3c slow EMA
-Suppressed for exit_grace_bars closed 5M bars after entry. Does NOT replace
-the hard SL/TP — an additional, faster path evaluated once per closed 5M bar.
+The implementation is stateful, symmetric and closed-candle only.  It avoids
+indicator-voting confluence and does not require a new moving-average cross for
+every trade, which preserves trade frequency while Structure Room, extension,
+chop and candle-quality gates reduce false entries.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 import indicators as ind
 from config import Config
 
-LONG  = "LONG"
+LONG = "LONG"
 SHORT = "SHORT"
-NONE  = "NONE"
+NONE = "NONE"
 
 EMA_CROSS_REVERSAL = "EMA_CROSS_REVERSAL"
 PRICE_OPEN_BEYOND_EMA = "PRICE_OPEN_BEYOND_EMA"
 
-# TF label -> minutes, for cross-freshness math across layers.
-_TF_MIN = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
+FAST_PULLBACK = "FAST_PULLBACK"
+MOMENTUM = "MOMENTUM"
+MOMENTUM_RETEST = "MOMENTUM_RETEST"
 
 
 @dataclass
 class EntryResult:
-    direction: str             # LONG | SHORT | NONE
+    direction: str
     allow_entry: bool
     reason: str = ""
     price: float = 0.0
-    ema_fast: float = 0.0      # L3c fast EMA (for logging/telegram)
-    ema_slow: float = 0.0      # L3c slow EMA
-    macd_hist: float = 0.0     # repurposed: # of layers confirming (for log compat)
-    cross_id: object = None
-    entry_score: float = 0.0   # 100 on a valid trigger, 0 otherwise
+    ema_fast: float = 0.0
+    ema_slow: float = 0.0
+    macd_hist: float = 0.0  # kept for existing status views; now candidate edge
+    cross_id: object = None  # deterministic signal key, kept for caller compatibility
+    entry_score: float = 0.0
+    setup_type: str = ""
+    trigger: str = ""
+    planned_stop: Optional[float] = None
+    planned_target: Optional[float] = None
+    planned_rr: float = 0.0
+    structure_room_r: float = 0.0
+    invalidation_level: Optional[float] = None
+    score_components: dict = field(default_factory=dict)
 
 
 @dataclass
 class ExitCheckResult:
     should_exit: bool
-    reason: str = ""           # EMA_CROSS_REVERSAL | PRICE_OPEN_BEYOND_EMA | ""
+    reason: str = ""
     detail: str = ""
 
 
 @dataclass
-class _LayerCross:
-    """Most recent cross seen on ONE layer."""
-    direction: Optional[str] = None      # LONG | SHORT | None
-    close_ts: Optional[pd.Timestamp] = None   # close time of the bar the cross fired on
-    bar_ts: Optional[pd.Timestamp] = None     # open ts of that bar (dedupe guard)
+class _PullbackSetup:
+    direction: str
+    started_bar: int
+    started_ts: pd.Timestamp
+    setup_low: float
+    setup_high: float
+    trigger_level: float
+    invalidation: float
+    location_score: float
+
+
+@dataclass
+class _BreakoutSetup:
+    direction: str
+    started_bar: int
+    started_ts: pd.Timestamp
+    breakout_level: float
+    breakout_low: float
+    breakout_high: float
 
 
 @dataclass
 class _SetupState:
-    """Per-symbol confluence state."""
-    layers: dict = field(default_factory=lambda: {"L3a": _LayerCross(),
-                                                   "L3b": _LayerCross(),
-                                                   "L3c": _LayerCross()})
-    last_entry_ts: Optional[pd.Timestamp] = None   # newest cross ts consumed by the last entry
+    last_processed_bar: Optional[pd.Timestamp] = None
+    pullback: Optional[_PullbackSetup] = None
+    breakout: Optional[_BreakoutSetup] = None
+    last_entry_key: object = None
+    last_candidate_key: object = None
+
+
+@dataclass
+class _Candidate:
+    direction: str
+    setup_type: str
+    score: float
+    threshold: float
+    trigger: str
+    price: float
+    stop: float
+    target: float
+    rr: float
+    room_r: float
+    invalidation: float
+    components: dict
+    signal_key: object
+
+    @property
+    def edge(self) -> float:
+        return self.score - self.threshold
 
 
 class EntryEngine:
@@ -87,228 +119,735 @@ class EntryEngine:
         self.cfg = cfg
         self._state: dict[str, _SetupState] = {}
 
-    # ── per-symbol state ──────────────────────────────────────────────────────
     def _get_state(self, symbol: str) -> _SetupState:
         return self._state.setdefault(symbol, _SetupState())
-
-    def on_position_closed(self, symbol: str) -> None:
-        """Call whenever a position FULLY closes. last_entry_ts already blocks
-        re-entry until a cross NEWER than it appears, so nothing else is
-        needed — kept for API parity with callers."""
-        # no-op: last_entry_ts is the re-arm guard.
-        self._get_state(symbol)
 
     def reset_symbol(self, symbol: str) -> None:
         self._state.pop(symbol, None)
 
-    # ── indicators ────────────────────────────────────────────────────────────
-    def _l3c_emas(self, df_5m: pd.DataFrame):
-        c = self.cfg
-        close = df_5m["close"]
-        return ind.ema(close, c.l3c_ema_fast), ind.ema(close, c.l3c_ema_slow)
+    def on_position_closed(self, symbol: str) -> None:
+        # Clear any setup that existed before/during the position.  last_entry_key
+        # remains the anti-duplicate guard, so re-entry needs a new timestamp.
+        state = self._get_state(symbol)
+        state.pullback = None
+        state.breakout = None
+        state.last_candidate_key = None
+
+    def observe(
+        self,
+        df_30m: pd.DataFrame,
+        df_15m: pd.DataFrame,
+        df_5m: pd.DataFrame,
+        symbol: str,
+    ) -> None:
+        """Compatibility hook retained for Pipeline; setup logic runs in analyze."""
+        self._get_state(symbol)
 
     @staticmethod
-    def _tf_min(tf: str) -> int:
-        return _TF_MIN.get(tf, 5)
+    def _is_long(direction: str) -> bool:
+        return direction == LONG
 
-    def _detect_cross(self, df: pd.DataFrame, fast: pd.Series, slow: pd.Series,
-                      tf: str) -> Optional[tuple]:
-        """Return (direction, close_ts, bar_ts) if the LAST closed bar of `df`
-        is a fresh fast/slow cross, else None."""
-        if df is None or len(df) < 2:
-            return None
-        cur_f, cur_s = float(fast.iloc[-1]), float(slow.iloc[-1])
-        prev_f, prev_s = float(fast.iloc[-2]), float(slow.iloc[-2])
-        bar_ts = df.index[-1]
-        close_ts = bar_ts + pd.Timedelta(minutes=self._tf_min(tf))
-        if prev_f <= prev_s and cur_f > cur_s:
-            return LONG, close_ts, bar_ts
-        if prev_f >= prev_s and cur_f < cur_s:
-            return SHORT, close_ts, bar_ts
-        return None
+    def _nearest_levels(
+        self,
+        price: float,
+        df_15m: pd.DataFrame,
+        df_1h: Optional[pd.DataFrame],
+        df_4h: Optional[pd.DataFrame],
+    ) -> tuple[Optional[float], Optional[float]]:
+        supports: list[float] = []
+        resistances: list[float] = []
+        for frame in (df_15m, df_1h, df_4h):
+            support, resistance = ind.nearest_confirmed_levels(
+                frame,
+                price,
+                getattr(self.cfg, "entry_swing_left", 3),
+                getattr(self.cfg, "entry_swing_right", 3),
+            )
+            if support is not None:
+                supports.append(support)
+            if resistance is not None:
+                resistances.append(resistance)
+        return (max(supports) if supports else None, min(resistances) if resistances else None)
 
-    # ── cross bookkeeping ─────────────────────────────────────────────────────
-    def observe(self, df_30m: pd.DataFrame, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
-                symbol: str) -> None:
-        """Record any fresh cross on each layer's last closed bar. Called once
-        per evaluation, regardless of Regime/Bias. Idempotent per (layer, bar)."""
+    def _local_snapshot(self, df: pd.DataFrame, direction: str) -> dict:
         c = self.cfg
-        state = self._get_state(symbol)
-        specs = (
-            ("L3a", df_30m, c.l3a_tf, ind.hma, c.l3a_hma_fast, c.l3a_hma_slow),
-            ("L3b", df_15m, c.l3b_tf, ind.ema, c.l3b_ema_fast, c.l3b_ema_slow),
-            ("L3c", df_5m,  c.l3c_tf, ind.ema, c.l3c_ema_fast, c.l3c_ema_slow),
+        close = df["close"]
+        hma_fast = ind.hma(close, getattr(c, "dual_hma_fast", 10))
+        hma_slow = ind.hma(close, getattr(c, "dual_hma_slow", 16))
+        ema20 = ind.ema(close, 20)
+        ema50 = ind.ema(close, 50)
+        atr_s = ind.atr(df, 14)
+        atr_value = ind.safe_float(atr_s.iloc[-1])
+        adx_s, plus_s, minus_s = ind.adx(df, 12)
+        adx_value = ind.safe_float(adx_s.iloc[-1])
+        plus_di = ind.safe_float(plus_s.iloc[-1])
+        minus_di = ind.safe_float(minus_s.iloc[-1])
+        chop = ind.safe_float(ind.choppiness_index(df, 14).iloc[-1], 100.0)
+        roc5 = ind.safe_float(ind.roc(close, 5).iloc[-1])
+        roc_prev = ind.safe_float(ind.roc(close, 5).iloc[-2])
+        structure = ind.market_structure(
+            df["high"],
+            df["low"],
+            getattr(c, "entry_swing_left", 3),
+            getattr(c, "entry_swing_right", 3),
         )
-        for name, df, tf, fn, pf, ps in specs:
-            if df is None or len(df) < max(ps * 2, 5):
-                continue
-            lc = state.layers[name]
-            bar_ts = df.index[-1]
-            if lc.bar_ts == bar_ts:
-                continue   # this bar already processed for this layer
-            fast = fn(df["close"], pf)
-            slow = fn(df["close"], ps)
-            hit = self._detect_cross(df, fast, slow, tf)
-            # advance the per-layer "seen" marker even when there's no cross, so
-            # we don't re-scan the same bar every tick.
-            if hit is None:
-                lc.bar_ts = bar_ts
-                continue
-            lc.direction, lc.close_ts, lc.bar_ts = hit
+        candle = ind.candle_metrics(df, atr_value)
+        price = ind.safe_float(close.iloc[-1])
+        hfast = ind.safe_float(hma_fast.iloc[-1])
+        hslow = ind.safe_float(hma_slow.iloc[-1])
+        hfast_prev = ind.safe_float(hma_fast.iloc[-2])
+        hslow_prev = ind.safe_float(hma_slow.iloc[-2])
+        spread_atr = abs(hfast - hslow) / max(atr_value, ind.EPSILON)
+        flip_count = ind.cross_count(hma_fast, hma_slow, 8)
 
-    # ── combined entry decision ──────────────────────────────────────────────
-    def analyze(self, df_30m: pd.DataFrame, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
-               direction: str, symbol: str) -> EntryResult:
+        long = direction == LONG
+        aligned = hfast > hslow if long else hfast < hslow
+        fast_slope = hfast > hfast_prev if long else hfast < hfast_prev
+        slow_slope = hslow >= hslow_prev if long else hslow <= hslow_prev
+        dmi_ok = plus_di > minus_di if long else minus_di > plus_di
+        roc_ok = roc5 > 0 if long else roc5 < 0
+        roc_accel = roc5 > roc_prev if long else roc5 < roc_prev
+        structure_ok = structure != ("LH_LL" if long else "HH_HL")
+        close_above_ema50 = price > ema50.iloc[-1] if long else price < ema50.iloc[-1]
+
+        obvious_chop = (
+            (adx_value < getattr(c, "dual_min_adx", 11.0) and chop > getattr(c, "dual_max_chop", 62.0))
+            or (flip_count >= 3 and spread_atr < 0.12)
+        )
+        strong = (
+            aligned
+            and fast_slope
+            and slow_slope
+            and dmi_ok
+            and adx_value >= getattr(c, "dual_strong_adx", 20.0)
+            and chop <= getattr(c, "dual_strong_chop", 52.0)
+        )
+        transition = (
+            structure_ok
+            and not obvious_chop
+            and adx_value >= 9.0
+            and chop <= 64.0
+            and (aligned or abs(hfast - hslow) / max(atr_value, ind.EPSILON) <= 0.18)
+        )
+        return {
+            "price": price,
+            "hma_fast_series": hma_fast,
+            "hma_slow_series": hma_slow,
+            "hma_fast": hfast,
+            "hma_slow": hslow,
+            "ema20": ind.safe_float(ema20.iloc[-1]),
+            "ema50": ind.safe_float(ema50.iloc[-1]),
+            "atr": atr_value,
+            "adx": adx_value,
+            "plus_di": plus_di,
+            "minus_di": minus_di,
+            "chop": chop,
+            "roc": roc5,
+            "roc_accel": roc_accel,
+            "structure": structure,
+            "candle": candle,
+            "aligned": aligned,
+            "fast_slope": fast_slope,
+            "slow_slope": slow_slope,
+            "dmi_ok": dmi_ok,
+            "roc_ok": roc_ok,
+            "structure_ok": structure_ok,
+            "ema50_ok": close_above_ema50,
+            "obvious_chop": obvious_chop,
+            "strong": strong,
+            "transition": transition,
+            "spread_atr": spread_atr,
+            "flip_count": flip_count,
+        }
+
+    def _finalize_candidate(
+        self,
+        *,
+        direction: str,
+        setup_type: str,
+        score: float,
+        threshold: float,
+        trigger: str,
+        price: float,
+        raw_stop: float,
+        atr_value: float,
+        nearest_support: Optional[float],
+        nearest_resistance: Optional[float],
+        bar_ts: pd.Timestamp,
+        components: dict,
+    ) -> Optional[_Candidate]:
+        c = self.cfg
+        long = direction == LONG
+        min_stop = atr_value * getattr(c, "dual_min_stop_atr", 0.55)
+        max_stop = atr_value * getattr(c, "dual_max_stop_atr", 1.50)
+        if atr_value <= 0:
+            return None
+
+        if long:
+            if raw_stop >= price:
+                return None
+            stop = min(raw_stop, price - min_stop)
+            risk = price - stop
+            opposing = nearest_resistance if nearest_resistance and nearest_resistance > price else None
+        else:
+            if raw_stop <= price:
+                return None
+            stop = max(raw_stop, price + min_stop)
+            risk = stop - price
+            opposing = nearest_support if nearest_support and nearest_support < price else None
+        if risk <= 0 or risk > max_stop:
+            return None
+
+        base_rr = getattr(c, "dual_pullback_tp2_r", 2.0) if setup_type == FAST_PULLBACK else getattr(c, "dual_momentum_tp2_r", 2.0)
+        base_target = price + risk * base_rr if long else price - risk * base_rr
+        target_buffer = atr_value * getattr(c, "dual_target_buffer_atr", 0.08)
+        if opposing is not None:
+            structure_target = opposing - target_buffer if long else opposing + target_buffer
+            target = min(base_target, structure_target) if long else max(base_target, structure_target)
+            room_r = ((opposing - price) / risk) if long else ((price - opposing) / risk)
+        else:
+            target = base_target
+            room_r = 99.0
+        rr = ((target - price) / risk) if long else ((price - target) / risk)
+        min_room = (
+            getattr(c, "dual_pullback_min_room_r", 1.05)
+            if setup_type == FAST_PULLBACK
+            else getattr(c, "dual_momentum_min_room_r", 1.15)
+        )
+        if room_r < min_room or rr < getattr(c, "minimum_actual_rr", 1.20):
+            return None
+        signal_key = (str(bar_ts), direction, setup_type, round(price, 10))
+        return _Candidate(
+            direction=direction,
+            setup_type=setup_type,
+            score=round(score, 1),
+            threshold=threshold,
+            trigger=trigger,
+            price=price,
+            stop=stop,
+            target=target,
+            rr=rr,
+            room_r=room_r,
+            invalidation=raw_stop,
+            components=components,
+            signal_key=signal_key,
+        )
+
+    def _pullback_candidate(
+        self,
+        df: pd.DataFrame,
+        direction: str,
+        snapshot: dict,
+        state: _SetupState,
+        nearest_support: Optional[float],
+        nearest_resistance: Optional[float],
+        regime=None,
+        bias=None,
+    ) -> Optional[_Candidate]:
+        c = self.cfg
+        long = direction == LONG
+        atr_value = snapshot["atr"]
+        if snapshot["obvious_chop"] or not snapshot["structure_ok"] or not snapshot["transition"]:
+            state.pullback = None
+            return None
+
+        price = snapshot["price"]
+        row = df.iloc[-1]
+        bar_ts = df.index[-1]
+        bar_no = len(df) - 1
+        hfast, hslow = snapshot["hma_fast"], snapshot["hma_slow"]
+        zone_upper = max(hfast, hslow) + atr_value * getattr(c, "dual_pullback_zone_atr", 0.20)
+        zone_lower = min(hfast, hslow) - atr_value * getattr(c, "dual_pullback_depth_atr", 0.35)
+
+        swing_high, swing_low = ind.recent_swing_levels(
+            df["high"],
+            df["low"],
+            getattr(c, "entry_swing_left", 3),
+            getattr(c, "entry_swing_right", 3),
+        )
+        level = nearest_support if long else nearest_resistance
+        sweep = ind.sweep_reclaim(df, direction, level)
+        if long:
+            hma_touch = float(row["low"]) <= zone_upper and float(row["low"]) >= zone_lower
+            htf_touch = level is not None and float(row["low"]) <= level + 0.20 * atr_value and price > level
+            location_touch = hma_touch or htf_touch or sweep
+            invalidation = min(float(row["low"]), swing_low if np.isfinite(swing_low) else float(row["low"]))
+            reclaim = price > hfast and float(row["low"]) <= max(hfast, hslow)
+            previous_break = price > float(df["high"].iloc[-2])
+            micro_bos = price > float(df["high"].iloc[-3:-1].max())
+        else:
+            hma_touch = float(row["high"]) >= zone_lower and float(row["high"]) <= zone_upper
+            htf_touch = level is not None and float(row["high"]) >= level - 0.20 * atr_value and price < level
+            location_touch = hma_touch or htf_touch or sweep
+            invalidation = max(float(row["high"]), swing_high if np.isfinite(swing_high) else float(row["high"]))
+            reclaim = price < hfast and float(row["high"]) >= min(hfast, hslow)
+            previous_break = price < float(df["low"].iloc[-2])
+            micro_bos = price < float(df["low"].iloc[-3:-1].min())
+
+        location_score = 20.0 if htf_touch or sweep else 14.0 if hma_touch else 0.0
+        candle_ok = (
+            ind.bullish_trigger_candle(
+                snapshot["candle"],
+                getattr(c, "dual_pullback_min_body_atr", 0.15),
+                getattr(c, "dual_pullback_close_quality", 0.62),
+            )
+            if long
+            else ind.bearish_trigger_candle(
+                snapshot["candle"],
+                getattr(c, "dual_pullback_min_body_atr", 0.15),
+                getattr(c, "dual_pullback_close_quality", 0.62),
+            )
+        )
+        same_bar_trigger = location_touch and candle_ok and (reclaim or sweep or previous_break)
+
+        # Arm a location touch.  The same-bar path is evaluated before waiting,
+        # allowing fast entries only when location and candle quality are strong.
+        if location_touch and state.pullback is None:
+            state.pullback = _PullbackSetup(
+                direction=direction,
+                started_bar=bar_no,
+                started_ts=bar_ts,
+                setup_low=float(row["low"]),
+                setup_high=float(row["high"]),
+                trigger_level=float(row["high"] if long else row["low"]),
+                invalidation=invalidation,
+                location_score=location_score,
+            )
+
+        setup = state.pullback
+        if setup is None or setup.direction != direction:
+            return None
+        age = bar_no - setup.started_bar
+        if age > getattr(c, "dual_pullback_window_bars", 3):
+            state.pullback = None
+            return None
+        if long:
+            setup.setup_low = min(setup.setup_low, float(row["low"]))
+            invalidated = price < setup.invalidation
+            armed_break = price > setup.trigger_level
+        else:
+            setup.setup_high = max(setup.setup_high, float(row["high"]))
+            invalidated = price > setup.invalidation
+            armed_break = price < setup.trigger_level
+        if invalidated:
+            state.pullback = None
+            return None
+
+        trigger = ""
+        if same_bar_trigger and age == 0:
+            trigger = "SAME_BAR_RECLAIM" if not sweep else "SWEEP_RECLAIM"
+        elif age >= 1 and candle_ok and (armed_break or reclaim or micro_bos or sweep):
+            if sweep:
+                trigger = "SWEEP_RECLAIM"
+            elif micro_bos:
+                trigger = "MICRO_BOS"
+            elif armed_break:
+                trigger = "TRIGGER_BREAK"
+            else:
+                trigger = "HMA_RECLAIM"
+        if not trigger:
+            return None
+
+        extension = (
+            (price - hslow) / atr_value if long else (hslow - price) / atr_value
+        )
+        if extension < -0.20 or extension > getattr(c, "dual_pullback_max_extension_atr", 0.75):
+            return None
+
+        components = {
+            "macro": 10.0 if getattr(regime, "label", "").startswith("STRONG") else 7.0,
+            "bias": min(15.0, max(6.0, abs(getattr(bias, "directional_edge", 8.0)) * 0.6)),
+            "structure": 15.0 if snapshot["structure"] == ("HH_HL" if long else "LH_LL") else 9.0,
+            "location": setup.location_score,
+            "prior_context": 10.0 if snapshot["aligned"] else 6.0,
+            "trigger": 15.0 if trigger in ("SWEEP_RECLAIM", "MICRO_BOS") else 12.0,
+            "candle": 10.0 if candle_ok else 0.0,
+            "momentum": 5.0 if snapshot["roc_ok"] or snapshot["dmi_ok"] else 2.0,
+        }
+        score = min(100.0, sum(components.values()))
+        threshold = (
+            getattr(c, "dual_same_bar_pullback_threshold", 70.0)
+            if age == 0
+            else getattr(c, "dual_pullback_threshold", 64.0)
+        )
+        if score < threshold:
+            return None
+
+        buffer = atr_value * getattr(c, "dual_stop_buffer_atr", 0.10)
+        raw_stop = setup.setup_low - buffer if long else setup.setup_high + buffer
+        candidate = self._finalize_candidate(
+            direction=direction,
+            setup_type=FAST_PULLBACK,
+            score=score,
+            threshold=threshold,
+            trigger=trigger,
+            price=price,
+            raw_stop=raw_stop,
+            atr_value=atr_value,
+            nearest_support=nearest_support,
+            nearest_resistance=nearest_resistance,
+            bar_ts=bar_ts,
+            components=components,
+        )
+        if candidate is not None:
+            state.pullback = None
+        return candidate
+
+    def _momentum_candidate(
+        self,
+        df: pd.DataFrame,
+        direction: str,
+        snapshot: dict,
+        state: _SetupState,
+        nearest_support: Optional[float],
+        nearest_resistance: Optional[float],
+        regime=None,
+        bias=None,
+    ) -> Optional[_Candidate]:
+        c = self.cfg
+        long = direction == LONG
+        atr_value = snapshot["atr"]
+        if snapshot["obvious_chop"] or not snapshot["structure_ok"]:
+            state.breakout = None
+            return None
+        if not (snapshot["strong"] or (snapshot["aligned"] and snapshot["adx"] >= getattr(c, "dual_momentum_min_adx", 13.0))):
+            return None
+
+        price = snapshot["price"]
+        row = df.iloc[-1]
+        bar_ts = df.index[-1]
+        bar_no = len(df) - 1
+        lookback = getattr(c, "dual_breakout_lookback", 4)
+        if len(df) < lookback + 3:
+            return None
+        break_level = (
+            float(df["high"].iloc[-lookback - 1 : -1].max())
+            if long
+            else float(df["low"].iloc[-lookback - 1 : -1].min())
+        )
+        crossed = (
+            price > break_level and float(df["close"].iloc[-2]) <= break_level
+            if long
+            else price < break_level and float(df["close"].iloc[-2]) >= break_level
+        )
+        candle = snapshot["candle"]
+        candle_ok = (
+            ind.bullish_trigger_candle(
+                candle,
+                getattr(c, "dual_momentum_min_body_atr", 0.18),
+                getattr(c, "dual_momentum_close_quality", 0.68),
+            )
+            if long
+            else ind.bearish_trigger_candle(
+                candle,
+                getattr(c, "dual_momentum_min_body_atr", 0.18),
+                getattr(c, "dual_momentum_close_quality", 0.68),
+            )
+        )
+        strong_breakout = (
+            crossed
+            and candle.body_atr >= 0.25
+            and (candle.bull_close_quality >= 0.75 if long else candle.bear_close_quality >= 0.75)
+            and (candle.volume_ratio >= getattr(c, "dual_momentum_volume_ratio", 1.05) or candle.body_atr >= 0.32)
+        )
+
+        if crossed:
+            state.breakout = _BreakoutSetup(
+                direction=direction,
+                started_bar=bar_no,
+                started_ts=bar_ts,
+                breakout_level=break_level,
+                breakout_low=float(row["low"]),
+                breakout_high=float(row["high"]),
+            )
+
+        setup = state.breakout
+        if setup is None or setup.direction != direction:
+            return None
+        age = bar_no - setup.started_bar
+        if age > 1:
+            state.breakout = None
+            return None
+
+        direct = age == 0 and strong_breakout
+        if long:
+            retest = (
+                age == 1
+                and float(row["low"]) <= setup.breakout_level + 0.15 * atr_value
+                and float(row["low"]) >= setup.breakout_level - 0.35 * atr_value
+                and price > setup.breakout_level
+                and candle_ok
+            )
+            invalidated = price < setup.breakout_level - 0.35 * atr_value
+        else:
+            retest = (
+                age == 1
+                and float(row["high"]) >= setup.breakout_level - 0.15 * atr_value
+                and float(row["high"]) <= setup.breakout_level + 0.35 * atr_value
+                and price < setup.breakout_level
+                and candle_ok
+            )
+            invalidated = price > setup.breakout_level + 0.35 * atr_value
+        if invalidated:
+            state.breakout = None
+            return None
+        if not (direct or retest):
+            return None
+
+        reference = setup.breakout_level
+        extension = abs(price - reference) / max(atr_value, ind.EPSILON)
+        hma_extension = (
+            (price - snapshot["hma_slow"]) / atr_value
+            if long
+            else (snapshot["hma_slow"] - price) / atr_value
+        )
+        max_ext = (
+            getattr(c, "dual_strong_momentum_extension_atr", 1.10)
+            if strong_breakout
+            else getattr(c, "dual_momentum_max_extension_atr", 0.90)
+        )
+        if extension > 0.55 or hma_extension > max_ext:
+            return None
+
+        components = {
+            "macro": 10.0 if getattr(regime, "label", "").startswith("STRONG") else 7.0,
+            "bias": min(15.0, max(6.0, abs(getattr(bias, "directional_edge", 8.0)) * 0.6)),
+            "structure_break": 22.0 if crossed else 18.0,
+            "breakout_close": 8.0 if candle_ok else 4.0,
+            "displacement": 10.0 if candle.body_atr >= 0.25 else 6.0,
+            "volume": 8.0 if candle.volume_ratio >= getattr(c, "dual_momentum_volume_ratio", 1.05) else 4.0,
+            "trend": 12.0 if snapshot["strong"] else 8.0,
+            "momentum": 10.0 if snapshot["roc_ok"] and snapshot["dmi_ok"] else 6.0,
+            "retest": 5.0 if retest else 2.0,
+        }
+        score = min(100.0, sum(components.values()))
+        threshold = (
+            getattr(c, "dual_strong_breakout_threshold", 66.0)
+            if direct
+            else getattr(c, "dual_momentum_threshold", 70.0)
+        )
+        if score < threshold:
+            return None
+
+        buffer = atr_value * getattr(c, "dual_stop_buffer_atr", 0.10)
+        if long:
+            base_low = float(df["low"].iloc[-lookback - 1 : -1].min())
+            raw_stop = min(setup.breakout_low, setup.breakout_level - buffer, base_low)
+        else:
+            base_high = float(df["high"].iloc[-lookback - 1 : -1].max())
+            raw_stop = max(setup.breakout_high, setup.breakout_level + buffer, base_high)
+        candidate = self._finalize_candidate(
+            direction=direction,
+            setup_type=MOMENTUM if direct else MOMENTUM_RETEST,
+            score=score,
+            threshold=threshold,
+            trigger="DIRECT_BREAKOUT" if direct else "BREAKOUT_RETEST",
+            price=price,
+            raw_stop=raw_stop,
+            atr_value=atr_value,
+            nearest_support=nearest_support,
+            nearest_resistance=nearest_resistance,
+            bar_ts=bar_ts,
+            components=components,
+        )
+        if candidate is not None:
+            state.breakout = None
+        return candidate
+
+    def analyze(
+        self,
+        df_30m: pd.DataFrame,
+        df_15m: pd.DataFrame,
+        df_5m: pd.DataFrame,
+        direction: str,
+        symbol: str,
+        df_1h: Optional[pd.DataFrame] = None,
+        df_4h: Optional[pd.DataFrame] = None,
+        regime=None,
+        bias=None,
+    ) -> EntryResult:
         c = self.cfg
         if direction not in (LONG, SHORT):
-            return EntryResult(NONE, False, "no direction from Bias layer — nothing to time")
-
-        self.observe(df_30m, df_15m, df_5m, symbol)
-
-        if df_5m is None or len(df_5m) < max(c.l3c_ema_slow * 2, 20):
-            return EntryResult(NONE, False, "insufficient 5m history")
+            return EntryResult(NONE, False, "no fixed direction from Bias")
+        if df_15m is None or len(df_15m) < 100:
+            return EntryResult(NONE, False, "insufficient 15M history")
 
         state = self._get_state(symbol)
-        now = df_5m.index[-1] + pd.Timedelta(minutes=self._tf_min(c.l3c_tf))
-        window = pd.Timedelta(minutes=c.entry_confluence_window_min)
+        bar_ts = df_15m.index[-1]
+        # The strategy is 15M-entry. A repeated poll of the same closed bar may
+        # display the existing candidate but must never create a new signal.
+        if state.last_processed_bar == bar_ts:
+            snap = self._local_snapshot(df_15m, direction)
+            return EntryResult(
+                NONE,
+                False,
+                "15M bar already processed",
+                price=snap["price"],
+                ema_fast=snap["hma_fast"],
+                ema_slow=snap["hma_slow"],
+            )
+        state.last_processed_bar = bar_ts
 
-        ema_f, ema_s = self._l3c_emas(df_5m)
-        cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
-        close_px = float(df_5m["close"].iloc[-1])
+        snapshot = self._local_snapshot(df_15m, direction)
+        base = dict(
+            price=snapshot["price"],
+            ema_fast=snapshot["hma_fast"],
+            ema_slow=snapshot["hma_slow"],
+        )
+        if snapshot["atr"] <= 0:
+            return EntryResult(NONE, False, "ATR invalid", **base)
+        if snapshot["obvious_chop"]:
+            state.pullback = None
+            state.breakout = None
+            return EntryResult(
+                NONE,
+                False,
+                f"CHOP veto: ADX={snapshot['adx']:.1f} CHOP={snapshot['chop']:.1f} flips={snapshot['flip_count']}",
+                **base,
+            )
+        if getattr(regime, "volatility_shock", False):
+            # A pullback can still be evaluated after the shock bar, but direct
+            # momentum on the shock itself is blocked unless exceptionally clean.
+            candle = snapshot["candle"]
+            if candle.body_atr > 2.5 and candle.volume_ratio < 1.5:
+                return EntryResult(NONE, False, "volatility shock without quality confirmation", **base)
 
-        # layers that crossed in `direction` and are still within the 45-min window
-        active = []
-        for name, lc in state.layers.items():
-            if (lc.direction == direction and lc.close_ts is not None
-                    and (now - lc.close_ts) <= window and (now - lc.close_ts) >= pd.Timedelta(0)):
-                active.append((name, lc.close_ts))
-        n_active = len(active)
-        base = dict(price=close_px, ema_fast=cur_f, ema_slow=cur_s,
-                    macd_hist=float(n_active), cross_id=state.last_entry_ts)
+        support, resistance = self._nearest_levels(
+            snapshot["price"], df_15m, df_1h, df_4h
+        )
+        pullback = self._pullback_candidate(
+            df_15m,
+            direction,
+            snapshot,
+            state,
+            support,
+            resistance,
+            regime,
+            bias,
+        )
+        momentum = self._momentum_candidate(
+            df_15m,
+            direction,
+            snapshot,
+            state,
+            support,
+            resistance,
+            regime,
+            bias,
+        )
+        candidates = [x for x in (pullback, momentum) if x is not None]
+        if not candidates:
+            armed = []
+            if state.pullback is not None:
+                armed.append("PB")
+            if state.breakout is not None:
+                armed.append("MOM")
+            armed_text = "+".join(armed) if armed else "none"
+            return EntryResult(
+                NONE,
+                False,
+                f"no valid 15M trigger (armed={armed_text}) | structure={snapshot['structure']} "
+                f"ADX={snapshot['adx']:.1f} CHOP={snapshot['chop']:.1f}",
+                macd_hist=0.0,
+                **base,
+            )
 
-        if n_active < c.entry_confluence_min:
-            armed = ",".join(n for n, _ in active) if active else "none"
-            return EntryResult(NONE, False,
-                               f"L3: {direction} setup {n_active}/{c.entry_confluence_min} "
-                               f"layers in {c.entry_confluence_window_min}m window (armed: {armed})", **base)
+        # Prefer the higher edge. If quality is nearly equal, Pullback gets
+        # priority because it normally offers better location and less slippage.
+        candidates.sort(key=lambda x: x.edge, reverse=True)
+        selected = candidates[0]
+        if len(candidates) > 1 and abs(candidates[0].edge - candidates[1].edge) <= 2:
+            selected = next((x for x in candidates if x.setup_type == FAST_PULLBACK), selected)
+        if state.last_entry_key is not None and selected.signal_key == state.last_entry_key:
+            return EntryResult(NONE, False, "duplicate signal key", **base)
 
-        newest_ts = max(ts for _, ts in active)
-        # one entry per setup — require a cross newer than the last one consumed
-        if state.last_entry_ts is not None and newest_ts <= state.last_entry_ts:
-            return EntryResult(NONE, False,
-                               f"L3: {direction} confluence {n_active}/3 but no new cross since last "
-                               f"entry — waiting for a fresh setup", **base)
-
-        # ── Sideways veto (ported from TrendConfirm) — a trend system bleeds
-        # in ranges, and a range can still produce cross confluence on a
-        # bounce. 4 independent range reads on 15M; >= min_signals = veto.
-        vetoed, side_detail = self._sideways_context(df_15m)
-        if vetoed:
-            return EntryResult(NONE, False,
-                               f"L3: {direction} blocked — SIDEWAYS veto ({side_detail})", **base)
-
-        # ── Chase guard (ported from TrendConfirm) — never buy a move that
-        # already left: entry must be within chase_max_dist_atr of the 5M
-        # reference EMA, else wait for a pullback + fresh setup.
-        if c.chase_guard_enabled and len(df_5m) >= c.chase_ema_ref + 5:
-            ema_ref = float(ind.ema(df_5m["close"], c.chase_ema_ref).iloc[-1])
-            atr5 = float(ind.atr(df_5m, 14).iloc[-1])
-            if atr5 > 0:
-                dist_atr = abs(close_px - ema_ref) / atr5
-                if dist_atr > c.chase_max_dist_atr:
-                    return EntryResult(NONE, False,
-                                       f"L3: {direction} blocked — CHASE guard: "
-                                       f"{dist_atr:.2f}xATR from EMA{c.chase_ema_ref} (5m) "
-                                       f"(max {c.chase_max_dist_atr:.2f}) — wait for pullback", **base)
-
-        # Do NOT consume the setup here: analyze() runs on EVERY poll tick, but
-        # the actual open can still be blocked downstream (symbol cooldown, max
-        # positions, a daily/streak limit, a balance-read blip, open_position
-        # returning None). Burning last_entry_ts now would discard a still-valid
-        # 45-min setup and make the bot wait for a brand-new cross. The caller
-        # calls confirm_entry() ONLY after a position really opened.
-        names = "+".join(sorted(n for n, _ in active))
-        return EntryResult(direction, True,
-                           f"ENTRY {direction}  confluence {n_active}/3 ({names}) within "
-                           f"{c.entry_confluence_window_min}m", entry_score=100.0,
-                           **{**base, "cross_id": newest_ts})
-
-    def _sideways_context(self, df_15m: pd.DataFrame) -> tuple:
-        """Range detector on 15M (ported from TrendConfirm). Returns
-        (vetoed, detail). Signals lean on EMA compression / high chop / tight
-        range — which stay range-y while ADX lags at trend starts — and ADX
-        only counts when REALLY weak (< sideways_adx_max), so a fresh trend
-        at ADX ~18 isn't mistaken for a range."""
-        c = self.cfg
-        if not c.sideways_filter_enabled:
-            return False, ""
-        n = 20
-        min_needed = max(50 + 2, 14 * 2 + 2, n + 1)
-        if df_15m is None or len(df_15m) < min_needed:
-            return False, ""
-        closes = df_15m["close"]
-        ema20 = float(ind.ema(closes, 20).iloc[-1])
-        ema50 = float(ind.ema(closes, 50).iloc[-1])
-        atr15 = float(ind.atr(df_15m, 14).iloc[-1])
-        if not (atr15 > 0) or pd.isna(ema20) or pd.isna(ema50):
-            return False, ""
-        adx_s, _, _ = ind.adx(df_15m, 14)
-        adx_v = float(adx_s.iloc[-1]) if not pd.isna(adx_s.iloc[-1]) else 100.0
-        chop_v = float(ind.choppiness_index(df_15m, 14).iloc[-1])
-        window = df_15m.iloc[-n:]
-        rng_atr = float((window["high"].max() - window["low"].min()) / atr15)
-        ema_gap_atr = abs(ema20 - ema50) / atr15
-
-        sig = {
-            "ema_compressed": ema_gap_atr < c.sideways_ema_compression_atr,
-            "high_chop": (not pd.isna(chop_v)) and chop_v > c.sideways_chop_threshold,
-            "tight_range": rng_atr < c.sideways_range_atr,
-            "weak_adx": adx_v < c.sideways_adx_max,
-        }
-        count = sum(1 for v in sig.values() if v)
-        fired = ",".join(k for k, v in sig.items() if v)
-        detail = (f"{count} signals: {fired} | gap={ema_gap_atr:.2f}ATR "
-                  f"chop={chop_v:.0f} adx={adx_v:.0f} range={rng_atr:.2f}ATR")
-        return count >= c.sideways_min_signals, detail
+        state.last_candidate_key = selected.signal_key
+        return EntryResult(
+            direction=selected.direction,
+            allow_entry=True,
+            reason=(
+                f"{selected.setup_type} {selected.trigger}: score={selected.score:.1f}/"
+                f"{selected.threshold:.1f} edge={selected.edge:+.1f} "
+                f"room={selected.room_r:.2f}R actualRR={selected.rr:.2f}"
+            ),
+            price=selected.price,
+            ema_fast=snapshot["hma_fast"],
+            ema_slow=snapshot["hma_slow"],
+            macd_hist=selected.edge,
+            cross_id=selected.signal_key,
+            entry_score=selected.score,
+            setup_type=selected.setup_type,
+            trigger=selected.trigger,
+            planned_stop=selected.stop,
+            planned_target=selected.target,
+            planned_rr=selected.rr,
+            structure_room_r=selected.room_r,
+            invalidation_level=selected.invalidation,
+            score_components=selected.components,
+        )
 
     def confirm_entry(self, symbol: str, cross_ts) -> None:
-        """Mark the confluence setup that produced `cross_ts` (EntryResult.cross_id)
-        as consumed — call ONLY after a position actually opened. A blocked or
-        failed open then leaves the setup armed for the rest of its 45-min window
-        instead of silently eating it."""
         if cross_ts is not None:
-            self._get_state(symbol).last_entry_ts = cross_ts
+            state = self._get_state(symbol)
+            state.last_entry_key = cross_ts
+            state.last_candidate_key = None
+            state.pullback = None
+            state.breakout = None
 
-    # ── Early exit — L3c (5M EMA10/20) hard gate ─────────────────────────────
-    def check_exit(self, df_5m: pd.DataFrame, position_side: str,
-                   bars_since_entry: Optional[int] = None) -> ExitCheckResult:
-        """position_side: 'long' | 'short'. While bars_since_entry <
-        exit_grace_bars the hard exit is suppressed so the L3c EMAs can
-        separate from entry. Only an L3c EMA cross-back or an OPEN on the wrong
-        side of the L3c slow EMA closes a position — nothing on L3a/L3b."""
+    def check_exit(
+        self,
+        df_5m: pd.DataFrame,
+        position_side: str,
+        bars_since_entry: Optional[int] = None,
+    ) -> ExitCheckResult:
+        """Noise-resistant 5M early exit.
+
+        A single EMA flip no longer closes a position.  Hard reversal requires a
+        cross plus price confirmation and either ROC or DMI confirmation.  The
+        slower weakness path requires two consecutive closed bars.
+        """
         c = self.cfg
         if bars_since_entry is not None and bars_since_entry < c.exit_grace_bars:
             return ExitCheckResult(False)
-        if df_5m is None or len(df_5m) < max(c.l3c_ema_slow * 2, 20):
+        if df_5m is None or len(df_5m) < 50:
             return ExitCheckResult(False)
 
-        ema_f, ema_s = self._l3c_emas(df_5m)
-        cur_f, cur_s = float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
-        prev_f, prev_s = float(ema_f.iloc[-2]), float(ema_s.iloc[-2])
-        open_px = float(df_5m["open"].iloc[-1])
+        close = df_5m["close"]
+        fast = ind.ema(close, c.l3c_ema_fast)
+        slow = ind.ema(close, c.l3c_ema_slow)
+        roc5 = ind.roc(close, 5)
+        _, plus_di, minus_di = ind.adx(df_5m, 12)
         is_long = position_side == "long"
 
-        if is_long:
-            cross_back = prev_f >= prev_s and cur_f < cur_s
-            open_wrong = open_px < cur_s
-        else:
-            cross_back = prev_f <= prev_s and cur_f > cur_s
-            open_wrong = open_px > cur_s
+        def weakness(i: int) -> tuple[bool, int]:
+            if is_long:
+                price_wrong = close.iloc[i] < slow.iloc[i]
+                score = int(roc5.iloc[i] < 0) + int(minus_di.iloc[i] > plus_di.iloc[i]) + int(close.iloc[i] < fast.iloc[i])
+            else:
+                price_wrong = close.iloc[i] > slow.iloc[i]
+                score = int(roc5.iloc[i] > 0) + int(plus_di.iloc[i] > minus_di.iloc[i]) + int(close.iloc[i] > fast.iloc[i])
+            return bool(price_wrong), int(score)
 
-        if cross_back:
-            return ExitCheckResult(True, EMA_CROSS_REVERSAL,
-                                   f"L3c EMA{c.l3c_ema_fast} crossed back against {position_side}")
-        if open_wrong:
-            return ExitCheckResult(True, PRICE_OPEN_BEYOND_EMA,
-                                   f"open={open_px:.6f} L3c EMA{c.l3c_ema_slow}={cur_s:.6f}")
+        if is_long:
+            cross_back = fast.iloc[-2] >= slow.iloc[-2] and fast.iloc[-1] < slow.iloc[-1]
+            momentum_wrong = roc5.iloc[-1] < 0 or minus_di.iloc[-1] > plus_di.iloc[-1]
+        else:
+            cross_back = fast.iloc[-2] <= slow.iloc[-2] and fast.iloc[-1] > slow.iloc[-1]
+            momentum_wrong = roc5.iloc[-1] > 0 or plus_di.iloc[-1] > minus_di.iloc[-1]
+        wrong_now, score_now = weakness(-1)
+        wrong_prev, score_prev = weakness(-2)
+
+        if cross_back and wrong_now and momentum_wrong:
+            return ExitCheckResult(
+                True,
+                EMA_CROSS_REVERSAL,
+                f"confirmed EMA reversal: weak={score_now}/3 close={close.iloc[-1]:.6f} slow={slow.iloc[-1]:.6f}",
+            )
+        required = getattr(c, "exit_weak_signals", 2)
+        if wrong_now and wrong_prev and score_now >= required and score_prev >= required:
+            return ExitCheckResult(
+                True,
+                PRICE_OPEN_BEYOND_EMA,
+                f"2-bar weakness: now={score_now}/3 prev={score_prev}/3",
+            )
         return ExitCheckResult(False)

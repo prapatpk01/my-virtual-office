@@ -102,7 +102,7 @@ class Config:
     margin_mode: str = "isolated"
     exchange_id: str = "okx"
 
-    min_bars: int = 100          # skip trading a symbol if any TF has fewer closed bars
+    min_bars: int = 200          # skip trading a symbol if any TF has fewer closed bars
 
     # Regime engine (4h)
     regime_ema_fast: int = 10   # was 20 — faster pair (10/20) per user request
@@ -178,7 +178,7 @@ class Config:
     # SpikeGuard) manage the trade. TrendConfirm's backtest note: single-close
     # EMA exits killed 75% of trades at ~-0.3R before TP1; arming them only on
     # the runner nearly doubled WR (25->62% BTC, 41->60% SOL).
-    signal_exit_requires_tp1: bool = True
+    signal_exit_requires_tp1: bool = False
 
     # ── Sideways / range veto (ported from TrendConfirm) ─────────────────────
     # Hard-block NEW entries when the 15M context reads as a range. 4 signals;
@@ -197,7 +197,7 @@ class Config:
     # for a pullback + fresh setup instead of chasing.
     chase_guard_enabled: bool = True
     chase_ema_ref: int = 50                     # EMA period on the 5M frame
-    chase_max_dist_atr: float = 1.5             # max |close-EMA50| in ATR(5m)
+    chase_max_dist_atr: float = 0.75             # max |close-EMA50| in ATR(5m)
     one_entry_per_cross: bool = True
     require_new_cross_after_exit: bool = True
     entry_on_closed_candle_only: bool = True
@@ -233,22 +233,19 @@ class Config:
     bias_conf_high_adj: float = -5.0
     bias_conf_low_adj: float = 10.0
 
-    # Risk manager
+    # Risk manager — exactly 5% planned account risk per accepted trade.
+    # With max two positions, planned simultaneous open risk is at most 10%.
     risk_min_pct: float = 0.05
-    risk_max_pct: float = 0.10
-    # Disabled by user request: at risk_per_trade=5%, one SL loss is already
-    # ~5% of the day-start balance — past this 3% limit on the FIRST loss of
-    # the day, freezing all new entries until next UTC day (up to ~24h idle
-    # off a single trade). The loss-streak cooldown below is the intended
-    # brake instead.
-    daily_loss_limit_enabled: bool = False
-    daily_loss_limit_pct: float = 0.03    # halt new entries: day PnL <= -3% (only if enabled above)
+    risk_max_pct: float = 0.05
+    # At 5% risk/trade, two full losses in one UTC day trigger a safety lock.
+    daily_loss_limit_enabled: bool = True
+    daily_loss_limit_pct: float = 0.10
     # Disabled by user request ("trade continuously, no waiting for the next
     # UTC day") — a +10.8% day tripped the +8% lock and idled the bot ~13h.
     # Loss-streak cooldown below remains the only pause.
     daily_profit_lock_enabled: bool = False
     daily_profit_lock_pct: float = 0.08   # halt new entries: day PnL >= +8% (only if enabled above)
-    loss_streak_limit: int = 3            # 3 consecutive losses ->
+    loss_streak_limit: int = 2            # 3 consecutive losses ->
     loss_streak_cooldown_min: int = 180   # -> 3-hour cooldown (was 30 min)
     max_open_positions: int = 0  # set in __post_init__ from MAX_POSITIONS (default 2)
 
@@ -282,12 +279,12 @@ class Config:
 
     # Stop loss / take profit
     sl_atr_period: int = 14
-    sl_atr_mult: float = 1.5
+    sl_atr_mult: float = 1.0
     # Floor/ceiling on SL distance as % of entry price. The floor exists so a
     # quiet-candle ATR stop can never come out so tight that TP1/TP2 R-multiple
     # profit targets fail to clear round-trip fees (see calc_stop_loss docstring).
-    sl_min_pct: float = 0.004   # 0.4%
-    sl_max_pct: float = 0.035  # 3.5%
+    sl_min_pct: float = 0.005   # 0.4%
+    sl_max_pct: float = 0.030  # 3.5%
     # Pulls the final SL distance in to this fraction of the ATR/swing/floor
     # calc. MEASURED on the local BTC/XAU set (Jan-May 2026): 0.85 made every
     # metric WORSE (PF 0.647->0.520, WR 64.4%->61.9%, net -17828->-19324,
@@ -297,20 +294,15 @@ class Config:
     # only adds re-entry churn and fee drag without reducing risk. Reverted
     # to 1.0 (no tightening).
     sl_tighten_mult: float = 1.0
-    tp1_r: float = 0.6   # was 0.5 (per user request)
-    # Fraction of the position closed at TP1 (remainder rides to TP2/SL-at-BE).
-    # Swept against the live 6-symbol backtest (BTC/ETH/SOL/XAU/XAG, Jan-Jun
-    # 2026): the TP2 bucket is the strategy's only real profit source, so a
-    # SMALLER TP1 take (bigger runner) improves expected value — 40% beat
-    # both 50% (previous default) and 70%/60%@0.6R.
-    tp1_fraction: float = 0.6
-    # tp2_r = 1.5R (per user request). Paired with TP1 0.6R / 60% closed then
-    # SL to breakeven — the 40% runner now targets 1.5R instead of 1.2R.
-    tp2_r: float = 1.5
+    # Balanced partial-profit geometry: 50% at 1R, 50% at 2R.
+    # A full TP2 outcome earns 1.5R gross instead of less than 1R.
+    tp1_r: float = 1.0
+    tp1_fraction: float = 0.5
+    tp2_r: float = 2.0
     swing_lookback_left: int = 3
     swing_lookback_right: int = 3
 
-    symbol_cooldown_min: int = 30  # no new entry on a symbol for this long after it closes
+    symbol_cooldown_min: int = 15  # no new entry on a symbol for this long after it closes
 
     # ── SpikeGuard (fast 5m/15m reversal-spike protection) ───────────────────
     # Runs EVERY poll tick while a position is open — the slow 30m health
@@ -423,6 +415,58 @@ class Config:
     booster_max_bonus_weak: float = 5.0        # 60-69
     booster_max_bonus_transition: float = 4.0
     booster_score_to_bonus: float = 0.5        # early_bonus = min(early_score * this, max_bonus)
+
+
+    # ── DUALCORE Balanced V1.5 strategy parameters ──────────────────────────
+    # 4H macro + 1H bias + 15M dual entry. 5M is used for noise-resistant
+    # management, not as a mandatory entry-cross layer. The settings below are
+    # calibrated for a behavioural target of roughly 10–15 trades/month per
+    # active symbol; market conditions can produce fewer or more trades.
+    dual_hma_fast: int = 10
+    dual_hma_slow: int = 16
+    dual_min_adx: float = 11.0
+    dual_momentum_min_adx: float = 13.0
+    dual_strong_adx: float = 20.0
+    dual_max_chop: float = 62.0
+    dual_strong_chop: float = 52.0
+
+    entry_swing_left: int = 3
+    entry_swing_right: int = 3
+    dual_pullback_zone_atr: float = 0.20
+    dual_pullback_depth_atr: float = 0.35
+    dual_pullback_window_bars: int = 3
+    dual_pullback_max_extension_atr: float = 0.75
+    dual_pullback_threshold: float = 64.0
+    dual_same_bar_pullback_threshold: float = 70.0
+    dual_pullback_min_body_atr: float = 0.15
+    dual_pullback_close_quality: float = 0.62
+    dual_pullback_min_room_r: float = 1.05
+
+    dual_breakout_lookback: int = 4
+    dual_momentum_threshold: float = 70.0
+    dual_strong_breakout_threshold: float = 66.0
+    dual_momentum_min_body_atr: float = 0.18
+    dual_momentum_close_quality: float = 0.68
+    dual_momentum_volume_ratio: float = 1.05
+    dual_momentum_max_extension_atr: float = 0.90
+    dual_strong_momentum_extension_atr: float = 1.10
+    dual_momentum_min_room_r: float = 1.15
+
+    dual_min_stop_atr: float = 0.55
+    dual_max_stop_atr: float = 1.50
+    dual_stop_buffer_atr: float = 0.10
+    dual_target_buffer_atr: float = 0.08
+    dual_pullback_tp2_r: float = 2.0
+    dual_momentum_tp2_r: float = 2.0
+    minimum_actual_rr: float = 1.20
+
+    bias_min_directional_edge: float = 8.0
+    bias_1h_min_bull: float = 55.0
+    bias_15m_min_bull: float = 52.0
+
+    expected_slippage_pct: float = 0.0005
+    be_lock_r: float = 0.08
+    exit_weak_signals: int = 2
 
     # Loop timing
     poll_interval_sec: int = 30    # how often main.py checks for a newly-closed 30m bar

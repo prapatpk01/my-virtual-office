@@ -135,8 +135,8 @@ class Bot:
                 f"🤖 *Bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT\n"
-                f"Architecture: Regime → Bias → Entry (3-TF cross confluence: "
-                f"30M HMA / 15M EMA5-9 / 5M EMA10-20, ≥2 within 15m)"
+                f"Architecture: 4H Regime → 1H Bias → 15M Dual Entry "
+                f"(Fast Pullback + Momentum Breakout/Retest)"
             )
 
     async def stop(self):
@@ -285,9 +285,9 @@ class Bot:
         return event
 
     async def _look_for_entry(self, symbol: str, df_15m, df_5m, sig):
-        # Entry is evaluated once per closed 5M bar (the confluence trigger's
-        # cadence) — keying on the 15M bar would skip 2 of every 3 chances.
-        bar_ts = df_5m.index[-1] if (df_5m is not None and len(df_5m)) else None
+        # Entry engines operate on completed 15M bars. Repeated 30-second polls
+        # of the same candle must never submit the same setup twice.
+        bar_ts = df_15m.index[-1] if (df_15m is not None and len(df_15m)) else None
         if bar_ts is None or self._last_entry_bar.get(symbol) == bar_ts:
             return   # already evaluated this closed bar
         self._last_entry_bar[symbol] = bar_ts
@@ -309,23 +309,22 @@ class Bot:
             return
 
         risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
-        # Chart the L3c timeframe (5M) with its EMA10/20 — the layer that times
-        # the entry and gates the exit — so the signal image matches the system.
+        # Chart the actual 15M execution frame with HMA10/HMA16.
         chart_path = build_entry_chart(
-            symbol, df_5m, sig.direction, sig.price,
+            symbol, df_15m, sig.direction, sig.price,
             *self._preview_sl_tp(sig, df_15m),
-            ema_fast_len=self.cfg.l3c_ema_fast, ema_slow_len=self.cfg.l3c_ema_slow,
-            tf_label=self.cfg.l3c_tf.upper(),
+            ema_fast_len=self.cfg.dual_hma_fast, ema_slow_len=self.cfg.dual_hma_slow,
+            tf_label="15M",
         )
 
         pos = await self.positions.open_position(
-            symbol, sig.direction, sig.price, df_15m, sig.regime, sig.bias, sig.entry_score,
-            df_5m=df_5m)
+            symbol, sig.direction, sig.price, df_15m, sig.regime, sig.bias,
+            sig.entry_score, df_5m=df_5m, entry_result=sig.entry)
         if pos is None:
             return
 
-        # Consume the confluence setup ONLY now that a position really opened —
-        # a blocked/failed open above leaves it armed within its 45-min window.
+        # Consume the deterministic setup key ONLY now that a position really opened —
+        # a blocked/failed open above leaves the setup eligible until it expires.
         self.signal_engine.entry_engine.confirm_entry(
             symbol, sig.entry.cross_id if sig.entry is not None else None)
 
@@ -348,31 +347,40 @@ class Bot:
             logger.error("[%s] entry_signal notify failed: %s", symbol, e, exc_info=True)
 
     def _log_pipeline_block(self, symbol: str, sig):
-        """Explain WHICH layer stopped the trade — never a generic 'no signal'."""
+        """Explain the exact layer and setup state that blocked a trade."""
         r = sig.regime
-        layer = sig.blocked_layer
-        if layer == "BIAS" and sig.bias is not None:
+        if sig.blocked_layer == "BIAS" and sig.bias is not None:
             b = sig.bias
-            logger.info("[%s] regime=%s(4H=%s,1H=%s)  BIAS NO-TRADE  1H=%.0f 15M=%.0f 5M=%.0f — %s",
-                       symbol, r.label, r.label_4h, r.label_1h,
-                       b.score_1h, b.score_15m, b.score_5m, b.reason)
-        elif layer == "ENTRY" and sig.entry is not None:
+            logger.info(
+                "[%s] regime=%s(4H=%s,1H=%s) BIAS NO-TRADE bull=%.0f bear=%.0f edge=%+.0f — %s",
+                symbol, r.label, r.label_4h, r.label_1h,
+                b.bull_score, b.bear_score, b.directional_edge, b.reason,
+            )
+        elif sig.blocked_layer == "ENTRY" and sig.entry is not None:
             e = sig.entry
-            logger.info("[%s] regime=%s dir=%s(bias)  NO ENTRY  L3c EMA%d=%.6f EMA%d=%.6f "
-                       "confluence=%.0f/%d — %s",
-                       symbol, r.label, sig.bias.direction if sig.bias else "-",
-                       self.cfg.l3c_ema_fast, e.ema_fast, self.cfg.l3c_ema_slow, e.ema_slow,
-                       e.macd_hist, self.cfg.entry_confluence_min, e.reason)
-        elif layer == "MARKET":
+            logger.info(
+                "[%s] regime=%s bias=%s NO ENTRY HMA=%.6f/%.6f edge=%.1f — %s",
+                symbol, r.label, sig.bias.direction if sig.bias else "-",
+                e.ema_fast, e.ema_slow, e.macd_hist, e.reason,
+            )
+        elif sig.blocked_layer == "MARKET":
             logger.info("[%s] MARKET CLOSED — %s", symbol, sig.reason)
         else:
             logger.debug("[%s] no trade: %s", symbol, sig.reason)
 
     def _preview_sl_tp(self, sig, df_15m) -> tuple[float, float, float]:
-        """Compute SL/TP1/TP2 for the chart BEFORE the order is placed (same math as open_position)."""
+        """Use the Entry Engine's structure plan when available."""
         import indicators as ind
         from position_manager import calc_stop_loss, calc_take_profits
         c = self.cfg
+        if sig.entry is not None and sig.entry.planned_stop is not None:
+            sl = float(sig.entry.planned_stop)
+            one_r = abs(sig.price - sl)
+            tp1 = sig.price + c.tp1_r * one_r if sig.direction == LONG else sig.price - c.tp1_r * one_r
+            tp2 = float(sig.entry.planned_target) if sig.entry.planned_target is not None else (
+                sig.price + c.tp2_r * one_r if sig.direction == LONG else sig.price - c.tp2_r * one_r
+            )
+            return sl, tp1, tp2
         atr_val = float(ind.atr(df_15m, c.sl_atr_period).iloc[-1])
         swing_high, swing_low = ind.recent_swing_levels(
             df_15m["high"], df_15m["low"], c.swing_lookback_left, c.swing_lookback_right)
@@ -418,9 +426,8 @@ class Bot:
             self._symbol_cooldown_until[symbol] = time.time() + cooldown_sec
             logger.info("[%s] closed (%s) — cooldown %d min before next entry",
                        symbol, ev, self.cfg.symbol_cooldown_min)
-            # Trade log for /stats and /trades. trade_pnl = FULL trade total
-            # (TP1 partial leg + final leg), tp1_hit drives the win rule:
-            # a TP1-then-breakeven exit counts as a WIN.
+            # Trade log for /stats and /trades. A trade is a win only when its
+            # final post-fee PnL is positive; TP1 is tracked separately.
             self._trade_log.append({
                 "time": time.time(), "symbol": symbol,
                 "side": event.get("side", ""), "reason": ev,
@@ -522,7 +529,7 @@ class Bot:
             lines = []
             for t in reversed(last):
                 ts = time.strftime("%m-%d %H:%M", time.gmtime(t["time"]))
-                win = t["pnl"] > 0 or t["tp1_hit"]
+                win = t["pnl"] > 0
                 lines.append(
                     f"{'🟢' if win else '🔴'} `{t['symbol']}` {t['side'].upper()} "
                     f"{t['reason']}  pnl `{t['pnl']:+.2f}`  {ts}")
@@ -555,8 +562,8 @@ class Bot:
                     bias_str = f"`{b.direction}` 1H`{b.score_1h:.0f}` 15M`{b.score_15m:.0f}` 5M`{b.score_5m:.0f}`"
                 else:
                     bias_str = "`—`"
-                entry_str = (f"`confluence {sig.entry.macd_hist:.0f}/{self.cfg.entry_confluence_min} "
-                             f"L3c {sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
+                entry_str = (f"`{sig.entry.setup_type or 'WAIT'} score={sig.entry.entry_score:.0f} "
+                             f"HMA={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
                             if sig.entry is not None else "`-`")
                 lines.append(
                     f"`{sym}` {pos_label}\n"
@@ -568,32 +575,33 @@ class Bot:
             await self.telegram.send_text(f"unknown command: {cmd} — try /help")
 
     def _merge_trade_history(self, okx_rows: list[dict]) -> list[dict]:
-        """Merge OKX's authoritative closed-position rows (exact symbol/side/
-        pnl/close-time) with THIS process's own live-captured classification
-        (reason / tp1_hit) — OKX's history has no such field, but the bot
-        decided every close itself, so borrow it by matching (symbol, close
-        time) within a 5-minute tolerance. An OKX row with no live match
-        (bot was down / redeployed when it closed) falls back to
-        reason=RECONCILED, tp1_hit=False — still counted, still OKX-exact
-        PnL, just without the TP1/TP2 breakdown for that one trade."""
+        """Merge authoritative OKX PnL with local reason metadata one-to-one."""
         live_by_symbol: dict[str, list[dict]] = {}
-        for t in self._trade_log:
-            live_by_symbol.setdefault(t["symbol"], []).append(t)
-        merged = []
-        for row in okx_rows:
+        for trade in self._trade_log:
+            live_by_symbol.setdefault(trade["symbol"], []).append(trade)
+        used_ids: set[int] = set()
+        merged: list[dict] = []
+        for row in sorted(okx_rows, key=lambda x: x["close_time_ms"]):
             close_sec = row["close_time_ms"] / 1000.0
-            best = None
-            for t in live_by_symbol.get(row["symbol"], []):
-                if abs(t["time"] - close_sec) <= 300:
-                    best = t
-                    break
+            candidates = []
+            for trade in live_by_symbol.get(row["symbol"], []):
+                if id(trade) in used_ids:
+                    continue
+                delta = abs(trade["time"] - close_sec)
+                if delta <= 300:
+                    candidates.append((delta, trade))
+            best = min(candidates, key=lambda x: x[0])[1] if candidates else None
             if best is not None:
-                merged.append({"time": close_sec, "symbol": row["symbol"], "side": best["side"],
-                               "reason": best["reason"], "tp1_hit": best["tp1_hit"],
-                               "pnl": row["pnl"]})
+                used_ids.add(id(best))
+                merged.append({
+                    "time": close_sec, "symbol": row["symbol"], "side": best["side"],
+                    "reason": best["reason"], "tp1_hit": best["tp1_hit"], "pnl": row["pnl"],
+                })
             else:
-                merged.append({"time": close_sec, "symbol": row["symbol"], "side": row["side"],
-                               "reason": "RECONCILED", "tp1_hit": False, "pnl": row["pnl"]})
+                merged.append({
+                    "time": close_sec, "symbol": row["symbol"], "side": row["side"],
+                    "reason": "RECONCILED", "tp1_hit": False, "pnl": row["pnl"],
+                })
         return merged
 
     async def _build_stats_report(self) -> str:
@@ -626,19 +634,22 @@ class Bot:
             return header + f"\n\n_no closed trades since {since_lbl}_"
 
         sep = "――――――――――――――――――"
-        # Win rule (per spec): TP1 hit then stopped at breakeven still counts
-        # as a WIN — the trade banked the TP1 partial.
-        wins = [t for t in trades if t["pnl"] > 0 or t["tp1_hit"]]
+        wins = [t for t in trades if t["pnl"] > 0]
+        losses_list = [t for t in trades if t["pnl"] < 0]
+        breakevens = [t for t in trades if abs(t["pnl"]) <= 1e-8]
         total = len(trades)
-        losses = total - len(wins)
         tp1 = [t for t in trades if t["tp1_hit"]]
         tp2 = [t for t in trades if t["reason"] == "TP2_HIT"]
-        sl_only = [t for t in trades if not t["tp1_hit"] and t["pnl"] <= 0]
+        sl_only = [t for t in trades if not t["tp1_hit"] and t["pnl"] < 0]
         net = sum(t["pnl"] for t in trades)
+        gross_profit = sum(t["pnl"] for t in wins)
+        gross_loss = abs(sum(t["pnl"] for t in losses_list))
+        pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
         lines = [header, "", sep, "*OVERALL (OKX)*", sep,
-            f"Trades : `{total}`  (`{len(wins)}W` / `{losses}L`)",
+            f"Trades : `{total}`  (`{len(wins)}W` / `{len(losses_list)}L` / `{len(breakevens)}BE`)",
             f"Win rate : `{len(wins)/total*100:.0f}%`",
+            f"Profit factor : `{'∞' if pf == float('inf') else f'{pf:.2f}'}`",
             f"TP1 hit : `{len(tp1)}/{total}` (`{len(tp1)/total*100:.0f}%`)   "
             f"TP2 hit : `{len(tp2)}/{total}` (`{len(tp2)/total*100:.0f}%`)",
             f"SL only : `{len(sl_only)}/{total}` (`{len(sl_only)/total*100:.0f}%`)",
@@ -653,7 +664,7 @@ class Bot:
             if not ts:
                 lines.append(f"`{_sym(sym)}`   0 trades")
                 continue
-            w = sum(1 for t in ts if t["pnl"] > 0 or t["tp1_hit"])
+            w = sum(1 for t in ts if t["pnl"] > 0)
             lines.append(f"`{_sym(sym)}`   {len(ts)} trades  {w/len(ts)*100:.0f}%WR  "
                         f"`{sum(t['pnl'] for t in ts):+.2f}`")
 
@@ -662,7 +673,7 @@ class Bot:
         for i, t in enumerate(sorted(trades, key=lambda x: -x["time"])[:5], 1):
             age = now - t["time"]
             age_lbl = f"{age/3600:.1f}h ago" if age < 86400 else f"{age/86400:.1f}d ago"
-            win = t["pnl"] > 0 or t["tp1_hit"]
+            win = t["pnl"] > 0
             lines.append(f"{i}. {'✅' if win else '❌'} `{_sym(t['symbol'])}` "
                         f"{t['side'].upper()} `{t['pnl']:+.2f}` — {age_lbl}")
         return "\n".join(lines)
@@ -694,8 +705,8 @@ class Bot:
                 bias_label = f"{sig.bias.direction}(1H={sig.bias.score_1h:.0f},15M={sig.bias.score_15m:.0f},5M={sig.bias.score_5m:.0f})"
             else:
                 bias_label = "—"
-            entry_label = (f"confl={sig.entry.macd_hist:.0f}/{self.cfg.entry_confluence_min} "
-                          f"L3c={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
+            entry_label = (f"{sig.entry.setup_type or 'WAIT'} score={sig.entry.entry_score:.0f} "
+                          f"HMA={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
                           if sig.entry is not None else "-")
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(

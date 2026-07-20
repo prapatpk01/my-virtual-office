@@ -1,262 +1,412 @@
-"""
-Pure indicator functions — pandas/numpy only, no external TA library.
+"""Shared technical-analysis primitives for live trading and backtesting.
 
-Every function operates on already-CLOSED bars only. Callers (live loop,
-backtest) are responsible for never passing an in-progress candle — that
-is the single no-lookahead contract this module relies on.
+All functions expect *closed* candles.  No function fetches data or uses future
+bars.  Swing points are only returned after their right-hand confirmation bars
+exist, preventing look-ahead bias.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Iterable, Optional
+
 import numpy as np
 import pandas as pd
+
+EPSILON = 1e-12
 
 
 # ── Moving averages ──────────────────────────────────────────────────────────
 
 def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+    return series.astype(float).ewm(span=max(1, period), adjust=False).mean()
 
 
 def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).mean()
+    return series.astype(float).rolling(max(1, period)).mean()
 
 
 def wma(series: pd.Series, period: int) -> pd.Series:
-    weights = np.arange(1, period + 1)
-    return series.rolling(period).apply(
-        lambda x: np.dot(x, weights) / weights.sum(), raw=True
+    period = max(1, int(period))
+    weights = np.arange(1, period + 1, dtype=float)
+    return series.astype(float).rolling(period).apply(
+        lambda x: float(np.dot(x, weights) / weights.sum()), raw=True
     )
 
 
 def hma(series: pd.Series, period: int) -> pd.Series:
-    """Hull Moving Average: WMA(2*WMA(n/2) - WMA(n), sqrt(n)) — fast, low-lag."""
+    period = max(2, int(period))
     half = max(1, period // 2)
-    sqrt_p = max(1, int(round(np.sqrt(period))))
-    raw = 2 * wma(series, half) - wma(series, period)
-    return wma(raw, sqrt_p)
+    root = max(1, int(round(np.sqrt(period))))
+    return wma(2.0 * wma(series, half) - wma(series, period), root)
 
 
 def slope_pct(series: pd.Series, lookback: int = 5) -> pd.Series:
-    """% change of `series` over `lookback` bars — used for EMA/HMA slope direction."""
-    prior = series.shift(lookback)
-    return (series - prior) / prior.replace(0, np.nan) * 100
+    prior = series.shift(max(1, lookback))
+    return (series - prior) / prior.replace(0, np.nan) * 100.0
 
 
-# ── Momentum ──────────────────────────────────────────────────────────────────
+def normalized_slope(series: pd.Series, atr_series: pd.Series, lookback: int = 3) -> pd.Series:
+    """Slope measured in ATR units, comparable across BTC, metals and alts."""
+    return (series - series.shift(max(1, lookback))) / atr_series.replace(0, np.nan)
+
+
+# ── Momentum ────────────────────────────────────────────────────────────────
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Wilder-smoothed RSI."""
-    delta = series.diff()
+    delta = series.astype(float).diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    out = 100 - 100 / (1 + rs)
+    out = 100.0 - 100.0 / (1.0 + rs)
     return out.fillna(50.0)
 
 
 def roc(series: pd.Series, period: int = 9) -> pd.Series:
-    """Rate of change, %."""
-    prior = series.shift(period)
-    return (series - prior) / prior.replace(0, np.nan) * 100
+    prior = series.shift(max(1, period))
+    return (series - prior) / prior.replace(0, np.nan) * 100.0
 
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26,
-         signal: int = 9) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Returns (macd_line, signal_line, histogram)."""
+def macd(
+    series: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
     line = ema(series, fast) - ema(series, slow)
-    sig  = ema(line, signal)
+    sig = ema(line, signal)
     return line, sig, line - sig
 
 
 def vwap(df: pd.DataFrame, window: int = 48) -> pd.Series:
-    """
-    Rolling VWAP over the last `window` bars — a session-anchored VWAP needs
-    exchange session boundaries we don't track per-symbol, so a rolling window
-    (default 48 = one 24h day on 30m) is the robust, symbol-agnostic stand-in.
-    """
+    window = max(1, min(int(window), max(len(df), 1)))
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = (typical * df["volume"]).rolling(window, min_periods=1).sum()
     vol = df["volume"].rolling(window, min_periods=1).sum().replace(0, np.nan)
     return pv / vol
 
 
-# ── Volatility / trend strength ──────────────────────────────────────────────
+# ── Volatility and trend strength ───────────────────────────────────────────
 
 def true_range(df: pd.DataFrame) -> pd.Series:
-    h, l, c_prev = df["high"], df["low"], df["close"].shift(1)
-    return pd.concat([h - l, (h - c_prev).abs(), (l - c_prev).abs()], axis=1).max(axis=1)
+    prev_close = df["close"].shift(1)
+    return pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Wilder-smoothed ATR."""
-    tr = true_range(df)
-    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    return true_range(df).ewm(
+        alpha=1.0 / max(1, period),
+        adjust=False,
+        min_periods=max(1, period),
+    ).mean()
 
 
 def rolling_percentile(series: pd.Series, lookback: int = 100) -> pd.Series:
-    """Percentile rank (0-100) of the current value within the trailing `lookback` window."""
+    lookback = max(5, int(lookback))
+
     def _rank(window: np.ndarray) -> float:
-        cur = window[-1]
-        return float((window <= cur).sum() - 1) / max(len(window) - 1, 1) * 100.0
+        valid = window[~np.isnan(window)]
+        if len(valid) < 2:
+            return np.nan
+        current = valid[-1]
+        return float((valid <= current).sum() - 1) / max(len(valid) - 1, 1) * 100.0
+
     return series.rolling(lookback, min_periods=max(20, lookback // 4)).apply(_rank, raw=True)
 
 
 def atr_percentile(atr_series: pd.Series, lookback: int = 100) -> pd.Series:
-    """Percentile rank (0-100) of the current ATR within the trailing `lookback` window."""
     return rolling_percentile(atr_series, lookback)
 
 
 def bollinger_width(df: pd.DataFrame, period: int = 20, mult: float = 2.0) -> pd.Series:
-    """Bollinger Band width as % of the middle band — a compression/expansion gauge."""
-    close = df["close"]
-    mid = sma(close, period)
-    std = close.rolling(period).std()
-    upper, lower = mid + mult * std, mid - mult * std
-    return (upper - lower) / mid.replace(0, np.nan) * 100
+    mid = sma(df["close"], period)
+    std = df["close"].rolling(period).std()
+    return (2.0 * mult * std) / mid.replace(0, np.nan) * 100.0
 
 
 def adx(df: pd.DataFrame, period: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Returns (ADX, +DI, -DI), Wilder-smoothed."""
     high, low, close = df["high"], df["low"], df["close"]
-    prev_high, prev_low, prev_close = high.shift(1), low.shift(1), close.shift(1)
-
-    up_move = high - prev_high
-    dn_move = prev_low - low
-    plus_dm  = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
-
-    tr = pd.concat([(high - low), (high - prev_close).abs(),
-                    (low - prev_close).abs()], axis=1).max(axis=1)
-
-    atr_s = tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    plus_dm_s  = pd.Series(plus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False,
-                                                          min_periods=period).mean()
-    minus_dm_s = pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False,
-                                                           min_periods=period).mean()
-
-    plus_di  = 100 * plus_dm_s  / atr_s.replace(0, np.nan)
-    minus_di = 100 * minus_dm_s / atr_s.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx_val = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    return adx_val, plus_di, minus_di
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index
+    )
+    tr = true_range(df)
+    atr_smoothed = tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    plus_smoothed = plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    minus_smoothed = minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    plus_di = 100.0 * plus_smoothed / atr_smoothed.replace(0, np.nan)
+    minus_di = 100.0 * minus_smoothed / atr_smoothed.replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx_value = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    return adx_value, plus_di, minus_di
 
 
 def choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Choppiness Index: 100 * log10(sum(TR, n) / (max(high,n) - min(low,n))) / log10(n).
-    High (>60) = choppy/ranging. Low (<38) = trending.
-    """
-    tr = true_range(df)
-    tr_sum = tr.rolling(period).sum()
-    hh = df["high"].rolling(period).max()
-    ll = df["low"].rolling(period).min()
-    rng = (hh - ll).replace(0, np.nan)
-    return 100 * np.log10(tr_sum / rng) / np.log10(period)
+    tr_sum = true_range(df).rolling(period).sum()
+    price_range = (
+        df["high"].rolling(period).max() - df["low"].rolling(period).min()
+    ).replace(0, np.nan)
+    return 100.0 * np.log10(tr_sum / price_range) / np.log10(max(period, 2))
 
 
-# ── Market structure (swing HH/HL vs LH/LL) ──────────────────────────────────
+# ── Candle quality ──────────────────────────────────────────────────────────
 
-def swing_pivots(highs: pd.Series, lows: pd.Series, left: int = 3, right: int = 3):
-    """
-    Fractal pivot detection. A pivot at index i needs `right` bars AFTER it to
-    confirm — so the most recent `right` bars can never have a confirmed pivot
-    yet. This is a natural lag, not lookahead: at live time T we only see bars
-    up to T, so a pivot at T-right is the newest one we could possibly know.
-    Returns (pivot_high_idx, pivot_low_idx) — lists of positional indices.
-    """
-    n = len(highs)
-    ph, pl = [], []
-    h = highs.values
-    l = lows.values
-    for i in range(left, n - right):
-        window_h = h[i - left:i + right + 1]
-        window_l = l[i - left:i + right + 1]
-        if h[i] == window_h.max() and np.argmax(window_h) == left:
-            ph.append(i)
-        if l[i] == window_l.min() and np.argmin(window_l) == left:
-            pl.append(i)
-    return ph, pl
+@dataclass(frozen=True)
+class CandleMetrics:
+    body: float
+    candle_range: float
+    body_atr: float
+    body_ratio: float
+    bull_close_quality: float
+    bear_close_quality: float
+    upper_wick: float
+    lower_wick: float
+    volume_ratio: float
+    bullish: bool
+    bearish: bool
 
 
-def market_structure(highs: pd.Series, lows: pd.Series,
-                     left: int = 3, right: int = 3) -> str:
-    """
-    Classify structure from the two most recent CONFIRMED swing highs and
-    the two most recent CONFIRMED swing lows:
-      'HH_HL' — higher high AND higher low  (bullish structure)
-      'LH_LL' — lower high AND lower low    (bearish structure)
-      'MIXED' — anything else / not enough confirmed pivots
-    """
+def candle_metrics(df: pd.DataFrame, atr_value: Optional[float] = None, volume_period: int = 20) -> CandleMetrics:
+    if df is None or len(df) == 0:
+        return CandleMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, False, False)
+    row = df.iloc[-1]
+    op, hi, lo, cl = map(float, (row["open"], row["high"], row["low"], row["close"]))
+    rng = max(hi - lo, EPSILON)
+    body = abs(cl - op)
+    if atr_value is None:
+        atr_value = float(atr(df, 14).iloc[-1]) if len(df) >= 14 else 0.0
+    body_atr = body / max(float(atr_value or 0.0), EPSILON)
+    volume = float(row.get("volume", 0.0))
+    if len(df) > 1:
+        base = float(df["volume"].iloc[-(volume_period + 1):-1].mean())
+    else:
+        base = 0.0
+    volume_ratio = volume / max(base, EPSILON) if base > 0 else 1.0
+    return CandleMetrics(
+        body=body,
+        candle_range=rng,
+        body_atr=body_atr,
+        body_ratio=body / rng,
+        bull_close_quality=(cl - lo) / rng,
+        bear_close_quality=(hi - cl) / rng,
+        upper_wick=hi - max(op, cl),
+        lower_wick=min(op, cl) - lo,
+        volume_ratio=volume_ratio,
+        bullish=cl > op,
+        bearish=cl < op,
+    )
+
+
+def bullish_trigger_candle(
+    metrics: CandleMetrics,
+    min_body_atr: float = 0.15,
+    min_close_quality: float = 0.62,
+) -> bool:
+    return (
+        metrics.bullish
+        and metrics.body_atr >= min_body_atr
+        and metrics.bull_close_quality >= min_close_quality
+    )
+
+
+def bearish_trigger_candle(
+    metrics: CandleMetrics,
+    min_body_atr: float = 0.15,
+    min_close_quality: float = 0.62,
+) -> bool:
+    return (
+        metrics.bearish
+        and metrics.body_atr >= min_body_atr
+        and metrics.bear_close_quality >= min_close_quality
+    )
+
+
+# ── Confirmed market structure ─────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class SwingPoint:
+    position: int
+    timestamp: object
+    price: float
+    kind: str  # HIGH | LOW
+
+
+def swing_pivots(
+    highs: pd.Series,
+    lows: pd.Series,
+    left: int = 3,
+    right: int = 3,
+) -> tuple[list[int], list[int]]:
+    left, right = max(1, int(left)), max(1, int(right))
+    high_values = highs.astype(float).to_numpy()
+    low_values = lows.astype(float).to_numpy()
+    pivot_highs: list[int] = []
+    pivot_lows: list[int] = []
+    for i in range(left, len(high_values) - right):
+        hw = high_values[i - left : i + right + 1]
+        lw = low_values[i - left : i + right + 1]
+        if np.isfinite(high_values[i]) and high_values[i] == np.nanmax(hw) and np.nanargmax(hw) == left:
+            pivot_highs.append(i)
+        if np.isfinite(low_values[i]) and low_values[i] == np.nanmin(lw) and np.nanargmin(lw) == left:
+            pivot_lows.append(i)
+    return pivot_highs, pivot_lows
+
+
+def confirmed_swings(
+    highs: pd.Series,
+    lows: pd.Series,
+    left: int = 3,
+    right: int = 3,
+) -> tuple[list[SwingPoint], list[SwingPoint]]:
+    ph, pl = swing_pivots(highs, lows, left, right)
+    high_points = [
+        SwingPoint(i, highs.index[i], float(highs.iloc[i]), "HIGH") for i in ph
+    ]
+    low_points = [
+        SwingPoint(i, lows.index[i], float(lows.iloc[i]), "LOW") for i in pl
+    ]
+    return high_points, low_points
+
+
+def market_structure(
+    highs: pd.Series,
+    lows: pd.Series,
+    left: int = 3,
+    right: int = 3,
+) -> str:
     ph, pl = swing_pivots(highs, lows, left, right)
     if len(ph) < 2 or len(pl) < 2:
         return "MIXED"
-    h_vals = highs.values
-    l_vals = lows.values
-    higher_high = h_vals[ph[-1]] > h_vals[ph[-2]]
-    higher_low  = l_vals[pl[-1]] > l_vals[pl[-2]]
-    lower_high  = h_vals[ph[-1]] < h_vals[ph[-2]]
-    lower_low   = l_vals[pl[-1]] < l_vals[pl[-2]]
-    if higher_high and higher_low:
+    hh = float(highs.iloc[ph[-1]]) > float(highs.iloc[ph[-2]])
+    hl = float(lows.iloc[pl[-1]]) > float(lows.iloc[pl[-2]])
+    lh = float(highs.iloc[ph[-1]]) < float(highs.iloc[ph[-2]])
+    ll = float(lows.iloc[pl[-1]]) < float(lows.iloc[pl[-2]])
+    if hh and hl:
         return "HH_HL"
-    if lower_high and lower_low:
+    if lh and ll:
         return "LH_LL"
     return "MIXED"
 
 
-def structure_flags(highs: pd.Series, lows: pd.Series,
-                    left: int = 3, right: int = 3) -> dict:
-    """
-    Individual swing-structure flags from the two most recent CONFIRMED pivots
-    on each side — unlike market_structure() this doesn't require BOTH the
-    high and low leg to agree, so callers can ask for e.g. "higher low" alone
-    (an early-trend / reversal tell) without also needing a higher high.
-    """
+def structure_flags(
+    highs: pd.Series,
+    lows: pd.Series,
+    left: int = 3,
+    right: int = 3,
+) -> dict[str, bool]:
     ph, pl = swing_pivots(highs, lows, left, right)
-    h_vals, l_vals = highs.values, lows.values
     return {
-        "higher_high": len(ph) >= 2 and h_vals[ph[-1]] > h_vals[ph[-2]],
-        "lower_high":  len(ph) >= 2 and h_vals[ph[-1]] < h_vals[ph[-2]],
-        "higher_low":  len(pl) >= 2 and l_vals[pl[-1]] > l_vals[pl[-2]],
-        "lower_low":   len(pl) >= 2 and l_vals[pl[-1]] < l_vals[pl[-2]],
+        "higher_high": len(ph) >= 2 and float(highs.iloc[ph[-1]]) > float(highs.iloc[ph[-2]]),
+        "lower_high": len(ph) >= 2 and float(highs.iloc[ph[-1]]) < float(highs.iloc[ph[-2]]),
+        "higher_low": len(pl) >= 2 and float(lows.iloc[pl[-1]]) > float(lows.iloc[pl[-2]]),
+        "lower_low": len(pl) >= 2 and float(lows.iloc[pl[-1]]) < float(lows.iloc[pl[-2]]),
     }
 
 
+def recent_swing_levels(
+    highs: pd.Series,
+    lows: pd.Series,
+    left: int = 3,
+    right: int = 3,
+) -> tuple[float, float]:
+    ph, pl = swing_pivots(highs, lows, left, right)
+    swing_high = float(highs.iloc[ph[-1]]) if ph else float("nan")
+    swing_low = float(lows.iloc[pl[-1]]) if pl else float("nan")
+    return swing_high, swing_low
+
+
+def nearest_confirmed_levels(
+    df: Optional[pd.DataFrame],
+    price: float,
+    left: int = 3,
+    right: int = 3,
+) -> tuple[Optional[float], Optional[float]]:
+    """Nearest confirmed support below and resistance above `price`."""
+    if df is None or len(df) < left + right + 3:
+        return None, None
+    highs, lows = confirmed_swings(df["high"], df["low"], left, right)
+    supports = [p.price for p in lows if p.price < price]
+    resistances = [p.price for p in highs if p.price > price]
+    return (max(supports) if supports else None, min(resistances) if resistances else None)
+
+
+def latest_bos(
+    df: pd.DataFrame,
+    direction: str,
+    left: int = 3,
+    right: int = 3,
+    min_body_atr: float = 0.18,
+) -> tuple[bool, Optional[float]]:
+    if df is None or len(df) < left + right + 5:
+        return False, None
+    atr_value = float(atr(df, 14).iloc[-1])
+    metrics = candle_metrics(df, atr_value)
+    ph, pl = swing_pivots(df["high"], df["low"], left, right)
+    close = float(df["close"].iloc[-1])
+    previous_close = float(df["close"].iloc[-2])
+    if direction.upper() == "LONG" and ph:
+        level = float(df["high"].iloc[ph[-1]])
+        return close > level and previous_close <= level and metrics.body_atr >= min_body_atr, level
+    if direction.upper() == "SHORT" and pl:
+        level = float(df["low"].iloc[pl[-1]])
+        return close < level and previous_close >= level and metrics.body_atr >= min_body_atr, level
+    return False, None
+
+
+def sweep_reclaim(
+    df: pd.DataFrame,
+    direction: str,
+    level: Optional[float],
+    min_wick_body_ratio: float = 1.2,
+) -> bool:
+    if df is None or len(df) == 0 or level is None:
+        return False
+    metrics = candle_metrics(df)
+    row = df.iloc[-1]
+    if direction.upper() == "LONG":
+        return (
+            float(row["low"]) < level < float(row["close"])
+            and metrics.lower_wick >= max(metrics.body * min_wick_body_ratio, EPSILON)
+        )
+    return (
+        float(row["high"]) > level > float(row["close"])
+        and metrics.upper_wick >= max(metrics.body * min_wick_body_ratio, EPSILON)
+    )
+
+
 def recent_cross_above(price: pd.Series, level: pd.Series, lookback: int = 5) -> bool:
-    """True if `price` is above `level` now and crossed up within the last `lookback` bars."""
-    n = len(price)
-    if n < lookback + 2 or level.iloc[-1] != level.iloc[-1]:  # NaN check
+    if len(price) < lookback + 2 or pd.isna(level.iloc[-1]) or not price.iloc[-1] > level.iloc[-1]:
         return False
-    if not (price.iloc[-1] > level.iloc[-1]):
-        return False
-    for back in range(1, lookback + 1):
-        if n - 1 - back < 0:
-            break
-        if price.iloc[-1 - back] <= level.iloc[-1 - back]:
-            return True
-    return False
+    return any(price.iloc[-1 - back] <= level.iloc[-1 - back] for back in range(1, lookback + 1))
 
 
 def recent_cross_below(price: pd.Series, level: pd.Series, lookback: int = 5) -> bool:
-    """True if `price` is below `level` now and crossed down within the last `lookback` bars."""
-    n = len(price)
-    if n < lookback + 2 or level.iloc[-1] != level.iloc[-1]:
+    if len(price) < lookback + 2 or pd.isna(level.iloc[-1]) or not price.iloc[-1] < level.iloc[-1]:
         return False
-    if not (price.iloc[-1] < level.iloc[-1]):
-        return False
-    for back in range(1, lookback + 1):
-        if n - 1 - back < 0:
-            break
-        if price.iloc[-1 - back] >= level.iloc[-1 - back]:
-            return True
-    return False
+    return any(price.iloc[-1 - back] >= level.iloc[-1 - back] for back in range(1, lookback + 1))
 
 
-def recent_swing_levels(highs: pd.Series, lows: pd.Series,
-                        left: int = 3, right: int = 3) -> tuple[float, float]:
-    """Most recent confirmed swing high / swing low price — used for SL safety check."""
-    ph, pl = swing_pivots(highs, lows, left, right)
-    swing_high = float(highs.values[ph[-1]]) if ph else float("nan")
-    swing_low  = float(lows.values[pl[-1]])  if pl else float("nan")
-    return swing_high, swing_low
+def cross_count(fast: pd.Series, slow: pd.Series, lookback: int = 8) -> int:
+    relation = np.sign((fast - slow).fillna(0.0).to_numpy())
+    relation = relation[-max(2, lookback + 1) :]
+    return int(np.sum(relation[1:] * relation[:-1] < 0))
+
+
+def safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if not np.isfinite(result) else result
