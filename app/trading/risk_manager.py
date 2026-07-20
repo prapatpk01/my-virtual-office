@@ -26,7 +26,7 @@ class RiskManager:
     """
 
     def __init__(self,
-                 max_risk_per_trade_pct: float = 0.02,   # 2% of balance per trade
+                 max_risk_per_trade_pct: float = 0.05,   # 5% of balance per trade
                  stop_loss_pct: float = 0.03,            # 3% stop-loss
                  take_profit_pct: float = 0.06,          # 6% take-profit (2:1 RR)
                  max_open_positions: int = 5,
