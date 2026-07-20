@@ -1,5 +1,5 @@
 """
-Adaptive Trading Bot — v9.0  Multi-Layer AI Decision Engine
+Adaptive Trading Bot — v9.3  Balanced Active Multi-Layer Engine
 ============================================================
 3-layer pipeline replacing the old 8-state flat classifier:
 
@@ -96,25 +96,22 @@ REGIME_WEIGHTS: Dict[str, Dict[str, float]] = {
 
 # Minimum composite score (strategy*0.40 + L2ctx*0.30 + L1fit*0.30 - penalty) to generate a signal
 REGIME_THRESHOLDS: Dict[str, int] = {
-    "Trend":      60,
+    # [V9.3 ACTIVE] Small relaxation only after all hard quality gates pass.
+    # This increases usable setups without turning the score into a loose vote.
+    "Trend":      57,
     "Range":      65,
-    "Breakout":   58,
+    "Breakout":   56,
     "Reversal":   65,
     "Exhaustion": 68,
 }
 
-# [V9.2 QUALITY] Only regimes with proven positive expectancy generate entries.
-# Clean-run evidence (protection layer off, trades ran purely to T1/T2/SL,
-# 183 trades, 4 symbols, Jan–Jul 2026 realistic 3m intrabar):
-#   Trend      102 trades  68.6% WR (above the 66.7% random baseline at this
-#              geometry, and 79-82% when the 4H macro is decisive — see the
-#              NEUTRAL-L1 veto in _generate_signal)          → tradeable
-#   Reversal    78 trades  55.1% WR  -$1,684 (WELL below baseline) → BLOCKED
-#   Exhaustion   3 trades  (sample too small to trust)       → BLOCKED
-#   Range/Breakout: blocked since V9.1 (42.1%/47.5% WR over 1,957 trades).
-# Blocked regimes are still CLASSIFIED (regime display, state-drift checks) —
-# they just never open a position.
-_TRADEABLE_REGIMES: frozenset = frozenset({"Trend"})
+# [V9.3 ACTIVE] Entry regime policy.
+# Trend remains the primary high-quality engine. Breakout is admitted with its
+# own score threshold because Trend-only operation caused multi-day silence
+# during market compression. Historically weak Range/Reversal/Exhaustion
+# engines remain classified for diagnostics and position-state drift checks,
+# but cannot open new positions.
+_TRADEABLE_REGIMES: frozenset = frozenset({"Trend", "Breakout"})
 
 # Regimes where entries FADE the macro trend (want opposite of L1 direction)
 _COUNTER_REGIMES: frozenset = frozenset({"Reversal", "Exhaustion"})
@@ -1015,7 +1012,10 @@ class TradingBot:
                  sizing_leverage: int = 10,
                  state_file: Optional[str] = None,
                  execution_callback: Optional[Callable] = None,
-                 startup_warmup_minutes: int = 45,
+                 # 45 minutes could repeatedly suppress entries after Railway
+                 # redeploys/restarts. 15 minutes is enough to stabilize live feeds
+                 # because indicator history is already loaded before on_tick.
+                 startup_warmup_minutes: int = 15,
                  enable_swing_reversal: bool = True,
                  enable_mean_reversion: bool = False,
                  expectancy_engine: Optional["ExpectancyEngine"] = None,
@@ -1565,27 +1565,35 @@ class TradingBot:
 
     # [FAKE-FILTER] Minimum price-to-EMA20 distance (in ATR) for a trend-state
     # entry. Below this, price is in the chop-zone with near-zero edge. Swept.
-    MIN_EMA_DIST_ATR: float = 0.6
+    # [V9.3 ACTIVE] 0.60 ATR rejected many valid pullback/reclaim entries
+    # near EMA20. Keep a small anti-chop buffer instead of requiring extension.
+    MIN_EMA_DIST_ATR: float = 0.25
 
     # ── [V9.1 QUALITY GATES] Backtest-proven filters (2,972 trades) ──────────
     # Trend entries with 15m ADX already elevated are LATE (chasing an
     # extended leg): ADX≤22 quartile ran 68.9% WR vs 47-49% above 30.
     # Enter the pullback/quiet phase of a 4H trend, not the climax.
-    MAX_15M_ADX_TREND: float = 22.0
+    # [V9.3 ACTIVE] RegimeClassifier labels Trend at ADX >20, therefore
+    # the old <=22 gate left an impractically narrow 20-22 entry window.
+    # <=32 still avoids late climax legs but permits normal developing trends.
+    MAX_15M_ADX_TREND: float = 32.0
 
     # Trend-direction RSI chase guard: LONG into overbought / SHORT into
     # oversold on the 15m entry bar = buying the top of the leg.
-    TREND_RSI_CHASE_HI: float = 65.0
-    TREND_RSI_CHASE_LO: float = 35.0
+    TREND_RSI_CHASE_HI: float = 70.0
+    TREND_RSI_CHASE_LO: float = 30.0
 
     # Asia session (00-05 UTC) ran 37-45% WR across every regime — thin
     # liquidity whipsaw. Hard-gated rather than left to the session-tag
     # learner (which needs 8+ samples per tag to react).
-    BLOCKED_ENTRY_HOURS_UTC: frozenset = frozenset({0, 1, 2, 3, 4, 5})
+    # [V9.3 ACTIVE] Do not globally block Asia hours: this class is used
+    # by both crypto and commodities, and crypto remains liquid 24/7. Commodity
+    # market-hours protection stays in session_engine via session_gate_open.
+    BLOCKED_ENTRY_HOURS_UTC: frozenset = frozenset()
 
     # [CLIMAX-VETO] Skip trend entries on bars with range > this × ATR
     # (vertical blow-off spikes). 99 = disabled.
-    CLIMAX_BAR_ATR: float = 2.0
+    CLIMAX_BAR_ATR: float = 2.5
 
     # [1H CHOP-FILTER] Minimum Kaufman efficiency ratio (0=pure noise,
     # 1=perfectly smooth trend) the 1H timeframe itself must show. A choppy
@@ -1593,7 +1601,7 @@ class TradingBot:
     # how the EMA/RSI/momentum snapshot reads at this instant. MR states are
     # exempt (they deliberately trade mean-reversion in choppy/exhausted
     # markets). 0 = disabled.
-    MIN_1H_EFFICIENCY: float = 0.20
+    MIN_1H_EFFICIENCY: float = 0.15
 
     # [DIAGNOSTIC TAGS] Rule-based thresholds for "what was off about this
     # entry" — deliberately simple/auditable (no ML), built entirely from
@@ -1776,26 +1784,41 @@ class TradingBot:
                     f"veto:climax-bar (range {_rng/_atr:.1f} > {self.CLIMAX_BAR_ATR} ATR)")
                 return None
 
-            _eff_1h = ind_1h.get("eff_ratio", 0.5)
-            if self.MIN_1H_EFFICIENCY > 0 and _eff_1h < self.MIN_1H_EFFICIENCY:
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_1h_chop"] += 1
-                self._scan_info[direction] = (
-                    f"veto:1h-chop (eff {_eff_1h:.2f} < {self.MIN_1H_EFFICIENCY})")
-                return None
+            # 1H efficiency confirms a Trend pullback. It must NOT veto a
+            # Breakout, which naturally begins from compression/chop before expansion.
+            if regime == "Trend":
+                _eff_1h = ind_1h.get("eff_ratio", 0.5)
+                if self.MIN_1H_EFFICIENCY > 0 and _eff_1h < self.MIN_1H_EFFICIENCY:
+                    self._filter_stats["checked"] += 1
+                    self._filter_stats["veto_1h_chop"] += 1
+                    self._scan_info[direction] = (
+                        f"veto:1h-chop (eff {_eff_1h:.2f} < {self.MIN_1H_EFFICIENCY})")
+                    return None
 
         # ── [V9.2 QUALITY] Macro-conviction veto ─────────────────────────────
         # A 15m "Trend" classification with a NEUTRAL 4H macro behind it is a
         # trend with no higher-timeframe fuel. Clean-run evidence: L1 score in
         # the neutral middle third → 44% WR (-$1,217); decisive L1 either
         # direction → 79-82% WR (+$945).
+        # [V9.3 ACTIVE] A broad NEUTRAL label covers L1 scores 40-59. The old
+        # hard veto rejected even 58/42, which already carries useful directional
+        # lean. Only reject a truly flat macro when 1H context is also weak;
+        # otherwise allow it with a bounded score penalty below.
+        _macro_soft_penalty = 0.0
         if regime == "Trend" and l1.get("level") == "NEUTRAL":
-            self._filter_stats["checked"] += 1
-            self._filter_stats["veto_macro"] += 1
-            self._scan_info[direction] = (
-                f"veto:neutral-macro (L1 {l1.get('score', 50):.0f} — 15m trend "
-                f"with no 4H trend behind it)")
-            return None
+            _l1_score = float(l1.get("score", 50.0))
+            _dir_edge = ((_l1_score - 50.0) if direction == "LONG"
+                         else (50.0 - _l1_score))
+            _l2_preview = (l2.get("bull_score", 50.0) if direction == "LONG"
+                           else l2.get("bear_score", 50.0))
+            if _dir_edge < 4.0 and _l2_preview < 60.0:
+                self._filter_stats["checked"] += 1
+                self._filter_stats["veto_macro"] += 1
+                self._scan_info[direction] = (
+                    f"veto:flat-macro (L1 {_l1_score:.0f}, edge {_dir_edge:.1f}, "
+                    f"L2 {_l2_preview:.0f})")
+                return None
+            _macro_soft_penalty = float(np.clip((8.0 - max(_dir_edge, 0.0)) * 0.75, 0.0, 6.0))
 
         # ── [V9.1 QUALITY] Trend pullback + RSI-chase vetoes ─────────────────
         # Enter the QUIET phase of a 4H trend (15m ADX still low = pullback),
@@ -1855,7 +1878,8 @@ class TradingBot:
             vol_ratio=_vol_ratio, adx=ind_15m.get("adx", 25.0), now=_now_ts,
         )
         _condition_penalty = (self.condition_engine.get_penalty(_current_tags)
-                              + self._active_strategy_penalty(_current_tags, _now_ts))
+                              + self._active_strategy_penalty(_current_tags, _now_ts)
+                              + _macro_soft_penalty)
 
         # ── Composite score ──────────────────────────────────────────────────
         total = best_score * 0.40 + l2_ctx * 0.30 + l1_fit * 0.30 - _condition_penalty
@@ -2913,6 +2937,14 @@ class TradingBot:
 
         self._check_daily_reset(bar_dt)
 
+        # [V9.3 RECOVERY] A persisted BLOCKED state should not strand the bot
+        # when its daily PnL is currently inside both limits (for example after
+        # a stale state-file restore or manual balance correction).
+        if (self.state == "BLOCKED"
+                and self.daily_loss_limit_pct < self.daily_pnl_pct < self.daily_profit_limit_pct):
+            self.state = "SCANNING"
+            self._log_event("Recovered stale BLOCKED state → SCANNING", level="warning")
+
         atr_4h = ind_4h.get("atr", 0)
         if atr_4h > 0:
             self.atr_history.append(atr_4h)
@@ -3160,6 +3192,16 @@ class TradingBot:
             "cooldown_until":     self.cooldown_until.isoformat() if self.cooldown_until else None,
             "warmup_remaining_m": warmup_remaining,
             "scan_info":          dict(self._scan_info),
+            "filter_stats":       dict(self._filter_stats),
+            "active_entry_config": {
+                "tradeable_regimes": sorted(_TRADEABLE_REGIMES),
+                "trend_threshold": REGIME_THRESHOLDS["Trend"],
+                "breakout_threshold": REGIME_THRESHOLDS["Breakout"],
+                "min_ema_dist_atr": self.MIN_EMA_DIST_ATR,
+                "max_15m_adx_trend": self.MAX_15M_ADX_TREND,
+                "min_1h_efficiency": self.MIN_1H_EFFICIENCY,
+                "blocked_hours_utc": sorted(self.BLOCKED_ENTRY_HOURS_UTC),
+            },
             "recent_log":         list(self._log[-20:]),
         }
 
