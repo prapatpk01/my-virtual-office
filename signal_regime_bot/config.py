@@ -88,14 +88,14 @@ class Config:
     # Same env var name the previous bot on this Railway service used.
     max_positions_env: int   = field(default_factory=lambda: _env_int("MAX_POSITIONS", 2))
 
-    # ── Timeframes (ENV, default per spec) ───────────────────────────────────
-    # tf_entry/TIMEFRAME_ENTRY = Entry Layer 3.1's quality pre-filter
-    # timeframe; the actual timing trigger (Layer 3.3) runs on tf_fast (15M).
-    tf_entry: str  = field(default_factory=lambda: os.environ.get("TIMEFRAME_ENTRY", "30m"))
+    # ── Timeframes ───────────────────────────────────────────────────────────
+    # Defaults are intentionally fixed in code; no Railway variables are needed.
+    # 4H = macro, 1H = bias, 15M = context/structure, 5M = actual execution.
+    tf_entry: str  = field(default_factory=lambda: os.environ.get("TIMEFRAME_ENTRY", "30m"))  # compatibility only
     tf_bias: str   = field(default_factory=lambda: os.environ.get("TIMEFRAME_BIAS", "1h"))
     tf_regime: str = field(default_factory=lambda: os.environ.get("TIMEFRAME_REGIME", "4h"))
-    tf_fast: str    = "15m"   # Bias secondary + Entry timeframe
-    tf_micro: str   = "5m"    # Bias tertiary timeframe
+    tf_fast: str    = "15m"   # context / structure timeframe
+    tf_micro: str   = "5m"    # actual entry + position-management timeframe
 
     # ── Hardcoded strategy constants (not exposed as ENV) ───────────────────
     market_type: str = "swap"
@@ -417,59 +417,68 @@ class Config:
     booster_score_to_bonus: float = 0.5        # early_bonus = min(early_score * this, max_bonus)
 
 
-    # ── DUALCORE Balanced V1.5 strategy parameters ──────────────────────────
-    # 4H macro + 1H bias + 15M dual entry. 5M is used for noise-resistant
-    # management, not as a mandatory entry-cross layer. The settings below are
-    # calibrated for a behavioural target of roughly 10–15 trades/month per
-    # active symbol; market conditions can produce fewer or more trades.
-    dual_hma_fast: int = 10
-    dual_hma_slow: int = 16
-    dual_min_adx: float = 11.0
-    dual_momentum_min_adx: float = 13.0
-    dual_strong_adx: float = 20.0
-    dual_max_chop: float = 62.0
-    dual_strong_chop: float = 52.0
+    # ── DUALCORE Balanced V1.6 — 5M EMA execution ───────────────────────────
+    # 4H macro + 1H bias + 15M context/structure + 5M EMA dual entry.
+    # EMA8/EMA13 is used instead of HMA on 5M to reduce whipsaw while keeping
+    # entries fast enough for a target of roughly 3–4 trades/day across seven
+    # active symbols when market conditions provide valid setups.
+    dual_entry_ema_fast: int = 8
+    dual_entry_ema_slow: int = 13
+    dual_entry_trend_ema: int = 20
+    dual_entry_filter_ema: int = 50
+    dual_context_ema_fast: int = 20
+    dual_context_ema_slow: int = 50
+    # Legacy names retained only for compatibility with old chart/config code.
+    dual_hma_fast: int = 8
+    dual_hma_slow: int = 13
+
+    dual_min_adx: float = 10.0
+    dual_momentum_min_adx: float = 11.0
+    dual_strong_adx: float = 18.0
+    dual_max_chop: float = 64.0
+    dual_strong_chop: float = 55.0
 
     entry_swing_left: int = 3
     entry_swing_right: int = 3
-    dual_pullback_zone_atr: float = 0.20
-    dual_pullback_depth_atr: float = 0.35
-    dual_pullback_window_bars: int = 3
-    dual_pullback_max_extension_atr: float = 0.75
-    dual_pullback_threshold: float = 64.0
-    dual_same_bar_pullback_threshold: float = 70.0
-    dual_pullback_min_body_atr: float = 0.15
-    dual_pullback_close_quality: float = 0.62
-    dual_pullback_min_room_r: float = 1.05
+    dual_pullback_zone_atr: float = 0.12
+    dual_pullback_depth_atr: float = 0.20
+    dual_pullback_window_bars: int = 4
+    dual_pullback_max_extension_atr: float = 0.95
+    dual_pullback_threshold: float = 60.0
+    dual_same_bar_pullback_threshold: float = 66.0
+    dual_pullback_min_body_atr: float = 0.12
+    dual_pullback_close_quality: float = 0.58
+    dual_pullback_min_room_r: float = 1.00
 
-    dual_breakout_lookback: int = 4
-    dual_momentum_threshold: float = 70.0
-    dual_strong_breakout_threshold: float = 66.0
-    dual_momentum_min_body_atr: float = 0.18
-    dual_momentum_close_quality: float = 0.68
+    dual_breakout_lookback: int = 5
+    dual_momentum_expiry_bars: int = 2
+    dual_momentum_threshold: float = 64.0
+    dual_strong_breakout_threshold: float = 62.0
+    dual_momentum_min_body_atr: float = 0.15
+    dual_momentum_close_quality: float = 0.65
     dual_momentum_volume_ratio: float = 1.05
-    dual_momentum_max_extension_atr: float = 0.90
+    dual_momentum_max_extension_atr: float = 1.00
     dual_strong_momentum_extension_atr: float = 1.10
-    dual_momentum_min_room_r: float = 1.15
+    dual_momentum_min_room_r: float = 1.10
 
-    dual_min_stop_atr: float = 0.55
-    dual_max_stop_atr: float = 1.50
-    dual_stop_buffer_atr: float = 0.10
+    dual_min_stop_atr: float = 0.45
+    dual_max_stop_atr: float = 1.40
+    dual_stop_buffer_atr: float = 0.08
     dual_target_buffer_atr: float = 0.08
     dual_pullback_tp2_r: float = 2.0
     dual_momentum_tp2_r: float = 2.0
-    minimum_actual_rr: float = 1.20
+    minimum_actual_rr: float = 1.10
 
-    bias_min_directional_edge: float = 8.0
-    bias_1h_min_bull: float = 55.0
-    bias_15m_min_bull: float = 52.0
+    bias_min_directional_edge: float = 6.0
+    bias_1h_min_bull: float = 52.0
+    bias_15m_min_bull: float = 48.0
 
     expected_slippage_pct: float = 0.0005
     be_lock_r: float = 0.08
     exit_weak_signals: int = 2
 
     # Loop timing
-    poll_interval_sec: int = 30    # how often main.py checks for a newly-closed 30m bar
+    poll_interval_sec: int = 30    # polls frequently; entries evaluate once per newly-closed 5M bar
     reconcile_interval_sec: int = 60   # how often to sweep OKX for untracked positions and adopt them
     reconcile_settle_grace_sec: int = 90   # after a close, don't re-adopt this symbol until OKX settles to zero
     status_log_interval_sec: int = 300  # per-symbol regime/bias/entry status log cadence
@@ -504,16 +513,16 @@ class Config:
     bias_tf_floor_5m: float = 40.0          # 5M Bull Bias floor (loosest — lowest weight, noisiest TF)
     # weight profile + combined-score pass bar, by Regime tier
     bias_w1h_confirmed: float = 0.50        # STRONG_BULL/BEAR_TREND ("Confirmed Trend") — 1H-heavy for continuity
-    bias_w15m_confirmed: float = 0.35
-    bias_w5m_confirmed: float = 0.15
+    bias_w15m_confirmed: float = 0.40
+    bias_w5m_confirmed: float = 0.10
     bias_threshold_confirmed: float = 65.0
-    bias_w1h_early: float = 0.35            # EARLY_BULL/BEAR_TREND ("Early Trend") — faster-reacting TFs weighted up
-    bias_w15m_early: float = 0.45
-    bias_w5m_early: float = 0.20
+    bias_w1h_early: float = 0.40            # EARLY_BULL/BEAR_TREND ("Early Trend") — faster-reacting TFs weighted up
+    bias_w15m_early: float = 0.50
+    bias_w5m_early: float = 0.10
     bias_threshold_early: float = 60.0
     bias_w1h_default: float = 0.45          # fallback weight profile (regime not a recognized trend tier)
-    bias_w15m_default: float = 0.40
-    bias_w5m_default: float = 0.15
+    bias_w15m_default: float = 0.45
+    bias_w5m_default: float = 0.10
     bias_threshold_default: float = 60.0
 
     def __post_init__(self):

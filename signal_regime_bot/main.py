@@ -1,18 +1,10 @@
-"""
-Signal Regime Bias Strategy — live bot entry point.
+"""DUALCORE live bot entry point.
 
-Loop: every `poll_interval_sec`, for each symbol —
-  1. fetch 5m/15m/1h/4h closed bars (skip symbol if any TF has < min_bars)
-  2. if a position is open: check SL/TP1/TP2 against the live ticker every
-     tick; run the HMA10/HMA16 early-exit check once per newly-closed 15m bar
-  3. else: once per newly-closed 15m bar, evaluate SignalEngine (Regime 4H+1H
-     -> Bias 1H+15M+5M -> Entry: 3.1 15M 5-category pre-filter -> 3.2 15M/5M
-     acceleration wait-rounds -> 3.3 15M HMA10/16 cross) and open a position
-     if the pipeline clears and risk manager allows a new entry (no cooldown,
-     no daily limit breach)
-
-Every branch that mutates state is wrapped so one symbol's exception can
-never kill the loop or leave an order half-placed with silent failure.
+Loop: fetch closed 5M/15M/1H/4H bars, manage open positions every poll, and
+for flat symbols evaluate 4H Regime -> 1H/15M Bias -> 15M Context -> 5M EMA
+Dual Entry (Fast Pullback + Momentum Breakout/Retest).  Entry logic runs once
+per newly-closed 5M candle.  Position management keeps the slower EMA10/EMA20
+5M reversal exit to avoid closing from the faster EMA8/EMA13 entry pair alone.
 """
 from __future__ import annotations
 
@@ -148,7 +140,7 @@ class Bot:
                 f"🤖 *Bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT\n"
-                f"Architecture: 4H Regime → 1H Bias → 15M Dual Entry "
+                f"Architecture: 4H Regime → 1H Bias → 15M Context → 5M EMA Dual Entry "
                 f"(Fast Pullback + Momentum Breakout/Retest)"
             )
 
@@ -298,9 +290,9 @@ class Bot:
         return event
 
     async def _look_for_entry(self, symbol: str, df_15m, df_5m, sig):
-        # Entry engines operate on completed 15M bars. Repeated 30-second polls
-        # of the same candle must never submit the same setup twice.
-        bar_ts = df_15m.index[-1] if (df_15m is not None and len(df_15m)) else None
+        # Actual execution runs once per completed 5M candle. Repeated polls of
+        # the same candle must never submit the same setup twice.
+        bar_ts = df_5m.index[-1] if (df_5m is not None and len(df_5m)) else None
         if bar_ts is None or self._last_entry_bar.get(symbol) == bar_ts:
             return   # already evaluated this closed bar
         self._last_entry_bar[symbol] = bar_ts
@@ -322,16 +314,19 @@ class Bot:
             return
 
         risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
-        # Chart the actual 15M execution frame with HMA10/HMA16.
+        # Chart the actual 5M execution frame with EMA8/EMA13.
         chart_path = build_entry_chart(
-            symbol, df_15m, sig.direction, sig.price,
-            *self._preview_sl_tp(sig, df_15m),
-            ema_fast_len=self.cfg.dual_hma_fast, ema_slow_len=self.cfg.dual_hma_slow,
-            tf_label="15M",
+            symbol, df_5m, sig.direction, sig.price,
+            *self._preview_sl_tp(sig, df_5m),
+            ema_fast_len=self.cfg.dual_entry_ema_fast,
+            ema_slow_len=self.cfg.dual_entry_ema_slow,
+            tf_label="5M",
         )
 
+        # PositionManager's first frame is the execution frame used for fallback
+        # ATR/swing calculations. EntryResult normally supplies the structure SL.
         pos = await self.positions.open_position(
-            symbol, sig.direction, sig.price, df_15m, sig.regime, sig.bias,
+            symbol, sig.direction, sig.price, df_5m, sig.regime, sig.bias,
             sig.entry_score, df_5m=df_5m, entry_result=sig.entry)
         if pos is None:
             return
@@ -371,17 +366,18 @@ class Bot:
             )
         elif sig.blocked_layer == "ENTRY" and sig.entry is not None:
             e = sig.entry
+            edge_text = f"{e.macd_hist:.1f}" if getattr(e, "score_evaluated", False) else "N/A"
             logger.info(
-                "[%s] regime=%s bias=%s NO ENTRY HMA=%.6f/%.6f edge=%.1f — %s",
+                "[%s] regime=%s bias=%s NO ENTRY EMA8/13=%.6f/%.6f edge=%s — %s",
                 symbol, r.label, sig.bias.direction if sig.bias else "-",
-                e.ema_fast, e.ema_slow, e.macd_hist, e.reason,
+                e.ema_fast, e.ema_slow, edge_text, e.reason,
             )
         elif sig.blocked_layer == "MARKET":
             logger.info("[%s] MARKET CLOSED — %s", symbol, sig.reason)
         else:
             logger.debug("[%s] no trade: %s", symbol, sig.reason)
 
-    def _preview_sl_tp(self, sig, df_15m) -> tuple[float, float, float]:
+    def _preview_sl_tp(self, sig, execution_df) -> tuple[float, float, float]:
         """Use the Entry Engine's structure plan when available."""
         import indicators as ind
         from position_manager import calc_stop_loss, calc_take_profits
@@ -394,9 +390,9 @@ class Bot:
                 sig.price + c.tp2_r * one_r if sig.direction == LONG else sig.price - c.tp2_r * one_r
             )
             return sl, tp1, tp2
-        atr_val = float(ind.atr(df_15m, c.sl_atr_period).iloc[-1])
+        atr_val = float(ind.atr(execution_df, c.sl_atr_period).iloc[-1])
         swing_high, swing_low = ind.recent_swing_levels(
-            df_15m["high"], df_15m["low"], c.swing_lookback_left, c.swing_lookback_right)
+            execution_df["high"], execution_df["low"], c.swing_lookback_left, c.swing_lookback_right)
         side = "long" if sig.direction == LONG else "short"
         sl = calc_stop_loss(side, sig.price, atr_val, c.sl_atr_mult, swing_high, swing_low,
                            c.sl_min_pct, c.sl_max_pct, c.sl_tighten_mult)
@@ -577,7 +573,7 @@ class Bot:
                     bias_str = "`—`"
                 entry_str = (
                     f"`{sig.entry.setup_type or 'WAIT'} score={_entry_score_text(sig.entry)} "
-                    f"HMA={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
+                    f"EMA8/13={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
                     if sig.entry is not None else "`-`"
                 )
                 lines.append(
@@ -722,7 +718,7 @@ class Bot:
                 bias_label = "—"
             entry_label = (
                 f"{sig.entry.setup_type or 'WAIT'} score={_entry_score_text(sig.entry)} "
-                f"HMA={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
+                f"EMA8/13={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
                 if sig.entry is not None else "-"
             )
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""

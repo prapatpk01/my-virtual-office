@@ -1,0 +1,43 @@
+DUALCORE V1.6 — FAST 5M EMA ENTRY
+
+Default architecture (no extra Railway variables required):
+- 4H: Macro Regime / strong-conflict filter
+- 1H: Directional Bias
+- 15M: Trend context, market structure, support/resistance
+- 5M: Actual entry trigger and entry score
+
+Entry timing:
+- EMA8 / EMA13 replaces HMA10 / HMA16 on 5M.
+- EMA20 is the local trend reference.
+- EMA50 is the location / anti-countertrend filter.
+- Position early exit remains slower EMA10 / EMA20 for noise resistance.
+
+Default entry values:
+- Pullback score: 60
+- Same-bar pullback: 66
+- Momentum retest: 64
+- Strong direct breakout: 62
+- Pullback setup window: 4 closed 5M bars
+- Momentum retest expiry: 2 closed 5M bars
+- 5M ADX minimum: 10
+- 5M maximum CHOP: 64
+- Pullback extension: 0.95 ATR
+- Momentum extension: 1.00 ATR
+- Pullback room: 1.00R
+- Momentum room: 1.10R
+- Minimum actual R:R: 1.10R
+- Stop range: 0.45–1.40 ATR
+
+Risk/portfolio rules preserved:
+- Risk per trade: 5% of balance (subject to regime size reduction)
+- Maximum total positions: 2
+- Maximum positions per symbol: 1
+
+Other corrections:
+- 5M no longer hard-blocks the HTF bias during a normal pullback.
+- Status and logs show EMA8/13 and edge=N/A before a candidate is scored.
+- Duplicate detection now keys off the newly closed 5M candle.
+- Pullback/breakout setup age uses timestamps, so rolling candle windows and
+  Railway restarts do not freeze setup age at zero.
+- Opposing-room checks use 15M/1H/4H structure; tiny 5M pivots do not reject
+  otherwise valid fast entries.

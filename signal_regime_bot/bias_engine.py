@@ -177,10 +177,10 @@ class BiasEngine:
         strong = regime_label in (STRONG_BULL, STRONG_BEAR)
         threshold = max(60.0 if strong else 58.0, legacy_threshold - 5.0)
 
-        # 5M is a timing modifier, not a hard direction gate.  It only blocks if
-        # it is very strongly opposite; this avoids missing clean 15M pullbacks.
-        five_min_strong_bear = s5.bear_score - s5.bull_score >= 25
-        five_min_strong_bull = s5.bull_score - s5.bear_score >= 25
+        # 5M is now the execution timeframe.  It must NOT hard-block the HTF
+        # bias during a normal pullback; the 5M Entry Engine waits for its own
+        # EMA reclaim / structure trigger before opening.  It remains a small
+        # weighted modifier in the combined score only.
 
         long_ok = (
             bull_regime
@@ -188,8 +188,7 @@ class BiasEngine:
             and edge >= getattr(c, "bias_min_directional_edge", 8.0)
             and s1.bull_score >= getattr(c, "bias_1h_min_bull", 55.0)
             and s1.bull_score - s1.bear_score >= 5.0
-            and s15.bull_score >= getattr(c, "bias_15m_min_bull", 52.0)
-            and not five_min_strong_bear
+            and s15.bull_score >= getattr(c, "bias_15m_min_bull", 48.0)
         )
         short_ok = (
             bear_regime
@@ -197,8 +196,7 @@ class BiasEngine:
             and edge <= -getattr(c, "bias_min_directional_edge", 8.0)
             and s1.bear_score >= getattr(c, "bias_1h_min_bull", 55.0)
             and s1.bear_score - s1.bull_score >= 5.0
-            and s15.bear_score >= getattr(c, "bias_15m_min_bull", 52.0)
-            and not five_min_strong_bull
+            and s15.bear_score >= getattr(c, "bias_15m_min_bull", 48.0)
         )
 
         detail = (

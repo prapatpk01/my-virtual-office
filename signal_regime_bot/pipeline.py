@@ -47,7 +47,12 @@ class Pipeline:
         symbol: str = "",
     ) -> PipelineResult:
         has_15m = df_15m is not None and len(df_15m) > 0
-        default_price = float(df_15m["close"].iloc[-1]) if has_15m else 0.0
+        has_5m = df_5m is not None and len(df_5m) > 0
+        default_price = (
+            float(df_5m["close"].iloc[-1]) if has_5m
+            else float(df_15m["close"].iloc[-1]) if has_15m
+            else 0.0
+        )
 
         regime = self.regime_engine.analyze(df_4h, df_1h)
         base = dict(regime=regime, size_multiplier=regime.size_multiplier)
@@ -57,10 +62,12 @@ class Pipeline:
         c = self.cfg
         if (
             c.commodity_weekend_block_enabled
-            and has_15m
+            and (has_5m or has_15m)
             and any(k in symbol.upper() for k in c.commodity_symbol_keywords)
         ):
-            bar_close = df_15m.index[-1] + pd.Timedelta(c.tf_fast)
+            entry_frame = df_5m if has_5m else df_15m
+            entry_tf = c.tf_micro if has_5m else c.tf_fast
+            bar_close = entry_frame.index[-1] + pd.Timedelta(entry_tf)
             weekday, hour = bar_close.weekday(), bar_close.hour
             halted = (
                 (weekday == 4 and hour >= c.commodity_halt_hour_utc)
