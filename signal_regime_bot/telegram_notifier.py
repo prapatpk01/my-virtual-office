@@ -17,9 +17,16 @@ API = "https://api.telegram.org/bot{token}/{method}"
 
 
 class TelegramNotifier:
+    # Prevent more than one long-poll request for the same token inside a
+    # single Python process. This does not replace the Railway requirement
+    # that only one replica/service may poll a Telegram bot token.
+    _poll_locks: dict[str, asyncio.Lock] = {}
+
     def __init__(self, token: str, chat_id: str):
         self.token = token
         self.chat_id = chat_id
+        self._conflict_count = 0
+        self._conflict_backoff_until = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -82,32 +89,78 @@ class TelegramNotifier:
         return await self._send_message(text)
 
     async def get_updates(self, offset: int, timeout: int = 25) -> list:
-        """
-        Long-poll Telegram getUpdates for incoming commands. Returns the raw
-        update list ([] on error/disabled). Caller tracks the offset.
+        """Long-poll Telegram for incoming commands.
+
+        The method is deliberately non-fatal: command polling failures must
+        never stop the trading loop. A per-token lock prevents duplicate
+        getUpdates calls inside one process. Telegram HTTP 409 responses are
+        backed off exponentially so deployment overlap does not create a hot
+        retry loop.
         """
         if not self.enabled:
             await asyncio.sleep(timeout)
             return []
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if now < self._conflict_backoff_until:
+            await asyncio.sleep(min(timeout, self._conflict_backoff_until - now))
+            return []
+
+        poll_lock = self._poll_locks.setdefault(self.token, asyncio.Lock())
         url = API.format(token=self.token, method="getUpdates")
-        params = {"offset": offset, "timeout": timeout, "allowed_updates": '["message"]'}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params,
-                                       timeout=aiohttp.ClientTimeout(total=timeout + 15)) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        logger.warning("[TG] getUpdates %s: %s", r.status, body[:200])
-                        await asyncio.sleep(3)
-                        return []
-                    data = await r.json()
-                    return data.get("result", []) if data.get("ok") else []
-        except asyncio.TimeoutError:
-            return []
-        except Exception as e:
-            logger.warning("[TG] getUpdates failed: %s", e)
-            await asyncio.sleep(3)
-            return []
+        params = {
+            "offset": offset,
+            "timeout": timeout,
+            "allowed_updates": '["message"]',
+        }
+
+        async with poll_lock:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=timeout + 15),
+                    ) as r:
+                        if r.status == 409:
+                            body = await r.text()
+                            self._conflict_count += 1
+                            backoff = min(300, 30 * (2 ** (self._conflict_count - 1)))
+                            self._conflict_backoff_until = loop.time() + backoff
+                            logger.warning(
+                                "[TG] getUpdates 409 conflict: another process/replica "
+                                "is polling this bot token. Commands paused for %ss; "
+                                "trading remains active. Detail: %s",
+                                backoff,
+                                body[:200],
+                            )
+                            return []
+
+                        if r.status != 200:
+                            body = await r.text()
+                            logger.warning("[TG] getUpdates %s: %s", r.status, body[:200])
+                            await asyncio.sleep(3)
+                            return []
+
+                        data = await r.json()
+                        if not data.get("ok"):
+                            logger.warning("[TG] getUpdates returned ok=false: %s", str(data)[:200])
+                            return []
+
+                        self._conflict_count = 0
+                        self._conflict_backoff_until = 0.0
+                        result = data.get("result", [])
+                        return result if isinstance(result, list) else []
+
+            except asyncio.TimeoutError:
+                return []
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("[TG] getUpdates failed: %s", e)
+                await asyncio.sleep(3)
+                return []
 
     # ── Formatted alerts ──────────────────────────────────────────────────────
 
