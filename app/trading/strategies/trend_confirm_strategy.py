@@ -1,5 +1,15 @@
 """
-3-Layer Trend-Confirmed Multi-TF Strategy.
+Trend-Confirmed Multi-TF Strategy — HTF Context V2.
+
+V2 keeps the three 5M entry engines (EMA_CROSS, BREAKOUT_RETEST and
+STRUCTURE_RETEST) and adds a production context architecture around them:
+  Layer 0 — OHLCV/timestamp data-quality validation.
+  Layer 1 — 30M confirmed trend direction.
+  Layer 1B — 4H major + 1H minor swing structure.
+  Layer 2 — 15M/1H quality score and explicit 15M regime router.
+  Layer 2B — 4H/1H supply-demand zones with freshness, touch count,
+             invalidation, role reversal and opposing-zone room in R.
+  Layer 3 — 5M three-engine candidate router and candidate-specific stops.
 
 Layer 1 — Trend direction (TF30m):
   Determines whether the market is currently in an uptrend or a
@@ -39,15 +49,14 @@ Layer 2 — Trade CONTEXT: trend quality (2a) + location/structure (2b).
     `location_threshold_penalty` (+4). Only evaluated once 2a passes and the
     5m EMA50 stop reference (l3) is available.
 
-Layer 3 — Entry TIMING (TF5m), reached only after Layer1 + Layer2 both pass:
-  LONG (only after Layer1+Layer2 confirm UP):
-    1. EMA10 crosses above EMA20 (5m)
-    2. price (close) is above EMA20 (5m) — the same line the cross + exit use
-    3. price is within `max_dist_atr_mult` (default 1.5) x ATR(14,5m) of EMA50
-  SHORT (only after Layer1+Layer2 confirm DOWN): the mirror —
-    1. EMA10 crosses below EMA20 (5m)
-    2. price below EMA20 (5m)
-    3. price within 1.5 x ATR of EMA50
+Layer 3 — Multi-entry router (TF5m), reached only after Layer1 + Layer2 pass:
+  A) EMA_CROSS — original EMA10/20 cross timing.
+  B) BREAKOUT_RETEST — a qualified breakout (body/close/volume) must return to
+     the broken level and reclaim it; direct breakout chasing is not allowed.
+  C) STRUCTURE_RETEST — confirmed HH/HL (long) or LH/LL (short), followed by a
+     retest of the latest HL/LH and reclaim, engulf/pin, or micro-BOS.
+  Every engine still requires EMA alignment, the EMA50 chase guard, HTF
+  location/room validation, and a candidate-specific quality threshold.
   Early-trend window: the 5m EMA10/20 cross is faster than Layer 1's 30m
   confirmation, so the cross that starts a move often fires a bar or two
   BEFORE the trend confirms. When Layer 1's trend JUST confirmed (within
@@ -155,6 +164,31 @@ class TrendConfirmStrategy(BaseStrategy):
                                     #   already open (quality/location often clear 1-2 bars AFTER the cross,
                                     #   which silently wasted almost every signal)
         max_dist_atr_mult: float = 1.8,  # max distance from the chase EMA in ATR(5m)
+        # Layer 3 Entry Router — three independent triggers. Breakout uses
+        # retest-only execution (no direct chasing) and structure entry requires
+        # a confirmed HH/HL or LH/LL sequence plus a reclaim / micro-BOS trigger.
+        use_ema_cross_entry: bool = True,
+        use_breakout_retest_entry: bool = True,
+        use_structure_retest_entry: bool = True,
+        entry_trigger_valid_bars: int = 2,
+        breakout_lookback: int = 6,
+        breakout_arm_bars: int = 4,
+        breakout_buffer_atr: float = 0.05,
+        breakout_retest_tolerance_atr: float = 0.20,
+        breakout_invalidation_atr: float = 0.25,
+        breakout_min_body_atr: float = 0.20,
+        breakout_min_close_quality: float = 0.65,
+        breakout_min_volume_ratio: float = 1.10,
+        breakout_entry_min_quality: float = 72.0,
+        structure_retest_window_bars: int = 5,
+        structure_level_max_age_bars: int = 40,
+        structure_retest_tolerance_atr: float = 0.25,
+        structure_invalidation_atr: float = 0.30,
+        structure_micro_bos_lookback: int = 2,
+        structure_entry_min_quality: float = 68.0,
+        entry_stop_buffer_atr: float = 0.10,
+        entry_min_stop_atr: float = 0.50,
+        entry_max_stop_atr: float = 1.50,
         # Position sizing (emitted in the signal so bot.py sizes live orders the
         # same way the paper account does): margin = margin_pct of balance,
         # notional = margin x leverage. e.g. $100 x 5% = $5 x 20 = $100 notional.
@@ -171,6 +205,44 @@ class TrendConfirmStrategy(BaseStrategy):
         preferred_structure_room_r: float = 0.75,  # below this (but >= min) just penalizes the quality gate
         location_threshold_penalty: float = 4.0,
         reject_midrange_when_choppy: bool = True,
+        # Production data / HTF context gates
+        use_data_quality_gate: bool = True,
+        max_recent_gap_mult: float = 20.0,
+        require_4h_context: bool = True,
+        min_4h_context_bars: int = 50,
+        use_htf_macro_filter: bool = True,
+        htf_transition_threshold_penalty: float = 3.0,
+        htf_alignment_edge_bonus: float = 3.0,
+        # 4H/1H supply-demand engine. Zones are detected from a compact base
+        # followed by an ATR-qualified departure, then tracked for touches,
+        # invalidation, freshness and support/resistance role reversal.
+        use_supply_demand_zones: bool = True,
+        sd_scan_lookback_bars: int = 180,
+        sd_base_max_bars: int = 4,
+        sd_base_max_range_atr: float = 1.00,
+        sd_base_max_body_atr: float = 0.45,
+        sd_departure_bars: int = 3,
+        sd_min_departure_atr: float = 1.20,
+        sd_break_buffer_atr: float = 0.10,
+        sd_touch_tolerance_atr: float = 0.08,
+        sd_max_touches: int = 3,
+        sd_touch_freshness_decay: float = 0.25,
+        sd_min_freshness: float = 0.25,
+        sd_supportive_zone_distance_atr: float = 0.30,
+        sd_supportive_zone_edge_bonus: float = 3.0,
+        sd_role_reversal_edge_bonus: float = 1.5,
+        # Explicit 15M regime router. Strong trends receive a small threshold
+        # discount; transition regimes require more quality and do not permit
+        # the structure-retest engine until the structure is established.
+        use_regime_router: bool = True,
+        regime_strong_adx: float = 25.0,
+        regime_trend_adx: float = 17.0,
+        regime_strong_chop_max: float = 50.0,
+        regime_trend_chop_max: float = 61.8,
+        regime_min_ema_gap_atr: float = 0.35,
+        regime_strong_threshold_discount: float = 3.0,
+        regime_transition_threshold_penalty: float = 5.0,
+        allow_structure_entry_in_transition: bool = False,
         # Sideways / range veto (Layer 2) — hard-block entries when the 15m
         # context looks like a range, not a trend. Designed NOT to kill early
         # trends: it leans on EMA compression + high chop (which stay range-y
@@ -244,6 +316,28 @@ class TrendConfirmStrategy(BaseStrategy):
         self.sizing_mode = sizing_mode
         self.margin_pct = margin_pct
         self.max_dist_atr_mult = max_dist_atr_mult
+        self.use_ema_cross_entry = use_ema_cross_entry
+        self.use_breakout_retest_entry = use_breakout_retest_entry
+        self.use_structure_retest_entry = use_structure_retest_entry
+        self.entry_trigger_valid_bars = max(1, entry_trigger_valid_bars)
+        self.breakout_lookback = max(3, breakout_lookback)
+        self.breakout_arm_bars = max(1, breakout_arm_bars)
+        self.breakout_buffer_atr = breakout_buffer_atr
+        self.breakout_retest_tolerance_atr = breakout_retest_tolerance_atr
+        self.breakout_invalidation_atr = breakout_invalidation_atr
+        self.breakout_min_body_atr = breakout_min_body_atr
+        self.breakout_min_close_quality = breakout_min_close_quality
+        self.breakout_min_volume_ratio = breakout_min_volume_ratio
+        self.breakout_entry_min_quality = breakout_entry_min_quality
+        self.structure_retest_window_bars = max(2, structure_retest_window_bars)
+        self.structure_level_max_age_bars = max(5, structure_level_max_age_bars)
+        self.structure_retest_tolerance_atr = structure_retest_tolerance_atr
+        self.structure_invalidation_atr = structure_invalidation_atr
+        self.structure_micro_bos_lookback = max(1, structure_micro_bos_lookback)
+        self.structure_entry_min_quality = structure_entry_min_quality
+        self.entry_stop_buffer_atr = entry_stop_buffer_atr
+        self.entry_min_stop_atr = entry_min_stop_atr
+        self.entry_max_stop_atr = entry_max_stop_atr
 
         self.use_location_filter = use_location_filter
         self.structure_pivot_left = structure_pivot_left
@@ -255,6 +349,37 @@ class TrendConfirmStrategy(BaseStrategy):
         self.preferred_structure_room_r = preferred_structure_room_r
         self.location_threshold_penalty = location_threshold_penalty
         self.reject_midrange_when_choppy = reject_midrange_when_choppy
+        self.use_data_quality_gate = use_data_quality_gate
+        self.max_recent_gap_mult = max(2.0, max_recent_gap_mult)
+        self.require_4h_context = require_4h_context
+        self.min_4h_context_bars = max(20, min_4h_context_bars)
+        self.use_htf_macro_filter = use_htf_macro_filter
+        self.htf_transition_threshold_penalty = max(0.0, htf_transition_threshold_penalty)
+        self.htf_alignment_edge_bonus = max(0.0, htf_alignment_edge_bonus)
+        self.use_supply_demand_zones = use_supply_demand_zones
+        self.sd_scan_lookback_bars = max(30, sd_scan_lookback_bars)
+        self.sd_base_max_bars = max(1, sd_base_max_bars)
+        self.sd_base_max_range_atr = max(0.10, sd_base_max_range_atr)
+        self.sd_base_max_body_atr = max(0.05, sd_base_max_body_atr)
+        self.sd_departure_bars = max(1, sd_departure_bars)
+        self.sd_min_departure_atr = max(0.25, sd_min_departure_atr)
+        self.sd_break_buffer_atr = max(0.0, sd_break_buffer_atr)
+        self.sd_touch_tolerance_atr = max(0.0, sd_touch_tolerance_atr)
+        self.sd_max_touches = max(0, sd_max_touches)
+        self.sd_touch_freshness_decay = min(1.0, max(0.0, sd_touch_freshness_decay))
+        self.sd_min_freshness = min(1.0, max(0.0, sd_min_freshness))
+        self.sd_supportive_zone_distance_atr = max(0.0, sd_supportive_zone_distance_atr)
+        self.sd_supportive_zone_edge_bonus = max(0.0, sd_supportive_zone_edge_bonus)
+        self.sd_role_reversal_edge_bonus = max(0.0, sd_role_reversal_edge_bonus)
+        self.use_regime_router = use_regime_router
+        self.regime_strong_adx = max(1.0, regime_strong_adx)
+        self.regime_trend_adx = max(1.0, min(regime_trend_adx, self.regime_strong_adx))
+        self.regime_strong_chop_max = max(1.0, regime_strong_chop_max)
+        self.regime_trend_chop_max = max(self.regime_strong_chop_max, regime_trend_chop_max)
+        self.regime_min_ema_gap_atr = max(0.0, regime_min_ema_gap_atr)
+        self.regime_strong_threshold_discount = max(0.0, regime_strong_threshold_discount)
+        self.regime_transition_threshold_penalty = max(0.0, regime_transition_threshold_penalty)
+        self.allow_structure_entry_in_transition = allow_structure_entry_in_transition
         self.use_sideways_filter = use_sideways_filter
         self.sideways_ema_compression_atr = sideways_ema_compression_atr
         self.sideways_adx_max = sideways_adx_max
@@ -281,6 +406,11 @@ class TrendConfirmStrategy(BaseStrategy):
         self._last_bar_ts_5: Optional[int] = None     # Layer 3 (5m) new-bar tracking
         self._last_ema_cross_up_ts: Optional[int] = None
         self._last_ema_cross_down_ts: Optional[int] = None
+        self._last_breakout_trigger_up_ts: Optional[int] = None
+        self._last_breakout_trigger_down_ts: Optional[int] = None
+        self._last_structure_trigger_up_ts: Optional[int] = None
+        self._last_structure_trigger_down_ts: Optional[int] = None
+        self._last_entry_attempt_bar_ts: Optional[int] = None
         self._last_exit_bar_ts: Optional[int] = None  # owned by tick_open_position()
         self._latest_candles: list = []
         self._latest_5m: list = []       # 5m series cached for tick_open_position()
@@ -288,15 +418,47 @@ class TrendConfirmStrategy(BaseStrategy):
         self._entry_price: Optional[float] = None
         self._entry_sl: Optional[float] = None
         self._tp1_done: bool = False
+        # HTF zone cache: location is evaluated once per candidate, but the
+        # expensive zone scan only needs to rerun when a 1H/4H bar changes.
+        self._zone_cache_key: Optional[tuple] = None
+        self._zone_cache: list[dict] = []
 
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
         self._latest_candles = candles  # 15m base (Layer1 30m resample + Layer2 15m)
         mtf = mtf_candles or {}
+        if not candles:
+            return self._hold(current_price, "Data Quality: empty 15m candle series")
         bar_ts_15 = candles[-1].timestamp
         # Entry, SL/TP and exit all run on the finer 5m series (mtf_candles).
         c5m = mtf.get(self.entry_tf, []) or []
+        c1h = mtf.get("1h", []) or []
+        c4h = mtf.get("4h", []) or []
         self._latest_5m = c5m  # cached for tick_open_position()
         bar_ts_5 = c5m[-1].timestamp if c5m else None
+
+        # ── Layer 0: production data-quality gate ──────────────────────────
+        data_quality: dict = {}
+        if self.use_data_quality_gate:
+            for tf_name, series, expected_ms in (
+                ("15m", candles, 15 * 60_000),
+                (self.entry_tf, c5m, 5 * 60_000),
+                ("1h", c1h, 60 * 60_000),
+                ("4h", c4h, 4 * 60 * 60_000),
+            ):
+                quality = self._data_quality_context(series, expected_ms)
+                data_quality[tf_name] = quality
+                if not quality["valid"]:
+                    return self._hold(
+                        current_price,
+                        f"Data Quality FAIL {tf_name}: {quality['reason']}",
+                        metadata={"data_quality": data_quality},
+                    )
+        if self.require_4h_context and len(c4h) < self.min_4h_context_bars:
+            return self._hold(
+                current_price,
+                f"HTF Context: need {self.min_4h_context_bars}+ 4H bars, have {len(c4h)}",
+                metadata={"data_quality": data_quality},
+            )
 
         # ── Layer 1: Trend direction (30m) ─────────────────────────────────
         c30 = self._closed_30m_bars(candles)
@@ -335,7 +497,12 @@ class TrendConfirmStrategy(BaseStrategy):
                     self._last_ema_cross_down_ts = bar_ts_5
 
         def _bars_ago_5(ts: Optional[int]) -> Optional[int]:
-            return (bar_ts_5 - ts) // (5 * 60_000) if (ts is not None and bar_ts_5 is not None) else None
+            if ts is None or bar_ts_5 is None:
+                return None
+            delta = bar_ts_5 - ts
+            if delta < 0:
+                return None
+            return delta // (5 * 60_000)
 
         ema_up_ago   = _bars_ago_5(self._last_ema_cross_up_ts)
         ema_down_ago = _bars_ago_5(self._last_ema_cross_down_ts)
@@ -358,10 +525,9 @@ class TrendConfirmStrategy(BaseStrategy):
         lookback = max(self.cross_valid_bars, fb) if is_early_trend else self.cross_valid_bars
         ema_cross_up   = ema_up_ago is not None and ema_up_ago <= lookback
         ema_cross_down = ema_down_ago is not None and ema_down_ago <= lookback
-        l2_thr = self.layer2_threshold_early if is_early_trend else self.layer2_threshold
+        base_l2_thr = self.layer2_threshold_early if is_early_trend else self.layer2_threshold
 
         # ── Layer 2: Trend quality — weighted 15m (65%) + 1H (35%) score ───
-        c1h = mtf.get("1h", [])
         q15 = self._tf_quality(candles, trend) if trend else None
         q1h = self._tf_quality(c1h, trend) if trend else None
         l2_score = None
@@ -372,17 +538,25 @@ class TrendConfirmStrategy(BaseStrategy):
         close_price = c5m[-1].close if c5m else candles[-1].close
         dist_atr = (abs(close_price - l3["dist_ema_val"]) / l3["atr_val"]
                    if (l3 is not None and l3["atr_val"] > 0) else None)
-        c4h = mtf.get("4h", [])
 
-        # Location/structure defaults — overwritten in the Layer 2b block once
-        # trend + base quality pass and l3 is available (location is evaluated
-        # as part of Layer2, before Layer3 waits for the cross).
+        # Location/structure defaults. With multiple entry engines the actual
+        # room-in-R calculation must use each candidate's own stop distance, so
+        # the final location gate is evaluated after candidates are built.
         has_long_candidate = trend == "up" and ema_cross_up
         has_short_candidate = trend == "down" and ema_cross_down
         location = self._neutral_location_context()
-        location_adjusted_l2_thr = l2_thr
         sideways = (self._sideways_context(candles) if self.use_sideways_filter
                     else {"is_sideways": False, "signals": 0, "detail": {}})
+        regime = self._regime_context(candles, trend, q15, sideways)
+        l2_thr = base_l2_thr
+        if self.use_regime_router:
+            if regime["state"] == "STRONG_TREND":
+                l2_thr = max(0.0, l2_thr - self.regime_strong_threshold_discount)
+            elif regime["state"] == "TRANSITION":
+                l2_thr += self.regime_transition_threshold_penalty
+        location_adjusted_l2_thr = l2_thr
+        engine_status: dict = {}
+        candidate_reviews: list[dict] = []
 
         def dbg(entry_status: str) -> dict:
             return {"trend_confirm": {
@@ -395,11 +569,16 @@ class TrendConfirmStrategy(BaseStrategy):
                 "q1h_breakdown": q1h["breakdown"] if q1h else None,
                 "layer2_score": round(l2_score, 1) if l2_score is not None else None,
                 "layer2_threshold": location_adjusted_l2_thr,
-                "base_layer2_threshold": l2_thr,
+                "base_layer2_threshold": base_l2_thr,
+                "regime_adjusted_threshold": l2_thr,
+                "regime": regime,
                 "location": location,
                 "sideways": sideways,
+                "data_quality": data_quality,
                 "open_position": self._open_position,
                 "entry_status": entry_status,
+                "entry_engines": engine_status,
+                "candidate_reviews": candidate_reviews,
                 "fresh_trend_bars": fb, "trend_age_bars": trend_age, "is_early_trend": is_early_trend,
                 "ema_cross_up_ago": ema_up_ago, "ema_cross_down_ago": ema_down_ago,
                 "above_ema_ref": l3["above_ema_ref"] if l3 else None,
@@ -421,16 +600,17 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price, "Layer2: quality indicators still warming up (15m/1H)",
                               metadata=dbg("no_trend"))
 
+        if bar_ts_5 is not None and self._last_entry_attempt_bar_ts == bar_ts_5:
+            return self._hold(current_price,
+                "Layer3: an entry was already attempted on this 5m bar — waiting for the next closed bar",
+                metadata=dbg("entry_already_attempted"))
+
         pending_cross = has_long_candidate or has_short_candidate
         score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
                       f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
 
         def _spend_cross_if_early() -> bool:
-            """Early-trend fail is DEFINITIVE: a 5m EMA cross led the confirm
-            but Layer2 rejected the setup — spend that leading cross so the
-            same setup can't retry on a later bar (a fresh cross is required
-            for another attempt). No-op unless we're in the early window with
-            a pending cross."""
+            """An early EMA cross is consumed when Layer2 definitively rejects it."""
             if not (is_early_trend and pending_cross):
                 return False
             if trend == "up":
@@ -440,10 +620,6 @@ class TrendConfirmStrategy(BaseStrategy):
             return True
 
         # ── Layer 2 — sideways / range veto (hard) ────────────────────────
-        # A trend-follower bleeds in ranges, so an explicit range read gets a
-        # hard veto here regardless of the quality score (a range can still
-        # score >60 on a bounce). Tuned not to fire on fresh trends (see
-        # _sideways_context). Definitive for early-trend crosses.
         if sideways["is_sideways"]:
             spent = _spend_cross_if_early()
             d = sideways["detail"]
@@ -463,106 +639,242 @@ class TrendConfirmStrategy(BaseStrategy):
                 f"Layer2 {tag}trend quality {l2_score:.0f} <= {l2_thr:.0f} {score_note}",
                 metadata=dbg("early_quality_fail" if spent else "quality_fail"))
 
-        # ── Layer 2b: location & structure-room filter ────────────────────
-        # Location is part of Layer2: the trade CONTEXT (trend quality AND
-        # where we'd be entering vs HTF structure) must both be good before
-        # Layer3 even waits for the cross. Needs the 5m EMA50 stop reference
-        # for the room-R estimate, so it requires l3.
-        if self.use_location_filter and l3 is not None:
-            entry_risk = max(abs(close_price - l3["sl_ema_val"]), self.min_sl_pct * close_price)
-            location = self._location_context(
-                direction=trend, entry_price=close_price,
-                atr_15m=self._last_atr(candles, self.atr_period) or l3["atr_val"],
-                estimated_risk=entry_risk, candles_15m=candles,
-                candles_1h=c1h, candles_4h=c4h, q15=q15,
-            )
-            location_adjusted_l2_thr = l2_thr + (
-                self.location_threshold_penalty if location["penalize"] else 0.0)
-            if not location["valid"]:
-                return self._hold(current_price,
-                    f"Layer2 Location/Structure REJECT: {location['reason']}",
-                    metadata=dbg("location_reject"))
-            if l2_score <= location_adjusted_l2_thr:
-                spent = _spend_cross_if_early()
-                tag = "FAIL (early trend, cross spent): " if spent else ""
-                return self._hold(current_price,
-                    f"Layer2 {tag}quality {l2_score:.0f} <= {location_adjusted_l2_thr:.0f} "
-                    f"(location-adjusted) {score_note}",
-                    metadata=dbg("early_quality_fail" if spent else "location_quality_fail"))
-
-        # ── Layer 3: Entry timing (5m) — wait for the EMA10/20 cross ─────────
-        # Reached only after Layer1 (trend) AND Layer2 (quality + location)
-        # both pass. Layer3 just waits for the precise cross and confirms the
-        # entry candle sits on the right side of EMA20, not too far from EMA50.
+        # ── Layer 3: Multi-entry router (5m) ──────────────────────────────
         if l3 is None:
             return self._hold(current_price, "Layer3: 5m indicators still warming up", metadata=dbg("no_trend"))
 
         dist_ok = dist_atr is not None and dist_atr <= self.max_dist_atr_mult
         dist_disp = f"{dist_atr:.2f}" if dist_atr is not None else "n/a"
+        direction = "long" if trend == "up" else "short"
+        candidates: list[dict] = []
 
-        if trend == "up":
-            if not has_long_candidate:
-                return self._hold(current_price, f"Layer1+2 passed — waiting for EMA{self.ema_fast}↑EMA{self.ema_slow} cross (5m)"
-                                  + (f" (early trend, within {fb} bars)" if is_early_trend else f" (cross valid {self.cross_valid_bars} bars)"),
-                                  metadata=dbg("waiting_cross"))
-            # cross fired — consume it, then validate the two entry conditions
-            self._last_ema_cross_up_ts = None
-            if not l3["above_ema_ref"]:
-                return self._hold(current_price,
-                    f"Long setup FAILED: price not above EMA{self.entry_ema_ref} (5m) — waiting for fresh cross",
-                    metadata=dbg("ema_ref_fail"))
-            if not dist_ok:
-                return self._hold(current_price,
-                    f"Long setup FAILED: price {dist_disp}xATR from EMA{self.sl_ema_ref} "
-                    f"(max {self.max_dist_atr_mult}x, 5m) — waiting for pullback + fresh cross",
-                    metadata=dbg("cross_pass_distance_fail"))
-            sl, tp = self._compute_sl_tp("long", close_price, l3["sl_ema_val"])
-            self._open_position = "long"
-            self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
-            meta = dbg("entered")
-            meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio,
-                         "sizing_mode": self.sizing_mode, "margin_pct": self.margin_pct,
-                         "structure_room_r": location.get("structure_room_r"),
-                         "nearest_opposing_zone": location.get("nearest_opposing_zone")})
-            return Signal(
-                type=SignalType.BUY, symbol=self.symbol, price=current_price, amount=0.0,
-                reason=f"Uptrend confirmed (Layer1 30m) + quality {l2_score:.0f}"
-                       f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} + location OK (Layer2) + "
-                       f"EMA{self.ema_fast}↑EMA{self.ema_slow} {ema_up_ago}b ago, above EMA{self.entry_ema_ref}, "
-                       f"{dist_atr:.2f}xATR from EMA{self.sl_ema_ref} (Layer3 5m)",
-                confidence=1.0,
-                metadata=meta,
+        # Engine A — EMA cross. Preserve the original behavior, but consume a
+        # cross that reaches Layer3 and fails the current-bar side/distance gate.
+        ema_pending = ema_cross_up if direction == "long" else ema_cross_down
+        if not self.use_ema_cross_entry:
+            engine_status["EMA_CROSS"] = "disabled"
+        elif not ema_pending:
+            engine_status["EMA_CROSS"] = "waiting"
+        else:
+            side_ok = l3["above_ema_ref"] if direction == "long" else l3["below_ema_ref"]
+            if not side_ok:
+                if direction == "long":
+                    self._last_ema_cross_up_ts = None
+                else:
+                    self._last_ema_cross_down_ts = None
+                engine_status["EMA_CROSS"] = f"rejected: price wrong side of EMA{self.entry_ema_ref}"
+            elif not dist_ok:
+                if direction == "long":
+                    self._last_ema_cross_up_ts = None
+                else:
+                    self._last_ema_cross_down_ts = None
+                engine_status["EMA_CROSS"] = f"rejected: {dist_disp}xATR from chase EMA"
+            elif not ((direction == "long" and l3["sl_ema_val"] < close_price)
+                      or (direction == "short" and l3["sl_ema_val"] > close_price)):
+                # Do not mirror an EMA50 that is on the wrong side of entry.
+                # Mirroring hid a bad trend/location read and produced a stop
+                # that was no longer actually anchored to EMA50.
+                if direction == "long":
+                    self._last_ema_cross_up_ts = None
+                else:
+                    self._last_ema_cross_down_ts = None
+                engine_status["EMA_CROSS"] = f"rejected: EMA{self.sl_ema_ref} is on wrong side of entry"
+            else:
+                cross_ts = self._last_ema_cross_up_ts if direction == "long" else self._last_ema_cross_down_ts
+                candidates.append({
+                    "entry_type": "EMA_CROSS", "direction": direction,
+                    "trigger_ts": cross_ts, "raw_stop": l3["sl_ema_val"],
+                    "stop_mode": "ema", "base_edge": 68.0, "min_quality": l2_thr,
+                    "detail": {"cross_bars_ago": ema_up_ago if direction == "long" else ema_down_ago},
+                })
+                engine_status["EMA_CROSS"] = "candidate"
+
+        # Engine B — breakout + retest. Direct breakout chasing is deliberately
+        # disabled: a breakout must first return to the broken level and reclaim.
+        if not self.use_breakout_retest_entry:
+            engine_status["BREAKOUT_RETEST"] = "disabled"
+        elif not dist_ok:
+            engine_status["BREAKOUT_RETEST"] = f"rejected: {dist_disp}xATR from chase EMA"
+        elif not (l3["ema_bull_aligned"] if direction == "long" else l3["ema_bear_aligned"]):
+            engine_status["BREAKOUT_RETEST"] = "waiting: EMA alignment"
+        else:
+            bo = self._breakout_retest_setup(c5m, direction, l3["atr_val"])
+            last_used = (self._last_breakout_trigger_up_ts if direction == "long"
+                         else self._last_breakout_trigger_down_ts)
+            if bo is None:
+                engine_status["BREAKOUT_RETEST"] = "waiting"
+            elif last_used is not None and bo["trigger_ts"] <= last_used:
+                engine_status["BREAKOUT_RETEST"] = "trigger already consumed"
+            else:
+                candidates.append({
+                    "entry_type": "BREAKOUT_RETEST", "direction": direction,
+                    "trigger_ts": bo["trigger_ts"], "raw_stop": bo["raw_stop"],
+                    "stop_mode": "structure", "base_edge": bo["edge_score"],
+                    "min_quality": max(l2_thr, self.breakout_entry_min_quality),
+                    "detail": bo,
+                })
+                engine_status["BREAKOUT_RETEST"] = "candidate"
+
+        # Engine C — confirmed market-structure retest. It only works with
+        # HH/HL for longs or LH/LL for shorts and needs a reclaim, engulf/pin,
+        # or micro-BOS after the level is tested.
+        if not self.use_structure_retest_entry:
+            engine_status["STRUCTURE_RETEST"] = "disabled"
+        elif (self.use_regime_router and regime["state"] == "TRANSITION"
+              and not self.allow_structure_entry_in_transition):
+            engine_status["STRUCTURE_RETEST"] = "disabled in TRANSITION regime"
+        elif not dist_ok:
+            engine_status["STRUCTURE_RETEST"] = f"rejected: {dist_disp}xATR from chase EMA"
+        elif not (l3["ema_bull_aligned"] if direction == "long" else l3["ema_bear_aligned"]):
+            engine_status["STRUCTURE_RETEST"] = "waiting: EMA alignment"
+        else:
+            st = self._structure_retest_setup(c5m, direction, l3["atr_val"])
+            last_used = (self._last_structure_trigger_up_ts if direction == "long"
+                         else self._last_structure_trigger_down_ts)
+            if st is None:
+                engine_status["STRUCTURE_RETEST"] = "waiting"
+            elif last_used is not None and st["trigger_ts"] <= last_used:
+                engine_status["STRUCTURE_RETEST"] = "trigger already consumed"
+            else:
+                candidates.append({
+                    "entry_type": "STRUCTURE_RETEST", "direction": direction,
+                    "trigger_ts": st["trigger_ts"], "raw_stop": st["raw_stop"],
+                    "stop_mode": "structure", "base_edge": st["edge_score"],
+                    "min_quality": max(l2_thr, self.structure_entry_min_quality),
+                    "detail": st,
+                })
+                engine_status["STRUCTURE_RETEST"] = "candidate"
+
+        if not candidates:
+            enabled = [name for name, status in engine_status.items() if status != "disabled"]
+            return self._hold(current_price,
+                "Layer1+2 passed — waiting for one of: " + ", ".join(enabled),
+                metadata=dbg("waiting_entry_router"))
+
+        # Candidate-specific stop, quality, and HTF room validation. This avoids
+        # measuring every entry with EMA50 risk when breakout/structure stops are
+        # naturally tied to their retest low/high.
+        valid_candidates: list[dict] = []
+        for candidate in candidates:
+            risk_plan = self._compute_entry_sl_tp(
+                direction=direction, price=close_price, raw_stop=candidate["raw_stop"],
+                atr_val=l3["atr_val"], mirror_raw_stop=candidate["stop_mode"] == "ema",
             )
+            review = {"entry_type": candidate["entry_type"]}
+            if risk_plan is None:
+                review["status"] = "rejected_stop_distance"
+                candidate_reviews.append(review)
+                continue
+            sl, tp, risk_distance, risk_atr = risk_plan
 
-        # trend == "down"
-        if not has_short_candidate:
-            return self._hold(current_price, f"Layer1+2 passed — waiting for EMA{self.ema_fast}↓EMA{self.ema_slow} cross (5m)"
-                              + (f" (early trend, within {fb} bars)" if is_early_trend else f" (cross valid {self.cross_valid_bars} bars)"),
-                              metadata=dbg("waiting_cross"))
-        self._last_ema_cross_down_ts = None
-        if not l3["below_ema_ref"]:
+            candidate_location = self._neutral_location_context()
+            if self.use_location_filter:
+                candidate_location = self._location_context(
+                    direction=trend, entry_price=close_price,
+                    atr_15m=self._last_atr(candles, self.atr_period) or l3["atr_val"],
+                    estimated_risk=risk_distance, candles_15m=candles,
+                    candles_1h=c1h, candles_4h=c4h, q15=q15,
+                )
+            adjusted_thr = candidate["min_quality"] + float(
+                candidate_location.get("threshold_penalty",
+                                       self.location_threshold_penalty if candidate_location.get("penalize") else 0.0)
+            )
+            review.update({
+                "min_quality": round(adjusted_thr, 1),
+                "risk_atr": round(risk_atr, 2),
+                "location_valid": candidate_location["valid"],
+                "location_reason": candidate_location["reason"],
+                "structure_1h": candidate_location.get("structure_1h"),
+                "structure_4h": candidate_location.get("structure_4h"),
+                "macro_alignment": candidate_location.get("macro_alignment"),
+                "supportive_zone": candidate_location.get("supportive_zone"),
+            })
+            if not candidate_location["valid"]:
+                review["status"] = "rejected_location"
+                candidate_reviews.append(review)
+                continue
+            if l2_score <= adjusted_thr:
+                review["status"] = "rejected_quality"
+                candidate_reviews.append(review)
+                continue
+
+            room_r = candidate_location.get("structure_room_r")
+            edge_score = candidate["base_edge"] + min(8.0, max(0.0, (l2_score - adjusted_thr) * 0.35))
+            if room_r is not None and room_r >= self.preferred_structure_room_r:
+                edge_score += min(4.0, room_r)
+            if candidate_location.get("macro_alignment") == "ALIGNED":
+                edge_score += self.htf_alignment_edge_bonus
+            supportive_zone = candidate_location.get("supportive_zone")
+            if supportive_zone is not None:
+                edge_score += float(supportive_zone.get("freshness", 0.0)) * self.sd_supportive_zone_edge_bonus
+                if supportive_zone.get("role_reversal"):
+                    edge_score += self.sd_role_reversal_edge_bonus
+            if regime.get("state") == "STRONG_TREND":
+                edge_score += 1.0
+            candidate.update({
+                "sl": sl, "tp": tp, "risk_distance": risk_distance,
+                "risk_atr": risk_atr, "location": candidate_location,
+                "adjusted_threshold": adjusted_thr, "edge_score": round(edge_score, 2),
+            })
+            review.update({"status": "valid", "edge_score": round(edge_score, 2)})
+            candidate_reviews.append(review)
+            valid_candidates.append(candidate)
+
+        if not valid_candidates:
+            reasons = ", ".join(f"{r['entry_type']}={r['status']}" for r in candidate_reviews)
             return self._hold(current_price,
-                f"Short setup FAILED: price not below EMA{self.entry_ema_ref} (5m) — waiting for fresh cross",
-                metadata=dbg("ema_ref_fail"))
-        if not dist_ok:
-            return self._hold(current_price,
-                f"Short setup FAILED: price {dist_disp}xATR from EMA{self.sl_ema_ref} "
-                f"(max {self.max_dist_atr_mult}x, 5m) — waiting for pullback + fresh cross",
-                metadata=dbg("cross_pass_distance_fail"))
-        sl, tp = self._compute_sl_tp("short", close_price, l3["sl_ema_val"])
-        self._open_position = "short"
+                f"Layer3 candidates rejected after risk/location checks: {reasons}",
+                metadata=dbg("candidate_rejected"))
+
+        selected = max(valid_candidates, key=lambda x: x["edge_score"])
+        location = selected["location"]
+        location_adjusted_l2_thr = selected["adjusted_threshold"]
+        entry_type = selected["entry_type"]
+        sl, tp = selected["sl"], selected["tp"]
+
+        # Consume the selected trigger and block duplicate attempts on this bar.
+        self._last_entry_attempt_bar_ts = bar_ts_5
+        if entry_type == "EMA_CROSS":
+            if direction == "long":
+                self._last_ema_cross_up_ts = None
+            else:
+                self._last_ema_cross_down_ts = None
+        elif entry_type == "BREAKOUT_RETEST":
+            if direction == "long":
+                self._last_breakout_trigger_up_ts = selected["trigger_ts"]
+            else:
+                self._last_breakout_trigger_down_ts = selected["trigger_ts"]
+        elif entry_type == "STRUCTURE_RETEST":
+            if direction == "long":
+                self._last_structure_trigger_up_ts = selected["trigger_ts"]
+            else:
+                self._last_structure_trigger_down_ts = selected["trigger_ts"]
+
+        self._open_position = direction
         self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
         meta = dbg("entered")
-        meta.update({"stop_loss": round(sl, 8), "take_profit": round(tp, 8), "rr_ratio": self.rr_ratio,
-                     "sizing_mode": self.sizing_mode, "margin_pct": self.margin_pct,
-                     "structure_room_r": location.get("structure_room_r"),
-                     "nearest_opposing_zone": location.get("nearest_opposing_zone")})
+        meta.update({
+            "entry_type": entry_type, "entry_detail": selected["detail"],
+            "entry_edge_score": selected["edge_score"],
+            "stop_loss": round(sl, 8), "take_profit": round(tp, 8),
+            "risk_atr": round(selected["risk_atr"], 3), "rr_ratio": self.rr_ratio,
+            "sizing_mode": self.sizing_mode, "margin_pct": self.margin_pct,
+            "structure_room_r": location.get("structure_room_r"),
+            "nearest_opposing_zone": location.get("nearest_opposing_zone"),
+            "supportive_zone": location.get("supportive_zone"),
+            "structure_1h": location.get("structure_1h"),
+            "structure_4h": location.get("structure_4h"),
+            "macro_alignment": location.get("macro_alignment"),
+            "regime": regime,
+        })
+        side_label = "Uptrend" if direction == "long" else "Downtrend"
+        trigger_summary = self._entry_reason_summary(selected)
         return Signal(
-            type=SignalType.SELL, symbol=self.symbol, price=current_price, amount=0.0,
-            reason=f"Downtrend confirmed (Layer1 30m) + quality {l2_score:.0f}"
-                   f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} + location OK (Layer2) + "
-                   f"EMA{self.ema_fast}↓EMA{self.ema_slow} {ema_down_ago}b ago, below EMA{self.entry_ema_ref}, "
-                   f"{dist_atr:.2f}xATR from EMA{self.sl_ema_ref} (Layer3 5m)",
+            type=SignalType.BUY if direction == "long" else SignalType.SELL,
+            symbol=self.symbol, price=current_price, amount=0.0,
+            reason=f"{side_label} confirmed (Layer1 30m) + quality {l2_score:.0f}"
+                   f"{' [early]' if is_early_trend else ''} >{location_adjusted_l2_thr:.0f} + "
+                   f"location OK (Layer2) + {entry_type}: {trigger_summary} (Layer3 5m)",
             confidence=1.0,
             metadata=meta,
         )
@@ -571,11 +883,11 @@ class TrendConfirmStrategy(BaseStrategy):
         """Position management, evaluated every tick:
 
         1. TP1 partial (price-based, checked every tick): when price reaches
-           tp1_r (1.25R, halfway to the 2.5R final TP), close tp1_close_pct
+           tp1_r (0.75R, halfway to the 1.5R final TP), close tp1_close_pct
            (50%) and move SL to break-even + be_offset_r (BE + 0.1R). Once.
         2. Exit the runner (5m bar-based): EMA10/20 cross-back (a genuine trend
            reversal) OR a 5m close past EMA20 (long: close below EMA20; short:
-           close above EMA20). The final TP (2.5R) and the trailed SL are the
+           close above EMA20). The final TP (1.5R) and the trailed SL are the
            hard bounds bot.py's risk manager checks underneath.
         Hedge-mode-safe: always closes whichever position is actually open,
         never relies on signal.type semantics."""
@@ -695,27 +1007,111 @@ class TrendConfirmStrategy(BaseStrategy):
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
+    def _data_quality_context(self, candles: list, expected_ms: int) -> dict:
+        """Validate the newest candle window without rejecting normal weekend
+        or session gaps. Gaps are reported for diagnostics; malformed OHLC,
+        duplicate/non-monotonic timestamps and non-finite data are hard fails."""
+        if not candles:
+            return {"valid": False, "reason": "missing candle series", "bars": 0}
+
+        window = candles[-300:]
+        previous_ts: Optional[int] = None
+        max_gap_mult = 0.0
+        for i, candle in enumerate(window):
+            try:
+                ts = int(candle.timestamp)
+                values = [float(candle.open), float(candle.high), float(candle.low),
+                          float(candle.close), float(candle.volume)]
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return {"valid": False, "reason": f"invalid candle fields at index {i}",
+                        "bars": len(candles)}
+            if not all(math.isfinite(v) for v in values):
+                return {"valid": False, "reason": f"non-finite OHLCV at index {i}",
+                        "bars": len(candles)}
+            o, h, l, c, volume = values
+            if h < l or h < max(o, c) or l > min(o, c):
+                return {"valid": False, "reason": f"invalid OHLC geometry at index {i}",
+                        "bars": len(candles)}
+            if volume < 0:
+                return {"valid": False, "reason": f"negative volume at index {i}",
+                        "bars": len(candles)}
+            if previous_ts is not None:
+                if ts <= previous_ts:
+                    return {"valid": False, "reason": "duplicate or non-monotonic timestamps",
+                            "bars": len(candles)}
+                if expected_ms > 0:
+                    max_gap_mult = max(max_gap_mult, (ts - previous_ts) / expected_ms)
+            previous_ts = ts
+
+        gap_warning = max_gap_mult > self.max_recent_gap_mult
+        return {
+            "valid": True,
+            "reason": "ok_with_session_gap" if gap_warning else "ok",
+            "bars": len(candles),
+            "max_gap_mult": round(max_gap_mult, 2),
+            "gap_warning": gap_warning,
+        }
+
+    def _regime_context(self, candles: list, trend: Optional[str], q15: Optional[dict],
+                        sideways: dict) -> dict:
+        if sideways.get("is_sideways"):
+            return {"state": "CHOP", "reason": "sideways veto", "ema_gap_atr": None}
+        if not self.use_regime_router:
+            return {"state": "TREND", "reason": "router disabled", "ema_gap_atr": None}
+        if not trend or q15 is None or len(candles) < self.quality_ema_slow + 2:
+            return {"state": "UNKNOWN", "reason": "warming up", "ema_gap_atr": None}
+
+        closes = [c.close for c in candles]
+        ema_fast = self.ema(closes, self.quality_ema_fast)
+        ema_slow = self.ema(closes, self.quality_ema_slow)
+        atr_val = self._last_atr(candles, self.atr_period)
+        if atr_val is None or np.isnan(ema_fast[-1]) or np.isnan(ema_slow[-1]):
+            return {"state": "UNKNOWN", "reason": "indicators unavailable", "ema_gap_atr": None}
+
+        up = trend == "up"
+        aligned = ((closes[-1] > ema_fast[-1] > ema_slow[-1]) if up
+                   else (closes[-1] < ema_fast[-1] < ema_slow[-1]))
+        gap_atr = abs(float(ema_fast[-1]) - float(ema_slow[-1])) / atr_val
+        breakdown = q15.get("breakdown", {})
+        adx_val = float(breakdown.get("adx_val", 0.0) or 0.0)
+        chop_val = float(breakdown.get("chop_val", 100.0) or 100.0)
+
+        if (aligned and adx_val >= self.regime_strong_adx
+                and chop_val <= self.regime_strong_chop_max
+                and gap_atr >= self.regime_min_ema_gap_atr):
+            state = "STRONG_TREND"
+        elif aligned and adx_val >= self.regime_trend_adx and chop_val <= self.regime_trend_chop_max:
+            state = "TREND"
+        else:
+            state = "TRANSITION"
+        return {
+            "state": state, "aligned": aligned, "adx": round(adx_val, 1),
+            "chop": round(chop_val, 1), "ema_gap_atr": round(gap_atr, 2),
+            "reason": f"aligned={aligned}, ADX={adx_val:.1f}, CHOP={chop_val:.1f}",
+        }
+
     def _neutral_location_context(self) -> dict:
         return {
-            "valid": True, "penalize": False, "reason": "filter_off_or_no_context",
-            "structure_room_r": None, "nearest_opposing_zone": None,
+            "valid": True, "penalize": False, "threshold_penalty": 0.0,
+            "reason": "filter_off_or_no_context", "structure_room_r": None,
+            "nearest_opposing_zone": None, "supportive_zone": None,
             "location_type": "UNKNOWN", "structure_1h": "UNKNOWN",
+            "structure_4h": "UNKNOWN", "macro_alignment": "UNKNOWN",
             "bearish_sweep": False, "bullish_sweep": False,
+            "active_zone_count": 0,
         }
 
     def _location_context(self, direction: str, entry_price: float, atr_15m: float,
                           estimated_risk: float, candles_15m: list, candles_1h: list,
                           candles_4h: list, q15: Optional[dict] = None) -> dict:
-        """Lightweight location and structure-room filter.
+        """HTF context gate using confirmed 1H/4H swing structure, active
+        pivots and systematic supply/demand zones.
 
-        It rejects only obvious conflicts: entering directly into an active HTF
-        opposing pivot zone, confirmed opposite 1H swing structure, wrong-side
-        liquidity sweep, or critically insufficient room. Borderline location
-        merely raises Layer-2's threshold so trade frequency is preserved.
-
-        `estimated_risk` is the candidate's actual entry->SL distance (EMA50 on
-        5m, floored) so structure-room-R matches the real stop. `atr_15m` still
-        sizes the 1h/4h pivot zone widths and the hard-zone-distance test.
+        `direction` is Layer-1's "up" or "down". Opposing zones define room
+        to target; same-side zones are confluence, not mandatory. 4H/1H
+        confirmed opposite structure is a hard conflict. Transition structure,
+        mid-range chop or limited room raises the threshold instead of blindly
+        deleting every setup.
         """
         if atr_15m <= 0 or estimated_risk <= 0:
             return self._neutral_location_context()
@@ -723,77 +1119,338 @@ class TrendConfirmStrategy(BaseStrategy):
         p1h = self._confirmed_pivots(candles_1h, self.structure_pivot_left, self.structure_pivot_right)
         p4h = self._confirmed_pivots(candles_4h, self.structure_pivot_left, self.structure_pivot_right)
         structure_1h = self._swing_structure(p1h)
+        structure_4h = self._swing_structure(p4h)
+        wanted_structure = "bull" if direction == "up" else "bear"
+        opposite_structure = "bear" if direction == "up" else "bull"
 
-        # Strong opposite 1H structure is a hard conflict. A single lower high
-        # is not enough; both highs and lows must confirm the opposing sequence.
-        if direction == "up" and structure_1h == "bear":
+        if structure_1h == opposite_structure:
             return {**self._neutral_location_context(), "valid": False,
-                    "reason": "1H confirmed LH/LL structure", "structure_1h": structure_1h}
-        if direction == "down" and structure_1h == "bull":
+                    "reason": f"1H confirmed {opposite_structure.upper()} swing structure",
+                    "structure_1h": structure_1h, "structure_4h": structure_4h,
+                    "macro_alignment": "CONFLICT"}
+        if self.use_htf_macro_filter and structure_4h == opposite_structure:
             return {**self._neutral_location_context(), "valid": False,
-                    "reason": "1H confirmed HH/HL structure", "structure_1h": structure_1h}
+                    "reason": f"4H major structure is {opposite_structure.upper()}",
+                    "structure_1h": structure_1h, "structure_4h": structure_4h,
+                    "macro_alignment": "CONFLICT"}
 
-        levels = []
-        for tf, piv, bars, mult in (("1h", p1h, candles_1h, self.zone_width_atr_1h),
-                                    ("4h", p4h, candles_4h, self.zone_width_atr_4h)):
+        levels: list[dict] = []
+        for tf, pivots, bars, mult in (
+            ("1h", p1h, candles_1h, self.zone_width_atr_1h),
+            ("4h", p4h, candles_4h, self.zone_width_atr_4h),
+        ):
             tf_atr = self._last_atr(bars, self.atr_period)
             width = max((tf_atr or atr_15m) * mult, atr_15m * 0.15)
-            wanted = "high" if direction == "up" else "low"
-            for pivot in piv:
-                if pivot["type"] == wanted and self._pivot_still_active(bars, pivot, direction, width):
-                    levels.append({"timeframe": tf, "price": pivot["price"], "width": width})
+            wanted_pivot = "high" if direction == "up" else "low"
+            for pivot in pivots:
+                if pivot["type"] != wanted_pivot:
+                    continue
+                if not self._pivot_still_active(bars, pivot, direction, width):
+                    continue
+                levels.append({
+                    "kind": "pivot", "timeframe": tf, "price": pivot["price"],
+                    "width": width, "lower": pivot["price"] - width,
+                    "upper": pivot["price"] + width, "freshness": None,
+                    "role_reversal": False,
+                })
+
+        zones = self._get_htf_zones(candles_1h, candles_4h) if self.use_supply_demand_zones else []
+        active_zones = [z for z in zones if z.get("active") and z.get("freshness", 0.0) >= self.sd_min_freshness]
+        opposing_type = "supply" if direction == "up" else "demand"
+        supportive_type = "demand" if direction == "up" else "supply"
+
+        for zone in active_zones:
+            if zone["zone_type"] != opposing_type:
+                continue
+            proximal = zone["lower"] if direction == "up" else zone["upper"]
+            levels.append({
+                **zone, "kind": "supply_demand", "price": proximal,
+                "width": max(zone["upper"] - zone["lower"], atr_15m * 0.05),
+            })
+
+        def room_to(level: dict) -> float:
+            if direction == "up":
+                return float(level["lower"]) - entry_price
+            return entry_price - float(level["upper"])
 
         if direction == "up":
-            opposing = [z for z in levels if z["price"] > entry_price]
-            nearest = min(opposing, key=lambda z: z["price"] - entry_price, default=None)
-            room = (nearest["price"] - nearest["width"] - entry_price) if nearest else None
+            eligible = [z for z in levels if z["upper"] > entry_price]
         else:
-            opposing = [z for z in levels if z["price"] < entry_price]
-            nearest = min(opposing, key=lambda z: entry_price - z["price"], default=None)
-            room = (entry_price - (nearest["price"] + nearest["width"])) if nearest else None
-
-        room_r = room / estimated_risk if (room is not None and estimated_risk > 0) else None
+            eligible = [z for z in levels if z["lower"] < entry_price]
+        nearest = min(eligible, key=room_to, default=None)
+        room = room_to(nearest) if nearest is not None else None
+        room_r = room / estimated_risk if room is not None else None
         zone_distance_atr = room / atr_15m if room is not None else None
+
+        support_tolerance = self.sd_supportive_zone_distance_atr * atr_15m
+        supportive_candidates: list[tuple[float, dict]] = []
+        for zone in active_zones:
+            if zone["zone_type"] != supportive_type:
+                continue
+            if direction == "up":
+                if entry_price < zone["lower"] - support_tolerance:
+                    continue
+                distance = max(0.0, entry_price - zone["upper"])
+            else:
+                if entry_price > zone["upper"] + support_tolerance:
+                    continue
+                distance = max(0.0, zone["lower"] - entry_price)
+            if distance <= support_tolerance:
+                supportive_candidates.append((distance, zone))
+        supportive = min(supportive_candidates, key=lambda x: x[0], default=(None, None))[1]
 
         sweep = self._wrong_side_liquidity_sweep(candles_15m, direction, nearest)
         if sweep:
             return {**self._neutral_location_context(), "valid": False,
-                    "reason": "wrong-side liquidity sweep/rejection at opposing zone",
-                    "structure_1h": structure_1h, "nearest_opposing_zone": nearest,
+                    "reason": "wrong-side liquidity sweep/rejection at opposing HTF level",
+                    "structure_1h": structure_1h, "structure_4h": structure_4h,
+                    "macro_alignment": "ALIGNED" if structure_4h == wanted_structure else "NEUTRAL",
+                    "nearest_opposing_zone": nearest, "supportive_zone": supportive,
                     "structure_room_r": round(room_r, 2) if room_r is not None else None,
+                    "active_zone_count": len(active_zones),
                     "bearish_sweep": direction == "up", "bullish_sweep": direction == "down"}
 
         if nearest is not None and zone_distance_atr is not None and zone_distance_atr < self.hard_zone_distance_atr:
+            source = nearest.get("timeframe", "HTF")
+            kind = nearest.get("kind", "zone")
             return {**self._neutral_location_context(), "valid": False,
-                    "reason": f"entry directly into {nearest['timeframe']} opposing zone",
-                    "structure_1h": structure_1h, "nearest_opposing_zone": nearest,
-                    "structure_room_r": round(room_r, 2) if room_r is not None else None}
+                    "reason": f"entry directly into {source} opposing {kind}",
+                    "structure_1h": structure_1h, "structure_4h": structure_4h,
+                    "macro_alignment": "ALIGNED" if structure_4h == wanted_structure else "NEUTRAL",
+                    "nearest_opposing_zone": nearest, "supportive_zone": supportive,
+                    "structure_room_r": round(room_r, 2) if room_r is not None else None,
+                    "active_zone_count": len(active_zones)}
 
         if room_r is not None and room_r < self.min_structure_room_r:
             return {**self._neutral_location_context(), "valid": False,
                     "reason": f"structure room {room_r:.2f}R below {self.min_structure_room_r:.2f}R",
-                    "structure_1h": structure_1h, "nearest_opposing_zone": nearest,
-                    "structure_room_r": round(room_r, 2)}
+                    "structure_1h": structure_1h, "structure_4h": structure_4h,
+                    "macro_alignment": "ALIGNED" if structure_4h == wanted_structure else "NEUTRAL",
+                    "nearest_opposing_zone": nearest, "supportive_zone": supportive,
+                    "structure_room_r": round(room_r, 2), "active_zone_count": len(active_zones)}
 
         midrange = self._is_midrange(candles_1h, entry_price)
         chop_val = (q15 or {}).get("breakdown", {}).get("chop_val")
         choppy_midrange = bool(self.reject_midrange_when_choppy and midrange and
                                chop_val is not None and chop_val >= self.chop_threshold - 3.0)
 
-        penalize = choppy_midrange or (room_r is not None and room_r < self.preferred_structure_room_r)
-        location_type = "MID_RANGE" if midrange else "EDGE_OR_TREND_LOCATION"
-        reason = "acceptable location"
+        penalty = 0.0
+        reasons: list[str] = []
         if choppy_midrange:
-            reason = "mid-range in choppy conditions; higher quality required"
-        elif penalize:
-            reason = f"limited room {room_r:.2f}R; higher quality required"
+            penalty += self.location_threshold_penalty
+            reasons.append("mid-range in choppy conditions")
+        if room_r is not None and room_r < self.preferred_structure_room_r:
+            penalty += self.location_threshold_penalty
+            reasons.append(f"limited room {room_r:.2f}R")
+        if structure_4h == "transition":
+            penalty += self.htf_transition_threshold_penalty
+            reasons.append("4H structure transition")
+
+        macro_alignment = ("ALIGNED" if structure_4h == wanted_structure
+                           else "TRANSITION" if structure_4h == "transition" else "NEUTRAL")
+        location_type = "MID_RANGE" if midrange else "EDGE_OR_TREND_LOCATION"
+        if supportive is not None:
+            location_type = "SUPPORTIVE_HTF_ZONE"
+            label = supportive.get("pattern", supportive.get("zone_type", "zone"))
+            reasons.append(f"near {supportive.get('timeframe')} {label}")
 
         return {
-            "valid": True, "penalize": penalize, "reason": reason,
+            "valid": True, "penalize": penalty > 0, "threshold_penalty": round(penalty, 2),
+            "reason": "; ".join(reasons) if reasons else "acceptable HTF location",
             "structure_room_r": round(room_r, 2) if room_r is not None else None,
-            "nearest_opposing_zone": nearest, "location_type": location_type,
-            "structure_1h": structure_1h, "bearish_sweep": False, "bullish_sweep": False,
+            "nearest_opposing_zone": nearest, "supportive_zone": supportive,
+            "location_type": location_type, "structure_1h": structure_1h,
+            "structure_4h": structure_4h, "macro_alignment": macro_alignment,
+            "bearish_sweep": False, "bullish_sweep": False,
+            "active_zone_count": len(active_zones),
         }
+
+    def _get_htf_zones(self, candles_1h: list, candles_4h: list) -> list[dict]:
+        key = (
+            candles_1h[-1].timestamp if candles_1h else None, len(candles_1h),
+            candles_4h[-1].timestamp if candles_4h else None, len(candles_4h),
+        )
+        if key == self._zone_cache_key:
+            return self._zone_cache
+        zones = self._supply_demand_zones(candles_1h, "1h")
+        zones.extend(self._supply_demand_zones(candles_4h, "4h"))
+        self._zone_cache_key = key
+        self._zone_cache = zones
+        return zones
+
+    def _supply_demand_zones(self, candles: list, timeframe: str) -> list[dict]:
+        """Detect RBR/DBR demand and RBD/DBD supply from a compact base and
+        ATR-qualified departure. This is intentionally numeric and conservative;
+        it does not attempt visual discretionary zone drawing."""
+        minimum = self.atr_period + self.sd_base_max_bars + self.sd_departure_bars + 5
+        if len(candles) < minimum:
+            return []
+        atr_arr = self.atr(candles, self.atr_period)
+        n = len(candles)
+        scan_start = max(self.atr_period + self.sd_base_max_bars,
+                         n - self.sd_scan_lookback_bars)
+        last_base_end = n - self.sd_departure_bars - 1
+        detected: list[dict] = []
+
+        for base_end in range(scan_start, last_base_end + 1):
+            atr_ref = float(atr_arr[base_end]) if not np.isnan(atr_arr[base_end]) else 0.0
+            if atr_ref <= 0:
+                continue
+            best: Optional[dict] = None
+            for base_len in range(1, self.sd_base_max_bars + 1):
+                base_start = base_end - base_len + 1
+                if base_start < 1:
+                    continue
+                base = candles[base_start:base_end + 1]
+                base_high = max(c.high for c in base)
+                base_low = min(c.low for c in base)
+                base_range_atr = (base_high - base_low) / atr_ref
+                avg_body_atr = float(np.mean([abs(c.close - c.open) for c in base])) / atr_ref
+                if (base_range_atr > self.sd_base_max_range_atr
+                        or avg_body_atr > self.sd_base_max_body_atr):
+                    continue
+
+                departure = candles[base_end + 1:base_end + 1 + self.sd_departure_bars]
+                if len(departure) < self.sd_departure_bars:
+                    continue
+                rally_extent = (max(c.close for c in departure) - base_high) / atr_ref
+                drop_extent = (base_low - min(c.close for c in departure)) / atr_ref
+                departure_type: Optional[str] = None
+                departure_atr = 0.0
+                if rally_extent >= self.sd_min_departure_atr and rally_extent > drop_extent:
+                    departure_type, departure_atr = "demand", rally_extent
+                elif drop_extent >= self.sd_min_departure_atr:
+                    departure_type, departure_atr = "supply", drop_extent
+                if departure_type is None:
+                    continue
+
+                displacement_bodies = [abs(c.close - c.open) / atr_ref for c in departure]
+                if max(displacement_bodies, default=0.0) < 0.35:
+                    continue
+                pre_start = max(0, base_start - 3)
+                pre_delta = candles[base_start].open - candles[pre_start].close
+                if departure_type == "demand":
+                    pattern = "DBR" if pre_delta < -0.20 * atr_ref else "RBR"
+                    lower = float(base_low)
+                    upper = float(max(max(c.open, c.close) for c in base))
+                else:
+                    pattern = "RBD" if pre_delta > 0.20 * atr_ref else "DBD"
+                    lower = float(min(min(c.open, c.close) for c in base))
+                    upper = float(base_high)
+                if upper <= lower:
+                    lower, upper = float(base_low), float(base_high)
+                width_atr = (upper - lower) / atr_ref
+                if width_atr <= 0.02 or width_atr > 1.25:
+                    continue
+
+                candidate = {
+                    "zone_id": f"{timeframe}:{candles[base_end].timestamp}:{departure_type}",
+                    "timeframe": timeframe, "zone_type": departure_type,
+                    "original_zone_type": departure_type, "pattern": pattern,
+                    "lower": lower, "upper": upper,
+                    "created_ts": candles[base_end].timestamp,
+                    "departure_end_ts": departure[-1].timestamp,
+                    "departure_atr": round(float(departure_atr), 3),
+                    "base_bars": base_len, "base_range_atr": round(base_range_atr, 3),
+                    "avg_base_body_atr": round(avg_body_atr, 3),
+                    "quality": round(min(1.0, departure_atr / max(1.0, self.sd_min_departure_atr * 2.0)), 3),
+                    "_departure_end_index": base_end + self.sd_departure_bars,
+                    "_atr_ref": atr_ref,
+                }
+                if best is None or (candidate["quality"], -candidate["base_range_atr"]) > (
+                        best["quality"], -best["base_range_atr"]):
+                    best = candidate
+            if best is not None:
+                lifecycle = self._zone_lifecycle(candles, best)
+                best.update(lifecycle)
+                best.pop("_departure_end_index", None)
+                best.pop("_atr_ref", None)
+                if best.get("active"):
+                    detected.append(best)
+
+        return self._dedupe_zones(detected)
+
+    def _zone_lifecycle(self, candles: list, zone: dict) -> dict:
+        lower, upper = float(zone["lower"]), float(zone["upper"])
+        atr_ref = float(zone["_atr_ref"])
+        start = int(zone["_departure_end_index"]) + 1
+        tolerance = self.sd_touch_tolerance_atr * atr_ref
+        break_buffer = self.sd_break_buffer_atr * atr_ref
+        original_type = zone["zone_type"]
+
+        touch_count = 0
+        in_touch = False
+        break_idx: Optional[int] = None
+        for i in range(start, len(candles)):
+            candle = candles[i]
+            intersects = candle.high >= lower - tolerance and candle.low <= upper + tolerance
+            if intersects and not in_touch:
+                touch_count += 1
+            in_touch = intersects
+            broken = ((original_type == "demand" and candle.close < lower - break_buffer)
+                      or (original_type == "supply" and candle.close > upper + break_buffer))
+            if broken:
+                break_idx = i
+                break
+
+        role_reversal = break_idx is not None
+        invalidated = False
+        if role_reversal:
+            flipped_type = "supply" if original_type == "demand" else "demand"
+            touch_count = 0
+            in_touch = False
+            for candle in candles[break_idx + 1:]:
+                intersects = candle.high >= lower - tolerance and candle.low <= upper + tolerance
+                if intersects and not in_touch:
+                    touch_count += 1
+                in_touch = intersects
+                invalidated = ((flipped_type == "demand" and candle.close < lower - break_buffer)
+                               or (flipped_type == "supply" and candle.close > upper + break_buffer))
+                if invalidated:
+                    break
+            active_type = flipped_type
+            base_freshness = 0.75
+        else:
+            active_type = original_type
+            base_freshness = 1.0
+
+        freshness = max(0.0, base_freshness - touch_count * self.sd_touch_freshness_decay)
+        active = (not invalidated and touch_count <= self.sd_max_touches
+                  and freshness >= self.sd_min_freshness)
+        return {
+            "zone_type": active_type, "active": active,
+            "broken_original": role_reversal, "role_reversal": role_reversal,
+            "touch_count": touch_count, "freshness": round(freshness, 3),
+            "invalidated": invalidated,
+            "break_ts": candles[break_idx].timestamp if break_idx is not None else None,
+        }
+
+    @staticmethod
+    def _dedupe_zones(zones: list[dict]) -> list[dict]:
+        """Keep the strongest representative when same-type zones overlap."""
+        ranked = sorted(
+            zones,
+            key=lambda z: (z.get("freshness", 0.0) * z.get("quality", 0.0),
+                           z.get("created_ts", 0)),
+            reverse=True,
+        )
+        kept: list[dict] = []
+        for zone in ranked:
+            width = max(zone["upper"] - zone["lower"], 1e-12)
+            duplicate = False
+            for existing in kept:
+                if zone["timeframe"] != existing["timeframe"] or zone["zone_type"] != existing["zone_type"]:
+                    continue
+                overlap = max(0.0, min(zone["upper"], existing["upper"]) -
+                              max(zone["lower"], existing["lower"]))
+                denominator = min(width, max(existing["upper"] - existing["lower"], 1e-12))
+                if overlap / denominator >= 0.60:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(zone)
+        kept.sort(key=lambda z: z.get("created_ts", 0), reverse=True)
+        return kept[:16]
 
     @staticmethod
     def _confirmed_pivots(candles: list, left: int, right: int) -> list[dict]:
@@ -860,43 +1517,279 @@ class TrendConfirmStrategy(BaseStrategy):
 
     @staticmethod
     def _wrong_side_liquidity_sweep(candles_15m: list, direction: str, nearest: Optional[dict]) -> bool:
-        """True if the last 2 bars show a stop-hunt at the opposing zone that
-        hasn't since been reclaimed. Checking 2 bars (not just the latest)
-        catches a sweep that fired the bar BEFORE the entry cross; but a sweep
-        1 bar back that the market has already reclaimed (closed cleanly back
-        on the trade's own side) is a false alarm, not a live rejection —
-        don't let it block an otherwise-good entry."""
+        """Detect rejection after probing an opposing pivot/zone.
+
+        For a long, price must actually reach the opposing zone's lower edge
+        (not merely come within a full zone width) and close back below it with
+        a meaningful upper wick. Shorts mirror the rule at the upper edge.
+        """
         if nearest is None or len(candles_15m) < 3:
             return False
-        level = nearest["price"]
-        width = nearest["width"]
+        level = float(nearest.get("price", 0.0))
+        width = max(float(nearest.get("width", 0.0)), 1e-12)
+        lower = float(nearest.get("lower", level - width))
+        upper = float(nearest.get("upper", level + width))
+        rejection_buffer = width * 0.05
 
         def is_sweep(c) -> bool:
             body = abs(c.close - c.open)
             rng = max(c.high - c.low, 1e-12)
             if direction == "up":
-                # Price probes resistance but closes back below with a meaningful upper wick.
-                return (c.high >= level - width and c.close < level - width * 0.25
-                        and (c.high - max(c.open, c.close)) >= body * 1.2 and body / rng >= 0.15)
-            return (c.low <= level + width and c.close > level + width * 0.25
-                    and (min(c.open, c.close) - c.low) >= body * 1.2 and body / rng >= 0.15)
+                # Probe resistance/supply then close back below its proximal edge.
+                return (c.high >= lower and c.close < lower - rejection_buffer
+                        and (c.high - max(c.open, c.close)) >= max(body * 1.2, rng * 0.20)
+                        and body / rng >= 0.10)
+            # Probe support/demand then close back above its proximal edge.
+            return (c.low <= upper and c.close > upper + rejection_buffer
+                    and (min(c.open, c.close) - c.low) >= max(body * 1.2, rng * 0.20)
+                    and body / rng >= 0.10)
 
         last = candles_15m[-1]
         for idx in (-1, -2):
-            c = candles_15m[idx]
-            if not is_sweep(c):
+            candle = candles_15m[idx]
+            if not is_sweep(candle):
                 continue
             if idx == -2:
-                reclaimed = (last.close > level + width if direction == "up"
-                            else last.close < level - width)
+                reclaimed = (last.close > upper if direction == "up" else last.close < lower)
                 if reclaimed:
                     continue
             return True
         return False
 
+    def _breakout_retest_setup(self, candles: list, direction: str, atr_val: float) -> Optional[dict]:
+        """Return the newest qualified breakout-retest trigger within the
+        validity window. A direct breakout is never returned: price must revisit
+        the broken level and close back on the trend side."""
+        min_needed = self.breakout_lookback + self.breakout_arm_bars + 3
+        if atr_val <= 0 or len(candles) < min_needed:
+            return None
+
+        n = len(candles)
+        trigger_start = max(1, n - self.entry_trigger_valid_bars)
+        buffer = self.breakout_buffer_atr * atr_val
+        tolerance = self.breakout_retest_tolerance_atr * atr_val
+        invalidation = self.breakout_invalidation_atr * atr_val
+
+        for trigger_idx in range(n - 1, trigger_start - 1, -1):
+            trigger = candles[trigger_idx]
+            bo_start = max(self.breakout_lookback, trigger_idx - self.breakout_arm_bars)
+            for bo_idx in range(trigger_idx - 1, bo_start - 1, -1):
+                prior = candles[bo_idx - self.breakout_lookback:bo_idx]
+                if len(prior) < self.breakout_lookback:
+                    continue
+                breakout = candles[bo_idx]
+                prev = candles[bo_idx - 1]
+                level = (max(c.high for c in prior) if direction == "long"
+                         else min(c.low for c in prior))
+                body_atr = abs(breakout.close - breakout.open) / atr_val
+                rng = max(breakout.high - breakout.low, 1e-12)
+                close_quality = ((breakout.close - breakout.low) / rng if direction == "long"
+                                 else (breakout.high - breakout.close) / rng)
+                vol_hist = [c.volume for c in candles[max(0, bo_idx - self.volume_sma_period):bo_idx]]
+                vol_base = float(np.mean(vol_hist)) if vol_hist else 0.0
+                vol_ratio = breakout.volume / vol_base if vol_base > 0 else 0.0
+
+                if direction == "long":
+                    broke = breakout.close > level + buffer and prev.close <= level + buffer
+                else:
+                    broke = breakout.close < level - buffer and prev.close >= level - buffer
+                if not (broke and body_atr >= self.breakout_min_body_atr
+                        and close_quality >= self.breakout_min_close_quality
+                        and vol_ratio >= self.breakout_min_volume_ratio):
+                    continue
+
+                segment = candles[bo_idx + 1:trigger_idx + 1]
+                if not segment:
+                    continue
+                if direction == "long":
+                    touched = any(c.low <= level + tolerance for c in segment)
+                    held = all(c.close >= level - invalidation for c in segment)
+                    reclaimed = trigger.close > level and candles[-1].close > level
+                else:
+                    touched = any(c.high >= level - tolerance for c in segment)
+                    held = all(c.close <= level + invalidation for c in segment)
+                    reclaimed = trigger.close < level and candles[-1].close < level
+                confirm, labels = self._entry_candle_confirmation(
+                    candles, trigger_idx, direction, level, atr_val, allow_micro_bos=True)
+                if not (touched and held and reclaimed and confirm):
+                    continue
+
+                if direction == "long":
+                    raw_stop = min(c.low for c in candles[bo_idx + 1:]) - self.entry_stop_buffer_atr * atr_val
+                else:
+                    raw_stop = max(c.high for c in candles[bo_idx + 1:]) + self.entry_stop_buffer_atr * atr_val
+                edge = 75.0 + min(5.0, max(0.0, (vol_ratio - self.breakout_min_volume_ratio) * 5.0))
+                if "micro_bos" in labels:
+                    edge += 2.0
+                return {
+                    "trigger_ts": trigger.timestamp, "breakout_ts": breakout.timestamp,
+                    "breakout_level": round(float(level), 8), "raw_stop": float(raw_stop),
+                    "body_atr": round(body_atr, 3), "close_quality": round(close_quality, 3),
+                    "volume_ratio": round(vol_ratio, 3), "confirmations": labels,
+                    "edge_score": round(edge, 2),
+                }
+        return None
+
+    def _structure_retest_setup(self, candles: list, direction: str, atr_val: float) -> Optional[dict]:
+        """Return a HH/HL or LH/LL retest entry. The level is the latest
+        confirmed HL (long) or LH (short); a touch alone is insufficient — a
+        reclaim, engulf/pin, or micro-BOS must follow."""
+        if atr_val <= 0 or len(candles) < max(12, self.structure_level_max_age_bars // 2):
+            return None
+        pivots = self._confirmed_pivots(candles, self.structure_pivot_left, self.structure_pivot_right)
+        structure = self._swing_structure(pivots)
+        required = "bull" if direction == "long" else "bear"
+        if structure != required:
+            return None
+
+        wanted = "low" if direction == "long" else "high"
+        levels = [p for p in pivots if p["type"] == wanted]
+        if len(levels) < 2:
+            return None
+        level_pivot = levels[-1]
+        index_by_ts = {c.timestamp: i for i, c in enumerate(candles)}
+        pivot_idx = index_by_ts.get(level_pivot["timestamp"])
+        if pivot_idx is None or len(candles) - 1 - pivot_idx > self.structure_level_max_age_bars:
+            return None
+
+        level = level_pivot["price"]
+        tolerance = self.structure_retest_tolerance_atr * atr_val
+        invalidation = self.structure_invalidation_atr * atr_val
+        n = len(candles)
+        trigger_start = max(pivot_idx + self.structure_pivot_right + 1, n - self.entry_trigger_valid_bars)
+
+        for trigger_idx in range(n - 1, trigger_start - 1, -1):
+            touch_start = max(pivot_idx + 1, trigger_idx - self.structure_retest_window_bars + 1)
+            touch_idx = None
+            for i in range(trigger_idx, touch_start - 1, -1):
+                c = candles[i]
+                touched = (c.low <= level + tolerance if direction == "long"
+                           else c.high >= level - tolerance)
+                if touched:
+                    touch_idx = i
+                    break
+            if touch_idx is None:
+                continue
+            segment = candles[touch_idx:trigger_idx + 1]
+            if direction == "long":
+                held = all(c.close >= level - invalidation for c in segment)
+                current_side = candles[trigger_idx].close > level and candles[-1].close > level
+            else:
+                held = all(c.close <= level + invalidation for c in segment)
+                current_side = candles[trigger_idx].close < level and candles[-1].close < level
+            confirm, labels = self._entry_candle_confirmation(
+                candles, trigger_idx, direction, level, atr_val, allow_micro_bos=True)
+            if not (held and current_side and confirm):
+                continue
+
+            if direction == "long":
+                raw_stop = min(c.low for c in candles[touch_idx:]) - self.entry_stop_buffer_atr * atr_val
+            else:
+                raw_stop = max(c.high for c in candles[touch_idx:]) + self.entry_stop_buffer_atr * atr_val
+            edge = 78.0
+            if "micro_bos" in labels:
+                edge += 3.0
+            if "reclaim" in labels:
+                edge += 2.0
+            return {
+                "trigger_ts": candles[trigger_idx].timestamp,
+                "structure": structure, "retest_level": round(float(level), 8),
+                "level_pivot_ts": level_pivot["timestamp"], "touch_ts": candles[touch_idx].timestamp,
+                "raw_stop": float(raw_stop), "confirmations": labels,
+                "edge_score": round(edge, 2),
+            }
+        return None
+
+    def _entry_candle_confirmation(self, candles: list, idx: int, direction: str,
+                                   level: float, atr_val: float,
+                                   allow_micro_bos: bool = True) -> tuple[bool, list[str]]:
+        if idx <= 0 or idx >= len(candles) or atr_val <= 0:
+            return False, []
+        c = candles[idx]
+        prev = candles[idx - 1]
+        rng = max(c.high - c.low, 1e-12)
+        body = abs(c.close - c.open)
+        labels: list[str] = []
+
+        if direction == "long":
+            close_quality = (c.close - c.low) / rng
+            reclaim = c.low <= level + self.structure_retest_tolerance_atr * atr_val and c.close > level and c.close > c.open
+            engulf = c.close > prev.open and c.open <= prev.close and c.close > c.open
+            lower_wick = min(c.open, c.close) - c.low
+            pin = lower_wick >= max(body * 1.5, atr_val * 0.05) and close_quality >= 0.60
+            micro_bos = False
+            if allow_micro_bos and idx >= self.structure_micro_bos_lookback:
+                prior_high = max(x.high for x in candles[idx - self.structure_micro_bos_lookback:idx])
+                micro_bos = c.close > prior_high and body >= atr_val * 0.10
+        else:
+            close_quality = (c.high - c.close) / rng
+            reclaim = c.high >= level - self.structure_retest_tolerance_atr * atr_val and c.close < level and c.close < c.open
+            engulf = c.close < prev.open and c.open >= prev.close and c.close < c.open
+            upper_wick = c.high - max(c.open, c.close)
+            pin = upper_wick >= max(body * 1.5, atr_val * 0.05) and close_quality >= 0.60
+            micro_bos = False
+            if allow_micro_bos and idx >= self.structure_micro_bos_lookback:
+                prior_low = min(x.low for x in candles[idx - self.structure_micro_bos_lookback:idx])
+                micro_bos = c.close < prior_low and body >= atr_val * 0.10
+
+        if reclaim:
+            labels.append("reclaim")
+        if engulf:
+            labels.append("engulfing")
+        if pin:
+            labels.append("pin_bar")
+        if micro_bos:
+            labels.append("micro_bos")
+        return bool(labels), labels
+
+    def _compute_entry_sl_tp(self, direction: str, price: float, raw_stop: float,
+                             atr_val: float, mirror_raw_stop: bool = False
+                             ) -> Optional[tuple[float, float, float, float]]:
+        """Normalize a candidate stop. EMA stops keep the legacy absolute
+        distance behavior; structure stops must genuinely sit beyond the retest
+        low/high. Tiny stops are widened, overly large stops are rejected."""
+        if price <= 0 or atr_val <= 0 or raw_stop is None or np.isnan(raw_stop):
+            return None
+        if mirror_raw_stop:
+            raw_distance = abs(price - raw_stop)
+        elif direction == "long":
+            raw_distance = price - raw_stop
+        else:
+            raw_distance = raw_stop - price
+        if raw_distance <= 0:
+            return None
+
+        min_distance = max(self.min_sl_pct * price, self.entry_min_stop_atr * atr_val)
+        max_distance = max(min_distance, self.entry_max_stop_atr * atr_val)
+        distance = max(raw_distance, min_distance)
+        if distance > max_distance:
+            return None
+        if direction == "long":
+            sl = price - distance
+            tp = price + distance * self.rr_ratio
+        else:
+            sl = price + distance
+            tp = price - distance * self.rr_ratio
+        return sl, tp, distance, distance / atr_val
+
+    @staticmethod
+    def _entry_reason_summary(candidate: dict) -> str:
+        detail = candidate.get("detail", {})
+        et = candidate.get("entry_type")
+        if et == "EMA_CROSS":
+            return f"EMA cross {detail.get('cross_bars_ago')} bar(s) ago"
+        if et == "BREAKOUT_RETEST":
+            return (f"breakout level {detail.get('breakout_level')} retested; "
+                    f"volume {detail.get('volume_ratio')}x; "
+                    f"confirm {','.join(detail.get('confirmations', []))}")
+        if et == "STRUCTURE_RETEST":
+            return (f"{detail.get('structure')} structure retest at {detail.get('retest_level')}; "
+                    f"confirm {','.join(detail.get('confirmations', []))}")
+        return et or "entry"
+
     def _compute_sl_tp(self, direction: str, price: float, sl_ema_val: float) -> tuple[float, float]:
         # SL sits at the 5m EMA50 (sl_ema_val). Its distance from entry defines
-        # R; TP2 = R x rr_ratio (2.5). If EMA50 sits right on price the raw SL
+        # R; TP2 = R x rr_ratio. If EMA50 sits right on price the raw SL
         # would be a microscopic noise-stop, so the distance is floored at
         # min_sl_pct (0.5% of price) and R/TP measured from the floored value.
         dist = max(abs(price - sl_ema_val), self.min_sl_pct * price)
@@ -1111,7 +2004,10 @@ class TrendConfirmStrategy(BaseStrategy):
         return {
             "ema_cross_up":   ema_f[-2] <= ema_s[-2] and ema_f[-1] > ema_s[-1],
             "ema_cross_down": ema_f[-2] >= ema_s[-2] and ema_f[-1] < ema_s[-1],
+            "ema_fast_val": float(ema_f[-1]),
             "ema_slow_val": float(ema_s[-1]),
+            "ema_bull_aligned": ema_f[-1] > ema_s[-1] and last.close > ema_ref[-1],
+            "ema_bear_aligned": ema_f[-1] < ema_s[-1] and last.close < ema_ref[-1],
             "close_below_ema_slow": last.close < ema_s[-1],
             "close_above_ema_slow": last.close > ema_s[-1],
             "above_ema_ref": last.close > ema_ref[-1],
