@@ -6,6 +6,7 @@ risk accounting is registered once, when the full trade closes.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -200,6 +201,149 @@ class PositionManager:
             adopted.append(f"{symbol} {side.upper()}")
         return adopted
 
+    async def _emergency_flatten_new_fill(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        amount: float,
+        fill: float,
+        entry_fee: float,
+        reason: str,
+    ) -> bool:
+        """Immediately flatten a fill that fails post-fill safety validation.
+
+        The entry already exists on the exchange, so returning ``None`` without
+        flattening would create an untracked live position.  Retry the reduce-only
+        close and confirm the exchange amount is zero before reporting success.
+        """
+        close_side = "sell" if side == LONG else "buy"
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 4):
+            close_order = None
+            try:
+                close_order = await self.client.create_order(
+                    symbol,
+                    close_side,
+                    amount,
+                    pos_side=side,
+                    reduce_only=True,
+                )
+            except Exception as exc:
+                last_error = exc
+                if not self._is_no_position_error(exc):
+                    logger.critical(
+                        "[POS] %s emergency close attempt %d/3 failed: %s",
+                        symbol,
+                        attempt,
+                        exc,
+                    )
+            try:
+                remaining = await self.client.fetch_position_amount(symbol, side)
+            except Exception as exc:
+                last_error = exc
+                remaining = amount
+            if remaining <= 0:
+                exit_price = (
+                    close_order.avg_price
+                    if close_order is not None and close_order.avg_price > 0
+                    else fill
+                )
+                exit_fee = (
+                    close_order.fee_cost
+                    if close_order is not None
+                    else exit_price * amount * self.cfg.fee_rate
+                )
+                gross = (exit_price - fill) * amount if side == LONG else (fill - exit_price) * amount
+                net = gross - max(entry_fee, 0.0) - max(exit_fee, 0.0)
+                try:
+                    balance = await self.client.fetch_balance_usdt()
+                    self.risk.register_trade_result(net, balance, time.time())
+                except Exception as exc:
+                    logger.error("[POS] %s could not register emergency-close PnL: %s", symbol, exc)
+                self._mark_closed(symbol)
+                self.entry_engine.on_position_closed(symbol)
+                logger.critical(
+                    "[POS] %s emergency-flattened after %s; estimated net PnL %.2f",
+                    symbol,
+                    reason,
+                    net,
+                )
+                return True
+            await asyncio.sleep(0.5 * attempt)
+        logger.critical(
+            "[POS] %s EMERGENCY CLOSE FAILED after %s; position remains live: %s",
+            symbol,
+            reason,
+            last_error,
+        )
+        return False
+
+    def _track_recovery_position(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        fill: float,
+        amount: float,
+        sl: float,
+        tp2: float,
+        atr_value: float,
+        regime: RegimeResult,
+        bias: BiasResult,
+        entry_score: float,
+        entry_fee: float,
+        df_15m: pd.DataFrame,
+        df_5m: Optional[pd.DataFrame],
+        entry_result,
+        reason: str,
+    ) -> Position:
+        """Keep a failed-to-flatten exchange fill under local management."""
+        min_risk = max(
+            atr_value * getattr(self.cfg, "dual_min_stop_atr", 0.55),
+            fill * max(self.cfg.sl_min_pct, 0.001),
+        )
+        valid_sl = (side == LONG and sl < fill) or (side == SHORT and sl > fill)
+        if not valid_sl:
+            sl = fill - min_risk if side == LONG else fill + min_risk
+        one_r = max(abs(fill - sl), min_risk)
+        if side == LONG:
+            sl = min(sl, fill - one_r)
+            if tp2 <= fill:
+                tp2 = fill + one_r * max(self.cfg.minimum_actual_rr, 1.20)
+            tp1 = fill + self.cfg.tp1_r * one_r
+        else:
+            sl = max(sl, fill + one_r)
+            if tp2 >= fill:
+                tp2 = fill - one_r * max(self.cfg.minimum_actual_rr, 1.20)
+            tp1 = fill - self.cfg.tp1_r * one_r
+        pos = Position(
+            symbol=symbol,
+            side=side,
+            entry_price=fill,
+            amount=amount,
+            full_amount=amount,
+            stop_loss=sl,
+            tp1=tp1,
+            tp2=tp2,
+            one_r=one_r,
+            regime_at_entry=regime.name,
+            bias_at_entry=bias.bias if bias is not None else "",
+            entry_score=entry_score,
+            entry_fee=entry_fee,
+            entry_bar_ts=(
+                df_5m.index[-1]
+                if df_5m is not None and len(df_5m)
+                else df_15m.index[-1]
+            ),
+            setup_type=f"RECOVERY:{reason}",
+            trigger=getattr(entry_result, "trigger", ""),
+            planned_rr=abs(tp2 - fill) / max(one_r, ind.EPSILON),
+            structure_room_r=getattr(entry_result, "structure_room_r", 0.0),
+        )
+        self._positions[symbol] = pos
+        return pos
+
     async def open_position(
         self,
         symbol: str,
@@ -310,14 +454,60 @@ class PositionManager:
             return None
 
         fill = order.avg_price if order.avg_price > 0 else price
-        actual_risk = abs(fill - sl)
-        if actual_risk <= 0:
-            logger.critical("[POS] %s filled with invalid risk; emergency close required", symbol)
-            return None
-        # Keep structure target but recalculate TP1 from actual fill.
-        tp1 = fill + c.tp1_r * actual_risk if side == LONG else fill - c.tp1_r * actual_risk
-        actual_rr = abs(tp2 - fill) / actual_risk
         filled_amount = order.amount if order.amount > 0 else amount
+        actual_risk = (fill - sl) if side == LONG else (sl - fill)
+        if actual_risk <= 0:
+            reason = f"invalid post-fill stop: fill={fill:.8f} sl={sl:.8f}"
+            flattened = await self._emergency_flatten_new_fill(
+                symbol=symbol,
+                side=side,
+                amount=filled_amount,
+                fill=fill,
+                entry_fee=order.fee_cost,
+                reason=reason,
+            )
+            if flattened:
+                return None
+            # Never leave a live exchange position untracked if emergency close fails.
+            pos = self._track_recovery_position(
+                symbol=symbol, side=side, fill=fill, amount=filled_amount,
+                sl=sl, tp2=tp2, atr_value=atr_value, regime=regime, bias=bias,
+                entry_score=entry_score, entry_fee=order.fee_cost,
+                df_15m=df_15m, df_5m=df_5m, entry_result=entry_result, reason="INVALID_RISK",
+            )
+            try:
+                await self.client.move_sl_to_breakeven(
+                    symbol, side, pos.stop_loss, pos.amount, tp_price=pos.tp2
+                )
+            except Exception as exc:
+                logger.critical("[POS] %s recovery protection update failed: %s", symbol, exc)
+            return pos
+
+        # Keep the structure target but recalculate TP1 from the actual fill.
+        tp1 = fill + c.tp1_r * actual_risk if side == LONG else fill - c.tp1_r * actual_risk
+        actual_rr = ((tp2 - fill) / actual_risk) if side == LONG else ((fill - tp2) / actual_risk)
+        minimum_rr = getattr(c, "minimum_actual_rr", 1.20)
+        if actual_rr < minimum_rr:
+            reason = f"post-fill RR {actual_rr:.2f} below minimum {minimum_rr:.2f}"
+            flattened = await self._emergency_flatten_new_fill(
+                symbol=symbol,
+                side=side,
+                amount=filled_amount,
+                fill=fill,
+                entry_fee=order.fee_cost,
+                reason=reason,
+            )
+            if flattened:
+                return None
+            # The exchange position still exists. Track and manage it rather than
+            # silently returning None and losing control of a live position.
+            return self._track_recovery_position(
+                symbol=symbol, side=side, fill=fill, amount=filled_amount,
+                sl=sl, tp2=tp2, atr_value=atr_value, regime=regime, bias=bias,
+                entry_score=entry_score, entry_fee=order.fee_cost,
+                df_15m=df_15m, df_5m=df_5m, entry_result=entry_result, reason="LOW_ACTUAL_RR",
+            )
+
         pos = Position(
             symbol=symbol,
             side=side,

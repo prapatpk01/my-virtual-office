@@ -1,0 +1,19 @@
+DUALCORE Balanced Rewrite — safety fixes
+
+1. Corrected RSI edge handling:
+   - one-sided gains => RSI 100
+   - one-sided losses => RSI 0
+   - flat market => RSI 50
+2. Entry WAIT logs now display score=N/A until a candidate is actually scored.
+3. Accepted candidates display score/current-threshold (e.g. 72/64).
+4. Revalidates actual R:R after the exchange fill.
+5. If post-fill stop or R:R is invalid, the bot sends a reduce-only emergency close with retries.
+6. If emergency close fails, the live exchange position is kept in local recovery management instead of being left untracked.
+7. Risk state persists atomically across restarts (daily PnL, loss streak, cooldown).
+8. Entry setup state and duplicate-signal keys persist atomically across restarts.
+9. Logs are emitted to stdout so Railway does not label normal INFO logs as stderr errors.
+
+Risk and portfolio requirements are unchanged:
+- 5% planned risk per accepted trade
+- maximum 2 total open positions
+- maximum 1 open position per symbol

@@ -53,14 +53,29 @@ def normalized_slope(series: pd.Series, atr_series: pd.Series, lookback: int = 3
 # ── Momentum ────────────────────────────────────────────────────────────────
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder RSI with symmetric zero-gain/zero-loss handling.
+
+    A one-sided advance must produce RSI=100 and a one-sided decline RSI=0.
+    The previous implementation replaced a zero average loss with NaN and then
+    filled it with 50, which incorrectly weakened strong bullish trends while
+    strong bearish trends still approached zero.  Both-zero windows remain 50.
+    """
+    period = max(1, int(period))
     delta = series.astype(float).diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    rs = avg_gain / avg_loss.where(avg_loss > EPSILON)
     out = 100.0 - 100.0 / (1.0 + rs)
-    return out.fillna(50.0)
+
+    gain_zero = avg_gain.abs() <= EPSILON
+    loss_zero = avg_loss.abs() <= EPSILON
+    out = out.mask(loss_zero & ~gain_zero, 100.0)
+    out = out.mask(gain_zero & ~loss_zero, 0.0)
+    out = out.mask(gain_zero & loss_zero, 50.0)
+    return out.fillna(50.0).clip(0.0, 100.0)
 
 
 def roc(series: pd.Series, period: int = 9) -> pd.Series:

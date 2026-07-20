@@ -7,7 +7,9 @@ Position size includes estimated round-trip fees and slippage so the intended
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -34,6 +36,50 @@ class RiskManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.state = RiskState()
+        self._state_path = os.path.join(
+            getattr(cfg, "state_dir", "state"), "risk_state.json"
+        )
+        self._load_state()
+
+    def _load_state(self) -> None:
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            self.state = RiskState(
+                day=str(raw.get("day", "")),
+                day_start_balance=float(raw.get("day_start_balance", 0.0)),
+                day_realized_pnl=float(raw.get("day_realized_pnl", 0.0)),
+                loss_streak=max(0, int(raw.get("loss_streak", 0))),
+                cooldown_until=max(0.0, float(raw.get("cooldown_until", 0.0))),
+                peak_balance=max(0.0, float(raw.get("peak_balance", 0.0))),
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            self.state = RiskState()
+
+    def _save_state(self) -> None:
+        directory = os.path.dirname(self._state_path) or "."
+        os.makedirs(directory, exist_ok=True)
+        tmp = f"{self._state_path}.tmp"
+        payload = {
+            "version": 1,
+            "day": self.state.day,
+            "day_start_balance": self.state.day_start_balance,
+            "day_realized_pnl": self.state.day_realized_pnl,
+            "loss_streak": self.state.loss_streak,
+            "cooldown_until": self.state.cooldown_until,
+            "peak_balance": self.state.peak_balance,
+        }
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, self._state_path)
+        except OSError as exc:
+            logger.error("[RISK] failed to persist risk state: %s", exc)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
     def _roll_day(self, balance: float, now: float) -> None:
         today = _day_key(now)
@@ -43,6 +89,7 @@ class RiskManager:
             self.state.day_realized_pnl = 0.0
             if self.state.peak_balance <= 0:
                 self.state.peak_balance = max(balance, 0.0)
+            self._save_state()
 
     def register_trade_result(self, pnl: float, balance_after: float, now: float) -> None:
         """Register one *fully closed trade*, not each partial leg."""
@@ -65,6 +112,7 @@ class RiskManager:
         elif pnl > epsilon:
             self.state.loss_streak = 0
         # A near-zero trade neither resets nor increases the streak.
+        self._save_state()
 
     def is_in_cooldown(self, now: float) -> bool:
         return now < self.state.cooldown_until

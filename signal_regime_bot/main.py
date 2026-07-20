@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 
 import pandas as pd
@@ -40,6 +41,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger("main")
 
@@ -47,6 +50,16 @@ logger = logging.getLogger("main")
 def _sym(symbol: str) -> str:
     """'BTC/USDT:USDT' -> 'BTC' for compact Telegram output."""
     return symbol.split("/")[0]
+
+
+def _entry_score_text(entry) -> str:
+    """Render N/A until a complete candidate was actually scored."""
+    if entry is None or not getattr(entry, "score_evaluated", False):
+        return "N/A"
+    threshold = getattr(entry, "score_threshold", None)
+    if threshold is None:
+        return f"{entry.entry_score:.0f}"
+    return f"{entry.entry_score:.0f}/{threshold:.0f}"
 
 
 def _stats_reset_path(state_dir: str) -> str:
@@ -562,9 +575,11 @@ class Bot:
                     bias_str = f"`{b.direction}` 1H`{b.score_1h:.0f}` 15M`{b.score_15m:.0f}` 5M`{b.score_5m:.0f}`"
                 else:
                     bias_str = "`—`"
-                entry_str = (f"`{sig.entry.setup_type or 'WAIT'} score={sig.entry.entry_score:.0f} "
-                             f"HMA={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
-                            if sig.entry is not None else "`-`")
+                entry_str = (
+                    f"`{sig.entry.setup_type or 'WAIT'} score={_entry_score_text(sig.entry)} "
+                    f"HMA={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
+                    if sig.entry is not None else "`-`"
+                )
                 lines.append(
                     f"`{sym}` {pos_label}\n"
                     f"  regime `{sig.regime.label}`\n"
@@ -705,9 +720,11 @@ class Bot:
                 bias_label = f"{sig.bias.direction}(1H={sig.bias.score_1h:.0f},15M={sig.bias.score_15m:.0f},5M={sig.bias.score_5m:.0f})"
             else:
                 bias_label = "—"
-            entry_label = (f"{sig.entry.setup_type or 'WAIT'} score={sig.entry.entry_score:.0f} "
-                          f"HMA={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
-                          if sig.entry is not None else "-")
+            entry_label = (
+                f"{sig.entry.setup_type or 'WAIT'} score={_entry_score_text(sig.entry)} "
+                f"HMA={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
+                if sig.entry is not None else "-"
+            )
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(
                 "  %-16s %-24s regime=%-20s bias=%-40s entry=%-5s dir=%s%s%s",

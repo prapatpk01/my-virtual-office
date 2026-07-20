@@ -13,7 +13,9 @@ chop and candle-quality gates reduce false entries.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+import json
+import os
 from typing import Optional
 
 import numpy as np
@@ -45,6 +47,8 @@ class EntryResult:
     macd_hist: float = 0.0  # kept for existing status views; now candidate edge
     cross_id: object = None  # deterministic signal key, kept for caller compatibility
     entry_score: float = 0.0
+    score_evaluated: bool = False
+    score_threshold: Optional[float] = None
     setup_type: str = ""
     trigger: str = ""
     planned_stop: Optional[float] = None
@@ -118,12 +122,122 @@ class EntryEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._state: dict[str, _SetupState] = {}
+        self._state_path = os.path.join(
+            getattr(cfg, "state_dir", "state"), "entry_engine_state.json"
+        )
+        self._load_state()
+
+    @staticmethod
+    def _json_key(value):
+        if value is None:
+            return None
+        if isinstance(value, tuple):
+            return [EntryEngine._json_key(x) for x in value]
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        return value
+
+    @staticmethod
+    def _restore_key(value):
+        if isinstance(value, list):
+            return tuple(EntryEngine._restore_key(x) for x in value)
+        return value
+
+    @staticmethod
+    def _restore_ts(value) -> Optional[pd.Timestamp]:
+        if value in (None, ""):
+            return None
+        try:
+            return pd.Timestamp(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _load_state(self) -> None:
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+            return
+        for symbol, raw in payload.get("symbols", {}).items():
+            try:
+                pb_raw = raw.get("pullback")
+                bo_raw = raw.get("breakout")
+                pullback = None
+                breakout = None
+                if pb_raw:
+                    pullback = _PullbackSetup(
+                        direction=str(pb_raw["direction"]),
+                        started_bar=int(pb_raw["started_bar"]),
+                        started_ts=self._restore_ts(pb_raw["started_ts"]),
+                        setup_low=float(pb_raw["setup_low"]),
+                        setup_high=float(pb_raw["setup_high"]),
+                        trigger_level=float(pb_raw["trigger_level"]),
+                        invalidation=float(pb_raw["invalidation"]),
+                        location_score=float(pb_raw["location_score"]),
+                    )
+                if bo_raw:
+                    breakout = _BreakoutSetup(
+                        direction=str(bo_raw["direction"]),
+                        started_bar=int(bo_raw["started_bar"]),
+                        started_ts=self._restore_ts(bo_raw["started_ts"]),
+                        breakout_level=float(bo_raw["breakout_level"]),
+                        breakout_low=float(bo_raw["breakout_low"]),
+                        breakout_high=float(bo_raw["breakout_high"]),
+                    )
+                self._state[str(symbol)] = _SetupState(
+                    last_processed_bar=self._restore_ts(raw.get("last_processed_bar")),
+                    pullback=pullback,
+                    breakout=breakout,
+                    last_entry_key=self._restore_key(raw.get("last_entry_key")),
+                    last_candidate_key=self._restore_key(raw.get("last_candidate_key")),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def _persist_state(self) -> None:
+        directory = os.path.dirname(self._state_path) or "."
+        os.makedirs(directory, exist_ok=True)
+        symbols = {}
+        for symbol, state in self._state.items():
+            pullback = asdict(state.pullback) if state.pullback is not None else None
+            breakout = asdict(state.breakout) if state.breakout is not None else None
+            if pullback is not None:
+                pullback["started_ts"] = state.pullback.started_ts.isoformat()
+            if breakout is not None:
+                breakout["started_ts"] = state.breakout.started_ts.isoformat()
+            symbols[symbol] = {
+                "last_processed_bar": (
+                    state.last_processed_bar.isoformat()
+                    if state.last_processed_bar is not None else None
+                ),
+                "pullback": pullback,
+                "breakout": breakout,
+                "last_entry_key": self._json_key(state.last_entry_key),
+                "last_candidate_key": self._json_key(state.last_candidate_key),
+            }
+        tmp = f"{self._state_path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"version": 1, "symbols": symbols},
+                    fh,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            os.replace(tmp, self._state_path)
+        except OSError:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
     def _get_state(self, symbol: str) -> _SetupState:
         return self._state.setdefault(symbol, _SetupState())
 
     def reset_symbol(self, symbol: str) -> None:
         self._state.pop(symbol, None)
+        self._persist_state()
 
     def on_position_closed(self, symbol: str) -> None:
         # Clear any setup that existed before/during the position.  last_entry_key
@@ -132,6 +246,7 @@ class EntryEngine:
         state.pullback = None
         state.breakout = None
         state.last_candidate_key = None
+        self._persist_state()
 
     def observe(
         self,
@@ -695,10 +810,12 @@ class EntryEngine:
             ema_slow=snapshot["hma_slow"],
         )
         if snapshot["atr"] <= 0:
+            self._persist_state()
             return EntryResult(NONE, False, "ATR invalid", **base)
         if snapshot["obvious_chop"]:
             state.pullback = None
             state.breakout = None
+            self._persist_state()
             return EntryResult(
                 NONE,
                 False,
@@ -710,6 +827,7 @@ class EntryEngine:
             # momentum on the shock itself is blocked unless exceptionally clean.
             candle = snapshot["candle"]
             if candle.body_atr > 2.5 and candle.volume_ratio < 1.5:
+                self._persist_state()
                 return EntryResult(NONE, False, "volatility shock without quality confirmation", **base)
 
         support, resistance = self._nearest_levels(
@@ -743,6 +861,7 @@ class EntryEngine:
             if state.breakout is not None:
                 armed.append("MOM")
             armed_text = "+".join(armed) if armed else "none"
+            self._persist_state()
             return EntryResult(
                 NONE,
                 False,
@@ -759,9 +878,11 @@ class EntryEngine:
         if len(candidates) > 1 and abs(candidates[0].edge - candidates[1].edge) <= 2:
             selected = next((x for x in candidates if x.setup_type == FAST_PULLBACK), selected)
         if state.last_entry_key is not None and selected.signal_key == state.last_entry_key:
+            self._persist_state()
             return EntryResult(NONE, False, "duplicate signal key", **base)
 
         state.last_candidate_key = selected.signal_key
+        self._persist_state()
         return EntryResult(
             direction=selected.direction,
             allow_entry=True,
@@ -776,6 +897,8 @@ class EntryEngine:
             macd_hist=selected.edge,
             cross_id=selected.signal_key,
             entry_score=selected.score,
+            score_evaluated=True,
+            score_threshold=selected.threshold,
             setup_type=selected.setup_type,
             trigger=selected.trigger,
             planned_stop=selected.stop,
@@ -793,6 +916,7 @@ class EntryEngine:
             state.last_candidate_key = None
             state.pullback = None
             state.breakout = None
+            self._persist_state()
 
     def check_exit(
         self,
