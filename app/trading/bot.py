@@ -1232,7 +1232,20 @@ class TradingBot:
                 strategy_name, conn_lev, env_lev, leverage,
             )
 
-        if sizing_mode == "margin":
+        # ── Fixed-notional sizing (takes precedence when set) ─────────────────
+        # A dead-simple, deterministic size that can't be thrown off by
+        # leverage/margin/free-vs-total math: the order value (notional) is a
+        # fixed $ amount and amount = notional / market price. Set
+        # FIXED_NOTIONAL_USD=0 to disable and fall back to margin/risk sizing.
+        fixed_notional = float(os.getenv("FIXED_NOTIONAL_USD", "35"))
+        if fixed_notional > 0:
+            sizing_mode = "fixed"
+            notional_target = fixed_notional
+            amount = round(notional_target / price, 6) if price > 0 else 0
+            risk_per_unit = abs(price - sl_p) if sl_p else 0
+            sizing_label = (f"fixed-notional ${fixed_notional:.2f} → amount {amount:g} "
+                            f"@ ${price:,.4f} (margin ${fixed_notional/max(leverage,1):.2f} at {leverage}x)")
+        elif sizing_mode == "margin":
             # ── Margin-based sizing (opt-in via signal.metadata) ─────────────
             # Position margin = margin_pct of TOTAL account equity (so "5% of
             # balance" stays consistent whether or not another position is
@@ -1281,7 +1294,7 @@ class TradingBot:
         required_margin = (notional / leverage) if is_futures else notional
         max_margin      = quote_balance * max_margin_pct
 
-        if sizing_mode != "margin" and required_margin > max_margin:
+        if sizing_mode not in ("margin", "fixed") and required_margin > max_margin:
             max_notional_by_risk_cap = max_margin * (leverage if is_futures else 1)
             capped_amount = round(max_notional_by_risk_cap / price, 6) if price > 0 else 0
             logger.warning(
