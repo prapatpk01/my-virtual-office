@@ -1,8 +1,8 @@
-"""DUALCORE live bot entry point.
+"""DUALCORE V1.8 live bot entry point.
 
 Loop: fetch closed 5M/15M/1H/4H bars, manage open positions every poll, and
-for flat symbols evaluate 4H Regime -> 1H/15M Bias -> 15M Context -> 5M EMA
-Dual Entry (Fast Pullback + Momentum Breakout/Retest).  Entry logic runs once
+for flat symbols evaluate 4H Macro -> 1H Bias -> 15M Structure/Location ->
+5M EMA timing (Fast Pullback + Major/Base Breakout-Retest).  Entry logic runs once
 per newly-closed 5M candle.  Position management keeps the slower EMA10/EMA20
 5M reversal exit to avoid closing from the faster EMA8/EMA13 entry pair alone.
 """
@@ -350,7 +350,8 @@ class Bot:
         try:
             await self.telegram.entry_signal(
                 symbol, sig.direction, pos.entry_price, pos.stop_loss, pos.tp1, pos.tp2,
-                sig.regime, sig.bias, sig.entry_score, risk_pct, self.cfg.leverage, chart_path)
+                sig.regime, sig.bias, sig.entry_score, risk_pct, self.cfg.leverage,
+                chart_path, sig.entry)
         except Exception as e:
             logger.error("[%s] entry_signal notify failed: %s", symbol, e, exc_info=True)
 
@@ -380,10 +381,16 @@ class Bot:
     def _preview_sl_tp(self, sig, execution_df) -> tuple[float, float, float]:
         """Use the Entry Engine's structure plan when available."""
         import indicators as ind
-        from position_manager import calc_stop_loss, calc_take_profits
+        from position_manager import calc_stop_loss, calc_take_profits, _normalize_planned_stop
         c = self.cfg
         if sig.entry is not None and sig.entry.planned_stop is not None:
-            sl = float(sig.entry.planned_stop)
+            atr_val = float(ind.atr(execution_df, c.sl_atr_period).iloc[-1])
+            side = "long" if sig.direction == LONG else "short"
+            sl, _, _ = _normalize_planned_stop(
+                c, side, sig.price, float(sig.entry.planned_stop), atr_val
+            )
+            if sl <= 0:
+                sl = float(sig.entry.planned_stop)
             one_r = abs(sig.price - sl)
             tp1 = sig.price + c.tp1_r * one_r if sig.direction == LONG else sig.price - c.tp1_r * one_r
             tp2 = float(sig.entry.planned_target) if sig.entry.planned_target is not None else (
@@ -411,30 +418,36 @@ class Bot:
         if ev == "TP1_HIT":
             await self.telegram.tp1_hit(symbol, event["price"], event["pnl"], event["new_sl"], ev=event)
         elif ev == "TP2_HIT":
-            await self.telegram.tp2_hit(symbol, event["price"], event["pnl"], ev=event)
+            await self.telegram.tp2_hit(symbol, event["price"], event.get("trade_pnl", event["pnl"]), ev=event)
         elif ev == "SL_HIT":
-            await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=False, ev=event)
+            await self.telegram.sl_hit(symbol, event["price"], event.get("trade_pnl", event["pnl"]), at_breakeven=False, ev=event)
         elif ev == "BE_HIT":
-            await self.telegram.sl_hit(symbol, event["price"], event["pnl"], at_breakeven=True, ev=event)
+            await self.telegram.sl_hit(symbol, event["price"], event.get("trade_pnl", event["pnl"]), at_breakeven=True, ev=event)
         elif ev in (EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA):
-            await self.telegram.early_exit(symbol, event["price"], event["pnl"],
+            await self.telegram.early_exit(symbol, event["price"], event.get("trade_pnl", event["pnl"]),
                                            ev, event.get("exit_detail", ""), ev=event)
         elif ev == "SPIKE_GUARD":
-            await self.telegram.spike_guard(symbol, event["price"], event["pnl"],
+            await self.telegram.spike_guard(symbol, event["price"], event.get("trade_pnl", event["pnl"]),
                                             event.get("spike_reason", ""), ev=event)
         elif ev == "TP1_THEN_EXTERNAL_CLOSE":
             # The exchange-side algo closed the FULL position before our TP1
             # partial fired — no separate TP1 leg happened, just note the
             # approximate total pnl for the trade.
-            await self.telegram.tp2_hit(symbol, event["price"], event["pnl"], ev=event)
+            await self.telegram.tp2_hit(symbol, event["price"], event.get("trade_pnl", event["pnl"]), ev=event)
         elif ev == "ERROR":
             await self.telegram.error(symbol, event.get("detail", "unknown error"))
 
         if ev in self._TERMINAL_EVENTS and symbol:
-            cooldown_sec = self.cfg.symbol_cooldown_min * 60
+            if ev == "SL_HIT":
+                cooldown_min = getattr(self.cfg, "symbol_sl_cooldown_min", 90)
+            elif ev == "BE_HIT":
+                cooldown_min = getattr(self.cfg, "symbol_be_cooldown_min", 45)
+            else:
+                cooldown_min = self.cfg.symbol_cooldown_min
+            cooldown_sec = cooldown_min * 60
             self._symbol_cooldown_until[symbol] = time.time() + cooldown_sec
             logger.info("[%s] closed (%s) — cooldown %d min before next entry",
-                       symbol, ev, self.cfg.symbol_cooldown_min)
+                       symbol, ev, cooldown_min)
             # Trade log for /stats and /trades. A trade is a win only when its
             # final post-fee PnL is positive; TP1 is tracked separately.
             self._trade_log.append({

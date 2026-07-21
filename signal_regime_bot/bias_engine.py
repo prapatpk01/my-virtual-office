@@ -1,8 +1,9 @@
-"""Layer 2: independent Bull/Bear multi-timeframe bias scoring.
+"""DUALCORE V1.8 directional bias engine.
 
-Unlike the previous implementation, Bear score is not computed as 100-Bull.
-Every directional condition has an exact inverse. Missing or ambiguous evidence
-adds zero to both sides and can never silently become a Short signal.
+1H chooses the active side, 15M confirms that the side is not structurally
+invalid, and 5M is informational only.  Bull and bear evidence are calculated
+independently with mirrored rules.  A noisy 5M pullback can never flip the HTF
+permission by itself.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ NEUTRAL = "NEUTRAL"
 
 @dataclass
 class TFBiasScore:
-    score: float  # bull-lean display score, 0..100
+    score: float
     bull_score: float = 0.0
     bear_score: float = 0.0
     direction: str = BIAS_NEUTRAL
@@ -58,70 +59,91 @@ class BiasEngine:
     def _tf_score(self, df: pd.DataFrame) -> TFBiasScore:
         c = self.cfg
         if df is None or len(df) < max(c.bias_ema_slow + 10, 70):
-            return TFBiasScore(50.0, direction=BIAS_NEUTRAL, components={"insufficient": True})
+            return TFBiasScore(
+                50.0,
+                direction=BIAS_NEUTRAL,
+                components={"insufficient": True},
+            )
 
         close = df["close"]
         price = ind.safe_float(close.iloc[-1])
-        ema20 = ind.ema(close, c.bias_ema_fast)
-        ema50 = ind.ema(close, c.bias_ema_slow)
+        ema20_s = ind.ema(close, c.bias_ema_fast)
+        ema50_s = ind.ema(close, c.bias_ema_slow)
+        ema20 = ind.safe_float(ema20_s.iloc[-1])
+        ema50 = ind.safe_float(ema50_s.iloc[-1])
         atr_s = ind.atr(df, 14)
-        slope20 = ind.safe_float(ind.normalized_slope(ema20, atr_s, 3).iloc[-1])
+        atr_value = ind.safe_float(atr_s.iloc[-1])
+        slope20 = ind.safe_float(ind.normalized_slope(ema20_s, atr_s, 3).iloc[-1])
+
         line, signal, hist = ind.macd(close)
         macd_line = ind.safe_float(line.iloc[-1])
         macd_signal = ind.safe_float(signal.iloc[-1])
         macd_hist = ind.safe_float(hist.iloc[-1])
         roc9 = ind.safe_float(ind.roc(close, c.bias_roc_period).iloc[-1])
         rsi14 = ind.safe_float(ind.rsi(close, 14).iloc[-1], 50.0)
-        adx_s, plus_di_s, minus_di_s = ind.adx(df, 14)
+        adx_s, plus_s, minus_s = ind.adx(df, 14)
         adx_now = ind.safe_float(adx_s.iloc[-1])
-        plus_di = ind.safe_float(plus_di_s.iloc[-1])
-        minus_di = ind.safe_float(minus_di_s.iloc[-1])
+        plus_di = ind.safe_float(plus_s.iloc[-1])
+        minus_di = ind.safe_float(minus_s.iloc[-1])
+
         structure = ind.market_structure(
             df["high"], df["low"], c.bias_structure_left, c.bias_structure_right
         )
-        bull_bos, _ = ind.latest_bos(
+        bull_bos, bull_level = ind.latest_bos(
             df, LONG, c.bias_structure_left, c.bias_structure_right, 0.18
         )
-        bear_bos, _ = ind.latest_bos(
+        bear_bos, bear_level = ind.latest_bos(
             df, SHORT, c.bias_structure_left, c.bias_structure_right, 0.18
         )
         rolling_vwap = ind.vwap(df, min(48, max(len(df) - 1, 1)))
         vwap_value = ind.safe_float(rolling_vwap.iloc[-1], price)
-        candle = ind.candle_metrics(df, ind.safe_float(atr_s.iloc[-1]))
+        candle = ind.candle_metrics(df, atr_value)
 
+        # Evidence groups are independent and mirrored.  No side is derived as
+        # the complement of the other.
         bull = {
-            "structure": 25.0 if structure == "HH_HL" else 12.0 if bull_bos else 0.0,
-            "trend": 15.0 if ema20.iloc[-1] > ema50.iloc[-1] else 0.0,
-            "price": 10.0 if price > ema20.iloc[-1] else 0.0,
-            "slope": 10.0 if slope20 > 0.03 else 5.0 if slope20 > 0 else 0.0,
+            "structure": 22.0 if structure == "HH_HL" else 11.0 if bull_bos else 0.0,
+            "ema_alignment": 16.0 if ema20 > ema50 else 0.0,
+            "price_hold": 10.0 if price > ema20 else 0.0,
+            "ema_slope": 10.0 if slope20 > 0.03 else 5.0 if slope20 > 0 else 0.0,
             "macd": 10.0 if macd_line > macd_signal and macd_hist > 0 else 0.0,
-            "roc": 7.5 if roc9 > 0 else 0.0,
-            "rsi": 5.0 if 50 <= rsi14 <= 72 else 2.5 if rsi14 > 50 else 0.0,
+            "roc": 7.0 if roc9 > 0 else 0.0,
             "dmi": 10.0 if plus_di > minus_di else 0.0,
-            "adx": 2.5 if adx_now >= 13 else 0.0,
-            "vwap": 2.5 if price > vwap_value else 0.0,
-            "directional_volume": 2.5 if candle.volume_ratio >= c.bias_rel_vol_min and candle.bullish else 0.0,
+            "adx": 5.0 if adx_now >= 15 else 2.5 if adx_now >= 11 else 0.0,
+            "rsi": 4.0 if 50 <= rsi14 <= 72 else 2.0 if rsi14 > 50 else 0.0,
+            "vwap": 3.0 if price > vwap_value else 0.0,
+            "directional_volume": (
+                3.0
+                if candle.volume_ratio >= c.bias_rel_vol_min and candle.bullish
+                else 0.0
+            ),
         }
         bear = {
-            "structure": 25.0 if structure == "LH_LL" else 12.0 if bear_bos else 0.0,
-            "trend": 15.0 if ema20.iloc[-1] < ema50.iloc[-1] else 0.0,
-            "price": 10.0 if price < ema20.iloc[-1] else 0.0,
-            "slope": 10.0 if slope20 < -0.03 else 5.0 if slope20 < 0 else 0.0,
+            "structure": 22.0 if structure == "LH_LL" else 11.0 if bear_bos else 0.0,
+            "ema_alignment": 16.0 if ema20 < ema50 else 0.0,
+            "price_hold": 10.0 if price < ema20 else 0.0,
+            "ema_slope": 10.0 if slope20 < -0.03 else 5.0 if slope20 < 0 else 0.0,
             "macd": 10.0 if macd_line < macd_signal and macd_hist < 0 else 0.0,
-            "roc": 7.5 if roc9 < 0 else 0.0,
-            "rsi": 5.0 if 28 <= rsi14 <= 50 else 2.5 if rsi14 < 50 else 0.0,
+            "roc": 7.0 if roc9 < 0 else 0.0,
             "dmi": 10.0 if minus_di > plus_di else 0.0,
-            "adx": 2.5 if adx_now >= 13 else 0.0,
-            "vwap": 2.5 if price < vwap_value else 0.0,
-            "directional_volume": 2.5 if candle.volume_ratio >= c.bias_rel_vol_min and candle.bearish else 0.0,
+            "adx": 5.0 if adx_now >= 15 else 2.5 if adx_now >= 11 else 0.0,
+            "rsi": 4.0 if 28 <= rsi14 <= 50 else 2.0 if rsi14 < 50 else 0.0,
+            "vwap": 3.0 if price < vwap_value else 0.0,
+            "directional_volume": (
+                3.0
+                if candle.volume_ratio >= c.bias_rel_vol_min and candle.bearish
+                else 0.0
+            ),
         }
         bull_score = min(100.0, float(sum(bull.values())))
         bear_score = min(100.0, float(sum(bear.values())))
         edge = bull_score - bear_score
         display = max(0.0, min(100.0, 50.0 + edge / 2.0))
         direction = (
-            BIAS_BULL if edge >= 10 and bull_score >= 55
-            else BIAS_BEAR if edge <= -10 and bear_score >= 55
+            BIAS_BULL
+            if edge >= 10 and bull_score >= 55
+            else BIAS_BEAR
+            if edge <= -10 and bear_score >= 55
             else BIAS_NEUTRAL
         )
         return TFBiasScore(
@@ -129,31 +151,27 @@ class BiasEngine:
             bull_score=round(bull_score, 1),
             bear_score=round(bear_score, 1),
             direction=direction,
-            components={"bull": bull, "bear": bear, "structure": structure, "edge": round(edge, 1)},
+            components={
+                "bull": bull,
+                "bear": bear,
+                "structure": structure,
+                "edge": round(edge, 1),
+                "bull_bos": bool(bull_bos),
+                "bear_bos": bool(bear_bos),
+                "bull_bos_level": bull_level,
+                "bear_bos_level": bear_level,
+                "adx": round(adx_now, 1),
+            },
         )
 
-    def _weight_profile(self, regime_label: str) -> tuple[float, float, float, float]:
-        c = self.cfg
+    def _weights(self, regime_label: str) -> tuple[float, float]:
+        # 5M is deliberately excluded from permission. It remains visible in
+        # diagnostics and is compared locally inside EntryEngine.
         if regime_label in (STRONG_BULL, STRONG_BEAR):
-            return (
-                c.bias_w1h_confirmed,
-                c.bias_w15m_confirmed,
-                c.bias_w5m_confirmed,
-                c.bias_threshold_confirmed,
-            )
+            return 0.60, 0.40
         if regime_label in BULL_LABELS + BEAR_LABELS:
-            return (
-                c.bias_w1h_early,
-                c.bias_w15m_early,
-                c.bias_w5m_early,
-                c.bias_threshold_early,
-            )
-        return (
-            c.bias_w1h_default,
-            c.bias_w15m_default,
-            c.bias_w5m_default,
-            c.bias_threshold_default,
-        )
+            return 0.52, 0.48
+        return 0.55, 0.45
 
     def analyze(
         self,
@@ -166,37 +184,46 @@ class BiasEngine:
         s1 = self._tf_score(df_1h)
         s15 = self._tf_score(df_15m) if df_15m is not None and len(df_15m) else s1
         s5 = self._tf_score(df_5m) if df_5m is not None and len(df_5m) else s15
-        w1, w15, w5, legacy_threshold = self._weight_profile(regime_label)
+        w1, w15 = self._weights(regime_label)
 
-        combined_bull = s1.bull_score * w1 + s15.bull_score * w15 + s5.bull_score * w5
-        combined_bear = s1.bear_score * w1 + s15.bear_score * w15 + s5.bear_score * w5
+        combined_bull = s1.bull_score * w1 + s15.bull_score * w15
+        combined_bear = s1.bear_score * w1 + s15.bear_score * w15
         edge = combined_bull - combined_bear
+        minimum_edge = getattr(c, "bias_min_directional_edge", 8.0)
 
         bull_regime = regime_label in BULL_LABELS
         bear_regime = regime_label in BEAR_LABELS
-        strong = regime_label in (STRONG_BULL, STRONG_BEAR)
-        threshold = max(60.0 if strong else 58.0, legacy_threshold - 5.0)
+        one_hour_bull_edge = s1.bull_score - s1.bear_score
+        one_hour_bear_edge = -one_hour_bull_edge
+        fifteen_bull_edge = s15.bull_score - s15.bear_score
+        fifteen_bear_edge = -fifteen_bull_edge
 
-        # 5M is now the execution timeframe.  It must NOT hard-block the HTF
-        # bias during a normal pullback; the 5M Entry Engine waits for its own
-        # EMA reclaim / structure trigger before opening.  It remains a small
-        # weighted modifier in the combined score only.
+        one_hour_bear_shift = bool(s1.components.get("bear_bos"))
+        one_hour_bull_shift = bool(s1.components.get("bull_bos"))
+        fifteen_bear_shift = bool(s15.components.get("bear_bos"))
+        fifteen_bull_shift = bool(s15.components.get("bull_bos"))
 
         long_ok = (
             bull_regime
-            and combined_bull >= threshold
-            and edge >= getattr(c, "bias_min_directional_edge", 8.0)
-            and s1.bull_score >= getattr(c, "bias_1h_min_bull", 55.0)
-            and s1.bull_score - s1.bear_score >= 5.0
-            and s15.bull_score >= getattr(c, "bias_15m_min_bull", 48.0)
+            and combined_bull >= 58.0
+            and edge >= minimum_edge
+            and s1.bull_score >= getattr(c, "bias_1h_min_bull", 56.0)
+            and one_hour_bull_edge >= 6.0
+            and s15.bull_score >= getattr(c, "bias_15m_min_bull", 50.0)
+            and fifteen_bull_edge >= -2.0
+            and not one_hour_bear_shift
+            and not (fifteen_bear_shift and s15.bear_score > s15.bull_score)
         )
         short_ok = (
             bear_regime
-            and combined_bear >= threshold
-            and edge <= -getattr(c, "bias_min_directional_edge", 8.0)
-            and s1.bear_score >= getattr(c, "bias_1h_min_bull", 55.0)
-            and s1.bear_score - s1.bull_score >= 5.0
-            and s15.bear_score >= getattr(c, "bias_15m_min_bull", 48.0)
+            and combined_bear >= 58.0
+            and edge <= -minimum_edge
+            and s1.bear_score >= getattr(c, "bias_1h_min_bull", 56.0)
+            and one_hour_bear_edge >= 6.0
+            and s15.bear_score >= getattr(c, "bias_15m_min_bull", 50.0)
+            and fifteen_bear_edge >= -2.0
+            and not one_hour_bull_shift
+            and not (fifteen_bull_shift and s15.bull_score > s15.bear_score)
         )
 
         detail = (
@@ -213,10 +240,12 @@ class BiasEngine:
             direction, bias = NEUTRAL, BIAS_NEUTRAL
             if not (bull_regime or bear_regime):
                 reason = f"NO TRADE: non-directional regime; {detail}"
-            elif abs(edge) < getattr(c, "bias_min_directional_edge", 8.0):
+            elif abs(edge) < minimum_edge:
                 reason = f"NO TRADE: directional edge too small; {detail}"
+            elif one_hour_bear_shift or one_hour_bull_shift:
+                reason = f"NO TRADE: fresh opposite 1H structure shift; {detail}"
             else:
-                reason = f"NO TRADE: HTF/15M bias quality failed; {detail}"
+                reason = f"NO TRADE: 1H/15M bias quality failed; {detail}"
 
         bull_lean = max(0.0, min(100.0, 50.0 + edge / 2.0))
         return BiasResult(

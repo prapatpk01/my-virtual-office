@@ -1,0 +1,68 @@
+DUALCORE V1.8 — BALANCED STRUCTURE ENTRY
+========================================
+
+Purpose
+-------
+Rewrite the strategy core after high-score BTC LONG entries repeatedly failed.
+The execution/integration framework remains compatible with the existing bot.
+
+Architecture
+------------
+4H Macro Conflict Filter
+  -> 1H Directional Regime/Bias
+  -> 15M Structure + Trend Groups + Active Location
+  -> 5M EMA8/EMA13 Timing + Independent Long/Short Local Edge
+  -> Structure/Fee-Aware Stop + Opposing Room + Actual R:R
+
+Core changes
+------------
+1. Entry scores are recalibrated. A candidate no longer receives a large base
+   score merely for reaching the scoring stage.
+2. 15M context requires at least 2 independent groups: trend, structure,
+   momentum, and price hold. Fresh opposite BOS blocks the side.
+3. 5M independently calculates Bull and Bear local pressure. Entries require:
+      local direction score >= 52
+      local direction edge >= 8
+   Direct breakout requires local edge >= 10.
+4. Fast Pullback:
+   - EMA-only touch may ARM but cannot enter on the same candle.
+   - Same-bar entry requires HTF level/sweep + strong candle + micro BOS.
+   - Normal trigger requires reclaim plus micro BOS, trigger break, sweep, or
+     confirmed EMA reclaim.
+5. Momentum:
+   - Uses a confirmed 15M swing break or a 10-bar 5M base break.
+   - Direct entry requires major displacement and a major/compressed level.
+   - Other breakouts wait 1-2 closed 5M candles for a retest.
+   - An active breakout setup is not overwritten by each new incremental high.
+6. Same-direction re-entry after full SL is locked until a fresh confirmed 15M
+   BOS or newly confirmed structure appears.
+7. Fixed a floating-point boundary bug that could reject a valid stop when the
+   calculated minimum and maximum stop distances were equal.
+8. Telegram Entry Signal now displays setup type, trigger, threshold, and local
+   directional edge.
+
+Default thresholds
+------------------
+Confirmed Pullback       68
+Same-bar HTF Pullback    74
+Breakout Retest          72
+Direct Major Breakout    78
+Local Direction Edge      8
+Direct Breakout Edge      10
+
+Risk/exposure retained as requested
+-----------------------------------
+Risk per accepted trade: 5% of balance
+Maximum open positions: 2 total
+Maximum position per symbol: 1
+
+Fee-aware management retained from V1.7
+---------------------------------------
+Minimum stop uses ATR, price-distance, and fee/slippage floors.
+TP1/TP2 and fee-adjusted runner stop remain enabled.
+Actual post-fill R:R is validated.
+
+Deployment
+----------
+Replace the files with the same names in the existing GitHub/Railway project.
+No additional Railway variables are required for this strategy version.

@@ -166,24 +166,38 @@ class TelegramNotifier:
 
     async def entry_signal(self, symbol: str, direction: str, price: float, sl: float,
                            tp1: float, tp2: float, regime, bias, entry_score: float,
-                           risk_pct: float, leverage: int, chart_path: str | None = None):
-        # bias is None for MEANREV / BREAKOUT style trades (they bypass the
-        # momentum-bias gate) — show the trade style instead.
+                           risk_pct: float, leverage: int, chart_path: str | None = None,
+                           entry_result=None):
         if bias is not None:
             bias_line = f"Bias: `{bias.bias}` ({bias.bull_score if direction=='LONG' else bias.bear_score:.0f})"
         else:
             bias_line = f"Style: `{getattr(regime, 'style', '—')}` ({getattr(regime, 'regime_type', '—')})"
+        setup_line = ""
+        score_line = f"Entry Score: `{entry_score:.0f}`"
+        edge_line = ""
+        if entry_result is not None:
+            setup = getattr(entry_result, "setup_type", "") or "—"
+            trigger = getattr(entry_result, "trigger", "") or "—"
+            threshold = getattr(entry_result, "score_threshold", None)
+            setup_line = f"Setup: `{setup}` | Trigger: `{trigger}`\n"
+            if threshold is not None:
+                score_line = f"Entry Score: `{entry_score:.0f}/{threshold:.0f}`"
+            components = getattr(entry_result, "score_components", {}) or {}
+            local_edge = components.get("local_direction_edge")
+            if local_edge is not None:
+                edge_line = f"\nLocal Edge: `{float(local_edge):+.0f}`"
         text = (
             f"🎯 *Entry Signal*\n\n"
             f"Symbol: `{symbol}`\n"
             f"Direction: *{direction}*\n"
+            f"{setup_line}"
             f"Entry: `{price:.6f}`\n"
             f"SL: `{sl:.6f}`\n"
             f"TP1: `{tp1:.6f}`\n"
             f"TP2: `{tp2:.6f}`\n"
             f"Regime: `{regime.name}` ({regime.score:.0f})\n"
             f"{bias_line}\n"
-            f"Entry Score: `{entry_score:.0f}`\n"
+            f"{score_line}{edge_line}\n"
             f"Risk: `{risk_pct*100:.1f}%`\n"
             f"Leverage: `{leverage}x`"
         )
@@ -205,12 +219,25 @@ class TelegramNotifier:
 
     @staticmethod
     def _net_block(pnl: float, ev: Optional[dict] = None) -> str:
-        """PnL line. When OKX fill actuals are present (realized + fees), show
-        the exact Net = Realized - openFeeAlloc - closeFee breakdown."""
+        """Clearly distinguish a partial-leg result from the whole-trade result."""
         if ev and ev.get("realized") is not None:
-            return (f"Net PnL: `{pnl:+.4f}` USDT\n"
-                    f"  realized `{ev['realized']:+.4f}` − openFee "
-                    f"`{ev.get('entry_fee_alloc', 0.0):.4f}` − closeFee `{ev.get('exit_fee', 0.0):.4f}`")
+            breakdown = (
+                f"  exit-leg realized `{ev['realized']:+.4f}` − openFeeAlloc "
+                f"`{ev.get('entry_fee_alloc', 0.0):.4f}` − closeFee `{ev.get('exit_fee', 0.0):.4f}`"
+            )
+            if ev.get("trade_pnl") is not None:
+                return (
+                    f"Trade Net PnL: `{float(ev['trade_pnl']):+.4f}` USDT\n"
+                    f"This exit leg: `{float(ev.get('pnl', pnl)):+.4f}` USDT\n"
+                    f"{breakdown}"
+                )
+            if ev.get("cumulative_pnl") is not None:
+                return (
+                    f"TP1 leg net: `{pnl:+.4f}` USDT\n"
+                    f"Banked cumulative net: `{float(ev['cumulative_pnl']):+.4f}` USDT\n"
+                    f"{breakdown}"
+                )
+            return f"Net PnL: `{pnl:+.4f}` USDT\n{breakdown}"
         return f"PnL: `{pnl:+.2f}` USDT"
 
     async def tp1_hit(self, symbol: str, price: float, pnl: float, new_sl: float,
@@ -219,7 +246,7 @@ class TelegramNotifier:
             f"🎯 *TP1 Hit* `{symbol}`\n\n"
             f"Price: `{price:.6f}`\n"
             f"{self._net_block(pnl, ev)}\n"
-            f"SL moved to Breakeven: `{new_sl:.6f}`"
+            f"Fee-adjusted runner SL: `{new_sl:.6f}`"
         )
 
     async def tp2_hit(self, symbol: str, price: float, pnl: float, ev: Optional[dict] = None):

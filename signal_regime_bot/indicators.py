@@ -419,6 +419,70 @@ def cross_count(fast: pd.Series, slow: pd.Series, lookback: int = 8) -> int:
     return int(np.sum(relation[1:] * relation[:-1] < 0))
 
 
+
+def latest_bos_event(
+    df: pd.DataFrame,
+    direction: str,
+    left: int = 3,
+    right: int = 3,
+    min_body_atr: float = 0.18,
+    scan_bars: int = 40,
+) -> tuple[Optional[pd.Timestamp], Optional[float]]:
+    """Return the latest closed-candle BOS event without future leakage.
+
+    Each candidate event is evaluated using only candles available at that
+    candle close.  This is intentionally a little more expensive than a
+    vectorized shortcut, but it is deterministic and safe for live/backtest
+    parity.
+    """
+    if df is None or len(df) < left + right + 8:
+        return None, None
+    start = max(left + right + 7, len(df) - max(int(scan_bars), 10))
+    event_ts: Optional[pd.Timestamp] = None
+    event_level: Optional[float] = None
+    for end in range(start, len(df)):
+        view = df.iloc[: end + 1]
+        hit, level = latest_bos(view, direction, left, right, min_body_atr)
+        if hit:
+            event_ts = pd.Timestamp(view.index[-1])
+            event_level = level
+    return event_ts, event_level
+
+
+def latest_confirmed_swing_confirmation(
+    df: pd.DataFrame,
+    kind: str,
+    left: int = 3,
+    right: int = 3,
+) -> tuple[Optional[pd.Timestamp], Optional[float]]:
+    """Return confirmation time and price of the newest confirmed swing.
+
+    A pivot at position ``i`` becomes knowable only after ``right`` additional
+    candles.  The returned timestamp is therefore the confirmation candle, not
+    the pivot candle itself.
+    """
+    if df is None or len(df) < left + right + 3:
+        return None, None
+    highs, lows = confirmed_swings(df["high"], df["low"], left, right)
+    points = highs if kind.upper() == "HIGH" else lows
+    if not points:
+        return None, None
+    point = points[-1]
+    confirmation_pos = point.position + max(1, int(right))
+    if confirmation_pos >= len(df):
+        return None, None
+    return pd.Timestamp(df.index[confirmation_pos]), float(point.price)
+
+
+def compression_ratio(df: pd.DataFrame, recent: int = 4, normal: int = 20) -> float:
+    """Recent average candle range divided by its longer baseline."""
+    if df is None or len(df) < normal + 2:
+        return 1.0
+    ranges = (df["high"] - df["low"]).astype(float)
+    recent_avg = safe_float(ranges.iloc[-recent - 1 : -1].mean(), 0.0)
+    normal_avg = safe_float(ranges.iloc[-normal - 1 : -1].mean(), 0.0)
+    return recent_avg / max(normal_avg, EPSILON) if normal_avg > 0 else 1.0
+
 def safe_float(value: object, default: float = 0.0) -> float:
     try:
         result = float(value)

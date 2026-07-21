@@ -98,6 +98,43 @@ def calc_stop_loss(
     return entry + distance
 
 
+
+
+def _stop_distance_bounds(cfg: Config, entry: float, atr_value: float) -> tuple[float, float, float]:
+    """Return fee-aware minimum/maximum stop distance and estimated cost distance."""
+    cost_distance = entry * (
+        2.0 * max(getattr(cfg, "fee_rate", 0.0), 0.0)
+        + max(getattr(cfg, "expected_slippage_pct", 0.0), 0.0)
+    )
+    minimum = max(
+        entry * max(getattr(cfg, "sl_min_pct", 0.0075), 0.0),
+        atr_value * getattr(cfg, "dual_min_stop_atr", 0.80),
+        cost_distance * getattr(cfg, "stop_fee_floor_mult", 3.0),
+    )
+    maximum = max(
+        atr_value * getattr(cfg, "dual_max_stop_atr", 2.20),
+        minimum,
+    )
+    pct_cap = entry * max(getattr(cfg, "sl_max_pct", 0.020), 0.0)
+    if pct_cap > 0:
+        maximum = max(minimum, min(maximum, pct_cap))
+    return minimum, maximum, cost_distance
+
+
+def _normalize_planned_stop(
+    cfg: Config, side: str, entry: float, planned_stop: float, atr_value: float
+) -> tuple[float, float, float]:
+    minimum, maximum, cost_distance = _stop_distance_bounds(cfg, entry, atr_value)
+    raw_distance = (entry - planned_stop) if side == LONG else (planned_stop - entry)
+    if raw_distance <= 0:
+        return 0.0, 0.0, cost_distance
+    distance = max(raw_distance, minimum)
+    if distance > maximum * (1.0 + 1e-9):
+        return 0.0, distance, cost_distance
+    stop = entry - distance if side == LONG else entry + distance
+    return stop, distance, cost_distance
+
+
 def calc_take_profits(
     direction: str,
     entry: float,
@@ -262,7 +299,9 @@ class PositionManager:
                 except Exception as exc:
                     logger.error("[POS] %s could not register emergency-close PnL: %s", symbol, exc)
                 self._mark_closed(symbol)
-                self.entry_engine.on_position_closed(symbol)
+                self.entry_engine.on_position_closed(
+                    symbol, side.upper(), reason, net
+                )
                 logger.critical(
                     "[POS] %s emergency-flattened after %s; estimated net PnL %.2f",
                     symbol,
@@ -377,9 +416,9 @@ class PositionManager:
             (side == LONG and 0 < planned_stop < price)
             or (side == SHORT and planned_stop > price)
         ):
-            sl = float(planned_stop)
+            proposed_sl = float(planned_stop)
         else:
-            sl = calc_stop_loss(
+            proposed_sl = calc_stop_loss(
                 side,
                 price,
                 atr_value,
@@ -390,8 +429,21 @@ class PositionManager:
                 c.sl_max_pct,
                 c.sl_tighten_mult,
             )
+        sl, stop_distance, cost_distance = _normalize_planned_stop(
+            c, side, price, proposed_sl, atr_value
+        )
         if sl <= 0 or (side == LONG and sl >= price) or (side == SHORT and sl <= price):
-            logger.warning("[POS] %s invalid stop %.8f for %s @ %.8f", symbol, sl, side, price)
+            logger.info(
+                "[POS] %s rejected: structure stop %.8f is invalid/too wide after fee-aware bounds",
+                symbol, proposed_sl,
+            )
+            return None
+        fee_drag_r = cost_distance / max(stop_distance, ind.EPSILON)
+        if fee_drag_r > getattr(c, "max_fee_drag_r", 0.35):
+            logger.info(
+                "[POS] %s rejected: estimated fee drag %.2fR exceeds %.2fR",
+                symbol, fee_drag_r, getattr(c, "max_fee_drag_r", 0.35),
+            )
             return None
 
         tp1, base_tp2 = calc_take_profits(side, price, sl, c.tp1_r, c.tp2_r)
@@ -588,7 +640,9 @@ class PositionManager:
         self.risk.register_trade_result(trade_pnl, balance, time.time())
         del self._positions[pos.symbol]
         self._mark_closed(pos.symbol)
-        self.entry_engine.on_position_closed(pos.symbol)
+        self.entry_engine.on_position_closed(
+            pos.symbol, pos.side.upper(), reason, trade_pnl
+        )
         return {
             "event": reason,
             "symbol": pos.symbol,
@@ -604,6 +658,39 @@ class PositionManager:
             "position": pos,
             "approximate": True,
         }
+
+    def _fee_adjusted_runner_stop(self, pos: Position, tp1_fill: float) -> tuple[float, bool, float]:
+        """Solve the runner stop so the whole trade remains net-positive after fees.
+
+        Uses the already banked TP1 net, the remaining allocated entry fee, and
+        the estimated fee on the runner exit. The stop is kept on the valid side
+        of the current TP1 fill to avoid an immediately-triggered stop order.
+        """
+        qty = max(pos.amount, ind.EPSILON)
+        fee = max(getattr(self.cfg, "fee_rate", 0.0), 0.0)
+        target_cash = (
+            pos.full_amount
+            * pos.one_r
+            * getattr(self.cfg, "be_trade_lock_r", 0.05)
+        )
+        remaining_entry_fee = pos.entry_fee * (pos.amount / max(pos.full_amount, ind.EPSILON))
+        cash_needed = target_cash - pos.realized_pnl + remaining_entry_fee
+        per_unit_needed = cash_needed / qty
+        market_buffer = max(
+            pos.one_r * getattr(self.cfg, "be_market_buffer_r", 0.05),
+            pos.entry_price * 0.0001,
+        )
+        if pos.side == LONG:
+            required = (pos.entry_price + per_unit_needed) / max(1.0 - fee, ind.EPSILON)
+            max_valid = tp1_fill - market_buffer
+            stop = min(max_valid, required) if required > max_valid else required
+            guarantee_ok = stop + 1e-12 >= required
+        else:
+            required = (pos.entry_price - per_unit_needed) / (1.0 + fee)
+            min_valid = tp1_fill + market_buffer
+            stop = max(min_valid, required) if required < min_valid else required
+            guarantee_ok = stop - 1e-12 <= required
+        return stop, guarantee_ok, target_cash
 
     async def _close_partial_tp1(self, pos: Position, price: float) -> dict:
         close_amount = min(round(pos.full_amount * self.cfg.tp1_fraction, 8), pos.amount)
@@ -628,13 +715,17 @@ class PositionManager:
         pos.amount = round(pos.amount - filled, 8)
         pos.tp1_hit = True
         pos.realized_pnl += leg["net"]
-        # Fee-aware positive breakeven. Exact entry can still be a net loss after
-        # round-trip fees, so lock at least 0.08R or the fee equivalent.
-        fee_lock = pos.entry_price * self.cfg.fee_rate * 2.2
-        lock_distance = max(pos.one_r * getattr(self.cfg, "be_lock_r", 0.08), fee_lock)
-        pos.stop_loss = (
-            pos.entry_price + lock_distance if pos.side == LONG else pos.entry_price - lock_distance
+        # Exact fee-adjusted trade-level breakeven. This uses TP1 banked net and
+        # the remaining runner fees instead of applying a raw price offset that
+        # can accidentally place the stop above TP1 and still leave the trade red.
+        pos.stop_loss, guarantee_ok, target_cash = self._fee_adjusted_runner_stop(
+            pos, leg["exit_price"]
         )
+        if not guarantee_ok:
+            logger.warning(
+                "[POS] %s runner stop had to be capped by live price; trade-level net lock is not guaranteed",
+                pos.symbol,
+            )
         sl_ok = await self.client.move_sl_to_breakeven(
             pos.symbol,
             pos.side,
@@ -653,6 +744,9 @@ class PositionManager:
             "entry_fee_alloc": leg["entry_fee_alloc"],
             "sl_moved": sl_ok,
             "new_sl": pos.stop_loss,
+            "cumulative_pnl": pos.realized_pnl,
+            "trade_lock_target": target_cash,
+            "trade_lock_guaranteed": guarantee_ok,
             "position": pos,
         }
 
@@ -682,7 +776,9 @@ class PositionManager:
         self.risk.register_trade_result(trade_pnl, balance, time.time())
         del self._positions[pos.symbol]
         self._mark_closed(pos.symbol)
-        self.entry_engine.on_position_closed(pos.symbol)
+        self.entry_engine.on_position_closed(
+            pos.symbol, pos.side.upper(), reason, trade_pnl
+        )
         return {
             "event": reason,
             "symbol": pos.symbol,

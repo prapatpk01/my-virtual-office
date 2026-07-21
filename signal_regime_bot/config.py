@@ -283,8 +283,8 @@ class Config:
     # Floor/ceiling on SL distance as % of entry price. The floor exists so a
     # quiet-candle ATR stop can never come out so tight that TP1/TP2 R-multiple
     # profit targets fail to clear round-trip fees (see calc_stop_loss docstring).
-    sl_min_pct: float = 0.005   # 0.4%
-    sl_max_pct: float = 0.030  # 3.5%
+    sl_min_pct: float = 0.0075  # 0.75% minimum price distance; prevents fee/noise dominated stops
+    sl_max_pct: float = 0.020   # 2.0% hard ceiling for normal entries
     # Pulls the final SL distance in to this fraction of the ATR/swing/floor
     # calc. MEASURED on the local BTC/XAU set (Jan-May 2026): 0.85 made every
     # metric WORSE (PF 0.647->0.520, WR 64.4%->61.9%, net -17828->-19324,
@@ -296,13 +296,15 @@ class Config:
     sl_tighten_mult: float = 1.0
     # Balanced partial-profit geometry: 50% at 1R, 50% at 2R.
     # A full TP2 outcome earns 1.5R gross instead of less than 1R.
-    tp1_r: float = 1.0
-    tp1_fraction: float = 0.5
-    tp2_r: float = 2.0
+    tp1_r: float = 1.20
+    tp1_fraction: float = 0.50
+    tp2_r: float = 2.40
     swing_lookback_left: int = 3
     swing_lookback_right: int = 3
 
-    symbol_cooldown_min: int = 15  # no new entry on a symbol for this long after it closes
+    symbol_cooldown_min: int = 30   # normal close cooldown
+    symbol_sl_cooldown_min: int = 90  # longer pause after full SL to avoid repeated same-symbol churn
+    symbol_be_cooldown_min: int = 45  # pause after fee-adjusted runner stop
 
     # ── SpikeGuard (fast 5m/15m reversal-spike protection) ───────────────────
     # Runs EVERY poll tick while a position is open — the slow 30m health
@@ -417,11 +419,11 @@ class Config:
     booster_score_to_bonus: float = 0.5        # early_bonus = min(early_score * this, max_bonus)
 
 
-    # ── DUALCORE Balanced V1.6 — 5M EMA execution ───────────────────────────
+    # ── DUALCORE V1.8 — Balanced Structure Entry ───────────────────────────
     # 4H macro + 1H bias + 15M context/structure + 5M EMA dual entry.
     # EMA8/EMA13 is used instead of HMA on 5M to reduce whipsaw while keeping
-    # entries fast enough for a target of roughly 3–4 trades/day across seven
-    # active symbols when market conditions provide valid setups.
+    # entries fast enough for active multi-symbol trading. EMA is timing only;
+    # 15M structure/location and 5M directional edge remain mandatory.
     dual_entry_ema_fast: int = 8
     dual_entry_ema_slow: int = 13
     dual_entry_trend_ema: int = 20
@@ -440,40 +442,62 @@ class Config:
 
     entry_swing_left: int = 3
     entry_swing_right: int = 3
-    dual_pullback_zone_atr: float = 0.12
-    dual_pullback_depth_atr: float = 0.20
+    dual_pullback_zone_atr: float = 0.15
+    dual_pullback_depth_atr: float = 0.30
     dual_pullback_window_bars: int = 4
-    dual_pullback_max_extension_atr: float = 0.95
-    dual_pullback_threshold: float = 60.0
-    dual_same_bar_pullback_threshold: float = 66.0
-    dual_pullback_min_body_atr: float = 0.12
-    dual_pullback_close_quality: float = 0.58
-    dual_pullback_min_room_r: float = 1.00
+    dual_pullback_max_extension_atr: float = 0.80
+    dual_pullback_threshold: float = 68.0
+    dual_same_bar_pullback_threshold: float = 74.0
+    dual_pullback_min_body_atr: float = 0.15
+    dual_pullback_close_quality: float = 0.62
+    dual_pullback_min_room_r: float = 1.10
 
-    dual_breakout_lookback: int = 5
+    dual_breakout_lookback: int = 10
     dual_momentum_expiry_bars: int = 2
-    dual_momentum_threshold: float = 64.0
-    dual_strong_breakout_threshold: float = 62.0
-    dual_momentum_min_body_atr: float = 0.15
-    dual_momentum_close_quality: float = 0.65
+    dual_momentum_threshold: float = 72.0
+    dual_strong_breakout_threshold: float = 78.0
+    dual_momentum_min_body_atr: float = 0.18
+    dual_momentum_close_quality: float = 0.68
     dual_momentum_volume_ratio: float = 1.05
-    dual_momentum_max_extension_atr: float = 1.00
-    dual_strong_momentum_extension_atr: float = 1.10
-    dual_momentum_min_room_r: float = 1.10
+    dual_momentum_max_extension_atr: float = 1.35
+    dual_strong_momentum_extension_atr: float = 1.20
+    dual_momentum_min_room_r: float = 1.20
 
-    dual_min_stop_atr: float = 0.45
-    dual_max_stop_atr: float = 1.40
+    # V1.8 structure/edge gates. These are intentionally hard-coded defaults
+    # so Railway needs no additional variables.
+    dual_context_min_groups: int = 2
+    dual_local_directional_edge: float = 8.0
+    dual_direct_directional_edge: float = 10.0
+    dual_local_score_floor: float = 52.0
+    dual_base_compression_ratio: float = 0.88
+    dual_direct_min_body_atr: float = 0.30
+    dual_direct_close_quality: float = 0.75
+    dual_direct_max_level_extension_atr: float = 0.60
+    dual_retest_max_level_extension_atr: float = 0.50
+    dual_direct_breakout_min_room_r: float = 1.30
+    dual_reentry_requires_new_structure: bool = True
+    dual_reentry_bos_scan_bars: int = 48
+
+    dual_min_stop_atr: float = 0.80
+    dual_max_stop_atr: float = 2.20
     dual_stop_buffer_atr: float = 0.08
     dual_target_buffer_atr: float = 0.08
-    dual_pullback_tp2_r: float = 2.0
-    dual_momentum_tp2_r: float = 2.0
-    minimum_actual_rr: float = 1.10
+    dual_pullback_tp2_r: float = 2.20
+    dual_momentum_tp2_r: float = 2.40
+    minimum_actual_rr: float = 1.50
 
-    bias_min_directional_edge: float = 6.0
-    bias_1h_min_bull: float = 52.0
-    bias_15m_min_bull: float = 48.0
+    bias_min_directional_edge: float = 8.0
+    bias_1h_min_bull: float = 56.0
+    bias_15m_min_bull: float = 50.0
 
     expected_slippage_pct: float = 0.0005
+    # A setup is rejected if round-trip fee+slippage consumes too much of 1R.
+    max_fee_drag_r: float = 0.35
+    stop_fee_floor_mult: float = 3.0
+    # After TP1, calculate an exact runner stop that keeps the whole trade at
+    # least this much net profit after remaining entry/exit fees.
+    be_trade_lock_r: float = 0.05
+    be_market_buffer_r: float = 0.05
     be_lock_r: float = 0.08
     exit_weak_signals: int = 2
 

@@ -1,0 +1,13 @@
+DUALCORE V1.7 FEE-AWARE WIDER STOPS
+
+- Final stop distance is enforced after the Entry Engine plan; planned structure stops can no longer bypass the percent/fee floor.
+- Minimum stop: max(0.80 ATR, 0.75% of entry, 3x estimated round-trip cost distance).
+- Maximum normal stop: up to 2.20 ATR, capped near 2.0% of entry.
+- Reject setup when expected fees+slippage consume more than 0.35R.
+- TP1: 1.20R, close 50%.
+- Pullback TP2: up to 2.20R; Momentum TP2: up to 2.40R.
+- Minimum actual R:R: 1.50 after structure adjustment and again after actual fill.
+- TP1 runner stop is solved from actual banked TP1 net + remaining fees, targeting at least +0.05R total trade net.
+- Telegram distinguishes TP1 leg PnL from final whole-trade PnL.
+- 90-minute same-symbol cooldown after SL; 45 minutes after runner/BE stop.
+- Risk remains fixed at 5% of balance per accepted trade; max 2 total positions; max 1 per symbol.
