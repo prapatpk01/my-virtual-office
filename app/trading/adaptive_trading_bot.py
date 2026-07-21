@@ -3433,6 +3433,77 @@ class TradingBot:
         )
         return True
 
+    def _backfill_reconciled_trade(self, symbol: str, exchange_adapter) -> None:
+        """A position that closes via an exchange-side order (the attached
+        TP2/SL) while the bot is offline or mid-restart is caught by
+        reconcile_with_exchange AFTER the fact — _log_trade() only ever runs
+        from the bot's own on_tick EXITING state, so it never fires here,
+        and the trade would otherwise vanish from trade_journal entirely
+        (this is why /stats' TP1/TP2/SL-hit breakdown can undercount OKX's
+        real trade total — e.g. 3/9 instead of 9/9, every restart drops
+        whatever closed while the process was down).
+        Backfills a best-effort entry using OKX's own closed-position history
+        for the real exit price/pnl, and infers 'targets_hit' from where
+        that close price landed relative to this trade's own tp1/tp2 —
+        purely additive to whatever the bot already saw locally before going
+        offline (never removes a hit it already recorded)."""
+        t = self.current_trade
+        if not t or not hasattr(exchange_adapter, "fetch_closed_positions_history"):
+            return
+        entry_dt = t.get("entry_time")
+        if not isinstance(entry_dt, datetime.datetime):
+            entry_dt = datetime.datetime.now(datetime.timezone.utc)
+        elif entry_dt.tzinfo is None:
+            entry_dt = entry_dt.replace(tzinfo=datetime.timezone.utc)
+        try:
+            since_ms = int(entry_dt.timestamp() * 1000) - 60_000
+            rows = exchange_adapter.fetch_closed_positions_history(
+                since_ms=since_ms, symbols=[symbol])
+        except Exception as e:
+            self._log_event(f"[RECONCILE] OKX history backfill failed (non-fatal): {e}",
+                            level="warning")
+            return
+        if not rows:
+            return
+
+        row         = rows[-1]  # most recent close for this symbol since entry
+        direction   = t.get("direction", "LONG")
+        dir_mult    = 1 if direction == "LONG" else -1
+        close_price = float(row.get("close_price") or 0.0)
+        tp1         = float(t.get("tp1") or 0.0)
+        tp2         = float(t.get("tp2") or 0.0)
+        targets_hit = list(t.get("targets_hit", []))
+        if tp2 and dir_mult * (close_price - tp2) >= 0 and "T2" not in targets_hit:
+            targets_hit.append("T2")
+        if tp1 and dir_mult * (close_price - tp1) >= 0 and "T1" not in targets_hit:
+            targets_hit.append("T1")
+        pnl = float(row.get("pnl") or 0.0)
+        close_ts = row.get("close_ts")
+        closed_at = (
+            datetime.datetime.fromtimestamp(close_ts / 1000, tz=datetime.timezone.utc)
+            if close_ts else datetime.datetime.now(datetime.timezone.utc)
+        ).isoformat()
+
+        self.trade_journal.append({
+            "symbol":      symbol,
+            "direction":   direction,
+            "entry":       t.get("entry"),
+            "exit":        close_price,
+            "sl":          t.get("sl"),
+            "tp1":         tp1,
+            "tp2":         tp2,
+            "win_loss":    "WIN" if pnl > 0 else "LOSS",
+            "pnl":         pnl,
+            "targets_hit": targets_hit,
+            "exit_reason": "RECONCILE_EXTERNAL_CLOSE",
+            "closed_at":   closed_at,
+        })
+        self.trade_journal = self.trade_journal[-200:]
+        self._log_event(
+            f"[RECONCILE] backfilled trade_journal from OKX history: "
+            f"targets_hit={targets_hit} pnl={pnl:+.2f}"
+        )
+
     def reconcile_with_exchange(self, symbol: str, exchange_adapter) -> None:
         try:
             live_position = exchange_adapter.fetch_open_position(symbol)
@@ -3466,6 +3537,7 @@ class TradingBot:
                 "clearing local state → SCANNING",
                 level="warning",
             )
+            self._backfill_reconciled_trade(symbol, exchange_adapter)
             self.position_open = False
             self.current_trade = {}
             # [WHIPSAW GUARD] A close that happens outside _close_position()
