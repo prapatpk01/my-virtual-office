@@ -314,21 +314,38 @@ class TelegramNotifier:
             total_pnl    = sum(t["pnl"] for t in okx_trades)
             overall_wr   = total_wins / total_trades * 100 if total_trades else 0.0
 
+            # n_all (local trade_journal count) can be SMALLER than
+            # total_trades (OKX's real count) — e.g. a position closed by
+            # the exchange's own attached TP2/SL order while the bot was
+            # offline/restarting never got locally logged (reconcile now
+            # backfills this going forward — see
+            # TradingBot._backfill_reconciled_trade — but trades that closed
+            # before that fix existed stay permanently untracked; there's no
+            # stored SL/TP to recover them from). Always denominate against
+            # total_trades (not n_all) so this line's numbers actually add up
+            # to the "Trades" count above instead of silently using a
+            # smaller, different total that looks complete but isn't.
             n_all = len(all_trades)
             tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
             tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
             sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
+            untracked_n = max(total_trades - n_all, 0)
 
             # ── SECTION 1: overall win rate + TP1/TP2/SL breakdown + PnL ─────
             lines += ["", DIVIDER, "OVERALL (OKX)", DIVIDER]
             lines.append(f"Trades   : {total_trades}  ({total_wins}W / {total_losses}L)")
             lines.append(f"Win rate : {overall_wr:.0f}%")
-            if n_all:
+            if total_trades:
                 lines.append(
-                    f"TP1 hit  : {tp1_n}/{n_all} ({tp1_n/n_all*100:.0f}%)   "
-                    f"TP2 hit : {tp2_n}/{n_all} ({tp2_n/n_all*100:.0f}%)   "
-                    f"SL only : {sl_only_n}/{n_all} ({sl_only_n/n_all*100:.0f}%)"
+                    f"TP1 hit  : {tp1_n}/{total_trades} ({tp1_n/total_trades*100:.0f}%)   "
+                    f"TP2 hit : {tp2_n}/{total_trades} ({tp2_n/total_trades*100:.0f}%)   "
+                    f"SL only : {sl_only_n}/{total_trades} ({sl_only_n/total_trades*100:.0f}%)"
                 )
+                if untracked_n:
+                    lines.append(
+                        f"Untracked: {untracked_n}/{total_trades} "
+                        "(closed while bot was offline — target unknown)"
+                    )
             lines.append(f"Net PnL  : ${total_pnl:+,.2f}  (post-fee, from OKX)")
 
             # ── SECTION 2: per-symbol trade count + win rate ─────────────────
