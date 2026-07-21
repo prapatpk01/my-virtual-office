@@ -47,6 +47,7 @@ class TelegramNotifier:
         self.chat_id = str(chat_id).strip()
         self.get_state_fn = get_state_fn
         self.get_stats_fn = get_stats_fn
+        self.get_okx_stats_fn = None   # async; set by the bot runner (real OKX stats)
         self.get_insights_fn = get_insights_fn
         self.start_bot_fn = start_bot_fn
         self.stop_bot_fn = stop_bot_fn
@@ -289,8 +290,8 @@ class TelegramNotifier:
             f"Entry: `{entry:,.4f}` → Exit: `{exit_price:,.4f}`\n"
             f"SL: {sl_str} | TP: {tp_str}\n"
             + result_block +
-            f"_Reason: {raw_reason}_\n\n"
-            + self._account_stats_block(stats, "Paper Account")
+            f"_Reason: {raw_reason}_\n"
+            f"_Use /stats for the OKX post-fee summary._"
         )
         self.notify(text)
 
@@ -319,8 +320,7 @@ class TelegramNotifier:
         text = (
             f"{result_emoji} *{label}* {reason_emoji} _(virtual)_\n"
             f"`{symbol}` @ `{exit_price:,.4f}`\n"
-            f"{pnl_line}\n"
-            + self._account_stats_block(stats, "Paper Account")
+            f"{pnl_line}"
         )
         self.notify(text)
 
@@ -474,6 +474,70 @@ class TelegramNotifier:
                 logger.warning("Poll loop error: %s", e)
                 await asyncio.sleep(5)
 
+    @staticmethod
+    def _age_str(seconds: int) -> str:
+        if seconds < 3600:
+            return f"{max(1, seconds // 60)}m ago"
+        if seconds < 86400:
+            return f"{seconds / 3600:.1f}h ago"
+        return f"{seconds / 86400:.1f}d ago"
+
+    def _render_stats(self, s: dict) -> str:
+        """Render /stats. OKX-sourced format (OVERALL / BY SYMBOL / LAST 5)
+        when source == 'okx'; otherwise a short internal-fallback block."""
+        SEP = "—" * 16
+        bal = s.get("balance")
+        bal_line = f"💰 Balance: `${bal:,.2f}`" if bal is not None else "💰 Balance: `—`"
+        open_pos = s.get("open_positions", 0)
+        pos_line = f"📌 Open positions: `{open_pos}`" if open_pos else "📌 No open positions"
+
+        if s.get("source") != "okx":
+            # Fallback (paper mode / no exchange history yet)
+            return "\n".join([
+                bal_line, pos_line, "",
+                "_Live OKX stats unavailable (paper mode or no fills yet)._",
+                f"Internal record: `{s.get('trades', 0)}` trades, "
+                f"WR `{s.get('win_rate', 0):.0f}%`, "
+                f"net `{'+' if s.get('total_pnl_usd', 0) >= 0 else ''}"
+                f"${s.get('total_pnl_usd', 0):,.2f}`",
+            ])
+
+        n = s.get("trades", 0)
+        wins = s.get("wins", 0); losses = s.get("losses", 0)
+        net = s.get("net_pnl", 0.0)
+        net_sign = "+" if net >= 0 else "-"
+        tp1 = s.get("tp1_hits", 0); tp2 = s.get("tp2_hits", 0); sl = s.get("sl_only", 0)
+        den = max(1, s.get("partial_denom", 0))
+
+        lines = [bal_line, pos_line, "", SEP, "OVERALL (OKX)", SEP,
+                 f"Trades   : `{n}`  (`{wins}W / {losses}L`)",
+                 f"Win rate : `{s.get('win_rate', 0):.0f}%`",
+                 f"TP1 hit  : `{tp1}/{den}` (`{tp1/den*100:.0f}%`)   "
+                 f"TP2 hit : `{tp2}/{den}` (`{tp2/den*100:.0f}%`)",
+                 f"SL only  : `{sl}/{n or 1}` (`{sl/(n or 1)*100:.0f}%`)",
+                 f"Net PnL  : `{net_sign}${abs(net):,.2f}`  (post-fee, from OKX)"]
+
+        per = s.get("per_symbol", {})
+        if per:
+            lines += ["", SEP, "BY SYMBOL", SEP]
+            for sym, d in sorted(per.items(), key=lambda kv: -kv[1]["net"]):
+                if d["trades"] == 0:
+                    lines.append(f"`{sym:<5}` 0 trades")
+                else:
+                    ns = "+" if d["net"] >= 0 else "-"
+                    lines.append(f"`{sym:<5}` {d['trades']} trades  {d['win_rate']:.0f}%WR  "
+                                 f"`{ns}${abs(d['net']):,.2f}`")
+
+        last = s.get("last_trades", [])
+        if last:
+            lines += ["", SEP, "LAST 5 TRADES", SEP]
+            for i, t in enumerate(last, 1):
+                e = "✅" if t["won"] else "❌"
+                ns = "+" if t["net"] >= 0 else "-"
+                lines.append(f"{i}. {e} {t['short']} {t['side'].upper()} "
+                             f"`{ns}${abs(t['net']):,.2f}` — {self._age_str(t['age_s'])}")
+        return "\n".join(lines)
+
     async def _handle_command(self, text: str):
         cmd = text.split()[0].lower().lstrip("/")
         if cmd == "help":
@@ -567,89 +631,10 @@ class TelegramNotifier:
                 await self._send("⚠️ stop\\_bot not configured")
 
         elif cmd == "stats":
-            s       = self.get_stats_fn() if self.get_stats_fn else {}
-            total   = s.get("trades",          0)
-            sig_all = s.get("total_signals",   0)
-            sig_day = s.get("signals_per_day", 0)
-            pending = s.get("pending",         0)
-
-            if sig_all == 0:
-                await self._send("📭 No signals fired yet.")
-                return
-
-            wins    = s.get("wins",            0)
-            losses  = s.get("losses",          0)
-            wr      = s.get("win_rate",        0.0)
-            pf      = s.get("profit_factor",   0.0)
-            total_r = s.get("total_r",         0.0)
-            total_usd = s.get("total_pnl_usd", 0.0)
-            paper_bal = s.get("paper_balance", 0.0)
-            start_bal = s.get("start_balance", 1000.0)
-            ret_pct   = s.get("return_pct",    0.0)
-            streak  = s.get("streak",          0)
-            recent  = s.get("recent",          [])
-            breakdown = s.get("strategy_breakdown", {})
-
-            streak_str = (f"W{streak}" if streak > 0 else f"L{abs(streak)}") if streak else "—"
-            sign_r = "+" if total_r >= 0 else ""
-            usd_sign = "+" if total_usd >= 0 else "-"
-            ret_sign = "+" if ret_pct >= 0 else ""
-
-            lines = [f"📊 *Signal Stats — ย้อนหลัง 7 วัน*\n"]
-
-            # ── Per-strategy table ───────────────────────────────────
-            if breakdown:
-                lines.append("*Strategy        Signals    WR*")
-                for strat, d in breakdown.items():
-                    sigs = d["signals"]
-                    wr_s = f"{d['win_rate']:.1f}%" if d["win_rate"] is not None else "—"
-                    cl   = d["wins"] + d["losses"]
-                    cl_s = f"({d['wins']}W/{d['losses']}L)" if cl else ""
-                    lines.append(f"`{strat:<16}` `{sigs:>3}` signals  `{wr_s:>6}` {cl_s}")
-                lines.append("")
-
-            # ── Overall ──────────────────────────────────────────────
-            lines += [
-                f"รวม signals: `{sig_all}` (avg `{sig_day}/day`)",
-                f"ปิด trades: `{total}` (`{wins}W` / `{losses}L`)",
-            ]
-            if total > 0:
-                lines += [
-                    f"Win Rate: `{wr:.1f}%`",
-                    f"Profit Factor: `{pf:.2f}`",
-                    f"Total P&L: `{usd_sign}${abs(total_usd):,.2f}` (`{sign_r}{total_r:.1f}R`)",
-                    f"Streak: `{streak_str}`",
-                ]
-            lines += [
-                f"\n💰 *Paper Account*: `${paper_bal:,.2f}` "
-                f"(start `${start_bal:,.0f}`, `{ret_sign}{ret_pct:.2f}%`)",
-            ]
-            if pending:
-                lines.append(f"Tracking open: `{pending}` virtual trades")
-
-            lines.append("\n_Last closed trades:_")
-            if not recent:
-                lines.append("_(waiting for SL/TP to be hit)_")
-            else:
-                for o in reversed(recent[-10:]):
-                    won   = o.get("won", o.get("pnl_r", 0) > 0)
-                    e     = "✅" if won else "❌"
-                    pu    = o.get("pnl_usd")
-                    if pu is not None:
-                        us  = "+" if pu >= 0 else "-"
-                        pnl_str = f"`{us}${abs(pu):,.2f}`"
-                    else:  # legacy outcome without $ figure
-                        sr = "+" if o.get("pnl_r", 0) >= 0 else ""
-                        pnl_str = f"`{sr}{o.get('pnl_r', 0):.1f}R`"
-                    label = o.get("emoji", "") or ("🎯" if won else "🛑")
-                    strat = o.get("strategy", "")
-                    strat_tag = f" [{strat}]" if strat else ""
-                    lines.append(
-                        f"{e} `{o['symbol']}` {o['side'].upper()} "
-                        f"{pnl_str} {label}{strat_tag}"
-                    )
-
-            await self._send("\n".join(lines))
+            # Real stats from OKX order history (post-fee), sectioned display.
+            fn = getattr(self, "get_okx_stats_fn", None)
+            s = (await fn()) if fn else (self.get_stats_fn() if self.get_stats_fn else {})
+            await self._send(self._render_stats(s))
 
         elif cmd == "insights":
             insights = self.get_insights_fn() if self.get_insights_fn else {}

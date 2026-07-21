@@ -38,10 +38,14 @@ def _load_dotenv():
 _load_dotenv()
 
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+# Send ALL logs to stdout (not the default stderr). Railway/most log viewers
+# render stderr as red "error" lines, which made ordinary INFO logs look like
+# failures. stream=sys.stdout keeps INFO/WARNING/ERROR on the normal stream.
 logging.basicConfig(
     level=getattr(logging, log_level, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
 )
 logger = logging.getLogger("run_bot")
 
@@ -321,6 +325,7 @@ async def main():
     if telegram:
         telegram.get_state_fn    = crypto_bot.get_state
         telegram.get_stats_fn    = crypto_bot.get_stats
+        telegram.get_okx_stats_fn = crypto_bot.get_okx_stats
         telegram.get_insights_fn = crypto_bot.get_learning_insights
         telegram.stop_bot_fn     = lambda: _stop_signal.set()
         telegram.start_bot_fn    = lambda: {"message": "Bot is already running"}

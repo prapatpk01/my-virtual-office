@@ -244,6 +244,90 @@ class TradingBot:
             kwargs["macd_signal_period"] = strategy_inst.macd_signal
         return kwargs
 
+    async def _reconcile_closed_positions(self) -> None:
+        """Runs every tick. If a position the bot still tracks is no longer
+        open on the exchange, the exchange closed it itself — its OKX TP/SL
+        algo order fired between ticks. Clear the bot's state for it (risk,
+        portfolio, strategy, locks), pull the actual close from OKX order
+        history to report the real post-fee PnL, and notify. Without this the
+        bot keeps 'managing' a position that's already gone (the log/positions
+        show it open long after OKX closed it)."""
+        tracked = list(self.risk.get_positions())
+        if not tracked or self.connector.paper or not hasattr(self.connector, "fetch_positions"):
+            return
+        try:
+            live = await self.connector.fetch_positions(list({p["symbol"] for p in tracked}))
+        except Exception as e:
+            logger.debug("[Reconcile-closed] fetch_positions failed: %s", e)
+            return
+        live_keys = {(p["symbol"], p["side"]) for p in live if p.get("amount")}
+        for pos_info in tracked:
+            sym = pos_info["symbol"]; side = pos_info["side"]; strat = pos_info.get("strategy", "")
+            if (sym, side) in live_keys:
+                continue  # still open — normal management handles it
+            # Gone on the exchange → closed by OKX (algo SL/TP).
+            logger.info("[Reconcile-closed] %s %s no longer open on exchange — "
+                        "closed by OKX (algo SL/TP). Clearing bot state.", sym, side)
+            exit_px = pos_info.get("entry", 0.0)
+            reason = "exchange_sl_tp"
+            fill = None
+            try:
+                # Pull the real close (avgPx/fee/realized pnl) from OKX history.
+                fill = await self._okx_last_close_fill(sym, side)
+                if fill:
+                    exit_px = fill.get("exit_avg_px", exit_px)
+                    reason = fill.get("reason", reason)
+            except Exception as e:
+                logger.debug("[Reconcile-closed] history lookup failed for %s: %s", sym, e)
+            strategy_inst = self._resolve_strategy_inst(strat)
+            _outcome = self._sig.record_outcome(
+                symbol=sym, side=side, entry=pos_info.get("entry", 0.0), exit_price=exit_px,
+                sl=pos_info.get("stop_loss"), tp=pos_info.get("take_profit"),
+                reason=reason, strategy=strat, fill=fill,
+            )
+            self._entry_fills.pop(f"{sym}||{strat}", None)
+            self._sig.unlock_strategy(sym, strat)
+            self.risk.close_position(sym, strategy=strat)
+            self._on_position_closed(sym, strat, exit_px, reason, strategy_inst)
+            # Clear any leftover exchange algo orders for the symbol.
+            try:
+                await self.connector.set_position_tpsl(sym, side, 0.0)
+            except Exception:
+                pass
+            if self.telegram:
+                self.telegram.notify_trade_closed(sym, _outcome, self._sig.summary())
+
+    async def _okx_last_close_fill(self, symbol: str, side: str) -> Optional[dict]:
+        """Best-effort: fetch the most recent reduce-only (close) fill for a
+        symbol from OKX order history and shape it like _close_fill_info so the
+        outcome/notification carry real avgPx/fee/realized-PnL. Returns None if
+        unavailable."""
+        if not hasattr(self.connector, "fetch_recent_closes"):
+            return None
+        closes = await self.connector.fetch_recent_closes(symbol, limit=5)
+        if not closes:
+            return None
+        c = closes[0]  # most recent
+        entry_fee_alloc = 0.0
+        # allocate whatever entry fee we still have tracked for this symbol
+        for key, ef in list(self._entry_fills.items()):
+            if key.startswith(f"{symbol}||"):
+                entry_fee_alloc = ef.get("fee", 0.0) * ef.get("fee_frac_left", 1.0)
+                break
+        realized = c.get("pnl")
+        exit_fee = c.get("fee", 0.0)
+        net = (realized - entry_fee_alloc - exit_fee) if realized is not None else None
+        return {
+            "exit_avg_px": c.get("price", 0.0),
+            "exit_sz": c.get("amount", 0.0),
+            "exit_fee": round(exit_fee, 6),
+            "entry_fee_alloc": round(entry_fee_alloc, 6),
+            "entry_avg_px": None,
+            "realized_pnl": realized,
+            "net_pnl": round(net, 6) if net is not None else None,
+            "reason": "exchange_sl_tp",
+        }
+
     async def _reconcile_positions(self) -> None:
         """Runs once, right before the first tick of every (re)start.
 
@@ -416,6 +500,10 @@ class TradingBot:
         in_cd, remaining = self.risk.in_cooldown()
         if in_cd:
             self.state.error = f"Cooldown active — resumes in {remaining/60:.0f} min"
+
+        # ── Detect positions the EXCHANGE closed on its own (OKX TP/SL algo
+        # firing) so the bot doesn't keep managing a ghost position. ─────────
+        await self._reconcile_closed_positions()
 
         # ── Position management: SL/TP, AI Layer 7, and learning callbacks ──
         for pos_info in list(self.risk.get_positions()):
@@ -1095,7 +1183,9 @@ class TradingBot:
 
         # ── Balance check (always fresh, right before sizing) ─────────────────
         balances      = await self.connector.fetch_balance()
-        quote_balance = next((b.free for b in balances if b.asset in ("USDT", "USD", "BUSD")), 0)
+        _quote = [b for b in balances if b.asset in ("USDT", "USD", "BUSD")]
+        quote_balance  = next((b.free for b in _quote), 0)          # spendable now
+        equity_balance = next((b.total for b in _quote), quote_balance)  # total account value
         ticker        = await self.connector.fetch_ticker(sym)
         price         = ticker["last"]
         meta          = signal.metadata or {}
@@ -1104,8 +1194,8 @@ class TradingBot:
 
         min_balance = float(os.getenv("MIN_BALANCE_USD", "10"))
         logger.info(
-            "[%s] Balance check: free=$%.2f  min_required=$%.2f  (paper=%s)",
-            strategy_name, quote_balance, min_balance, self.connector.paper,
+            "[%s] Balance check: equity=$%.2f  free=$%.2f  min_required=$%.2f  (paper=%s)",
+            strategy_name, equity_balance, quote_balance, min_balance, self.connector.paper,
         )
         if quote_balance < min_balance:
             logger.warning(
@@ -1122,21 +1212,61 @@ class TradingBot:
                 sl_p = price + (price - sl_p)
                 tp_p = price - (tp_p - price)
 
-        leverage      = max(getattr(self.connector, "_leverage", 1), 1)
+        # Leverage used for sizing MUST match what the exchange has set, or the
+        # notional comes out N× wrong. Prefer the connector's configured value;
+        # fall back to the LEVERAGE env so a connector that didn't receive it
+        # still sizes correctly.
+        # Take the MAX of the connector's configured leverage and the LEVERAGE
+        # env. This defends against the recurring "size came out ~10x too small"
+        # bug: if the connector's _leverage was left stale/low (e.g. 2) while the
+        # OKX position is actually 20x, using the low value would size the
+        # notional ~10x under. env LEVERAGE=20 is the source of truth, so never
+        # size with anything below it.
+        conn_lev      = getattr(self.connector, "_leverage", None) or 0
+        env_lev       = int(os.getenv("LEVERAGE", "20"))
+        leverage      = max(conn_lev, env_lev, 1)
         is_futures    = getattr(self.connector, "_futures", False)
-        sizing_mode   = meta.get("sizing_mode", "risk")
+        # Default to margin-based sizing (5% of equity × leverage) — the mode
+        # the account is meant to run. Strategy metadata or SIZING_MODE env can
+        # override. (Previously defaulted to "risk", so any strategy that didn't
+        # explicitly set sizing_mode got risk-based/tiny sizes.)
+        sizing_mode   = meta.get("sizing_mode") or os.getenv("SIZING_MODE", "margin")
+        if conn_lev and conn_lev != env_lev:
+            logger.warning(
+                "[%s] leverage mismatch: connector=%s but LEVERAGE env=%s — using %s. "
+                "If the OKX position shows a different x than this, sizing will be off.",
+                strategy_name, conn_lev, env_lev, leverage,
+            )
 
-        if sizing_mode == "margin":
+        # ── Fixed-notional sizing (takes precedence when set) ─────────────────
+        # A dead-simple, deterministic size that can't be thrown off by
+        # leverage/margin/free-vs-total math: the order value (notional) is a
+        # fixed $ amount and amount = notional / market price. Set
+        # FIXED_NOTIONAL_USD=0 (default) disables this and uses margin sizing
+        # (5% of equity × leverage = notional ≈ full balance). Set it to a $
+        # amount only if you want a flat per-trade size instead.
+        fixed_notional = float(os.getenv("FIXED_NOTIONAL_USD", "0"))
+        if fixed_notional > 0:
+            sizing_mode = "fixed"
+            notional_target = fixed_notional
+            amount = round(notional_target / price, 6) if price > 0 else 0
+            risk_per_unit = abs(price - sl_p) if sl_p else 0
+            sizing_label = (f"fixed-notional ${fixed_notional:.2f} → amount {amount:g} "
+                            f"@ ${price:,.4f} (margin ${fixed_notional/max(leverage,1):.2f} at {leverage}x)")
+        elif sizing_mode == "margin":
             # ── Margin-based sizing (opt-in via signal.metadata) ─────────────
-            # Position margin = balance × margin_pct, notional = margin × leverage.
-            # Note: this is NOT the same as risking margin_pct of balance — actual
-            # $ risk on a stop-out depends on SL distance, same as any leveraged size.
+            # Position margin = margin_pct of TOTAL account equity (so "5% of
+            # balance" stays consistent whether or not another position is
+            # already open), notional = margin × leverage. e.g. $100 equity ×
+            # 5% = $5 margin × 20x = $100 notional. The free-balance
+            # availability clamp below still stops us exceeding spendable cash.
             margin_pct = float(meta.get("margin_pct", 0.05))
-            margin = quote_balance * margin_pct
+            margin = equity_balance * margin_pct
             notional_target = margin * (leverage if is_futures else 1)
             amount = round(notional_target / price, 6) if price > 0 else 0
             risk_per_unit = abs(price - sl_p) if sl_p else 0
-            sizing_label = f"margin-based {margin_pct*100:.1f}% of balance (leverage {leverage}x)"
+            sizing_label = (f"margin-based {margin_pct*100:.1f}% of equity ${equity_balance:.2f} "
+                            f"→ margin ${margin:.2f} × {leverage}x = notional ${notional_target:.2f}")
         else:
             # ── Risk-based position sizing ───────────────────────────────────
             # amount is sized so that a full SL hit loses exactly RISK_PER_TRADE_PCT
@@ -1172,7 +1302,7 @@ class TradingBot:
         required_margin = (notional / leverage) if is_futures else notional
         max_margin      = quote_balance * max_margin_pct
 
-        if sizing_mode != "margin" and required_margin > max_margin:
+        if sizing_mode not in ("margin", "fixed") and required_margin > max_margin:
             max_notional_by_risk_cap = max_margin * (leverage if is_futures else 1)
             capped_amount = round(max_notional_by_risk_cap / price, 6) if price > 0 else 0
             logger.warning(
@@ -1402,6 +1532,43 @@ class TradingBot:
 
     def get_stats(self) -> dict:
         return self._sig.summary()
+
+    async def get_okx_stats(self) -> dict:
+        """Real /stats sourced from OKX order history (post-fee PnL), grouped
+        into round-trip trades since STATS_SINCE_DATE (default 2026-07-16).
+        Falls back to the internal summary (+ real balance) in paper mode or if
+        the exchange history isn't available."""
+        from .okx_stats import build_stats, since_ts_for
+        since = since_ts_for(os.getenv("STATS_SINCE_DATE", "2026-07-16"))
+        symbols = list({s.symbol for s in self.strategies})
+
+        # real balance (total equity)
+        balance = None
+        try:
+            bals = await self.connector.fetch_balance()
+            balance = next((b.total for b in bals if b.asset in ("USDT", "USD", "BUSD")), None)
+        except Exception as e:
+            logger.debug("[Stats] balance fetch failed: %s", e)
+        open_pos = len(self.risk.get_positions())
+
+        orders_by_symbol: dict = {}
+        if not self.connector.paper and hasattr(self.connector, "fetch_closed_orders_raw"):
+            for sym in symbols:
+                try:
+                    orders_by_symbol[sym] = await self.connector.fetch_closed_orders_raw(
+                        sym, since=since, limit=100)
+                except Exception as e:
+                    logger.warning("[Stats] history fetch failed for %s: %s", sym, e)
+
+        if orders_by_symbol and any(orders_by_symbol.values()):
+            return build_stats(orders_by_symbol, balance, open_pos, since)
+
+        # Fallback — internal record + real balance, tagged so the renderer knows.
+        s = self._sig.summary()
+        s["source"] = "internal"
+        s["balance"] = balance
+        s["open_positions"] = open_pos
+        return s
 
     def get_learning_insights(self, days: int = 30) -> dict:
         """Deep-dive analytics: win-rate by strategy/symbol/confidence/hour, trend, recommendations."""

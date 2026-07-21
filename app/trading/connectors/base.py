@@ -81,6 +81,15 @@ class BaseConnector(ABC):
         Default no-op for connectors that don't support it (paper/spot/forex)."""
         return False
 
+    async def fetch_closed_orders_raw(self, symbol: str, since: Optional[int] = None,
+                                      limit: int = 100) -> list[dict]:
+        """Normalized filled orders from exchange history. Default: none."""
+        return []
+
+    async def fetch_recent_closes(self, symbol: str, limit: int = 5) -> list[dict]:
+        """Most-recent close (reduce-only) fills for a symbol. Default: none."""
+        return []
+
     @property
     def name(self) -> str:
         return self.__class__.__name__
