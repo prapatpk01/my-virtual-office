@@ -1512,7 +1512,7 @@ class TradingBot:
                         sym, len(_l5) if _l5 else 0, len(candles) if candles else 0,
                     )
                 self.telegram.notify_order(
-                    sym, order_side, order.filled or amount, order.price,
+                    sym, order_side, order.filled or amount, order.price or entry_px or price,
                     strategy_name, self.connector.paper,
                     fee=getattr(order, "fee", 0.0),
                     sl=sl_p, tp=tp_p,
@@ -1528,6 +1528,19 @@ class TradingBot:
                 )
             except Exception as e:
                 logger.warning("Telegram notify_order failed for %s %s (position is still open): %s", sym, direction, e)
+                # Never leave an opened position unannounced — send a minimal
+                # text alert as a fallback if the rich (chart) notification blew up.
+                try:
+                    _sl = f"{sl_p:.4f}" if sl_p else "—"
+                    self.telegram.notify(
+                        f"🟢 *Order Executed* {'📄 PAPER' if self.connector.paper else '💰 LIVE'}\n"
+                        f"`{sym}` — *{direction.upper()}*\n"
+                        f"Fill: `{(order.filled or amount):.6g}` @ "
+                        f"`{(order.price or entry_px or price):,.4f}`  |  SL: `{_sl}`\n"
+                        f"_{signal.reason}_"
+                    )
+                except Exception as e2:
+                    logger.error("Fallback order notify also failed for %s: %s", sym, e2)
 
     # ------------------------------------------------------------------
     # Balance, state, and stats helpers
