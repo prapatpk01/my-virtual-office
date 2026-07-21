@@ -1525,11 +1525,20 @@ class TradingBot:
                         "Notification goes out text-only.",
                         sym, len(_l5) if _l5 else 0, len(candles) if candles else 0,
                     )
+                _fill_px = order.price or entry_px or price
+                _fill_sz = order.filled or amount
+                _notional = _fill_sz * _fill_px
+                _margin = (_notional / leverage) if (is_futures and leverage) else _notional
+                _use_trail = getattr(strategy_inst, "use_be_trail", False)
+                _trig_r = getattr(strategy_inst, "be_trail_trigger_r", None) if _use_trail else None
+                _sl_r = getattr(strategy_inst, "be_trail_sl_r", None) if _use_trail else None
                 self.telegram.notify_order(
-                    sym, order_side, order.filled or amount, order.price or entry_px or price,
+                    sym, order_side, _fill_sz, _fill_px,
                     strategy_name, self.connector.paper,
                     fee=getattr(order, "fee", 0.0),
                     sl=sl_p, tp=tp_p,
+                    notional=_notional, margin=_margin,
+                    trail_trigger_r=_trig_r, trail_sl_r=_sl_r,
                     macro_score=macro_info.get("score"),
                     macro_bias=macro_info.get("bias"),
                     selected_strategy=meta.get("selected_strategy"),

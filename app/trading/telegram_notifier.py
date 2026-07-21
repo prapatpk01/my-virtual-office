@@ -152,48 +152,53 @@ class TelegramNotifier:
                             selected_strategy: str = None, strategy_confidence: float = None,
                             regime: str = None, direction: str = None,
                             early_trend: bool = False, reason: str = None,
-                            fee: float = 0.0) -> str:
-        emoji = "🟢" if side == "buy" else "🔴"
-        mode  = "📄 PAPER" if paper else "💰 LIVE"
-        dir_label = f"LONG" if direction == "long" else "SHORT" if direction == "short" else side.upper()
+                            fee: float = 0.0, notional: float = None,
+                            margin: float = None, trail_trigger_r: float = None,
+                            trail_sl_r: float = None) -> str:
+        SEP = "—" * 16
+        is_long = (direction == "long") or (direction is None and side == "buy")
+        dir_emoji = "🟢" if is_long else "🔴"
+        dir_label = "LONG" if is_long else "SHORT"
+        mode = "📄 PAPER" if paper else "💰 LIVE"
+
+        lines = [f"{dir_emoji} *OPEN {dir_label}*  `{symbol}`  {mode}", SEP]
+        lines.append(f"📍 Entry : `{price:,.4f}`")
+        if sl:
+            lines.append(f"🛑 SL : `{sl:,.4f}`  (`{(sl - price) / price * 100:+.2f}%`)")
+        # Target = the 0.8R trail trigger (locks SL to BE+0.5R), else the hard TP.
+        if sl and trail_trigger_r and trail_sl_r:
+            r = abs(price - sl)
+            tgt = price + trail_trigger_r * r if is_long else price - trail_trigger_r * r
+            lines.append(f"🎯 Target : `{tgt:,.4f}`  (`{trail_trigger_r:.1f}R` → SL→BE+{trail_sl_r:.1f}R)")
+        elif sl and tp:
+            rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
+            lines.append(f"🎯 TP : `{tp:,.4f}`  (`{rr:.1f}R`)")
+        lines.append("🏁 Exit : trend flip (EMA cross-back / close past EMA)")
+        # Size / margin / fee
+        if notional is not None:
+            lines.append(f"💰 Size : `{amount:.6g}`  (≈`${notional:,.2f}`)")
+        else:
+            lines.append(f"💰 Size : `{amount:.6g}`")
+        mfee = []
+        if margin is not None:
+            mfee.append(f"Margin : `${margin:,.2f}`")
+        if fee:
+            mfee.append(f"Fee : `${fee:,.4f}`")
+        if mfee:
+            lines.append("📥 " + "   ".join(mfee))
+        lines.append(SEP)
+        # Strategy | Regime
+        reg_str = regime.get("state") if isinstance(regime, dict) else regime
+        strat_name = selected_strategy or strategy
+        sline = f"📊 Strategy: `{strat_name}`"
+        if reg_str:
+            sline += f" | Regime: `{reg_str}`"
+        lines.append(sline)
+        if macro_bias:
+            ms = f" ({macro_score:.0f}/100)" if macro_score is not None else ""
+            lines.append(f"🧭 4H Macro: `{macro_bias}`{ms}")
         if early_trend:
-            dir_label += " 🌱 EARLY"
-
-        # price/amount here are the exchange's post-fill avgPx / fillSz —
-        # the actual fill, not the requested size.
-        lines = [
-            f"{emoji} *Order Executed* {mode}",
-            f"`{symbol}` — *{dir_label}*",
-            f"Fill: `{amount:.6g}` @ `{price:,.4f}`"
-            + (f"  |  Fee: `${fee:,.4f}`" if fee else ""),
-        ]
-        if reason:
-            lines.append(f"_{reason}_")
-        if early_trend:
-            lines.append("🌱 _Early-trend entry: HMA crossed before the 30m trend confirmed "
-                         "(passed the stricter Layer2 quality gate)._")
-
-        if sl and tp:
-            risk   = abs(price - sl)
-            reward = abs(tp - price)
-            rr     = reward / risk if risk > 0 else 0
-            lines += [
-                f"🛑 SL: `{sl:,.4f}`  ({abs(price-sl)/price*100:.2f}%)",
-                f"🎯 TP: `{tp:,.4f}`  ({abs(tp-price)/price*100:.2f}%)",
-                f"📐 R:R `1:{rr:.2f}`",
-            ]
-        elif sl:
-            lines.append(f"🛑 SL: `{sl:,.4f}`")
-
-        lines.append("")
-        if selected_strategy:
-            lines.append(f"🧠 Strategy: `{selected_strategy}` ({strategy_confidence:.0f})" if strategy_confidence else f"🧠 Strategy: `{selected_strategy}`")
-        if macro_score is not None and macro_bias:
-            lines.append(f"📈 Macro: `{macro_bias}` ({macro_score:.0f}/100)")
-        if regime:
-            lines.append(f"🌍 Regime: `{regime}`")
-        lines.append(f"⚙️ {strategy}")
-
+            lines.append("🌱 _Early-trend entry (stricter Layer2 gate)_")
         return "\n".join(lines)
 
     def notify_order(self, symbol: str, side: str, amount: float,
@@ -203,7 +208,9 @@ class TelegramNotifier:
                      selected_strategy: str = None, strategy_confidence: float = None,
                      regime: str = None, direction: str = None,
                      chart_path: str = None, early_trend: bool = False,
-                     reason: str = None, fee: float = 0.0):
+                     reason: str = None, fee: float = 0.0,
+                     notional: float = None, margin: float = None,
+                     trail_trigger_r: float = None, trail_sl_r: float = None):
         """Send the order alert. If chart_path is given, sends it as a photo
         with the order details as caption; otherwise sends text only."""
         caption = self.build_order_caption(
@@ -211,7 +218,8 @@ class TelegramNotifier:
             sl=sl, tp=tp, macro_score=macro_score, macro_bias=macro_bias,
             selected_strategy=selected_strategy, strategy_confidence=strategy_confidence,
             regime=regime, direction=direction, early_trend=early_trend,
-            reason=reason, fee=fee,
+            reason=reason, fee=fee, notional=notional, margin=margin,
+            trail_trigger_r=trail_trigger_r, trail_sl_r=trail_sl_r,
         )
         if chart_path:
             self.notify_photo(chart_path, caption=caption)
