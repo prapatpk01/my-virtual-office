@@ -178,6 +178,16 @@ class Config:
     # SpikeGuard) manage the trade. TrendConfirm's backtest note: single-close
     # EMA exits killed 75% of trades at ~-0.3R before TP1; arming them only on
     # the runner nearly doubled WR (25->62% BTC, 41->60% SOL).
+    # TESTED and REJECTED for V1.8 (2026-07-21): flipping this to True was
+    # hypothesized (from the comment above, sourced from a different codebase)
+    # to fix PRICE_OPEN_BEYOND_EMA showing up as the dominant loss driver in a
+    # 7-symbol/20-day backtest. A direct before/after re-run on BTC/ETH/XRP/
+    # HYPE showed the opposite: every symbol got worse or flat-worse (BTC
+    # -1.3%->-4.8%, XRP -6.4%->-8.6%, HYPE +13.1%->+6.1%) because in THIS
+    # codebase's stop distances, the early exit is cutting losers early
+    # (small loss) rather than cutting winners short — gating it behind TP1
+    # just lets the same losing trades ride to the full, larger hard-SL
+    # instead. Keep False unless re-validated with fresh evidence.
     signal_exit_requires_tp1: bool = False
 
     # ── Sideways / range veto (ported from TrendConfirm) ─────────────────────
