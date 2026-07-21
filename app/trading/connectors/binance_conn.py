@@ -403,6 +403,56 @@ class BinanceConnector(BaseConnector):
             })
         return out
 
+    async def fetch_closed_orders_raw(self, symbol: str, since: Optional[int] = None,
+                                      limit: int = 100) -> list[dict]:
+        """Normalized FILLED orders (opens + closes) from OKX order history for
+        one symbol. Each dict: symbol/side/pos_side/price(avgPx)/amount(fillSz)/
+        fee/pnl(realized, closes only)/reduce_only/ts/ord_id. Live only."""
+        if self.paper:
+            return []
+        raw = await self._exchange.fetch_closed_orders(symbol, since=since, limit=limit)
+        out = []
+        for o in raw:
+            info = o.get("info") or {}
+            filled = float(o.get("filled") or info.get("accFillSz") or 0)
+            if filled <= 0:
+                continue
+            fee = 0.0
+            if o.get("fee") and o["fee"].get("cost") is not None:
+                fee = abs(float(o["fee"]["cost"]))
+            elif info.get("fee") not in (None, ""):
+                try:
+                    fee = abs(float(info["fee"]))
+                except (TypeError, ValueError):
+                    pass
+            pnl = None
+            if info.get("pnl") not in (None, ""):
+                try:
+                    pnl = float(info["pnl"])
+                except (TypeError, ValueError):
+                    pass
+            reduce_only = str(info.get("reduceOnly")).lower() in ("true", "1")
+            out.append({
+                "symbol":   o.get("symbol") or symbol,
+                "side":     o.get("side"),
+                "pos_side": info.get("posSide"),
+                "price":    float(o.get("average") or info.get("avgPx") or o.get("price") or 0),
+                "amount":   filled,
+                "fee":      fee,
+                "pnl":      pnl,
+                "reduce_only": reduce_only,
+                "ts":       int(o.get("timestamp") or int(info.get("uTime") or 0) or 0),
+                "ord_id":   o.get("id"),
+            })
+        out.sort(key=lambda x: x["ts"])
+        return out
+
+    async def fetch_recent_closes(self, symbol: str, limit: int = 5) -> list[dict]:
+        """Most-recent reduce-only (close) fills for a symbol, newest first."""
+        orders = await self.fetch_closed_orders_raw(symbol, limit=max(limit * 4, 20))
+        closes = [o for o in orders if o["reduce_only"] or (o["pnl"] not in (None, 0.0))]
+        return list(reversed(closes))[:limit]
+
     async def fetch_balance(self) -> list[Balance]:
         if self.paper:
             # total = free + used (margin locked in open positions) so that
