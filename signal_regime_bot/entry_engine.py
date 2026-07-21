@@ -19,6 +19,7 @@ across restarts.
 """
 from __future__ import annotations
 
+
 from dataclasses import asdict, dataclass, field
 import json
 import os
@@ -838,15 +839,26 @@ class EntryEngine:
             state.pullback = None
             return None
 
+        # candle_ok (a genuinely strong/decisive candle) is only required for
+        # the break-type triggers (sweep/micro-BOS/level break) — those claim
+        # real displacement, so they should have a real candle behind them.
+        # EMA_RECLAIM_CONFIRM is a lower-conviction signal by construction
+        # (price merely closed back above/below the fast EMA after dipping
+        # through it) and already requires its own confluence check
+        # (fresh_cross / previous_break / high location score); it does not
+        # also need the break-quality candle test. Measured on a 4-day dense
+        # BTC backtest: gating ALL four sub-triggers behind candle_ok caused
+        # 171 of 234 (73%) blocked confirmations — pullback setups routinely
+        # reclaim on ordinary, low-drama candles, not high-conviction ones.
         trigger = ""
         if same_bar_trigger and age == 0:
             trigger = "SWEEP_RECLAIM" if sweep else "HTF_MICRO_BOS"
-        elif age >= 1 and candle_ok:
-            if sweep:
+        elif age >= 1:
+            if candle_ok and sweep:
                 trigger = "SWEEP_RECLAIM"
-            elif micro_bos:
+            elif candle_ok and micro_bos:
                 trigger = "MICRO_BOS"
-            elif armed_break:
+            elif candle_ok and armed_break:
                 trigger = "TRIGGER_BREAK"
             elif reclaim and (snapshot["fresh_cross"] or previous_break or setup.location_score >= 17.0):
                 trigger = "EMA_RECLAIM_CONFIRM"

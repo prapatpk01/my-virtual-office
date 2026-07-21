@@ -444,7 +444,7 @@ class Config:
     entry_swing_right: int = 3
     dual_pullback_zone_atr: float = 0.15
     dual_pullback_depth_atr: float = 0.30
-    dual_pullback_window_bars: int = 4
+    dual_pullback_window_bars: int = 6   # was 4 — 20min confirmation window was cutting setups off early
     dual_pullback_max_extension_atr: float = 0.80
     dual_pullback_threshold: float = 68.0
     dual_same_bar_pullback_threshold: float = 74.0

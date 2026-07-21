@@ -32,7 +32,7 @@ from config import Config, load_config
 from exchange_client import ExchangeClient
 from pipeline import Pipeline as SignalEngine, LONG, SHORT
 from risk_manager import RiskManager
-from position_manager import calc_stop_loss, calc_take_profits, Position
+from position_manager import calc_stop_loss, calc_take_profits, Position, _normalize_planned_stop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("backtest")
@@ -308,9 +308,47 @@ def simulate_symbol(cfg: Config, symbol: str, df_15m: pd.DataFrame, df_1h: pd.Da
         swing_high, swing_low = ind.recent_swing_levels(
             hist_15m["high"], hist_15m["low"], cfg.swing_lookback_left, cfg.swing_lookback_right)
         side = "long" if sig.direction == LONG else "short"
-        sl = calc_stop_loss(side, entry_px, atr_val, cfg.sl_atr_mult, swing_high, swing_low,
-                           cfg.sl_min_pct, cfg.sl_max_pct, cfg.sl_tighten_mult)
-        tp1, tp2 = calc_take_profits(side, entry_px, sl, cfg.tp1_r, cfg.tp2_r)
+
+        # Mirror position_manager.open_position() EXACTLY: prefer the entry
+        # engine's own planned_stop/planned_target (already fee-drag- and
+        # room/RR-checked inside _finalize_candidate) over independently
+        # recomputed ATR/swing levels, apply the same fee-aware stop bounds,
+        # and reject on the same fee-drag / actual-RR gates. This used to
+        # diverge from live (fixed cfg.tp1_r/tp2_r only, no planned_target
+        # tightening, no fee-drag or min-RR reject) — backtest results could
+        # silently differ from what the live bot actually does.
+        entry_result = sig.entry
+        planned_stop = getattr(entry_result, "planned_stop", None)
+        planned_target = getattr(entry_result, "planned_target", None)
+        if planned_stop is not None and (
+            (side == LONG and 0 < planned_stop < entry_px)
+            or (side == SHORT and planned_stop > entry_px)
+        ):
+            proposed_sl = float(planned_stop)
+        else:
+            proposed_sl = calc_stop_loss(side, entry_px, atr_val, cfg.sl_atr_mult, swing_high, swing_low,
+                                         cfg.sl_min_pct, cfg.sl_max_pct, cfg.sl_tighten_mult)
+        sl, stop_distance, cost_distance = _normalize_planned_stop(cfg, side, entry_px, proposed_sl, atr_val)
+        if sl <= 0 or (side == LONG and sl >= entry_px) or (side == SHORT and sl <= entry_px):
+            continue
+        fee_drag_r = cost_distance / max(stop_distance, ind.EPSILON)
+        if fee_drag_r > getattr(cfg, "max_fee_drag_r", 0.35):
+            continue
+
+        tp1, base_tp2 = calc_take_profits(side, entry_px, sl, cfg.tp1_r, cfg.tp2_r)
+        if planned_target is not None:
+            planned_target = float(planned_target)
+            if side == LONG and planned_target > entry_px:
+                tp2 = min(base_tp2, planned_target)
+            elif side == SHORT and planned_target < entry_px:
+                tp2 = max(base_tp2, planned_target)
+            else:
+                tp2 = base_tp2
+        else:
+            tp2 = base_tp2
+        actual_rr = abs(tp2 - entry_px) / max(abs(entry_px - sl), ind.EPSILON)
+        if actual_rr < getattr(cfg, "minimum_actual_rr", 1.20):
+            continue
 
         amount = risk.size_by_risk(balance, entry_px, sl, sig.regime.size_multiplier)
         if amount <= 0:
