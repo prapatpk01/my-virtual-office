@@ -158,9 +158,9 @@ class TrendConfirmStrategy(BaseStrategy):
         single_tf_quality_penalty: float = 4.0,
         # Layer 3 — entry (5m): EMA10/20 cross, price above/below EMA20, within 1.5xATR of EMA50
         entry_tf: str = "5m",       # timeframe (mtf key) the entry cross + exit run on
-        ema_fast: int = 10,         # entry-cross fast EMA (5m)
-        ema_slow: int = 20,         # entry-cross slow EMA (5m); also the "close past" exit reference
-        entry_ema_ref: int = 20,    # price must be above (long) / below (short) this EMA (5m) — EMA20, same line the cross + exit use
+        ema_fast: int = 8,          # entry-cross fast EMA (5m)
+        ema_slow: int = 13,         # entry-cross slow EMA (5m); also the cross-back exit reference
+        entry_ema_ref: int = 13,    # price must be above (long) / below (short) this EMA (5m) — same line the cross + exit use
         sl_ema_ref: int = 50,       # SL sits at this EMA (5m)
         chase_ema_ref: int = 50,    # chase-guard distance is measured vs this EMA (5m); decoupled from sl_ema_ref
         fresh_trend_bars: int = 3,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
@@ -175,8 +175,8 @@ class TrendConfirmStrategy(BaseStrategy):
         # retest-only execution (no direct chasing) and structure entry requires
         # a confirmed HH/HL or LH/LL sequence plus a reclaim / micro-BOS trigger.
         use_ema_cross_entry: bool = True,
-        use_breakout_retest_entry: bool = True,
-        use_structure_retest_entry: bool = True,
+        use_breakout_retest_entry: bool = False,   # single entry engine: EMA cross only
+        use_structure_retest_entry: bool = False,  # single entry engine: EMA cross only
         entry_trigger_valid_bars: int = 3,
         breakout_lookback: int = 6,
         breakout_arm_bars: int = 6,
@@ -263,15 +263,18 @@ class TrendConfirmStrategy(BaseStrategy):
         sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
         sideways_min_signals: int = 3,              # how many of the 4 signals must fire to veto
         # Exit (5m): EMA10/20 cross-back OR a 5m close past EMA20 closes the runner
-        use_close_past_exit: bool = True,   # enable the "close past EMA20" exit at all (cross-back always on)
-        exit_close_confirm_bars: int = 1,   # N consecutive 5m closes past EMA20 required for that exit
-        signal_exit_requires_tp1: bool = True,   # no signal exits before TP1 — only the hard SL (EMA50) / TP
+        use_close_past_exit: bool = False,  # pure cross-back system: exit ONLY on the EMA8/13 cross-back
+        exit_close_confirm_bars: int = 1,   # N consecutive 5m closes past EMA_slow required for that exit
+        signal_exit_requires_tp1: bool = False,  # cross-back exit works immediately (no TP1 to wait for now)
                                                  #   bounds manage the trade until then. On 5m the single-close
                                                  #   slow-EMA exits killed 75% of trades at ~-0.3R before TP1; arming
                                                  #   them only on the runner nearly doubled WR (25->62% BTC,
                                                  #   41->60% SOL) and cut losses ~2-3x in backtest
-        # Partial take-profit + break-even (2-TP scheme)
-        use_partial_tp: bool = True,        # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
+        # Take-profit scheme. use_hard_tp=False + use_partial_tp=False = a pure
+        # trend-follow cross system: no TP at all, ride the position until the
+        # EMA8/13 cross-back (the SL at EMA50 is only a disaster stop).
+        use_hard_tp: bool = False,          # emit a fixed TP2 (1.5R) with the entry? off = hold to cross-back
+        use_partial_tp: bool = False,       # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
         tp1_r: float = 0.75,                # TP1 at 0.75R (halfway to the 1.5R final TP)
         tp1_close_pct: float = 0.5,         # fraction closed at TP1
         be_offset_r: float = 0.1,           # after TP1, SL -> entry +/- this many R (BE + 0.1R, a small locked profit)
@@ -407,6 +410,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.exit_close_confirm_bars = exit_close_confirm_bars
         self.signal_exit_requires_tp1 = signal_exit_requires_tp1
 
+        self.use_hard_tp = use_hard_tp
         self.use_partial_tp = use_partial_tp
         self.tp1_r = tp1_r
         self.tp1_close_pct = tp1_close_pct
@@ -967,7 +971,10 @@ class TrendConfirmStrategy(BaseStrategy):
         meta.update({
             "entry_type": entry_type, "entry_detail": selected["detail"],
             "entry_edge_score": selected["edge_score"],
-            "stop_loss": round(sl, 8), "take_profit": round(tp, 8),
+            "stop_loss": round(sl, 8),
+            # No hard TP in the pure cross-back system — ride until EMA8/13
+            # crosses back. Only the SL (EMA50) is placed on the exchange.
+            "take_profit": round(tp, 8) if self.use_hard_tp else None,
             "risk_atr": round(selected["risk_atr"], 3), "rr_ratio": self.rr_ratio,
             "sizing_mode": self.sizing_mode, "margin_pct": self.margin_pct,
             "structure_room_r": location.get("structure_room_r"),
