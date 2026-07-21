@@ -428,23 +428,47 @@ def latest_bos_event(
     min_body_atr: float = 0.18,
     scan_bars: int = 40,
 ) -> tuple[Optional[pd.Timestamp], Optional[float]]:
-    """Return the latest closed-candle BOS event without future leakage.
+    """Return the newest closed-candle BOS event without repeated pivot scans.
 
-    Each candidate event is evaluated using only candles available at that
-    candle close.  This is intentionally a little more expensive than a
-    vectorized shortcut, but it is deterministic and safe for live/backtest
-    parity.
+    A pivot at position ``p`` is eligible only when ``p + right <= end``.
+    This is equivalent to evaluating :func:`latest_bos` on every historical
+    prefix, but computes pivots and ATR once, making restart/re-entry checks
+    practical in both live trading and backtests.
     """
     if df is None or len(df) < left + right + 8:
         return None, None
-    start = max(left + right + 7, len(df) - max(int(scan_bars), 10))
+    ph, pl = swing_pivots(df["high"], df["low"], left, right)
+    pivots = ph if direction.upper() == "LONG" else pl
+    if not pivots:
+        return None, None
+    atr_s = atr(df, 14)
+    opens = df["open"].astype(float).to_numpy()
+    closes = df["close"].astype(float).to_numpy()
+    highs = df["high"].astype(float).to_numpy()
+    lows = df["low"].astype(float).to_numpy()
+    start_end = max(left + right + 7, len(df) - max(int(scan_bars), 10))
     event_ts: Optional[pd.Timestamp] = None
     event_level: Optional[float] = None
-    for end in range(start, len(df)):
-        view = df.iloc[: end + 1]
-        hit, level = latest_bos(view, direction, left, right, min_body_atr)
+    pivot_pos = -1
+    for end_pos in range(start_end, len(df)):
+        eligible_limit = end_pos - max(1, int(right))
+        while pivot_pos + 1 < len(pivots) and pivots[pivot_pos + 1] <= eligible_limit:
+            pivot_pos += 1
+        if pivot_pos < 0 or end_pos < 1:
+            continue
+        p = pivots[pivot_pos]
+        level = float(highs[p] if direction.upper() == "LONG" else lows[p])
+        atr_value = safe_float(atr_s.iloc[end_pos], 0.0)
+        body_atr = abs(closes[end_pos] - opens[end_pos]) / max(atr_value, EPSILON)
+        if body_atr < min_body_atr:
+            continue
+        hit = (
+            closes[end_pos] > level and closes[end_pos - 1] <= level
+            if direction.upper() == "LONG"
+            else closes[end_pos] < level and closes[end_pos - 1] >= level
+        )
         if hit:
-            event_ts = pd.Timestamp(view.index[-1])
+            event_ts = pd.Timestamp(df.index[end_pos])
             event_level = level
     return event_ts, event_level
 

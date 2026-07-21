@@ -1,4 +1,4 @@
-"""DUALCORE V1.8 live bot entry point.
+"""DUALCORE V1.9 live bot entry point.
 
 Loop: fetch closed 5M/15M/1H/4H bars, manage open positions every poll, and
 for flat symbols evaluate 4H Macro -> 1H Bias -> 15M Structure/Location ->

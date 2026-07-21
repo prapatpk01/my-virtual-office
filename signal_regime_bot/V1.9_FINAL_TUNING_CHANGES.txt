@@ -1,0 +1,17 @@
+DUALCORE V1.9 — FINAL BACKTEST-TUNED ENTRY CORE
+
+Architecture:
+4H strong-conflict filter -> 1H bias -> 15M structure/location -> 5M EMA8/13 execution.
+
+Final default changes:
+- Direct breakout: compressed base or volume ratio >= 1.10.
+- Direct breakout: EMA13 extension <= 0.85 ATR and break-level extension <= 0.45 ATR.
+- Direct breakout: fee+slippage drag <= 0.28R; otherwise wait for retest.
+- Retest: EMA13 extension <= 1.35 ATR, no unlimited waiver.
+- Precision pullback extension: 0.65 ATR for BTC/ETH/XAU/XAG.
+- High-beta pullback extension: 0.70 ATR for SOL/XRP/HYPE.
+- EMA_RECLAIM_CONFIRM in EARLY regime requires local directional edge >= 85.
+- EMA_RECLAIM_CONFIRM in STRONG regime requires local directional edge >= 55.
+- EARLY-regime breakout retest requires compression or volume ratio >= 1.10.
+- EMA cross alone never opens a trade.
+- Risk remains 5% by user request; maximum 2 positions total and 1 per symbol.

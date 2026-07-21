@@ -1,4 +1,4 @@
-"""DUALCORE V1.8 market-regime classification.
+"""DUALCORE V1.9 market-regime classification.
 
 4H is a macro conflict filter; 1H is the active directional regime.  A neutral
 4H does not block a valid 1H trend, while a confirmed strong opposite 4H does.

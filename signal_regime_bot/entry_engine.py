@@ -1,4 +1,4 @@
-"""DUALCORE V1.8 — balanced 15M structure + 5M EMA execution engine.
+"""DUALCORE V1.9 — balanced 15M structure + 5M EMA execution engine.
 
 Architecture:
     4H macro -> 1H bias -> 15M context/structure -> 5M execution.
@@ -18,7 +18,6 @@ All calculations use closed candles only.  Setups and duplicate keys persist
 across restarts.
 """
 from __future__ import annotations
-
 
 from dataclasses import asdict, dataclass, field
 import json
@@ -273,6 +272,18 @@ class EntryEngine:
     def _get_state(self, symbol: str) -> _SetupState:
         return self._state.setdefault(symbol, _SetupState())
 
+    def _is_precision_symbol(self, symbol: str) -> bool:
+        upper = str(symbol).upper()
+        return any(k in upper for k in getattr(
+            self.cfg, "dual_precision_symbol_keywords", ("BTC", "ETH", "XAU", "XAG")
+        ))
+
+    def _is_high_beta_symbol(self, symbol: str) -> bool:
+        upper = str(symbol).upper()
+        return any(k in upper for k in getattr(
+            self.cfg, "dual_high_beta_symbol_keywords", ("SOL", "XRP", "HYPE")
+        ))
+
     def reset_symbol(self, symbol: str) -> None:
         self._state.pop(symbol, None)
         self._persist_state()
@@ -287,7 +298,7 @@ class EntryEngine:
         """Clear used setups and lock same-direction re-entry after a full SL.
 
         A time cooldown alone can repeatedly reuse the same failed trend thesis.
-        V1.8 therefore requires a fresh confirmed 15M BOS or a newly-confirmed
+        V1.9 therefore requires a fresh confirmed 15M BOS or a newly-confirmed
         swing structure before the same side can be traded again after SL.
         """
         state = self._get_state(symbol)
@@ -632,6 +643,7 @@ class EntryEngine:
         bar_ts: pd.Timestamp,
         components: dict,
         minimum_room_override: Optional[float] = None,
+        max_fee_drag_override: Optional[float] = None,
     ) -> Optional[_Candidate]:
         c = self.cfg
         long = direction == LONG
@@ -666,7 +678,12 @@ class EntryEngine:
         if risk <= 0 or risk > max_stop * (1.0 + 1e-9):
             return None
         fee_drag_r = cost_distance / max(risk, ind.EPSILON)
-        if fee_drag_r > getattr(c, "max_fee_drag_r", 0.35):
+        max_fee_drag = (
+            getattr(c, "max_fee_drag_r", 0.35)
+            if max_fee_drag_override is None
+            else max_fee_drag_override
+        )
+        if fee_drag_r > max_fee_drag:
             return None
 
         base_rr = (
@@ -725,9 +742,11 @@ class EntryEngine:
         nearest_resistance: Optional[float],
         regime=None,
         bias=None,
+        symbol: str = "",
     ) -> Optional[_Candidate]:
         c = self.cfg
         long = direction == LONG
+        precision_symbol = self._is_precision_symbol(symbol)
         atr_value = snapshot["atr"]
         if (
             snapshot["obvious_chop"]
@@ -839,29 +858,38 @@ class EntryEngine:
             state.pullback = None
             return None
 
-        # candle_ok (a genuinely strong/decisive candle) is only required for
-        # the break-type triggers (sweep/micro-BOS/level break) — those claim
-        # real displacement, so they should have a real candle behind them.
-        # EMA_RECLAIM_CONFIRM is a lower-conviction signal by construction
-        # (price merely closed back above/below the fast EMA after dipping
-        # through it) and already requires its own confluence check
-        # (fresh_cross / previous_break / high location score); it does not
-        # also need the break-quality candle test. Measured on a 4-day dense
-        # BTC backtest: gating ALL four sub-triggers behind candle_ok caused
-        # 171 of 234 (73%) blocked confirmations — pullback setups routinely
-        # reclaim on ordinary, low-drama candles, not high-conviction ones.
         trigger = ""
         if same_bar_trigger and age == 0:
             trigger = "SWEEP_RECLAIM" if sweep else "HTF_MICRO_BOS"
-        elif age >= 1:
-            if candle_ok and sweep:
+        elif age >= 1 and candle_ok:
+            if sweep:
                 trigger = "SWEEP_RECLAIM"
-            elif candle_ok and micro_bos:
+            elif micro_bos:
                 trigger = "MICRO_BOS"
-            elif candle_ok and armed_break:
+            elif armed_break:
                 trigger = "TRIGGER_BREAK"
             elif reclaim and (snapshot["fresh_cross"] or previous_break or setup.location_score >= 17.0):
                 trigger = "EMA_RECLAIM_CONFIRM"
+        if (
+            precision_symbol
+            and setup.location_score < 14.0
+            and trigger in ("EMA_RECLAIM_CONFIRM", "TRIGGER_BREAK")
+        ):
+            trigger = ""
+
+        # EMA reclaim has no structure break of its own. In an EARLY regime it
+        # must show near-unanimous 5M directional agreement; in a STRONG regime
+        # a lower, but still meaningful, edge is sufficient.
+        if trigger == "EMA_RECLAIM_CONFIRM":
+            regime_name = str(getattr(regime, "name", getattr(regime, "label", "")))
+            required_edge = (
+                getattr(c, "dual_ema_reclaim_early_min_edge", 85.0)
+                if regime_name.startswith("EARLY_")
+                else getattr(c, "dual_ema_reclaim_strong_min_edge", 55.0)
+            )
+            if snapshot["direction_edge"] < required_edge:
+                trigger = ""
+
         if not trigger:
             return None
         if (
@@ -871,7 +899,13 @@ class EntryEngine:
             return None
 
         extension = (price - ema_slow) / atr_value if long else (ema_slow - price) / atr_value
-        if extension < -0.20 or extension > getattr(c, "dual_pullback_max_extension_atr", 0.80):
+        if precision_symbol:
+            max_pullback_extension = getattr(c, "dual_precision_pullback_max_extension_atr", 0.65)
+        elif self._is_high_beta_symbol(symbol):
+            max_pullback_extension = getattr(c, "dual_high_beta_pullback_max_extension_atr", 0.70)
+        else:
+            max_pullback_extension = getattr(c, "dual_pullback_max_extension_atr", 0.80)
+        if extension < -0.20 or extension > max_pullback_extension:
             return None
 
         recent = df.iloc[-6:]
@@ -955,9 +989,11 @@ class EntryEngine:
         nearest_resistance: Optional[float],
         regime=None,
         bias=None,
+        symbol: str = "",
     ) -> Optional[_Candidate]:
         c = self.cfg
         long = direction == LONG
+        precision_symbol = self._is_precision_symbol(symbol)
         atr_value = snapshot["atr"]
         if snapshot["obvious_chop"] or not snapshot["structure_ok"] or not context["allowed"]:
             state.breakout = None
@@ -1011,6 +1047,10 @@ class EntryEngine:
             and snapshot["direction_edge"] >= getattr(c, "dual_direct_directional_edge", 10.0)
             and (major_crossed or compressed)
             and (context["strong"] or major_crossed)
+            and (
+                compressed
+                or candle.volume_ratio >= getattr(c, "dual_direct_min_volume_ratio", 1.10)
+            )
         )
 
         if crossed and (state.breakout is None or state.breakout.direction != direction):
@@ -1034,10 +1074,21 @@ class EntryEngine:
             state.breakout = None
             return None
 
-        direct = age == 0 and direct_quality
+        regime_name = str(getattr(regime, "name", getattr(regime, "label", "")))
+        direct_regime_ok = not (
+            getattr(c, "dual_block_direct_breakout_in_early_trend", True)
+            and regime_name.startswith("EARLY_")
+        )
+        direct = age == 0 and direct_quality and direct_regime_ok
+        early_retest_quality = bool(
+            not regime_name.startswith("EARLY_")
+            or setup.compressed
+            or candle.volume_ratio >= getattr(c, "dual_early_retest_min_volume_ratio", 1.10)
+        )
         if long:
             retest = (
                 1 <= age <= expiry
+                and early_retest_quality
                 and float(row["low"]) <= setup.breakout_level + 0.15 * atr_value
                 and float(row["low"]) >= setup.breakout_level - 0.35 * atr_value
                 and price > setup.breakout_level
@@ -1049,6 +1100,7 @@ class EntryEngine:
         else:
             retest = (
                 1 <= age <= expiry
+                and early_retest_quality
                 and float(row["high"]) >= setup.breakout_level - 0.15 * atr_value
                 and float(row["high"]) <= setup.breakout_level + 0.35 * atr_value
                 and price < setup.breakout_level
@@ -1073,14 +1125,14 @@ class EntryEngine:
             if direct else getattr(c, "dual_retest_max_level_extension_atr", 0.50)
         )
         max_ema_ext = (
-            getattr(c, "dual_strong_momentum_extension_atr", 1.20)
-            if direct else getattr(c, "dual_momentum_max_extension_atr", 1.35)
+            getattr(c, "dual_direct_max_ema_extension_atr", 0.85)
+            if direct else getattr(c, "dual_retest_max_ema_extension_atr", 1.35)
         )
         if level_extension > level_limit:
             return None
-        # For a confirmed retest, the broken level is the relevant extension
-        # reference. EMA13 may still lag far behind after a valid impulse.
-        if ema_extension > max_ema_ext and not (retest and level_extension <= level_limit):
+        # A valid retest does not justify chasing when price is already far
+        # from EMA13; this was a recurring losing pattern in the exact-data test.
+        if ema_extension > max_ema_ext:
             return None
 
         bias_edge = abs(getattr(bias, "directional_edge", 0.0))
@@ -1142,6 +1194,10 @@ class EntryEngine:
                 "ema_extension_atr": round(ema_extension, 3),
             },
             minimum_room_override=min_room,
+            max_fee_drag_override=(
+                getattr(c, "dual_direct_max_fee_drag_r", 0.28)
+                if direct else None
+            ),
         )
         if candidate is not None:
             state.breakout = None
@@ -1274,11 +1330,11 @@ class EntryEngine:
         )
         pullback = self._pullback_candidate(
             df_5m, direction, context, snapshot, state,
-            support, resistance, regime, bias,
+            support, resistance, regime, bias, symbol,
         )
         momentum = self._momentum_candidate(
             df_5m, direction, context, snapshot, state,
-            support, resistance, regime, bias,
+            support, resistance, regime, bias, symbol,
         )
         candidates = [x for x in (pullback, momentum) if x is not None]
         if not candidates:

@@ -178,16 +178,6 @@ class Config:
     # SpikeGuard) manage the trade. TrendConfirm's backtest note: single-close
     # EMA exits killed 75% of trades at ~-0.3R before TP1; arming them only on
     # the runner nearly doubled WR (25->62% BTC, 41->60% SOL).
-    # TESTED and REJECTED for V1.8 (2026-07-21): flipping this to True was
-    # hypothesized (from the comment above, sourced from a different codebase)
-    # to fix PRICE_OPEN_BEYOND_EMA showing up as the dominant loss driver in a
-    # 7-symbol/20-day backtest. A direct before/after re-run on BTC/ETH/XRP/
-    # HYPE showed the opposite: every symbol got worse or flat-worse (BTC
-    # -1.3%->-4.8%, XRP -6.4%->-8.6%, HYPE +13.1%->+6.1%) because in THIS
-    # codebase's stop distances, the early exit is cutting losers early
-    # (small loss) rather than cutting winners short — gating it behind TP1
-    # just lets the same losing trades ride to the full, larger hard-SL
-    # instead. Keep False unless re-validated with fresh evidence.
     signal_exit_requires_tp1: bool = False
 
     # ── Sideways / range veto (ported from TrendConfirm) ─────────────────────
@@ -429,7 +419,7 @@ class Config:
     booster_score_to_bonus: float = 0.5        # early_bonus = min(early_score * this, max_bonus)
 
 
-    # ── DUALCORE V1.8 — Balanced Structure Entry ───────────────────────────
+    # ── DUALCORE V1.9 — Balanced Structure Entry ───────────────────────────
     # 4H macro + 1H bias + 15M context/structure + 5M EMA dual entry.
     # EMA8/EMA13 is used instead of HMA on 5M to reduce whipsaw while keeping
     # entries fast enough for active multi-symbol trading. EMA is timing only;
@@ -454,7 +444,7 @@ class Config:
     entry_swing_right: int = 3
     dual_pullback_zone_atr: float = 0.15
     dual_pullback_depth_atr: float = 0.30
-    dual_pullback_window_bars: int = 6   # was 4 — 20min confirmation window was cutting setups off early
+    dual_pullback_window_bars: int = 4
     dual_pullback_max_extension_atr: float = 0.80
     dual_pullback_threshold: float = 68.0
     dual_same_bar_pullback_threshold: float = 74.0
@@ -473,7 +463,7 @@ class Config:
     dual_strong_momentum_extension_atr: float = 1.20
     dual_momentum_min_room_r: float = 1.20
 
-    # V1.8 structure/edge gates. These are intentionally hard-coded defaults
+    # V1.9 structure/edge gates. These are intentionally hard-coded defaults
     # so Railway needs no additional variables.
     dual_context_min_groups: int = 2
     dual_local_directional_edge: float = 8.0
@@ -482,10 +472,33 @@ class Config:
     dual_base_compression_ratio: float = 0.88
     dual_direct_min_body_atr: float = 0.30
     dual_direct_close_quality: float = 0.75
-    dual_direct_max_level_extension_atr: float = 0.60
+    dual_direct_max_level_extension_atr: float = 0.45
     dual_retest_max_level_extension_atr: float = 0.50
+    # Direct momentum must be close to both the broken level and EMA13.
+    # Retests may sit farther from EMA13 after a valid impulse, but no longer
+    # receive an unlimited EMA-extension waiver.
+    dual_direct_max_ema_extension_atr: float = 0.85
+    dual_retest_max_ema_extension_atr: float = 1.35
+    dual_direct_min_volume_ratio: float = 1.10
+    dual_direct_max_fee_drag_r: float = 0.28
     dual_direct_breakout_min_room_r: float = 1.30
     dual_reentry_requires_new_structure: bool = True
+
+    # V1.9 symbol behaviour profiles. Precision assets require a real HTF/
+    # structure trigger before entering; higher-beta crypto may use a clean
+    # EMA-zone reclaim because it trends more impulsively.
+    dual_precision_symbol_keywords: tuple = ("BTC", "ETH", "XAU", "XAG")
+    dual_high_beta_symbol_keywords: tuple = ("SOL", "XRP", "HYPE")
+    dual_precision_pullback_max_extension_atr: float = 0.65
+    dual_high_beta_pullback_max_extension_atr: float = 0.70
+    # EMA reclaim is the weakest pullback trigger. It needs substantially
+    # stronger local agreement in an EARLY regime than after a structure shift.
+    dual_ema_reclaim_early_min_edge: float = 85.0
+    dual_ema_reclaim_strong_min_edge: float = 55.0
+    # EARLY-trend breakout retests require evidence of an impulse, otherwise
+    # the setup is commonly just a false break inside a developing range.
+    dual_early_retest_min_volume_ratio: float = 1.10
+    dual_block_direct_breakout_in_early_trend: bool = True
     dual_reentry_bos_scan_bars: int = 48
 
     dual_min_stop_atr: float = 0.80

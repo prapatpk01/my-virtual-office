@@ -1,4 +1,4 @@
-"""DUALCORE V1.8 directional bias engine.
+"""DUALCORE V1.9 directional bias engine.
 
 1H chooses the active side, 15M confirms that the side is not structurally
 invalid, and 5M is informational only.  Bull and bear evidence are calculated
@@ -183,7 +183,8 @@ class BiasEngine:
         c = self.cfg
         s1 = self._tf_score(df_1h)
         s15 = self._tf_score(df_15m) if df_15m is not None and len(df_15m) else s1
-        s5 = self._tf_score(df_5m) if df_5m is not None and len(df_5m) else s15
+        # 5M permission is evaluated by EntryEngine; avoid duplicate full score.
+        s5 = s15
         w1, w15 = self._weights(regime_label)
 
         combined_bull = s1.bull_score * w1 + s15.bull_score * w15
