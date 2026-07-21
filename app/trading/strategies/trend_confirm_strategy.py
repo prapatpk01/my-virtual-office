@@ -264,8 +264,9 @@ class TrendConfirmStrategy(BaseStrategy):
         sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
         sideways_min_signals: int = 3,              # how many of the 4 signals must fire to veto
         # Exit (5m): EMA10/20 cross-back OR a 5m close past EMA20 closes the runner
-        use_close_past_exit: bool = False,  # pure cross-back system: exit ONLY on the EMA8/13 cross-back
-        exit_close_confirm_bars: int = 1,   # N consecutive 5m closes past EMA_slow required for that exit
+        use_close_past_exit: bool = True,   # faster exit: also close when price closes past EMA_slow (before
+                                            #   the full EMA8/13 cross-back) — more responsive, protects profit
+        exit_close_confirm_bars: int = 1,   # N consecutive closes past EMA_slow required (1 = fastest)
         signal_exit_requires_tp1: bool = False,  # cross-back exit works immediately (no TP1 to wait for now)
                                                  #   bounds manage the trade until then. On 5m the single-close
                                                  #   slow-EMA exits killed 75% of trades at ~-0.3R before TP1; arming
@@ -1098,17 +1099,17 @@ class TrendConfirmStrategy(BaseStrategy):
                           and self._closes_past_ema_slow(candles, "long", cb))
             if l3["ema_cross_down"] or close_exit:
                 reason = (f"EMA{self.ema_fast} crossed below EMA{self.ema_slow}" if l3["ema_cross_down"]
-                          else f"{cb} close(s) below EMA{self.ema_slow}")
+                          else f"price closed below EMA{self.ema_slow} (early)")
                 self._reset_position_state()
-                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} (5m)")
+                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} ({self.entry_tf})")
         if self._open_position == "short":
             close_exit = (self.use_close_past_exit
                           and self._closes_past_ema_slow(candles, "short", cb))
             if l3["ema_cross_up"] or close_exit:
                 reason = (f"EMA{self.ema_fast} crossed above EMA{self.ema_slow}" if l3["ema_cross_up"]
-                          else f"{cb} close(s) above EMA{self.ema_slow}")
+                          else f"price closed above EMA{self.ema_slow} (early)")
                 self._reset_position_state()
-                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} (5m)")
+                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} ({self.entry_tf})")
 
         return PositionUpdate(action="hold", reason=f"Holding {self._open_position.upper()}")
 
