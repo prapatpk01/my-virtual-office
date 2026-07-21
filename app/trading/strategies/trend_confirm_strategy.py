@@ -157,10 +157,11 @@ class TrendConfirmStrategy(BaseStrategy):
         allow_15m_quality_fallback: bool = True,
         single_tf_quality_penalty: float = 4.0,
         # Layer 3 — entry (5m): EMA10/20 cross, price above/below EMA20, within 1.5xATR of EMA50
-        entry_tf: str = "5m",       # timeframe (mtf key) the entry cross + exit run on
-        ema_fast: int = 8,          # entry-cross fast EMA (5m)
-        ema_slow: int = 13,         # entry-cross slow EMA (5m); also the cross-back exit reference
-        entry_ema_ref: int = 13,    # price must be above (long) / below (short) this EMA (5m) — same line the cross + exit use
+        entry_tf: str = "15m",      # timeframe the entry cross + exit run on (15m base beats 5m fee drag)
+        trend_tf: str = "1h",       # Layer1 trend timeframe: "1h" (uses mtf 1h) or "30m" (15m resample)
+        ema_fast: int = 8,          # entry-cross fast EMA (on entry_tf)
+        ema_slow: int = 13,         # entry-cross slow EMA (on entry_tf); also the cross-back exit reference
+        entry_ema_ref: int = 13,    # price must be above (long) / below (short) this EMA — same line the cross + exit use
         sl_ema_ref: int = 50,       # SL sits at this EMA (5m)
         chase_ema_ref: int = 50,    # chase-guard distance is measured vs this EMA (5m); decoupled from sl_ema_ref
         fresh_trend_bars: int = 3,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
@@ -328,6 +329,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.single_tf_quality_penalty = max(0.0, float(single_tf_quality_penalty))
 
         self.entry_tf = entry_tf
+        self.trend_tf = trend_tf
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.entry_ema_ref = entry_ema_ref
@@ -530,13 +532,19 @@ class TrendConfirmStrategy(BaseStrategy):
         if not candles:
             return self._hold(current_price, "Data Quality: empty 15m candle series")
         bar_ts_15 = candles[-1].timestamp
-        # Entry, SL/TP and exit all run on the finer 5m series (mtf_candles).
+        _TF_MS = {"5m": 5 * 60_000, "15m": 15 * 60_000, "30m": 30 * 60_000,
+                  "1h": 60 * 60_000, "4h": 4 * 60 * 60_000}
+        entry_ms = _TF_MS.get(self.entry_tf, 15 * 60_000)
+        # Entry, SL/TP and exit all run on the entry_tf series. When entry_tf is
+        # the 15m base, that IS `candles` — mtf usually only carries 5m/1h/4h.
         c5m = mtf.get(self.entry_tf, []) or []
+        if not c5m and self.entry_tf == "15m":
+            c5m = candles
         # Some bot deployments only request 5m/15m data. Build missing HTFs
         # from the 15m series instead of permanently blocking all entries.
         c1h = mtf.get("1h", []) or self._resample_timeframe(candles, 60 * 60_000, 15 * 60_000)
         c4h = mtf.get("4h", []) or self._resample_timeframe(candles, 4 * 60 * 60_000, 15 * 60_000)
-        self._latest_5m = c5m  # cached for tick_open_position()
+        self._latest_5m = c5m  # cached for tick_open_position() (name kept; = entry_tf series)
         bar_ts_5 = c5m[-1].timestamp if c5m else None
 
         # ── Layer 0: production data-quality gate ──────────────────────────
@@ -544,7 +552,7 @@ class TrendConfirmStrategy(BaseStrategy):
         if self.use_data_quality_gate:
             for tf_name, series, expected_ms, required in (
                 ("15m", candles, 15 * 60_000, True),
-                (self.entry_tf, c5m, 5 * 60_000, True),
+                (self.entry_tf, c5m, entry_ms, True),
                 ("1h", c1h, 60 * 60_000, False),
                 ("4h", c4h, 4 * 60 * 60_000, self.require_4h_context),
             ):
@@ -566,12 +574,14 @@ class TrendConfirmStrategy(BaseStrategy):
                 metadata={"data_quality": data_quality},
             )
 
-        # ── Layer 1: Trend direction (30m) ─────────────────────────────────
-        c30 = self._closed_30m_bars(candles)
+        # ── Layer 1: Trend direction (trend_tf) ────────────────────────────
+        # "1h" reads the mtf 1H series (falls back to a 15m→1h resample);
+        # "30m" keeps the legacy 15m→30m resample.
+        c30 = c1h if self.trend_tf == "1h" else self._closed_30m_bars(candles)
         min_needed_30 = max(self.ema2_period + self.ema_slope_lookback, self.sma_trend,
                             self.macd_slow + self.macd_signal) + 5
         if len(c30) < min_needed_30:
-            return self._hold(current_price, f"Layer1: need {min_needed_30}+ closed 30m bars, have {len(c30)}")
+            return self._hold(current_price, f"Layer1: need {min_needed_30}+ closed {self.trend_tf} bars, have {len(c30)}")
 
         bar_ts_30 = c30[-1].timestamp
         is_new_bar_30 = bar_ts_30 != self._last_bar_ts_30
