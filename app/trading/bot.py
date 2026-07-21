@@ -1354,13 +1354,27 @@ class TradingBot:
         # would reject.
         safety_buffer = 0.95  # leave headroom for fees/slippage
         if required_margin > quote_balance * safety_buffer:
-            max_notional = quote_balance * safety_buffer * (leverage if is_futures else 1)
-            clamped_amount = round(max_notional / price, 6) if price > 0 else 0
-            logger.warning(
-                "[%s] Margin required $%.2f exceeds available $%.2f — clamping size %.6f → %.6f",
-                strategy_name, required_margin, quote_balance, amount, clamped_amount,
-            )
-            amount = clamped_amount
+            if sizing_mode in ("fixed", "fixed_margin"):
+                # Fixed sizing means "this exact size or nothing" — clamping it
+                # down produces a meaningless micro-position that only pays fees
+                # (e.g. $0.33 margin instead of $35 when the balance is tied up
+                # in other positions). Skip the trade instead; it can re-fire
+                # once capital frees up.
+                logger.warning(
+                    "[%s] Fixed sizing needs $%.2f margin but only $%.2f free — SKIPPING "
+                    "this entry (won't open a clamped micro-position). Frees up when other "
+                    "positions close.",
+                    strategy_name, required_margin, quote_balance,
+                )
+                amount = 0
+            else:
+                max_notional = quote_balance * safety_buffer * (leverage if is_futures else 1)
+                clamped_amount = round(max_notional / price, 6) if price > 0 else 0
+                logger.warning(
+                    "[%s] Margin required $%.2f exceeds available $%.2f — clamping size %.6f → %.6f",
+                    strategy_name, required_margin, quote_balance, amount, clamped_amount,
+                )
+                amount = clamped_amount
 
         actual_risk_dollars = amount * risk_per_unit if risk_per_unit > 0 else 0
         logger.info(
