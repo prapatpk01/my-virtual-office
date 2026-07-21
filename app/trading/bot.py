@@ -1271,7 +1271,7 @@ class TradingBot:
         # still applies (can't lock more margin than the account can cover), but
         # the % concentration cap is skipped (this IS the intended big size).
         # FIXED_MARGIN_USD=0 disables it.
-        fixed_margin = float(os.getenv("FIXED_MARGIN_USD", "35"))
+        fixed_margin = float(os.getenv("FIXED_MARGIN_USD", "20"))
         fixed_notional = float(os.getenv("FIXED_NOTIONAL_USD", "0"))
         if fixed_margin > 0:
             sizing_mode = "fixed_margin"
