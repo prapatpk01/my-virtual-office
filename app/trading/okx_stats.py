@@ -56,8 +56,11 @@ def group_trades(orders: list[dict]) -> list[dict]:
 
 
 def build_stats(orders_by_symbol: dict[str, list[dict]], balance: float | None,
-                open_positions: int, since_ms: int) -> dict:
+                open_positions: int, since_ms: int,
+                open_positions_detail: list[dict] | None = None) -> dict:
     """orders_by_symbol: {symbol: [normalized fills chronological]}.
+    open_positions_detail: live position dicts (symbol/side/amount/entry_price/
+    mark_price/unrealized_pnl) to LIST under an OPEN POSITIONS section.
     Returns the dict the Telegram /stats renderer consumes."""
     all_trades: list[dict] = []
     per_symbol: dict[str, dict] = {}
@@ -85,10 +88,32 @@ def build_stats(orders_by_symbol: dict[str, list[dict]], balance: float | None,
     sl_only = sum(1 for t in all_trades if t["partials"] == 0 and not t["won"])
     denom = max(1, len(with_partial))
 
+    open_list = []
+    for p in (open_positions_detail or []):
+        entry = p.get("entry_price") or 0.0
+        mark = p.get("mark_price") or entry
+        amt = p.get("amount") or 0.0
+        upnl = p.get("unrealized_pnl")
+        notional = p.get("notional") or (amt * mark)
+        if upnl is None and entry:
+            # derive uPnL if the exchange didn't hand it back
+            sign = 1 if p.get("side") == "long" else -1
+            upnl = sign * (mark - entry) * amt
+        open_list.append({
+            "short": _sym_short(p.get("symbol", "")),
+            "side": p.get("side", ""),
+            "amount": amt,
+            "entry": entry,
+            "mark": mark,
+            "notional": round(notional, 2),
+            "upnl": round(upnl, 4) if upnl is not None else None,
+        })
+
     return {
         "source": "okx",
         "balance": balance,
         "open_positions": open_positions,
+        "open_list": open_list,
         "trades": n, "wins": wins, "losses": losses,
         "win_rate": round(wins / n * 100, 1) if n else 0.0,
         "net_pnl": net_total,

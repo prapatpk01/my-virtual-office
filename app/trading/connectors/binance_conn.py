@@ -395,11 +395,26 @@ class BinanceConnector(BaseConnector):
             entry_price = p.get("entryPrice")
             if not entry_price:
                 continue
+            info = p.get("info") or {}
+            def _f(*keys):
+                for src in (p, info):
+                    for k in keys:
+                        v = src.get(k)
+                        if v not in (None, ""):
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+                return None
             out.append({
                 "symbol": p.get("symbol"),
                 "side": side,
                 "amount": abs(float(contracts)),
                 "entry_price": float(entry_price),
+                "mark_price": _f("markPrice", "markPx"),
+                "unrealized_pnl": _f("unrealizedPnl", "upl"),
+                "notional": _f("notional", "notionalUsd"),
+                "margin": _f("initialMargin", "margin", "imr", "mmr"),
             })
         return out
 

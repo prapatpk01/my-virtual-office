@@ -517,6 +517,22 @@ class TelegramNotifier:
                  f"SL only  : `{sl}/{n or 1}` (`{sl/(n or 1)*100:.0f}%`)",
                  f"Net PnL  : `{net_sign}${abs(net):,.2f}`  (post-fee, from OKX)"]
 
+        open_list = s.get("open_list", [])
+        if open_list:
+            lines += ["", SEP, "OPEN POSITIONS", SEP]
+            for p in open_list:
+                arrow = "🟢" if p["side"] == "long" else "🔴"
+                upnl = p.get("upnl")
+                if upnl is None:
+                    upnl_str = ""
+                else:
+                    us = "+" if upnl >= 0 else "-"
+                    upnl_str = f"  uPnL `{us}${abs(upnl):,.2f}`"
+                lines.append(
+                    f"{arrow} `{p['short']:<5}` {p['side'].upper()} "
+                    f"`{p['amount']:g}` @ `${p['entry']:,.4f}`  "
+                    f"(≈`${p['notional']:,.0f}`){upnl_str}")
+
         per = s.get("per_symbol", {})
         if per:
             lines += ["", SEP, "BY SYMBOL", SEP]

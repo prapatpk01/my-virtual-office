@@ -1238,15 +1238,24 @@ class TradingBot:
                 strategy_name, conn_lev, env_lev, leverage,
             )
 
-        # ── Fixed-notional sizing (takes precedence when set) ─────────────────
-        # A dead-simple, deterministic size that can't be thrown off by
-        # leverage/margin/free-vs-total math: the order value (notional) is a
-        # fixed $ amount and amount = notional / market price. Set
-        # FIXED_NOTIONAL_USD=0 (default) disables this and uses margin sizing
-        # (5% of equity × leverage = notional ≈ full balance). Set it to a $
-        # amount only if you want a flat per-trade size instead.
+        # ── Fixed-MARGIN sizing (highest precedence) ─────────────────────────
+        # Lock a FIXED $ margin (collateral) per trade, then notional = margin ×
+        # leverage. e.g. $35 margin × 20x = $700 position. This is what shows in
+        # the OKX "Margin" column. Aggressive on a small account — one trade's
+        # margin is a big share of the balance — so the free-balance clamp below
+        # still applies (can't lock more margin than the account can cover), but
+        # the % concentration cap is skipped (this IS the intended big size).
+        # FIXED_MARGIN_USD=0 disables it.
+        fixed_margin = float(os.getenv("FIXED_MARGIN_USD", "35"))
         fixed_notional = float(os.getenv("FIXED_NOTIONAL_USD", "0"))
-        if fixed_notional > 0:
+        if fixed_margin > 0:
+            sizing_mode = "fixed_margin"
+            notional_target = fixed_margin * (leverage if is_futures else 1)
+            amount = round(notional_target / price, 6) if price > 0 else 0
+            risk_per_unit = abs(price - sl_p) if sl_p else 0
+            sizing_label = (f"fixed-margin ${fixed_margin:.2f} × {leverage}x = notional "
+                            f"${notional_target:.2f} → amount {amount:g} @ ${price:,.4f}")
+        elif fixed_notional > 0:
             sizing_mode = "fixed"
             notional_target = fixed_notional
             amount = round(notional_target / price, 6) if price > 0 else 0
@@ -1302,7 +1311,7 @@ class TradingBot:
         required_margin = (notional / leverage) if is_futures else notional
         max_margin      = quote_balance * max_margin_pct
 
-        if sizing_mode not in ("margin", "fixed") and required_margin > max_margin:
+        if sizing_mode not in ("margin", "fixed", "fixed_margin") and required_margin > max_margin:
             max_notional_by_risk_cap = max_margin * (leverage if is_futures else 1)
             capped_amount = round(max_notional_by_risk_cap / price, 6) if price > 0 else 0
             logger.warning(
@@ -1448,7 +1457,16 @@ class TradingBot:
                 # Render on the timeframe the strategy actually entered on: if
                 # it exposes a finer entry series (trend_confirm's 5m), chart
                 # THAT so the EMA lines match the trade; else the base candles.
-                chart_candles = getattr(strategy_inst, "_latest_5m", None) or candles
+                # render_entry_chart needs >=20 bars — pick whichever series has
+                # enough. A short 5m series must NOT shadow a full 15m one
+                # (that silently killed the chart for some symbols, e.g. HYPE).
+                _l5 = getattr(strategy_inst, "_latest_5m", None)
+                if _l5 and len(_l5) >= 20:
+                    chart_candles = _l5
+                elif candles and len(candles) >= 20:
+                    chart_candles = candles
+                else:
+                    chart_candles = _l5 or candles  # best effort; may still be too short
                 if chart_candles:
                     try:
                         from .chart_renderer import render_entry_chart
@@ -1462,6 +1480,12 @@ class TradingBot:
                         )
                     except Exception as e:
                         logger.warning("Chart render failed for %s: %s", sym, e)
+                if chart_path is None:
+                    logger.warning(
+                        "[%s] no entry chart sent — 5m bars=%s, base bars=%s (need >=20). "
+                        "Notification goes out text-only.",
+                        sym, len(_l5) if _l5 else 0, len(candles) if candles else 0,
+                    )
                 self.telegram.notify_order(
                     sym, order_side, order.filled or amount, order.price,
                     strategy_name, self.connector.paper,
@@ -1549,7 +1573,16 @@ class TradingBot:
             balance = next((b.total for b in bals if b.asset in ("USDT", "USD", "BUSD")), None)
         except Exception as e:
             logger.debug("[Stats] balance fetch failed: %s", e)
-        open_pos = len(self.risk.get_positions())
+        # Live open positions from OKX (symbol/side/size/entry/mark/uPnL) so
+        # /stats can LIST them, not just count. Falls back to the in-memory
+        # count if the exchange call isn't available.
+        open_positions_detail: list = []
+        if not self.connector.paper and hasattr(self.connector, "fetch_positions"):
+            try:
+                open_positions_detail = await self.connector.fetch_positions(symbols)
+            except Exception as e:
+                logger.debug("[Stats] fetch_positions failed: %s", e)
+        open_pos = len(open_positions_detail) if open_positions_detail else len(self.risk.get_positions())
 
         orders_by_symbol: dict = {}
         if not self.connector.paper and hasattr(self.connector, "fetch_closed_orders_raw"):
@@ -1561,7 +1594,8 @@ class TradingBot:
                     logger.warning("[Stats] history fetch failed for %s: %s", sym, e)
 
         if orders_by_symbol and any(orders_by_symbol.values()):
-            return build_stats(orders_by_symbol, balance, open_pos, since)
+            return build_stats(orders_by_symbol, balance, open_pos, since,
+                               open_positions_detail=open_positions_detail)
 
         # Fallback — internal record + real balance, tagged so the renderer knows.
         s = self._sig.summary()
