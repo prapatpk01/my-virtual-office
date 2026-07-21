@@ -1,5 +1,5 @@
 """
-Trend-Confirmed Multi-TF Strategy — HTF Context V2.
+Trend-Confirmed Multi-TF Strategy — Adaptive HTF Context V2.1.
 
 V2 keeps the three 5M entry engines (EMA_CROSS, BREAKOUT_RETEST and
 STRUCTURE_RETEST) and adds a production context architecture around them:
@@ -13,8 +13,9 @@ STRUCTURE_RETEST) and adds a production context architecture around them:
 
 Layer 1 — Trend direction (TF30m):
   Determines whether the market is currently in an uptrend or a
-  downtrend. FOUR checks must ALL agree on the same direction, or there
-  is no confirmed trend (self._trend_state = None) and nothing below runs:
+  downtrend. EMA10/20 alignment is mandatory and at least 3 of the 4
+  direction checks must agree. This preserves trend confirmation without
+  requiring slower SMA/MACD components to turn on the exact same bar:
     SMA30      : candle opens above SMA30 -> up, below -> down
     EMA10/20   : EMA10 > EMA20 -> up, EMA10 < EMA20 -> down
     EMA20 slope: EMA20 higher than `ema_slope_lookback` bars ago -> up
@@ -28,8 +29,8 @@ Layer 2 — Trade CONTEXT: trend quality (2a) + location/structure (2b).
 
   2a) Trend quality — dynamic weighted score (TF15m + TF1H):
     Scores HOW GOOD the confirmed trend is on each timeframe (0-100 per TF),
-    then combines them 15m x 65% + 1H x 35%. Must score > `layer2_threshold`
-    (default 60) established, or > `layer2_threshold_early` (68, stricter) for
+    then combines them 15m x 70% + 1H x 30%. Must score above the balanced
+    `layer2_threshold` (default 56) established, or 62 for
     an early-trend entry. Each per-TF quality score (in _tf_quality()) is:
       Alignment 40 pts — 4 x 10 pts: close vs EMA20, EMA20 vs EMA50, RSI
                          lean (>55 bull / <45 bear), MACD line sign — each
@@ -63,8 +64,8 @@ Layer 3 — Multi-entry router (TF5m), reached only after Layer1 + Layer2 pass:
   `fresh_trend_bars`, default 2, 5m bars of when it flipped) the entry counts
   a cross up to fresh_trend_bars ago — which may predate the confirmation.
   Entering this early is riskier, so it must clear the STRICTER
-  `layer2_threshold_early` (68) instead of the normal 60. Outside that window
-  (established trend) only the normal 60 threshold applies.
+  `layer2_threshold_early` (62) instead of the normal 56. Outside that
+  window the established-trend threshold applies.
   Cross validity: a cross stays usable for `cross_valid_bars` (default 3) 5m
   bars — the Layer2 gates (quality/location) often clear a bar or two AFTER
   the cross fires, and requiring both on the exact same bar silently wasted
@@ -130,6 +131,8 @@ class TrendConfirmStrategy(BaseStrategy):
         macd_fast: int = 12,
         macd_slow: int = 26,
         macd_signal: int = 9,
+        layer1_min_agreement: int = 3,  # 3-of-4 direction vote; EMA10/20 remains mandatory
+        layer1_require_ema_alignment: bool = True,
         # Layer 2 — trend quality (15m + 1H)
         quality_ema_fast: int = 20,
         quality_ema_slow: int = 50,
@@ -147,10 +150,12 @@ class TrendConfirmStrategy(BaseStrategy):
         trend_weight: float = 30.0,      # trend strength / not choppy (ADX + Choppiness)
         momentum_weight: float = 25.0,   # RSI lean + MACD histogram in-trend
         volume_weight: float = 15.0,     # volume expansion vs its SMA
-        tf_weight_15m: float = 0.65,
-        tf_weight_1h: float = 0.35,
-        layer2_threshold: float = 60.0,        # established-trend entries
-        layer2_threshold_early: float = 68.0,  # stricter quality gate for early-trend entries (5m cross led the confirm)
+        tf_weight_15m: float = 0.70,
+        tf_weight_1h: float = 0.30,
+        layer2_threshold: float = 56.0,        # balanced live threshold; HTF context still protects location
+        layer2_threshold_early: float = 62.0,  # early setups remain stricter without becoming practically unreachable
+        allow_15m_quality_fallback: bool = True,
+        single_tf_quality_penalty: float = 4.0,
         # Layer 3 — entry (5m): EMA10/20 cross, price above/below EMA20, within 1.5xATR of EMA50
         entry_tf: str = "5m",       # timeframe (mtf key) the entry cross + exit run on
         ema_fast: int = 10,         # entry-cross fast EMA (5m)
@@ -158,37 +163,39 @@ class TrendConfirmStrategy(BaseStrategy):
         entry_ema_ref: int = 20,    # price must be above (long) / below (short) this EMA (5m) — EMA20, same line the cross + exit use
         sl_ema_ref: int = 50,       # SL sits at this EMA (5m)
         chase_ema_ref: int = 50,    # chase-guard distance is measured vs this EMA (5m); decoupled from sl_ema_ref
-        fresh_trend_bars: int = 2,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
-        cross_valid_bars: int = 3,  # how many 5m bars a cross stays usable while Layer2 gates settle —
+        fresh_trend_bars: int = 3,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
+        cross_valid_bars: int = 6,  # how many 5m bars a cross stays usable while Layer2 gates settle —
                                     #   without this, a cross was only good on the exact bar every gate was
                                     #   already open (quality/location often clear 1-2 bars AFTER the cross,
                                     #   which silently wasted almost every signal)
-        max_dist_atr_mult: float = 1.8,  # max distance from the chase EMA in ATR(5m)
+        max_dist_atr_mult: float = 2.2,  # EMA-cross chase limit in ATR(5m)
+        breakout_max_dist_atr_mult: float = 2.8,
+        structure_max_dist_atr_mult: float = 2.4,
         # Layer 3 Entry Router — three independent triggers. Breakout uses
         # retest-only execution (no direct chasing) and structure entry requires
         # a confirmed HH/HL or LH/LL sequence plus a reclaim / micro-BOS trigger.
         use_ema_cross_entry: bool = True,
         use_breakout_retest_entry: bool = True,
         use_structure_retest_entry: bool = True,
-        entry_trigger_valid_bars: int = 2,
+        entry_trigger_valid_bars: int = 3,
         breakout_lookback: int = 6,
-        breakout_arm_bars: int = 4,
+        breakout_arm_bars: int = 6,
         breakout_buffer_atr: float = 0.05,
-        breakout_retest_tolerance_atr: float = 0.20,
-        breakout_invalidation_atr: float = 0.25,
+        breakout_retest_tolerance_atr: float = 0.30,
+        breakout_invalidation_atr: float = 0.35,
         breakout_min_body_atr: float = 0.20,
         breakout_min_close_quality: float = 0.65,
-        breakout_min_volume_ratio: float = 1.10,
-        breakout_entry_min_quality: float = 72.0,
-        structure_retest_window_bars: int = 5,
-        structure_level_max_age_bars: int = 40,
-        structure_retest_tolerance_atr: float = 0.25,
+        breakout_min_volume_ratio: float = 0.95,
+        breakout_entry_min_quality: float = 64.0,
+        structure_retest_window_bars: int = 8,
+        structure_level_max_age_bars: int = 60,
+        structure_retest_tolerance_atr: float = 0.35,
         structure_invalidation_atr: float = 0.30,
         structure_micro_bos_lookback: int = 2,
-        structure_entry_min_quality: float = 68.0,
+        structure_entry_min_quality: float = 62.0,
         entry_stop_buffer_atr: float = 0.10,
         entry_min_stop_atr: float = 0.50,
-        entry_max_stop_atr: float = 1.50,
+        entry_max_stop_atr: float = 2.20,
         # Position sizing (emitted in the signal so bot.py sizes live orders the
         # same way the paper account does): margin = margin_pct of balance,
         # notional = margin x leverage. e.g. $100 x 5% = $5 x 20 = $100 notional.
@@ -200,18 +207,20 @@ class TrendConfirmStrategy(BaseStrategy):
         structure_pivot_right: int = 2,
         zone_width_atr_1h: float = 0.18,
         zone_width_atr_4h: float = 0.22,
-        hard_zone_distance_atr: float = 0.30,
-        min_structure_room_r: float = 0.50,   # hard-reject below this many R of room to the opposing zone
+        hard_zone_distance_atr: float = 0.15,
+        min_structure_room_r: float = 0.25,   # hard-reject below this many R of room to the opposing zone
         preferred_structure_room_r: float = 0.75,  # below this (but >= min) just penalizes the quality gate
-        location_threshold_penalty: float = 4.0,
+        location_threshold_penalty: float = 3.0,
+        max_location_threshold_penalty: float = 8.0,
         reject_midrange_when_choppy: bool = True,
         # Production data / HTF context gates
         use_data_quality_gate: bool = True,
         max_recent_gap_mult: float = 20.0,
-        require_4h_context: bool = True,
-        min_4h_context_bars: int = 50,
+        require_4h_context: bool = False,
+        min_4h_context_bars: int = 30,
         use_htf_macro_filter: bool = True,
-        htf_transition_threshold_penalty: float = 3.0,
+        htf_transition_threshold_penalty: float = 2.0,
+        htf_single_conflict_penalty: float = 4.0,
         htf_alignment_edge_bonus: float = 3.0,
         # 4H/1H supply-demand engine. Zones are detected from a compact base
         # followed by an ATR-qualified departure, then tracked for touches,
@@ -241,8 +250,8 @@ class TrendConfirmStrategy(BaseStrategy):
         regime_trend_chop_max: float = 61.8,
         regime_min_ema_gap_atr: float = 0.35,
         regime_strong_threshold_discount: float = 3.0,
-        regime_transition_threshold_penalty: float = 5.0,
-        allow_structure_entry_in_transition: bool = False,
+        regime_transition_threshold_penalty: float = 3.0,
+        allow_structure_entry_in_transition: bool = True,
         # Sideways / range veto (Layer 2) — hard-block entries when the 15m
         # context looks like a range, not a trend. Designed NOT to kill early
         # trends: it leans on EMA compression + high chop (which stay range-y
@@ -252,7 +261,7 @@ class TrendConfirmStrategy(BaseStrategy):
         sideways_ema_compression_atr: float = 0.5,  # |EMA20-EMA50| < this x ATR = tangled/flat
         sideways_adx_max: float = 15.0,             # ADX below this = "really weak" (< adx_threshold on purpose)
         sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
-        sideways_min_signals: int = 2,              # how many of the 4 signals must fire to veto
+        sideways_min_signals: int = 3,              # how many of the 4 signals must fire to veto
         # Exit (5m): EMA10/20 cross-back OR a 5m close past EMA20 closes the runner
         use_close_past_exit: bool = True,   # enable the "close past EMA20" exit at all (cross-back always on)
         exit_close_confirm_bars: int = 1,   # N consecutive 5m closes past EMA20 required for that exit
@@ -284,6 +293,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self.macd_fast = macd_fast
         self.macd_slow = macd_slow
         self.macd_signal = macd_signal
+        self.layer1_min_agreement = max(2, min(4, int(layer1_min_agreement)))
+        self.layer1_require_ema_alignment = bool(layer1_require_ema_alignment)
 
         self.quality_ema_fast = quality_ema_fast
         self.quality_ema_slow = quality_ema_slow
@@ -304,6 +315,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self.tf_weight_1h = tf_weight_1h
         self.layer2_threshold = layer2_threshold
         self.layer2_threshold_early = layer2_threshold_early
+        self.allow_15m_quality_fallback = bool(allow_15m_quality_fallback)
+        self.single_tf_quality_penalty = max(0.0, float(single_tf_quality_penalty))
 
         self.entry_tf = entry_tf
         self.ema_fast = ema_fast
@@ -315,7 +328,9 @@ class TrendConfirmStrategy(BaseStrategy):
         self.cross_valid_bars = cross_valid_bars
         self.sizing_mode = sizing_mode
         self.margin_pct = margin_pct
-        self.max_dist_atr_mult = max_dist_atr_mult
+        self.max_dist_atr_mult = max(0.5, float(max_dist_atr_mult))
+        self.breakout_max_dist_atr_mult = max(self.max_dist_atr_mult, float(breakout_max_dist_atr_mult))
+        self.structure_max_dist_atr_mult = max(self.max_dist_atr_mult, float(structure_max_dist_atr_mult))
         self.use_ema_cross_entry = use_ema_cross_entry
         self.use_breakout_retest_entry = use_breakout_retest_entry
         self.use_structure_retest_entry = use_structure_retest_entry
@@ -347,7 +362,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self.hard_zone_distance_atr = hard_zone_distance_atr
         self.min_structure_room_r = min_structure_room_r
         self.preferred_structure_room_r = preferred_structure_room_r
-        self.location_threshold_penalty = location_threshold_penalty
+        self.location_threshold_penalty = max(0.0, float(location_threshold_penalty))
+        self.max_location_threshold_penalty = max(self.location_threshold_penalty, float(max_location_threshold_penalty))
         self.reject_midrange_when_choppy = reject_midrange_when_choppy
         self.use_data_quality_gate = use_data_quality_gate
         self.max_recent_gap_mult = max(2.0, max_recent_gap_mult)
@@ -355,6 +371,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.min_4h_context_bars = max(20, min_4h_context_bars)
         self.use_htf_macro_filter = use_htf_macro_filter
         self.htf_transition_threshold_penalty = max(0.0, htf_transition_threshold_penalty)
+        self.htf_single_conflict_penalty = max(0.0, htf_single_conflict_penalty)
         self.htf_alignment_edge_bonus = max(0.0, htf_alignment_edge_bonus)
         self.use_supply_demand_zones = use_supply_demand_zones
         self.sd_scan_lookback_bars = max(30, sd_scan_lookback_bars)
@@ -399,6 +416,10 @@ class TrendConfirmStrategy(BaseStrategy):
         self.rr_ratio = rr_ratio
         self.min_sl_pct = min_sl_pct
 
+        # Apply params passed by the bot/config. Older versions forwarded params
+        # to BaseStrategy but silently ignored them in this class.
+        self._apply_runtime_params(params)
+
         self._open_position: Optional[str] = None   # "long" | "short" | None
         self._trend_state: Optional[str] = None      # "up" | "down" | None — Layer 1 result
         self._trend_confirmed_since_ts: Optional[int] = None  # 5m bar_ts when trend last CHANGED
@@ -423,6 +444,72 @@ class TrendConfirmStrategy(BaseStrategy):
         self._zone_cache_key: Optional[tuple] = None
         self._zone_cache: list[dict] = []
 
+
+    def _apply_runtime_params(self, params: Optional[dict]) -> None:
+        """Apply strategy settings supplied through the bot's params dict.
+
+        The previous file accepted ``params`` but never copied those values to
+        this strategy, so Railway/config changes appeared to work while the
+        strict defaults kept running. Only existing public scalar attributes
+        are accepted; unknown keys are ignored.
+        """
+        if not isinstance(params, dict):
+            return
+        cfg = params
+        for nested_key in ("strategy_params", "trend_confirm", "trend_confirm_strategy"):
+            nested = params.get(nested_key)
+            if isinstance(nested, dict):
+                cfg = nested
+                break
+
+        protected = {"name", "symbol", "params"}
+        for key, raw in cfg.items():
+            if key in protected or key.startswith("_") or not hasattr(self, key):
+                continue
+            current = getattr(self, key)
+            if not isinstance(current, (bool, int, float, str)):
+                continue
+            try:
+                if isinstance(current, bool):
+                    if isinstance(raw, str):
+                        value = raw.strip().lower() in {"1", "true", "yes", "on"}
+                    else:
+                        value = bool(raw)
+                elif isinstance(current, int) and not isinstance(current, bool):
+                    value = int(raw)
+                elif isinstance(current, float):
+                    value = float(raw)
+                else:
+                    value = str(raw)
+                setattr(self, key, value)
+            except (TypeError, ValueError):
+                continue
+
+        # Re-normalize values that can make all signals impossible when a bad
+        # environment value is supplied.
+        self.layer1_min_agreement = max(2, min(4, int(self.layer1_min_agreement)))
+        self.tf_weight_15m = max(0.0, float(self.tf_weight_15m))
+        self.tf_weight_1h = max(0.0, float(self.tf_weight_1h))
+        weight_sum = self.tf_weight_15m + self.tf_weight_1h
+        if weight_sum <= 0:
+            self.tf_weight_15m, self.tf_weight_1h = 0.70, 0.30
+        else:
+            self.tf_weight_15m /= weight_sum
+            self.tf_weight_1h /= weight_sum
+        self.layer2_threshold = max(35.0, min(85.0, float(self.layer2_threshold)))
+        self.layer2_threshold_early = max(self.layer2_threshold, min(90.0, float(self.layer2_threshold_early)))
+        self.cross_valid_bars = max(1, int(self.cross_valid_bars))
+        self.entry_trigger_valid_bars = max(1, int(self.entry_trigger_valid_bars))
+        self.max_dist_atr_mult = max(0.5, float(self.max_dist_atr_mult))
+        self.breakout_max_dist_atr_mult = max(self.max_dist_atr_mult, float(self.breakout_max_dist_atr_mult))
+        self.structure_max_dist_atr_mult = max(self.max_dist_atr_mult, float(self.structure_max_dist_atr_mult))
+        self.sideways_min_signals = max(2, min(4, int(self.sideways_min_signals)))
+        self.location_threshold_penalty = max(0.0, float(self.location_threshold_penalty))
+        self.max_location_threshold_penalty = max(
+            self.location_threshold_penalty, float(self.max_location_threshold_penalty)
+        )
+        self.min_4h_context_bars = max(10, int(self.min_4h_context_bars))
+
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
         self._latest_candles = candles  # 15m base (Layer1 30m resample + Layer2 15m)
         mtf = mtf_candles or {}
@@ -431,20 +518,25 @@ class TrendConfirmStrategy(BaseStrategy):
         bar_ts_15 = candles[-1].timestamp
         # Entry, SL/TP and exit all run on the finer 5m series (mtf_candles).
         c5m = mtf.get(self.entry_tf, []) or []
-        c1h = mtf.get("1h", []) or []
-        c4h = mtf.get("4h", []) or []
+        # Some bot deployments only request 5m/15m data. Build missing HTFs
+        # from the 15m series instead of permanently blocking all entries.
+        c1h = mtf.get("1h", []) or self._resample_timeframe(candles, 60 * 60_000, 15 * 60_000)
+        c4h = mtf.get("4h", []) or self._resample_timeframe(candles, 4 * 60 * 60_000, 15 * 60_000)
         self._latest_5m = c5m  # cached for tick_open_position()
         bar_ts_5 = c5m[-1].timestamp if c5m else None
 
         # ── Layer 0: production data-quality gate ──────────────────────────
         data_quality: dict = {}
         if self.use_data_quality_gate:
-            for tf_name, series, expected_ms in (
-                ("15m", candles, 15 * 60_000),
-                (self.entry_tf, c5m, 5 * 60_000),
-                ("1h", c1h, 60 * 60_000),
-                ("4h", c4h, 4 * 60 * 60_000),
+            for tf_name, series, expected_ms, required in (
+                ("15m", candles, 15 * 60_000, True),
+                (self.entry_tf, c5m, 5 * 60_000, True),
+                ("1h", c1h, 60 * 60_000, False),
+                ("4h", c4h, 4 * 60 * 60_000, self.require_4h_context),
             ):
+                if not series and not required:
+                    data_quality[tf_name] = {"valid": True, "reason": "optional_context_missing", "bars": 0}
+                    continue
                 quality = self._data_quality_context(series, expected_ms)
                 data_quality[tf_name] = quality
                 if not quality["valid"]:
@@ -490,11 +582,14 @@ class TrendConfirmStrategy(BaseStrategy):
         is_new_bar_5 = bar_ts_5 is not None and bar_ts_5 != self._last_bar_ts_5
         if is_new_bar_5:
             self._last_bar_ts_5 = bar_ts_5
-            if l3 is not None:
-                if l3["ema_cross_up"]:
-                    self._last_ema_cross_up_ts = bar_ts_5
-                if l3["ema_cross_down"]:
-                    self._last_ema_cross_down_ts = bar_ts_5
+        # Re-check the latest candle on every analysis call. Some exchanges
+        # return the currently forming 5m bar; the old code inspected it only
+        # once at bar open and therefore missed crosses that formed later.
+        if bar_ts_5 is not None and l3 is not None:
+            if l3["ema_cross_up"] and self._last_ema_cross_up_ts != bar_ts_5:
+                self._last_ema_cross_up_ts = bar_ts_5
+            if l3["ema_cross_down"] and self._last_ema_cross_down_ts != bar_ts_5:
+                self._last_ema_cross_down_ts = bar_ts_5
 
         def _bars_ago_5(ts: Optional[int]) -> Optional[int]:
             if ts is None or bar_ts_5 is None:
@@ -531,8 +626,13 @@ class TrendConfirmStrategy(BaseStrategy):
         q15 = self._tf_quality(candles, trend) if trend else None
         q1h = self._tf_quality(c1h, trend) if trend else None
         l2_score = None
+        quality_fallback = False
         if q15 is not None and q1h is not None:
             l2_score = q15["score"] * self.tf_weight_15m + q1h["score"] * self.tf_weight_1h
+        elif q15 is not None and self.allow_15m_quality_fallback:
+            # Startup-safe mode: use 15m quality until enough 1H bars exist.
+            l2_score = q15["score"]
+            quality_fallback = True
 
         # Entry price is the latest 5m close (the TF the cross fires on).
         close_price = c5m[-1].close if c5m else candles[-1].close
@@ -554,6 +654,8 @@ class TrendConfirmStrategy(BaseStrategy):
                 l2_thr = max(0.0, l2_thr - self.regime_strong_threshold_discount)
             elif regime["state"] == "TRANSITION":
                 l2_thr += self.regime_transition_threshold_penalty
+        if quality_fallback:
+            l2_thr += self.single_tf_quality_penalty
         location_adjusted_l2_thr = l2_thr
         engine_status: dict = {}
         candidate_reviews: list[dict] = []
@@ -562,11 +664,14 @@ class TrendConfirmStrategy(BaseStrategy):
             return {"trend_confirm": {
                 "sma_trend": l1["sma_dir"], "ema10_20_trend": l1["ema1020_dir"],
                 "ema20_slope": l1["slope_dir"], "macd_trend": l1["macd_dir"],
-                "confirmed": trend,
+                "confirmed": trend, "layer1_up_votes": l1.get("up_votes"),
+                "layer1_down_votes": l1.get("down_votes"),
+                "layer1_required_votes": l1.get("required_votes"),
                 "q15": round(q15["score"], 1) if q15 else None,
                 "q1h": round(q1h["score"], 1) if q1h else None,
                 "q15_breakdown": q15["breakdown"] if q15 else None,
                 "q1h_breakdown": q1h["breakdown"] if q1h else None,
+                "quality_source": "15m_fallback" if quality_fallback else "15m_plus_1h",
                 "layer2_score": round(l2_score, 1) if l2_score is not None else None,
                 "layer2_threshold": location_adjusted_l2_thr,
                 "base_layer2_threshold": base_l2_thr,
@@ -593,11 +698,12 @@ class TrendConfirmStrategy(BaseStrategy):
 
         if trend is None:
             return self._hold(current_price,
-                "Layer1: SMA30/EMA10-20/EMA20 slope/MACD not confirmed or conflicting",
+                f"Layer1: direction vote not confirmed ({l1.get('up_votes', 0)} up / "
+                f"{l1.get('down_votes', 0)} down; need {self.layer1_min_agreement}/4 with EMA alignment)",
                 metadata=dbg("no_trend"))
 
-        if q15 is None or q1h is None:
-            return self._hold(current_price, "Layer2: quality indicators still warming up (15m/1H)",
+        if q15 is None or l2_score is None:
+            return self._hold(current_price, "Layer2: quality indicators still warming up (15m; 1H fallback unavailable)",
                               metadata=dbg("no_trend"))
 
         if bar_ts_5 is not None and self._last_entry_attempt_bar_ts == bar_ts_5:
@@ -606,8 +712,9 @@ class TrendConfirmStrategy(BaseStrategy):
                 metadata=dbg("entry_already_attempted"))
 
         pending_cross = has_long_candidate or has_short_candidate
-        score_note = (f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
-                      f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
+        score_note = ((f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
+                       f"1H={q1h['score']:.0f} x{self.tf_weight_1h:.2f})")
+                      if q1h is not None else f"(15m fallback={q15['score']:.0f})")
 
         def _spend_cross_if_early() -> bool:
             """An early EMA cross is consumed when Layer2 definitively rejects it."""
@@ -644,6 +751,8 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price, "Layer3: 5m indicators still warming up", metadata=dbg("no_trend"))
 
         dist_ok = dist_atr is not None and dist_atr <= self.max_dist_atr_mult
+        breakout_dist_ok = dist_atr is not None and dist_atr <= self.breakout_max_dist_atr_mult
+        structure_dist_ok = dist_atr is not None and dist_atr <= self.structure_max_dist_atr_mult
         dist_disp = f"{dist_atr:.2f}" if dist_atr is not None else "n/a"
         direction = "long" if trend == "up" else "short"
         candidates: list[dict] = []
@@ -693,8 +802,9 @@ class TrendConfirmStrategy(BaseStrategy):
         # disabled: a breakout must first return to the broken level and reclaim.
         if not self.use_breakout_retest_entry:
             engine_status["BREAKOUT_RETEST"] = "disabled"
-        elif not dist_ok:
-            engine_status["BREAKOUT_RETEST"] = f"rejected: {dist_disp}xATR from chase EMA"
+        elif not breakout_dist_ok:
+            engine_status["BREAKOUT_RETEST"] = (f"rejected: {dist_disp}xATR from chase EMA "
+                                                  f"> {self.breakout_max_dist_atr_mult:.2f}")
         elif not (l3["ema_bull_aligned"] if direction == "long" else l3["ema_bear_aligned"]):
             engine_status["BREAKOUT_RETEST"] = "waiting: EMA alignment"
         else:
@@ -723,8 +833,9 @@ class TrendConfirmStrategy(BaseStrategy):
         elif (self.use_regime_router and regime["state"] == "TRANSITION"
               and not self.allow_structure_entry_in_transition):
             engine_status["STRUCTURE_RETEST"] = "disabled in TRANSITION regime"
-        elif not dist_ok:
-            engine_status["STRUCTURE_RETEST"] = f"rejected: {dist_disp}xATR from chase EMA"
+        elif not structure_dist_ok:
+            engine_status["STRUCTURE_RETEST"] = (f"rejected: {dist_disp}xATR from chase EMA "
+                                                   f"> {self.structure_max_dist_atr_mult:.2f}")
         elif not (l3["ema_bull_aligned"] if direction == "long" else l3["ema_bear_aligned"]):
             engine_status["STRUCTURE_RETEST"] = "waiting: EMA alignment"
         else:
@@ -1123,16 +1234,24 @@ class TrendConfirmStrategy(BaseStrategy):
         wanted_structure = "bull" if direction == "up" else "bear"
         opposite_structure = "bear" if direction == "up" else "bull"
 
-        if structure_1h == opposite_structure:
+        context_penalty = 0.0
+        context_reasons: list[str] = []
+        one_h_conflict = structure_1h == opposite_structure
+        four_h_conflict = self.use_htf_macro_filter and structure_4h == opposite_structure
+        # A single HTF disagreement is common near reversals and should not
+        # silence the bot. Only a confirmed conflict on BOTH 1H and 4H is a
+        # hard veto; one conflicting timeframe raises the required quality.
+        if one_h_conflict and four_h_conflict:
             return {**self._neutral_location_context(), "valid": False,
-                    "reason": f"1H confirmed {opposite_structure.upper()} swing structure",
+                    "reason": f"1H and 4H both confirmed {opposite_structure.upper()} structure",
                     "structure_1h": structure_1h, "structure_4h": structure_4h,
                     "macro_alignment": "CONFLICT"}
-        if self.use_htf_macro_filter and structure_4h == opposite_structure:
-            return {**self._neutral_location_context(), "valid": False,
-                    "reason": f"4H major structure is {opposite_structure.upper()}",
-                    "structure_1h": structure_1h, "structure_4h": structure_4h,
-                    "macro_alignment": "CONFLICT"}
+        if one_h_conflict:
+            context_penalty += self.htf_single_conflict_penalty
+            context_reasons.append(f"1H {opposite_structure} structure conflict")
+        if four_h_conflict:
+            context_penalty += self.htf_single_conflict_penalty
+            context_reasons.append(f"4H {opposite_structure} structure conflict")
 
         levels: list[dict] = []
         for tf, pivots, bars, mult in (
@@ -1210,7 +1329,9 @@ class TrendConfirmStrategy(BaseStrategy):
                     "active_zone_count": len(active_zones),
                     "bearish_sweep": direction == "up", "bullish_sweep": direction == "down"}
 
-        if nearest is not None and zone_distance_atr is not None and zone_distance_atr < self.hard_zone_distance_atr:
+        if (nearest is not None and zone_distance_atr is not None
+                and zone_distance_atr < self.hard_zone_distance_atr
+                and (room_r is None or room_r < self.min_structure_room_r)):
             source = nearest.get("timeframe", "HTF")
             kind = nearest.get("kind", "zone")
             return {**self._neutral_location_context(), "valid": False,
@@ -1234,8 +1355,8 @@ class TrendConfirmStrategy(BaseStrategy):
         choppy_midrange = bool(self.reject_midrange_when_choppy and midrange and
                                chop_val is not None and chop_val >= self.chop_threshold - 3.0)
 
-        penalty = 0.0
-        reasons: list[str] = []
+        penalty = context_penalty
+        reasons: list[str] = list(context_reasons)
         if choppy_midrange:
             penalty += self.location_threshold_penalty
             reasons.append("mid-range in choppy conditions")
@@ -1245,6 +1366,7 @@ class TrendConfirmStrategy(BaseStrategy):
         if structure_4h == "transition":
             penalty += self.htf_transition_threshold_penalty
             reasons.append("4H structure transition")
+        penalty = min(penalty, self.max_location_threshold_penalty)
 
         macro_alignment = ("ALIGNED" if structure_4h == wanted_structure
                            else "TRANSITION" if structure_4h == "transition" else "NEUTRAL")
@@ -1804,7 +1926,7 @@ class TrendConfirmStrategy(BaseStrategy):
     def _sideways_context(self, candles: list) -> dict:
         """Range / sideways detector on the 15m context. Returns
         {is_sideways, signals, detail}. Fires up to 4 independent range
-        signals; `sideways_min_signals` (default 2) of them = veto.
+        signals; `sideways_min_signals` (default 3) of them = veto.
 
         Deliberately weighted toward signals that STAY range-y while ADX is
         still lagging at the start of a trend (EMA compression, high chop,
@@ -1866,8 +1988,12 @@ class TrendConfirmStrategy(BaseStrategy):
         # "MACD 4C" trend read: raw MACD line vs zero, not vs its signal line.
         macd_up, macd_down = macd_line[-1] > 0, macd_line[-1] < 0
 
-        trend_up = sma_up and ema1020_up and slope_up and macd_up
-        trend_down = sma_down and ema1020_down and slope_down and macd_down
+        up_votes = sum((sma_up, ema1020_up, slope_up, macd_up))
+        down_votes = sum((sma_down, ema1020_down, slope_down, macd_down))
+        up_core = ema1020_up if self.layer1_require_ema_alignment else True
+        down_core = ema1020_down if self.layer1_require_ema_alignment else True
+        trend_up = up_core and up_votes >= self.layer1_min_agreement and up_votes > down_votes
+        trend_down = down_core and down_votes >= self.layer1_min_agreement and down_votes > up_votes
 
         return {
             "trend": "up" if trend_up else "down" if trend_down else None,
@@ -1875,6 +2001,8 @@ class TrendConfirmStrategy(BaseStrategy):
             "ema1020_dir": "up" if ema1020_up else "down" if ema1020_down else "flat",
             "slope_dir": "up" if slope_up else "down" if slope_down else "flat",
             "macd_dir": "up" if macd_up else "down" if macd_down else "flat",
+            "up_votes": int(up_votes), "down_votes": int(down_votes),
+            "required_votes": self.layer1_min_agreement,
         }
 
     def _tf_quality(self, candles: list, trend: str) -> Optional[dict]:
@@ -2016,6 +2144,42 @@ class TrendConfirmStrategy(BaseStrategy):
             "dist_ema_val": float(chase_ema[-1]),   # chase-guard reference
             "atr_val": float(atr_arr[-1]),
         }
+
+    @staticmethod
+    def _resample_timeframe(candles: list, bucket_ms: int, source_ms: int) -> list:
+        """Resample closed OHLCV candles into a higher timeframe.
+
+        The final bucket is dropped only when the newest source candle has not
+        reached that bucket's end. This provides a safe 1H/4H fallback when the
+        bot does not request those timeframes directly.
+        """
+        if not candles or bucket_ms <= 0 or source_ms <= 0:
+            return []
+        buckets: dict[int, list] = {}
+        for candle in candles:
+            key = (int(candle.timestamp) // bucket_ms) * bucket_ms
+            buckets.setdefault(key, []).append(candle)
+
+        class _Bar:
+            __slots__ = ("timestamp", "open", "high", "low", "close", "volume")
+            def __init__(self, ts, o, h, l, cl, v):
+                self.timestamp = ts; self.open = o; self.high = h
+                self.low = l; self.close = cl; self.volume = v
+
+        keys = sorted(buckets)
+        out: list = []
+        for key in keys:
+            group = sorted(buckets[key], key=lambda c: c.timestamp)
+            out.append(_Bar(
+                key, group[0].open, max(c.high for c in group),
+                min(c.low for c in group), group[-1].close,
+                sum(c.volume for c in group),
+            ))
+        if keys:
+            last_source_end = int(candles[-1].timestamp) + source_ms
+            if last_source_end < keys[-1] + bucket_ms:
+                out = out[:-1]
+        return out
 
     @staticmethod
     def _closed_30m_bars(candles_15m: list) -> list:
