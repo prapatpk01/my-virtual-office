@@ -797,6 +797,30 @@ class TradingBot:
                 )
             return False
 
+        if update.action == "move_sl":
+            # Ratchet the stop without closing any of the position, and push the
+            # new stop to the exchange so OKX enforces the locked profit even if
+            # the bot is offline. Position stays open (rides to the cross-back).
+            if update.new_sl:
+                self.risk.update_stop_loss(sym, update.new_sl, strategy=strategy_name)
+                logger.info("[%s] MOVE_SL %s → SL=%.4f | %s",
+                            strategy_name, sym, update.new_sl, update.reason)
+                try:
+                    await self.connector.set_position_tpsl(
+                        sym, pos_info["side"], pos_info["amount"],
+                        sl=update.new_sl, tp=pos_info.get("take_profit"))
+                except Exception as e:
+                    logger.warning("[TPSL] move_sl exchange update failed for %s: %s", sym, e)
+                if self.telegram:
+                    try:
+                        self.telegram.notify(
+                            f"🔒 *SL moved to lock profit* `{sym}` [{strategy_name}]\n"
+                            f"New SL: `{update.new_sl:,.4f}`\n"
+                            f"_{update.reason}_")
+                    except Exception as e:
+                        logger.warning("[%s] move_sl notify failed: %s", strategy_name, e)
+            return False
+
         if update.action == "partial_tp":
             close_amt = round(pos_info["amount"] * update.close_pct, 8)
             if close_amt > 0:

@@ -275,6 +275,12 @@ class TrendConfirmStrategy(BaseStrategy):
         # EMA8/13 cross-back (the SL at EMA50 is only a disaster stop).
         use_hard_tp: bool = False,          # emit a fixed TP2 (1.5R) with the entry? off = hold to cross-back
         use_partial_tp: bool = False,       # TP1 -> take tp1_close_pct, move SL to BE+be_offset_r; runner rides on
+        # Break-even TRAIL (no partial close): once price reaches be_trail_trigger_r
+        # of profit, ratchet the SL up to entry + be_trail_sl_r (locks a minimum
+        # profit) and keep riding the full position until the EMA8/13 cross-back.
+        use_be_trail: bool = True,
+        be_trail_trigger_r: float = 0.8,    # target: move the SL once +0.8R is reached
+        be_trail_sl_r: float = 0.5,         # new SL sits at entry +/- 0.5R (BE + 0.5R locked)
         tp1_r: float = 0.75,                # TP1 at 0.75R (halfway to the 1.5R final TP)
         tp1_close_pct: float = 0.5,         # fraction closed at TP1
         be_offset_r: float = 0.1,           # after TP1, SL -> entry +/- this many R (BE + 0.1R, a small locked profit)
@@ -412,6 +418,10 @@ class TrendConfirmStrategy(BaseStrategy):
 
         self.use_hard_tp = use_hard_tp
         self.use_partial_tp = use_partial_tp
+        self.use_be_trail = use_be_trail
+        self.be_trail_trigger_r = be_trail_trigger_r
+        self.be_trail_sl_r = be_trail_sl_r
+        self._be_trailed: bool = False
         self.tp1_r = tp1_r
         self.tp1_close_pct = tp1_close_pct
         self.be_offset_r = be_offset_r
@@ -967,6 +977,7 @@ class TrendConfirmStrategy(BaseStrategy):
 
         self._open_position = direction
         self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
+        self._be_trailed = False
         meta = dbg("entered")
         meta.update({
             "entry_type": entry_type, "entry_detail": selected["detail"],
@@ -1032,6 +1043,25 @@ class TrendConfirmStrategy(BaseStrategy):
                                           reason=f"TP1 {self.tp1_r:.1f}R hit — took {self.tp1_close_pct*100:.0f}%, "
                                                  f"SL -> BE+{self.be_offset_r:.1f}R")
 
+        # ── 1b) Break-even TRAIL (no close): at +be_trail_trigger_r, ratchet SL
+        #        up to entry +/- be_trail_sl_r and keep the full position. ──────
+        if (self.use_be_trail and not self._be_trailed
+                and self._entry_price is not None and self._entry_sl is not None):
+            r = abs(self._entry_price - self._entry_sl)
+            if r > 0:
+                hit_long = (self._open_position == "long"
+                            and current_price >= self._entry_price + self.be_trail_trigger_r * r)
+                hit_short = (self._open_position == "short"
+                             and current_price <= self._entry_price - self.be_trail_trigger_r * r)
+                if hit_long or hit_short:
+                    self._be_trailed = True
+                    new_sl = (self._entry_price + self.be_trail_sl_r * r if hit_long
+                              else self._entry_price - self.be_trail_sl_r * r)
+                    return PositionUpdate(
+                        action="move_sl", new_sl=new_sl,
+                        reason=f"Target +{self.be_trail_trigger_r:.1f}R hit — SL -> "
+                               f"BE+{self.be_trail_sl_r:.1f}R (locked), riding to cross-back")
+
         # ── 2) Runner exit — EMA10/20 cross-back OR 5m close past EMA20 ──────
         candles = self._latest_5m
         if not candles:
@@ -1094,6 +1124,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self._entry_price = None
         self._entry_sl = None
         self._tp1_done = False
+        self._be_trailed = False
 
     def record_closed_trade(self, exit_price: float, exit_reason: str, duration_min: float = 0.0) -> None:
         """Called by bot.py after ANY close, including the risk-manager's
