@@ -370,11 +370,16 @@ class TelegramNotifier:
     def notify_reconciled_position(self, symbol: str, strategy_name: str, side: str,
                                     entry_price: float, amount: float,
                                     stop_loss: Optional[float], take_profit: Optional[float]):
+        # SL/TP may be None (e.g. the pure cross-back system runs with no TP) —
+        # format defensively so this notification never crashes and get silently
+        # swallowed, which would leave a restart-adopted position unannounced.
+        sl_str = f"`{stop_loss:.4f}`" if stop_loss else "—"
+        tp_str = f"`{take_profit:.4f}`" if take_profit else "—"
         text = (
             f"🔄 *Reconciled Position on Restart*\n"
             f"`{strategy_name}` on `{symbol}`\n"
             f"Side: *{side.upper()}*  Entry: `{entry_price:.4f}`  Amount: `{amount:.6f}`\n"
-            f"SL: `{stop_loss:.4f}`  TP: `{take_profit:.4f}` _(default — original stops unknown)_"
+            f"SL: {sl_str}  TP: {tp_str} _(adopted after restart)_"
         )
         self.notify(text)
 

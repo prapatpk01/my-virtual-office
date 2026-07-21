@@ -408,8 +408,9 @@ class TradingBot:
                             strategy.symbol, strategy_name, side, entry_price, amount,
                             pos.stop_loss, pos.take_profit,
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("[Reconcile] notify_reconciled_position failed [%s]: %s",
+                                       strategy_name, e)
 
     # ------------------------------------------------------------------
     # Public control
