@@ -1216,9 +1216,15 @@ class TradingBot:
         # notional comes out N× wrong. Prefer the connector's configured value;
         # fall back to the LEVERAGE env so a connector that didn't receive it
         # still sizes correctly.
-        conn_lev      = getattr(self.connector, "_leverage", None)
+        # Take the MAX of the connector's configured leverage and the LEVERAGE
+        # env. This defends against the recurring "size came out ~10x too small"
+        # bug: if the connector's _leverage was left stale/low (e.g. 2) while the
+        # OKX position is actually 20x, using the low value would size the
+        # notional ~10x under. env LEVERAGE=20 is the source of truth, so never
+        # size with anything below it.
+        conn_lev      = getattr(self.connector, "_leverage", None) or 0
         env_lev       = int(os.getenv("LEVERAGE", "20"))
-        leverage      = max(conn_lev if conn_lev else env_lev, 1)
+        leverage      = max(conn_lev, env_lev, 1)
         is_futures    = getattr(self.connector, "_futures", False)
         # Default to margin-based sizing (5% of equity × leverage) — the mode
         # the account is meant to run. Strategy metadata or SIZING_MODE env can
@@ -1236,8 +1242,10 @@ class TradingBot:
         # A dead-simple, deterministic size that can't be thrown off by
         # leverage/margin/free-vs-total math: the order value (notional) is a
         # fixed $ amount and amount = notional / market price. Set
-        # FIXED_NOTIONAL_USD=0 to disable and fall back to margin/risk sizing.
-        fixed_notional = float(os.getenv("FIXED_NOTIONAL_USD", "35"))
+        # FIXED_NOTIONAL_USD=0 (default) disables this and uses margin sizing
+        # (5% of equity × leverage = notional ≈ full balance). Set it to a $
+        # amount only if you want a flat per-trade size instead.
+        fixed_notional = float(os.getenv("FIXED_NOTIONAL_USD", "0"))
         if fixed_notional > 0:
             sizing_mode = "fixed"
             notional_target = fixed_notional
