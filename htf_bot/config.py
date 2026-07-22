@@ -75,7 +75,10 @@ class Config:
     min_body_atr: float = field(default_factory=lambda: _env_float("MIN_BODY_ATR", 0.5))
 
     poll_interval_sec: int = 30
-    status_log_interval_sec: int = 300
+    # View-log print cadence. Default 15 min — the strategy is 1H-based so the
+    # per-symbol view barely changes faster than that; 15 min keeps the log
+    # readable. STATUS_LOG_INTERVAL_SEC overrides.
+    status_log_interval_sec: int = field(default_factory=lambda: _env_int("STATUS_LOG_INTERVAL_SEC", 900))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "state"))
     stats_since_date: str = field(default_factory=lambda: os.environ.get("STATS_SINCE_DATE", "2026-07-22"))
 
