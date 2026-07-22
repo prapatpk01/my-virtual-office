@@ -86,6 +86,12 @@ class BaseConnector(ABC):
         """Normalized filled orders from exchange history. Default: none."""
         return []
 
+    async def fetch_positions_history(self, since: Optional[int] = None,
+                                      limit: int = 100) -> list[dict]:
+        """Closed round-trip positions (one row each) with OKX realizedPnl.
+        Default: none (paper/spot/forex)."""
+        return []
+
     async def fetch_recent_closes(self, symbol: str, limit: int = 5) -> list[dict]:
         """Most-recent close (reduce-only) fills for a symbol. Default: none."""
         return []

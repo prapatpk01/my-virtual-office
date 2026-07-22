@@ -401,7 +401,9 @@ class TelegramNotifier:
 
     async def _send(self, text: str, parse_mode: str = "Markdown") -> bool:
         url = TELEGRAM_API.format(token=self.token, method="sendMessage")
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
+        payload = {"chat_id": self.chat_id, "text": text}
+        if parse_mode:  # falsy (""/None) => plain text, so raw * and _ don't get mangled
+            payload["parse_mode"] = parse_mode
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
@@ -664,10 +666,15 @@ class TelegramNotifier:
                 await self._send("⚠️ stop\\_bot not configured")
 
         elif cmd == "stats":
-            # Real stats from OKX order history (post-fee), sectioned display.
+            # Real stats from OKX positions-history (post-fee). Sent as PLAIN
+            # TEXT (parse_mode="") so the emoji + rule-line layout isn't mangled.
             fn = getattr(self, "get_okx_stats_fn", None)
             s = (await fn()) if fn else (self.get_stats_fn() if self.get_stats_fn else {})
-            await self._send(self._render_stats(s))
+            if s.get("source") == "okx" or ("month_label" in s):
+                from .adaptive_stats import render_adaptive_stats
+                await self._send(render_adaptive_stats(s), parse_mode="")
+            else:
+                await self._send(self._render_stats(s))
 
         elif cmd == "insights":
             insights = self.get_insights_fn() if self.get_insights_fn else {}

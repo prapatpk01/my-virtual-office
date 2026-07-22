@@ -445,6 +445,55 @@ class BinanceConnector(BaseConnector):
             })
         return out
 
+    async def fetch_positions_history(self, since: Optional[int] = None,
+                                      limit: int = 100) -> list[dict]:
+        """Closed round-trip positions from OKX positions-history. ONE row per
+        position (open -> fully closed; T1/T2 partials already collapsed by OKX).
+        `realized_pnl` is OKX's own realizedPnl = pnl - fees - funding, so it
+        matches the OKX app exactly — never recompute it. Each dict:
+        symbol/side/realized_pnl/open_ts/close_ts/entry_px/close_px/size/lever.
+        Live only; [] on paper or if the endpoint isn't available."""
+        if self.paper:
+            return []
+        try:
+            raw = await self._exchange.fetch_positions_history(
+                symbols=None, since=since, limit=limit)
+        except Exception as e:
+            logger.warning("[Stats] fetch_positions_history failed: %s", e)
+            return []
+        out = []
+        for p in raw:
+            info = p.get("info") or {}
+            def _f(*keys, src_first=True):
+                for src in ((info, p) if not src_first else (p, info)):
+                    for k in keys:
+                        v = src.get(k)
+                        if v not in (None, ""):
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+                return None
+            rpnl = _f("realizedPnl", src_first=False)
+            if rpnl is None:
+                rpnl = _f("realized_pnl") or (float(info["pnl"]) if info.get("pnl") not in (None, "") else 0.0)
+            # OKX: direction 'long'/'short'; posSide too. ccxt normalizes 'side'.
+            side = (p.get("side") or info.get("direction") or info.get("posSide") or "").lower()
+            open_ts = int(_f("timestamp", src_first=True) or float(info.get("cTime") or 0) or 0)
+            close_ts = int(float(info.get("uTime") or 0) or p.get("lastUpdateTimestamp") or open_ts)
+            out.append({
+                "symbol": p.get("symbol") or info.get("instId"),
+                "side": "long" if side.startswith("l") else "short" if side.startswith("s") else side,
+                "realized_pnl": round(float(rpnl or 0.0), 6),
+                "open_ts": open_ts,
+                "close_ts": close_ts,
+                "entry_px": _f("entryPrice") or (float(info["openAvgPx"]) if info.get("openAvgPx") else None),
+                "close_px": float(info["closeAvgPx"]) if info.get("closeAvgPx") else None,
+                "size": round(abs(float(info.get("closeTotalPos") or 0)) * self._ct_size(p.get("symbol") or info.get("instId") or ""), 8),
+                "lever": _f("leverage") or (float(info["lever"]) if info.get("lever") else None),
+            })
+        return out
+
     async def fetch_closed_orders_raw(self, symbol: str, since: Optional[int] = None,
                                       limit: int = 100) -> list[dict]:
         """Normalized FILLED orders (opens + closes) from OKX order history for

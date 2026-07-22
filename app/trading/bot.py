@@ -1631,50 +1631,48 @@ class TradingBot:
         return self._sig.summary()
 
     async def get_okx_stats(self) -> dict:
-        """Real /stats sourced from OKX order history (post-fee PnL), grouped
-        into round-trip trades since STATS_SINCE_DATE (default 2026-07-16).
-        Falls back to the internal summary (+ real balance) in paper mode or if
-        the exchange history isn't available."""
-        from .okx_stats import build_stats, since_ts_for
-        since = since_ts_for(os.getenv("STATS_SINCE_DATE", "2026-07-16"))
+        """Real /stats from OKX positions-history — ONE row per round-trip using
+        OKX's own realizedPnl (post fee + funding), so the numbers match the OKX
+        app exactly. OVERALL resets monthly, BY SYMBOL is all-time since
+        ADAPTIVE_STATS_SINCE_DATE, TP1/TP2/SL come from the local journal but are
+        divided by the OKX trade count (rest = Untracked). Falls back to the
+        internal summary in paper mode or if the exchange history isn't up."""
+        from .adaptive_stats import build_adaptive_stats, since_ts_for
+        since = since_ts_for(os.getenv("ADAPTIVE_STATS_SINCE_DATE",
+                                       os.getenv("STATS_SINCE_DATE", "2026-07-16")))
         symbols = list({s.symbol for s in self.strategies})
 
-        # real balance (total equity)
         balance = None
         try:
             bals = await self.connector.fetch_balance()
             balance = next((b.total for b in bals if b.asset in ("USDT", "USD", "BUSD")), None)
         except Exception as e:
             logger.debug("[Stats] balance fetch failed: %s", e)
-        # Live open positions from OKX (symbol/side/size/entry/mark/uPnL) so
-        # /stats can LIST them, not just count. Falls back to the in-memory
-        # count if the exchange call isn't available.
+
         open_positions_detail: list = []
         if not self.connector.paper and hasattr(self.connector, "fetch_positions"):
             try:
                 open_positions_detail = await self.connector.fetch_positions(symbols)
             except Exception as e:
                 logger.debug("[Stats] fetch_positions failed: %s", e)
-        open_pos = len(open_positions_detail) if open_positions_detail else len(self.risk.get_positions())
 
-        orders_by_symbol: dict = {}
-        if not self.connector.paper and hasattr(self.connector, "fetch_closed_orders_raw"):
-            for sym in symbols:
-                try:
-                    orders_by_symbol[sym] = await self.connector.fetch_closed_orders_raw(
-                        sym, since=since, limit=100)
-                except Exception as e:
-                    logger.warning("[Stats] history fetch failed for %s: %s", sym, e)
+        okx_positions: list = []
+        if not self.connector.paper and hasattr(self.connector, "fetch_positions_history"):
+            try:
+                okx_positions = await self.connector.fetch_positions_history(since=since, limit=100)
+            except Exception as e:
+                logger.warning("[Stats] positions-history fetch failed: %s", e)
 
-        if orders_by_symbol and any(orders_by_symbol.values()):
-            return build_stats(orders_by_symbol, balance, open_pos, since,
-                               open_positions_detail=open_positions_detail)
+        if okx_positions:
+            return build_adaptive_stats(
+                okx_positions, list(getattr(self._sig, "_outcomes", [])),
+                open_positions_detail, balance, since)
 
         # Fallback — internal record + real balance, tagged so the renderer knows.
         s = self._sig.summary()
         s["source"] = "internal"
         s["balance"] = balance
-        s["open_positions"] = open_pos
+        s["open_positions"] = len(open_positions_detail) if open_positions_detail else len(self.risk.get_positions())
         return s
 
     def get_learning_insights(self, days: int = 30) -> dict:
