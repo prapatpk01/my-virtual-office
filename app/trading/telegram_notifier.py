@@ -392,6 +392,15 @@ class TelegramNotifier:
                 else:
                     wr = row["wins"] / row["n"] * 100
                     lines.append(f"{base:6s}  {row['n']} trades  {wr:.0f}%WR  ${row['pnl']:+.2f}")
+            # All-time combined line — average win rate across every symbol
+            # (total wins / total trades ever, NOT the monthly OVERALL above).
+            _all_n    = len(okx_trades)
+            _all_wins = sum(1 for t in okx_trades if t["pnl"] > 0)
+            _all_pnl  = sum(t["pnl"] for t in okx_trades)
+            if _all_n:
+                _all_wr = _all_wins / _all_n * 100
+                lines.append(DIVIDER)
+                lines.append(f"{'TOTAL':6s}  {_all_n} trades  {_all_wr:.0f}%WR  ${_all_pnl:+.2f}")
 
             # ── SECTION 3: last 5 closed trades across every symbol ──────────
             lines += ["", DIVIDER, "LAST 5 TRADES", DIVIDER]
@@ -451,6 +460,13 @@ class TelegramNotifier:
                 else:
                     wr = row["wins"] / row["n"] * 100
                     lines.append(f"{base:6s}  {row['n']} trades  {wr:.0f}%WR  ${row['pnl']:+.2f}")
+            _all_n    = len(all_trades)
+            _all_wins = sum(1 for tr in all_trades if tr.get("win_loss") == "WIN")
+            _all_pnl  = sum(tr.get("pnl", 0.0) for tr in all_trades)
+            if _all_n:
+                _all_wr = _all_wins / _all_n * 100
+                lines.append(DIVIDER)
+                lines.append(f"{'TOTAL':6s}  {_all_n} trades  {_all_wr:.0f}%WR  ${_all_pnl:+.2f}")
 
             lines += ["", DIVIDER, "LAST 5 TRADES", DIVIDER]
             if not all_trades:
