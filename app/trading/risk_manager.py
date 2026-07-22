@@ -31,8 +31,10 @@ class RiskManager:
                  take_profit_pct: float = 0.06,          # 6% take-profit (2:1 RR)
                  max_open_positions: int = 5,
                  max_drawdown_pct: float = 0.15,         # halt if 15% drawdown
-                 max_consecutive_sl: int = 3,            # cooldown after N losing closes in a row
-                 cooldown_hours: float = 4.0,            # how long the cooldown lasts
+                 max_consecutive_sl: int = 3,            # cooldown after N losing closes in a row (PER SYMBOL)
+                 cooldown_hours: float = 3.0,            # how long a symbol's cooldown lasts
+                 post_cooldown_strict_trades: int = 5,   # tighten entries for N trades after resuming
+                 post_cooldown_threshold_bonus: float = 6.0,  # extra quality points required during that window
                  ):
         self.max_risk_per_trade_pct = max_risk_per_trade_pct
         self.stop_loss_pct = stop_loss_pct
@@ -41,11 +43,15 @@ class RiskManager:
         self.max_drawdown_pct = max_drawdown_pct
         self.max_consecutive_sl = max_consecutive_sl
         self.cooldown_seconds = cooldown_hours * 3600
+        self.post_cooldown_strict_trades = post_cooldown_strict_trades
+        self.post_cooldown_threshold_bonus = post_cooldown_threshold_bonus
         self._positions: dict[str, Position] = {}
         self._peak_balance: float = 0.0
         self._halted: bool = False
-        self._sl_streak: int = 0
-        self._cooldown_until: float = 0.0
+        # Per-symbol cooldown state (silver/gold losing a run shouldn't pause BTC):
+        self._sl_streak: dict[str, int] = {}       # symbol -> consecutive losing closes
+        self._cooldown_until: dict[str, float] = {}  # symbol -> epoch when it resumes
+        self._strict_left: dict[str, int] = {}     # symbol -> stricter entries remaining after resume
 
     def update_peak(self, balance: float):
         if balance > self._peak_balance:
@@ -61,29 +67,47 @@ class RiskManager:
             return False
         return True
 
-    def record_trade_result(self, pnl: float) -> bool:
+    def record_trade_result(self, pnl: float, symbol: str = "") -> bool:
         """
-        Track consecutive losing closes. A losing close (pnl < 0) extends the
-        streak; any non-losing close (win or scratch, pnl >= 0) resets it.
+        Track consecutive losing closes PER SYMBOL. A losing close (pnl < 0)
+        extends that symbol's streak; any non-losing close resets it. When a
+        symbol hits max_consecutive_sl, only that symbol is paused, and its
+        first post_cooldown_strict_trades entries after resuming are tightened.
         Returns True the moment this result just triggered a cooldown.
         """
+        streak = self._sl_streak.get(symbol, 0)
         if pnl < 0:
-            self._sl_streak += 1
+            streak += 1
         else:
-            self._sl_streak = 0
+            streak = 0
+        self._sl_streak[symbol] = streak
 
-        if self._sl_streak >= self.max_consecutive_sl:
-            self._cooldown_until = time.time() + self.cooldown_seconds
-            self._sl_streak = 0
+        if streak >= self.max_consecutive_sl:
+            self._cooldown_until[symbol] = time.time() + self.cooldown_seconds
+            self._sl_streak[symbol] = 0
+            self._strict_left[symbol] = self.post_cooldown_strict_trades
             return True
         return False
 
-    def in_cooldown(self) -> tuple[bool, float]:
-        """Returns (is_in_cooldown, seconds_remaining)."""
-        remaining = self._cooldown_until - time.time()
+    def in_cooldown(self, symbol: str = "") -> tuple[bool, float]:
+        """Returns (is_in_cooldown, seconds_remaining) for one symbol."""
+        remaining = self._cooldown_until.get(symbol, 0.0) - time.time()
         if remaining > 0:
             return True, remaining
         return False, 0.0
+
+    def entry_threshold_bonus(self, symbol: str = "") -> float:
+        """Extra quality points a symbol's entry must clear while it's in the
+        post-cooldown strict window (0 when not tightened)."""
+        if self._strict_left.get(symbol, 0) > 0:
+            return self.post_cooldown_threshold_bonus
+        return 0.0
+
+    def consume_strict_entry(self, symbol: str = "") -> None:
+        """Call once a stricter post-cooldown entry actually opens — counts it
+        down so the tightening lifts after post_cooldown_strict_trades trades."""
+        if self._strict_left.get(symbol, 0) > 0:
+            self._strict_left[symbol] -= 1
 
     def size_position(self, balance: float, price: float,
                       size_pct: float = None) -> float:
@@ -107,10 +131,10 @@ class RiskManager:
     def can_open(self, symbol: str, strategy: str = "") -> tuple[bool, str]:
         if self._halted:
             return False, "Trading halted: max drawdown reached"
-        in_cd, remaining = self.in_cooldown()
+        in_cd, remaining = self.in_cooldown(symbol)
         if in_cd:
             return False, (
-                f"Cooldown active after {self.max_consecutive_sl} consecutive losing closes "
+                f"{symbol} cooldown after {self.max_consecutive_sl} consecutive losing closes "
                 f"— resumes in {remaining/60:.0f} min"
             )
         key = f"{symbol}||{strategy}"

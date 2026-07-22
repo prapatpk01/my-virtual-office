@@ -425,6 +425,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.be_trail_trigger_r = be_trail_trigger_r
         self.be_trail_sl_r = be_trail_sl_r
         self._be_trailed: bool = False
+        self._entry_threshold_bonus: float = 0.0  # bot raises this during post-cooldown strict window
         self.tp1_r = tp1_r
         self.tp1_close_pct = tp1_close_pct
         self.be_offset_r = be_offset_r
@@ -646,6 +647,9 @@ class TrendConfirmStrategy(BaseStrategy):
         ema_cross_up   = ema_up_ago is not None and ema_up_ago <= lookback
         ema_cross_down = ema_down_ago is not None and ema_down_ago <= lookback
         base_l2_thr = self.layer2_threshold_early if is_early_trend else self.layer2_threshold
+        # Post-cooldown tightening: bot raises this after a symbol resumes from a
+        # losing-streak cooldown, so its first few re-entries need better quality.
+        base_l2_thr += getattr(self, "_entry_threshold_bonus", 0.0)
 
         # ── Layer 2: Trend quality — weighted 15m (65%) + 1H (35%) score ───
         q15 = self._tf_quality(candles, trend) if trend else None

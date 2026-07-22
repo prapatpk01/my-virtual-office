@@ -496,11 +496,14 @@ class TradingBot:
             self._broadcast_state()
             return
 
-        # Cooldown (3 consecutive losing closes) blocks NEW entries only —
-        # existing positions still get managed/closed normally below.
-        in_cd, remaining = self.risk.in_cooldown()
-        if in_cd:
-            self.state.error = f"Cooldown active — resumes in {remaining/60:.0f} min"
+        # Per-symbol cooldown (3 consecutive losing closes) blocks NEW entries
+        # for that symbol only — existing positions are still managed below.
+        _cooling = [(s, self.risk.in_cooldown(s)[1]) for s in {st.symbol for st in self.strategies}
+                    if self.risk.in_cooldown(s)[0]]
+        if _cooling:
+            _cooling.sort(key=lambda x: x[1])
+            self.state.error = (f"{len(_cooling)} symbol(s) cooling — "
+                                f"{_cooling[0][0].split('/')[0]} resumes in {_cooling[0][1]/60:.0f} min")
 
         # ── Detect positions the EXCHANGE closed on its own (OKX TP/SL algo
         # firing) so the bot doesn't keep managing a ghost position. ─────────
@@ -563,7 +566,7 @@ class TradingBot:
                 logger.info("Position closed by %s: %s [%s]", trigger, sym, strategy_name)
                 if self.telegram:
                     self.telegram.notify_trade_closed(sym, _outcome, self._sig.summary())
-                self._check_cooldown_trigger(pnl)
+                self._check_cooldown_trigger(pnl, sym)
 
         # ── Periodic drift alert (every 50 ticks) ────────────────────────────
         if self._tick_count - self._last_drift_alert_tick >= 50:
@@ -610,6 +613,10 @@ class TradingBot:
                     except Exception:
                         pass
 
+                # Post-cooldown tightening: raise this symbol's quality gate for
+                # its first few re-entries after resuming from a loss-streak pause.
+                if hasattr(strategy, "_entry_threshold_bonus"):
+                    strategy._entry_threshold_bonus = self.risk.entry_threshold_bonus(strategy.symbol)
                 signal = await strategy.analyze(candles, current_price, mtf_candles=mtf_candles)
                 self._log_scan(strategy.symbol, strategy.name, current_price, signal)
 
@@ -867,7 +874,7 @@ class TradingBot:
                         strategy_name, update.close_pct * 100, sym, exit_px, pnl,
                         fill["entry_fee_alloc"], fill["exit_fee"], update.reason,
                     )
-                    self._check_cooldown_trigger(pnl)
+                    self._check_cooldown_trigger(pnl, sym)
                     # Book the partial into the paper account (fixed entry-size).
                     self._sig.record_paper_partial(
                         sym, exit_px, update.close_pct, strategy=strategy_name,
@@ -930,25 +937,28 @@ class TradingBot:
                 )
                 if self.telegram:
                     self.telegram.notify_trade_closed(sym, _outcome, self._sig.summary())
-                self._check_cooldown_trigger(pnl)
+                self._check_cooldown_trigger(pnl, sym)
             except Exception as e:
                 logger.error("AI-driven close failed [%s %s]: %s", strategy_name, sym, e)
             return True
 
         return False
 
-    def _check_cooldown_trigger(self, pnl: float) -> None:
-        """Feed a closed trade's PnL into the consecutive-loss streak tracker.
-        Notifies Telegram the moment a cooldown gets triggered."""
-        triggered = self.risk.record_trade_result(pnl)
+    def _check_cooldown_trigger(self, pnl: float, symbol: str = "") -> None:
+        """Feed a closed trade's PnL into that SYMBOL's consecutive-loss streak.
+        Notifies Telegram the moment a per-symbol cooldown gets triggered."""
+        triggered = self.risk.record_trade_result(pnl, symbol)
         if triggered:
             hours = self.risk.cooldown_seconds / 3600
+            strict_n = self.risk.post_cooldown_strict_trades
             logger.warning(
-                "Cooldown triggered: %d consecutive losing closes — new entries paused for %.1fh",
-                self.risk.max_consecutive_sl, hours,
+                "[%s] Cooldown triggered: %d consecutive losing closes — %s paused for %.1fh "
+                "(next %d entries tightened after resume)",
+                symbol, self.risk.max_consecutive_sl, symbol, hours, strict_n,
             )
             if self.telegram:
-                self.telegram.notify_cooldown_halt(self.risk.max_consecutive_sl, hours)
+                self.telegram.notify_cooldown_halt(self.risk.max_consecutive_sl, hours,
+                                                   symbol=symbol, strict_trades=strict_n)
 
     def _on_position_closed(
         self,
@@ -1424,6 +1434,8 @@ class TradingBot:
             entry_sz = order.filled or amount
             self.risk.open_position(sym, direction, entry_px, entry_sz, strategy=strategy_name,
                                     stop_loss=sl_p, take_profit=tp_p)
+            # Count down the post-cooldown strict window once a real entry opens.
+            self.risk.consume_strict_entry(sym)
 
             # Snapshot the paper-account position at entry so partial TPs and
             # the final close book against one fixed size (keeps $ coherent).

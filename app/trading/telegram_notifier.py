@@ -354,12 +354,16 @@ class TelegramNotifier:
         )
         self.notify(text)
 
-    def notify_cooldown_halt(self, streak: int, hours: float):
+    def notify_cooldown_halt(self, streak: int, hours: float, symbol: str = "",
+                             strict_trades: int = 0):
+        sym = f"`{symbol}` " if symbol else ""
+        extra = (f"\nAfter resuming, its next `{strict_trades}` entries are tightened "
+                 f"(stricter quality gate)." if strict_trades else "")
         text = (
-            f"🧊 *Cooldown Started — New Entries Paused*\n"
-            f"`{streak}` consecutive losing closes in a row.\n"
-            f"Resumes automatically in `{hours:.1f}h` — existing positions "
-            f"are still managed normally, no action needed."
+            f"🧊 *Cooldown Started — {sym}Paused*\n"
+            f"`{streak}` consecutive losing closes on {sym or 'this symbol'}.\n"
+            f"Only this symbol pauses — others keep trading. Resumes in `{hours:.1f}h`; "
+            f"existing positions are still managed normally.{extra}"
         )
         self.notify(text)
 
