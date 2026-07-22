@@ -250,10 +250,13 @@ class Config:
     max_open_positions: int = 0  # set in __post_init__ from MAX_POSITIONS (default 2)
 
     # ── Fees ─────────────────────────────────────────────────────────────────
-    # OKX charges 0.10% per fill on this account — open, close, TP and SL all
-    # pay it. Used by live/paper PnL accounting AND the backtest, so the two
-    # can never disagree on fee drag.
-    fee_rate: float = 0.001
+    # VERIFIED from an actual OKX fill (2026-07-22, BTCUSDT perp market open:
+    # fee 0.3325905 USDT on $664.70 notional = 0.0500%): this account pays
+    # 0.05% taker per fill, NOT the 0.10% previously assumed. Used by live/
+    # paper PnL accounting, the fee-aware stop floor, the fee-drag entry
+    # reject AND the backtest — the old 2x-overstated value was silently
+    # rejecting valid entries and widening every minimum stop.
+    fee_rate: float = 0.0005
 
     # ── /stats ───────────────────────────────────────────────────────────────
     # /stats is sourced live from OKX's own closed-position history (not this

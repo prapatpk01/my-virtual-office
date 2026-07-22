@@ -194,7 +194,8 @@ class Config:
     risk_reward: float = 1.20
     min_acceptable_rr: float = 1.08
     target_buffer_atr: float = 0.10
-    fee_rate: float = 0.001                     # per fill
+    fee_rate: float = 0.0005                    # per fill — verified from an
+                                                # actual OKX fill (0.05% taker)
     expected_slippage_atr: float = 0.03
 
     # ── Execution quality ───────────────────────────────────────────────────
