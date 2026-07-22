@@ -53,6 +53,7 @@ class Bot:
         self._state_path = os.path.join(self.cfg.state_dir, "htf_state.json")
         self.state: dict = self._load_state()   # symbol -> {last_bar, pos{...}}
         self.trade_log: list = []               # closed trades this process
+        self._view: dict = {s: "starting…" for s in self.cfg.symbols}  # per-symbol view line
         self._tg_offset = 0
         self._running = False
         self._last_status_ts = 0.0
@@ -159,10 +160,39 @@ class Bot:
             await self.client.fetch_ohlcv(symbol, "4h", limit=250)), 4, now_ms)
         return h1, h4
 
+    def _set_view(self, symbol: str, h1, h4):
+        """One-line 'what is the bot watching' per symbol — refreshed every
+        poll from the same frames the entry check uses."""
+        trend = S.trend_direction(h4)
+        tlabel = {1: "4H↑LONG-only", -1: "4H↓SHORT-only", 0: "4H no-trend"}[trend]
+        e20 = float(S.ema(h1["close"], 20).iloc[-1])
+        av = float(S.atr(h1, 14).iloc[-1])
+        px = float(h1["close"].iloc[-1])
+        dist_atr = (px - e20) / av if av > 0 else 0.0
+        if S.commodity_halted(symbol, pd.Timestamp.now(tz="UTC")):
+            why = "HALT (metal weekend)"
+        elif trend == 0:
+            why = "no 4H trend"
+        elif self.open_position_count() >= self.cfg.max_positions:
+            why = f"max {self.cfg.max_positions} positions open"
+        else:
+            # what the pullback trigger is waiting for
+            side_ok = "above" if trend == 1 else "below"
+            near = abs(dist_atr) <= 0.15
+            if (trend == 1 and px > e20) or (trend == -1 and px < e20):
+                why = (f"waiting pullback→EMA20 (px {side_ok} EMA20 by {abs(dist_atr):.2f}ATR)"
+                       if not near else "at EMA20 — waiting close-back confirm")
+            else:
+                why = f"px on wrong side of EMA20 ({dist_atr:+.2f}ATR) — waiting reclaim"
+        self._view[symbol] = f"{tlabel} | 1H px={px:.6g} EMA20={e20:.6g} | {why}"
+
     async def _look_for_entry(self, symbol: str, st: dict):
         h1, h4 = await self._frames(symbol)
         if len(h1) < 60 or len(h4) < 55:
+            self._view[symbol] = f"warming up ({len(h1)}×1H, {len(h4)}×4H)"
             return
+        self._set_view(symbol, h1, h4)   # refresh view every poll (pre-gate)
+
         bar_key = h1.index[-1].isoformat()
         if st.get("last_bar") == bar_key:
             return
@@ -293,18 +323,25 @@ class Bot:
 
     # ── status / telegram ────────────────────────────────────────────────────
 
+    def _view_line(self, symbol: str) -> str:
+        """OPEN position summary if in a trade, else the 'what am I watching'
+        view line (trend + distance-to-EMA20 + what it's waiting for)."""
+        st = self.state.get(symbol) or {}
+        pos = st.get("pos")
+        if pos:
+            return (f"OPEN {pos['side'].upper()} @ {pos['entry']:.6g} "
+                    f"SL {pos['sl']:.6g} TP {pos['tp']:.6g}"
+                    f"{' 🔒BE' if pos.get('be_done') else ''}")
+        return self._view.get(symbol, "flat")
+
     def _maybe_status_log(self):
         now = time.time()
         if now - self._last_status_ts < self.cfg.status_log_interval_sec:
             return
         self._last_status_ts = now
+        logger.info("── VIEW %d symbols ──", len(self.cfg.symbols))
         for symbol in self.cfg.symbols:
-            st = self.state.get(symbol) or {}
-            pos = st.get("pos")
-            label = (f"OPEN {pos['side'].upper()} @ {pos['entry']:.6g} "
-                     f"sl={pos['sl']:.6g} tp={pos['tp']:.6g} be={pos['be_done']}"
-                     if pos else f"flat (last bar {st.get('last_bar', '-')})")
-            logger.info("  %-16s %s", symbol, label)
+            logger.info("  %-16s %s", _sym(symbol), self._view_line(symbol))
 
     async def _command_loop(self):
         while self._running:
@@ -330,16 +367,8 @@ class Bot:
                 "🤖 *HTF Pullback Bot*\n/status — สถานะทุก symbol\n"
                 "/stats — ผลเทรด (จาก OKX, post-fee)\n/help — เมนูนี้")
         elif cmd == "/status":
-            lines = []
-            for symbol in self.cfg.symbols:
-                st = self.state.get(symbol) or {}
-                pos = st.get("pos")
-                if pos:
-                    lines.append(f"`{_sym(symbol)}` OPEN {pos['side'].upper()} @ `{pos['entry']:.6g}` "
-                                 f"SL `{pos['sl']:.6g}` TP `{pos['tp']:.6g}` "
-                                 f"{'🔒BE' if pos['be_done'] else ''}")
-                else:
-                    lines.append(f"`{_sym(symbol)}` flat — last 1H bar `{st.get('last_bar', '-')}`")
+            lines = [f"`{_sym(symbol)}` {self._view_line(symbol)}"
+                     for symbol in self.cfg.symbols]
             await self.tg.send_text("📡 *Status*\n\n" + "\n".join(lines))
         elif cmd == "/stats":
             since = self.cfg.stats_since_ms()
