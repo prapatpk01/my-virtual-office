@@ -14,46 +14,58 @@ DATA_ROOT = Path(os.getenv('BACKTEST_DATA_ROOT', './historical_data')).resolve()
 
 TF_MINUTES = {'5m':5,'15m':15,'1h':60,'4h':240}
 
-def load_tf(symbol: str, tf: str, months=range(1,6)) -> pd.DataFrame:
-    pats=[]
+def _read_month_file(p: Path) -> pd.DataFrame:
+    with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
+        first=fh.readline().strip()
+    cols=['open_time','open','high','low','close','volume','close_time','quote_volume','count','taker_buy_volume','taker_buy_quote_volume','ignore']
+    if first.startswith('open_time'):
+        df=pd.read_csv(p)
+    else:
+        df=pd.read_csv(p, header=None, names=cols)
+    for col in ['open','high','low','close','volume','close_time']:
+        df[col]=pd.to_numeric(df[col], errors='coerce')
+    mx=float(df['close_time'].dropna().iloc[0])
+    unit='us' if mx>1e14 else 'ms'
+    idx=pd.to_datetime(df['close_time'], unit=unit, utc=True).dt.tz_convert(None)
+    out=df[['open','high','low','close','volume']].copy()
+    out.index=pd.DatetimeIndex(idx)
+    return out.dropna()
+
+def _resample_ohlcv(base: pd.DataFrame, rule: str) -> pd.DataFrame:
+    out=base.resample(rule, label='right', closed='right').agg({
+        'open':'first','high':'max','low':'min','close':'last','volume':'sum'
+    }).dropna()
+    out.index=out.index-pd.Timedelta(microseconds=1)
+    return out
+
+def load_tf(symbol: str, tf: str, months=range(1,7)) -> pd.DataFrame:
     root=DATA_ROOT/symbol
-    for m in months:
-        pats.extend(root.rglob(f'{symbol}USDT-{tf}-2026-{m:02d}.csv'))
-    # remove duplicates by filename/path preference; any duplicate monthly sources should be identical
-    by_month={}
-    for p in sorted(pats, key=lambda p: len(str(p))):
-        name=p.name
-        by_month.setdefault(name,p)
     frames=[]
-    for p in sorted(by_month.values()):
-        with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
-            first=fh.readline().strip()
-        cols=['open_time','open','high','low','close','volume','close_time','quote_volume','count','taker_buy_volume','taker_buy_quote_volume','ignore']
-        if first.startswith('open_time'):
-            df=pd.read_csv(p)
-        else:
-            df=pd.read_csv(p, header=None, names=cols)
-        for col in ['open','high','low','close','volume','close_time']:
-            df[col]=pd.to_numeric(df[col], errors='coerce')
-        mx=float(df['close_time'].dropna().iloc[0])
-        unit='us' if mx>1e14 else 'ms'
-        idx=pd.to_datetime(df['close_time'], unit=unit, utc=True).dt.tz_convert(None)
-        out=df[['open','high','low','close','volume']].copy()
-        out.index=pd.DatetimeIndex(idx)
-        frames.append(out)
+    for m in months:
+        exact=list(root.rglob(f'{symbol}USDT-{tf}-2026-{m:02d}.csv'))
+        if exact:
+            p=sorted(exact, key=lambda x: len(str(x)))[0]
+            frames.append(_read_month_file(p))
+            continue
+        # Fill missing higher-timeframe months from the finest reliable source.
+        if tf=='15m':
+            base5=list(root.rglob(f'{symbol}USDT-5m-2026-{m:02d}.csv'))
+            if base5:
+                frames.append(_resample_ohlcv(_read_month_file(sorted(base5,key=lambda x:len(str(x)))[0]), '15min'))
+        elif tf in ('1h','4h'):
+            base15=list(root.rglob(f'{symbol}USDT-15m-2026-{m:02d}.csv'))
+            if base15:
+                base=_read_month_file(sorted(base15,key=lambda x:len(str(x)))[0])
+            else:
+                base5=list(root.rglob(f'{symbol}USDT-5m-2026-{m:02d}.csv'))
+                if not base5:
+                    continue
+                base=_read_month_file(sorted(base5,key=lambda x:len(str(x)))[0])
+            frames.append(_resample_ohlcv(base, '1h' if tf=='1h' else '4h'))
     if not frames:
-        if tf in ('1h','4h'):
-            base=load_tf(symbol,'15m',months)
-            rule='1h' if tf=='1h' else '4h'
-            out=base.resample(rule, label='right', closed='right').agg({
-                'open':'first','high':'max','low':'min','close':'last','volume':'sum'
-            }).dropna()
-            out.index=out.index-pd.Timedelta(microseconds=1)
-            return out
         raise FileNotFoundError(f'No {symbol} {tf}')
     out=pd.concat(frames).sort_index()
-    out=out[~out.index.duplicated(keep='last')]
-    out=out.dropna()
+    out=out[~out.index.duplicated(keep='last')].dropna()
     return out
 
 def adverse_fill(open_price: float, side: str, slip: float) -> float:
@@ -97,6 +109,29 @@ def run_symbol(symbol: str, cfg_overrides: dict, start='2026-02-01', end='2026-0
     d4=load_tf(symbol,'4h')
     start=pd.Timestamp(start); end=pd.Timestamp(end)
     # temp state, no disk churn
+    # Backtest-only memoization for repeated indicator requests on the same
+    # closed-candle window. Production logic remains unchanged.
+    import indicators as _ind_global
+    def _frame_key(obj):
+        try:
+            if obj is None or len(obj)==0: return (None,0)
+            idx=str(obj.index[-1]); n=len(obj)
+            if hasattr(obj, 'columns') and 'close' in obj.columns:
+                return (idx,n,round(float(obj['close'].iloc[0]),8),round(float(obj['close'].iloc[-1]),8))
+            return (idx,n,round(float(obj.iloc[0]),8),round(float(obj.iloc[-1]),8))
+        except Exception:
+            return (id(obj),)
+    def _memoize_indicator(name, maxsize=2048):
+        original=getattr(_ind_global,name); cache={}
+        def wrapped(*args,**kwargs):
+            key=(name,)+tuple(_frame_key(x) if hasattr(x,'index') else x for x in args)+tuple(sorted(kwargs.items()))
+            if key not in cache:
+                cache[key]=original(*args,**kwargs)
+                if len(cache)>maxsize: cache.pop(next(iter(cache)))
+            return cache[key]
+        setattr(_ind_global,name,wrapped)
+    for _name in ('true_range','atr','adx','choppiness_index','market_structure','structure_flags','recent_swing_levels','latest_bos'):
+        _memoize_indicator(_name)
     cfg=Config()
     cfg.state_dir=tempfile.mkdtemp(prefix=f'bt_{symbol}_')
     cfg.symbols=[f'{symbol}/USDT:USDT']
@@ -194,7 +229,7 @@ def run_symbol(symbol: str, cfg_overrides: dict, start='2026-02-01', end='2026-0
                 total=pos['realized_net']+net_leg
                 result_r=total/(pos['full_qty']*pos['one_r'])
                 trades.append({**pos,'exit_time':t,'exit_price':exit_price,'exit_reason':exit_reason,'net_r':result_r,'net_pnl_unit':total})
-                pipe.entry_engine.on_position_closed(sym,side,exit_reason,total)
+                pipe.entry_engine.on_position_closed(sym,side,exit_reason,total,closed_at=t)
                 cd=cfg.symbol_sl_cooldown_min if exit_reason=='SL_HIT' else cfg.symbol_be_cooldown_min if exit_reason=='BE_HIT' else cfg.symbol_cooldown_min
                 cooldown_until=t+pd.Timedelta(minutes=cd)
                 pos=None
@@ -244,7 +279,11 @@ def metrics(trades):
     return {'trades':len(r),'wr':100*len(wins)/len(r),'pf':wins.sum()/abs(losses.sum()) if len(losses) else float('inf'),
             'net_r':r.sum(),'avg_r':r.mean(),'mdd_r':dd.min() if len(dd) else 0,'tpm':len(r)/months,
             'tp2':sum(x['exit_reason']=='TP2_HIT' for x in trades),'sl':sum(x['exit_reason']=='SL_HIT' for x in trades),'be':sum(x['exit_reason']=='BE_HIT' for x in trades),
-            'pullback':sum(x['setup_type']=='FAST_PULLBACK' for x in trades),'momentum':sum(x['setup_type']!='FAST_PULLBACK' for x in trades)}
+            'trend_pullback':sum(x['setup_type']=='FAST_PULLBACK' for x in trades),
+            'micro_pullback':sum(x['setup_type']=='MICRO_PULLBACK' for x in trades),
+            'ema_reclaim':sum(x['setup_type']=='EMA_RECLAIM' for x in trades),
+            'continuation':sum(x['setup_type']=='TREND_CONTINUATION' for x in trades),
+            'momentum':sum(x['setup_type'] in ('MOMENTUM','MOMENTUM_RETEST') for x in trades)}
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser()

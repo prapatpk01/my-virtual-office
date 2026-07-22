@@ -264,20 +264,32 @@ def swing_pivots(
     left: int = 3,
     right: int = 3,
 ) -> tuple[list[int], list[int]]:
-    left, right = max(1, int(left)), max(1, int(right))
-    high_values = highs.astype(float).to_numpy()
-    low_values = lows.astype(float).to_numpy()
-    pivot_highs: list[int] = []
-    pivot_lows: list[int] = []
-    for i in range(left, len(high_values) - right):
-        hw = high_values[i - left : i + right + 1]
-        lw = low_values[i - left : i + right + 1]
-        if np.isfinite(high_values[i]) and high_values[i] == np.nanmax(hw) and np.nanargmax(hw) == left:
-            pivot_highs.append(i)
-        if np.isfinite(low_values[i]) and low_values[i] == np.nanmin(lw) and np.nanargmin(lw) == left:
-            pivot_lows.append(i)
-    return pivot_highs, pivot_lows
+    """Return confirmed pivot positions using a vectorized sliding window.
 
+    The tie rule matches the previous implementation: the center must be the
+    first maximum/minimum in the window. This keeps backtest/live behaviour
+    unchanged while making repeated 5M evaluations much faster.
+    """
+    left, right = max(1, int(left)), max(1, int(right))
+    high_values = highs.astype(float).to_numpy(copy=False)
+    low_values = lows.astype(float).to_numpy(copy=False)
+    window = left + right + 1
+    if len(high_values) < window:
+        return [], []
+    from numpy.lib.stride_tricks import sliding_window_view
+    hw = sliding_window_view(high_values, window)
+    lw = sliding_window_view(low_values, window)
+    # nanargmax/nanargmin raise on all-NaN windows. OHLC validation should
+    # prevent these, but replace non-finite values defensively.
+    hsafe = np.where(np.isfinite(hw), hw, -np.inf)
+    lsafe = np.where(np.isfinite(lw), lw, np.inf)
+    centers_h = high_values[left:len(high_values)-right]
+    centers_l = low_values[left:len(low_values)-right]
+    hmask = np.isfinite(centers_h) & (np.argmax(hsafe, axis=1) == left)
+    lmask = np.isfinite(centers_l) & (np.argmin(lsafe, axis=1) == left)
+    pivot_highs = (np.nonzero(hmask)[0] + left).tolist()
+    pivot_lows = (np.nonzero(lmask)[0] + left).tolist()
+    return pivot_highs, pivot_lows
 
 def confirmed_swings(
     highs: pd.Series,

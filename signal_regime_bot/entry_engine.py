@@ -1,21 +1,17 @@
-"""DUALCORE V1.9 — balanced 15M structure + 5M EMA execution engine.
+"""DUALCORE V2.0 — active-frequency 15M structure + 5M execution engine.
 
 Architecture:
     4H macro -> 1H bias -> 15M context/structure -> 5M execution.
 
-The 15M frame is context only.  Actual entries are generated from closed 5M
-candles using EMA8/EMA13 timing because it is smoother and less whipsaw-prone
-than HMA10/HMA16 on a 5-minute chart while still reacting quickly enough for a
-behavioural target of roughly 3–4 trades/day across seven active symbols.
+Five independent entry engines share the same higher-timeframe permission:
+* FAST_PULLBACK: HTF/EMA-zone pullback with reclaim or micro structure break.
+* MICRO_PULLBACK: shallow 5M higher-low/lower-high continuation.
+* EMA_RECLAIM: EMA13/EMA20 touch followed by EMA8 reclaim; no new cross needed.
+* TREND_CONTINUATION: EMA5/9 recross after a real pullback in strong context.
+* MOMENTUM: significant swing/base breakout, direct or breakout-retest.
 
-Entry engines:
-* FAST_PULLBACK: valid 15M/HTF location -> 5M reclaim plus structure trigger.
-  EMA-only touches arm a setup but cannot enter on the same candle.
-* MOMENTUM: significant 15M swing break or a compressed 5M base break. Direct
-  entry is reserved for major displacement; otherwise a 1–2 bar retest is required.
-
-All calculations use closed candles only.  Setups and duplicate keys persist
-across restarts.
+Hard structure, room, fee-drag, stop-distance and actual-R:R gates remain
+non-compensable. All decisions use closed candles and persisted duplicate state.
 """
 from __future__ import annotations
 
@@ -40,6 +36,9 @@ PRICE_OPEN_BEYOND_EMA = "PRICE_OPEN_BEYOND_EMA"
 FAST_PULLBACK = "FAST_PULLBACK"
 MOMENTUM = "MOMENTUM"
 MOMENTUM_RETEST = "MOMENTUM_RETEST"
+TREND_CONTINUATION = "TREND_CONTINUATION"
+MICRO_PULLBACK = "MICRO_PULLBACK"
+EMA_RECLAIM = "EMA_RECLAIM"
 
 
 @dataclass
@@ -111,6 +110,9 @@ class _SetupState:
     reentry_lock: Optional[_ReentryLock] = None
     last_entry_key: object = None
     last_candidate_key: object = None
+    sl_streak_direction: str = ""
+    sl_streak_count: int = 0
+    last_sl_ts: Optional[pd.Timestamp] = None
 
 
 @dataclass
@@ -223,6 +225,9 @@ class EntryEngine:
                     reentry_lock=reentry_lock,
                     last_entry_key=self._restore_key(raw.get("last_entry_key")),
                     last_candidate_key=self._restore_key(raw.get("last_candidate_key")),
+                    sl_streak_direction=str(raw.get("sl_streak_direction", "")),
+                    sl_streak_count=int(raw.get("sl_streak_count", 0)),
+                    last_sl_ts=self._restore_ts(raw.get("last_sl_ts")),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -251,12 +256,15 @@ class EntryEngine:
                 "reentry_lock": reentry_lock,
                 "last_entry_key": self._json_key(state.last_entry_key),
                 "last_candidate_key": self._json_key(state.last_candidate_key),
+                "sl_streak_direction": state.sl_streak_direction,
+                "sl_streak_count": state.sl_streak_count,
+                "last_sl_ts": state.last_sl_ts.isoformat() if state.last_sl_ts is not None else None,
             }
         tmp = f"{self._state_path}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(
-                    {"version": 3, "symbols": symbols},
+                    {"version": 4, "symbols": symbols},
                     fh,
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -294,31 +302,51 @@ class EntryEngine:
         direction: Optional[str] = None,
         exit_reason: str = "",
         trade_pnl: float = 0.0,
+        closed_at: Optional[pd.Timestamp] = None,
     ) -> None:
-        """Clear used setups and lock same-direction re-entry after a full SL.
+        """Clear used setups and apply a two-strike same-side structure lock.
 
-        A time cooldown alone can repeatedly reuse the same failed trend thesis.
-        V1.9 therefore requires a fresh confirmed 15M BOS or a newly-confirmed
-        swing structure before the same side can be traded again after SL.
+        The first full SL uses only the normal symbol cooldown. A fresh 15M
+        structure requirement is activated only after repeated same-direction
+        full SLs inside a rolling window. This keeps frequency active without
+        allowing unlimited retries on a failed trend thesis.
         """
         state = self._get_state(symbol)
         state.pullback = None
         state.breakout = None
         state.last_candidate_key = None
         normalized = str(direction or "").upper()
-        if (
-            getattr(self.cfg, "dual_reentry_requires_new_structure", True)
-            and normalized in (LONG, SHORT)
+        now = pd.Timestamp(closed_at) if closed_at is not None else pd.Timestamp.utcnow()
+        is_full_loss = (
+            normalized in (LONG, SHORT)
             and trade_pnl < 0
             and str(exit_reason).upper() in {"SL_HIT", "FALSE_BREAKOUT"}
-        ):
-            state.reentry_lock = _ReentryLock(
-                direction=normalized,
-                set_ts=pd.Timestamp.utcnow(),
-                exit_reason=str(exit_reason),
+        )
+        if is_full_loss:
+            window_h = max(1, int(getattr(self.cfg, "dual_reentry_sl_window_hours", 12)))
+            inside_window = bool(
+                state.last_sl_ts is not None
+                and now - state.last_sl_ts <= pd.Timedelta(hours=window_h)
+                and state.sl_streak_direction == normalized
             )
-        elif trade_pnl > 0 and state.reentry_lock is not None:
+            state.sl_streak_count = state.sl_streak_count + 1 if inside_window else 1
+            state.sl_streak_direction = normalized
+            state.last_sl_ts = now
+            lock_after = max(1, int(getattr(self.cfg, "dual_reentry_lock_after_sl_count", 2)))
+            if (
+                getattr(self.cfg, "dual_reentry_requires_new_structure", True)
+                and state.sl_streak_count >= lock_after
+            ):
+                state.reentry_lock = _ReentryLock(
+                    direction=normalized,
+                    set_ts=now,
+                    exit_reason=f"{exit_reason}_X{state.sl_streak_count}",
+                )
+        elif trade_pnl > 0:
             state.reentry_lock = None
+            state.sl_streak_direction = ""
+            state.sl_streak_count = 0
+            state.last_sl_ts = None
         self._persist_state()
 
     def observe(
@@ -408,7 +436,9 @@ class EntryEngine:
         long = direction == LONG
         aligned = ef > es if long else ef < es
         slope_ok = ef > ef_prev if long else ef < ef_prev
-        dmi_ok = plus_di > minus_di if long else minus_di > plus_di
+        di_tolerance = getattr(c, "dual_di_tolerance", 2.0)
+        dmi_dominant = plus_di > minus_di if long else minus_di > plus_di
+        dmi_ok = plus_di >= minus_di - di_tolerance if long else minus_di >= plus_di - di_tolerance
         roc_ok = roc9 > 0 if long else roc9 < 0
         structure_aligned = structure == ("HH_HL" if long else "LH_LL")
         opposite_structure = structure == ("LH_LL" if long else "HH_HL")
@@ -458,6 +488,7 @@ class EntryEngine:
             "aligned": aligned,
             "slope_ok": slope_ok,
             "dmi_ok": dmi_ok,
+            "dmi_dominant": dmi_dominant,
             "roc_ok": roc_ok,
             "structure_aligned": structure_aligned,
             "opposite_structure": opposite_structure,
@@ -565,7 +596,9 @@ class EntryEngine:
         )
         fast_slope = ef > ef_prev if long else ef < ef_prev
         slow_slope = es >= es_prev if long else es <= es_prev
-        dmi_ok = plus_di > minus_di if long else minus_di > plus_di
+        di_tolerance = getattr(c, "dual_di_tolerance", 2.0)
+        dmi_dominant = plus_di > minus_di if long else minus_di > plus_di
+        dmi_ok = plus_di >= minus_di - di_tolerance if long else minus_di >= plus_di - di_tolerance
         roc_ok = roc5 > 0 if long else roc5 < 0
         roc_accel = roc5 > roc_prev if long else roc5 < roc_prev
         adx_support = adx_value >= getattr(c, "dual_momentum_min_adx", 11.0) or adx_value > adx_prev
@@ -575,7 +608,7 @@ class EntryEngine:
         support_count = sum((aligned, roc_ok, dmi_ok, adx_support))
         obvious_chop = (
             (adx_value < getattr(c, "dual_min_adx", 10.0) and chop > getattr(c, "dual_max_chop", 64.0))
-            or (flip_count >= 4 and spread_atr < 0.08)
+            or (flip_count >= 5 and spread_atr < 0.07)
         )
         strong = (
             aligned and fast_slope and slow_slope and dmi_ok
@@ -607,6 +640,7 @@ class EntryEngine:
             "fast_slope": fast_slope,
             "slow_slope": slow_slope,
             "dmi_ok": dmi_ok,
+            "dmi_dominant": dmi_dominant,
             "roc_ok": roc_ok,
             "adx_support": adx_support,
             "support_count": support_count,
@@ -626,6 +660,42 @@ class EntryEngine:
             "bull_components": bull_components,
             "bear_components": bear_components,
         }
+
+    def _dynamic_threshold(
+        self,
+        base: float,
+        context: dict,
+        snapshot: dict,
+        regime=None,
+        floor: Optional[float] = None,
+    ) -> float:
+        """Adapt the trigger bar without relaxing hard structure/risk gates."""
+        c = self.cfg
+        if not getattr(c, "dual_dynamic_threshold_enabled", True):
+            return float(base)
+        name = str(getattr(regime, "name", getattr(regime, "label", "")))
+        threshold = float(base)
+        strong = bool(
+            name.startswith("STRONG_")
+            or (
+                context.get("strong", False)
+                and snapshot.get("adx", 0.0) >= getattr(c, "dual_strong_adx", 18.0)
+                and snapshot.get("chop", 100.0) <= getattr(c, "dual_strong_chop", 57.0)
+            )
+        )
+        if strong:
+            threshold -= getattr(c, "dual_strong_threshold_discount", 6.0)
+        elif context.get("group_count", 0) >= 3:
+            threshold -= getattr(c, "dual_normal_threshold_discount", 3.0)
+        elif context.get("transition", False):
+            threshold += getattr(c, "dual_transition_threshold_add", 2.0)
+        edge = float(snapshot.get("direction_edge", 0.0))
+        if edge >= 35.0:
+            threshold -= 2.0
+        elif edge < 10.0:
+            threshold += 2.0
+        hard_floor = getattr(c, "dual_threshold_floor", 58.0) if floor is None else floor
+        return round(max(float(hard_floor), threshold), 1)
 
     def _finalize_candidate(
         self,
@@ -686,9 +756,10 @@ class EntryEngine:
         if fee_drag_r > max_fee_drag:
             return None
 
+        pullback_like = setup_type in {FAST_PULLBACK, MICRO_PULLBACK, EMA_RECLAIM, TREND_CONTINUATION}
         base_rr = (
             getattr(c, "dual_pullback_tp2_r", 2.20)
-            if setup_type == FAST_PULLBACK
+            if pullback_like
             else getattr(c, "dual_momentum_tp2_r", 2.40)
         )
         base_target = price + risk * base_rr if long else price - risk * base_rr
@@ -702,9 +773,9 @@ class EntryEngine:
             room_r = 99.0
         rr = ((target - price) / risk) if long else ((price - target) / risk)
         default_room = (
-            getattr(c, "dual_pullback_min_room_r", 1.10)
-            if setup_type == FAST_PULLBACK
-            else getattr(c, "dual_momentum_min_room_r", 1.20)
+            getattr(c, "dual_pullback_min_room_r", 1.00)
+            if pullback_like
+            else getattr(c, "dual_momentum_min_room_r", 1.10)
         )
         min_room = default_room if minimum_room_override is None else minimum_room_override
         if room_r < min_room or rr < getattr(c, "minimum_actual_rr", 1.50):
@@ -870,12 +941,24 @@ class EntryEngine:
                 trigger = "TRIGGER_BREAK"
             elif reclaim and (snapshot["fresh_cross"] or previous_break or setup.location_score >= 17.0):
                 trigger = "EMA_RECLAIM_CONFIRM"
-        if (
-            precision_symbol
-            and setup.location_score < 14.0
-            and trigger in ("EMA_RECLAIM_CONFIRM", "TRIGGER_BREAK")
-        ):
-            trigger = ""
+        if precision_symbol and setup.location_score < 14.0:
+            # Precision assets may use a delayed EMA-zone trigger break only
+            # when the 15M context is strong and the 5M directional edge is
+            # decisive. A naked EMA reclaim remains insufficient.
+            if trigger == "EMA_RECLAIM_CONFIRM":
+                trigger = ""
+            elif trigger == "TRIGGER_BREAK":
+                regime_name = str(getattr(regime, "name", getattr(regime, "label", "")))
+                if not (
+                    regime_name.startswith("STRONG_")
+                    and context["strong"]
+                    and strong_candle
+                    and snapshot["direction_edge"] >= 32.0
+                    and age >= 1
+                ):
+                    trigger = ""
+                else:
+                    trigger = "EMA_ZONE_TRIGGER_BREAK"
 
         # EMA reclaim has no structure break of its own. In an EARLY regime it
         # must show near-unanimous 5M directional agreement; in a STRONG regime
@@ -938,15 +1021,18 @@ class EntryEngine:
             ),
             "location": setup.location_score,
             "prior_context": 10.0 if prior_displacement or context["directional_bos"] else 8.0 if context["structure_aligned"] else 5.0,
-            "trigger": 15.0 if trigger in ("SWEEP_RECLAIM", "MICRO_BOS", "HTF_MICRO_BOS") else 13.0 if trigger == "TRIGGER_BREAK" else 10.0,
+            "trigger": 15.0 if trigger in ("SWEEP_RECLAIM", "MICRO_BOS", "HTF_MICRO_BOS") else 13.0 if trigger in ("TRIGGER_BREAK", "EMA_ZONE_TRIGGER_BREAK") else 10.0,
             "candle": 10.0 if strong_candle else 7.0 if candle_ok else 0.0,
             "local_edge": 10.0 if snapshot["direction_edge"] >= 18 else 7.0 if snapshot["direction_edge"] >= 12 else 4.0,
         }
         score = min(100.0, sum(components.values()))
-        threshold = (
-            getattr(c, "dual_same_bar_pullback_threshold", 74.0)
+        base_threshold = (
+            getattr(c, "dual_same_bar_pullback_threshold", 72.0)
             if age == 0
-            else getattr(c, "dual_pullback_threshold", 68.0)
+            else getattr(c, "dual_pullback_threshold", 66.0)
+        )
+        threshold = self._dynamic_threshold(
+            base_threshold, context, snapshot, regime, floor=66.0 if age == 0 else 62.0
         )
         if score < threshold:
             return None
@@ -977,6 +1063,420 @@ class EntryEngine:
         if candidate is not None:
             state.pullback = None
         return candidate
+
+    def _micro_pullback_candidate(
+        self,
+        df: pd.DataFrame,
+        direction: str,
+        context: dict,
+        snapshot: dict,
+        nearest_support: Optional[float],
+        nearest_resistance: Optional[float],
+        regime=None,
+        bias=None,
+    ) -> Optional[_Candidate]:
+        """Shallow 5M higher-low/lower-high continuation inside HTF bias."""
+        c = self.cfg
+        if not getattr(c, "dual_micro_pullback_enabled", True) or len(df) < 12:
+            return None
+        long = direction == LONG
+        if (
+            snapshot["obvious_chop"]
+            or not context["allowed"]
+            or context["group_count"] < 2
+            or not snapshot["structure_ok"]
+            or not snapshot["ema50_ok"]
+            or not snapshot["aligned"]
+            or snapshot["direction_score"] < getattr(c, "dual_micro_pullback_min_score", 54.0)
+            or snapshot["direction_edge"] < getattr(c, "dual_micro_pullback_min_edge", 10.0)
+        ):
+            return None
+        atr_value = snapshot["atr"]
+        if atr_value <= 0:
+            return None
+        row = df.iloc[-1]
+        prev = df.iloc[-2]
+        recent = df.iloc[-7:-1]
+        candle = snapshot["candle"]
+        candle_ok = (
+            ind.bullish_trigger_candle(
+                candle,
+                getattr(c, "dual_micro_pullback_min_body_atr", 0.10),
+                getattr(c, "dual_micro_pullback_close_quality", 0.58),
+            )
+            if long
+            else ind.bearish_trigger_candle(
+                candle,
+                getattr(c, "dual_micro_pullback_min_body_atr", 0.10),
+                getattr(c, "dual_micro_pullback_close_quality", 0.58),
+            )
+        )
+        if not candle_ok:
+            return None
+        price = snapshot["price"]
+        if long:
+            impulse_high = float(recent["high"].max())
+            pullback_low = float(df["low"].iloc[-4:].min())
+            depth = (impulse_high - pullback_low) / max(atr_value, ind.EPSILON)
+            trigger = price > float(prev["high"])
+            hold = pullback_low >= snapshot["ema20"] - 0.18 * atr_value and price > snapshot["ema20"]
+            raw_stop = pullback_low - getattr(c, "dual_stop_buffer_atr", 0.08) * atr_value
+            extension = (price - snapshot["ema_slow"]) / atr_value
+        else:
+            impulse_low = float(recent["low"].min())
+            pullback_high = float(df["high"].iloc[-4:].max())
+            depth = (pullback_high - impulse_low) / max(atr_value, ind.EPSILON)
+            trigger = price < float(prev["low"])
+            hold = pullback_high <= snapshot["ema20"] + 0.18 * atr_value and price < snapshot["ema20"]
+            raw_stop = pullback_high + getattr(c, "dual_stop_buffer_atr", 0.08) * atr_value
+            extension = (snapshot["ema_slow"] - price) / atr_value
+        if (
+            not trigger
+            or not hold
+            or depth < 0.12
+            or depth > getattr(c, "dual_micro_pullback_max_depth_atr", 0.85)
+            or extension < -0.10
+            or extension > getattr(c, "dual_micro_pullback_max_extension_atr", 0.75)
+            or not (snapshot["roc_ok"] or snapshot["roc_accel"])
+        ):
+            return None
+        bias_edge = abs(getattr(bias, "directional_edge", 0.0))
+        components = {
+            "bias": 14.0 if bias_edge >= 12 else 11.0,
+            "context": 18.0 if context["strong"] else 14.0,
+            "ema_alignment": 14.0,
+            "shallow_pullback": 15.0 if depth <= 0.55 else 11.0,
+            "bar_break": 14.0,
+            "candle": 10.0,
+            "local_edge": 10.0 if snapshot["direction_edge"] >= 22 else 7.0,
+            "momentum": 8.0 if snapshot["dmi_dominant"] and snapshot["roc_ok"] else 5.0,
+        }
+        score = min(100.0, sum(components.values()))
+        threshold = self._dynamic_threshold(
+            getattr(c, "dual_micro_pullback_threshold", 65.0),
+            context,
+            snapshot,
+            regime,
+            floor=64.0,
+        )
+        if score < threshold:
+            return None
+        return self._finalize_candidate(
+            direction=direction,
+            setup_type=MICRO_PULLBACK,
+            score=score,
+            threshold=threshold,
+            trigger="MICRO_HL_BREAK" if long else "MICRO_LH_BREAK",
+            price=price,
+            raw_stop=raw_stop,
+            atr_value=atr_value,
+            nearest_support=nearest_support,
+            nearest_resistance=nearest_resistance,
+            bar_ts=pd.Timestamp(df.index[-1]),
+            components={
+                **components,
+                "depth_atr": round(depth, 3),
+                "extension_atr": round(extension, 3),
+                "local_direction_edge": snapshot["direction_edge"],
+                "context_groups": context["group_count"],
+            },
+            minimum_room_override=getattr(c, "dual_micro_pullback_min_room_r", 1.00),
+        )
+
+    def _ema_reclaim_candidate(
+        self,
+        df: pd.DataFrame,
+        direction: str,
+        context: dict,
+        snapshot: dict,
+        nearest_support: Optional[float],
+        nearest_resistance: Optional[float],
+        regime=None,
+        bias=None,
+        symbol: str = "",
+    ) -> Optional[_Candidate]:
+        """EMA13/EMA20 touch followed by EMA8 reclaim; no fresh cross required."""
+        c = self.cfg
+        if not getattr(c, "dual_ema_reclaim_engine_enabled", True) or len(df) < 20:
+            return None
+        long = direction == LONG
+        precision = self._is_precision_symbol(symbol)
+        if (
+            snapshot["obvious_chop"]
+            or not context["allowed"]
+            or context["group_count"] < (3 if precision else 2)
+            or not snapshot["structure_ok"]
+            or not snapshot["ema50_ok"]
+            or not snapshot["aligned"]
+            or snapshot["direction_score"] < getattr(c, "dual_ema_reclaim_min_score", 56.0)
+            or snapshot["direction_edge"] < getattr(c, "dual_ema_reclaim_min_edge", 12.0)
+        ):
+            return None
+        atr_value = snapshot["atr"]
+        if atr_value <= 0:
+            return None
+        n = max(2, int(getattr(c, "dual_ema_reclaim_touch_bars", 4)))
+        recent = df.iloc[-n-1:-1]
+        fast = snapshot["ema_fast_series"]
+        slow = snapshot["ema_slow_series"]
+        ema20 = ind.ema(df["close"], getattr(c, "dual_entry_trend_ema", 20))
+        recent_slow = slow.iloc[-n-1:-1]
+        recent_e20 = ema20.iloc[-n-1:-1]
+        price = snapshot["price"]
+        row = df.iloc[-1]
+        prev_close = float(df["close"].iloc[-2])
+        candle = snapshot["candle"]
+        candle_ok = (
+            ind.bullish_trigger_candle(
+                candle,
+                getattr(c, "dual_ema_reclaim_min_body_atr", 0.10),
+                getattr(c, "dual_ema_reclaim_close_quality", 0.57),
+            )
+            if long
+            else ind.bearish_trigger_candle(
+                candle,
+                getattr(c, "dual_ema_reclaim_min_body_atr", 0.10),
+                getattr(c, "dual_ema_reclaim_close_quality", 0.57),
+            )
+        )
+        if long:
+            touched_slow = bool((recent["low"].to_numpy() <= recent_slow.to_numpy() + 0.10 * atr_value).any())
+            touched_e20 = bool((recent["low"].to_numpy() <= recent_e20.to_numpy() + 0.08 * atr_value).any())
+            touched = touched_slow or touched_e20
+            reclaimed = price > snapshot["ema_fast"] and prev_close <= float(fast.iloc[-2]) + 0.05 * atr_value
+            hold = price > snapshot["ema20"] and price > snapshot["ema50"]
+            raw_stop = min(float(df["low"].iloc[-n-1:].min()), snapshot["ema20"] - 0.08 * atr_value)
+            extension = (price - snapshot["ema_slow"]) / atr_value
+        else:
+            touched_slow = bool((recent["high"].to_numpy() >= recent_slow.to_numpy() - 0.10 * atr_value).any())
+            touched_e20 = bool((recent["high"].to_numpy() >= recent_e20.to_numpy() - 0.08 * atr_value).any())
+            touched = touched_slow or touched_e20
+            reclaimed = price < snapshot["ema_fast"] and prev_close >= float(fast.iloc[-2]) - 0.05 * atr_value
+            hold = price < snapshot["ema20"] and price < snapshot["ema50"]
+            raw_stop = max(float(df["high"].iloc[-n-1:].max()), snapshot["ema20"] + 0.08 * atr_value)
+            extension = (snapshot["ema_slow"] - price) / atr_value
+        if (
+            not touched
+            or not reclaimed
+            or not hold
+            or not candle_ok
+            or extension < 0
+            or extension > getattr(c, "dual_ema_reclaim_max_extension_atr", 0.70)
+            or not (snapshot["roc_ok"] or snapshot["roc_accel"])
+            or not snapshot["dmi_ok"]
+        ):
+            return None
+        if precision and not (
+            touched_e20
+            and snapshot["dmi_dominant"]
+            and snapshot["roc_ok"]
+            and snapshot["direction_edge"] >= 45.0
+            and (
+                context["strong"]
+                or context["structure_aligned"]
+                or context["directional_bos"]
+            )
+        ):
+            return None
+        bias_edge = abs(getattr(bias, "directional_edge", 0.0))
+        components = {
+            "bias": 14.0 if bias_edge >= 12 else 11.0,
+            "context": 18.0 if context["strong"] else 14.0,
+            "ema_touch": 14.0,
+            "ema_reclaim": 15.0,
+            "trend_hold": 12.0,
+            "candle": 10.0,
+            "local_edge": 10.0 if snapshot["direction_edge"] >= 25 else 7.0,
+            "momentum": 8.0 if snapshot["dmi_dominant"] and snapshot["roc_ok"] else 5.0,
+        }
+        score = min(100.0, sum(components.values()))
+        threshold = self._dynamic_threshold(
+            getattr(c, "dual_ema_reclaim_threshold", 64.0),
+            context,
+            snapshot,
+            regime,
+            floor=64.0 if not precision else 68.0,
+        )
+        if score < threshold:
+            return None
+        return self._finalize_candidate(
+            direction=direction,
+            setup_type=EMA_RECLAIM,
+            score=score,
+            threshold=threshold,
+            trigger="EMA8_RECLAIM_AFTER_TOUCH",
+            price=price,
+            raw_stop=raw_stop,
+            atr_value=atr_value,
+            nearest_support=nearest_support,
+            nearest_resistance=nearest_resistance,
+            bar_ts=pd.Timestamp(df.index[-1]),
+            components={
+                **components,
+                "precision_profile": precision,
+                "extension_atr": round(extension, 3),
+                "local_direction_edge": snapshot["direction_edge"],
+                "context_groups": context["group_count"],
+            },
+            minimum_room_override=getattr(c, "dual_ema_reclaim_min_room_r", 1.00),
+        )
+
+    def _continuation_candidate(
+        self,
+        df: pd.DataFrame,
+        direction: str,
+        context: dict,
+        snapshot: dict,
+        nearest_support: Optional[float],
+        nearest_resistance: Optional[float],
+        regime=None,
+        bias=None,
+    ) -> Optional[_Candidate]:
+        """Strong-context 5M EMA recross after a real pullback.
+
+        This is the frequency engine. EMA8/13 is only the timing event; 15M
+        trend/structure, a prior touch of EMA13/EMA20, local directional edge,
+        candle quality, room and fee-aware risk remain mandatory.
+        """
+        c = self.cfg
+        if not getattr(c, "dual_continuation_enabled", True):
+            return None
+        long = direction == LONG
+        regime_name = str(getattr(regime, "name", getattr(regime, "label", "")))
+        strong_regime = regime_name.startswith("STRONG_")
+        early_allowed = bool(
+            getattr(c, "dual_continuation_allow_early_regime", False)
+            and regime_name.startswith("EARLY_")
+            and context.get("group_count", 0) >= 3
+        )
+        if not (strong_regime or early_allowed):
+            return None
+        if (
+            snapshot["obvious_chop"]
+            or not snapshot["structure_ok"]
+            or not snapshot["ema50_ok"]
+            or not context["allowed"]
+            or context["group_count"] < 2
+        ):
+            return None
+        if (
+            snapshot["direction_score"] < getattr(c, "dual_continuation_min_direction_score", 68.0)
+            or snapshot["direction_edge"] < getattr(c, "dual_continuation_min_edge", 25.0)
+        ):
+            return None
+        if len(df) < 30:
+            return None
+
+        close = df["close"]
+        fast = ind.ema(close, getattr(c, "dual_continuation_ema_fast", 5))
+        slow = ind.ema(close, getattr(c, "dual_continuation_ema_slow", 9))
+        ema20 = ind.ema(close, getattr(c, "dual_entry_trend_ema", 20))
+        max_age = max(0, int(getattr(c, "dual_continuation_max_cross_age_bars", 1)))
+        cross_age = None
+        for age in range(0, max_age + 1):
+            i = -1 - age
+            j = i - 1
+            if abs(j) > len(df):
+                break
+            crossed = (
+                fast.iloc[i] > slow.iloc[i] and fast.iloc[j] <= slow.iloc[j]
+                if long
+                else fast.iloc[i] < slow.iloc[i] and fast.iloc[j] >= slow.iloc[j]
+            )
+            if crossed:
+                cross_age = age
+                break
+        if cross_age is None:
+            return None
+        # Alignment must still be valid at the actual decision candle.
+        if not (fast.iloc[-1] > slow.iloc[-1] if long else fast.iloc[-1] < slow.iloc[-1]):
+            return None
+
+        atr_value = snapshot["atr"]
+        price = snapshot["price"]
+        recent = df.iloc[-5:-1]
+        recent_slow = slow.iloc[-5:-1]
+        recent_e20 = ema20.iloc[-5:-1]
+        if long:
+            pullback_touch = bool(
+                (recent["low"].to_numpy() <= (recent_slow.to_numpy() + 0.12 * atr_value)).any()
+                or (recent["low"].to_numpy() <= (recent_e20.to_numpy() + 0.10 * atr_value)).any()
+            )
+            hold_ok = price > snapshot["ema20"] and price > snapshot["ema50"]
+            raw_stop = min(float(df["low"].iloc[-5:].min()), float(snapshot["ema20"] - 0.08 * atr_value))
+        else:
+            pullback_touch = bool(
+                (recent["high"].to_numpy() >= (recent_slow.to_numpy() - 0.12 * atr_value)).any()
+                or (recent["high"].to_numpy() >= (recent_e20.to_numpy() - 0.10 * atr_value)).any()
+            )
+            hold_ok = price < snapshot["ema20"] and price < snapshot["ema50"]
+            raw_stop = max(float(df["high"].iloc[-5:].max()), float(snapshot["ema20"] + 0.08 * atr_value))
+        if not pullback_touch or not hold_ok:
+            return None
+
+        candle = snapshot["candle"]
+        candle_ok = (
+            ind.bullish_trigger_candle(
+                candle,
+                getattr(c, "dual_continuation_min_body_atr", 0.14),
+                getattr(c, "dual_continuation_close_quality", 0.62),
+            )
+            if long
+            else ind.bearish_trigger_candle(
+                candle,
+                getattr(c, "dual_continuation_min_body_atr", 0.14),
+                getattr(c, "dual_continuation_close_quality", 0.62),
+            )
+        )
+        if not candle_ok or not snapshot["dmi_ok"] or not (snapshot["roc_ok"] or snapshot["roc_accel"]):
+            return None
+        extension = (price - snapshot["ema_slow"]) / atr_value if long else (snapshot["ema_slow"] - price) / atr_value
+        if extension < 0 or extension > getattr(c, "dual_continuation_max_extension_atr", 0.60):
+            return None
+
+        bias_edge = abs(getattr(bias, "directional_edge", 0.0))
+        components = {
+            "bias": 15.0 if bias_edge >= 15 else 12.0,
+            "context": 20.0 if context["structure_aligned"] or context["directional_bos"] else 16.0,
+            "pullback_touch": 15.0,
+            "ema_recross": 15.0 if cross_age == 0 else 12.0,
+            "candle": 10.0,
+            "local_edge": 15.0 if snapshot["direction_edge"] >= 40 else 12.0,
+            "momentum": 10.0 if snapshot["adx_support"] and snapshot["roc_accel"] else 7.0,
+        }
+        score = min(100.0, sum(components.values()))
+        threshold = self._dynamic_threshold(
+            getattr(c, "dual_continuation_threshold", 70.0),
+            context,
+            snapshot,
+            regime,
+            floor=64.0,
+        )
+        if score < threshold:
+            return None
+        return self._finalize_candidate(
+            direction=direction,
+            setup_type=TREND_CONTINUATION,
+            score=score,
+            threshold=threshold,
+            trigger="EMA_CROSS_CONTINUATION",
+            price=price,
+            raw_stop=raw_stop,
+            atr_value=atr_value,
+            nearest_support=nearest_support,
+            nearest_resistance=nearest_resistance,
+            bar_ts=pd.Timestamp(df.index[-1]),
+            components={
+                **components,
+                "engine": TREND_CONTINUATION,
+                "cross_age": cross_age,
+                "local_direction_score": snapshot["direction_score"],
+                "local_opposite_score": snapshot["opposite_score"],
+                "local_direction_edge": snapshot["direction_edge"],
+                "extension_atr": round(extension, 3),
+            },
+            minimum_room_override=getattr(c, "dual_continuation_min_room_r", 1.15),
+        )
 
     def _momentum_candidate(
         self,
@@ -1078,6 +1578,7 @@ class EntryEngine:
         direct_regime_ok = not (
             getattr(c, "dual_block_direct_breakout_in_early_trend", True)
             and regime_name.startswith("EARLY_")
+            and not (setup.source == "15M_SWING" or (setup.compressed and candle.volume_ratio >= 1.05))
         )
         direct = age == 0 and direct_quality and direct_regime_ok
         early_retest_quality = bool(
@@ -1149,9 +1650,16 @@ class EntryEngine:
             "extension": 5.0 if level_extension <= 0.25 else 3.0,
         }
         score = min(100.0, sum(components.values()))
-        threshold = (
-            getattr(c, "dual_strong_breakout_threshold", 78.0)
-            if direct else getattr(c, "dual_momentum_threshold", 72.0)
+        base_threshold = (
+            getattr(c, "dual_strong_breakout_threshold", 76.0)
+            if direct else getattr(c, "dual_momentum_threshold", 70.0)
+        )
+        threshold = self._dynamic_threshold(
+            base_threshold,
+            context,
+            snapshot,
+            regime,
+            floor=70.0 if direct else 64.0,
         )
         if score < threshold:
             return None
@@ -1217,35 +1725,40 @@ class EntryEngine:
             or not getattr(self.cfg, "dual_reentry_requires_new_structure", True)
         ):
             return True, ""
-        scan = getattr(self.cfg, "dual_reentry_bos_scan_bars", 48)
-        bos_ts, _ = ind.latest_bos_event(
-            df_15m, direction,
-            getattr(self.cfg, "entry_swing_left", 3),
-            getattr(self.cfg, "entry_swing_right", 3),
-            0.18,
-            scan,
-        )
-        swing_kind = "LOW" if direction == LONG else "HIGH"
-        swing_ts, _ = ind.latest_confirmed_swing_confirmation(
-            df_15m, swing_kind,
-            getattr(self.cfg, "entry_swing_left", 3),
-            getattr(self.cfg, "entry_swing_right", 3),
-        )
-        lock_value = pd.Timestamp(lock.set_ts).value
-        fresh_bos = bos_ts is not None and pd.Timestamp(bos_ts).value > lock_value
-        fresh_swing = (
-            swing_ts is not None
-            and pd.Timestamp(swing_ts).value > lock_value
-            and context["structure_aligned"]
+
+        # Evaluate only structure created AFTER the lock. This avoids reusing an
+        # old BOS and is materially faster than rescanning every historical
+        # swing on each 5M loop.
+        lock_ts = pd.Timestamp(lock.set_ts)
+        post = df_15m.loc[df_15m.index > lock_ts]
+        if len(post) < 4:
+            return False, f"same-side re-entry locked after {lock.exit_reason}; waiting for post-SL 15M structure"
+        atr_value = ind.safe_float(ind.atr(df_15m, 14).iloc[-1])
+        row = post.iloc[-1]
+        prior = post.iloc[:-1].tail(max(3, min(12, len(post) - 1)))
+        if prior.empty or atr_value <= 0:
+            return False, f"same-side re-entry locked after {lock.exit_reason}; waiting for post-SL 15M structure"
+        body = abs(float(row["close"]) - float(row["open"]))
+        if direction == LONG:
+            range_break = float(row["close"]) > float(prior["high"].max())
+            hold = float(row["close"]) > context["ema_fast"]
+        else:
+            range_break = float(row["close"]) < float(prior["low"].min())
+            hold = float(row["close"]) < context["ema_fast"]
+        fresh_structure = bool(
+            range_break
+            and hold
+            and body >= 0.15 * atr_value
             and context["group_count"] >= 3
+            and not context["opposite_shift"]
         )
-        if fresh_bos or fresh_swing:
+        if fresh_structure:
             state.reentry_lock = None
-            return True, "fresh 15M thesis confirmed"
-        return (
-            False,
-            f"same-side re-entry locked after {lock.exit_reason}; waiting for fresh 15M BOS/structure",
-        )
+            state.sl_streak_direction = ""
+            state.sl_streak_count = 0
+            state.last_sl_ts = None
+            return True, "fresh post-SL 15M range break confirmed"
+        return False, f"same-side re-entry locked after {lock.exit_reason}; waiting for post-SL 15M range break"
 
     def analyze(
         self,
@@ -1332,11 +1845,43 @@ class EntryEngine:
             df_5m, direction, context, snapshot, state,
             support, resistance, regime, bias, symbol,
         )
+        micro_pullback = self._micro_pullback_candidate(
+            df_5m, direction, context, snapshot,
+            support, resistance, regime, bias,
+        )
+        ema_reclaim = self._ema_reclaim_candidate(
+            df_5m, direction, context, snapshot,
+            support, resistance, regime, bias, symbol,
+        )
+        continuation = self._continuation_candidate(
+            df_5m, direction, context, snapshot,
+            support, resistance, regime, bias,
+        )
         momentum = self._momentum_candidate(
             df_5m, direction, context, snapshot, state,
             support, resistance, regime, bias, symbol,
         )
-        candidates = [x for x in (pullback, momentum) if x is not None]
+        candidates = [
+            x for x in (pullback, micro_pullback, ema_reclaim, continuation, momentum)
+            if x is not None
+        ]
+        # Prevent one permissive trigger family from repeatedly firing inside
+        # the same short trend leg. Other engines remain eligible, so frequency
+        # is preserved through setup diversity rather than same-engine churn.
+        if candidates and isinstance(state.last_entry_key, tuple) and len(state.last_entry_key) >= 3:
+            try:
+                last_ts = pd.Timestamp(state.last_entry_key[0])
+                last_setup = str(state.last_entry_key[2])
+                cooldown_bars = (
+                    getattr(self.cfg, "dual_same_engine_cooldown_bars_precision", 36)
+                    if self._is_precision_symbol(symbol)
+                    else getattr(self.cfg, "dual_same_engine_cooldown_bars_high_beta", 12)
+                )
+                age_bars = self._age_bars(last_ts, pd.Timestamp(df_5m.index[-1]), 5)
+                if age_bars < cooldown_bars:
+                    candidates = [x for x in candidates if x.setup_type != last_setup]
+            except (TypeError, ValueError, IndexError):
+                pass
         if not candidates:
             armed = []
             if state.pullback is not None:
@@ -1358,8 +1903,17 @@ class EntryEngine:
 
         candidates.sort(key=lambda x: x.edge, reverse=True)
         selected = candidates[0]
-        if len(candidates) > 1 and abs(candidates[0].edge - candidates[1].edge) <= 2:
-            selected = next((x for x in candidates if x.setup_type == FAST_PULLBACK), selected)
+        if len(candidates) > 1 and abs(candidates[0].edge - candidates[1].edge) <= 5:
+            priority = {
+                FAST_PULLBACK: 0,
+                MICRO_PULLBACK: 1,
+                EMA_RECLAIM: 2,
+                TREND_CONTINUATION: 3,
+                MOMENTUM_RETEST: 4,
+                MOMENTUM: 5,
+            }
+            near = [x for x in candidates if candidates[0].edge - x.edge <= 5]
+            selected = min(near, key=lambda x: priority.get(x.setup_type, 99))
         if state.last_entry_key is not None and selected.signal_key == state.last_entry_key:
             self._persist_state()
             return EntryResult(NONE, False, "duplicate signal key", **base)

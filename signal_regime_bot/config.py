@@ -419,7 +419,7 @@ class Config:
     booster_score_to_bonus: float = 0.5        # early_bonus = min(early_score * this, max_bonus)
 
 
-    # ── DUALCORE V1.9 — Balanced Structure Entry ───────────────────────────
+    # ── DUALCORE V2.0 — Active Frequency Multi-Engine Entry ───────────────
     # 4H macro + 1H bias + 15M context/structure + 5M EMA dual entry.
     # EMA8/EMA13 is used instead of HMA on 5M to reduce whipsaw while keeping
     # entries fast enough for active multi-symbol trading. EMA is timing only;
@@ -444,7 +444,7 @@ class Config:
     entry_swing_right: int = 3
     dual_pullback_zone_atr: float = 0.15
     dual_pullback_depth_atr: float = 0.30
-    dual_pullback_window_bars: int = 4
+    dual_pullback_window_bars: int = 5
     dual_pullback_max_extension_atr: float = 0.80
     dual_pullback_threshold: float = 68.0
     dual_same_bar_pullback_threshold: float = 74.0
@@ -493,13 +493,75 @@ class Config:
     dual_high_beta_pullback_max_extension_atr: float = 0.70
     # EMA reclaim is the weakest pullback trigger. It needs substantially
     # stronger local agreement in an EARLY regime than after a structure shift.
-    dual_ema_reclaim_early_min_edge: float = 85.0
-    dual_ema_reclaim_strong_min_edge: float = 55.0
+    dual_ema_reclaim_early_min_edge: float = 80.0
+    dual_ema_reclaim_strong_min_edge: float = 60.0
     # EARLY-trend breakout retests require evidence of an impulse, otherwise
     # the setup is commonly just a false break inside a developing range.
     dual_early_retest_min_volume_ratio: float = 1.10
     dual_block_direct_breakout_in_early_trend: bool = True
     dual_reentry_bos_scan_bars: int = 48
+
+    # V2.0 active-frequency continuation engine. This is deliberately stricter
+    # than a naked EMA cross: 1H/15M context must already be strong, the 5M
+    # market must have pulled into EMA13/EMA20, and the fresh EMA8/13 recross
+    # must close with directional quality. It adds continuation opportunities
+    # without weakening the core pullback/structure gates.
+    dual_continuation_enabled: bool = True
+    dual_continuation_ema_fast: int = 5
+    dual_continuation_ema_slow: int = 9
+    dual_continuation_threshold: float = 74.0
+    dual_continuation_min_edge: float = 20.0
+    dual_continuation_min_direction_score: float = 65.0
+    dual_continuation_max_cross_age_bars: int = 1
+    dual_continuation_max_extension_atr: float = 0.60
+    dual_continuation_min_room_r: float = 1.15
+    dual_continuation_min_body_atr: float = 0.14
+    dual_continuation_close_quality: float = 0.62
+    dual_continuation_allow_early_regime: bool = True
+
+
+    # V2.0 dynamic threshold and additional entry engines.
+    dual_dynamic_threshold_enabled: bool = True
+    dual_strong_threshold_discount: float = 4.0
+    dual_normal_threshold_discount: float = 2.0
+    dual_transition_threshold_add: float = 4.0
+    dual_threshold_floor: float = 62.0
+    dual_di_tolerance: float = 2.0
+
+    dual_micro_pullback_enabled: bool = True
+    dual_micro_pullback_threshold: float = 72.0
+    dual_micro_pullback_min_edge: float = 18.0
+    dual_micro_pullback_min_score: float = 65.0
+    dual_micro_pullback_min_body_atr: float = 0.14
+    dual_micro_pullback_close_quality: float = 0.62
+    dual_micro_pullback_max_depth_atr: float = 0.70
+    dual_micro_pullback_max_extension_atr: float = 0.60
+    dual_micro_pullback_min_room_r: float = 1.10
+
+    dual_ema_reclaim_engine_enabled: bool = True
+    dual_ema_reclaim_threshold: float = 74.0
+    dual_ema_reclaim_min_edge: float = 25.0
+    dual_ema_reclaim_min_score: float = 68.0
+    dual_ema_reclaim_touch_bars: int = 4
+    dual_ema_reclaim_min_body_atr: float = 0.14
+    dual_ema_reclaim_close_quality: float = 0.62
+    dual_ema_reclaim_max_extension_atr: float = 0.55
+    dual_ema_reclaim_min_room_r: float = 1.10
+
+    # First full SL only uses the time cooldown. A fresh 15M structure lock is
+    # activated only after two same-direction full SLs within this window.
+    dual_reentry_lock_after_sl_count: int = 2
+    dual_reentry_sl_window_hours: int = 12
+    dual_same_engine_cooldown_bars_precision: int = 36
+    dual_same_engine_cooldown_bars_high_beta: int = 12
+
+    # Regime/bias active-frequency tolerances.
+    dual_regime_early_score_min: float = 62.0
+    dual_regime_early_edge_min: float = 12.0
+    bias_combined_min: float = 58.0
+    bias_1h_edge_min: float = 6.0
+    bias_15m_edge_floor: float = -2.0
+    bias_opposite_bos_margin: float = 5.0
 
     dual_min_stop_atr: float = 0.80
     dual_max_stop_atr: float = 2.20

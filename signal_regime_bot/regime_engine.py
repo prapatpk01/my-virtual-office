@@ -1,4 +1,4 @@
-"""DUALCORE V1.9 market-regime classification.
+"""DUALCORE V2.0 market-regime classification.
 
 4H is a macro conflict filter; 1H is the active directional regime.  A neutral
 4H does not block a valid 1H trend, while a confirmed strong opposite 4H does.
@@ -156,9 +156,9 @@ class RegimeEngine:
             label = STRONG_BULL
         elif bear_core and bear_score >= 80 and edge <= -18:
             label = STRONG_BEAR
-        elif bull_score >= 62 and edge >= 12 and not range_state:
+        elif bull_score >= getattr(c, "dual_regime_early_score_min", 58.0) and edge >= getattr(c, "dual_regime_early_edge_min", 8.0) and not range_state:
             label = EARLY_BULL
-        elif bear_score >= 62 and edge <= -12 and not range_state:
+        elif bear_score >= getattr(c, "dual_regime_early_score_min", 58.0) and edge <= -getattr(c, "dual_regime_early_edge_min", 8.0) and not range_state:
             label = EARLY_BEAR
         elif compression:
             label = COMPRESSION

@@ -1,4 +1,4 @@
-"""DUALCORE V1.9 directional bias engine.
+"""DUALCORE V2.0 directional bias engine.
 
 1H chooses the active side, 15M confirms that the side is not structurally
 invalid, and 5M is informational only.  Bull and bear evidence are calculated
@@ -206,25 +206,25 @@ class BiasEngine:
 
         long_ok = (
             bull_regime
-            and combined_bull >= 58.0
+            and combined_bull >= getattr(c, "bias_combined_min", 55.0)
             and edge >= minimum_edge
             and s1.bull_score >= getattr(c, "bias_1h_min_bull", 56.0)
-            and one_hour_bull_edge >= 6.0
+            and one_hour_bull_edge >= getattr(c, "bias_1h_edge_min", 4.0)
             and s15.bull_score >= getattr(c, "bias_15m_min_bull", 50.0)
-            and fifteen_bull_edge >= -2.0
-            and not one_hour_bear_shift
-            and not (fifteen_bear_shift and s15.bear_score > s15.bull_score)
+            and fifteen_bull_edge >= getattr(c, "bias_15m_edge_floor", -5.0)
+            and not (one_hour_bear_shift and s1.bear_score >= s1.bull_score + getattr(c, "bias_opposite_bos_margin", 5.0))
+            and not (fifteen_bear_shift and s15.bear_score >= s15.bull_score + getattr(c, "bias_opposite_bos_margin", 5.0))
         )
         short_ok = (
             bear_regime
-            and combined_bear >= 58.0
+            and combined_bear >= getattr(c, "bias_combined_min", 55.0)
             and edge <= -minimum_edge
             and s1.bear_score >= getattr(c, "bias_1h_min_bull", 56.0)
-            and one_hour_bear_edge >= 6.0
+            and one_hour_bear_edge >= getattr(c, "bias_1h_edge_min", 4.0)
             and s15.bear_score >= getattr(c, "bias_15m_min_bull", 50.0)
-            and fifteen_bear_edge >= -2.0
-            and not one_hour_bull_shift
-            and not (fifteen_bull_shift and s15.bull_score > s15.bear_score)
+            and fifteen_bear_edge >= getattr(c, "bias_15m_edge_floor", -5.0)
+            and not (one_hour_bull_shift and s1.bull_score >= s1.bear_score + getattr(c, "bias_opposite_bos_margin", 5.0))
+            and not (fifteen_bull_shift and s15.bull_score >= s15.bear_score + getattr(c, "bias_opposite_bos_margin", 5.0))
         )
 
         detail = (
