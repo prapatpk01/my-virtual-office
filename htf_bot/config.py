@@ -53,9 +53,10 @@ class Config:
             "XAU/USDT:USDT,XRP/USDT:USDT,XAG/USDT:USDT,BTC/USDT:USDT",
         ).split(",") if s.strip()])
     leverage: int = field(default_factory=lambda: _env_int("LEVERAGE", 20))
-    # Backtested portfolio maxDD is ~12R -> at 5% risk that's a -60% swing.
-    # Default 1%; RISK_PER_TRADE overrides (a >2% setting logs a warning).
-    risk_per_trade: float = field(default_factory=lambda: _env_float("RISK_PER_TRADE", 0.01))
+    # 5% per trade — same default as the dual/regime bots (per user request).
+    # Note: the backtested portfolio maxDD is ~12R, so at 5% risk a bad
+    # stretch can draw down very deeply; the startup warning below stays.
+    risk_per_trade: float = field(default_factory=lambda: _env_float("RISK_PER_TRADE", 0.05))
     max_positions: int = field(default_factory=lambda: _env_int("MAX_POSITIONS", 2))
 
     fee_rate: float = 0.0005      # verified from an actual OKX fill (0.05% taker)
