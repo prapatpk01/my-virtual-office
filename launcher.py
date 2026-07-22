@@ -2,6 +2,7 @@
 
     MODE=dual    -> DUAL ENTRY PRECISION V1.4   (default)
     MODE=regime  -> Signal Regime Bias bot (legacy)
+    MODE=htf     -> HTF pullback bot (1H/4H, backtest-validated)
 
 This file is baked into the Docker image AS /app/main.py, so it runs no
 matter which start command Railway uses (`python main.py`, the image CMD,
@@ -36,8 +37,15 @@ def main() -> None:
         if not os.path.isfile(os.path.join(target_dir, "main.py")):
             print(f"FATAL: signal_regime_bot/main.py not found under {HERE}", flush=True)
             sys.exit(1)
+    elif mode in ("htf", "htf_pullback", "simple"):
+        target_dir = os.path.join(HERE, "htf_bot")
+        argv = [sys.executable, "main.py"]
+        name = "HTF Pullback (1H/4H, backtest-validated)"
+        if not os.path.isfile(os.path.join(target_dir, "main.py")):
+            print(f"FATAL: htf_bot/main.py not found under {HERE}", flush=True)
+            sys.exit(1)
     else:
-        print(f"FATAL: unknown MODE={mode!r} — use MODE=dual or MODE=regime", flush=True)
+        print(f"FATAL: unknown MODE={mode!r} — use MODE=dual, MODE=regime or MODE=htf", flush=True)
         sys.exit(1)
 
     print(f"{banner}\nLAUNCHER: MODE={mode} -> {name}\n"
