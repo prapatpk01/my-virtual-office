@@ -3473,12 +3473,37 @@ class TradingBot:
         tp1         = float(t.get("tp1") or 0.0)
         tp2         = float(t.get("tp2") or 0.0)
         targets_hit = list(t.get("targets_hit", []))
-        if tp2 and dir_mult * (close_price - tp2) >= 0 and "T2" not in targets_hit:
-            targets_hit.append("T2")
-        if tp1 and dir_mult * (close_price - tp1) >= 0 and "T1" not in targets_hit:
-            targets_hit.append("T1")
         pnl = float(row.get("pnl") or 0.0)
         close_ts = row.get("close_ts")
+
+        # [T2 DETECTION] The position's AVERAGE close price (row["close_price"]
+        # = OKX closeAvgPx) can't tell whether the runner hit T2: on a
+        # T1(60%)+T2(40%) split the big T1 partial drags the average below T2
+        # even when the runner closed exactly at T2 — which is why /stats
+        # showed TP2 hit 0/N despite trades clearly reaching their exchange-
+        # attached TP2. Use the most-FAVORABLE individual close FILL instead
+        # (max sell for LONG / min buy for SHORT); if any close reached T2,
+        # that fill did. Falls back to the average when the per-fill lookup
+        # isn't available (paper/backtest, fetch failure).
+        ref_price = close_price
+        try:
+            entry_ms = int(entry_dt.timestamp() * 1000)
+            best = None
+            if hasattr(exchange_adapter, "fetch_best_close_price"):
+                best = exchange_adapter.fetch_best_close_price(
+                    symbol, entry_ms, int(close_ts) if close_ts else None, direction)
+            if best is not None and best > 0:
+                # Most-favorable = furthest in the trade's direction, so take
+                # whichever of avg/best is further along for T-level detection.
+                ref_price = max(ref_price, best) if direction == "LONG" else min(ref_price, best)
+        except Exception as e:
+            self._log_event(f"[RECONCILE] best-close lookup failed (non-fatal): {e}",
+                            level="warning")
+
+        if tp2 and dir_mult * (ref_price - tp2) >= 0 and "T2" not in targets_hit:
+            targets_hit.append("T2")
+        if tp1 and dir_mult * (ref_price - tp1) >= 0 and "T1" not in targets_hit:
+            targets_hit.append("T1")
         closed_at = (
             datetime.datetime.fromtimestamp(close_ts / 1000, tz=datetime.timezone.utc)
             if close_ts else datetime.datetime.now(datetime.timezone.utc)

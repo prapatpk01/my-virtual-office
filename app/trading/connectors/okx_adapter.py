@@ -424,6 +424,45 @@ class OKXAdapter(BaseConnector):
         trades.sort(key=lambda t: t["close_ts"])
         return trades
 
+    def fetch_best_close_price(
+        self,
+        symbol: str,
+        since_ms: int,
+        until_ms: Optional[int],
+        direction: str,
+    ) -> Optional[float]:
+        """Most-FAVORABLE closing fill price for a position that lived in the
+        [since_ms, until_ms] window — the MAX sell price for a LONG, the MIN
+        buy price for a SHORT. This is what tells whether the runner actually
+        reached T2: a position's average close price (OKX closeAvgPx) can't,
+        because the larger T1 partial (60%) drags the average below T2 even
+        when the 40% runner closed exactly at T2. Bounding by the position's
+        own open/close timestamps isolates THIS position's closes from any
+        earlier/later trade on the same symbol.
+        Returns None on paper mode, fetch failure, or no matching fills — the
+        caller then falls back to the average close price."""
+        if self.paper:
+            return None
+        try:
+            fills = self._call(
+                self._ex.fetch_my_trades, symbol, since_ms, 100, {},
+                label=f"fetch_my_trades({symbol})",
+            )
+        except Exception as e:
+            logger.warning("[OKX] fetch_best_close_price(%s) failed: %s", symbol, e)
+            return None
+        close_side = "sell" if direction == "LONG" else "buy"
+        hi = (until_ms + 5_000) if until_ms else None
+        prices = [
+            float(f["price"])
+            for f in (fills or [])
+            if f.get("side") == close_side and f.get("price")
+            and (hi is None or float(f.get("timestamp") or 0) <= hi)
+        ]
+        if not prices:
+            return None
+        return max(prices) if direction == "LONG" else min(prices)
+
     def cancel_all_open_orders_sync(self, symbol: Optional[str] = None) -> None:
         sym = symbol or self.symbol
         orders = self._call(self._ex.fetch_open_orders, sym, label="fetch_open_orders_sync")
