@@ -203,7 +203,8 @@ class Bot:
             return
         if self.open_position_count() >= self.cfg.max_positions:
             return
-        sig = S.entry_signal(h1, S.trend_direction(h4))
+        sig = S.entry_signal(h1, S.trend_direction(h4),
+                             min_body_atr=self.cfg.min_body_atr)
         if sig is None:
             return
 

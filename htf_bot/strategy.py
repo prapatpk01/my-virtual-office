@@ -75,8 +75,15 @@ def trend_direction(df_4h: pd.DataFrame, fast: int = 20, slow: int = 50) -> int:
     return 1 if f > s else -1
 
 
-def entry_signal(df_1h: pd.DataFrame, trend: int) -> Optional[Signal]:
-    """Signal on the LAST CLOSED 1H bar, or None."""
+def entry_signal(df_1h: pd.DataFrame, trend: int,
+                 min_body_atr: float = 0.5) -> Optional[Signal]:
+    """Signal on the LAST CLOSED 1H bar, or None.
+
+    min_body_atr: the reclaim bar's BODY must be at least this many ATRs —
+    a decisive close-back, not a doji graze. Swept 0.0→1.2 on the 6-month
+    set: monotone improvement into a 0.5–1.0 plateau (portfolio +22R at 0.0
+    → +57R at 0.5, 7/8 symbols positive, drawdowns lower). 0.5 is the
+    middle of the plateau, not the tail spike, to avoid curve-fitting."""
     if trend == 0 or len(df_1h) < 60:
         return None
     e20 = ema(df_1h["close"], 20)
@@ -85,6 +92,8 @@ def entry_signal(df_1h: pd.DataFrame, trend: int) -> Optional[Signal]:
     if not np.isfinite(e) or not np.isfinite(av) or av <= 0:
         return None
     bar = df_1h.iloc[-1]
+    if abs(float(bar["close"]) - float(bar["open"])) < min_body_atr * av:
+        return None
     if trend == 1 and bar["low"] <= e and bar["close"] > e:
         return Signal(LONG, df_1h.index[-1], e, av)
     if trend == -1 and bar["high"] >= e and bar["close"] < e:

@@ -69,6 +69,10 @@ class Config:
     sl_buf_atr: float = 0.25
     min_sl_atr: float = 1.0
     min_sl_pct: float = 0.008
+    # Reclaim-bar body confirm (user-proposed, then swept 0.0-1.2 ATR):
+    # portfolio +22R -> +57R at 0.5, 7/8 symbols positive. MIN_BODY_ATR
+    # overrides.
+    min_body_atr: float = field(default_factory=lambda: _env_float("MIN_BODY_ATR", 0.5))
 
     poll_interval_sec: int = 30
     status_log_interval_sec: int = 300
