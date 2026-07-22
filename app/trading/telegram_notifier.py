@@ -297,6 +297,23 @@ class TelegramNotifier:
             except Exception as e:
                 logger.warning("[stats] OKX history fetch failed: %s", e)
 
+        # ── Calendar-month window ─────────────────────────────────────────────
+        # OVERALL resets on the 1st of each month (counts only this month's
+        # trades) + shows last month's total PnL for comparison. BY SYMBOL
+        # stays all-time (never resets) — it answers "how has this symbol
+        # done overall", a different question from "how's this month going".
+        _now_utc = datetime.datetime.now(datetime.timezone.utc)
+        _month_start = _now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        _month_start_ms = int(_month_start.timestamp() * 1000)
+        _month_start_iso = _month_start.isoformat()
+        if _month_start.month == 1:
+            _prev_month_start = _month_start.replace(year=_month_start.year - 1, month=12)
+        else:
+            _prev_month_start = _month_start.replace(month=_month_start.month - 1)
+        _prev_month_start_ms = int(_prev_month_start.timestamp() * 1000)
+        _prev_month_start_iso = _prev_month_start.isoformat()
+        _prev_month_label = _prev_month_start.strftime("%b %Y")
+
         lines = ["📊 Adaptive Bot Stats", ""]
         lines.append(f"💰 Balance: ${balance:,.2f}")
         if open_lines:
@@ -305,34 +322,42 @@ class TelegramNotifier:
             lines.append("📌 No open positions")
 
         if okx_trades is not None:
-            # ── OKX-sourced numbers: Trades/Win-rate/PnL always match what
-            # OKX itself reports (realizedPnl is already net of trading +
-            # funding fee) — no local bookkeeping involved.
-            total_trades = len(okx_trades)
-            total_wins   = sum(1 for t in okx_trades if t["pnl"] > 0)
+            month_trades = [t for t in okx_trades if t["close_ts"] >= _month_start_ms]
+            prev_month_pnl = sum(
+                t["pnl"] for t in okx_trades
+                if _prev_month_start_ms <= t["close_ts"] < _month_start_ms
+            )
+
+            # ── OKX-sourced numbers, THIS MONTH ONLY: Trades/Win-rate/PnL
+            # always match what OKX itself reports (realizedPnl is already
+            # net of trading + funding fee) — no local bookkeeping involved.
+            total_trades = len(month_trades)
+            total_wins   = sum(1 for t in month_trades if t["pnl"] > 0)
             total_losses = total_trades - total_wins
-            total_pnl    = sum(t["pnl"] for t in okx_trades)
+            total_pnl    = sum(t["pnl"] for t in month_trades)
             overall_wr   = total_wins / total_trades * 100 if total_trades else 0.0
 
-            # n_all (local trade_journal count) can be SMALLER than
-            # total_trades (OKX's real count) — e.g. a position closed by
-            # the exchange's own attached TP2/SL order while the bot was
-            # offline/restarting never got locally logged (reconcile now
-            # backfills this going forward — see
+            # n_all (local trade_journal count, also month-scoped) can be
+            # SMALLER than total_trades (OKX's real count) — e.g. a position
+            # closed by the exchange's own attached TP2/SL order while the
+            # bot was offline/restarting never got locally logged (reconcile
+            # now backfills this going forward — see
             # TradingBot._backfill_reconciled_trade — but trades that closed
             # before that fix existed stay permanently untracked; there's no
             # stored SL/TP to recover them from). Always denominate against
             # total_trades (not n_all) so this line's numbers actually add up
             # to the "Trades" count above instead of silently using a
             # smaller, different total that looks complete but isn't.
-            n_all = len(all_trades)
-            tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
-            tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
-            sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
+            month_local = [tr for tr in all_trades if (tr.get("closed_at") or "") >= _month_start_iso]
+            n_all = len(month_local)
+            tp1_n = sum(1 for tr in month_local if "T1" in (tr.get("targets_hit") or []))
+            tp2_n = sum(1 for tr in month_local if "T2" in (tr.get("targets_hit") or []))
+            sl_only_n = sum(1 for tr in month_local if not (tr.get("targets_hit") or []))
             untracked_n = max(total_trades - n_all, 0)
 
-            # ── SECTION 1: overall win rate + TP1/TP2/SL breakdown + PnL ─────
-            lines += ["", DIVIDER, "OVERALL (OKX)", DIVIDER]
+            # ── SECTION 1: overall win rate + TP1/TP2/SL breakdown + PnL,
+            # this calendar month only (resets on the 1st) ───────────────────
+            lines += ["", DIVIDER, f"OVERALL (OKX) — {_now_utc.strftime('%b %Y')}", DIVIDER]
             lines.append(f"Trades   : {total_trades}  ({total_wins}W / {total_losses}L)")
             lines.append(f"Win rate : {overall_wr:.0f}%")
             if total_trades:
@@ -347,8 +372,10 @@ class TelegramNotifier:
                         "(closed while bot was offline — target unknown)"
                     )
             lines.append(f"Net PnL  : ${total_pnl:+,.2f}  (post-fee, from OKX)")
+            lines.append(f"{_prev_month_label} PnL : ${prev_month_pnl:+,.2f}")
 
-            # ── SECTION 2: per-symbol trade count + win rate ─────────────────
+            # ── SECTION 2: per-symbol trade count + win rate — ALL-TIME,
+            # never resets monthly (unlike OVERALL above) ────────────────────
             per_symbol: dict = {}
             for t in okx_trades:
                 row = per_symbol.setdefault(t["symbol"], {"n": 0, "wins": 0, "pnl": 0.0})
@@ -383,16 +410,21 @@ class TelegramNotifier:
         else:
             # ── Fallback: OKX history unavailable — use local trade_journal ──
             lines.append("⚠️ OKX history unavailable — showing bot-tracked data")
-            n_all = len(all_trades)
-            total_wins = sum(1 for tr in all_trades if tr.get("win_loss") == "WIN")
+            month_local = [tr for tr in all_trades if (tr.get("closed_at") or "") >= _month_start_iso]
+            prev_month_pnl = sum(
+                tr.get("pnl", 0.0) for tr in all_trades
+                if _prev_month_start_iso <= (tr.get("closed_at") or "") < _month_start_iso
+            )
+            n_all = len(month_local)
+            total_wins = sum(1 for tr in month_local if tr.get("win_loss") == "WIN")
             total_trades = n_all
-            total_pnl = sum(tr.get("pnl", 0.0) for tr in all_trades)
+            total_pnl = sum(tr.get("pnl", 0.0) for tr in month_local)
             overall_wr = total_wins / total_trades * 100 if total_trades else 0.0
-            tp1_n = sum(1 for tr in all_trades if "T1" in (tr.get("targets_hit") or []))
-            tp2_n = sum(1 for tr in all_trades if "T2" in (tr.get("targets_hit") or []))
-            sl_only_n = sum(1 for tr in all_trades if not (tr.get("targets_hit") or []))
+            tp1_n = sum(1 for tr in month_local if "T1" in (tr.get("targets_hit") or []))
+            tp2_n = sum(1 for tr in month_local if "T2" in (tr.get("targets_hit") or []))
+            sl_only_n = sum(1 for tr in month_local if not (tr.get("targets_hit") or []))
 
-            lines += ["", DIVIDER, "OVERALL", DIVIDER]
+            lines += ["", DIVIDER, f"OVERALL — {_now_utc.strftime('%b %Y')}", DIVIDER]
             lines.append(f"Trades   : {total_trades}  ({total_wins}W / {total_trades - total_wins}L)")
             lines.append(f"Win rate : {overall_wr:.0f}%")
             if n_all:
@@ -402,6 +434,7 @@ class TelegramNotifier:
                     f"SL only : {sl_only_n}/{n_all} ({sl_only_n/n_all*100:.0f}%)"
                 )
             lines.append(f"Net PnL  : ${total_pnl:+,.2f}")
+            lines.append(f"{_prev_month_label} PnL : ${prev_month_pnl:+,.2f}")
 
             lines += ["", DIVIDER, "BY SYMBOL", DIVIDER]
             by_sym: dict = {}
