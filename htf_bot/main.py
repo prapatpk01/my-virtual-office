@@ -30,6 +30,10 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "..", "signal_regime_bot"))
 from exchange_client import ExchangeClient          # noqa: E402
 from telegram_notifier import TelegramNotifier      # noqa: E402
+try:
+    from chart_engine import build_entry_chart       # noqa: E402  (regime bot's)
+except Exception:  # matplotlib/mplfinance missing -> alerts fall back to text
+    build_entry_chart = None
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -245,10 +249,31 @@ class Bot:
         self._save_state()
         logger.info("[%s] OPEN %s @ %.6g sl=%.6g tp=%.6g risk/unit=%.6g",
                     symbol, sig.direction.upper(), fill, sl_f, tp_f, dist_f)
-        await self.tg.send_text(
+        caption = (
             f"🟢 *{_sym(symbol)} {sig.direction.upper()}* @ `{fill:.6g}`\n"
             f"SL `{sl_f:.6g}` (−1R)  TP `{tp_f:.6g}` (+{self.cfg.tp_r:.0f}R)\n"
-            f"Size `{st['pos']['amount']:.6g}` | BE lock at +{self.cfg.be_at_r:.0f}R")
+            f"Size `{st['pos']['amount']:.6g}` | BE lock at +{self.cfg.be_at_r:.0f}R\n"
+            f"4H {'↑LONG' if sig.direction==S.LONG else '↓SHORT'}-trend → 1H EMA20 pullback")
+        # technical chart like the regime bot: 1H candles + EMA20/50 + entry/SL/TP
+        chart = self._build_chart(symbol, h1, sig.direction, fill, sl_f, tp_f)
+        if chart:
+            await self.tg._send_photo(chart, caption)
+        else:
+            await self.tg.send_text(caption)
+
+    def _build_chart(self, symbol, h1, direction, entry, sl, tp):
+        """1H candlestick + EMA20/50 + entry/SL/TP lines (reuses the regime
+        bot's chart engine). Single-target here, so tp1==tp2==tp. Returns a
+        file path or None; never raises."""
+        if build_entry_chart is None:
+            return None
+        try:
+            return build_entry_chart(
+                symbol, h1, direction.upper(), entry, sl, tp, tp,
+                ema_fast_len=20, ema_slow_len=50, tf_label="1H")
+        except Exception as e:
+            logger.warning("[%s] chart build failed: %s", symbol, e)
+            return None
 
     async def _manage(self, symbol: str, st: dict):
         pos = st["pos"]
@@ -372,32 +397,60 @@ class Bot:
                      for symbol in self.cfg.symbols]
             await self.tg.send_text("📡 *Status*\n\n" + "\n".join(lines))
         elif cmd == "/stats":
-            since = self.cfg.stats_since_ms()
-            rows = []
-            if not self.cfg.paper:
-                try:
-                    rows = await self.client.fetch_trade_history(since, self.cfg.symbols)
-                except Exception as e:
-                    logger.warning("[STATS] %s", e)
-            if not rows:
-                rows = [{"symbol": t["symbol"], "pnl": t["pnl"]}
-                        for t in self.trade_log if t["time"] * 1000 >= since]
-            if not rows:
-                await self.tg.send_text(f"_no closed trades since {self.cfg.stats_since_date}_")
-                return
-            wins = [r for r in rows if r["pnl"] > 0]
-            net = sum(r["pnl"] for r in rows)
-            by = {}
-            for r in rows:
-                by.setdefault(r["symbol"], []).append(r["pnl"])
-            lines = [f"Trades `{len(rows)}` | WR `{len(wins)/len(rows)*100:.0f}%` | "
-                     f"Net `{net:+.2f}` USDT (post-fee, OKX)", ""]
-            for s, ps in by.items():
-                w = sum(1 for p in ps if p > 0)
-                lines.append(f"`{_sym(s)}` {len(ps)} tr {w/len(ps)*100:.0f}%WR `{sum(ps):+.2f}`")
-            await self.tg.send_text("📈 *Stats*\n\n" + "\n".join(lines))
+            await self.tg.send_text(await self._build_stats_report())
         else:
             await self.tg.send_text(f"unknown: {cmd} — /help")
+
+    async def _build_stats_report(self) -> str:
+        """Sectioned /stats sourced from OKX closed-position history (post-fee,
+        matches the OKX app), same layout as the regime bot: header (balance/
+        positions) → OVERALL → BY SYMBOL → LAST 5 TRADES."""
+        since = self.cfg.stats_since_ms()
+        rows = []
+        if not self.cfg.paper:
+            try:
+                rows = await self.client.fetch_trade_history(since, self.cfg.symbols)
+            except Exception as e:
+                logger.warning("[STATS] OKX history fetch failed: %s", e)
+        if not rows:
+            rows = [{"symbol": t["symbol"], "pnl": t["pnl"], "close_time_ms": int(t["time"] * 1000)}
+                    for t in self.trade_log if t["time"] * 1000 >= since]
+
+        balance = await self.client.fetch_balance_usdt()
+        open_lines = [f"📌 `{_sym(s)}` {p['side'].upper()} @ `{p['entry']:.6g}`"
+                      for s in self.cfg.symbols if (p := (self.state.get(s) or {}).get("pos"))]
+        header = (f"💰 Balance: `${balance:.2f}`\n"
+                  + ("\n".join(open_lines) if open_lines else "📌 No open positions"))
+        if not rows:
+            return header + f"\n\n_no closed trades since {self.cfg.stats_since_date}_"
+
+        sep = "――――――――――――――――――"
+        wins = [r for r in rows if r["pnl"] > 0]
+        total = len(rows)
+        net = sum(r["pnl"] for r in rows)
+        lines = [header, "", sep, "*OVERALL (OKX)*", sep,
+                 f"Trades : `{total}`  (`{len(wins)}W` / `{total - len(wins)}L`)",
+                 f"Win rate : `{len(wins) / total * 100:.0f}%`",
+                 f"Net PnL : `{net:+.2f}` USDT (post-fee, from OKX)",
+                 "", sep, "*BY SYMBOL*", sep]
+        by = {}
+        for r in rows:
+            by.setdefault(r["symbol"], []).append(r["pnl"])
+        for s in self.cfg.symbols:
+            ps = by.get(s, [])
+            if not ps:
+                lines.append(f"`{_sym(s)}`   0 trades")
+                continue
+            w = sum(1 for p in ps if p > 0)
+            lines.append(f"`{_sym(s)}`   {len(ps)} tr  {w / len(ps) * 100:.0f}%WR  `{sum(ps):+.2f}`")
+        lines += ["", sep, "*LAST 5 TRADES*", sep]
+        now = time.time()
+        for i, r in enumerate(sorted(rows, key=lambda x: -x.get("close_time_ms", 0))[:5], 1):
+            age = now - r.get("close_time_ms", now * 1000) / 1000
+            age_lbl = f"{age / 3600:.1f}h ago" if age < 86400 else f"{age / 86400:.1f}d ago"
+            e = "✅" if r["pnl"] > 0 else "❌"
+            lines.append(f"{i}. {e} `{_sym(r['symbol'])}` `{r['pnl']:+.2f}` — {age_lbl}")
+        return "\n".join(lines)
 
 
 async def _main():
