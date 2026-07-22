@@ -120,6 +120,24 @@ class BinanceConnector(BaseConnector):
     # Orders
     # ------------------------------------------------------------------
 
+    def _ct_size(self, symbol: str) -> float:
+        """Contract size (ctVal) for a market — how many base-ccy units one
+        contract is worth. 1.0 when unknown (base==contracts)."""
+        try:
+            return float(self._exchange.market(symbol).get("contractSize") or 1) or 1.0
+        except Exception:
+            return 1.0
+
+    def _to_contracts(self, symbol: str, base_amount: float) -> float:
+        """Convert a base-currency size into exchange contracts, rounded to lot
+        precision (OKX order/algo sizes are in contracts)."""
+        ct = self._ct_size(symbol)
+        contracts = base_amount / ct if ct else base_amount
+        try:
+            return float(self._exchange.amount_to_precision(symbol, contracts))
+        except Exception:
+            return contracts
+
     async def create_order(
         self,
         symbol: str,
@@ -140,7 +158,16 @@ class BinanceConnector(BaseConnector):
         if pos_side and self._hedge_mode:
             kwargs["params"] = {"posSide": pos_side}
 
-        raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
+        # OKX swap/futures orders take the size in CONTRACTS, not base currency.
+        # Convert base -> contracts with the market's contractSize (ctVal): SOL
+        # has ctVal=1 (base==contracts, no-op) but e.g. HYPE has ctVal=0.1, so a
+        # 6-HYPE order is 60 contracts — sending the base amount directly filled
+        # 10x too small. Fills come back in contracts and are converted back to
+        # base below so the rest of the bot keeps accounting in base units.
+        ct_size = self._ct_size(symbol)
+        send_amount = self._to_contracts(symbol, amount)
+
+        raw = await self._exchange.create_order(symbol, order_type, side, send_amount, **kwargs)
         order_id = str(raw.get("id", uuid.uuid4()))
 
         # Post-fill data — the create_order response on OKX carries little
@@ -186,7 +213,7 @@ class BinanceConnector(BaseConnector):
             side=side,
             amount=amount,
             price=avg_px or raw.get("price") or price or 0.0,
-            filled=fill_sz,
+            filled=(fill_sz or 0.0) * ct_size,   # contracts -> base units
             status=status,
             fee=fee_cost,
             realized_pnl=realized_pnl,
@@ -335,7 +362,7 @@ class BinanceConnector(BaseConnector):
         if sl:
             try:
                 await self._exchange.create_order(
-                    symbol, "market", close_side, amount,
+                    symbol, "market", close_side, self._to_contracts(symbol, amount),
                     params={**params_base, "stopLossPrice": sl},
                 )
                 logger.info("[TPSL] SL set on %s %s @ %.6g (sz %.6g)", symbol, pos_side, sl, amount)
@@ -345,7 +372,7 @@ class BinanceConnector(BaseConnector):
         if tp:
             try:
                 await self._exchange.create_order(
-                    symbol, "market", close_side, amount,
+                    symbol, "market", close_side, self._to_contracts(symbol, amount),
                     params={**params_base, "takeProfitPrice": tp},
                 )
                 logger.info("[TPSL] TP set on %s %s @ %.6g (sz %.6g)", symbol, pos_side, tp, amount)
@@ -409,7 +436,7 @@ class BinanceConnector(BaseConnector):
             out.append({
                 "symbol": p.get("symbol"),
                 "side": side,
-                "amount": abs(float(contracts)),
+                "amount": abs(float(contracts)) * self._ct_size(p.get("symbol")),  # contracts -> base
                 "entry_price": float(entry_price),
                 "mark_price": _f("markPrice", "markPx"),
                 "unrealized_pnl": _f("unrealizedPnl", "upl"),
