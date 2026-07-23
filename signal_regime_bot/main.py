@@ -668,11 +668,14 @@ class Bot:
                     f"EMA8/13={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
                     if sig.entry is not None else "`-`"
                 )
+                why = ""
+                if pos is None and sig.blocked_layer:
+                    why = f"\n  ⛔ {sig.blocked_layer}: `{(getattr(sig,'reason','') or '')[:120]}`"
                 lines.append(
                     f"`{sym}` {pos_label}\n"
                     f"  regime `{sig.regime.label}`\n"
                     f"  bias {bias_str}\n"
-                    f"  entry {entry_str} dir `{sig.direction}`{cd_lb}")
+                    f"  entry {entry_str} dir `{sig.direction}`{cd_lb}{why}")
             await self.telegram.send_text("📡 *Status*\n\n" + "\n".join(lines))
         else:
             await self.telegram.send_text(f"unknown command: {cmd} — try /help")
@@ -839,7 +842,14 @@ class Bot:
                 f"EMA8/13={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
                 if sig.entry is not None else "-"
             )
-            blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
+            # Surface WHY a flat symbol isn't triggering — the blocking layer's
+            # own reason (bias.reason / entry.reason, carried on sig.reason). The
+            # v3.0 upload had dropped this; without it the log can't answer
+            # "why no trades?". Only shown when blocked (i.e. no open position).
+            blk = ""
+            if sig.blocked_layer:
+                why = (getattr(sig, "reason", "") or "")[:150]
+                blk = f" blocked={sig.blocked_layer}" + (f" why={why}" if why else "")
             logger.info(
                 "  %-16s %-24s regime=%-20s bias=%-40s entry=%-5s dir=%s%s%s",
                 symbol, pos_label, sig.regime.label, bias_label, entry_label,
