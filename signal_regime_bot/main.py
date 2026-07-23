@@ -102,11 +102,75 @@ class Bot:
         self._cooldown_alert_sent = False
         self._last_status_log_ts = 0.0
         self._last_reconcile_ts = 0.0         # periodic untracked-position safety net
-        self._trade_log: list[dict] = []      # closed trades (for /stats, /trades)
+        self._trade_log: list[dict] = []      # closed trades (for /trades, live view)
+        # Persistent close-journal — one line per closed trade with the exit
+        # bucket (TP/BE/SL) the bot observed. Survives restarts and is the ONLY
+        # source of the TP/BE/SL breakdown (OKX has no "which target" concept).
+        # Trade COUNT / WR / PnL always come from OKX, never from here.
+        # Same format/role as the HTF bot's journal so /stats is unified.
+        self._journal_path = os.path.join(self.cfg.state_dir, "trade_journal.jsonl")
+        self.journal: list[dict] = self._load_journal()
+        self._journaled_close_ms = {(e["symbol"], int(e["close_ms"] // 60000))
+                                    for e in self.journal}   # dedup key: symbol+minute
         self._stats_reset_ms = _load_stats_reset_ms(self.cfg.state_dir)   # /restats cursor override
         self._cmd_task = None                 # Telegram command polling task
         self._tg_offset = 0
         self._running = False
+
+    # ── close journal (exit-type breakdown source) ───────────────────────────
+
+    def _load_journal(self) -> list[dict]:
+        out: list[dict] = []
+        try:
+            with open(self._journal_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        out.append(json.loads(line))
+        except (FileNotFoundError, OSError):
+            pass
+        except json.JSONDecodeError:
+            logger.warning("[JOURNAL] corrupt line(s) skipped")
+        return out
+
+    def _journal_add(self, symbol: str, side: str, pnl: float, exit_type: str,
+                     reason: str, close_ms: int) -> None:
+        """Append one closed trade. Deduped by (symbol, close-minute) so a
+        restart-time backfill can't double-count a trade already journaled.
+        `reason` keeps the raw event (TP2_HIT / EMA_CROSS_REVERSAL / …) so the
+        collapsed TP/BE/SL bucket can be re-derived or expanded later."""
+        key = (symbol, int(close_ms // 60000))
+        if key in self._journaled_close_ms:
+            return
+        entry = {"close_ms": int(close_ms), "symbol": symbol, "side": side,
+                 "pnl": round(float(pnl), 4), "exit_type": exit_type, "reason": reason}
+        try:
+            os.makedirs(self.cfg.state_dir, exist_ok=True)
+            with open(self._journal_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            logger.warning("[JOURNAL] write failed: %s", e)
+        self.journal.append(entry)
+        self._journaled_close_ms.add(key)
+
+    @staticmethod
+    def _bucket_for_event(ev: str, pnl: float) -> str:
+        """Collapse this 2-TP bot's exit reasons into the HTF bot's three
+        buckets (TP / BE / SL) so /stats reads identically across bots. The raw
+        reason is still journaled, so TP1/TP2 can be split back out later."""
+        if ev == "TP2_HIT":
+            return "TP"
+        if ev == "BE_HIT":
+            return "BE"
+        if ev == "SL_HIT":
+            return "SL"
+        # TP1_THEN_EXTERNAL_CLOSE, EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA,
+        # SPIKE_GUARD — a target-or-stop by outcome: sign of realized PnL.
+        if pnl > 1e-8:
+            return "TP"
+        if pnl < -1e-8:
+            return "SL"
+        return "BE"
 
     async def start(self):
         problems = self.cfg.validate_live()
@@ -448,17 +512,24 @@ class Bot:
             self._symbol_cooldown_until[symbol] = time.time() + cooldown_sec
             logger.info("[%s] closed (%s) — cooldown %d min before next entry",
                        symbol, ev, cooldown_min)
-            # Trade log for /stats and /trades. A trade is a win only when its
-            # final post-fee PnL is positive; TP1 is tracked separately.
+            # Trade log for /trades and the live view. A trade is a win only
+            # when its final post-fee PnL is positive; TP1 is tracked separately.
+            pnl = float(event.get("trade_pnl", event.get("pnl", 0.0)) or 0.0)
+            side = event.get("side", "")
             self._trade_log.append({
                 "time": time.time(), "symbol": symbol,
-                "side": event.get("side", ""), "reason": ev,
+                "side": side, "reason": ev,
                 "entry": float(event.get("entry_price", 0.0) or 0.0),
                 "exit": float(event.get("price", 0.0) or 0.0),
                 "tp1_hit": bool(event.get("tp1_hit", False)),
-                "pnl": float(event.get("trade_pnl", event.get("pnl", 0.0)) or 0.0),
+                "pnl": pnl,
             })
             del self._trade_log[:-200]   # keep the last 200 trades
+            # Persist the exit bucket for the /stats breakdown (restart-safe).
+            # The event fires the moment the close is detected, so this close_ms
+            # is within the 3-min match tolerance of OKX's own close time.
+            self._journal_add(symbol, side, pnl, self._bucket_for_event(ev, pnl),
+                              ev, int(time.time() * 1000))
 
     async def _check_global_alerts(self):
         now = time.time()
@@ -557,7 +628,9 @@ class Bot:
                     f"{t['reason']}  pnl `{t['pnl']:+.2f}`  {ts}")
             await self.telegram.send_text("🧾 *Last 5 Trades*\n\n" + "\n".join(lines))
         elif cmd == "/stats":
-            await self.telegram.send_text(await self._build_stats_report())
+            # plain text (no markdown) — separators + emoji, so symbols/numbers
+            # never get mangled by Telegram's Markdown parser. Same as HTF.
+            await self.telegram._send_message(await self._build_stats_report(), _markdown=False)
         elif cmd == "/restats":
             now_ms = int(time.time() * 1000)
             self._stats_reset_ms = now_ms
@@ -598,108 +671,130 @@ class Bot:
         else:
             await self.telegram.send_text(f"unknown command: {cmd} — try /help")
 
-    def _merge_trade_history(self, okx_rows: list[dict]) -> list[dict]:
-        """Merge authoritative OKX PnL with local reason metadata one-to-one."""
-        live_by_symbol: dict[str, list[dict]] = {}
-        for trade in self._trade_log:
-            live_by_symbol.setdefault(trade["symbol"], []).append(trade)
-        used_ids: set[int] = set()
-        merged: list[dict] = []
-        for row in sorted(okx_rows, key=lambda x: x["close_time_ms"]):
-            close_sec = row["close_time_ms"] / 1000.0
-            candidates = []
-            for trade in live_by_symbol.get(row["symbol"], []):
-                if id(trade) in used_ids:
+    @staticmethod
+    def _month_bounds(now_ms: int) -> tuple:
+        """(this_month_start_ms, prev_month_start_ms, prev_month_label) in UTC."""
+        import datetime as dt
+        now = dt.datetime.fromtimestamp(now_ms / 1000, tz=dt.timezone.utc)
+        m0 = dt.datetime(now.year, now.month, 1, tzinfo=dt.timezone.utc)
+        py, pm = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
+        p0 = dt.datetime(py, pm, 1, tzinfo=dt.timezone.utc)
+        return int(m0.timestamp() * 1000), int(p0.timestamp() * 1000), p0.strftime("%b")
+
+    def _match_exit_types(self, okx_rows: list) -> dict:
+        """One-to-one match OKX-closed trades to journal entries by nearest
+        close time (same symbol, within 3 min), each journal entry consumed at
+        most once — so two same-symbol trades minutes apart can't both borrow
+        one journal row. Returns {id(row): exit_type} for matched rows."""
+        pool = list(self.journal)
+        used = [False] * len(pool)
+        out = {}
+        for row in sorted(okx_rows, key=lambda r: r.get("close_time_ms", 0)):
+            cms = row.get("close_time_ms", 0)
+            best_j, best_d = -1, 3 * 60_000 + 1
+            for j, e in enumerate(pool):
+                if used[j] or e["symbol"] != row["symbol"]:
                     continue
-                delta = abs(trade["time"] - close_sec)
-                if delta <= 300:
-                    candidates.append((delta, trade))
-            best = min(candidates, key=lambda x: x[0])[1] if candidates else None
-            if best is not None:
-                used_ids.add(id(best))
-                merged.append({
-                    "time": close_sec, "symbol": row["symbol"], "side": best["side"],
-                    "reason": best["reason"], "tp1_hit": best["tp1_hit"], "pnl": row["pnl"],
-                })
-            else:
-                merged.append({
-                    "time": close_sec, "symbol": row["symbol"], "side": row["side"],
-                    "reason": "RECONCILED", "tp1_hit": False, "pnl": row["pnl"],
-                })
-        return merged
+                d = abs(int(e["close_ms"]) - cms)
+                if d < best_d:
+                    best_d, best_j = d, j
+            if best_j >= 0:
+                used[best_j] = True
+                out[id(row)] = pool[best_j]["exit_type"]
+        return out
 
     async def _build_stats_report(self) -> str:
-        """/stats — sourced from OKX's own closed-position history (post-fee,
-        exact match to the OKX app) since `stats_since_date`, sectioned per
-        the requested layout: header, OVERALL, BY SYMBOL, LAST 5 TRADES.
-        Paper mode has no real OKX ledger to query, so it falls back to this
-        process's in-memory log (still filtered to the same since-date)."""
-        since_ms = (self._stats_reset_ms if self._stats_reset_ms is not None
-                   else self.cfg.stats_since_ms())
-        if self.cfg.paper:
-            trades = [t for t in self._trade_log if t["time"] * 1000 >= since_ms]
-        else:
+        """Three sections, plain text — identical layout to the HTF bot:
+        OVERALL (current UTC month, resets on the 1st) with TP/BE/SL/Untracked
+        broken out — counts/WR/PnL from OKX, breakdown from the local journal,
+        denominators = OKX total (never the journal's); BY SYMBOL (all-time);
+        LAST 5. Falls back to the journal with a warning if OKX is unreachable.
+        The regime bot is a 2-TP system, so TP here means "hit a profit target"
+        (TP2, or a net-positive TP1-then-exit); the raw reason stays journaled."""
+        since = (self._stats_reset_ms if self._stats_reset_ms is not None
+                 else self.cfg.stats_since_ms())
+        now_ms = int(time.time() * 1000)
+        m0, p0, prev_lbl = self._month_bounds(now_ms)
+
+        okx_ok = True
+        rows = []
+        if not self.cfg.paper:
             try:
-                okx_rows = await self.client.fetch_trade_history(since_ms, self.cfg.symbols)
-                trades = self._merge_trade_history(okx_rows)
+                rows = await self.client.fetch_trade_history(since, self.cfg.symbols)
             except Exception as e:
-                logger.warning("[STATS] OKX history fetch failed, using local log: %s", e)
-                trades = [t for t in self._trade_log if t["time"] * 1000 >= since_ms]
+                logger.warning("[STATS] OKX history fetch failed: %s", e)
+                okx_ok = False
+        if not rows and (self.cfg.paper or not okx_ok):
+            rows = [{"symbol": e["symbol"], "side": e.get("side", ""), "pnl": e["pnl"],
+                     "close_time_ms": e["close_ms"], "_journal": True}
+                    for e in self.journal if e["close_ms"] >= since]
 
         balance = await self.client.fetch_balance_usdt()
-        open_lines = [f"`{_sym(sym)}` {pos.side.upper()} @ `{pos.entry_price:.6g}`"
+        open_lines = [f"📌 {_sym(sym)} {pos.side.upper()} @ {pos.entry_price:.6g}"
                       for sym in self.cfg.symbols if (pos := self.positions.get(sym)) is not None]
-        header = f"💰 Balance: `${balance:.2f}`\n"
-        header += ("\n".join(f"📌 {ln}" for ln in open_lines) if open_lines
-                  else "📌 No open positions")
-
-        if not trades:
-            since_lbl = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(since_ms / 1000))
-            return header + f"\n\n_no closed trades since {since_lbl}_"
-
+        header = (f"💰 Balance: ${balance:.2f}\n"
+                  + ("\n".join(open_lines) if open_lines else "📌 No open positions"))
+        if not okx_ok:
+            header = "⚠️ OKX history unavailable — showing local journal\n" + header
         sep = "――――――――――――――――――"
-        wins = [t for t in trades if t["pnl"] > 0]
-        losses_list = [t for t in trades if t["pnl"] < 0]
-        breakevens = [t for t in trades if abs(t["pnl"]) <= 1e-8]
-        total = len(trades)
-        tp1 = [t for t in trades if t["tp1_hit"]]
-        tp2 = [t for t in trades if t["reason"] == "TP2_HIT"]
-        sl_only = [t for t in trades if not t["tp1_hit"] and t["pnl"] < 0]
-        net = sum(t["pnl"] for t in trades)
-        gross_profit = sum(t["pnl"] for t in wins)
-        gross_loss = abs(sum(t["pnl"] for t in losses_list))
-        pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        if not rows:
+            since_lbl = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(since / 1000))
+            return header + f"\n\n(no closed trades since {since_lbl})"
 
-        lines = [header, "", sep, "*OVERALL (OKX)*", sep,
-            f"Trades : `{total}`  (`{len(wins)}W` / `{len(losses_list)}L` / `{len(breakevens)}BE`)",
-            f"Win rate : `{len(wins)/total*100:.0f}%`",
-            f"Profit factor : `{'∞' if pf == float('inf') else f'{pf:.2f}'}`",
-            f"TP1 hit : `{len(tp1)}/{total}` (`{len(tp1)/total*100:.0f}%`)   "
-            f"TP2 hit : `{len(tp2)}/{total}` (`{len(tp2)/total*100:.0f}%`)",
-            f"SL only : `{len(sl_only)}/{total}` (`{len(sl_only)/total*100:.0f}%`)",
-            f"Net PnL : `{net:+.2f}` USDT (post-fee, from OKX)",
-            "", sep, "*BY SYMBOL*", sep]
+        # ── ช่อง 1: OVERALL — current month only ──
+        month = [r for r in rows if r.get("close_time_ms", 0) >= m0]
+        total = len(month)
+        wins = sum(1 for r in month if r["pnl"] > 0)
+        net = sum(r["pnl"] for r in month)
+        prev_net = sum(r["pnl"] for r in rows if p0 <= r.get("close_time_ms", 0) < m0)
+        cnt = {"TP": 0, "BE": 0, "SL": 0}
+        matched = self._match_exit_types([r for r in month if not r.get("_journal")])
+        tracked = 0
+        for r in month:
+            et = matched.get(id(r))
+            if et in cnt:
+                cnt[et] += 1
+                tracked += 1
+        untracked = total - tracked
 
-        by_sym: dict[str, list[dict]] = {}
-        for t in trades:
-            by_sym.setdefault(t["symbol"], []).append(t)
-        for sym in self.cfg.symbols:
-            ts = by_sym.get(sym, [])
-            if not ts:
-                lines.append(f"`{_sym(sym)}`   0 trades")
+        def pct(n):
+            return f"{n}/{total} ({n / total * 100:.0f}%)" if total else "0/0"
+        lines = [header, "", sep, "OVERALL (this month, OKX)", sep,
+                 f"Trades   : {total}  ({wins}W / {total - wins}L)",
+                 f"Win rate : {wins / total * 100:.0f}%" if total else "Win rate : —",
+                 f"TP hit   : {pct(cnt['TP'])}   BE : {pct(cnt['BE'])}   SL : {pct(cnt['SL'])}"]
+        if untracked:
+            lines.append(f"Untracked: {untracked}/{total} (closed while bot offline)")
+        lines.append(f"Net PnL  : ${net:+.2f}  (post-fee, from OKX)")
+        lines.append(f"{prev_lbl} PnL  : ${prev_net:+.2f}")
+
+        # ── ช่อง 2: BY SYMBOL — all-time ──
+        lines += ["", sep, "BY SYMBOL (all-time)", sep]
+        by = {}
+        for r in rows:
+            by.setdefault(r["symbol"], []).append(r["pnl"])
+        for s in self.cfg.symbols:
+            ps = by.get(s, [])
+            if not ps:
+                lines.append(f"{_sym(s):5s} 0 trades")
                 continue
-            w = sum(1 for t in ts if t["pnl"] > 0)
-            lines.append(f"`{_sym(sym)}`   {len(ts)} trades  {w/len(ts)*100:.0f}%WR  "
-                        f"`{sum(t['pnl'] for t in ts):+.2f}`")
+            w = sum(1 for p in ps if p > 0)
+            lines.append(f"{_sym(s):5s} {len(ps)} trades  {w / len(ps) * 100:.0f}%WR  ${sum(ps):+.2f}")
+        allp = [p for ps in by.values() for p in ps]
+        if allp:
+            wa = sum(1 for p in allp if p > 0)
+            lines += ["――――――――",
+                      f"TOTAL {len(allp)} trades  {wa / len(allp) * 100:.0f}%WR  ${sum(allp):+.2f}"]
 
-        lines += ["", sep, "*LAST 5 TRADES*", sep]
+        # ── ช่อง 3: LAST 5 TRADES ──
+        lines += ["", sep, "LAST 5 TRADES", sep]
         now = time.time()
-        for i, t in enumerate(sorted(trades, key=lambda x: -x["time"])[:5], 1):
-            age = now - t["time"]
-            age_lbl = f"{age/3600:.1f}h ago" if age < 86400 else f"{age/86400:.1f}d ago"
-            win = t["pnl"] > 0
-            lines.append(f"{i}. {'✅' if win else '❌'} `{_sym(t['symbol'])}` "
-                        f"{t['side'].upper()} `{t['pnl']:+.2f}` — {age_lbl}")
+        for i, r in enumerate(sorted(rows, key=lambda x: -x.get("close_time_ms", 0))[:5], 1):
+            age = now - r.get("close_time_ms", now_ms) / 1000
+            age_lbl = f"{age / 3600:.1f}h ago" if age < 86400 else f"{age / 86400:.1f}d ago"
+            e = "✅" if r["pnl"] > 0 else "❌"
+            side = (r.get("side") or "").upper()
+            lines.append(f"{i}. {e} {_sym(r['symbol'])} {side} ${r['pnl']:+.2f} — {age_lbl}")
         return "\n".join(lines)
 
     async def _maybe_log_status(self):
