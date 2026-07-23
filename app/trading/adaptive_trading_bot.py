@@ -99,19 +99,21 @@ REGIME_THRESHOLDS: Dict[str, int] = {
     # [V9.3 ACTIVE] Small relaxation only after all hard quality gates pass.
     # This increases usable setups without turning the score into a loose vote.
     "Trend":      57,
-    "Range":      65,
+    # Conservative Range Edge-Fade: hard location/sweep/reclaim gates run
+    # before this score, so 70 is a final quality bar rather than a loose vote.
+    "Range":      70,
     "Breakout":   56,
     "Reversal":   65,
     "Exhaustion": 68,
 }
 
-# [V9.3 ACTIVE] Entry regime policy.
-# Trend remains the primary high-quality engine. Breakout is admitted with its
-# own score threshold because Trend-only operation caused multi-day silence
-# during market compression. Historically weak Range/Reversal/Exhaustion
-# engines remain classified for diagnostics and position-state drift checks,
-# but cannot open new positions.
-_TRADEABLE_REGIMES: frozenset = frozenset({"Trend", "Breakout"})
+# [V9.4 RANGE ADD-ON] Entry regime policy.
+# Trend and Breakout keep their existing signal paths unchanged. Range is
+# admitted only through the dedicated Conservative Range Edge-Fade engine
+# (_generate_range_signal), which requires a mature range, edge location,
+# liquidity sweep + reclaim, 3/5 confirmation, acceptable structure R:R, and
+# half-risk sizing. Reversal/Exhaustion remain diagnostics-only.
+_TRADEABLE_REGIMES: frozenset = frozenset({"Trend", "Breakout", "Range"})
 
 # Regimes where entries FADE the macro trend (want opposite of L1 direction)
 _COUNTER_REGIMES: frozenset = frozenset({"Reversal", "Exhaustion"})
@@ -667,9 +669,14 @@ class ExpectancyEngine:
 
     def is_blocked(self, regime: str, strategy: str) -> bool:
         lst = self.outcomes.get(self._key(regime, strategy))
-        if not lst or len(lst) < self.MIN_TRADES:
+        # Range is a lower-frequency, regime-transition-sensitive engine, so
+        # demand more evidence and a higher live WR before continuing to risk
+        # capital. This does not alter Trend/Breakout expectancy rules.
+        min_trades = 15 if regime == "Range" else self.MIN_TRADES
+        min_wr = 0.55 if regime == "Range" else self.MIN_WR
+        if not lst or len(lst) < min_trades:
             return False
-        return (sum(lst) / len(lst)) < self.MIN_WR
+        return (sum(lst) / len(lst)) < min_wr
 
     def get_summary(self) -> Dict:
         out = {}
@@ -1062,7 +1069,11 @@ class TradingBot:
                  # This is the single biggest entry blocker (41-55% of all
                  # Trend-regime checks in a 14-day live-config replay), so it's
                  # the main knob for trade frequency vs entry quality.
-                 max_15m_adx_trend: Optional[float] = None):
+                 max_15m_adx_trend: Optional[float] = None,
+                 # [RANGE ADD-ON] Range is intentionally half-risk and has a
+                 # dedicated cooldown that never pauses Trend/Breakout.
+                 range_risk_multiplier: float = 0.50,
+                 range_cooldown_minutes: int = 90):
         self.state: str = "SCANNING"
         self.entry_engine       = entry_engine
         self.enable_early_trend = enable_early_trend
@@ -1074,6 +1085,13 @@ class TradingBot:
         # and its log string) then picks it up automatically.
         if max_15m_adx_trend is not None:
             self.MAX_15M_ADX_TREND = float(max_15m_adx_trend)
+        self.range_risk_multiplier = float(np.clip(range_risk_multiplier, 0.10, 1.00))
+        self.range_cooldown_minutes = max(int(range_cooldown_minutes), 0)
+        # Runner updates this before each tick to enforce a portfolio-wide
+        # MAX_RANGE_POSITIONS without touching Trend/Breakout slots.
+        self.range_entry_allowed: bool = True
+        self.range_cooldown_until: Optional[datetime.datetime] = None
+        self.range_loss_streak: int = 0
         self.mtf_engine         = MTFConfluenceEngine()
         self.adaptive_engine    = AdaptiveEngine()
         self.health_calc        = PositionHealthCalculator()
@@ -1752,6 +1770,290 @@ class TradingBot:
             self._log_event(f"[STRATEGY] {msg}", level="warning")
             self._pending_strategy_alerts.append(f"🧠 Adaptive Strategy activated\n{msg}")
 
+    @staticmethod
+    def _bar_value(bar: Any, key: str, default: float = 0.0) -> float:
+        """Read OHLCV fields from either connector objects or plain dicts."""
+        try:
+            if isinstance(bar, dict):
+                return float(bar.get(key, default))
+            return float(getattr(bar, key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _generate_range_signal(self, direction: str, candle_15m: Dict,
+                               ind_15m: Dict, l1: Dict, l2: Dict) -> Optional[Dict]:
+        """
+        Conservative Range Edge-Fade engine. It is deliberately isolated from
+        the Trend and Breakout paths: those continue through the original
+        StrategyScorer/composite pipeline unchanged.
+
+        Mandatory sequence:
+          mature 24-bar range -> edge 25% -> liquidity sweep -> close reclaim
+          -> 3/5 confirmations -> structure R:R -> score >= 70.
+        """
+        threshold = REGIME_THRESHOLDS["Range"]
+        now = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
+
+        if not self.range_entry_allowed:
+            self._scan_info[direction] = "veto:range portfolio slot full"
+            return None
+
+        if self.range_cooldown_until:
+            try:
+                if now < self.range_cooldown_until:
+                    remain = max(0, int((self.range_cooldown_until - now).total_seconds() / 60))
+                    self._scan_info[direction] = f"veto:range cooldown ({remain}m left)"
+                    return None
+            except TypeError:
+                # State files from old deployments may mix naive/aware times.
+                self.range_cooldown_until = None
+
+        raw = self._raw_candles or {}
+        bars = list(raw.get("15m") or [])
+        lookback = 24
+        if len(bars) < lookback + 2:
+            self._scan_info[direction] = (
+                f"veto:range history {len(bars)}/{lookback + 2} bars")
+            return None
+
+        history = bars[-(lookback + 1):-1]  # define the range before trigger bar
+        prev = bars[-2]
+        atr = max(float(ind_15m.get("atr", 0.0) or 0.0), 1e-9)
+        if atr <= 1e-8:
+            self._scan_info[direction] = "veto:range ATR unavailable"
+            return None
+
+        o = float(candle_15m.get("open", self._bar_value(bars[-1], "open")))
+        h = float(candle_15m.get("high", self._bar_value(bars[-1], "high")))
+        lo_cur = float(candle_15m.get("low", self._bar_value(bars[-1], "low")))
+        close = float(candle_15m.get("close", self._bar_value(bars[-1], "close")))
+        prev_h = self._bar_value(prev, "high")
+        prev_l = self._bar_value(prev, "low")
+
+        range_high = max(self._bar_value(b, "high") for b in history)
+        range_low = min(self._bar_value(b, "low") for b in history)
+        width = range_high - range_low
+        width_atr = width / atr
+        if width <= 0 or not (2.0 <= width_atr <= 6.0):
+            self._scan_info[direction] = (
+                f"veto:range width {width_atr:.2f} ATR (need 2.0-6.0)")
+            return None
+
+        touch_tol = 0.18 * atr
+        upper_touches = sum(
+            1 for b in history
+            if self._bar_value(b, "high") >= range_high - touch_tol)
+        lower_touches = sum(
+            1 for b in history
+            if self._bar_value(b, "low") <= range_low + touch_tol)
+        if upper_touches < 2 or lower_touches < 2:
+            self._scan_info[direction] = (
+                f"veto:range touches U{upper_touches}/L{lower_touches} (need 2/2)")
+            return None
+
+        adx = float(ind_15m.get("adx", 20.0))
+        eff = float(ind_15m.get("eff_ratio", 0.5))
+        atr_exp = float(ind_15m.get("atr_exp", 0.0) or 0.0)
+        if atr_exp <= 0:
+            atr_exp = atr / max(float(ind_15m.get("atr_avg", atr) or atr), 1e-9)
+        volume = float(ind_15m.get("volume", 0.0) or 0.0)
+        vol_avg = max(float(ind_15m.get("vol_avg", volume or 1.0) or 1.0), 1e-9)
+        vol_ratio = volume / vol_avg
+
+        if not (10.0 <= adx <= 20.0):
+            self._scan_info[direction] = f"veto:range ADX {adx:.1f} (need 10-20)"
+            return None
+        if eff > 0.30:
+            self._scan_info[direction] = f"veto:range efficiency {eff:.2f} > 0.30"
+            return None
+        if not (0.75 <= atr_exp <= 1.10):
+            self._scan_info[direction] = (
+                f"veto:range ATR expansion {atr_exp:.2f} (need 0.75-1.10)")
+            return None
+
+        candle_range = max(h - lo_cur, 1e-9)
+        body = abs(close - o)
+        # Transition veto: strong displacement + participation often means the
+        # range is breaking, not rejecting. Never fade that condition.
+        if vol_ratio > 1.40 or (body / atr > 0.90 and vol_ratio > 1.25):
+            self._scan_info[direction] = (
+                f"veto:breakout-transition vol={vol_ratio:.2f} body={body/atr:.2f}ATR")
+            return None
+
+        location = float(np.clip((close - range_low) / max(width, 1e-9), 0.0, 1.0))
+        macro_level = str(l1.get("level", "NEUTRAL"))
+        if direction == "LONG" and macro_level == "STRONG_BEAR":
+            self._scan_info[direction] = "veto:range LONG against STRONG_BEAR 4H"
+            return None
+        if direction == "SHORT" and macro_level == "STRONG_BULL":
+            self._scan_info[direction] = "veto:range SHORT against STRONG_BULL 4H"
+            return None
+
+        if direction == "LONG":
+            sweep_depth = (range_low - lo_cur) / atr
+            swept = 0.02 <= sweep_depth <= 0.45
+            reclaimed = close >= range_low + 0.02 * atr
+            at_edge = location <= 0.25
+            sl_price = lo_cur - 0.15 * atr
+            tp1_price = (range_low + range_high) / 2.0
+            tp2_price = range_high - 0.10 * atr
+        else:
+            sweep_depth = (h - range_high) / atr
+            swept = 0.02 <= sweep_depth <= 0.45
+            reclaimed = close <= range_high - 0.02 * atr
+            at_edge = location >= 0.75
+            sl_price = h + 0.15 * atr
+            tp1_price = (range_low + range_high) / 2.0
+            tp2_price = range_low + 0.10 * atr
+
+        if not swept:
+            self._scan_info[direction] = (
+                f"veto:no liquidity sweep (depth {sweep_depth:.2f} ATR; need 0.02-0.45)")
+            return None
+        if not reclaimed:
+            self._scan_info[direction] = "veto:sweep did not close back inside range"
+            return None
+        if not at_edge:
+            self._scan_info[direction] = (
+                f"veto:range location {location:.0%} (must be outer 25%)")
+            return None
+
+        # 3 of 5 confirmation filter.
+        rsi = float(ind_15m.get("rsi", 50.0))
+        rsi_confirm = (20.0 <= rsi <= 43.0) if direction == "LONG" else (57.0 <= rsi <= 80.0)
+
+        closes = [self._bar_value(b, "close") for b in bars[-50:]]
+        macd_turn = False
+        if len(closes) >= 35:
+            try:
+                _m, _sig, hist = BaseStrategy.macd(closes, 12, 26, 9)
+                if len(hist) >= 2 and not (np.isnan(hist[-1]) or np.isnan(hist[-2])):
+                    macd_turn = hist[-1] > hist[-2] if direction == "LONG" else hist[-1] < hist[-2]
+            except Exception:
+                macd_turn = False
+
+        micro_choch = close > prev_h if direction == "LONG" else close < prev_l
+        close_loc = (close - lo_cur) / candle_range
+        lower_wick = min(o, close) - lo_cur
+        upper_wick = h - max(o, close)
+        if direction == "LONG":
+            rejection = lower_wick >= max(body * 1.20, atr * 0.08) and close_loc >= 0.62
+        else:
+            rejection = upper_wick >= max(body * 1.20, atr * 0.08) and close_loc <= 0.38
+        volume_confirm = vol_ratio >= 1.10
+
+        confirmations = {
+            "RSI": rsi_confirm,
+            "MACD": macd_turn,
+            "CHOCH": micro_choch,
+            "REJECTION": rejection,
+            "VOLUME": volume_confirm,
+        }
+        confirm_count = sum(1 for ok in confirmations.values() if ok)
+        if confirm_count < 3:
+            passed = ",".join(k for k, ok in confirmations.items() if ok) or "none"
+            self._scan_info[direction] = (
+                f"veto:range confirm {confirm_count}/5 (need 3/5; passed={passed})")
+            return None
+
+        risk_dist = abs(close - sl_price)
+        if risk_dist <= 1e-9:
+            self._scan_info[direction] = "veto:range invalid stop distance"
+            return None
+        dir_mult = 1.0 if direction == "LONG" else -1.0
+        rr1 = (tp1_price - close) * dir_mult / risk_dist
+        rr2 = (tp2_price - close) * dir_mult / risk_dist
+        if rr1 < 0.80 or rr2 < 1.10 or rr2 <= rr1:
+            self._scan_info[direction] = (
+                f"veto:range structure room T1={rr1:.2f}R T2={rr2:.2f}R")
+            return None
+
+        strategy_scores = {
+            name: self.strategy_scorer.score(name, direction, ind_15m, l1, l2, "Range")
+            for name in REGIME_STRATEGIES["Range"]
+            if not self.expectancy_engine.is_blocked("Range", name)
+        }
+        best = self.confidence_engine.select_best(strategy_scores)
+        if best is None:
+            self._scan_info[direction] = "strategy_fail: all Range strategies blocked"
+            return None
+        best_strategy, best_score = best
+
+        width_quality = float(np.clip(100.0 - abs(width_atr - 3.5) / 2.5 * 100.0, 0, 100))
+        touch_quality = float(np.clip((upper_touches + lower_touches) / 6.0 * 100.0, 0, 100))
+        adx_quality = float(np.clip(100.0 - abs(adx - 15.0) / 5.0 * 100.0, 0, 100))
+        eff_quality = float(np.clip((0.30 - eff) / 0.22 * 100.0, 0, 100))
+        atr_quality = float(np.clip(100.0 - abs(atr_exp - 0.90) / 0.20 * 100.0, 0, 100))
+        range_quality = float(np.mean([
+            width_quality, touch_quality, adx_quality, eff_quality, atr_quality]))
+
+        sweep_quality = float(np.clip(100.0 - abs(sweep_depth - 0.18) / 0.27 * 100.0, 0, 100))
+        location_quality = ((0.25 - location) / 0.25 * 100.0
+                            if direction == "LONG"
+                            else (location - 0.75) / 0.25 * 100.0)
+        edge_quality = float(np.clip((sweep_quality + location_quality) / 2.0, 0, 100))
+        confirm_quality = confirm_count / 5.0 * 100.0
+        rr1_q = float(np.clip((rr1 - 0.80) / 0.70 * 100.0, 0, 100))
+        rr2_q = float(np.clip((rr2 - 1.10) / 1.20 * 100.0, 0, 100))
+        rr_quality = (rr1_q + rr2_q) / 2.0
+
+        aligned = ((direction == "LONG" and macro_level in ("BULL", "STRONG_BULL")) or
+                   (direction == "SHORT" and macro_level in ("BEAR", "STRONG_BEAR")))
+        if aligned:
+            macro_quality = 100.0 if macro_level.startswith("STRONG") else 85.0
+        elif macro_level == "NEUTRAL":
+            macro_quality = 70.0
+        else:
+            macro_quality = 55.0
+
+        total = (
+            range_quality * 0.20 + edge_quality * 0.20 +
+            confirm_quality * 0.25 + rr_quality * 0.20 +
+            macro_quality * 0.10 + best_score * 0.05
+        )
+        passed_names = ",".join(k for k, ok in confirmations.items() if ok)
+        self._filter_stats["checked"] += 1
+        self._scan_info[direction] = (
+            f"total {total:.0f}/{threshold} regime=Range strat={best_strategy}({best_score:.0f}) "
+            f"edge={edge_quality:.0f} confirm={confirm_count}/5[{passed_names}] "
+            f"T1={rr1:.2f}R T2={rr2:.2f}R"
+            + (" → SIGNAL" if total >= threshold else "")
+        )
+        if total < threshold:
+            self._filter_stats["threshold_fail"] += 1
+            return None
+
+        self._filter_stats["passed"] += 1
+        health = range_quality * 0.40 + confirm_quality * 0.40 + best_score * 0.20
+        confidence = (edge_quality + rr_quality + macro_quality) / 3.0
+        return {
+            "direction": direction,
+            "sl_price": float(sl_price),
+            "tp1_price": float(tp1_price),
+            "tp2_price": float(tp2_price),
+            "tp1_close_pct": 0.60,
+            "risk_multiplier": self.range_risk_multiplier,
+            "health_score": float(health),
+            "confidence_score": float(confidence),
+            "total_score": float(total),
+            "entry_score": float(best_score),
+            "context_score": float(confirm_quality),
+            "direction_fit": float(macro_quality),
+            "entry_type": "mean_revert",
+            "strategy": best_strategy,
+            "regime": "Range",
+            "l1_score": l1.get("score", 50.0),
+            "l1_level": macro_level,
+            "l2_bull": l2.get("bull_score", 50.0),
+            "l2_bear": l2.get("bear_score", 50.0),
+            "all_strategies": strategy_scores,
+            "condition_penalty": 0.0,
+            "entry_tags": ["range_edge_fade", f"range_confirm_{confirm_count}of5"],
+            "range_low": float(range_low),
+            "range_high": float(range_high),
+            "range_confirmations": confirmations,
+        }
+
     def _generate_signal(self, direction: str, candle_15m: Dict, ind_15m: Dict,
                          ind_1h: Dict, ind_4h: Dict,
                          l1: Dict, l2: Dict, l3: Dict) -> Optional[Dict]:
@@ -1762,6 +2064,11 @@ class TradingBot:
         """
         regime     = l3["regime"]
         threshold  = REGIME_THRESHOLDS.get(regime, 62)
+
+        # Range never shares the Trend/Breakout veto or scoring path. Keeping
+        # this branch first guarantees the add-on cannot modify their logic.
+        if regime == "Range":
+            return self._generate_range_signal(direction, candle_15m, ind_15m, l1, l2)
 
         # ── Veto filters (non-MR regimes only) ──────────────────────────────
         if regime not in _MR_REGIMES:
@@ -2278,7 +2585,8 @@ class TradingBot:
         entry_type    = signal.get("entry_type") or _REGIME_ENTRY_TYPE.get(
             self.current_market_state, "trend_follow")
         learning_mult = self.learning_engine.get_weight(entry_type)
-        size_mult     = health_mult * learning_mult
+        regime_risk_mult = float(np.clip(signal.get("risk_multiplier", 1.0), 0.10, 1.00))
+        size_mult     = health_mult * learning_mult * regime_risk_mult
 
         # [SIZING] Three modes, in this precedence order:
         # - margin_pct_min/max > 0 (Level 1 default): dynamic %-of-balance,
@@ -2298,7 +2606,7 @@ class TradingBot:
             tag_penalty_norm = float(np.clip(
                 signal.get("condition_penalty", 0.0) / max(self.condition_engine.MAX_PENALTY, 1e-9), 0.0, 1.0))
             conviction    = conf_norm * (1.0 - tag_penalty_norm)
-            margin_pct    = lo + (hi - lo) * conviction
+            margin_pct    = (lo + (hi - lo) * conviction) * regime_risk_mult
             notional      = self.account_balance * margin_pct * max(self.sizing_leverage, 1)
             position_size = notional / max(entry_price, 1e-9)
 
@@ -2330,7 +2638,7 @@ class TradingBot:
                 f"{_risk_now / max(self.account_balance, 1e-9) * 100:.1f}% of balance)"
             )
         elif self.margin_usdt and self.margin_usdt > 0:
-            notional      = self.margin_usdt * max(self.sizing_leverage, 1)
+            notional      = self.margin_usdt * max(self.sizing_leverage, 1) * regime_risk_mult
             position_size = notional / max(entry_price, 1e-9)
 
             # [MIN-LOT FLOOR] The exchange fills whole contracts — if the
@@ -2371,16 +2679,34 @@ class TradingBot:
         # ── TP levels ────────────────────────────────────────────────────────
         mult = 1 if direction == "LONG" else -1
 
-        # Unified 2-level target structure (user-designed, same for every
-        # state): T1=+0.5R->close tp1_close_pct + SL to breakeven,
-        # T2=+1.2R->full close of what's left. tp1/tp2 fields kept for
-        # logging/exchange-attach (tp2 = T2's price = what's attached as the
-        # real OKX TP order).
-        ladder = self._target_ladder()
-        tp1 = entry_price + sl_dist * ladder[0][0] * mult
-        tp2 = entry_price + sl_dist * ladder[-1][0] * mult
+        # Trend/Breakout keep the original fixed-R target ladder. Range may
+        # supply structure targets (midpoint / opposite edge); after the
+        # min-SL floor above, re-check their actual R:R and reject only that
+        # Range setup if the widened stop leaves insufficient room.
+        custom_tp1 = signal.get("tp1_price")
+        custom_tp2 = signal.get("tp2_price")
+        if custom_tp1 is not None and custom_tp2 is not None:
+            tp1 = float(custom_tp1)
+            tp2 = float(custom_tp2)
+            tp1_r_actual = (tp1 - entry_price) * mult / sl_dist
+            tp2_r_actual = (tp2 - entry_price) * mult / sl_dist
+            if tp1_r_actual < 0.80 or tp2_r_actual < 1.10 or tp2_r_actual <= tp1_r_actual:
+                self._log_event(
+                    f"[Range] SKIP after min-SL floor: T1={tp1_r_actual:.2f}R "
+                    f"T2={tp2_r_actual:.2f}R", level="debug")
+                return
+            range_close_pct = float(np.clip(
+                signal.get("tp1_close_pct", 0.60), 0.0, 0.99))
+            ladder = [
+                (tp1_r_actual, range_close_pct, self.BREAKEVEN_LOCK_R),
+                (tp2_r_actual, 1.0, None),
+            ]
+        else:
+            ladder = self._target_ladder()
+            tp1 = entry_price + sl_dist * ladder[0][0] * mult
+            tp2 = entry_price + sl_dist * ladder[-1][0] * mult
         tp3 = None
-        tp1_pct   = self.tp1_close_pct
+        tp1_pct   = ladder[0][1]
         tp2_pct   = 1.0
         trail_atr = 2.0
 
@@ -2389,8 +2715,8 @@ class TradingBot:
         self._log_event(
             f"[{strategy_tag}] OPEN {direction} entry={entry_price:.4f} "
             f"sl={pattern_sl:.4f} tp1={tp1:.4f}({ladder[0][0]}R, close {tp1_pct:.0%}) "
-            f"tp2={tp2:.4f}({ladder[-1][0]}R, close rest) "
-            f"size×{size_mult:.2f} health={health:.0f}"
+            f"tp2={tp2:.4f}({ladder[-1][0]:.2f}R, close rest) "
+            f"size×{size_mult:.2f} risk×{regime_risk_mult:.2f} health={health:.0f}"
         )
 
         self.current_trade = {
@@ -2437,6 +2763,10 @@ class TradingBot:
             "e_vol_ratio":          ind.get("volume", 0.0) / max(ind.get("vol_avg", ind.get("volume", 1.0)), 1e-9),
             "e_ema_dist_atr":       abs(entry_price - ind.get("ema20", entry_price)) / max(ind.get("atr", 1.0), 1e-9),
             "e_rsi":                ind.get("rsi", 50.0),
+            "risk_multiplier":       regime_risk_mult,
+            "range_low":             signal.get("range_low"),
+            "range_high":            signal.get("range_high"),
+            "range_confirmations":   signal.get("range_confirmations"),
         }
 
         _open_result = self._send_order(
@@ -2841,47 +3171,64 @@ class TradingBot:
         self.account_balance   += pnl
 
         win = (result == "WIN")
-        if win:
-            self.win_streak             += 1
-            self.loss_streak             = 0
-            self.consecutive_sl_hits     = 0
-        else:
-            self.loss_streak            += 1
-            self.session_losses         += 1
-            self.win_streak              = 0
-            if close_reason == "SL_HIT":
-                self.consecutive_sl_hits += 1
-            else:
-                self.consecutive_sl_hits  = 0
-
-        # [V8-6] Tiered cooldown
-        # FIX-#7: always use timezone-aware UTC so comparison with bar_dt (aware) works
         _now = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
+        is_range_trade = (t.get("e_state") == "Range")
         cooldown_mins = None
 
-        if self.consecutive_sl_hits >= 2:
-            cooldown_mins = 90
-            self._log_event(
-                f"[V8-6] {self.consecutive_sl_hits} consecutive SL hits → 90-min cooldown",
-                level="warning",
-            )
-            self.consecutive_sl_hits = 0
-        elif self.session_losses >= 3:
-            cooldown_mins = 240
-            self._log_event(
-                f"[V8-6] {self.session_losses} session losses → 4-hour cooldown",
-                level="warning",
-            )
-        elif self.loss_streak >= self.max_loss_streak:
-            cooldown_mins = self.cooldown_minutes
-            self._log_event(
-                f"Loss streak {self.loss_streak} → {cooldown_mins}m cooldown",
-                level="warning",
-            )
+        if is_range_trade:
+            # Range has its own streak/cooldown. A failed edge fade must never
+            # pause a valid Trend/Breakout setup; only the account-wide daily
+            # PnL limits above remain shared.
+            if win:
+                self.range_loss_streak = 0
+            else:
+                self.range_loss_streak += 1
+                if close_reason == "SL_HIT" and self.range_cooldown_minutes > 0:
+                    self.range_cooldown_until = _now + datetime.timedelta(
+                        minutes=self.range_cooldown_minutes)
+                    self._log_event(
+                        f"[Range] SL → Range-only cooldown "
+                        f"{self.range_cooldown_minutes}m (Trend/Breakout unaffected)",
+                        level="warning",
+                    )
+        else:
+            if win:
+                self.win_streak             += 1
+                self.loss_streak             = 0
+                self.consecutive_sl_hits     = 0
+            else:
+                self.loss_streak            += 1
+                self.session_losses         += 1
+                self.win_streak              = 0
+                if close_reason == "SL_HIT":
+                    self.consecutive_sl_hits += 1
+                else:
+                    self.consecutive_sl_hits  = 0
 
-        if cooldown_mins is not None:
-            self.cooldown_until = _now + datetime.timedelta(minutes=cooldown_mins)
-            self.state = "COOLDOWN"
+            # [V8-6] Tiered cooldown — Trend/Breakout only.
+            if self.consecutive_sl_hits >= 2:
+                cooldown_mins = 90
+                self._log_event(
+                    f"[V8-6] {self.consecutive_sl_hits} consecutive SL hits → 90-min cooldown",
+                    level="warning",
+                )
+                self.consecutive_sl_hits = 0
+            elif self.session_losses >= 3:
+                cooldown_mins = 240
+                self._log_event(
+                    f"[V8-6] {self.session_losses} session losses → 4-hour cooldown",
+                    level="warning",
+                )
+            elif self.loss_streak >= self.max_loss_streak:
+                cooldown_mins = self.cooldown_minutes
+                self._log_event(
+                    f"Loss streak {self.loss_streak} → {cooldown_mins}m cooldown",
+                    level="warning",
+                )
+
+            if cooldown_mins is not None:
+                self.cooldown_until = _now + datetime.timedelta(minutes=cooldown_mins)
+                self.state = "COOLDOWN"
 
         self._log_event(
             f"TRADE CLOSED | {result} | PnL={pnl:+.2f} "
@@ -2924,6 +3271,7 @@ class TradingBot:
         self._bar_count += 1
         self._last_candle_15m = candle_15m
         self._raw_candles = raw_candles
+        self._scan_info = {}  # never show a stale verdict from the prior bar/regime
 
         if self._startup_unblock_at is None and self.startup_warmup_minutes > 0:
             self._startup_unblock_at = now + datetime.timedelta(
@@ -3190,6 +3538,9 @@ class TradingBot:
             "session_state":      self.session_state,
             "session_gate_open":  self.session_gate_open,
             "cooldown_until":     self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "range_cooldown_until": self.range_cooldown_until.isoformat() if self.range_cooldown_until else None,
+            "range_loss_streak":  self.range_loss_streak,
+            "range_entry_allowed": self.range_entry_allowed,
             "warmup_remaining_m": warmup_remaining,
             "scan_info":          dict(self._scan_info),
             "filter_stats":       dict(self._filter_stats),
@@ -3197,6 +3548,9 @@ class TradingBot:
                 "tradeable_regimes": sorted(_TRADEABLE_REGIMES),
                 "trend_threshold": REGIME_THRESHOLDS["Trend"],
                 "breakout_threshold": REGIME_THRESHOLDS["Breakout"],
+                "range_threshold": REGIME_THRESHOLDS["Range"],
+                "range_risk_multiplier": self.range_risk_multiplier,
+                "range_cooldown_minutes": self.range_cooldown_minutes,
                 "min_ema_dist_atr": self.MIN_EMA_DIST_ATR,
                 "max_15m_adx_trend": self.MAX_15M_ADX_TREND,
                 "min_1h_efficiency": self.MIN_1H_EFFICIENCY,
@@ -3306,6 +3660,8 @@ class TradingBot:
             "consecutive_sl_hits":  self.consecutive_sl_hits,
             "session_losses":       self.session_losses,
             "cooldown_until":       self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "range_cooldown_until": self.range_cooldown_until.isoformat() if self.range_cooldown_until else None,
+            "range_loss_streak":    self.range_loss_streak,
             "last_close_at":        self._last_close_at.isoformat() if self._last_close_at else None,
             "trading_date":         self.trading_date.isoformat() if self.trading_date else None,
             "current_market_state": self.current_market_state,
@@ -3384,6 +3740,10 @@ class TradingBot:
         cooldown = data.get("cooldown_until")
         self.cooldown_until = (datetime.datetime.fromisoformat(cooldown)
                                if cooldown else None)
+        range_cooldown = data.get("range_cooldown_until")
+        self.range_cooldown_until = (datetime.datetime.fromisoformat(range_cooldown)
+                                     if range_cooldown else None)
+        self.range_loss_streak = int(data.get("range_loss_streak", 0) or 0)
 
         last_close = data.get("last_close_at", data.get("last_entry_at"))  # tolerate old field name
         self._last_close_at = (datetime.datetime.fromisoformat(last_close)
