@@ -253,8 +253,14 @@ class TrendConfirmStrategy(BaseStrategy):
         regime_strong_threshold_discount: float = 3.0,
         regime_transition_threshold_penalty: float = 3.0,
         allow_structure_entry_in_transition: bool = True,
-        require_trend_regime: bool = True,      # HARD-block entries unless regime is TREND/STRONG_TREND
-                                                #   (TRANSITION/CHOP = the choppy, range-y setups that lost)
+        require_trend_regime: bool = False,     # if True, HARD-block non-TREND regimes. Default off:
+                                                #   TRANSITION is allowed but must pass the extra gate below.
+        # TRANSITION extra-analysis gate — these regimes CAN trade, but only the
+        # strongest setups get through (this is where the live losses came from):
+        transition_extra_threshold: float = 6.0,   # extra quality points required (on top of the normal bar)
+        transition_min_vol_ratio: float = 1.0,      # need volume >= its 20-bar SMA (real participation)
+        transition_require_momentum: bool = True,   # need MACD histogram pushing in the trend's direction
+        transition_require_clean_location: bool = True,  # reject borderline/penalized HTF location
         # Sideways / range veto (Layer 2) — hard-block entries when the 15m
         # context looks like a range, not a trend. Designed NOT to kill early
         # trends: it leans on EMA compression + high chop (which stay range-y
@@ -264,7 +270,7 @@ class TrendConfirmStrategy(BaseStrategy):
         sideways_ema_compression_atr: float = 0.5,  # |EMA20-EMA50| < this x ATR = tangled/flat
         sideways_adx_max: float = 15.0,             # ADX below this = "really weak" (< adx_threshold on purpose)
         sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
-        sideways_min_signals: int = 2,              # how many of the 4 signals must fire to veto (tightened 3->2)
+        sideways_min_signals: int = 3,              # how many of the 4 signals must fire to veto (clear ranges only)
         # Exit (5m): EMA10/20 cross-back OR a 5m close past EMA20 closes the runner
         use_close_past_exit: bool = True,   # faster exit: also close when price closes past EMA_slow (before
                                             #   the full EMA8/13 cross-back) — more responsive, protects profit
@@ -412,6 +418,10 @@ class TrendConfirmStrategy(BaseStrategy):
         self.regime_transition_threshold_penalty = max(0.0, regime_transition_threshold_penalty)
         self.allow_structure_entry_in_transition = allow_structure_entry_in_transition
         self.require_trend_regime = require_trend_regime
+        self.transition_extra_threshold = max(0.0, transition_extra_threshold)
+        self.transition_min_vol_ratio = max(0.0, transition_min_vol_ratio)
+        self.transition_require_momentum = transition_require_momentum
+        self.transition_require_clean_location = transition_require_clean_location
         self.use_sideways_filter = use_sideways_filter
         self.sideways_ema_compression_atr = sideways_ema_compression_atr
         self.sideways_adx_max = sideways_adx_max
@@ -770,17 +780,35 @@ class TrendConfirmStrategy(BaseStrategy):
                 f"range {d.get('range_atr')}xATR",
                 metadata=dbg("early_quality_fail" if spent else "sideways_veto"))
 
-        # ── Layer 2 — regime veto (hard): only enter a REAL trend ─────────
-        # The live losers were almost all TRANSITION-regime entries (tangled
-        # EMAs, weak ADX, chop) — exactly the setups that revert. Require the
-        # 15m regime to be TREND or STRONG_TREND before any entry.
+        # ── Layer 2 — regime gate ─────────────────────────────────────────
+        # Optional hard block (off by default):
         if self.require_trend_regime and regime.get("state") not in ("TREND", "STRONG_TREND"):
             _spend_cross_if_early()
             return self._hold(current_price,
-                f"Layer2 REGIME veto — need TREND/STRONG_TREND, got {regime.get('state')} "
-                f"(aligned={regime.get('aligned')}, ADX={regime.get('adx')}, chop={regime.get('chop')}, "
-                f"EMA-gap {regime.get('ema_gap_atr')}xATR)",
+                f"Layer2 REGIME veto — need TREND/STRONG_TREND, got {regime.get('state')}",
                 metadata=dbg("regime_veto"))
+
+        # TRANSITION extra-analysis gate: the live losers were TRANSITION-regime
+        # entries (tangled EMAs, weak ADX, chop). TRANSITION may still trade, but
+        # only the strongest setups — a higher quality bar AND volume + momentum +
+        # clean HTF location must all confirm.
+        if regime.get("state") == "TRANSITION":
+            qb = q15.get("breakdown", {})
+            fails = []
+            trans_bar = l2_thr + self.transition_extra_threshold
+            if l2_score < trans_bar:
+                fails.append(f"quality {l2_score:.0f} < {trans_bar:.0f} (transition needs extra)")
+            if qb.get("vol_ratio", 0.0) < self.transition_min_vol_ratio:
+                fails.append(f"volume {qb.get('vol_ratio')}x < {self.transition_min_vol_ratio}x")
+            if self.transition_require_momentum and qb.get("momentum", 0.0) < self.momentum_weight * 0.5:
+                fails.append(f"weak momentum ({qb.get('momentum')}/{self.momentum_weight:.0f})")
+            if self.transition_require_clean_location and location.get("penalize"):
+                fails.append("borderline HTF location")
+            if fails:
+                _spend_cross_if_early()
+                return self._hold(current_price,
+                    "Layer2 TRANSITION extra-analysis veto: " + "; ".join(fails),
+                    metadata=dbg("transition_extra_veto"))
 
         # ── Layer 2a: base trend quality ──────────────────────────────────
         if l2_score <= l2_thr:
