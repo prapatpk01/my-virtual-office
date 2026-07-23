@@ -84,11 +84,17 @@ def adverse_exit(price: float, side: str, slip: float) -> float:
 
 def fee_adjusted_runner_stop(entry, one_r, full_qty, remaining_qty, realized_net, entry_fee, tp1_fill, side, cfg):
     qty=max(remaining_qty,1e-12); fee=cfg.fee_rate
+    market_buffer=max(one_r*cfg.be_market_buffer_r, entry*0.0001)
+    # Fixed breakeven+N·R lock — mirror position_manager._fee_adjusted_runner_stop.
+    lock=getattr(cfg,'runner_lock_r',None)
+    if lock is not None:
+        if side=='LONG':
+            return min(entry+lock*one_r, tp1_fill-market_buffer)
+        return max(entry-lock*one_r, tp1_fill+market_buffer)
     target_cash=full_qty*one_r*cfg.be_trade_lock_r
     remaining_entry_fee=entry_fee*(remaining_qty/max(full_qty,1e-12))
     cash_needed=target_cash-realized_net+remaining_entry_fee
     per_unit_needed=cash_needed/qty
-    market_buffer=max(one_r*cfg.be_market_buffer_r, entry*0.0001)
     if side=='LONG':
         required=(entry+per_unit_needed)/max(1-fee,1e-12)
         max_valid=tp1_fill-market_buffer

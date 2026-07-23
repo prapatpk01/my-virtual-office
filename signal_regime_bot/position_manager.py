@@ -668,6 +668,21 @@ class PositionManager:
         """
         qty = max(pos.amount, ind.EPSILON)
         fee = max(getattr(self.cfg, "fee_rate", 0.0), 0.0)
+        market_buffer = max(
+            pos.one_r * getattr(self.cfg, "be_market_buffer_r", 0.05),
+            pos.entry_price * 0.0001,
+        )
+        # Fixed breakeven+N·R lock (if configured) — a raw price offset, still
+        # clamped to the valid side of the TP1 fill so it can't trigger instantly.
+        lock = getattr(self.cfg, "runner_lock_r", None)
+        if lock is not None:
+            if pos.side == LONG:
+                desired = pos.entry_price + lock * pos.one_r
+                stop = min(desired, tp1_fill - market_buffer)
+                return stop, stop + 1e-12 >= desired, lock * pos.full_amount * pos.one_r
+            desired = pos.entry_price - lock * pos.one_r
+            stop = max(desired, tp1_fill + market_buffer)
+            return stop, stop - 1e-12 <= desired, lock * pos.full_amount * pos.one_r
         target_cash = (
             pos.full_amount
             * pos.one_r
@@ -676,10 +691,6 @@ class PositionManager:
         remaining_entry_fee = pos.entry_fee * (pos.amount / max(pos.full_amount, ind.EPSILON))
         cash_needed = target_cash - pos.realized_pnl + remaining_entry_fee
         per_unit_needed = cash_needed / qty
-        market_buffer = max(
-            pos.one_r * getattr(self.cfg, "be_market_buffer_r", 0.05),
-            pos.entry_price * 0.0001,
-        )
         if pos.side == LONG:
             required = (pos.entry_price + per_unit_needed) / max(1.0 - fee, ind.EPSILON)
             max_valid = tp1_fill - market_buffer

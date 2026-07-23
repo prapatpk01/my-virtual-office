@@ -250,10 +250,12 @@ class Config:
     max_open_positions: int = 0  # set in __post_init__ from MAX_POSITIONS (default 2)
 
     # ── Fees ─────────────────────────────────────────────────────────────────
-    # OKX charges 0.10% per fill on this account — open, close, TP and SL all
-    # pay it. Used by live/paper PnL accounting AND the backtest, so the two
-    # can never disagree on fee drag.
-    fee_rate: float = 0.001
+    # OKX charges 0.05% taker per fill on this account — open, close, TP and SL
+    # all pay it. VERIFIED from a real OKX fill (0.3325905 fee / 664.70 notional
+    # = 0.05%), not the 0.10% default. Used by live/paper PnL accounting AND the
+    # backtest, so the two can never disagree on fee drag. (The v3.0 upload
+    # re-introduced 0.10% — restored here.)
+    fee_rate: float = 0.0005
 
     # ── /stats ───────────────────────────────────────────────────────────────
     # /stats is sourced live from OKX's own closed-position history (not this
@@ -584,6 +586,13 @@ class Config:
     be_trade_lock_r: float = 0.05
     be_market_buffer_r: float = 0.05
     be_lock_r: float = 0.08
+    # Alternative runner rule: after TP1, park the stop at a FIXED breakeven +N·R
+    # (a raw price offset), instead of the fee-adjusted net-breakeven solve above.
+    # None -> use the fee-adjusted solver. Set (e.g. 0.2) to lock exactly +0.2R on
+    # the runner. Shared by live AND backtest so they can't diverge. RUNNER_LOCK_R
+    # overrides. Ship a non-None default only after a backtest beats baseline.
+    runner_lock_r: float | None = field(default_factory=lambda: (
+        float(os.environ["RUNNER_LOCK_R"]) if os.environ.get("RUNNER_LOCK_R") else None))
     exit_weak_signals: int = 2
 
     # Loop timing
