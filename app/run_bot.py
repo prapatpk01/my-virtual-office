@@ -285,7 +285,11 @@ def build_config() -> dict:
         # Startup warmup — no new entries until this many minutes after
         # process start (indicators need a few closed bars to stabilize
         # after a fresh restart). Was hardcoded 45; lowered to 10 by request.
-        "adaptive_warmup_min": _env_int("ADAPTIVE_WARMUP_MIN", 10),
+        # Startup warmup DISABLED by default (0 = off): no post-restart entry
+        # freeze. Indicators are computed from history already loaded before
+        # the first on_tick, so entries are safe immediately. Set a positive
+        # value to re-enable a warmup freeze after each restart/redeploy.
+        "adaptive_warmup_min": _env_int("ADAPTIVE_WARMUP_MIN", 0),
         # /stats now sources trade count/win-rate/PnL straight from OKX's own
         # post-fill positions-history (realizedPnl already nets OKX's trading
         # + funding fee — no local re-derivation, so the numbers always match
@@ -619,7 +623,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             daily_profit_limit_pct=cfg["adaptive_daily_profit"],
             cooldown_minutes=cfg["adaptive_cooldown_min"],
             max_loss_streak=cfg["adaptive_max_loss_streak"],
-            startup_warmup_minutes=cfg.get("adaptive_warmup_min", 10),
+            startup_warmup_minutes=cfg.get("adaptive_warmup_min", 0),
             state_file=state_file,
             execution_callback=_make_callback(sym, okx),
             enable_swing_reversal=cfg["strategies"].get("swing_reversal_pro", True),
@@ -686,8 +690,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             f"Range: risk×{cfg.get('adaptive_range_risk_multiplier', 0.50):.2f}, "
             f"max positions={max(0, cfg.get('adaptive_max_range_positions', 1))}, "
             f"cooldown={cfg.get('adaptive_range_cooldown_min', 90)}m\n"
-            f"Warmup: {cfg.get('adaptive_warmup_min', 10)}m — "
-            f"no new entries until indicators stabilize"
+            f"Warmup: {cfg.get('adaptive_warmup_min', 0)}m"
+            f"{' (off — entries allowed immediately)' if not cfg.get('adaptive_warmup_min', 0) else ' — no new entries until indicators stabilize'}"
         )
 
     import time as _time
