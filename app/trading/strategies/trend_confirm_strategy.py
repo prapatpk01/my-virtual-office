@@ -255,11 +255,16 @@ class TrendConfirmStrategy(BaseStrategy):
         allow_structure_entry_in_transition: bool = True,
         require_trend_regime: bool = False,     # if True, HARD-block non-TREND regimes. Default off:
                                                 #   TRANSITION is allowed but must pass the extra gate below.
-        # TRANSITION extra-analysis gate — these regimes CAN trade, but only the
-        # strongest setups get through (this is where the live losses came from):
-        transition_extra_threshold: float = 6.0,   # extra quality points required (on top of the normal bar)
-        transition_min_vol_ratio: float = 1.0,      # need volume >= its 20-bar SMA (real participation)
+        # TRANSITION extra-analysis gate — these regimes CAN trade, but need
+        # real confirmation. Kept LIGHT on the quality axis (a fresh cross is
+        # usually early-trend, which already carries the stricter early
+        # threshold) — the extra confidence comes from momentum + volume, not a
+        # sky-high score bar that would block essentially every cross.
+        transition_extra_threshold: float = 0.0,    # no quality stacking (6 blocked ~every cross). The extra
+                                                     #   analysis is momentum + volume below, not a higher bar.
+        transition_min_vol_ratio: float = 0.5,      # only block genuinely dead volume (< 0.5x its SMA)
         transition_require_momentum: bool = True,   # need MACD histogram pushing in the trend's direction
+        transition_momentum_frac: float = 0.3,      # momentum dimension must reach this fraction of its weight
         transition_require_clean_location: bool = True,  # reject borderline/penalized HTF location
         # Sideways / range veto (Layer 2) — hard-block entries when the 15m
         # context looks like a range, not a trend. Designed NOT to kill early
@@ -421,6 +426,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.transition_extra_threshold = max(0.0, transition_extra_threshold)
         self.transition_min_vol_ratio = max(0.0, transition_min_vol_ratio)
         self.transition_require_momentum = transition_require_momentum
+        self.transition_momentum_frac = max(0.0, min(1.0, transition_momentum_frac))
         self.transition_require_clean_location = transition_require_clean_location
         self.use_sideways_filter = use_sideways_filter
         self.sideways_ema_compression_atr = sideways_ema_compression_atr
@@ -800,7 +806,7 @@ class TrendConfirmStrategy(BaseStrategy):
                 fails.append(f"quality {l2_score:.0f} < {trans_bar:.0f} (transition needs extra)")
             if qb.get("vol_ratio", 0.0) < self.transition_min_vol_ratio:
                 fails.append(f"volume {qb.get('vol_ratio')}x < {self.transition_min_vol_ratio}x")
-            if self.transition_require_momentum and qb.get("momentum", 0.0) < self.momentum_weight * 0.5:
+            if self.transition_require_momentum and qb.get("momentum", 0.0) < self.momentum_weight * self.transition_momentum_frac:
                 fails.append(f"weak momentum ({qb.get('momentum')}/{self.momentum_weight:.0f})")
             if self.transition_require_clean_location and location.get("penalize"):
                 fails.append("borderline HTF location")
