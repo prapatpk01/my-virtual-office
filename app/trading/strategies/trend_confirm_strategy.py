@@ -253,6 +253,8 @@ class TrendConfirmStrategy(BaseStrategy):
         regime_strong_threshold_discount: float = 3.0,
         regime_transition_threshold_penalty: float = 3.0,
         allow_structure_entry_in_transition: bool = True,
+        require_trend_regime: bool = True,      # HARD-block entries unless regime is TREND/STRONG_TREND
+                                                #   (TRANSITION/CHOP = the choppy, range-y setups that lost)
         # Sideways / range veto (Layer 2) — hard-block entries when the 15m
         # context looks like a range, not a trend. Designed NOT to kill early
         # trends: it leans on EMA compression + high chop (which stay range-y
@@ -262,7 +264,7 @@ class TrendConfirmStrategy(BaseStrategy):
         sideways_ema_compression_atr: float = 0.5,  # |EMA20-EMA50| < this x ATR = tangled/flat
         sideways_adx_max: float = 15.0,             # ADX below this = "really weak" (< adx_threshold on purpose)
         sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
-        sideways_min_signals: int = 3,              # how many of the 4 signals must fire to veto
+        sideways_min_signals: int = 2,              # how many of the 4 signals must fire to veto (tightened 3->2)
         # Exit (5m): EMA10/20 cross-back OR a 5m close past EMA20 closes the runner
         use_close_past_exit: bool = True,   # faster exit: also close when price closes past EMA_slow (before
                                             #   the full EMA8/13 cross-back) — more responsive, protects profit
@@ -409,6 +411,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.regime_strong_threshold_discount = max(0.0, regime_strong_threshold_discount)
         self.regime_transition_threshold_penalty = max(0.0, regime_transition_threshold_penalty)
         self.allow_structure_entry_in_transition = allow_structure_entry_in_transition
+        self.require_trend_regime = require_trend_regime
         self.use_sideways_filter = use_sideways_filter
         self.sideways_ema_compression_atr = sideways_ema_compression_atr
         self.sideways_adx_max = sideways_adx_max
@@ -766,6 +769,18 @@ class TrendConfirmStrategy(BaseStrategy):
                 f"EMA-gap {d.get('ema_gap_atr')}xATR, chop {d.get('chop')}, ADX {d.get('adx')}, "
                 f"range {d.get('range_atr')}xATR",
                 metadata=dbg("early_quality_fail" if spent else "sideways_veto"))
+
+        # ── Layer 2 — regime veto (hard): only enter a REAL trend ─────────
+        # The live losers were almost all TRANSITION-regime entries (tangled
+        # EMAs, weak ADX, chop) — exactly the setups that revert. Require the
+        # 15m regime to be TREND or STRONG_TREND before any entry.
+        if self.require_trend_regime and regime.get("state") not in ("TREND", "STRONG_TREND"):
+            _spend_cross_if_early()
+            return self._hold(current_price,
+                f"Layer2 REGIME veto — need TREND/STRONG_TREND, got {regime.get('state')} "
+                f"(aligned={regime.get('aligned')}, ADX={regime.get('adx')}, chop={regime.get('chop')}, "
+                f"EMA-gap {regime.get('ema_gap_atr')}xATR)",
+                metadata=dbg("regime_veto"))
 
         # ── Layer 2a: base trend quality ──────────────────────────────────
         if l2_score <= l2_thr:
