@@ -102,7 +102,11 @@ REGIME_THRESHOLDS: Dict[str, int] = {
     # Conservative Range Edge-Fade: hard location/sweep/reclaim gates run
     # before this score, so 70 is a final quality bar rather than a loose vote.
     "Range":      70,
-    "Breakout":   56,
+    # [V9.4 BREAKOUT] Raised 56→64: the dedicated Breakout engine
+    # (_generate_breakout_signal) adds a hard macro gate + 4/6 confirmations +
+    # retest logic, so this is a final quality bar on top of those, not a
+    # loose vote. Only real close-through breaks with macro support survive.
+    "Breakout":   64,
     "Reversal":   65,
     "Exhaustion": 68,
 }
@@ -1155,6 +1159,13 @@ class TradingBot:
         # (see on_tick's raw_candles param) — None until the first tick.
         self._raw_candles: Optional[Dict[str, List]] = None
 
+        # [BREAKOUT ADD-ON] Pending retest-breakout: when a Normal (4/6) or
+        # macro-transition breakout fires, we don't enter on the break bar —
+        # we remember it here and wait 1-3 bars for a retest+reclaim of the
+        # broken level. In-memory only (a restart safely abandons any pending
+        # retest — the window is just 1-3 bars). None when nothing is pending.
+        self._pending_breakout: Optional[Dict] = None
+
         # [SESSION CONTROL] set by run_bot.py from the shared TradingSessionEngine
         # BEFORE each on_tick call (see session_engine.py) — gates only the
         # SCANNING->FILTERING transition (_check_global_gates), never position
@@ -2065,6 +2076,239 @@ class TradingBot:
             "range_confirmations": confirmations,
         }
 
+    # ── [BREAKOUT ADD-ON] Dedicated Breakout engine ──────────────────────────
+    BREAKOUT_BOS_LOOKBACK   = 20      # bars defining the broken structure level
+    BREAKOUT_MIN_BEYOND_ATR = 0.12    # close must clear BOS by >= this × ATR
+    BREAKOUT_MIN_BODY_ATR   = 0.28    # candle body >= this × ATR
+    BREAKOUT_MIN_VOL_RATIO  = 1.20    # volume >= this × its average
+    BREAKOUT_RETEST_BARS    = 3       # retest must complete within this many bars
+    BREAKOUT_TRANSITION_RISK = 0.60   # half-ish risk in a macro-transition zone
+
+    def _breakout_macro_zone(self, direction: str, macro_score: float) -> str:
+        """User-defined hard macro-conflict gate on the 4H macro score (0-100).
+        Returns 'veto' (trade against a decisive macro — forbidden),
+        'transition' (mild conflict — allowed only with retest + reduced risk),
+        or 'normal' (macro supports or is neutral-favourable)."""
+        if direction == "LONG":
+            if macro_score <= 35:  return "veto"
+            if macro_score <= 44:  return "transition"
+            return "normal"
+        else:  # SHORT
+            if macro_score >= 65:  return "veto"
+            if macro_score >= 56:  return "transition"
+            return "normal"
+
+    def _breakout_signal_dict(self, direction, entry_price, sl_price, confirms,
+                              confirm_count, score, best_strategy, best_score,
+                              risk_mult, macro_quality, l1, l2, entry_mode):
+        """Build the unified signal dict for a confirmed breakout. TP is left
+        to the standard R-ladder in _step5 (no custom tp1/tp2) so Breakout
+        keeps the same 0.6R/1.2R geometry as Trend."""
+        health     = float(np.clip(confirm_count / 6.0 * 100.0 * 0.6 + best_score * 0.4, 0, 100))
+        confidence = float(np.clip((score + macro_quality) / 2.0, 0, 100))
+        return {
+            "direction": direction,
+            "sl_price": float(sl_price),
+            "risk_multiplier": float(risk_mult),
+            "health_score": health,
+            "confidence_score": confidence,
+            "total_score": float(score),
+            "entry_score": float(best_score),
+            "context_score": float(confirm_count / 6.0 * 100.0),
+            "direction_fit": float(macro_quality),
+            "entry_type": "breakout",
+            "strategy": best_strategy,
+            "regime": "Breakout",
+            "l1_score": l1.get("score", 50.0),
+            "l1_level": str(l1.get("level", "NEUTRAL")),
+            "l2_bull": l2.get("bull_score", 50.0),
+            "l2_bear": l2.get("bear_score", 50.0),
+            "condition_penalty": 0.0,
+            "entry_tags": ["breakout", f"breakout_{entry_mode}",
+                           f"breakout_confirm_{confirm_count}of6"],
+            "breakout_mode": entry_mode,
+            "breakout_confirmations": confirms,
+        }
+
+    def _generate_breakout_signal(self, direction: str, candle_15m: Dict,
+                                  ind_15m: Dict, ind_1h: Dict,
+                                  l1: Dict, l2: Dict) -> Optional[Dict]:
+        """
+        Dedicated Breakout engine — isolated from Trend/Range. Enforces:
+          1) hard 4H-macro conflict gate (never break INTO a decisive opposing
+             macro; a mild conflict is a 'transition' → retest + reduced risk),
+          2) >=4/6 breakout confirmations (5/6 when macro is a transition),
+          3) immediate entry only for a Strong (5-6/6, macro normal) break;
+             a Normal (4/6) or transition break must wait for a retest+reclaim
+             of the broken level within 1-3 bars,
+          4) composite score >= REGIME_THRESHOLDS['Breakout'] (64).
+        """
+        threshold = REGIME_THRESHOLDS["Breakout"]
+        atr = max(float(ind_15m.get("atr", 0.0) or 0.0), 1e-9)
+        o  = float(candle_15m.get("open", 0.0))
+        h  = float(candle_15m.get("high", 0.0))
+        lo_cur = float(candle_15m.get("low", 0.0))
+        close = float(candle_15m.get("close", 0.0))
+        dir_mult = 1.0 if direction == "LONG" else -1.0
+
+        # ── (A) process a pending retest first ───────────────────────────────
+        pb = self._pending_breakout
+        if pb is not None:
+            if pb["direction"] != direction:
+                return None  # the matching direction handles it
+            waited = self._bar_count - pb["created_bar"]
+            if waited > self.BREAKOUT_RETEST_BARS:
+                self._pending_breakout = None
+                self._scan_info[direction] = "veto:breakout retest expired (>3 bars, no reclaim)"
+                return None
+            lvl = pb["bos_level"]; a = pb["atr"]
+            if direction == "LONG":
+                retested  = lo_cur <= lvl + 0.15 * a      # dipped back to old resistance
+                reclaimed = close >= lvl                  # closed back above it
+            else:
+                retested  = h >= lvl - 0.15 * a
+                reclaimed = close <= lvl
+            if retested and reclaimed:
+                self._pending_breakout = None
+                sl_price = (lo_cur - 0.15 * a) if direction == "LONG" else (h + 0.15 * a)
+                self._filter_stats["checked"] += 1
+                self._filter_stats["passed"] += 1
+                self._scan_info[direction] = (
+                    f"total {pb['score']:.0f}/{threshold} regime=Breakout RETEST-reclaim "
+                    f"strat={pb['best_strategy']}({pb['best_score']:.0f}) "
+                    f"confirm={pb['confirm_count']}/6 → SIGNAL")
+                return self._breakout_signal_dict(
+                    direction, close, sl_price, pb["confirms"], pb["confirm_count"],
+                    pb["score"], pb["best_strategy"], pb["best_score"], pb["risk_mult"],
+                    pb["macro_quality"], l1, l2, "retest")
+            self._scan_info[direction] = (
+                f"breakout retest wait {waited}/{self.BREAKOUT_RETEST_BARS} "
+                f"(retested={retested} reclaimed={reclaimed})")
+            return None
+
+        # ── (B) hard macro-conflict gate ─────────────────────────────────────
+        macro_score = float(l1.get("score", 50.0))
+        macro_level = str(l1.get("level", "NEUTRAL"))
+        zone = self._breakout_macro_zone(direction, macro_score)
+        if zone == "veto":
+            self._scan_info[direction] = (
+                f"veto:breakout vs decisive 4H macro ({direction} macro={macro_score:.0f})")
+            return None
+        is_transition = (zone == "transition")
+
+        # ── (C) locate the broken structure (BOS) level ──────────────────────
+        raw = self._raw_candles or {}
+        bars = list(raw.get("15m") or [])
+        lb = self.BREAKOUT_BOS_LOOKBACK
+        if len(bars) < lb + 2:
+            self._scan_info[direction] = f"veto:breakout history {len(bars)}/{lb + 2} bars"
+            return None
+        history = bars[-(lb + 1):-1]  # structure BEFORE the current (break) bar
+        if direction == "LONG":
+            bos_level = max(self._bar_value(b, "high") for b in history)
+            beyond = (close - bos_level)          # >0 means closed above resistance
+        else:
+            bos_level = min(self._bar_value(b, "low") for b in history)
+            beyond = (bos_level - close)          # >0 means closed below support
+
+        # ── (D) six confirmations ────────────────────────────────────────────
+        body = abs(close - o)
+        vol_ratio = (float(ind_15m.get("volume", 0.0) or 0.0)
+                     / max(float(ind_15m.get("vol_avg", 1.0) or 1.0), 1e-9))
+        pdi = float(ind_15m.get("pdi", 0.0)); mdi = float(ind_15m.get("mdi", 0.0))
+        mh  = float(ind_15m.get("macd_hist", 0.0) or 0.0)
+        e20_1h = float(ind_1h.get("ema20", 0.0) or 0.0)
+        e50_1h = float(ind_1h.get("ema50", 0.0) or 0.0)
+        mh_1h  = float(ind_1h.get("macd_hist", 0.0) or 0.0)
+        if direction == "LONG":
+            c_macd_di = (mh > 0) and (pdi > mdi)
+            c_1h      = (e20_1h > e50_1h) or (mh_1h > 0)
+        else:
+            c_macd_di = (mh < 0) and (mdi > pdi)
+            c_1h      = (e20_1h < e50_1h) or (mh_1h < 0)
+        confirms = {
+            "CLOSE_BREAK": beyond > 0,                              # real close break, not a wick
+            "BEYOND_ATR":  beyond >= self.BREAKOUT_MIN_BEYOND_ATR * atr,
+            "BODY":        body   >= self.BREAKOUT_MIN_BODY_ATR * atr,
+            "VOLUME":      vol_ratio >= self.BREAKOUT_MIN_VOL_RATIO,
+            "MACD_DI":     c_macd_di,
+            "1H_ALIGN":    c_1h,
+        }
+        # CLOSE_BREAK is a prerequisite: without a real close beyond the level
+        # there is no breakout to trade at all.
+        if not confirms["CLOSE_BREAK"]:
+            self._scan_info[direction] = "veto:no close beyond structure (wick only / inside range)"
+            return None
+        confirm_count = sum(1 for ok in confirms.values() if ok)
+        required = 5 if is_transition else 4
+        if confirm_count < required:
+            passed = ",".join(k for k, ok in confirms.items() if ok)
+            self._scan_info[direction] = (
+                f"veto:breakout confirm {confirm_count}/6 (need {required}; "
+                f"passed={passed}{'; macro-transition' if is_transition else ''})")
+            return None
+
+        # ── (E) strategy score (expectancy-blocked combos excluded) ──────────
+        strategy_scores = {
+            name: self.strategy_scorer.score(name, direction, ind_15m, l1, l2, "Breakout")
+            for name in REGIME_STRATEGIES["Breakout"]
+            if not self.expectancy_engine.is_blocked("Breakout", name)
+        }
+        best = self.confidence_engine.select_best(strategy_scores)
+        if best is None:
+            self._scan_info[direction] = "strategy_fail: all Breakout strategies blocked"
+            return None
+        best_strategy, best_score = best
+
+        # ── (F) composite quality score → threshold 64 ───────────────────────
+        confirm_q = confirm_count / 6.0 * 100.0
+        break_q   = float(np.clip((beyond / atr - 0.10) / 0.30 * 100.0, 0, 100))
+        body_q    = float(np.clip((body / atr - 0.25) / 0.35 * 100.0, 0, 100))
+        vol_q     = float(np.clip((vol_ratio - 1.0) / 0.80 * 100.0, 0, 100))
+        aligned = ((direction == "LONG" and macro_level in ("BULL", "STRONG_BULL")) or
+                   (direction == "SHORT" and macro_level in ("BEAR", "STRONG_BEAR")))
+        if aligned:
+            macro_quality = 100.0 if macro_level.startswith("STRONG") else 85.0
+        elif is_transition:
+            macro_quality = 50.0
+        else:
+            macro_quality = 70.0
+        total = (confirm_q * 0.35 + break_q * 0.12 + body_q * 0.08 +
+                 vol_q * 0.15 + macro_quality * 0.20 + best_score * 0.10)
+
+        strong = (not is_transition) and (confirm_count >= 5)
+        mode = "immediate" if strong else "retest"
+        self._filter_stats["checked"] += 1
+        passed_names = ",".join(k for k, ok in confirms.items() if ok)
+        self._scan_info[direction] = (
+            f"total {total:.0f}/{threshold} regime=Breakout strat={best_strategy}({best_score:.0f}) "
+            f"confirm={confirm_count}/6[{passed_names}] macro={macro_score:.0f}({zone}) mode={mode}"
+            + (" → SIGNAL" if (total >= threshold and strong) else ""))
+        if total < threshold:
+            self._filter_stats["threshold_fail"] += 1
+            return None
+
+        risk_mult = self.BREAKOUT_TRANSITION_RISK if is_transition else 1.0
+
+        # ── (G) immediate vs retest ──────────────────────────────────────────
+        if strong:
+            self._filter_stats["passed"] += 1
+            sl_price = (lo_cur - 0.15 * atr) if direction == "LONG" else (h + 0.15 * atr)
+            return self._breakout_signal_dict(
+                direction, close, sl_price, confirms, confirm_count, total,
+                best_strategy, best_score, risk_mult, macro_quality, l1, l2, "immediate")
+
+        # Normal (4/6) or transition → arm a retest; enter only on reclaim.
+        self._pending_breakout = {
+            "direction": direction, "bos_level": float(bos_level), "atr": atr,
+            "created_bar": self._bar_count, "confirm_count": confirm_count,
+            "confirms": confirms, "score": total, "best_strategy": best_strategy,
+            "best_score": best_score, "risk_mult": risk_mult,
+            "macro_quality": macro_quality,
+        }
+        self._scan_info[direction] += " | armed retest (await reclaim 1-3 bars)"
+        return None
+
     def _generate_signal(self, direction: str, candle_15m: Dict, ind_15m: Dict,
                          ind_1h: Dict, ind_4h: Dict,
                          l1: Dict, l2: Dict, l3: Dict) -> Optional[Dict]:
@@ -2076,10 +2320,13 @@ class TradingBot:
         regime     = l3["regime"]
         threshold  = REGIME_THRESHOLDS.get(regime, 62)
 
-        # Range never shares the Trend/Breakout veto or scoring path. Keeping
-        # this branch first guarantees the add-on cannot modify their logic.
+        # Range and Breakout each have a dedicated isolated engine — keeping
+        # these branches first guarantees the add-ons cannot modify Trend's
+        # veto/scoring path (Trend still falls through to the pipeline below).
         if regime == "Range":
             return self._generate_range_signal(direction, candle_15m, ind_15m, l1, l2)
+        if regime == "Breakout":
+            return self._generate_breakout_signal(direction, candle_15m, ind_15m, ind_1h, l1, l2)
 
         # ── Veto filters (non-MR regimes only) ──────────────────────────────
         if regime not in _MR_REGIMES:
@@ -3302,6 +3549,14 @@ class TradingBot:
         self._last_candle_15m = candle_15m
         self._raw_candles = raw_candles
         self._scan_info = {}  # never show a stale verdict from the prior bar/regime
+
+        # [BREAKOUT] Expire an armed retest by age, independent of regime — if
+        # the regime flips away from Breakout and never returns within the
+        # window, the pending would otherwise linger and fire a stale retest
+        # on an old level much later.
+        if (self._pending_breakout and
+                (self._bar_count - self._pending_breakout["created_bar"]) > self.BREAKOUT_RETEST_BARS):
+            self._pending_breakout = None
 
         if self._startup_unblock_at is None and self.startup_warmup_minutes > 0:
             self._startup_unblock_at = now + datetime.timedelta(
