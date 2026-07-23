@@ -202,8 +202,8 @@ def _view_waiting_reason(status: dict, tradeable_regimes) -> str:
     regime = status.get("market_state")
     if regime not in tradeable_regimes:
         return (f"regime is {regime}, not tradeable — the bot only opens in "
-                f"{'/'.join(sorted(tradeable_regimes))} (waiting for the market to trend)")
-    if status.get("regime_bias") == "NEUTRAL":
+                f"{'/'.join(sorted(tradeable_regimes))} (waiting for an enabled setup)")
+    if regime == "Trend" and status.get("regime_bias") == "NEUTRAL":
         return (f"regime is Trend but the 4H macro is NEUTRAL "
                 f"({status.get('regime_score', 50):.0f}/100) — no higher-timeframe "
                 f"direction behind it yet")
@@ -322,6 +322,14 @@ def build_config() -> dict:
         # old 22). Raised to 26 to trade more often; higher = more trades but
         # risks chasing extended legs (backtest: ADX>30 ran only ~47% WR).
         "adaptive_max_15m_adx_trend": _env_float("ADAPTIVE_MAX_15M_ADX_TREND", 26.0),
+        # [RANGE ADD-ON] Dedicated half-risk engine. These settings affect
+        # Range only; Trend and Breakout keep their existing risk and gates.
+        "adaptive_range_risk_multiplier": _env_float(
+            "ADAPTIVE_RANGE_RISK_MULTIPLIER", 0.50),
+        "adaptive_range_cooldown_min": _env_int(
+            "ADAPTIVE_RANGE_COOLDOWN_MIN", 90),
+        "adaptive_max_range_positions": _env_int(
+            "ADAPTIVE_MAX_RANGE_POSITIONS", 1),
     }
 
 
@@ -627,6 +635,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             macro_ema_fast=cfg.get("adaptive_macro_ema_fast"),
             macro_ema_slow=cfg.get("adaptive_macro_ema_slow"),
             max_15m_adx_trend=cfg.get("adaptive_max_15m_adx_trend"),
+            range_risk_multiplier=cfg.get("adaptive_range_risk_multiplier", 0.50),
+            range_cooldown_minutes=cfg.get("adaptive_range_cooldown_min", 90),
         )
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)
@@ -668,6 +678,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             f"Adaptive Bot Started\n"
             f"Symbols: {', '.join(symbols)}\n"
             f"Mode: {'PAPER' if cfg['paper'] else 'LIVE'}\n"
+            f"Regimes: {', '.join(sorted(_TRADEABLE_REGIMES))}\n"
+            f"Range: risk×{cfg.get('adaptive_range_risk_multiplier', 0.50):.2f}, "
+            f"max positions={max(0, cfg.get('adaptive_max_range_positions', 1))}, "
+            f"cooldown={cfg.get('adaptive_range_cooldown_min', 90)}m\n"
             f"Warmup: {cfg.get('adaptive_warmup_min', 10)}m — "
             f"no new entries until indicators stabilize"
         )
@@ -677,6 +691,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
     loop = asyncio.get_event_loop()
     max_pos = cfg.get("adaptive_max_positions", 2)
+    max_range_pos = max(0, cfg.get("adaptive_max_range_positions", 1))
 
     # 5-minute health log: tracks last log time and cached indicators per symbol
     HEALTH_LOG_SECS = 300
@@ -878,6 +893,19 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 latest_ts = c15m[-1].timestamp if c15m else 0
                 is_new_bar = latest_ts > last_bar_ts[sym]
                 bot, state_file = bots[sym]
+
+                # [RANGE PORTFOLIO CAP] At most one Range position by default.
+                # This gate is read only by the dedicated Range engine; Trend
+                # and Breakout are never blocked by it and retain priority for
+                # the remaining global position slots.
+                range_open_count = sum(
+                    1 for b, _ in bots.values()
+                    if b.position_open and
+                    (getattr(b, "current_trade", {}) or {}).get("e_state") == "Range"
+                )
+                bot.range_entry_allowed = (
+                    max_range_pos > 0 and range_open_count < max_range_pos
+                )
 
                 # [SESSION CONTROL] gate only new entries (never position
                 # management — _check_global_gates is the only reader of
