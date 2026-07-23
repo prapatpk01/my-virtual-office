@@ -296,9 +296,14 @@ class Config:
     # only adds re-entry churn and fee drag without reducing risk. Reverted
     # to 1.0 (no tightening).
     sl_tighten_mult: float = 1.0
-    # Balanced partial-profit geometry: 50% at 1R, 50% at 2R.
-    # A full TP2 outcome earns 1.5R gross instead of less than 1R.
-    tp1_r: float = 1.20
+    # Early partial-profit geometry: bank 50% at 0.8R, run 50% to TP2, and lock
+    # the runner at breakeven+0.2R (runner_lock_r below). Chosen by explicit user
+    # direction. NOTE: a Feb–May 2026 BTC+XAU backtest (fee 0.05%) had this
+    # UNDERperform the 1.2R baseline (net −24.9R vs −10.3R, PF 0.78 vs 0.92) —
+    # early TP1 caps winners below what pays for the losers. Shipped anyway per
+    # the user's call; revert tp1_r→1.20 / runner_lock_r→None to restore baseline.
+    # TP1_R overrides.
+    tp1_r: float = field(default_factory=lambda: _env_float("TP1_R", 0.80))
     tp1_fraction: float = 0.50
     tp2_r: float = 2.40
     swing_lookback_left: int = 3
@@ -589,10 +594,12 @@ class Config:
     # Alternative runner rule: after TP1, park the stop at a FIXED breakeven +N·R
     # (a raw price offset), instead of the fee-adjusted net-breakeven solve above.
     # None -> use the fee-adjusted solver. Set (e.g. 0.2) to lock exactly +0.2R on
-    # the runner. Shared by live AND backtest so they can't diverge. RUNNER_LOCK_R
-    # overrides. Ship a non-None default only after a backtest beats baseline.
+    # the runner. Shared by live AND backtest so they can't diverge. Default 0.2
+    # (breakeven+0.2R) per explicit user direction — pairs with the 0.8R TP1
+    # above. Set RUNNER_LOCK_R="" (or revert to None) to restore the fee-adjusted
+    # net-breakeven runner stop.
     runner_lock_r: float | None = field(default_factory=lambda: (
-        float(os.environ["RUNNER_LOCK_R"]) if os.environ.get("RUNNER_LOCK_R") else None))
+        float(os.environ["RUNNER_LOCK_R"]) if os.environ.get("RUNNER_LOCK_R") else 0.2))
     exit_weak_signals: int = 2
 
     # Loop timing
