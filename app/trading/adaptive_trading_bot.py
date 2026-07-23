@@ -1543,12 +1543,14 @@ class TradingBot:
     # a flat scratch at exactly entry), T2 closes what's left (matches the
     # exchange-attached TP2, unchanged).
     BREAKEVEN_LOCK_R: float = 0.15
-    # [V9.2] T2 pulled in from 1.2R: clean-run data showed only 39.7% of
-    # trades that reached T1 went on to 1.2R (≈ the 41.7% random baseline);
-    # at 1.0R the same leg has ~50% odds, and with 75% already banked at T1
-    # the trade's outcome no longer depends on the weak runner leg.
-    TP1_R: float = 0.5
-    TP2_R: float = 1.0
+    # TP geometry — widened from 0.5R/1.0R to 0.6R/1.2R by request. Bar-close
+    # A/B backtest (8 symbols, Jan–Jul 2026, same tp1_close_pct 60% /
+    # breakeven-lock 0.15 / min-SL 1.2%): aggregate PnL improved by the
+    # equivalent of +$4.3k (mainly XAU +$3.5k, XRP +$1.7k; SOL/XAG/CL a bit
+    # worse) at the cost of ~3pp win-rate (66.8% → 63.4%) — targets sit
+    # further out so fewer trades reach T1/T2, but each banked leg is bigger.
+    TP1_R: float = 0.6
+    TP2_R: float = 1.2
 
     def _target_ladder(self) -> List[tuple]:
         """
@@ -1839,16 +1841,25 @@ class TradingBot:
                 f"veto:range width {width_atr:.2f} ATR (need 2.0-6.0)")
             return None
 
-        touch_tol = 0.18 * atr
+        touch_tol = 0.22 * atr
         upper_touches = sum(
             1 for b in history
             if self._bar_value(b, "high") >= range_high - touch_tol)
         lower_touches = sum(
             1 for b in history
             if self._bar_value(b, "low") <= range_low + touch_tol)
-        if upper_touches < 2 or lower_touches < 2:
+        # [RANGE GATE — direction-aware] Require the edge we're actually
+        # FADING to be well-tested (>=2 touches); the opposite edge only needs
+        # to exist (>=1). The original symmetric 2/2 gate rejected ~85% of all
+        # Range-regime bars in backtest (most had 1 touch on one side) — for
+        # an edge-fade, only the faded edge's integrity truly matters.
+        faded_touches, other_touches = (
+            (lower_touches, upper_touches) if direction == "LONG"
+            else (upper_touches, lower_touches))
+        if faded_touches < 2 or other_touches < 1:
             self._scan_info[direction] = (
-                f"veto:range touches U{upper_touches}/L{lower_touches} (need 2/2)")
+                f"veto:range touches U{upper_touches}/L{lower_touches} "
+                f"(need faded>=2, other>=1)")
             return None
 
         adx = float(ind_15m.get("adx", 20.0))
@@ -3793,6 +3804,102 @@ class TradingBot:
         )
         return True
 
+    def _backfill_reconciled_trade(self, symbol: str, exchange_adapter) -> None:
+        """A position that closes via an exchange-side order (the attached
+        TP2/SL) while the bot is offline or mid-restart is caught by
+        reconcile_with_exchange AFTER the fact — _log_trade() only ever runs
+        from the bot's own on_tick EXITING state, so it never fires here,
+        and the trade would otherwise vanish from trade_journal entirely
+        (this is why /stats' TP1/TP2/SL-hit breakdown can undercount OKX's
+        real trade total — e.g. 3/9 instead of 9/9, every restart drops
+        whatever closed while the process was down).
+        Backfills a best-effort entry using OKX's own closed-position history
+        for the real exit price/pnl, and infers 'targets_hit' from where
+        that close price landed relative to this trade's own tp1/tp2 —
+        purely additive to whatever the bot already saw locally before going
+        offline (never removes a hit it already recorded)."""
+        t = self.current_trade
+        if not t or not hasattr(exchange_adapter, "fetch_closed_positions_history"):
+            return
+        entry_dt = t.get("entry_time")
+        if not isinstance(entry_dt, datetime.datetime):
+            entry_dt = datetime.datetime.now(datetime.timezone.utc)
+        elif entry_dt.tzinfo is None:
+            entry_dt = entry_dt.replace(tzinfo=datetime.timezone.utc)
+        try:
+            since_ms = int(entry_dt.timestamp() * 1000) - 60_000
+            rows = exchange_adapter.fetch_closed_positions_history(
+                since_ms=since_ms, symbols=[symbol])
+        except Exception as e:
+            self._log_event(f"[RECONCILE] OKX history backfill failed (non-fatal): {e}",
+                            level="warning")
+            return
+        if not rows:
+            return
+
+        row         = rows[-1]  # most recent close for this symbol since entry
+        direction   = t.get("direction", "LONG")
+        dir_mult    = 1 if direction == "LONG" else -1
+        close_price = float(row.get("close_price") or 0.0)
+        tp1         = float(t.get("tp1") or 0.0)
+        tp2         = float(t.get("tp2") or 0.0)
+        targets_hit = list(t.get("targets_hit", []))
+        pnl = float(row.get("pnl") or 0.0)
+        close_ts = row.get("close_ts")
+
+        # [T2 DETECTION] The position's AVERAGE close price (row["close_price"]
+        # = OKX closeAvgPx) can't tell whether the runner hit T2: on a
+        # T1(60%)+T2(40%) split the big T1 partial drags the average below T2
+        # even when the runner closed exactly at T2 — which is why /stats
+        # showed TP2 hit 0/N despite trades clearly reaching their exchange-
+        # attached TP2. Use the most-FAVORABLE individual close FILL instead
+        # (max sell for LONG / min buy for SHORT); if any close reached T2,
+        # that fill did. Falls back to the average when the per-fill lookup
+        # isn't available (paper/backtest, fetch failure).
+        ref_price = close_price
+        try:
+            entry_ms = int(entry_dt.timestamp() * 1000)
+            best = None
+            if hasattr(exchange_adapter, "fetch_best_close_price"):
+                best = exchange_adapter.fetch_best_close_price(
+                    symbol, entry_ms, int(close_ts) if close_ts else None, direction)
+            if best is not None and best > 0:
+                # Most-favorable = furthest in the trade's direction, so take
+                # whichever of avg/best is further along for T-level detection.
+                ref_price = max(ref_price, best) if direction == "LONG" else min(ref_price, best)
+        except Exception as e:
+            self._log_event(f"[RECONCILE] best-close lookup failed (non-fatal): {e}",
+                            level="warning")
+
+        if tp2 and dir_mult * (ref_price - tp2) >= 0 and "T2" not in targets_hit:
+            targets_hit.append("T2")
+        if tp1 and dir_mult * (ref_price - tp1) >= 0 and "T1" not in targets_hit:
+            targets_hit.append("T1")
+        closed_at = (
+            datetime.datetime.fromtimestamp(close_ts / 1000, tz=datetime.timezone.utc)
+            if close_ts else datetime.datetime.now(datetime.timezone.utc)
+        ).isoformat()
+
+        self.trade_journal.append({
+            "symbol":      symbol,
+            "direction":   direction,
+            "entry":       t.get("entry"),
+            "exit":        close_price,
+            "sl":          t.get("sl"),
+            "tp1":         tp1,
+            "tp2":         tp2,
+            "win_loss":    "WIN" if pnl > 0 else "LOSS",
+            "pnl":         pnl,
+            "targets_hit": targets_hit,
+            "exit_reason": "RECONCILE_EXTERNAL_CLOSE",
+            "closed_at":   closed_at,
+        })
+        self.trade_journal = self.trade_journal[-200:]
+        self._log_event(
+            f"[RECONCILE] backfilled trade_journal from OKX history: "
+            f"targets_hit={targets_hit} pnl={pnl:+.2f}"
+        )
+
     def reconcile_with_exchange(self, symbol: str, exchange_adapter) -> None:
         try:
             live_position = exchange_adapter.fetch_open_position(symbol)
@@ -3826,6 +3933,7 @@ class TradingBot:
                 "clearing local state → SCANNING",
                 level="warning",
             )
+            self._backfill_reconciled_trade(symbol, exchange_adapter)
             self.position_open = False
             self.current_trade = {}
             # [WHIPSAW GUARD] A close that happens outside _close_position()
