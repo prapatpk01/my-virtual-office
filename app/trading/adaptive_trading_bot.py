@@ -1836,9 +1836,9 @@ class TradingBot:
         range_low = min(self._bar_value(b, "low") for b in history)
         width = range_high - range_low
         width_atr = width / atr
-        if width <= 0 or not (2.0 <= width_atr <= 6.0):
+        if width <= 0 or not (1.5 <= width_atr <= 7.0):
             self._scan_info[direction] = (
-                f"veto:range width {width_atr:.2f} ATR (need 2.0-6.0)")
+                f"veto:range width {width_atr:.2f} ATR (need 1.5-7.0)")
             return None
 
         touch_tol = 0.22 * atr
@@ -1871,15 +1871,15 @@ class TradingBot:
         vol_avg = max(float(ind_15m.get("vol_avg", volume or 1.0) or 1.0), 1e-9)
         vol_ratio = volume / vol_avg
 
-        if not (10.0 <= adx <= 20.0):
-            self._scan_info[direction] = f"veto:range ADX {adx:.1f} (need 10-20)"
+        if not (8.0 <= adx <= 23.0):
+            self._scan_info[direction] = f"veto:range ADX {adx:.1f} (need 8-23)"
             return None
-        if eff > 0.30:
-            self._scan_info[direction] = f"veto:range efficiency {eff:.2f} > 0.30"
+        if eff > 0.40:
+            self._scan_info[direction] = f"veto:range efficiency {eff:.2f} > 0.40"
             return None
-        if not (0.75 <= atr_exp <= 1.10):
+        if not (0.65 <= atr_exp <= 1.20):
             self._scan_info[direction] = (
-                f"veto:range ATR expansion {atr_exp:.2f} (need 0.75-1.10)")
+                f"veto:range ATR expansion {atr_exp:.2f} (need 0.65-1.20)")
             return None
 
         candle_range = max(h - lo_cur, 1e-9)
@@ -1902,7 +1902,7 @@ class TradingBot:
 
         if direction == "LONG":
             sweep_depth = (range_low - lo_cur) / atr
-            swept = 0.02 <= sweep_depth <= 0.45
+            swept = 0.01 <= sweep_depth <= 0.60
             reclaimed = close >= range_low + 0.02 * atr
             at_edge = location <= 0.25
             sl_price = lo_cur - 0.15 * atr
@@ -1910,7 +1910,7 @@ class TradingBot:
             tp2_price = range_high - 0.10 * atr
         else:
             sweep_depth = (h - range_high) / atr
-            swept = 0.02 <= sweep_depth <= 0.45
+            swept = 0.01 <= sweep_depth <= 0.60
             reclaimed = close <= range_high - 0.02 * atr
             at_edge = location >= 0.75
             sl_price = h + 0.15 * atr
@@ -2578,7 +2578,21 @@ class TradingBot:
         if sl_dist < 1e-8:
             sl_dist = entry_price * 0.01
 
-        min_sl_dist = entry_price * self.min_sl_pct
+        # [RANGE FLOOR] The default min-SL floor (self.min_sl_pct, 1.2% of
+        # price) is calibrated for Trend's ATR×1.5 stops. Range uses a much
+        # tighter structure stop (edge ± 0.15 ATR) whose TP levels are also
+        # structure-based, so forcing the 1.2% floor blew the stop past the
+        # range midpoint and collapsed the R:R (every passing Range signal
+        # got skipped at the ladder R:R re-check). Range instead floors on a
+        # fraction of ATR — proportional to the same volatility its targets
+        # are, so the structure R:R survives — with a hard 0.25% absolute
+        # minimum so a tiny-ATR reading can't produce a runaway position size.
+        _is_range = signal.get("regime") == "Range"
+        if _is_range:
+            _atr_now = max(float(ind.get("atr", 0.0) or 0.0), 0.0)
+            min_sl_dist = max(0.30 * _atr_now, entry_price * 0.0025)
+        else:
+            min_sl_dist = entry_price * self.min_sl_pct
         if sl_dist < min_sl_dist:
             sl_dist = min_sl_dist
             pattern_sl = (entry_price - sl_dist if direction == "LONG"
