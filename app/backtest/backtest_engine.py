@@ -53,8 +53,8 @@ class BacktestConfig:
     tp1_close_pct:   float = 0.75          # [V9.2] 75% close at TP1
 
     # TP/SL structure (must match live bot)
-    tp1_r:           float = 0.5           # TP1 at 0.5R
-    tp2_r:           float = 1.0           # [V9.2] TP2 at 1.0R (was 1.2R)
+    tp1_r:           float = 0.6           # TP1 at 0.6R (widened from 0.5R)
+    tp2_r:           float = 1.2           # TP2 at 1.2R (widened from 1.0R)
     breakeven_lock_r: float = 0.15         # T1's SL-move locks in this much R (was flat 0R)
 
     # Risk limits

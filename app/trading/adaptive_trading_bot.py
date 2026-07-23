@@ -1525,12 +1525,14 @@ class TradingBot:
     # a flat scratch at exactly entry), T2 closes what's left (matches the
     # exchange-attached TP2, unchanged).
     BREAKEVEN_LOCK_R: float = 0.15
-    # [V9.2] T2 pulled in from 1.2R: clean-run data showed only 39.7% of
-    # trades that reached T1 went on to 1.2R (≈ the 41.7% random baseline);
-    # at 1.0R the same leg has ~50% odds, and with 75% already banked at T1
-    # the trade's outcome no longer depends on the weak runner leg.
-    TP1_R: float = 0.5
-    TP2_R: float = 1.0
+    # TP geometry — widened from 0.5R/1.0R to 0.6R/1.2R by request. Bar-close
+    # A/B backtest (8 symbols, Jan–Jul 2026, same tp1_close_pct 60% /
+    # breakeven-lock 0.15 / min-SL 1.2%): aggregate PnL improved by the
+    # equivalent of +$4.3k (mainly XAU +$3.5k, XRP +$1.7k; SOL/XAG/CL a bit
+    # worse) at the cost of ~3pp win-rate (66.8% → 63.4%) — targets sit
+    # further out so fewer trades reach T1/T2, but each banked leg is bigger.
+    TP1_R: float = 0.6
+    TP2_R: float = 1.2
 
     def _target_ladder(self) -> List[tuple]:
         """
