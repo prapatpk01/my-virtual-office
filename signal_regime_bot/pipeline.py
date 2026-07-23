@@ -1,4 +1,4 @@
-"""Shared Regime -> Bias -> Dual Entry decision pipeline."""
+"""Shared 4H Regime -> 1H/15M Bias -> 15M/5M Expert Entry pipeline."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,8 +8,8 @@ import pandas as pd
 
 from config import Config
 from regime_engine import RegimeEngine, RegimeResult
-from bias_engine import BiasEngine, BiasResult, LONG as B_LONG, SHORT as B_SHORT
-from entry_engine import EntryEngine, EntryResult, LONG, SHORT, NONE
+from bias_engine import BiasEngine, BiasResult, LONG as B_LONG, SHORT as B_SHORT, BOTH as B_BOTH
+from entry_engine import EntryEngine, EntryResult, LONG, SHORT, BOTH, NONE
 
 
 @dataclass
@@ -56,10 +56,8 @@ class Pipeline:
 
         regime = self.regime_engine.analyze(df_4h, df_1h)
         base = dict(regime=regime, size_multiplier=regime.size_multiplier)
-
-        # Commodity-linked symbols: block only new entries during the configured
-        # weekend window. Existing positions are managed by main/PositionManager.
         c = self.cfg
+
         if (
             c.commodity_weekend_block_enabled
             and (has_5m or has_15m)
@@ -76,59 +74,37 @@ class Pipeline:
             )
             if halted:
                 return PipelineResult(
-                    NONE,
-                    default_price,
-                    0.0,
-                    "MARKET",
+                    NONE, default_price, 0.0, "MARKET",
                     f"commodity weekend halt; entries resume Sunday {c.commodity_resume_hour_utc:02d}:00 UTC",
                     **base,
                 )
 
         bias = self.bias_engine.analyze(df_1h, df_15m, df_5m, regime.label)
-        if bias.direction not in (B_LONG, B_SHORT):
+        if bias.direction == B_LONG:
+            side = LONG
+        elif bias.direction == B_SHORT:
+            side = SHORT
+        elif bias.direction == B_BOTH:
+            side = BOTH
+        else:
             return PipelineResult(
-                NONE,
-                default_price,
-                0.0,
-                "BIAS",
-                bias.reason,
-                bias=bias,
-                **base,
+                NONE, default_price, 0.0, "BIAS", bias.reason,
+                bias=bias, **base,
             )
-        side = LONG if bias.direction == B_LONG else SHORT
 
         entry = self.entry_engine.analyze(
-            df_30m,
-            df_15m,
-            df_5m,
-            side,
-            symbol,
-            df_1h=df_1h,
-            df_4h=df_4h,
-            regime=regime,
-            bias=bias,
+            df_30m, df_15m, df_5m, side, symbol,
+            df_1h=df_1h, df_4h=df_4h, regime=regime, bias=bias,
         )
         price = entry.price if entry.price > 0 else default_price
-        if entry.allow_entry:
+        if entry.allow_entry and entry.direction in (LONG, SHORT):
             return PipelineResult(
-                side,
-                price,
-                entry.entry_score,
-                None,
-                entry.reason,
-                bias=bias,
-                entry=entry,
-                **base,
+                entry.direction, price, entry.entry_score, None, entry.reason,
+                bias=bias, entry=entry, **base,
             )
         return PipelineResult(
-            NONE,
-            price,
-            entry.entry_score,
-            "ENTRY",
-            entry.reason,
-            bias=bias,
-            entry=entry,
-            **base,
+            NONE, price, entry.entry_score, "ENTRY", entry.reason,
+            bias=bias, entry=entry, **base,
         )
 
 

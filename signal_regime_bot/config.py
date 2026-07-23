@@ -178,7 +178,7 @@ class Config:
     # SpikeGuard) manage the trade. TrendConfirm's backtest note: single-close
     # EMA exits killed 75% of trades at ~-0.3R before TP1; arming them only on
     # the runner nearly doubled WR (25->62% BTC, 41->60% SOL).
-    signal_exit_requires_tp1: bool = False
+    signal_exit_requires_tp1: bool = True
 
     # ── Sideways / range veto (ported from TrendConfirm) ─────────────────────
     # Hard-block NEW entries when the 15M context reads as a range. 4 signals;
@@ -245,18 +245,15 @@ class Config:
     # Loss-streak cooldown below remains the only pause.
     daily_profit_lock_enabled: bool = False
     daily_profit_lock_pct: float = 0.08   # halt new entries: day PnL >= +8% (only if enabled above)
-    loss_streak_limit: int = 2            # 3 consecutive losses ->
-    loss_streak_cooldown_min: int = 180   # -> 3-hour cooldown (was 30 min)
+    loss_streak_limit: int = 3            # 3 consecutive losses ->
+    loss_streak_cooldown_min: int = 60   # -> 3-hour cooldown (was 30 min)
     max_open_positions: int = 0  # set in __post_init__ from MAX_POSITIONS (default 2)
 
     # ── Fees ─────────────────────────────────────────────────────────────────
-    # VERIFIED from an actual OKX fill (2026-07-22, BTCUSDT perp market open:
-    # fee 0.3325905 USDT on $664.70 notional = 0.0500%): this account pays
-    # 0.05% taker per fill, NOT the 0.10% previously assumed. Used by live/
-    # paper PnL accounting, the fee-aware stop floor, the fee-drag entry
-    # reject AND the backtest — the old 2x-overstated value was silently
-    # rejecting valid entries and widening every minimum stop.
-    fee_rate: float = 0.0005
+    # OKX charges 0.10% per fill on this account — open, close, TP and SL all
+    # pay it. Used by live/paper PnL accounting AND the backtest, so the two
+    # can never disagree on fee drag.
+    fee_rate: float = 0.001
 
     # ── /stats ───────────────────────────────────────────────────────────────
     # /stats is sourced live from OKX's own closed-position history (not this
@@ -305,9 +302,9 @@ class Config:
     swing_lookback_left: int = 3
     swing_lookback_right: int = 3
 
-    symbol_cooldown_min: int = 30   # normal close cooldown
+    symbol_cooldown_min: int = 15   # normal close cooldown
     symbol_sl_cooldown_min: int = 90  # longer pause after full SL to avoid repeated same-symbol churn
-    symbol_be_cooldown_min: int = 45  # pause after fee-adjusted runner stop
+    symbol_be_cooldown_min: int = 20  # pause after fee-adjusted runner stop
 
     # ── SpikeGuard (fast 5m/15m reversal-spike protection) ───────────────────
     # Runs EVERY poll tick while a position is open — the slow 30m health
@@ -555,8 +552,8 @@ class Config:
     # activated only after two same-direction full SLs within this window.
     dual_reentry_lock_after_sl_count: int = 2
     dual_reentry_sl_window_hours: int = 12
-    dual_same_engine_cooldown_bars_precision: int = 36
-    dual_same_engine_cooldown_bars_high_beta: int = 12
+    dual_same_engine_cooldown_bars_precision: int = 6
+    dual_same_engine_cooldown_bars_high_beta: int = 3
 
     # Regime/bias active-frequency tolerances.
     dual_regime_early_score_min: float = 62.0
@@ -572,7 +569,7 @@ class Config:
     dual_target_buffer_atr: float = 0.08
     dual_pullback_tp2_r: float = 2.20
     dual_momentum_tp2_r: float = 2.40
-    minimum_actual_rr: float = 1.50
+    minimum_actual_rr: float = 1.35
 
     bias_min_directional_edge: float = 8.0
     bias_1h_min_bull: float = 56.0
@@ -636,6 +633,99 @@ class Config:
     bias_w15m_default: float = 0.45
     bias_w5m_default: float = 0.10
     bias_threshold_default: float = 60.0
+
+
+    # ══ V3.0 Expert Multi-Mode Entry Architecture ═══════════════════════════
+    # 4H is a conflict filter, 1H supplies directional bias, and both 15M and
+    # 5M may trigger an order.  Range/compression regimes are not globally
+    # blocked; they route only to SMC edge/sweep or compression-breakout modes.
+    expert_multimode_enabled: bool = True
+    # 15M remains the setup/context layer; execution defaults to closed 5M
+    # confirmation. Direct 15M fills are supported but disabled by default.
+    expert_allow_15m_entry: bool = False
+    expert_allow_5m_entry: bool = True
+    # Kept as an optional module. Default off because generic EMA20 pullbacks
+    # were less stable than SMC rejection, fresh retest and EMA timing setups.
+    expert_structure_pullback_enabled: bool = False
+    expert_allow_range_trades: bool = False
+    expert_allow_compression_breakout: bool = True
+    # Direct breakout logic remains available, but defaults off because fee-heavy
+    # first breaks were materially less reliable than breakout-retests in tests.
+    expert_direct_breakout_enabled: bool = False
+
+    # Permission is deliberately softer than V2.0. Strong opposite HTF
+    # structure remains a hard veto; ordinary disagreement only raises the
+    # setup threshold instead of suppressing every candidate.
+    expert_bias_edge_min: float = 4.0
+    expert_bias_score_min: float = 52.0
+    expert_htf_conflict_score: float = 72.0
+    expert_htf_conflict_edge: float = 18.0
+    expert_15m_opposite_veto_edge: float = 18.0
+
+    # Meaningful 0-100 setup thresholds. A valid setup must also satisfy
+    # non-compensable room, extension, stop and cost gates.
+    expert_thr_15m_ema_cross: float = 64.0
+    expert_thr_5m_ema_cross: float = 62.0
+    expert_thr_structure_pullback: float = 65.0
+    expert_thr_smc_zone_rejection: float = 67.0
+    expert_thr_breakout_retest: float = 65.0
+    expert_thr_direct_breakout: float = 70.0
+    expert_thr_liquidity_sweep: float = 66.0
+    expert_thr_momentum_continuation: float = 63.0
+    expert_thr_range_reversal: float = 69.0
+
+    expert_strong_trend_discount: float = 3.0
+    expert_weak_context_add: float = 3.0
+    expert_min_local_edge: float = 3.0
+    expert_min_room_r: float = 1.05
+    expert_major_level_veto_atr: float = 0.60
+    expert_range_min_room_r: float = 0.95
+    expert_max_extension_atr_5m: float = 1.10
+    expert_max_extension_atr_15m: float = 1.20
+    expert_zone_touch_atr: float = 0.30
+    expert_zone_lookback_15m: int = 96
+    expert_zone_lookback_1h: int = 80
+    expert_zone_lookback_4h: int = 60
+    expert_breakout_lookback_5m: int = 12
+    expert_breakout_lookback_15m: int = 10
+    expert_retest_window_bars: int = 4
+    # Execution quality gates calibrated as non-compensable filters. They do
+    # not simply add score: a late/weak trigger is rejected even if HTF score
+    # is high.
+    expert_retest_max_age_bars: int = 1
+    expert_ema_cross_adx_min: float = 18.0
+    expert_ema_cross_di_spread_min: float = 5.0
+    expert_pullback_adx_min: float = 20.0
+    expert_pullback_di_spread_min: float = 8.0
+    expert_pullback_edge_min: float = 40.0
+    expert_pullback_edge_max: float = 65.0
+    expert_smc_edge_min_strong: float = 60.0
+    expert_smc_edge_min_early: float = 55.0
+    expert_smc_edge_max: float = 75.0
+    expert_smc_di_spread_min: float = 8.0
+    expert_smc_max_ema20_extension_atr: float = 3.40
+    expert_fvg_max_width_pct: float = 0.0065
+    expert_1h_zone_requires_15m_structure: bool = True
+    expert_smc_rsi_long_max: float = 82.0
+    expert_smc_rsi_short_min: float = 18.0
+    expert_sweep_edge_max: float = 65.0
+    expert_min_displacement_atr: float = 0.24
+    expert_direct_breakout_body_atr: float = 0.42
+    expert_direct_breakout_volume_ratio: float = 1.10
+    expert_range_rsi_long: float = 38.0
+    expert_range_rsi_short: float = 62.0
+    expert_same_setup_cooldown_5m_bars: int = 3
+    expert_same_setup_cooldown_15m_bars: int = 1
+    expert_reentry_lock_hours: int = 8
+
+    # Setup-specific TP2 geometry. TP1 remains controlled by tp1_r and
+    # tp1_fraction in the shared PositionManager.
+    expert_tp2_ema_cross_r: float = 2.00
+    expert_tp2_pullback_r: float = 2.20
+    expert_tp2_smc_r: float = 2.10
+    expert_tp2_breakout_r: float = 2.40
+    expert_tp2_continuation_r: float = 2.10
+    expert_tp2_range_r: float = 1.70
 
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))

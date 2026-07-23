@@ -589,19 +589,11 @@ class Bot:
                     f"EMA8/13={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}`"
                     if sig.entry is not None else "`-`"
                 )
-                # score=N/A = none of the 5 engines built a candidate on this
-                # bar (bias/regime can be maximally aligned and this still
-                # happens — bias is trend conviction, not "a pattern exists
-                # right now"). Show WHY so it's diagnosable from /status alone.
-                why_str = ""
-                if (sig.entry is not None and not getattr(sig.entry, "score_evaluated", False)
-                        and sig.entry.reason):
-                    why_str = f"\n  why `{sig.entry.reason[:160]}`"
                 lines.append(
                     f"`{sym}` {pos_label}\n"
                     f"  regime `{sig.regime.label}`\n"
                     f"  bias {bias_str}\n"
-                    f"  entry {entry_str} dir `{sig.direction}`{cd_lb}{why_str}")
+                    f"  entry {entry_str} dir `{sig.direction}`{cd_lb}")
             await self.telegram.send_text("📡 *Status*\n\n" + "\n".join(lines))
         else:
             await self.telegram.send_text(f"unknown command: {cmd} — try /help")
@@ -742,21 +734,11 @@ class Bot:
                 f"EMA8/13={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
                 if sig.entry is not None else "-"
             )
-            # score=N/A only means "none of the 5 engines built a candidate on
-            # THIS bar" — it does not mean bias/regime are wrong or the bot is
-            # stuck. Surface entry.reason (already computed — which engines
-            # are armed, local/15M scores) so that's visible without needing
-            # a separate diagnostic pass every time it comes up.
-            why = (
-                f" why={sig.entry.reason[:140]}"
-                if sig.entry is not None and not getattr(sig.entry, "score_evaluated", False)
-                and sig.entry.reason else ""
-            )
             blk = f" blocked={sig.blocked_layer}" if sig.blocked_layer else ""
             logger.info(
-                "  %-16s %-24s regime=%-20s bias=%-40s entry=%-5s dir=%s%s%s%s",
+                "  %-16s %-24s regime=%-20s bias=%-40s entry=%-5s dir=%s%s%s",
                 symbol, pos_label, sig.regime.label, bias_label, entry_label,
-                sig.direction, cd_label, blk, why,
+                sig.direction, cd_label, blk,
             )
 
 
