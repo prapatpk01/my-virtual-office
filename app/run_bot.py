@@ -253,8 +253,12 @@ def build_config() -> dict:
         "use_adaptive": _env_bool("USE_ADAPTIVE", False),
         "adaptive_balance": _env_float("ADAPTIVE_BALANCE", 10000.0),
         "adaptive_risk_pct": _env_float("ADAPTIVE_RISK_PCT", 0.05),
-        "adaptive_daily_loss": _env_float("ADAPTIVE_DAILY_LOSS_PCT", -3.0),
-        "adaptive_daily_profit": _env_float("ADAPTIVE_DAILY_PROFIT_PCT", 8.0),
+        # Daily PnL day-halt DISABLED by default (0 = off) so the bot trades
+        # 24/7 and never stops after a profitable day. On a small balance the
+        # old -3%/+8% halted almost immediately. Set a negative loss / positive
+        # profit value again to re-enable the daily brake.
+        "adaptive_daily_loss": _env_float("ADAPTIVE_DAILY_LOSS_PCT", 0.0),
+        "adaptive_daily_profit": _env_float("ADAPTIVE_DAILY_PROFIT_PCT", 0.0),
         "adaptive_cooldown_min": _env_int("ADAPTIVE_COOLDOWN_MIN", 30),
         "adaptive_max_loss_streak": _env_int("ADAPTIVE_MAX_LOSS_STREAK", 3),
         "adaptive_max_positions": _env_int("ADAPTIVE_MAX_POSITIONS", 2),

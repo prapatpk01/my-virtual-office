@@ -2518,7 +2518,12 @@ class TradingBot:
                 # naive/aware mismatch after a state reload — reset rather than block forever
                 self._last_close_at = None
 
-        if self.daily_pnl_pct <= self.daily_loss_limit_pct:
+        # [DAILY LIMITS] Disabled sentinel: loss limit off when >= 0, profit
+        # limit off when <= 0 (so 0/0 = trade 24/7, never day-halt). On a
+        # small balance the old -3%/+8% tripped almost immediately (one 5%-
+        # risk SL loss alone is -5% < -3%, and ~4 small wins clear +8%),
+        # which stranded most symbols in BLOCKED for the rest of the day.
+        if self.daily_loss_limit_pct < 0 and self.daily_pnl_pct <= self.daily_loss_limit_pct:
             self.state = "BLOCKED"
             self._log_event(
                 f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit loss limit",
@@ -2526,7 +2531,7 @@ class TradingBot:
             )
             return False
 
-        if self.daily_pnl_pct >= self.daily_profit_limit_pct:
+        if self.daily_profit_limit_pct > 0 and self.daily_pnl_pct >= self.daily_profit_limit_pct:
             self.state = "BLOCKED"
             self._log_event(
                 f"BLOCKED: daily PnL {self.daily_pnl_pct:.2f}% hit profit limit",
