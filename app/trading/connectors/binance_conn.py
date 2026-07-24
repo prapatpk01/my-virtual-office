@@ -1,5 +1,7 @@
 """OKX/CCXT connector (named BinanceConnector for backward compatibility)."""
+import asyncio
 import logging
+import random
 import uuid
 from typing import Optional
 
@@ -42,6 +44,9 @@ class BinanceConnector(BaseConnector):
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
+            # CCXT timeout is milliseconds. 30s is safer for Railway→OKX
+            # during brief network congestion than the library default.
+            "timeout": 30000,
             "options": options,
         }
         if passphrase:
@@ -59,9 +64,42 @@ class BinanceConnector(BaseConnector):
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = "1h",
                           limit: int = 200) -> list[OHLCV]:
+        """Fetch candles with bounded retry/backoff for transient OKX errors.
+
+        A temporary RequestTimeout must not abort the symbol scan or flood
+        Railway with a full traceback. Fatal exchange/auth errors still raise
+        immediately so configuration problems remain visible.
+        """
         tf = self.TIMEFRAME_MAP.get(timeframe, "1h")
-        raw = await self._exchange.fetch_ohlcv(symbol, tf, limit=limit)
-        return [OHLCV(ts, o, h, l, c, v) for ts, o, h, l, c, v in raw]
+        max_attempts = 4
+        retryable = (
+            ccxt.RequestTimeout,
+            ccxt.NetworkError,
+            ccxt.ExchangeNotAvailable,
+            ccxt.RateLimitExceeded,
+            ccxt.DDoSProtection,
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                raw = await self._exchange.fetch_ohlcv(symbol, tf, limit=limit)
+                return [OHLCV(ts, o, h, l, c, v) for ts, o, h, l, c, v in raw]
+            except retryable as exc:
+                if attempt >= max_attempts:
+                    _log.warning(
+                        "[MarketData][%s %s] unavailable after %d attempts: %s",
+                        symbol, tf, max_attempts, exc,
+                    )
+                    raise
+                delay = min(1.5 * (2 ** (attempt - 1)), 8.0)
+                delay += random.uniform(0.0, 0.35)
+                _log.warning(
+                    "[MarketData][%s %s] transient error (%d/%d): %s; retry in %.1fs",
+                    symbol, tf, attempt, max_attempts, exc, delay,
+                )
+                await asyncio.sleep(delay)
+
+        return []  # unreachable; keeps static type checkers satisfied
 
     async def fetch_ticker(self, symbol: str) -> dict:
         return await self._exchange.fetch_ticker(symbol)
