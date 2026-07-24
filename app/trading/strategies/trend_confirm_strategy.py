@@ -285,7 +285,10 @@ class TrendConfirmStrategy(BaseStrategy):
         exit_on_trend_flip: bool = True,    # exit when the trend_tf (1h) Layer1 trend flips against us
         use_structural_exit: bool = True,   # exit when price closes past EMA50 (sl_ema_ref) — a real break
         exit_structural_confirm_bars: int = 1,   # N closes past EMA50 required
-        use_ema_crossback_exit: bool = False,    # the fast EMA8/13 cross-back exit — OFF (caused the whipsaw)
+        use_ema_crossback_exit: bool = False,    # ALWAYS-on fast EMA8/13 cross-back exit — OFF (caused whipsaw)
+        crossback_exit_after_target: bool = True,  # once IN PROFIT or past +0.8R (be_trailed), DO take the fast
+                                                   #   EMA8/13 cross-back — lock the gain on a reversal. Before
+                                                   #   profit it stays sticky (only trend-flip / EMA50 exits).
         use_close_past_exit: bool = False,  # the fast "close past EMA13" exit — OFF (too twitchy)
         exit_close_confirm_bars: int = 1,   # N consecutive closes past EMA_slow required (if the above is on)
         signal_exit_requires_tp1: bool = False,  # cross-back exit works immediately (no TP1 to wait for now)
@@ -446,6 +449,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.use_structural_exit = use_structural_exit
         self.exit_structural_confirm_bars = max(1, int(exit_structural_confirm_bars))
         self.use_ema_crossback_exit = use_ema_crossback_exit
+        self.crossback_exit_after_target = crossback_exit_after_target
         self.use_close_past_exit = use_close_past_exit
         self.exit_close_confirm_bars = exit_close_confirm_bars
         self.signal_exit_requires_tp1 = signal_exit_requires_tp1
@@ -1179,15 +1183,23 @@ class TrendConfirmStrategy(BaseStrategy):
             return PositionUpdate(action="close", close_pct=1.0,
                 reason=f"Exit {pos.upper()}: closed past EMA{self.sl_ema_ref} structure ({self.entry_tf})")
 
-        # (c) Fast EMA8/13 cross-back / close-past-EMA13 — opt-in, OFF by default
-        #     (this is what churned small losses in unclear markets).
-        if self.use_ema_crossback_exit:
+        # (c) Fast EMA8/13 cross-back exit — ARMED once we're in profit or past
+        #     the +0.8R target (be_trailed). Before that it stays sticky (only
+        #     the trend-flip / EMA50 exits above), so a losing wiggle can't churn
+        #     us out; but once green, an EMA reversal locks the gain immediately.
+        in_profit = ((pos == "long" and current_price > self._entry_price)
+                     or (pos == "short" and current_price < self._entry_price)) \
+                    if self._entry_price is not None else False
+        crossback_armed = self.use_ema_crossback_exit or (
+            self.crossback_exit_after_target and (self._be_trailed or in_profit))
+        if crossback_armed:
             xback = (pos == "long" and l3["ema_cross_down"]) or (pos == "short" and l3["ema_cross_up"])
             close_past = self.use_close_past_exit and self._closes_past_ema_slow(candles, pos, cb)
             if xback or close_past:
                 self._reset_position_state()
+                tag = "in profit" if in_profit else "post-0.8R"
                 return PositionUpdate(action="close", close_pct=1.0,
-                    reason=f"Exit {pos.upper()}: EMA{self.ema_fast}/{self.ema_slow} cross-back ({self.entry_tf})")
+                    reason=f"Exit {pos.upper()}: EMA{self.ema_fast}/{self.ema_slow} cross-back ({tag}, {self.entry_tf})")
 
         return PositionUpdate(action="hold",
                               reason=f"Holding {pos.upper()} — {self.trend_tf} trend intact")
