@@ -12,6 +12,8 @@ import os
 import signal
 import sys
 
+import ccxt.async_support as ccxt_async
+
 
 # ---------------------------------------------------------------------------
 # Load .env if present
@@ -1065,6 +1067,19 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
             except asyncio.CancelledError:
                 raise
+            except (ccxt_async.RequestTimeout,
+                    ccxt_async.NetworkError,
+                    ccxt_async.ExchangeNotAvailable,
+                    ccxt_async.RateLimitExceeded,
+                    ccxt_async.DDoSProtection) as e:
+                # The connector already retried with exponential backoff.
+                # Skip only this symbol for this loop; other symbols and open
+                # position management continue normally. Avoid a giant
+                # traceback for an expected transient network condition.
+                logger.warning(
+                    "[Adaptive][%s] market data temporarily unavailable after retries; "
+                    "skipping this tick: %s", sym, e,
+                )
             except Exception as e:
                 logger.error("[Adaptive][%s] tick error: %s", sym, e, exc_info=True)
 
