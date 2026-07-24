@@ -1,2 +1,2 @@
-DUALCORE V3.0 EXPERT MULTIMODE
-5M precision execution with 15M structure/SMC context, 1H bias/regime and 4H macro conflict filter.
+DUALCORE V3.0.1 OKX NETWORK RESILIENCE
+Expert multimode strategy with timeout-safe OKX candle retrieval, per-candle caching, stale-data fallback and alert de-duplication.

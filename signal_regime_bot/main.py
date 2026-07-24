@@ -20,7 +20,7 @@ import pandas as pd
 
 from config import load_config
 from exchange_client import ExchangeClient
-from data_engine import DataEngine, drop_unclosed_bar, _ohlcv_to_df
+from data_engine import DataEngine, MarketDataUnavailable
 from pipeline import Pipeline, LONG, SHORT
 from risk_manager import RiskManager
 from position_manager import PositionManager
@@ -102,6 +102,8 @@ class Bot:
         self._cooldown_alert_sent = False
         self._last_status_log_ts = 0.0
         self._last_reconcile_ts = 0.0         # periodic untracked-position safety net
+        self._data_fail_count: dict[str, int] = {}
+        self._data_alerted: set[str] = set()
         self._trade_log: list[dict] = []      # closed trades (for /trades, live view)
         # Persistent close-journal — one line per closed trade with the exit
         # bucket (TP/BE/SL) the bot observed. Survives restarts and is the ONLY
@@ -229,9 +231,30 @@ class Bot:
             # symbol that's actually in a position is never re-opened, and the
             # user is always told about a live position within ~one cycle.
             await self._maybe_reconcile()
+            self.data.new_tick()
             for symbol in self.cfg.symbols:
                 try:
                     await self._process_symbol(symbol)
+                    previous_failures = self._data_fail_count.pop(symbol, 0)
+                    if symbol in self._data_alerted:
+                        self._data_alerted.discard(symbol)
+                        await self.telegram.send_text(
+                            f"✅ *OKX market data recovered* `{_sym(symbol)}`\n"
+                            f"Candles are available again after {previous_failures} failed cycle(s)."
+                        )
+                except MarketDataUnavailable as e:
+                    count = self._data_fail_count.get(symbol, 0) + 1
+                    self._data_fail_count[symbol] = count
+                    logger.warning("[%s] market data unavailable cycle=%d: %s", symbol, count, e)
+                    # A single timeout is routine. Alert only after three full
+                    # symbol cycles fail, then stay quiet until recovery.
+                    if count >= 3 and symbol not in self._data_alerted:
+                        self._data_alerted.add(symbol)
+                        await self.telegram.send_text(
+                            f"⚠️ *OKX market data delayed* `{_sym(symbol)}`\n"
+                            "The bot is retrying automatically and will skip new entries "
+                            "until complete candle data is available. Existing native SL/TP remain active."
+                        )
                 except Exception as e:
                     logger.error("[%s] unhandled error: %s", symbol, e, exc_info=True)
                     await self.telegram.error(symbol, str(e))
@@ -281,7 +304,6 @@ class Bot:
     # ── Per-symbol processing ────────────────────────────────────────────────
 
     async def _process_symbol(self, symbol: str):
-        self.data.new_tick()
         frames = await self.data.fetch_all(symbol)
         if not self.data.has_min_bars(frames):
             logger.debug("[%s] insufficient bars (<%d) on one or more TFs — skip",
@@ -322,7 +344,7 @@ class Bot:
         # SpikeGuard — EVERY tick, 5m/15m closed bars + live price. The fast
         # layer: force-close before a V-reversal eats the full SL (+slippage).
         if self.cfg.spike_guard_enabled:
-            spike_event = await self._check_spike_guard(symbol, pos, price)
+            spike_event = await self._check_spike_guard(symbol, pos, price, df_15m, df_5m)
             if spike_event:
                 await self._handle_event(spike_event)
                 return
@@ -332,21 +354,19 @@ class Bot:
         if eevent:
             await self._handle_event(eevent)
 
-    async def _check_spike_guard(self, symbol: str, pos, price: float):
-        """Fetch 5m/15m closed bars and run the spike check. Non-fatal on data errors."""
-        import time as _t
-        c = self.cfg
-        now_ms = int(_t.time() * 1000)
-        try:
-            raw5 = await self.client.fetch_ohlcv(symbol, c.spike_tf_fast, limit=c.spike_fetch_limit)
-            raw15 = await self.client.fetch_ohlcv(symbol, c.spike_tf_slow, limit=c.spike_fetch_limit)
-        except Exception as e:
-            logger.warning("[%s] spike-guard data fetch failed (skipping this tick): %s", symbol, e)
-            return None
-        df5 = drop_unclosed_bar(_ohlcv_to_df(raw5), c.spike_tf_fast, now_ms)
-        df15 = drop_unclosed_bar(_ohlcv_to_df(raw15), c.spike_tf_slow, now_ms)
+    async def _check_spike_guard(self, symbol: str, pos, price: float, df_15m, df_5m):
+        """Run the spike check using frames already fetched for this symbol.
 
-        result = check_spike(pos.side, pos.entry_price, pos.one_r, df5, df15, price, c)
+        The previous implementation downloaded 5M and 15M a second time on
+        every open-position poll, doubling public API traffic exactly when
+        reliable position management mattered most.
+        """
+        c = self.cfg
+        if df_5m is None or df_15m is None or len(df_5m) < 3 or len(df_15m) < 3:
+            logger.warning("[%s] spike-guard skipped: insufficient cached frames", symbol)
+            return None
+
+        result = check_spike(pos.side, pos.entry_price, pos.one_r, df_5m, df_15m, price, c)
         if result.action != SPIKE_CLOSE:
             return None
         logger.warning("[%s] SPIKE GUARD firing: %s", symbol, result.reason)
