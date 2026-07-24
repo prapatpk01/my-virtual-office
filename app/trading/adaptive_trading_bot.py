@@ -1094,6 +1094,13 @@ class TradingBot:
         # Runner updates this before each tick to enforce a portfolio-wide
         # MAX_RANGE_POSITIONS without touching Trend/Breakout slots.
         self.range_entry_allowed: bool = True
+        # Portfolio-level direction veto populated by run_bot.py. Used to
+        # prevent BTC and ETH from opening the same directional exposure at
+        # the same time without altering position size or cooldown logic.
+        self.blocked_entry_directions: set = set()
+        self.symbol: str = ""
+        # Pending Trend retest created after an oversized displacement candle.
+        self._pending_trend_retest: Dict[str, Dict] = {}
         self.range_cooldown_until: Optional[datetime.datetime] = None
         self.range_loss_streak: int = 0
         self.mtf_engine         = MTFConfluenceEngine()
@@ -1560,8 +1567,8 @@ class TradingBot:
     # equivalent of +$4.3k (mainly XAU +$3.5k, XRP +$1.7k; SOL/XAG/CL a bit
     # worse) at the cost of ~3pp win-rate (66.8% → 63.4%) — targets sit
     # further out so fewer trades reach T1/T2, but each banked leg is bigger.
-    TP1_R: float = 0.6
-    TP2_R: float = 1.2
+    TP1_R: float = 0.70
+    TP2_R: float = 1.30
 
     def _target_ladder(self) -> List[tuple]:
         """
@@ -2309,6 +2316,57 @@ class TradingBot:
         self._scan_info[direction] += " | armed retest (await reclaim 1-3 bars)"
         return None
 
+    def _symbol_strategy_blocked(self, regime: str, strategy: str) -> bool:
+        """Local performance guard for this symbol × regime × strategy.
+
+        The shared ExpectancyEngine still evaluates a strategy across all
+        symbols. This second guard prevents one weak symbol/strategy pair from
+        being hidden by good results elsewhere. It changes eligibility only;
+        it never changes risk or cooldown.
+        """
+        rows = [r for r in self.trade_journal
+                if r.get("strategy") == strategy
+                and (r.get("e_state") or r.get("market_state")) == regime]
+        rows = rows[-20:]
+        if len(rows) < 8:
+            return False
+        wins = sum(1 for r in rows if r.get("win_loss") == "WIN")
+        wr = wins / len(rows)
+        avg_r = sum(float(r.get("realized_r") or 0.0) for r in rows) / len(rows)
+        return wr < 0.50 or avg_r < 0.0
+
+    def _trend_retest_gate(self, direction: str, candle: Dict, ind: Dict) -> bool:
+        """Require a real retest after a large 15m displacement candle.
+
+        Returns True when entry may continue. A large impulse arms a retest
+        and blocks the current bar. The next three bars must revisit the
+        breakout/open level and close back in the intended direction.
+        """
+        atr = max(float(ind.get("atr", 0.0)), 1e-9)
+        o = float(candle.get("open", candle.get("close", 0.0)))
+        h = float(candle.get("high", o)); l = float(candle.get("low", o))
+        c = float(candle.get("close", o))
+        body_r = abs(c-o)/atr
+        vol_ratio = float(ind.get("volume", 0.0))/max(float(ind.get("vol_avg", ind.get("volume", 1.0))),1e-9)
+        pending = self._pending_trend_retest.get(direction)
+        if pending:
+            pending["bars"] += 1
+            level = float(pending["level"]); tol = 0.18*atr
+            retested = (l <= level + tol and c > level) if direction == "LONG" else (h >= level - tol and c < level)
+            if retested:
+                self._pending_trend_retest.pop(direction, None)
+                return True
+            if pending["bars"] >= 3:
+                self._pending_trend_retest.pop(direction, None)
+            self._scan_info[direction] = f"veto:waiting-trend-retest ({pending['bars']}/3, level={level:.4f})"
+            return False
+        impulse = ((direction == "LONG" and c > o) or (direction == "SHORT" and c < o)) and (body_r >= 0.80 or vol_ratio >= 1.80)
+        if impulse:
+            self._pending_trend_retest[direction] = {"level": o, "bars": 0}
+            self._scan_info[direction] = f"veto:displacement-wait-retest (body={body_r:.2f}ATR vol={vol_ratio:.2f}x)"
+            return False
+        return True
+
     def _generate_signal(self, direction: str, candle_15m: Dict, ind_15m: Dict,
                          ind_1h: Dict, ind_4h: Dict,
                          l1: Dict, l2: Dict, l3: Dict) -> Optional[Dict]:
@@ -2319,6 +2377,26 @@ class TradingBot:
         """
         regime     = l3["regime"]
         threshold  = REGIME_THRESHOLDS.get(regime, 62)
+
+        if direction in self.blocked_entry_directions:
+            self._scan_info[direction] = "veto:correlated BTC/ETH exposure already open"
+            return None
+
+        # Trend is a continuation engine, so it must not trade against a
+        # materially opposing 4H macro. Breakout keeps its dedicated transition
+        # rules and Range keeps its isolated edge-fade rules.
+        macro_score = float(l1.get("score", 50.0))
+        if regime == "Trend":
+            if direction == "LONG" and macro_score < 45.0:
+                self._filter_stats["checked"] += 1
+                self._filter_stats["veto_macro"] += 1
+                self._scan_info[direction] = f"veto:trend macro conflict (LONG macro={macro_score:.0f}<45)"
+                return None
+            if direction == "SHORT" and macro_score > 55.0:
+                self._filter_stats["checked"] += 1
+                self._filter_stats["veto_macro"] += 1
+                self._scan_info[direction] = f"veto:trend macro conflict (SHORT macro={macro_score:.0f}>55)"
+                return None
 
         # Range and Breakout each have a dedicated isolated engine — keeping
         # these branches first guarantees the add-ons cannot modify Trend's
@@ -2389,6 +2467,10 @@ class TradingBot:
         # Enter the QUIET phase of a 4H trend (15m ADX still low = pullback),
         # never the extended leg. Backtest: ADX≤22 → 68.9% WR, ADX>30 → 47%.
         if regime == "Trend":
+            if not self._trend_retest_gate(direction, candle_15m, ind_15m):
+                self._filter_stats["checked"] += 1
+                self._filter_stats["veto_chase"] += 1
+                return None
             _adx15 = ind_15m.get("adx", 20.0)
             if _adx15 > self.MAX_15M_ADX_TREND:
                 self._filter_stats["checked"] += 1
@@ -2412,6 +2494,7 @@ class TradingBot:
             s: self.strategy_scorer.score(s, direction, ind_15m, l1, l2, regime)
             for s in REGIME_STRATEGIES.get(regime, REGIME_STRATEGIES["Trend"])
             if not self.expectancy_engine.is_blocked(regime, s)
+            and not self._symbol_strategy_blocked(regime, s)
         }
         best = self.confidence_engine.select_best(strategy_scores)
         if best is None:
