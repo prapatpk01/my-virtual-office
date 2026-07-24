@@ -253,8 +253,9 @@ class TrendConfirmStrategy(BaseStrategy):
         regime_strong_threshold_discount: float = 3.0,
         regime_transition_threshold_penalty: float = 3.0,
         allow_structure_entry_in_transition: bool = True,
-        require_trend_regime: bool = False,     # if True, HARD-block non-TREND regimes. Default off:
-                                                #   TRANSITION is allowed but must pass the extra gate below.
+        require_trend_regime: bool = True,      # enter only a CLEAR trend (regime TREND/STRONG_TREND).
+                                                #   TRANSITION/CHOP no longer trade — cuts the unclear-market
+                                                #   churn. Set False to allow TRANSITION via the extra gate below.
         # TRANSITION extra-analysis gate — these regimes CAN trade, but need
         # real confirmation. Kept LIGHT on the quality axis (a fresh cross is
         # usually early-trend, which already carries the stricter early
@@ -277,9 +278,16 @@ class TrendConfirmStrategy(BaseStrategy):
         sideways_range_atr: float = 1.2,            # last-20-bar high-low range < this x ATR = tight consolidation
         sideways_min_signals: int = 3,              # how many of the 4 signals must fire to veto (clear ranges only)
         # Exit (5m): EMA10/20 cross-back OR a 5m close past EMA20 closes the runner
-        use_close_past_exit: bool = True,   # faster exit: also close when price closes past EMA_slow (before
-                                            #   the full EMA8/13 cross-back) — more responsive, protects profit
-        exit_close_confirm_bars: int = 1,   # N consecutive closes past EMA_slow required (1 = fastest)
+        # ── Exit style ────────────────────────────────────────────────────
+        # STICKY by default: stay in the trade until the TREND actually reverses
+        # (the 1h trend flips, or price closes past EMA50) — not on every fast
+        # EMA8/13 wiggle, which was churning small losses in unclear markets.
+        exit_on_trend_flip: bool = True,    # exit when the trend_tf (1h) Layer1 trend flips against us
+        use_structural_exit: bool = True,   # exit when price closes past EMA50 (sl_ema_ref) — a real break
+        exit_structural_confirm_bars: int = 1,   # N closes past EMA50 required
+        use_ema_crossback_exit: bool = False,    # the fast EMA8/13 cross-back exit — OFF (caused the whipsaw)
+        use_close_past_exit: bool = False,  # the fast "close past EMA13" exit — OFF (too twitchy)
+        exit_close_confirm_bars: int = 1,   # N consecutive closes past EMA_slow required (if the above is on)
         signal_exit_requires_tp1: bool = False,  # cross-back exit works immediately (no TP1 to wait for now)
                                                  #   bounds manage the trade until then. On 5m the single-close
                                                  #   slow-EMA exits killed 75% of trades at ~-0.3R before TP1; arming
@@ -434,6 +442,10 @@ class TrendConfirmStrategy(BaseStrategy):
         self.sideways_range_atr = sideways_range_atr
         self.sideways_min_signals = sideways_min_signals
 
+        self.exit_on_trend_flip = exit_on_trend_flip
+        self.use_structural_exit = use_structural_exit
+        self.exit_structural_confirm_bars = max(1, int(exit_structural_confirm_bars))
+        self.use_ema_crossback_exit = use_ema_crossback_exit
         self.use_close_past_exit = use_close_past_exit
         self.exit_close_confirm_bars = exit_close_confirm_bars
         self.signal_exit_requires_tp1 = signal_exit_requires_tp1
@@ -1146,25 +1158,56 @@ class TrendConfirmStrategy(BaseStrategy):
             return PositionUpdate(action="hold",
                                   reason=f"Holding {self._open_position.upper()} — signal exits armed after TP1")
 
+        pos = self._open_position
         cb = self.exit_close_confirm_bars
-        if self._open_position == "long":
-            close_exit = (self.use_close_past_exit
-                          and self._closes_past_ema_slow(candles, "long", cb))
-            if l3["ema_cross_down"] or close_exit:
-                reason = (f"EMA{self.ema_fast} crossed below EMA{self.ema_slow}" if l3["ema_cross_down"]
-                          else f"price closed below EMA{self.ema_slow} (early)")
-                self._reset_position_state()
-                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} ({self.entry_tf})")
-        if self._open_position == "short":
-            close_exit = (self.use_close_past_exit
-                          and self._closes_past_ema_slow(candles, "short", cb))
-            if l3["ema_cross_up"] or close_exit:
-                reason = (f"EMA{self.ema_fast} crossed above EMA{self.ema_slow}" if l3["ema_cross_up"]
-                          else f"price closed above EMA{self.ema_slow} (early)")
-                self._reset_position_state()
-                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} ({self.entry_tf})")
 
-        return PositionUpdate(action="hold", reason=f"Holding {self._open_position.upper()}")
+        # (a) TREND-FLIP exit — the trend we entered on (trend_tf/1h Layer1) has
+        #     actually reversed. This is the primary "the trend changed" exit.
+        if self.exit_on_trend_flip and self._trend_state is not None:
+            flipped = ((pos == "long" and self._trend_state == "down")
+                       or (pos == "short" and self._trend_state == "up"))
+            if flipped:
+                self._reset_position_state()
+                return PositionUpdate(action="close", close_pct=1.0,
+                    reason=f"Exit {pos.upper()}: {self.trend_tf} trend flipped to {self._trend_state.upper()}")
+
+        # (b) STRUCTURAL exit — price closed past EMA50 (the trend structure), a
+        #     real break, not a fast EMA8/13 wiggle.
+        if self.use_structural_exit and self._closes_past_ema(
+                candles, pos, self.exit_structural_confirm_bars, self.sl_ema_ref):
+            self._reset_position_state()
+            return PositionUpdate(action="close", close_pct=1.0,
+                reason=f"Exit {pos.upper()}: closed past EMA{self.sl_ema_ref} structure ({self.entry_tf})")
+
+        # (c) Fast EMA8/13 cross-back / close-past-EMA13 — opt-in, OFF by default
+        #     (this is what churned small losses in unclear markets).
+        if self.use_ema_crossback_exit:
+            xback = (pos == "long" and l3["ema_cross_down"]) or (pos == "short" and l3["ema_cross_up"])
+            close_past = self.use_close_past_exit and self._closes_past_ema_slow(candles, pos, cb)
+            if xback or close_past:
+                self._reset_position_state()
+                return PositionUpdate(action="close", close_pct=1.0,
+                    reason=f"Exit {pos.upper()}: EMA{self.ema_fast}/{self.ema_slow} cross-back ({self.entry_tf})")
+
+        return PositionUpdate(action="hold",
+                              reason=f"Holding {pos.upper()} — {self.trend_tf} trend intact")
+
+    def _closes_past_ema(self, candles: list, side: str, n: int, period: int) -> bool:
+        """True if the last `n` bars ALL closed on the wrong side of EMA{period}
+        for the position (long: below, short: above). Used for the structural
+        EMA50 exit — a genuine break of the trend structure."""
+        closes = [c.close for c in candles]
+        ema_p = self.ema(closes, period)
+        if len(closes) < n:
+            return False
+        for k in range(1, n + 1):
+            if np.isnan(ema_p[-k]):
+                return False
+            if side == "long" and not (closes[-k] < ema_p[-k]):
+                return False
+            if side == "short" and not (closes[-k] > ema_p[-k]):
+                return False
+        return True
 
     def _closes_past_ema_slow(self, candles: list, side: str, n: int) -> bool:
         """True if the last `n` 5m bars ALL closed on the wrong side of EMA20 (ema_slow)
