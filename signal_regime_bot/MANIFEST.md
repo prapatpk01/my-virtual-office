@@ -39,3 +39,8 @@ are NOT imported when the bot runs.
 - runner_lock_r = 0.2 (runner stop = breakeven + 0.2R after TP1)
 - risk_per_trade = 0.05, leverage 20x, max 2 positions
 - env overrides: TP1_R, RUNNER_LOCK_R, SYMBOLS, RISK_PER_TRADE, MAX_POSITIONS, STATS_SINCE_DATE
+
+## V3.0.2 patch
+- `entry_engine.py`: populate EMA8/EMA13/MACD before duplicate-bar return.
+- `main.py`: preserve last meaningful status result during same-bar polling.
+- `EMA_STATUS_FIX.md`: patch notes.

@@ -320,7 +320,18 @@ class Bot:
         # the entry check below AND by the 5-minute status log, so the exit
         # branch and the entry branch never re-run the layers separately.
         sig = self.signal_engine.evaluate(df_1h, df_4h, df_15m, df_5m, df_30m=df_30m, symbol=symbol)
-        self._last_signal_by_symbol[symbol] = sig
+
+        # Do not replace the last meaningful status snapshot with the duplicate
+        # guard result produced by later polls inside the same 5M candle.  This
+        # keeps the most recent evaluated setup/score/reason visible in Railway.
+        # After a cold restart there may be no prior snapshot, so retain the
+        # duplicate result (it now contains real EMA values from entry_engine).
+        duplicate_bar = (
+            sig.entry is not None
+            and sig.entry.reason == "5M bar already processed"
+        )
+        if not duplicate_bar or symbol not in self._last_signal_by_symbol:
+            self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):
             await self._manage_open_position(symbol, df_15m, df_5m)
@@ -859,7 +870,7 @@ class Bot:
                 bias_label = "—"
             entry_label = (
                 f"{sig.entry.setup_type or 'WAIT'} score={_entry_score_text(sig.entry)} "
-                f"EMA8/13={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
+                f"EMA8/13={sig.entry.ema_fast:.6f}/{sig.entry.ema_slow:.6f}"
                 if sig.entry is not None else "-"
             )
             # Surface WHY a flat symbol isn't triggering — the blocking layer's

@@ -1,2 +1,3 @@
-DUALCORE V3.0.1 OKX NETWORK RESILIENCE
-Expert multimode strategy with timeout-safe OKX candle retrieval, per-candle caching, stale-data fallback and alert de-duplication.
+DUALCORE V3.0.2 EXPERT MULTI-ENTRY
+Patch: real EMA8/EMA13 values in duplicate-bar status logs
+Base: V3.0.1 OKX timeout/cache/fallback fix

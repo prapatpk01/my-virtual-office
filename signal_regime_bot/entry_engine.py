@@ -948,8 +948,24 @@ class EntryEngine:
         state=self._get_state(symbol)
         current_ts=pd.Timestamp(df_5m.index[-1])
         price=float(df_5m["close"].iloc[-1])
+
+        # Status/logging may call the pipeline several times while the same
+        # closed 5M candle is still current.  The duplicate-bar guard must block
+        # a second order evaluation, but it must not return the dataclass
+        # defaults (0.0/0.0) for EMA8/EMA13.  Calculate the lightweight display
+        # snapshot before the guard so Railway status always shows real values.
+        close_5m = df_5m["close"].astype(float)
+        ema8_now = ind.safe_float(ind.ema(close_5m, 8).iloc[-1])
+        ema13_now = ind.safe_float(ind.ema(close_5m, 13).iloc[-1])
+        _, _, macd_hist_s = ind.macd(close_5m, 12, 26, 9)
+        macd_hist_now = ind.safe_float(macd_hist_s.iloc[-1])
+
         if state.last_processed_5m==current_ts:
-            return EntryResult(NONE,False,"5M bar already processed",price=price)
+            return EntryResult(
+                NONE, False, "5M bar already processed", price=price,
+                ema_fast=ema8_now, ema_slow=ema13_now,
+                macd_hist=macd_hist_now, score_evaluated=False,
+            )
         state.last_processed_5m=current_ts
 
         label=getattr(regime,"label","")
