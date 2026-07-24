@@ -12,8 +12,6 @@ import os
 import signal
 import sys
 
-import ccxt.async_support as ccxt_async
-
 
 # ---------------------------------------------------------------------------
 # Load .env if present
@@ -660,6 +658,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             sym, bot.min_close_size)
         except Exception as e:
             logger.warning("[Adaptive][%s] could not fetch contract size: %s", sym, e)
+        bot.symbol = sym
         bots[sym] = (bot, state_file)
         last_bar_ts[sym] = 0
 
@@ -904,6 +903,20 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 is_new_bar = latest_ts > last_bar_ts[sym]
                 bot, state_file = bots[sym]
 
+                # [BTC/ETH CORRELATION GATE] Do not stack BTC and ETH in the
+                # same direction. The existing position remains untouched; only
+                # the new same-direction entry is vetoed. No risk or cooldown
+                # parameters are changed.
+                bot.blocked_entry_directions = set()
+                base_now = sym.split("/")[0].upper()
+                if base_now in {"BTC", "ETH"}:
+                    sibling = "ETH" if base_now == "BTC" else "BTC"
+                    for other_sym, (other_bot, _) in bots.items():
+                        if other_sym.split("/")[0].upper() == sibling and other_bot.position_open:
+                            d = (other_bot.current_trade or {}).get("direction")
+                            if d in {"LONG", "SHORT"}:
+                                bot.blocked_entry_directions.add(d)
+
                 # [RANGE PORTFOLIO CAP] At most one Range position by default.
                 # This gate is read only by the dedicated Range engine; Trend
                 # and Breakout are never blocked by it and retain priority for
@@ -1067,19 +1080,6 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
             except asyncio.CancelledError:
                 raise
-            except (ccxt_async.RequestTimeout,
-                    ccxt_async.NetworkError,
-                    ccxt_async.ExchangeNotAvailable,
-                    ccxt_async.RateLimitExceeded,
-                    ccxt_async.DDoSProtection) as e:
-                # The connector already retried with exponential backoff.
-                # Skip only this symbol for this loop; other symbols and open
-                # position management continue normally. Avoid a giant
-                # traceback for an expected transient network condition.
-                logger.warning(
-                    "[Adaptive][%s] market data temporarily unavailable after retries; "
-                    "skipping this tick: %s", sym, e,
-                )
             except Exception as e:
                 logger.error("[Adaptive][%s] tick error: %s", sym, e, exc_info=True)
 
