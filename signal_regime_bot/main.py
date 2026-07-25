@@ -224,7 +224,7 @@ class Bot:
         # authoritative for whether a position exists and its live SL/TP/size.
         restored_positions, restored_watches = self._load_runtime_state()
         logger.info("[STATE] startup restored positions=%d ai_exit_watches=%d", restored_positions, restored_watches)
-        await self._reconcile_positions(context="STARTUP")
+        await self._reconcile_positions(context="STARTUP", startup=True)
         self._save_runtime_state()
 
         self._running = True
@@ -300,38 +300,57 @@ class Bot:
             return
         self._last_reconcile_ts = now
         try:
-            await self._reconcile_positions(context="SAFETY-NET")
+            await self._reconcile_positions(context="SAFETY-NET", startup=False)
         except Exception as e:
             logger.warning("[RECONCILE] periodic sweep failed: %s", e)
 
-    async def _reconcile_positions(self, context: str):
-        """Adopt untracked OKX positions and ALERT for each. Runs at startup
-        and every reconcile_interval_sec — the single guard against a position
-        living on OKX while the bot flies blind (no SL/TP management, no
-        notification, and — worst — re-opening because it thinks it's flat)."""
-        adopted = await self.positions.reconcile_with_exchange(self.cfg.symbols)
-        if not adopted:
+    async def _reconcile_positions(self, context: str, startup: bool = False):
+        """Synchronize live OKX positions with local lifecycle state.
+
+        Startup discoveries are reported as resumed positions. Only positions
+        that appear unexpectedly while the bot is already running are labelled
+        as adopted/untracked.
+        """
+        events = await self.positions.reconcile_with_exchange(
+            self.cfg.symbols, startup=startup
+        )
+        if not events:
             return
-        logger.warning("[%s] Adopted %d untracked position(s): %s", context, len(adopted), adopted)
-        for entry in adopted:
-            # reconcile returns "SYMBOL SIDE" strings; _positions is keyed by
-            # the bare symbol (which itself contains no spaces).
-            sym = entry.rsplit(" ", 1)[0]
+
+        logger.warning("[%s] reconciliation events: %s", context, events)
+        for event in events:
+            if event.get("action") == "warning":
+                await self.telegram.send_text(
+                    f"⚠️ *Reconcile* ({context})\n\n"
+                    f"`{event.get('message', 'unknown warning')}`"
+                )
+                continue
+
+            sym = str(event.get("symbol", ""))
             pos = self.positions.get(sym)
             if pos is None:
-                # e.g. a hedge-conflict warning string — surface it as-is so an
-                # unmanaged leg is never silently dropped.
-                await self.telegram.send_text(f"⚠️ *Reconcile* ({context})\n\n`{entry}`")
                 continue
-            await self.telegram.send_text(
-                f"⚠️ *Adopted untracked position* `{sym}` ({context})\n\n"
-                f"This position was live on OKX but the bot wasn't tracking it — "
-                f"now managing SL/TP.\n"
-                f"Side: `{pos.side}`  Entry: `{pos.entry_price:.6f}`\n"
-                f"SL: `{pos.stop_loss:.6f}`  TP2: `{pos.tp2:.6f}`  "
-                f"TP1: `{pos.tp1 if pos.tp1 else 'hit'}`\n"
-                f"Amount: `{pos.amount:.6f}`"
-            )
+
+            if event.get("action") == "resumed":
+                await self.telegram.send_text(
+                    f"🔄 *Position resumed from OKX* `{sym}`\n\n"
+                    "Existing live position recovered after restart.\n"
+                    "SL/TP synchronized and persistent state saved.\n"
+                    f"Side: `{pos.side}`  Entry: `{pos.entry_price:.6f}`\n"
+                    f"SL: `{pos.stop_loss:.6f}`  TP2: `{pos.tp2:.6f}`  "
+                    f"TP1: `{pos.tp1 if pos.tp1 else 'hit'}`\n"
+                    f"Amount: `{pos.amount:.6f}`"
+                )
+            else:
+                await self.telegram.send_text(
+                    f"⚠️ *Adopted unexpected position* `{sym}` ({context})\n\n"
+                    "This position appeared on OKX while the bot was already running. "
+                    "It is now being managed with the live OKX SL/TP.\n"
+                    f"Side: `{pos.side}`  Entry: `{pos.entry_price:.6f}`\n"
+                    f"SL: `{pos.stop_loss:.6f}`  TP2: `{pos.tp2:.6f}`  "
+                    f"TP1: `{pos.tp1 if pos.tp1 else 'hit'}`\n"
+                    f"Amount: `{pos.amount:.6f}`"
+                )
 
     # ── Per-symbol processing ────────────────────────────────────────────────
 

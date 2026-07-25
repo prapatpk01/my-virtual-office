@@ -358,8 +358,15 @@ class PositionManager:
             )[0]
         return True
 
-    async def reconcile_with_exchange(self, symbols: list[str]) -> list[str]:
-        adopted: list[str] = []
+    async def reconcile_with_exchange(self, symbols: list[str], *, startup: bool = False) -> list[dict]:
+        """Synchronize local state with live OKX positions.
+
+        At startup, newly discovered positions are treated as *resumed from
+        OKX* rather than "untracked".  During normal runtime, a newly appearing
+        exchange position is still classified as externally adopted so the
+        operator is warned about a genuinely unexpected fill/manual trade.
+        """
+        recovered: list[dict] = []
         now = time.time()
         c = self.cfg
         for symbol in symbols:
@@ -396,9 +403,13 @@ class PositionManager:
             if not open_sides:
                 continue
             if len(open_sides) > 1:
-                adopted.append(
-                    f"{symbol} ⚠️ HEDGE conflict — only {open_sides[0][0].upper()} adopted; close other leg manually"
-                )
+                recovered.append({
+                    "action": "warning",
+                    "message": (
+                        f"{symbol} ⚠️ HEDGE conflict — only "
+                        f"{open_sides[0][0].upper()} can be managed; close the other leg manually"
+                    ),
+                })
                 logger.error("[RECONCILE] %s has both long and short open", symbol)
 
             side, details = open_sides[0]
@@ -419,7 +430,7 @@ class PositionManager:
                 logger.warning("[RECONCILE] %s using verified recovery TP2 %.8f", symbol, tp)
             if sl is None or tp is None:
                 msg = f"{symbol} {side.upper()} ⚠️ MANUAL REVIEW — live OKX SL/TP unavailable; not adopted"
-                adopted.append(msg)
+                recovered.append({"action": "warning", "message": msg})
                 logger.error("[RECONCILE] %s; SL=%s TP=%s", msg, sl, tp)
                 continue
 
@@ -446,13 +457,19 @@ class PositionManager:
                 tp2=float(tp),
                 one_r=one_r,
                 tp1_hit=tp1_hit,
-                regime_at_entry="ADOPTED_OKX",
-                bias_at_entry="ADOPTED_OKX",
-                setup_type="ADOPTED_OKX",
+                regime_at_entry=("RESUMED_OKX" if startup else "ADOPTED_OKX"),
+                bias_at_entry=("RESUMED_OKX" if startup else "ADOPTED_OKX"),
+                setup_type=("RESUMED_OKX" if startup else "ADOPTED_OKX"),
             )
-            adopted.append(f"{symbol} {side.upper()}")
+            recovered.append({
+                "action": ("resumed" if startup else "adopted"),
+                "symbol": symbol,
+                "side": side.upper(),
+            })
+            # Persist immediately so a second restart can load this lifecycle
+            # state when STATE_DIR is backed by a Railway Volume.
             self.save_state()
-        return adopted
+        return recovered
 
     async def _emergency_flatten_new_fill(
         self,
