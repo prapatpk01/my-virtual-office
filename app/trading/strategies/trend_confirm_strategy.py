@@ -176,8 +176,13 @@ class TrendConfirmStrategy(BaseStrategy):
         # retest-only execution (no direct chasing) and structure entry requires
         # a confirmed HH/HL or LH/LL sequence plus a reclaim / micro-BOS trigger.
         use_ema_cross_entry: bool = True,
-        use_breakout_retest_entry: bool = False,   # single entry engine: EMA cross only
-        use_structure_retest_entry: bool = False,  # single entry engine: EMA cross only
+        use_breakout_retest_entry: bool = True,
+        use_structure_retest_entry: bool = True,
+        use_price_action_structure_entry: bool = True,
+        # Price-action structure confirmation: sweep/reclaim or BOS/CHOCH with
+        # candle displacement and micro-structure confirmation. This engine is
+        # especially useful in TRANSITION, where EMA alignment is developing
+        # but a clean price-action shift already exists.
         entry_trigger_valid_bars: int = 3,
         breakout_lookback: int = 6,
         breakout_arm_bars: int = 6,
@@ -194,6 +199,15 @@ class TrendConfirmStrategy(BaseStrategy):
         structure_invalidation_atr: float = 0.30,
         structure_micro_bos_lookback: int = 2,
         structure_entry_min_quality: float = 62.0,
+        pa_structure_entry_min_quality: float = 64.0,
+        pa_structure_lookback: int = 12,
+        pa_structure_swing_lookback: int = 5,
+        pa_min_body_atr: float = 0.18,
+        pa_min_close_quality: float = 0.62,
+        pa_min_volume_ratio: float = 0.80,
+        pa_sweep_tolerance_atr: float = 0.12,
+        pa_break_buffer_atr: float = 0.04,
+        pa_require_sweep_or_choch: bool = True,
         entry_stop_buffer_atr: float = 0.10,
         entry_min_stop_atr: float = 0.50,
         entry_max_stop_atr: float = 2.20,
@@ -251,9 +265,9 @@ class TrendConfirmStrategy(BaseStrategy):
         regime_trend_chop_max: float = 61.8,
         regime_min_ema_gap_atr: float = 0.35,
         regime_strong_threshold_discount: float = 3.0,
-        regime_transition_threshold_penalty: float = 3.0,
+        regime_transition_threshold_penalty: float = 1.5,
         allow_structure_entry_in_transition: bool = True,
-        require_trend_regime: bool = True,      # enter only a CLEAR trend (regime TREND/STRONG_TREND).
+        require_trend_regime: bool = False,     # allow TRANSITION through the dedicated confirmation gate (regime TREND/STRONG_TREND).
                                                 #   TRANSITION/CHOP no longer trade — cuts the unclear-market
                                                 #   churn. Set False to allow TRANSITION via the extra gate below.
         # TRANSITION extra-analysis gate — these regimes CAN trade, but need
@@ -263,9 +277,9 @@ class TrendConfirmStrategy(BaseStrategy):
         # sky-high score bar that would block essentially every cross.
         transition_extra_threshold: float = 0.0,    # no quality stacking (6 blocked ~every cross). The extra
                                                      #   analysis is momentum + volume below, not a higher bar.
-        transition_min_vol_ratio: float = 0.5,      # only block genuinely dead volume (< 0.5x its SMA)
+        transition_min_vol_ratio: float = 0.75,      # only block genuinely dead volume (< 0.5x its SMA)
         transition_require_momentum: bool = True,   # need MACD histogram pushing in the trend's direction
-        transition_momentum_frac: float = 0.3,      # momentum dimension must reach this fraction of its weight
+        transition_momentum_frac: float = 0.35,      # momentum dimension must reach this fraction of its weight
         transition_require_clean_location: bool = True,  # reject borderline/penalized HTF location
         # Sideways / range veto (Layer 2) — hard-block entries when the 15m
         # context looks like a range, not a trend. Designed NOT to kill early
@@ -370,6 +384,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self.use_ema_cross_entry = use_ema_cross_entry
         self.use_breakout_retest_entry = use_breakout_retest_entry
         self.use_structure_retest_entry = use_structure_retest_entry
+        self.use_price_action_structure_entry = use_price_action_structure_entry
         self.entry_trigger_valid_bars = max(1, entry_trigger_valid_bars)
         self.breakout_lookback = max(3, breakout_lookback)
         self.breakout_arm_bars = max(1, breakout_arm_bars)
@@ -386,6 +401,15 @@ class TrendConfirmStrategy(BaseStrategy):
         self.structure_invalidation_atr = structure_invalidation_atr
         self.structure_micro_bos_lookback = max(1, structure_micro_bos_lookback)
         self.structure_entry_min_quality = structure_entry_min_quality
+        self.pa_structure_entry_min_quality = pa_structure_entry_min_quality
+        self.pa_structure_lookback = max(6, int(pa_structure_lookback))
+        self.pa_structure_swing_lookback = max(2, int(pa_structure_swing_lookback))
+        self.pa_min_body_atr = max(0.05, float(pa_min_body_atr))
+        self.pa_min_close_quality = max(0.50, min(0.95, float(pa_min_close_quality)))
+        self.pa_min_volume_ratio = max(0.0, float(pa_min_volume_ratio))
+        self.pa_sweep_tolerance_atr = max(0.0, float(pa_sweep_tolerance_atr))
+        self.pa_break_buffer_atr = max(0.0, float(pa_break_buffer_atr))
+        self.pa_require_sweep_or_choch = bool(pa_require_sweep_or_choch)
         self.entry_stop_buffer_atr = entry_stop_buffer_atr
         self.entry_min_stop_atr = entry_min_stop_atr
         self.entry_max_stop_atr = entry_max_stop_atr
@@ -484,6 +508,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self._last_breakout_trigger_down_ts: Optional[int] = None
         self._last_structure_trigger_up_ts: Optional[int] = None
         self._last_structure_trigger_down_ts: Optional[int] = None
+        self._last_pa_structure_trigger_up_ts: Optional[int] = None
+        self._last_pa_structure_trigger_down_ts: Optional[int] = None
         self._last_entry_attempt_bar_ts: Optional[int] = None
         self._last_exit_bar_ts: Optional[int] = None  # owned by tick_open_position()
         self._latest_candles: list = []
@@ -810,27 +836,25 @@ class TrendConfirmStrategy(BaseStrategy):
                 f"Layer2 REGIME veto — need TREND/STRONG_TREND, got {regime.get('state')}",
                 metadata=dbg("regime_veto"))
 
-        # TRANSITION extra-analysis gate: the live losers were TRANSITION-regime
-        # entries (tangled EMAs, weak ADX, chop). TRANSITION may still trade, but
-        # only the strongest setups — a higher quality bar AND volume + momentum +
-        # clean HTF location must all confirm.
+        # TRANSITION confirmation gate. Unlike the previous implementation,
+        # this does not inspect the placeholder `location` object before a
+        # candidate exists. It validates actual directional development:
+        # momentum, volume, EMA compression/expansion and recent price action.
         if regime.get("state") == "TRANSITION":
-            qb = q15.get("breakdown", {})
-            fails = []
+            trans = self._transition_confirmation_context(candles, trend, q15)
             trans_bar = l2_thr + self.transition_extra_threshold
+            fails = []
             if l2_score < trans_bar:
-                fails.append(f"quality {l2_score:.0f} < {trans_bar:.0f} (transition needs extra)")
-            if qb.get("vol_ratio", 0.0) < self.transition_min_vol_ratio:
-                fails.append(f"volume {qb.get('vol_ratio')}x < {self.transition_min_vol_ratio}x")
-            if self.transition_require_momentum and qb.get("momentum", 0.0) < self.momentum_weight * self.transition_momentum_frac:
-                fails.append(f"weak momentum ({qb.get('momentum')}/{self.momentum_weight:.0f})")
-            if self.transition_require_clean_location and location.get("penalize"):
-                fails.append("borderline HTF location")
+                fails.append(f"quality {l2_score:.0f} < {trans_bar:.0f}")
+            if not trans.get("valid"):
+                fails.extend(trans.get("fails", []))
             if fails:
                 _spend_cross_if_early()
-                return self._hold(current_price,
-                    "Layer2 TRANSITION extra-analysis veto: " + "; ".join(fails),
-                    metadata=dbg("transition_extra_veto"))
+                return self._hold(
+                    current_price,
+                    "Layer2 TRANSITION confirmation veto: " + "; ".join(fails),
+                    metadata=dbg("transition_extra_veto"),
+                )
 
         # ── Layer 2a: base trend quality ──────────────────────────────────
         if l2_score <= l2_thr:
@@ -950,6 +974,34 @@ class TrendConfirmStrategy(BaseStrategy):
                 })
                 engine_status["STRUCTURE_RETEST"] = "candidate"
 
+        # Engine D — Price Action Market Structure Confirm. This is distinct
+        # from STRUCTURE_RETEST: it can enter after a fresh BOS/CHOCH or a
+        # liquidity sweep + reclaim, so it does not require a mature HH/HL or
+        # LH/LL sequence. It is deliberately stricter in TRANSITION.
+        if not self.use_price_action_structure_entry:
+            engine_status["PA_STRUCTURE_CONFIRM"] = "disabled"
+        elif not structure_dist_ok:
+            engine_status["PA_STRUCTURE_CONFIRM"] = (
+                f"rejected: {dist_disp}xATR from chase EMA > {self.structure_max_dist_atr_mult:.2f}"
+            )
+        else:
+            pa = self._price_action_structure_setup(c5m, direction, l3["atr_val"], regime.get("state"))
+            last_used = (self._last_pa_structure_trigger_up_ts if direction == "long"
+                         else self._last_pa_structure_trigger_down_ts)
+            if pa is None:
+                engine_status["PA_STRUCTURE_CONFIRM"] = "waiting"
+            elif last_used is not None and pa["trigger_ts"] <= last_used:
+                engine_status["PA_STRUCTURE_CONFIRM"] = "trigger already consumed"
+            else:
+                candidates.append({
+                    "entry_type": "PA_STRUCTURE_CONFIRM", "direction": direction,
+                    "trigger_ts": pa["trigger_ts"], "raw_stop": pa["raw_stop"],
+                    "stop_mode": "structure", "base_edge": pa["edge_score"],
+                    "min_quality": max(l2_thr, self.pa_structure_entry_min_quality),
+                    "detail": pa,
+                })
+                engine_status["PA_STRUCTURE_CONFIRM"] = "candidate"
+
         if not candidates:
             enabled = [name for name, status in engine_status.items() if status != "disabled"]
             return self._hold(current_price,
@@ -1054,6 +1106,11 @@ class TrendConfirmStrategy(BaseStrategy):
                 self._last_structure_trigger_up_ts = selected["trigger_ts"]
             else:
                 self._last_structure_trigger_down_ts = selected["trigger_ts"]
+        elif entry_type == "PA_STRUCTURE_CONFIRM":
+            if direction == "long":
+                self._last_pa_structure_trigger_up_ts = selected["trigger_ts"]
+            else:
+                self._last_pa_structure_trigger_down_ts = selected["trigger_ts"]
 
         self._open_position = direction
         self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
@@ -1834,6 +1891,128 @@ class TrendConfirmStrategy(BaseStrategy):
                     continue
             return True
         return False
+
+    def _transition_confirmation_context(self, candles: list, trend: str,
+                                         q15: Optional[dict]) -> dict:
+        """Directional confirmation used only in TRANSITION.
+
+        Passes when at least three of five independent observations support the
+        Layer-1 direction, while momentum and volume retain minimum floors.
+        This prevents both extremes: trading every transition and blocking all
+        early trends because ADX has not caught up yet.
+        """
+        if not candles or q15 is None or len(candles) < max(30, self.quality_ema_slow + 3):
+            return {"valid": False, "fails": ["transition indicators warming up"], "score": 0}
+        closes = [c.close for c in candles]
+        fast = self.ema(closes, self.quality_ema_fast)
+        slow = self.ema(closes, self.quality_ema_slow)
+        macd = self.ema(closes, self.macd_fast) - self.ema(closes, self.macd_slow)
+        macd_sig = self.ema(macd.tolist(), self.macd_signal)
+        up = trend == "up"
+        last = candles[-1]
+        prev = candles[-2]
+        atr = self._last_atr(candles, self.atr_period) or 0.0
+        qb = q15.get("breakdown", {})
+        vol_ratio = float(qb.get("vol_ratio", 0.0) or 0.0)
+        momentum_points = float(qb.get("momentum", 0.0) or 0.0)
+        checks = {
+            "price_fast_side": last.close > fast[-1] if up else last.close < fast[-1],
+            "fast_slow_alignment": fast[-1] > slow[-1] if up else fast[-1] < slow[-1],
+            "fast_slope": fast[-1] > fast[-3] if up else fast[-1] < fast[-3],
+            "macd_hist_direction": (macd[-1] - macd_sig[-1]) > 0 if up else (macd[-1] - macd_sig[-1]) < 0,
+            "directional_close": (last.close > prev.high if up else last.close < prev.low)
+                                 or (last.close > last.open if up else last.close < last.open),
+        }
+        votes = sum(bool(v) for v in checks.values())
+        fails = []
+        if votes < 3:
+            fails.append(f"directional confirmation {votes}/5 < 3/5")
+        if vol_ratio < self.transition_min_vol_ratio:
+            fails.append(f"volume {vol_ratio:.2f}x < {self.transition_min_vol_ratio:.2f}x")
+        min_mom = self.momentum_weight * self.transition_momentum_frac
+        if self.transition_require_momentum and momentum_points < min_mom:
+            fails.append(f"momentum {momentum_points:.1f} < {min_mom:.1f}")
+        # Reject a large impulse candle that is already too extended; the entry
+        # router can wait for a retest instead of chasing it.
+        if atr > 0 and abs(last.close - last.open) / atr > 1.6:
+            fails.append("transition impulse candle > 1.6 ATR; wait for retest")
+        return {"valid": not fails, "fails": fails, "votes": votes, "checks": checks}
+
+    def _price_action_structure_setup(self, candles: list, direction: str,
+                                      atr_val: float, regime_state: Optional[str]) -> Optional[dict]:
+        """Fresh price-action structure entry using BOS/CHOCH or sweep/reclaim.
+
+        The setup requires displacement, a quality close, acceptable volume and
+        a micro break in the trend direction. In TRANSITION it additionally
+        requires both a structural event and stronger confirmation, preventing
+        ordinary inside-bar noise from becoming an entry.
+        """
+        if atr_val <= 0 or len(candles) < self.pa_structure_lookback + 4:
+            return None
+        n = len(candles)
+        start = max(2, n - self.entry_trigger_valid_bars)
+        for idx in range(n - 1, start - 1, -1):
+            c = candles[idx]
+            prev = candles[idx - 1]
+            hist_start = max(0, idx - self.pa_structure_lookback)
+            history = candles[hist_start:idx]
+            if len(history) < self.pa_structure_swing_lookback + 2:
+                continue
+            rng = max(c.high - c.low, 1e-12)
+            body_atr = abs(c.close - c.open) / atr_val
+            close_quality = ((c.close - c.low) / rng if direction == "long"
+                             else (c.high - c.close) / rng)
+            vol_hist = [x.volume for x in history[-self.volume_sma_period:]]
+            vol_base = float(np.mean(vol_hist)) if vol_hist else 0.0
+            vol_ratio = c.volume / vol_base if vol_base > 0 else 0.0
+
+            recent = history[-self.pa_structure_swing_lookback:]
+            swing_high = max(x.high for x in recent)
+            swing_low = min(x.low for x in recent)
+            prior_high = max(x.high for x in history[:-1])
+            prior_low = min(x.low for x in history[:-1])
+            buffer = self.pa_break_buffer_atr * atr_val
+            tol = self.pa_sweep_tolerance_atr * atr_val
+
+            if direction == "long":
+                bos = c.close > swing_high + buffer and prev.close <= swing_high + buffer
+                sweep = c.low <= prior_low + tol and c.close > prior_low and c.close > c.open
+                micro_break = c.close > max(prev.high, candles[idx - 2].high)
+                choch = sweep and micro_break
+                directional = c.close > c.open
+                raw_stop = min(c.low, prev.low, prior_low) - self.entry_stop_buffer_atr * atr_val
+            else:
+                bos = c.close < swing_low - buffer and prev.close >= swing_low - buffer
+                sweep = c.high >= prior_high - tol and c.close < prior_high and c.close < c.open
+                micro_break = c.close < min(prev.low, candles[idx - 2].low)
+                choch = sweep and micro_break
+                directional = c.close < c.open
+                raw_stop = max(c.high, prev.high, prior_high) + self.entry_stop_buffer_atr * atr_val
+
+            structural_event = bos or choch
+            if self.pa_require_sweep_or_choch and not structural_event:
+                continue
+            min_body = self.pa_min_body_atr + (0.05 if regime_state == "TRANSITION" else 0.0)
+            min_close = self.pa_min_close_quality + (0.05 if regime_state == "TRANSITION" else 0.0)
+            min_vol = self.pa_min_volume_ratio + (0.10 if regime_state == "TRANSITION" else 0.0)
+            if not (directional and micro_break and body_atr >= min_body
+                    and close_quality >= min_close and vol_ratio >= min_vol):
+                continue
+            labels = []
+            if bos: labels.append("bos")
+            if choch: labels.append("choch_sweep_reclaim")
+            if sweep and "choch_sweep_reclaim" not in labels: labels.append("liquidity_sweep")
+            labels.append("micro_structure_break")
+            edge = 76.0 + (3.0 if choch else 0.0) + (2.0 if bos else 0.0)
+            edge += min(3.0, max(0.0, (vol_ratio - min_vol) * 3.0))
+            return {
+                "trigger_ts": c.timestamp, "raw_stop": float(raw_stop),
+                "structure_level": round(float(swing_high if direction == "long" else swing_low), 8),
+                "body_atr": round(body_atr, 3), "close_quality": round(close_quality, 3),
+                "volume_ratio": round(vol_ratio, 3), "confirmations": labels,
+                "regime": regime_state, "edge_score": round(edge, 2),
+            }
+        return None
 
     def _breakout_retest_setup(self, candles: list, direction: str, atr_val: float) -> Optional[dict]:
         """Return the newest qualified breakout-retest trigger within the
