@@ -476,19 +476,23 @@ class ExchangeClient:
 
         def _side_matches(raw: dict) -> bool:
             raw_side = str(raw.get("posSide") or raw.get("positionSide") or "").lower()
-            # Some OKX responses omit posSide for an instrument with only one
-            # live leg.  In that case do not reject the record.
-            return not raw_side or raw_side == wanted_side
+            # In OKX one-way/net mode the raw protective-order payload uses
+            # posSide="net" even though CCXT normalizes the live position to
+            # side=long/short.  Rejecting "net" caused valid BTC TP/SL orders
+            # to be invisible during startup reconciliation.  Empty/net are
+            # safe here because the caller already scopes the query by instId
+            # and this bot permits only one live leg per symbol.
+            return raw_side in ("", "net", wanted_side)
 
         def _collect(raw: dict) -> None:
             if not isinstance(raw, dict) or not _side_matches(raw):
                 return
-            for key in ("slTriggerPx", "stopLossPrice", "slOrdPx"):
+            for key in ("slTriggerPx", "stopLossPrice", "slOrdPx", "stopPrice", "slPx"):
                 px = _as_price(raw.get(key))
                 if px is not None and px != -1:
                     sl_candidates.append(px)
                     break
-            for key in ("tpTriggerPx", "takeProfitPrice", "tpOrdPx"):
+            for key in ("tpTriggerPx", "takeProfitPrice", "tpOrdPx", "takeProfitPx", "tpPx"):
                 px = _as_price(raw.get(key))
                 if px is not None and px != -1:
                     tp_candidates.append(px)
@@ -500,18 +504,34 @@ class ExchangeClient:
                 if isinstance(child, dict):
                     _collect(child)
 
-        # Primary OKX source: pending algo orders.  Attached TP/SL commonly
-        # appears as conditional orders after the entry order has filled.
-        for ord_type in ("conditional", "oco", "move_order_stop"):
-            try:
-                resp = await self._exchange.privateGetTradeAlgosPending({
-                    "instId": inst_id,
-                    "ordType": ord_type,
-                })
-                for algo in (resp or {}).get("data", []):
-                    _collect(algo)
-            except Exception as e:
-                logger.warning("[RECONCILE] pending-algos query (%s) failed: %s", ord_type, e)
+        # Primary OKX source: pending algo orders. CCXT has used more than
+        # one implicit-method name for /api/v5/trade/orders-algo-pending across
+        # releases, so resolve it dynamically instead of silently calling a
+        # method that may not exist.
+        algo_method = None
+        for method_name in (
+            "privateGetTradeOrdersAlgoPending",
+            "private_get_trade_orders_algo_pending",
+            "privateGetTradeAlgosPending",
+        ):
+            candidate = getattr(self._exchange, method_name, None)
+            if callable(candidate):
+                algo_method = candidate
+                break
+
+        if algo_method is None:
+            logger.warning("[RECONCILE] this CCXT build exposes no OKX pending-algo method")
+        else:
+            for ord_type in ("conditional", "oco", "trigger", "move_order_stop"):
+                try:
+                    resp = await algo_method({
+                        "instId": inst_id,
+                        "ordType": ord_type,
+                    })
+                    for algo in (resp or {}).get("data", []):
+                        _collect(algo)
+                except Exception as e:
+                    logger.warning("[RECONCILE] pending-algos query (%s) failed: %s", ord_type, e)
 
         # Secondary source: normalized CCXT open orders and their raw OKX info.
         try:
