@@ -447,12 +447,12 @@ class ExchangeClient:
         return None
 
     async def fetch_attached_stops(self, symbol: str, pos_side: str) -> tuple:
-        """
-        Current SL/TP prices from OKX's pending algo orders for this leg — used
-        to reconstruct a Position after a restart (we don't know the strategy's
-        original TP1, so an adopted position resumes as single-TP: whatever
-        SL/TP the exchange currently has attached is treated as (SL, TP2)).
-        Returns (sl_price, tp_price), either may be None if not found.
+        """Return the live OKX stop-loss and take-profit for an open position.
+
+        OKX can expose attached TP/SL through more than one response shape,
+        depending on how the order was created and whether the parent order has
+        already filled.  Recovery therefore checks both pending algo orders and
+        CCXT's normalized open-order payloads.  No stop/target is invented here.
         """
         if self.paper:
             return None, None
@@ -463,23 +463,82 @@ class ExchangeClient:
             logger.warning("[RECONCILE] market lookup failed for %s: %s", symbol, e)
             return None, None
 
-        sl_price, tp_price = None, None
-        for ord_type in ("oco", "conditional", "move_order_stop"):
+        wanted_side = str(pos_side or "").lower()
+        sl_candidates: list[float] = []
+        tp_candidates: list[float] = []
+
+        def _as_price(value):
+            try:
+                x = float(value)
+                return x if x > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        def _side_matches(raw: dict) -> bool:
+            raw_side = str(raw.get("posSide") or raw.get("positionSide") or "").lower()
+            # Some OKX responses omit posSide for an instrument with only one
+            # live leg.  In that case do not reject the record.
+            return not raw_side or raw_side == wanted_side
+
+        def _collect(raw: dict) -> None:
+            if not isinstance(raw, dict) or not _side_matches(raw):
+                return
+            for key in ("slTriggerPx", "stopLossPrice", "slOrdPx"):
+                px = _as_price(raw.get(key))
+                if px is not None and px != -1:
+                    sl_candidates.append(px)
+                    break
+            for key in ("tpTriggerPx", "takeProfitPrice", "tpOrdPx"):
+                px = _as_price(raw.get(key))
+                if px is not None and px != -1:
+                    tp_candidates.append(px)
+                    break
+            attached = raw.get("attachAlgoOrds") or raw.get("attachAlgoOrders") or []
+            if isinstance(attached, dict):
+                attached = [attached]
+            for child in attached:
+                if isinstance(child, dict):
+                    _collect(child)
+
+        # Primary OKX source: pending algo orders.  Attached TP/SL commonly
+        # appears as conditional orders after the entry order has filled.
+        for ord_type in ("conditional", "oco", "move_order_stop"):
             try:
                 resp = await self._exchange.privateGetTradeAlgosPending({
-                    "instId": inst_id, "ordType": ord_type,
+                    "instId": inst_id,
+                    "ordType": ord_type,
                 })
                 for algo in (resp or {}).get("data", []):
-                    if algo.get("posSide") != pos_side:
-                        continue
-                    sl_raw = algo.get("slTriggerPx")
-                    tp_raw = algo.get("tpTriggerPx")
-                    if sl_raw not in (None, "", "0", "0.0") and sl_price is None:
-                        sl_price = float(sl_raw)
-                    if tp_raw not in (None, "", "0", "0.0") and tp_price is None:
-                        tp_price = float(tp_raw)
+                    _collect(algo)
             except Exception as e:
                 logger.warning("[RECONCILE] pending-algos query (%s) failed: %s", ord_type, e)
+
+        # Secondary source: normalized CCXT open orders and their raw OKX info.
+        try:
+            for order in await self._exchange.fetch_open_orders(symbol):
+                if isinstance(order, dict):
+                    _collect(order)
+                    _collect(order.get("info") or {})
+        except Exception as e:
+            logger.warning("[RECONCILE] open-orders TP/SL query failed %s: %s", symbol, e)
+
+        # Position payloads in newer CCXT/OKX versions may expose attached
+        # prices directly.  Keep this as a final read-only source.
+        try:
+            for pos in await self._exchange.fetch_positions([symbol]):
+                if str(pos.get("side") or "").lower() != wanted_side:
+                    continue
+                _collect(pos)
+                _collect(pos.get("info") or {})
+        except Exception as e:
+            logger.warning("[RECONCILE] position TP/SL query failed %s: %s", symbol, e)
+
+        sl_price = sl_candidates[0] if sl_candidates else None
+        tp_price = tp_candidates[0] if tp_candidates else None
+        logger.info(
+            "[RECONCILE] live OKX protection %s %s SL=%s TP=%s",
+            symbol, wanted_side, sl_price, tp_price,
+        )
         return sl_price, tp_price
 
     # ── Orders ───────────────────────────────────────────────────────────────

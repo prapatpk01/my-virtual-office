@@ -28,6 +28,22 @@ LONG = "long"
 SHORT = "short"
 
 
+# One-time restart recovery for the currently open ETH short reported by the
+# user.  It applies only when symbol, side, entry and amount all match closely,
+# so it cannot affect later trades.  Live OKX SL/TP still takes precedence.
+_RECOVERY_OVERRIDES = (
+    {
+        "symbol": "ETH/USDT:USDT",
+        "side": SHORT,
+        "entry": 1857.85,
+        "amount": 0.349,
+        "sl": 1872.08,
+        "tp1": 1846.88,
+        "tp2": 1828.88,
+    },
+)
+
+
 @dataclass
 class Position:
     symbol: str
@@ -182,13 +198,58 @@ class PositionManager:
                 return False
         return True
 
+    @staticmethod
+    def _matching_recovery_override(symbol: str, side: str, entry: float, amount: float):
+        for item in _RECOVERY_OVERRIDES:
+            if item["symbol"] != symbol or item["side"] != side:
+                continue
+            entry_ok = abs(entry - item["entry"]) <= max(0.02, item["entry"] * 0.00002)
+            amount_ok = abs(amount - item["amount"]) <= max(0.0005, item["amount"] * 0.01)
+            if entry_ok and amount_ok:
+                return item
+        return None
+
+    async def _sync_live_protection(self, pos: Position) -> bool:
+        """Refresh an already tracked position from live OKX TP/SL values."""
+        sl, tp = await self.client.fetch_attached_stops(pos.symbol, pos.side)
+        override = self._matching_recovery_override(
+            pos.symbol, pos.side, pos.entry_price, pos.full_amount
+        )
+        if sl is None and override is not None:
+            sl = float(override["sl"])
+        if tp is None and override is not None:
+            tp = float(override["tp2"])
+        if sl is None or tp is None:
+            logger.error(
+                "[RECONCILE] %s tracked position cannot be synced: live SL=%s TP=%s",
+                pos.symbol, sl, tp,
+            )
+            return False
+
+        pos.stop_loss = float(sl)
+        pos.tp2 = float(tp)
+        pos.one_r = abs(pos.entry_price - pos.stop_loss)
+        if override is not None and not pos.tp1_hit:
+            pos.tp1 = float(override["tp1"])
+        elif not pos.tp1_hit:
+            pos.tp1 = calc_take_profits(
+                pos.side, pos.entry_price, pos.stop_loss,
+                self.cfg.tp1_r, self.cfg.tp2_r,
+            )[0]
+        return True
+
     async def reconcile_with_exchange(self, symbols: list[str]) -> list[str]:
         adopted: list[str] = []
         now = time.time()
         c = self.cfg
         for symbol in symbols:
-            if self.has_position(symbol):
+            # A periodic reconciliation must also repair a tracked position
+            # whose internal SL/TP was reconstructed incorrectly on startup.
+            existing = self.get(symbol)
+            if existing is not None:
+                await self._sync_live_protection(existing)
                 continue
+
             closed_at = self._recently_closed.get(symbol)
             if closed_at is not None and now - closed_at < c.reconcile_settle_grace_sec:
                 continue
@@ -204,22 +265,41 @@ class PositionManager:
                     f"{symbol} ⚠️ HEDGE conflict — only {open_sides[0][0].upper()} adopted; close other leg manually"
                 )
                 logger.error("[RECONCILE] %s has both long and short open", symbol)
+
             side, details = open_sides[0]
             entry = float(details["entry_price"])
             amount = float(details["amount"])
+            override = self._matching_recovery_override(symbol, side, entry, amount)
             sl, tp = await self.client.fetch_attached_stops(symbol, side)
-            if sl is None:
-                sl = entry * (0.97 if side == LONG else 1.03)
-                logger.error("[RECONCILE] %s has no attached SL; using emergency 3%% stop", symbol)
+
+            # Never invent a 3% emergency stop.  For the currently open ETH
+            # position, use the exact verified protection values if an OKX API
+            # response is temporarily incomplete.  Other positions are not
+            # adopted until their live protection can be verified.
+            if sl is None and override is not None:
+                sl = float(override["sl"])
+                logger.warning("[RECONCILE] %s using verified recovery SL %.8f", symbol, sl)
+            if tp is None and override is not None:
+                tp = float(override["tp2"])
+                logger.warning("[RECONCILE] %s using verified recovery TP2 %.8f", symbol, tp)
+            if sl is None or tp is None:
+                msg = f"{symbol} {side.upper()} ⚠️ MANUAL REVIEW — live OKX SL/TP unavailable; not adopted"
+                adopted.append(msg)
+                logger.error("[RECONCILE] %s; SL=%s TP=%s", msg, sl, tp)
+                continue
+
             one_r = abs(entry - float(sl))
-            if tp is None:
-                _, tp = calc_take_profits(side, entry, float(sl), c.tp1_r, c.tp2_r)
-            # Stop at/through fee-adjusted breakeven implies TP1 already banked.
             be_tolerance = max(one_r * getattr(c, "be_lock_r", 0.08), entry * c.fee_rate * 2)
             tp1_hit = (
                 float(sl) >= entry - be_tolerance if side == LONG else float(sl) <= entry + be_tolerance
             )
-            tp1 = None if tp1_hit else calc_take_profits(side, entry, float(sl), c.tp1_r, c.tp2_r)[0]
+            if tp1_hit:
+                tp1 = None
+            elif override is not None:
+                tp1 = float(override["tp1"])
+            else:
+                tp1 = calc_take_profits(side, entry, float(sl), c.tp1_r, c.tp2_r)[0]
+
             self._positions[symbol] = Position(
                 symbol=symbol,
                 side=side,
@@ -231,9 +311,9 @@ class PositionManager:
                 tp2=float(tp),
                 one_r=one_r,
                 tp1_hit=tp1_hit,
-                regime_at_entry="ADOPTED",
-                bias_at_entry="ADOPTED",
-                setup_type="ADOPTED",
+                regime_at_entry="ADOPTED_OKX",
+                bias_at_entry="ADOPTED_OKX",
+                setup_type="ADOPTED_OKX",
             )
             adopted.append(f"{symbol} {side.upper()}")
         return adopted

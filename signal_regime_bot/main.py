@@ -209,8 +209,8 @@ class Bot:
                 f"🤖 *Bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT\n"
-                f"Architecture: 4H Regime → 1H Bias → 15M Context → 5M EMA Dual Entry "
-                f"(Fast Pullback + Momentum Breakout/Retest)"
+                f"Architecture: 4H Regime → 1H Bias → 15M/5M Expert Multi-Entry "
+                f"→ SMC/Structure/EMA → AI Exit Engine"
             )
 
     async def stop(self):
@@ -640,6 +640,8 @@ class Bot:
                 f"`{self.cfg.max_open_positions}`"
             )
         elif cmd == "/positions":
+            # Refresh live OKX protection before displaying internal state.
+            await self.positions.reconcile_with_exchange(self.cfg.symbols)
             lines = []
             for sym in self.cfg.symbols:
                 pos = self.positions.get(sym)
