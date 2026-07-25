@@ -44,6 +44,35 @@ class AIExitEngine:
     def clear(self, symbol: str) -> None:
         self._state.pop(symbol, None)
 
+    def export_state(self) -> dict:
+        out = {}
+        for symbol, state in self._state.items():
+            ts = state.last_bar_ts
+            try:
+                ts = pd.Timestamp(ts).isoformat() if ts is not None else None
+            except Exception:
+                ts = None
+            out[symbol] = {
+                "last_bar_ts": ts,
+                "confirmed_bars": int(state.confirmed_bars),
+                "peak_score": float(state.peak_score),
+            }
+        return out
+
+    def import_state(self, payload: dict) -> int:
+        self._state.clear()
+        for symbol, item in (payload or {}).items():
+            try:
+                ts = pd.Timestamp(item["last_bar_ts"]) if item.get("last_bar_ts") else None
+                self._state[str(symbol)] = _WatchState(
+                    last_bar_ts=ts,
+                    confirmed_bars=int(item.get("confirmed_bars", 0)),
+                    peak_score=float(item.get("peak_score", 0.0)),
+                )
+            except (TypeError, ValueError):
+                continue
+        return len(self._state)
+
     @staticmethod
     def _bar(df: pd.DataFrame, atr_v: float):
         o, h, l, c = [float(df[x].iloc[-1]) for x in ("open", "high", "low", "close")]

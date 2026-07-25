@@ -119,6 +119,32 @@ class Bot:
         self._cmd_task = None                 # Telegram command polling task
         self._tg_offset = 0
         self._running = False
+        self._ai_exit_state_path = os.path.join(self.cfg.state_dir, "ai_exit_state.json")
+
+    def _save_runtime_state(self) -> None:
+        self.positions.save_state()
+        try:
+            os.makedirs(self.cfg.state_dir, exist_ok=True)
+            path = self._ai_exit_state_path
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"saved_at": time.time(), "state": self.ai_exit.export_state()}, f)
+                f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.error("[STATE] AI exit state save failed: %s", exc)
+
+    def _load_runtime_state(self) -> tuple[int, int]:
+        positions = self.positions.load_state()
+        watches = 0
+        try:
+            with open(self._ai_exit_state_path) as f:
+                watches = self.ai_exit.import_state(json.load(f).get("state", {}))
+        except FileNotFoundError:
+            pass
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("[STATE] AI exit state load failed: %s", exc)
+        return positions, watches
 
     # ── close journal (exit-type breakdown source) ───────────────────────────
 
@@ -193,10 +219,13 @@ class Bot:
         if not self.telegram.enabled:
             logger.warning("Telegram not configured — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing")
 
-        # Adopt any position that already exists on OKX but isn't tracked —
-        # this bot's state is in-memory only, so a restart would otherwise
-        # orphan every open position (no more SL/TP/health management for it).
+        # Restore lifecycle state first, then validate it against live OKX.
+        # Local state preserves TP1/banked PnL/AI-exit persistence; OKX remains
+        # authoritative for whether a position exists and its live SL/TP/size.
+        restored_positions, restored_watches = self._load_runtime_state()
+        logger.info("[STATE] startup restored positions=%d ai_exit_watches=%d", restored_positions, restored_watches)
         await self._reconcile_positions(context="STARTUP")
+        self._save_runtime_state()
 
         self._running = True
         if self.telegram.enabled:
@@ -207,6 +236,7 @@ class Bot:
             # there's no way to tell "still starting" from "crashed".
             await self.telegram.send_text(
                 f"🤖 *Bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
+                f"State: `persistent recovery enabled`\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT\n"
                 f"Architecture: 4H Regime → 1H Bias → 15M/5M Expert Multi-Entry "
@@ -215,6 +245,7 @@ class Bot:
 
     async def stop(self):
         self._running = False
+        self._save_runtime_state()
         if self._cmd_task:
             self._cmd_task.cancel()
             try:
@@ -369,6 +400,7 @@ class Bot:
         if df_5m is None or df_15m is None:
             return None
         result = self.ai_exit.evaluate(symbol, pos, df_5m, df_15m, price)
+        self._save_runtime_state()
         if result.action == AI_EXIT_WATCH:
             logger.info("[%s] AI EXIT WATCH: %s", symbol, result.reason)
             return None

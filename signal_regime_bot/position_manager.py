@@ -7,7 +7,10 @@ risk accounting is registered once, when the full trade closes.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -172,6 +175,123 @@ class PositionManager:
         self.entry_engine = entry_engine
         self._positions: dict[str, Position] = {}
         self._recently_closed: dict[str, float] = {}
+        self._state_path = os.path.join(self.cfg.state_dir, "open_positions.json")
+        self._state_version = 1
+
+    @staticmethod
+    def _ts_to_text(value):
+        if value is None:
+            return None
+        try:
+            return pd.Timestamp(value).isoformat()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _text_to_ts(value):
+        if not value:
+            return None
+        try:
+            return pd.Timestamp(value)
+        except Exception:
+            return None
+
+    def _position_to_dict(self, pos: Position) -> dict:
+        return {
+            "symbol": pos.symbol, "side": pos.side,
+            "entry_price": pos.entry_price, "amount": pos.amount,
+            "full_amount": pos.full_amount, "stop_loss": pos.stop_loss,
+            "tp1": pos.tp1, "tp2": pos.tp2, "one_r": pos.one_r,
+            "tp1_hit": pos.tp1_hit, "realized_pnl": pos.realized_pnl,
+            "opened_at": pos.opened_at, "regime_at_entry": pos.regime_at_entry,
+            "bias_at_entry": pos.bias_at_entry, "entry_score": pos.entry_score,
+            "entry_fee": pos.entry_fee,
+            "entry_bar_ts": self._ts_to_text(pos.entry_bar_ts),
+            "last_exit_check_bar_ts": self._ts_to_text(pos.last_exit_check_bar_ts),
+            "setup_type": pos.setup_type, "trigger": pos.trigger,
+            "planned_rr": pos.planned_rr, "structure_room_r": pos.structure_room_r,
+        }
+
+    def _position_from_dict(self, item: dict) -> Optional[Position]:
+        try:
+            side = str(item["side"]).lower()
+            if side not in (LONG, SHORT):
+                return None
+            return Position(
+                symbol=str(item["symbol"]), side=side,
+                entry_price=float(item["entry_price"]), amount=float(item["amount"]),
+                full_amount=float(item.get("full_amount", item["amount"])),
+                stop_loss=float(item["stop_loss"]),
+                tp1=(None if item.get("tp1") is None else float(item["tp1"])),
+                tp2=float(item["tp2"]), one_r=float(item["one_r"]),
+                tp1_hit=bool(item.get("tp1_hit", False)),
+                realized_pnl=float(item.get("realized_pnl", 0.0)),
+                opened_at=float(item.get("opened_at", time.time())),
+                regime_at_entry=str(item.get("regime_at_entry", "")),
+                bias_at_entry=str(item.get("bias_at_entry", "")),
+                entry_score=float(item.get("entry_score", 0.0)),
+                entry_fee=float(item.get("entry_fee", 0.0)),
+                entry_bar_ts=self._text_to_ts(item.get("entry_bar_ts")),
+                last_exit_check_bar_ts=self._text_to_ts(item.get("last_exit_check_bar_ts")),
+                setup_type=str(item.get("setup_type", "")),
+                trigger=str(item.get("trigger", "")),
+                planned_rr=float(item.get("planned_rr", 0.0)),
+                structure_room_r=float(item.get("structure_room_r", 0.0)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("[STATE] invalid persisted position skipped: %s", exc)
+            return None
+
+    def save_state(self) -> None:
+        """Atomically persist every open position and lifecycle field."""
+        try:
+            os.makedirs(self.cfg.state_dir, exist_ok=True)
+            payload = {
+                "version": self._state_version,
+                "saved_at": time.time(),
+                "positions": [self._position_to_dict(p) for p in self._positions.values()],
+                "recently_closed": self._recently_closed,
+            }
+            fd, tmp = tempfile.mkstemp(prefix="open_positions.", suffix=".tmp", dir=self.cfg.state_dir)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+                    f.flush(); os.fsync(f.fileno())
+                os.replace(tmp, self._state_path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        except OSError as exc:
+            logger.error("[STATE] position state save failed: %s", exc)
+
+    def load_state(self) -> int:
+        """Restore local lifecycle state before OKX reconciliation.
+
+        OKX remains authoritative. Reconciliation validates every restored item
+        and discards stale local records.
+        """
+        try:
+            with open(self._state_path) as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return 0
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("[STATE] position state load failed: %s", exc)
+            return 0
+        loaded = 0
+        self._positions.clear()
+        for item in payload.get("positions", []):
+            pos = self._position_from_dict(item)
+            if pos is not None:
+                self._positions[pos.symbol] = pos
+                loaded += 1
+        now = time.time()
+        self._recently_closed = {
+            str(k): float(v) for k, v in payload.get("recently_closed", {}).items()
+            if now - float(v) < max(getattr(self.cfg, "reconcile_settle_grace_sec", 20), 20) * 10
+        }
+        logger.info("[STATE] restored %d persisted open position(s)", loaded)
+        return loaded
 
     def get(self, symbol: str) -> Optional[Position]:
         return self._positions.get(symbol)
@@ -247,7 +367,22 @@ class PositionManager:
             # whose internal SL/TP was reconstructed incorrectly on startup.
             existing = self.get(symbol)
             if existing is not None:
-                await self._sync_live_protection(existing)
+                details = await self.client.fetch_position_details(symbol, existing.side)
+                if not details or float(details.get("amount", 0.0)) <= 0:
+                    logger.warning("[STATE] removing stale persisted %s %s; no live OKX position", symbol, existing.side)
+                    self._positions.pop(symbol, None)
+                    self.save_state()
+                    continue
+                # OKX is authoritative for live quantity and average entry, while
+                # persisted lifecycle fields (TP1 hit, banked PnL, setup metadata) survive.
+                existing.amount = float(details.get("amount", existing.amount))
+                if not existing.tp1_hit:
+                    existing.full_amount = max(existing.full_amount, existing.amount)
+                live_entry = float(details.get("entry_price", existing.entry_price) or existing.entry_price)
+                if live_entry > 0:
+                    existing.entry_price = live_entry
+                if await self._sync_live_protection(existing):
+                    self.save_state()
                 continue
 
             closed_at = self._recently_closed.get(symbol)
@@ -316,6 +451,7 @@ class PositionManager:
                 setup_type="ADOPTED_OKX",
             )
             adopted.append(f"{symbol} {side.upper()}")
+            self.save_state()
         return adopted
 
     async def _emergency_flatten_new_fill(
@@ -461,6 +597,7 @@ class PositionManager:
             structure_room_r=getattr(entry_result, "structure_room_r", 0.0),
         )
         self._positions[symbol] = pos
+        self.save_state()
         return pos
 
     async def open_position(
@@ -665,6 +802,7 @@ class PositionManager:
             structure_room_r=getattr(entry_result, "structure_room_r", 0.0),
         )
         self._positions[symbol] = pos
+        self.save_state()
         return pos
 
     async def check_exits_live(self, symbol: str, current_price: float) -> Optional[dict]:
@@ -720,6 +858,7 @@ class PositionManager:
         self.risk.register_trade_result(trade_pnl, balance, time.time())
         del self._positions[pos.symbol]
         self._mark_closed(pos.symbol)
+        self.save_state()
         self.entry_engine.on_position_closed(
             pos.symbol, pos.side.upper(), reason, trade_pnl
         )
@@ -824,6 +963,7 @@ class PositionManager:
             pos.amount,
             tp_price=pos.tp2,
         )
+        self.save_state()
         return {
             "event": "TP1_HIT",
             "symbol": pos.symbol,
@@ -867,6 +1007,7 @@ class PositionManager:
         self.risk.register_trade_result(trade_pnl, balance, time.time())
         del self._positions[pos.symbol]
         self._mark_closed(pos.symbol)
+        self.save_state()
         self.entry_engine.on_position_closed(
             pos.symbol, pos.side.upper(), reason, trade_pnl
         )
@@ -899,6 +1040,7 @@ class PositionManager:
         if pos.last_exit_check_bar_ts is not None and bar_ts <= pos.last_exit_check_bar_ts:
             return None
         pos.last_exit_check_bar_ts = bar_ts
+        self.save_state()
         bars_since = (
             int((df_5m.index > pos.entry_bar_ts).sum())
             if pos.entry_bar_ts is not None
