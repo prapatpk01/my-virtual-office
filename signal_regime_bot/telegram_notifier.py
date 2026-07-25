@@ -263,6 +263,17 @@ class TelegramNotifier:
             f"Price: `{price:.6f}`\n{self._net_block(pnl, ev)}"
         )
 
+    async def ai_exit(self, symbol: str, price: float, pnl: float, reason: str,
+                      emergency: bool = False, ev: Optional[dict] = None):
+        title = "AI Exit — Emergency Close" if emergency else "AI Exit — Confirmed Reversal"
+        icon = "🚨" if emergency else "🧠"
+        await self._send_message(
+            f"{icon} *{title}* `{symbol}`\n\n"
+            f"Multi-factor exit decision.\n"
+            f"`{reason}`\n"
+            f"Price: `{price:.6f}`\n{self._net_block(pnl, ev)}"
+        )
+
     async def spike_guard(self, symbol: str, price: float, pnl: float, reason: str,
                           ev: Optional[dict] = None):
         await self._send_message(

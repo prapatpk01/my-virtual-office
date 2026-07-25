@@ -1,3 +1,1 @@
-DUALCORE V3.0.2 EXPERT MULTI-ENTRY
-Patch: real EMA8/EMA13 values in duplicate-bar status logs
-Base: V3.0.1 OKX timeout/cache/fallback fix
+3.1.0-AI-EXIT

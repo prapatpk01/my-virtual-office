@@ -44,3 +44,9 @@ are NOT imported when the bot runs.
 - `entry_engine.py`: populate EMA8/EMA13/MACD before duplicate-bar return.
 - `main.py`: preserve last meaningful status result during same-bar polling.
 - `EMA_STATUS_FIX.md`: patch notes.
+
+## V3.1 AI Exit Engine
+- `ai_exit_engine.py` — stateful multi-factor WATCH → CONFIRM → CLOSE engine.
+- `main.py` — integrates AI Exit before legacy TP1-gated EMA runner exit.
+- `config.py` — embedded defaults; no new Railway variables required.
+- `telegram_notifier.py` — confirmed/emergency AI exit notifications.

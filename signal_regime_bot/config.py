@@ -329,6 +329,21 @@ class Config:
     spike_tf_slow: str = "15m"
     spike_fetch_limit: int = 60
 
+    # ── AI Exit Engine (multi-factor replacement for one-spike close) ────────
+    ai_exit_enabled: bool = True
+    ai_exit_grace_bars: int = 2
+    ai_exit_watch_score: float = 45.0
+    ai_exit_close_score: float = 70.0
+    ai_exit_confirmations: int = 2
+    ai_exit_persistence_bars: int = 2
+    ai_exit_min_adverse_r: float = 0.30
+    ai_exit_watch_live_atr: float = 1.80
+    ai_exit_emergency_live_atr: float = 2.80
+    ai_exit_emergency_adverse_r: float = 0.82
+    ai_exit_absolute_emergency_r: float = 0.94
+    ai_exit_structure_lookback: int = 6
+    ai_exit_volume_ratio: float = 1.80
+
     # ══ Hard Gate + Soft Score + Adaptive Threshold pipeline ════════════════
     # Layer 1 — Regime (HARD GATE, 4H + 1H)
     regime_block_below_score: float = 60.0     # regime score < this -> block trade

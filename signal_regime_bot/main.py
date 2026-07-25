@@ -26,7 +26,7 @@ from risk_manager import RiskManager
 from position_manager import PositionManager
 from telegram_notifier import TelegramNotifier
 from chart_engine import build_entry_chart
-from spike_guard import check_spike, CLOSE as SPIKE_CLOSE
+from ai_exit_engine import AIExitEngine, CLOSE as AI_EXIT_CLOSE, EMERGENCY as AI_EXIT_EMERGENCY, WATCH as AI_EXIT_WATCH
 from entry_engine import EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA
 
 logging.basicConfig(
@@ -90,6 +90,7 @@ class Bot:
         )
         self.data = DataEngine(self.cfg, self.client)
         self.signal_engine = Pipeline(self.cfg)
+        self.ai_exit = AIExitEngine(self.cfg)
         self.risk = RiskManager(self.cfg)
         self.positions = PositionManager(self.cfg, self.client, self.risk,
                                          self.signal_engine.entry_engine)
@@ -352,12 +353,11 @@ class Bot:
             await self._handle_event(event)
             return   # position fully or partially closed this tick — exit check waits for next
 
-        # SpikeGuard — EVERY tick, 5m/15m closed bars + live price. The fast
-        # layer: force-close before a V-reversal eats the full SL (+slippage).
-        if self.cfg.spike_guard_enabled:
-            spike_event = await self._check_spike_guard(symbol, pos, price, df_15m, df_5m)
-            if spike_event:
-                await self._handle_event(spike_event)
+        # AI Exit Engine — every tick, but a spike alone only starts WATCH.
+        if self.cfg.ai_exit_enabled:
+            exit_event = await self._check_ai_exit(symbol, pos, price, df_15m, df_5m)
+            if exit_event:
+                await self._handle_event(exit_event)
                 return
 
         # EMA early-exit check — once per newly-closed 5m bar only.
@@ -365,25 +365,23 @@ class Bot:
         if eevent:
             await self._handle_event(eevent)
 
-    async def _check_spike_guard(self, symbol: str, pos, price: float, df_15m, df_5m):
-        """Run the spike check using frames already fetched for this symbol.
-
-        The previous implementation downloaded 5M and 15M a second time on
-        every open-position poll, doubling public API traffic exactly when
-        reliable position management mattered most.
-        """
-        c = self.cfg
-        if df_5m is None or df_15m is None or len(df_5m) < 3 or len(df_15m) < 3:
-            logger.warning("[%s] spike-guard skipped: insufficient cached frames", symbol)
+    async def _check_ai_exit(self, symbol: str, pos, price: float, df_15m, df_5m):
+        if df_5m is None or df_15m is None:
             return None
-
-        result = check_spike(pos.side, pos.entry_price, pos.one_r, df_5m, df_15m, price, c)
-        if result.action != SPIKE_CLOSE:
+        result = self.ai_exit.evaluate(symbol, pos, df_5m, df_15m, price)
+        if result.action == AI_EXIT_WATCH:
+            logger.info("[%s] AI EXIT WATCH: %s", symbol, result.reason)
             return None
-        logger.warning("[%s] SPIKE GUARD firing: %s", symbol, result.reason)
-        event = await self.positions._close_full(pos, price, "SPIKE_GUARD")
-        if event.get("event") == "SPIKE_GUARD":
-            event["spike_reason"] = result.reason
+        if result.action not in (AI_EXIT_CLOSE, AI_EXIT_EMERGENCY):
+            return None
+        reason_code = "AI_EXIT_EMERGENCY" if result.action == AI_EXIT_EMERGENCY else "AI_EXIT"
+        logger.warning("[%s] %s firing: %s", symbol, reason_code, result.reason)
+        event = await self.positions._close_full(pos, price, reason_code)
+        if event.get("event") == reason_code:
+            event["ai_exit_reason"] = result.reason
+            event["ai_exit_score"] = result.score
+            event["ai_exit_threshold"] = result.threshold
+        self.ai_exit.clear(symbol)
         return event
 
     async def _look_for_entry(self, symbol: str, df_15m, df_5m, sig):
@@ -507,7 +505,7 @@ class Bot:
     # partially closes and leaves the runner open) — each one starts this
     # symbol's post-close cooldown.
     _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", EMA_CROSS_REVERSAL,
-                        PRICE_OPEN_BEYOND_EMA, "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD"}
+                        PRICE_OPEN_BEYOND_EMA, "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD", "AI_EXIT", "AI_EXIT_EMERGENCY"}
 
     async def _handle_event(self, event: dict):
         ev = event.get("event")
@@ -523,6 +521,9 @@ class Bot:
         elif ev in (EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA):
             await self.telegram.early_exit(symbol, event["price"], event.get("trade_pnl", event["pnl"]),
                                            ev, event.get("exit_detail", ""), ev=event)
+        elif ev in ("AI_EXIT", "AI_EXIT_EMERGENCY"):
+            await self.telegram.ai_exit(symbol, event["price"], event.get("trade_pnl", event["pnl"]),
+                                        event.get("ai_exit_reason", ""), ev == "AI_EXIT_EMERGENCY", ev=event)
         elif ev == "SPIKE_GUARD":
             await self.telegram.spike_guard(symbol, event["price"], event.get("trade_pnl", event["pnl"]),
                                             event.get("spike_reason", ""), ev=event)
@@ -535,6 +536,7 @@ class Bot:
             await self.telegram.error(symbol, event.get("detail", "unknown error"))
 
         if ev in self._TERMINAL_EVENTS and symbol:
+            self.ai_exit.clear(symbol)
             if ev == "SL_HIT":
                 cooldown_min = getattr(self.cfg, "symbol_sl_cooldown_min", 90)
             elif ev == "BE_HIT":
