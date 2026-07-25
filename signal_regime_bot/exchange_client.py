@@ -73,6 +73,10 @@ class ExchangeClient:
         self._paper_balance: dict[str, float] = {"USDT": 10_000.0}
         self._paper_positions: dict[str, dict] = {}
         self._public_request_lock = asyncio.Lock()
+        # Log live OKX SL/TP only once per symbol/side for each process start.
+        # Periodic safety reconciliation still runs, but repeated unchanged
+        # protection values are kept at DEBUG level to avoid noisy Railway logs.
+        self._protection_logged_once: set[tuple[str, str]] = set()
 
         # CCXT's default HTTP timeout is too short for occasional OKX/Railway
         # latency spikes.  A slow public-data response must not crash the whole
@@ -555,10 +559,18 @@ class ExchangeClient:
 
         sl_price = sl_candidates[0] if sl_candidates else None
         tp_price = tp_candidates[0] if tp_candidates else None
-        logger.info(
-            "[RECONCILE] live OKX protection %s %s SL=%s TP=%s",
-            symbol, wanted_side, sl_price, tp_price,
-        )
+        log_key = (symbol, wanted_side)
+        if log_key not in self._protection_logged_once:
+            logger.info(
+                "[RECONCILE] live OKX protection %s %s SL=%s TP=%s",
+                symbol, wanted_side, sl_price, tp_price,
+            )
+            self._protection_logged_once.add(log_key)
+        else:
+            logger.debug(
+                "[RECONCILE] protection rechecked %s %s SL=%s TP=%s",
+                symbol, wanted_side, sl_price, tp_price,
+            )
         return sl_price, tp_price
 
     # ── Orders ───────────────────────────────────────────────────────────────
