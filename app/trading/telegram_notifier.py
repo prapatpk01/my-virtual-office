@@ -13,6 +13,8 @@ Commands received (polling loop):
   /positions — open positions
   /trades    — last 5 trades
   /balance   — balance & P&L
+  /stats     — OKX post-fee statistics
+  /restats   — reset /stats baseline from now
   /start_bot — start the trading bot
   /stop_bot  — stop the trading bot
   /help      — command list
@@ -23,6 +25,7 @@ import logging
 import os
 import time
 import threading
+import copy
 from typing import Callable, Optional
 import aiohttp
 
@@ -57,6 +60,8 @@ class TelegramNotifier:
         self._polling_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._enabled = bool(token and chat_id)
+        self._stats_reset_baseline = None
+        self._stats_reset_at = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -573,6 +578,41 @@ class TelegramNotifier:
                              f"`{ns}${abs(t['net']):,.2f}` — {self._age_str(t['age_s'])}")
         return "\n".join(lines)
 
+    def _stats_after_reset(self, current: dict) -> dict:
+        base = self._stats_reset_baseline
+        if not base or current.get("source") != "okx":
+            return current
+        out = copy.deepcopy(current)
+        for key in ("trades", "wins", "losses", "tp1", "tp2", "sl", "untracked"):
+            out[key] = max(0, int(current.get(key, 0) or 0) - int(base.get(key, 0) or 0))
+        out["win_rate"] = round(out["wins"] / out["trades"] * 100) if out["trades"] else 0
+        out["net_pnl"] = round(float(current.get("net_pnl", 0) or 0) - float(base.get("net_pnl", 0) or 0), 2)
+        per = {}
+        for sym, d in (current.get("per_symbol", {}) or {}).items():
+            bd = (base.get("per_symbol", {}) or {}).get(sym, {})
+            ct, bt = int(d.get("trades", 0) or 0), int(bd.get("trades", 0) or 0)
+            nt = max(0, ct - bt)
+            if not nt:
+                continue
+            cw = round(ct * float(d.get("win_rate", 0) or 0) / 100)
+            bw = round(bt * float(bd.get("win_rate", 0) or 0) / 100)
+            nw = max(0, cw - bw)
+            per[sym] = {"trades": nt, "win_rate": round(nw / nt * 100),
+                        "net": round(float(d.get("net", 0) or 0) - float(bd.get("net", 0) or 0), 2)}
+        out["per_symbol"] = per
+        out["total"] = {"trades": out["trades"], "win_rate": out["win_rate"], "net": out["net_pnl"]}
+        if self._stats_reset_at:
+            elapsed = max(0, int(time.time() - self._stats_reset_at))
+            if "last5" in current:
+                out["last5"] = [t for t in (current.get("last5") or []) if int(t.get("age_s", 10**12)) <= elapsed][:5]
+        if "prev_month_pnl" in out:
+            out["prev_month_pnl"] = 0.0
+        return out
+
+    async def _fetch_stats(self) -> dict:
+        fn = getattr(self, "get_okx_stats_fn", None)
+        return (await fn()) if fn else (self.get_stats_fn() if self.get_stats_fn else {})
+
     async def _handle_command(self, text: str):
         cmd = text.split()[0].lower().lstrip("/")
         if cmd == "help":
@@ -582,7 +622,8 @@ class TelegramNotifier:
                 "/positions — open positions\n"
                 "/trades — last 5 trades\n"
                 "/balance — balance & P\\&L\n"
-                "/stats — win rate & signal statistics\n"
+                "/stats — OKX post-fee statistics\n"
+                "/restats — reset stats baseline from now\n"
                 "/insights — deep learning analysis & recommendations\n"
                 "/start\\_bot — start the bot\n"
                 "/stop\\_bot — stop the bot\n"
@@ -668,13 +709,24 @@ class TelegramNotifier:
         elif cmd == "stats":
             # Real stats from OKX positions-history (post-fee). Sent as PLAIN
             # TEXT (parse_mode="") so the emoji + rule-line layout isn't mangled.
-            fn = getattr(self, "get_okx_stats_fn", None)
-            s = (await fn()) if fn else (self.get_stats_fn() if self.get_stats_fn else {})
+            s = self._stats_after_reset(await self._fetch_stats())
             if s.get("source") == "okx" or ("month_label" in s):
                 from .adaptive_stats import render_adaptive_stats
                 await self._send(render_adaptive_stats(s), parse_mode="")
             else:
                 await self._send(self._render_stats(s))
+
+        elif cmd == "restats":
+            s = await self._fetch_stats()
+            if not s:
+                await self._send("⚠️ Unable to read stats; reset was not applied.", parse_mode="")
+                return
+            self._stats_reset_baseline = copy.deepcopy(s)
+            self._stats_reset_at = time.time()
+            await self._send(
+                "♻️ Stats reset\n/stats now counts closed trades from this reset point onward.\nOKX history is not deleted; balance and open positions stay live.",
+                parse_mode="",
+            )
 
         elif cmd == "insights":
             insights = self.get_insights_fn() if self.get_insights_fn else {}
