@@ -21,6 +21,8 @@ import logging
 import os
 import signal
 import sys
+from datetime import datetime, timedelta, time as dt_time, timezone
+from zoneinfo import ZoneInfo
 
 
 def _load_dotenv():
@@ -86,6 +88,24 @@ def build_config() -> dict:
         "candle_limit": int(os.environ.get("CANDLE_LIMIT",  "300")),
         "interval":     int(os.environ.get("INTERVAL_SECONDS", "300")),
 
+        # ── Global FX-week Sleep Mode ─────────────────────────────────────
+        # Apply the FX 24/5 weekly calendar to ALL trading symbols, including
+        # crypto/perpetual symbols.  During sleep mode the bot keeps running
+        # and manages already-open positions, but RiskManager.can_open() is
+        # blocked so no NEW position can be created.
+        #
+        # Standard FX week: Sunday 17:00 -> Friday 17:00 New York time.
+        # We intentionally allow entries FX_EARLY_OPEN_HOURS before the Sunday
+        # open (default 4h -> Sunday 13:00 New York). ZoneInfo handles DST.
+        "fx_sleep_mode":       _env_bool("FX_SLEEP_MODE", True),
+        "fx_early_open_hours": float(os.environ.get("FX_EARLY_OPEN_HOURS", "4")),
+        "fx_market_open_hour": int(os.environ.get("FX_MARKET_OPEN_HOUR_NY", "17")),
+        "fx_market_close_hour": int(os.environ.get("FX_MARKET_CLOSE_HOUR_NY", "17")),
+        # Optional broker-specific FULL-DAY closures in New York calendar
+        # dates, e.g. FX_MARKET_HOLIDAYS=2026-12-25,2027-01-01
+        # (FX itself trades through many public holidays, so these are opt-in).
+        "fx_market_holidays": _env_list("FX_MARKET_HOLIDAYS", ""),
+
         # ── Strategy ──────────────────────────────────────────────────────
         "strategy_mode":            os.environ.get("STRATEGY", "ai_expert"),
         "strategies": {
@@ -125,6 +145,230 @@ def build_config() -> dict:
         "forex_interval": int(os.environ.get("FOREX_INTERVAL_SECONDS", "60")),
     }
 
+
+
+_NY_TZ = ZoneInfo("America/New_York")
+
+
+def _parse_fx_holidays(raw_dates: list[str]) -> set:
+    """Parse optional YYYY-MM-DD full-day closures in New York time.
+
+    FX is open on many public holidays, and broker holiday hours can differ.
+    For that reason the runner only applies dates explicitly supplied through
+    FX_MARKET_HOLIDAYS rather than guessing a universal holiday calendar.
+    """
+    holidays = set()
+    for raw in raw_dates or []:
+        raw = str(raw).strip()
+        if not raw:
+            continue
+        try:
+            holidays.add(datetime.strptime(raw, "%Y-%m-%d").date())
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid FX_MARKET_HOLIDAYS date %r (expected YYYY-MM-DD)",
+                raw,
+            )
+    return holidays
+
+
+def _fx_entry_session_status(config: dict, now_utc: datetime = None) -> dict:
+    """Return global new-entry status using the FX weekly calendar.
+
+    The underlying bots NEVER stop.  This function controls only whether new
+    positions may be opened.  Existing positions therefore continue to receive
+    normal SL/TP, trailing, BE and strategy-exit management during sleep mode.
+
+    Weekly schedule (America/New_York, DST aware):
+      * FX week closes Friday at 17:00 NY by default.
+      * FX officially reopens Sunday at 17:00 NY by default.
+      * This bot resumes EARLY by FX_EARLY_OPEN_HOURS (default 4 hours), so
+        entries are allowed from Sunday 13:00 NY through Friday 17:00 NY.
+    """
+    if not config.get("fx_sleep_mode", True):
+        return {
+            "entry_allowed": True,
+            "sleep": False,
+            "reason": "FX sleep mode disabled",
+            "now_ny": (now_utc or datetime.now(timezone.utc)).astimezone(_NY_TZ),
+            "next_transition": None,
+        }
+
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now_ny = now.astimezone(_NY_TZ)
+
+    open_hour = int(config.get("fx_market_open_hour", 17))
+    close_hour = int(config.get("fx_market_close_hour", 17))
+    early_hours = max(0.0, float(config.get("fx_early_open_hours", 4.0)))
+    early_delta = timedelta(hours=early_hours)
+    holidays = _parse_fx_holidays(config.get("fx_market_holidays", []))
+
+    # Optional explicit full-day broker closures.  We still calculate the next
+    # normal weekly transition below; monitor output will state the holiday.
+    if now_ny.date() in holidays:
+        tomorrow = (now_ny + timedelta(days=1)).date()
+        next_transition = datetime.combine(tomorrow, dt_time(0, 0), tzinfo=_NY_TZ)
+        return {
+            "entry_allowed": False,
+            "sleep": True,
+            "reason": f"FX market holiday {now_ny.date().isoformat()} (NY)",
+            "now_ny": now_ny,
+            "next_transition": next_transition,
+        }
+
+    # Build this week's Friday close and Sunday early-resume times from the
+    # current NY calendar date. weekday(): Mon=0 ... Sun=6.
+    weekday = now_ny.weekday()
+
+    # Entry window is open Monday-Thursday all day.
+    if weekday <= 3:
+        days_to_friday = 4 - weekday
+        friday = (now_ny + timedelta(days=days_to_friday)).date()
+        next_transition = datetime.combine(
+            friday, dt_time(close_hour, 0), tzinfo=_NY_TZ
+        )
+        return {
+            "entry_allowed": True,
+            "sleep": False,
+            "reason": "FX-week entry window open",
+            "now_ny": now_ny,
+            "next_transition": next_transition,
+        }
+
+    # Friday: entries allowed until the weekly close.
+    if weekday == 4:
+        close_dt = datetime.combine(
+            now_ny.date(), dt_time(close_hour, 0), tzinfo=_NY_TZ
+        )
+        if now_ny < close_dt:
+            return {
+                "entry_allowed": True,
+                "sleep": False,
+                "reason": "FX-week entry window open",
+                "now_ny": now_ny,
+                "next_transition": close_dt,
+            }
+        # Closed Friday evening -> resume next Sunday 4h before official open.
+        sunday = now_ny.date() + timedelta(days=2)
+        official_open = datetime.combine(
+            sunday, dt_time(open_hour, 0), tzinfo=_NY_TZ
+        )
+        resume = official_open - early_delta
+        return {
+            "entry_allowed": False,
+            "sleep": True,
+            "reason": "FX weekend closed",
+            "now_ny": now_ny,
+            "next_transition": resume,
+        }
+
+    # Saturday: always sleeping; resume Sunday early.
+    if weekday == 5:
+        sunday = now_ny.date() + timedelta(days=1)
+        official_open = datetime.combine(
+            sunday, dt_time(open_hour, 0), tzinfo=_NY_TZ
+        )
+        resume = official_open - early_delta
+        return {
+            "entry_allowed": False,
+            "sleep": True,
+            "reason": "FX weekend closed",
+            "now_ny": now_ny,
+            "next_transition": resume,
+        }
+
+    # Sunday: sleep until early-resume time, then allow every symbol to trade.
+    official_open = datetime.combine(
+        now_ny.date(), dt_time(open_hour, 0), tzinfo=_NY_TZ
+    )
+    resume = official_open - early_delta
+    if now_ny < resume:
+        return {
+            "entry_allowed": False,
+            "sleep": True,
+            "reason": "FX weekend closed",
+            "now_ny": now_ny,
+            "next_transition": resume,
+        }
+
+    # Sunday early window is deliberately active even though spot FX may not
+    # yet be open; this lets the configured crypto/perpetual universe start
+    # four hours before the FX week officially opens, as requested.
+    friday = now_ny.date() + timedelta(days=5)
+    next_transition = datetime.combine(
+        friday, dt_time(close_hour, 0), tzinfo=_NY_TZ
+    )
+    return {
+        "entry_allowed": True,
+        "sleep": False,
+        "reason": f"Early-open window ({early_hours:g}h before FX open)",
+        "now_ny": now_ny,
+        "next_transition": next_transition,
+    }
+
+
+def _install_fx_sleep_entry_gate(bot, config: dict) -> None:
+    """Block only NEW entries while preserving all open-position management.
+
+    Every real crypto/futures entry path in TradingBot calls
+    RiskManager.can_open().  Wrapping that method is therefore safer than
+    stopping TradingBot.start() or setting max_open_positions=0 (which would
+    activate the bot's signal-only mode).  Exits, hard SL/TP and trailing logic
+    continue unchanged.
+    """
+    risk = getattr(bot, "risk", None)
+    if risk is None or getattr(risk, "_fx_sleep_gate_installed", False):
+        return
+
+    original_can_open = risk.can_open
+
+    def _session_aware_can_open(symbol: str, strategy: str = ""):
+        status = _fx_entry_session_status(config)
+        if not status["entry_allowed"]:
+            nxt = status.get("next_transition")
+            resume_text = nxt.strftime("%Y-%m-%d %H:%M %Z") if nxt else "unknown"
+            return False, (
+                f"SLEEP MODE: {status['reason']} — no new positions for any symbol; "
+                f"next entry window {resume_text}"
+            )
+        return original_can_open(symbol, strategy=strategy)
+
+    risk.can_open = _session_aware_can_open
+    risk._fx_sleep_gate_installed = True
+    logger.info("FX-week Sleep Mode entry gate installed for ALL symbols")
+
+
+async def _fx_sleep_monitor(config: dict):
+    """Log sleep/active state changes without stopping the trading loop."""
+    last_state = None
+    while not _stop_signal.is_set():
+        status = _fx_entry_session_status(config)
+        state = "SLEEP" if status["sleep"] else "ACTIVE"
+        if state != last_state:
+            now_ny = status["now_ny"]
+            nxt = status.get("next_transition")
+            next_text = nxt.strftime("%Y-%m-%d %H:%M %Z") if nxt else "n/a"
+            if status["sleep"]:
+                logger.warning(
+                    "🌙 SLEEP MODE | ALL symbols: NEW positions BLOCKED | "
+                    "open positions still managed normally | reason=%s | "
+                    "NY=%s | entries resume=%s",
+                    status["reason"], now_ny.strftime("%Y-%m-%d %H:%M %Z"), next_text,
+                )
+            else:
+                logger.info(
+                    "🟢 ACTIVE MODE | ALL symbols: new entries ALLOWED | "
+                    "reason=%s | NY=%s | next sleep=%s",
+                    status["reason"], now_ny.strftime("%Y-%m-%d %H:%M %Z"), next_text,
+                )
+            last_state = state
+
+        try:
+            await asyncio.wait_for(_stop_signal.wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            pass
 
 def _make_strategies(symbols: list, config: dict):
     mode   = config.get("strategy_mode", "ai_expert")
@@ -314,6 +558,10 @@ async def main():
     crypto_bot  = build_crypto_bot(config, telegram)
     forex_bot   = build_forex_bot(config, telegram) if config["forex_enabled"] else None
 
+    # Global 24/5 gate: block NEW positions across the whole symbol universe
+    # during the FX weekend. Existing positions continue normal management.
+    _install_fx_sleep_entry_gate(crypto_bot, config)
+
     loop = asyncio.get_event_loop()
 
     def _handle_signal():
@@ -337,7 +585,10 @@ async def main():
     # Auto-optimize SL/TP via backtest (for legacy strategies)
     await _run_backtest(crypto_bot, config, telegram)
 
-    tasks = [asyncio.create_task(crypto_bot.start())]
+    tasks = [
+        asyncio.create_task(crypto_bot.start()),
+        asyncio.create_task(_fx_sleep_monitor(config)),
+    ]
     if forex_bot:
         tasks.append(asyncio.create_task(forex_bot.start()))
         logger.info("Forex signal bot started: %s", config["forex_symbols"])
