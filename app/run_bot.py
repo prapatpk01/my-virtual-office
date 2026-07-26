@@ -195,7 +195,7 @@ def _view_waiting_reason(status: dict, tradeable_regimes) -> str:
     if st == "COOLDOWN":
         return "cooldown after a loss streak (waits for the cooldown to expire)"
     if st == "BLOCKED":
-        return "daily PnL limit hit — blocked until the next trading day"
+        return "legacy BLOCKED state detected — ALWAYS-TRADE mode will clear it"
     if not status.get("session_gate_open", True):
         return (f"session {status.get('session_state')} — new entries paused "
                 f"(commodity weekend; crypto is unaffected)")
@@ -623,8 +623,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             "min_sl_pct": _min_sl_pct,
             "tp1_close_pct": cfg.get("adaptive_tp1_close_pct", 0.60),
             "base_risk_pct": cfg["adaptive_risk_pct"],
-            "daily_loss_limit_pct": cfg["adaptive_daily_loss"],
-            "daily_profit_limit_pct": cfg["adaptive_daily_profit"],
+            "daily_loss_limit_pct": 0.0,  # disabled: trade 24/7 regardless of daily PnL
+            "daily_profit_limit_pct": 0.0,  # disabled: trade 24/7 regardless of daily PnL
             "cooldown_minutes": cfg["adaptive_cooldown_min"],
             "max_loss_streak": cfg["adaptive_max_loss_streak"],
             "startup_warmup_minutes": cfg.get("adaptive_warmup_min", 0),
@@ -667,6 +667,17 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             _bot_kwargs = {k: v for k, v in _bot_kwargs.items() if k in _supported}
         bot = AdaptiveBot(**_bot_kwargs)
         bot.load_state(state_file)
+        # [ALWAYS-TRADE MODE] Daily PnL limits are intentionally disabled.
+        # Clear a persisted BLOCKED state from an older deployment so the bot
+        # can resume scanning immediately after restart.
+        bot.daily_loss_limit_pct = 0.0
+        bot.daily_profit_limit_pct = 0.0
+        if getattr(bot, "state", None) == "BLOCKED":
+            bot.state = "SCANNING"
+            try:
+                bot._log_event("ALWAYS-TRADE: cleared stale daily-PnL BLOCKED state", level="warning")
+            except Exception:
+                pass
         bot.reconcile_with_exchange(sym, okx)
         # [MIN-LOT TP1] tell the bot the smallest closable size (1 contract in
         # coins) so an unsplittable TP1 becomes a breakeven-move instead of
@@ -711,6 +722,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             f"Range: risk×{cfg.get('adaptive_range_risk_multiplier', 0.50):.2f}, "
             f"max positions={max(0, cfg.get('adaptive_max_range_positions', 1))}, "
             f"cooldown={cfg.get('adaptive_range_cooldown_min', 90)}m\n"
+            f"Session gate: ALL symbols follow FX weekly schedule; pre-open 4h; daily PnL gate disabled\n"
             f"Warmup: {cfg.get('adaptive_warmup_min', 0)}m"
             f"{' (off — entries allowed immediately)' if not cfg.get('adaptive_warmup_min', 0) else ' — no new entries until indicators stabilize'}"
         )
@@ -775,17 +787,13 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         open_hour=_env_int("WEEKLY_OPEN_HOUR", 18),
         close_weekday=os.environ.get("WEEKLY_CLOSE_WEEKDAY", "FRIDAY"),
         close_hour=_env_int("WEEKLY_CLOSE_HOUR", 17),
-        pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 3.0),
-        post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 3.0),
+        pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 4.0),
+        post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 0.0),
     )
-    # Default FALSE: the weekend/session gate applies ONLY to commodities
-    # (XAU/XAG/CL); crypto trades 24/7 as usual. Set
-    # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=true to also pause crypto on the
-    # commodity weekend.
-    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", False)
-    # _commodity_symbols defined earlier (shared with the min-SL-floor split
-    # above) — with the default above, this is the ONLY set the session gate
-    # touches; crypto's session_gate_open stays True regardless of session.
+    # Default TRUE: every symbol follows the FX-reference weekly session.
+    # Existing positions remain managed during SLEEP_MODE; only new entries pause.
+    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", True)
+    # The same session state is applied to every configured symbol.
     last_session_state = None
     last_allow_new_positions = None
 
@@ -886,18 +894,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         session = session_engine.evaluate()
         if session.allow_new_positions != last_allow_new_positions:
             if last_allow_new_positions is not None and telegram:
-                # Scope note: with crypto exempt (the default), this gate
-                # only pauses commodities — say so, otherwise the message's
-                # "New Positions: DISABLED" reads as a full stop.
-                if _follow_session_for_crypto:
-                    scope = "Applies to: ALL symbols (crypto + commodities)"
-                else:
-                    _commodity_syms_here = sorted(
-                        s.split("/")[0].upper() for s in symbols
-                        if s.split("/")[0].upper() in _commodity_symbols)
-                    scope = ("Applies to: COMMODITIES ONLY "
-                             f"({', '.join(_commodity_syms_here) or 'none configured'}) "
-                             "— crypto keeps trading 24/7")
+                scope = "Applies to: ALL symbols (FX-reference weekly schedule)"
                 telegram.send(session.view_log_message + "\n" + scope)
             last_allow_new_positions = session.allow_new_positions
         if session.state.value != last_session_state:
@@ -950,15 +947,13 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     max_range_pos > 0 and range_open_count < max_range_pos
                 )
 
-                # [SESSION CONTROL] gate only new entries (never position
-                # management — _check_global_gates is the only reader of
-                # session_gate_open). Crypto symbols follow the same
-                # commodity-market schedule by default; set
-                # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=false to exempt them.
+                # [SESSION CONTROL] FX-reference weekly gate applies to ALL symbols.
+                # Only NEW entries are paused in SLEEP_MODE; existing positions
+                # continue normal SL/TP/position management. Trading resumes during
+                # PRE_OPEN_EXTENSION, 4 hours before the configured FX weekly open.
                 base_sym = sym.split("/")[0].upper()
-                applies = _follow_session_for_crypto or base_sym in _commodity_symbols
-                bot.session_gate_open = session.allow_new_positions if applies else True
-                bot.session_state = session.state.value if applies else "ACTIVE"
+                bot.session_gate_open = bool(session.allow_new_positions)
+                bot.session_state = session.state.value
 
                 if is_new_bar:
                     last_bar_ts[sym] = latest_ts
