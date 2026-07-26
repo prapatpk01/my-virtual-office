@@ -1,116 +1,30 @@
 """
-Trend-Confirmed Multi-TF Strategy — Adaptive HTF Context V2.1.
+Trend Confirm — Precision EMA Cross V3.0.
 
-V2 keeps the three 5M entry engines (EMA_CROSS, BREAKOUT_RETEST and
-STRUCTURE_RETEST) and adds a production context architecture around them:
-  Layer 0 — OHLCV/timestamp data-quality validation.
-  Layer 1 — 30M confirmed trend direction.
-  Layer 1B — 4H major + 1H minor swing structure.
-  Layer 2 — 15M/1H quality score and explicit 15M regime router.
-  Layer 2B — 4H/1H supply-demand zones with freshness, touch count,
-             invalidation, role reversal and opposing-zone room in R.
-  Layer 3 — 5M three-engine candidate router and candidate-specific stops.
+This revision deliberately removes the five-engine OR-style entry router from
+the live default path.  The strategy now opens positions from one execution
+trigger only: a confirmed EMA8/EMA13 cross on a CLOSED 5-minute candle.
 
-Layer 1 — Trend direction (TF30m):
-  Determines whether the market is currently in an uptrend or a
-  downtrend. EMA10/20 alignment is mandatory and at least 3 of the 4
-  direction checks must agree. This preserves trend confirmation without
-  requiring slower SMA/MACD components to turn on the exact same bar:
-    SMA30      : candle opens above SMA30 -> up, below -> down
-    EMA10/20   : EMA10 > EMA20 -> up, EMA10 < EMA20 -> down
-    EMA20 slope: EMA20 higher than `ema_slope_lookback` bars ago -> up
-    MACD       : raw MACD LINE (fast EMA - slow EMA) vs zero ("MACD 4C"
-                 zero-line read, sign only).
-  Re-evaluated once per new 30m bar; a confirmed trend does not expire on
-  its own, it just gets re-read every 30m bar.
+The EMA cross is not used naked.  It is accepted only when 1H trend direction,
+15M/1H quality, regime, HTF location and current 5M execution quality agree.
+A large/extended cross candle is never chased; the strategy waits for the first
+EMA13 retest and reclaim while the cross remains fresh.  TRANSITION remains
+tradable, but requires stronger quality, participation and directional votes.
 
-Layer 2 — Trade CONTEXT: trend quality (2a) + location/structure (2b).
-  Both must pass before Layer 3 even waits for the cross.
+Position management uses one hard TP.  At +0.8R the SL moves to +0.5R and the
+full position remains a runner.  Before the lock, one EMA cross-back is no
+longer enough to close a trade: at least two independent failure confirmations
+are required on closed 5M candles (EMA cross-back, two closes through EMA13,
+and micro-structure failure).
 
-  2a) Trend quality — dynamic weighted score (TF15m + TF1H):
-    Scores HOW GOOD the confirmed trend is on each timeframe (0-100 per TF),
-    then combines them 15m x 70% + 1H x 30%. Must score above the balanced
-    `layer2_threshold` (default 56) established, or 62 for
-    an early-trend entry. Each per-TF quality score (in _tf_quality()) is:
-      Alignment 40 pts — 4 x 10 pts: close vs EMA20, EMA20 vs EMA50, RSI
-                         lean (>55 bull / <45 bear), MACD line sign — each
-                         agreeing with Layer 1's direction scores 10.
-      ADX       25 pts — trend strength, full credit at 2x adx_threshold (20).
-      Chop      20 pts — inverted Choppiness Index (low chop = high score),
-                         full credit at 100 - chop_threshold (61.8) points.
-      Volume    15 pts — volume / SMA20(volume), full credit at 2x
-                         volume_expansion_mult (1.0).
-    Soft point-scoring (ai_expert's ConfidenceEngine pattern): a weak reading
-    on one component can be outweighed by strong readings elsewhere.
-
-  2b) Location & structure-room filter (see _location_context()):
-    Hard-rejects entering into an active HTF opposing pivot zone, opposite 1H
-    swing structure, a wrong-side liquidity sweep, or critically low room.
-    Borderline location doesn't reject — it raises 2a's threshold by
-    `location_threshold_penalty` (+4). Only evaluated once 2a passes and the
-    5m EMA50 stop reference (l3) is available.
-
-Layer 3 — Multi-entry router (TF5m), reached only after Layer1 + Layer2 pass:
-  A) EMA_CROSS — original EMA10/20 cross timing.
-  B) BREAKOUT_RETEST — a qualified breakout (body/close/volume) must return to
-     the broken level and reclaim it; direct breakout chasing is not allowed.
-  C) STRUCTURE_RETEST — confirmed HH/HL (long) or LH/LL (short), followed by a
-     retest of the latest HL/LH and reclaim, engulf/pin, or micro-BOS.
-  Every engine still requires EMA alignment, the EMA50 chase guard, HTF
-  location/room validation, and a candidate-specific quality threshold.
-  Early-trend window: the 5m EMA10/20 cross is faster than Layer 1's 30m
-  confirmation, so the cross that starts a move often fires a bar or two
-  BEFORE the trend confirms. When Layer 1's trend JUST confirmed (within
-  `fresh_trend_bars`, default 2, 5m bars of when it flipped) the entry counts
-  a cross up to fresh_trend_bars ago — which may predate the confirmation.
-  Entering this early is riskier, so it must clear the STRICTER
-  `layer2_threshold_early` (62) instead of the normal 56. Outside that
-  window the established-trend threshold applies.
-  Cross validity: a cross stays usable for `cross_valid_bars` (default 3) 5m
-  bars — the Layer2 gates (quality/location) often clear a bar or two AFTER
-  the cross fires, and requiring both on the exact same bar silently wasted
-  almost every signal. The price-position and chase-guard checks always run
-  on the CURRENT bar, so a windowed cross can't produce a stale entry. The
-  cross timestamp is consumed (reset) once it triggers an entry attempt
-  (pass or fail), so one cross can't satisfy a later setup twice. The EMA50
-  distance check is a chase-guard: no entry if price already ran too far
-  from it — wait for a pullback + fresh cross.
-
-Exit — a 2-TP + break-even scheme managed in tick_open_position():
-  TP1 (partial): when price reaches `tp1_r` (0.75R, halfway to the 1.5R
-    final TP), take `tp1_close_pct` (50%) off and move SL to break-even +
-    `be_offset_r` (BE + 0.1R — a small locked profit on the runner). Checked
-    every tick, fires once.
-  Runner (remaining 50%): rides on until, on the 5m TF, EITHER the EMA10/20
-    cross-back (long: EMA10 crosses below EMA20) OR a close past EMA20 (long:
-    5m close below EMA20) — mirror for shorts — the hard final TP (1.5R), or
-    the trailed SL (BE+0.1R).
-  SL sits at the 5m EMA50 (the chase-guard keeps price within 1.5x ATR of it,
-  so max risk ~1.5 ATR). Its distance from entry is R; TP2 = 1.5R (2.5R put
-  the target too far — it was rarely hit). The
-  distance is floored at min_sl_pct (0.5% of price) so an EMA50 sitting right
-  at price can't produce a microscopic noise-stop. These are the hard bounds
-  bot.py's risk manager checks underneath; TP1 fires the partial + BE-move
-  via a PositionUpdate("partial_tp", new_sl=...).
-
-Once closed (by either exit condition or the hard SL/TP stop), the next
-bar where Layer1+Layer2 read confirmed again is eligible for a new entry.
-No cooldown.
-
-Exits are evaluated in tick_open_position() (called by bot.py every tick for
-an open position), NOT by returning a SELL/BUY Signal from analyze() — in
-hedge mode a SELL Signal always OPENS a new short rather than closing an
-open long. tick_open_position()'s PositionUpdate("close") always closes
-whichever position is actually open, regardless of hedge mode.
-
-Data: TF30m (Layer 1) is resampled from the 15m series this strategy
-receives (last, possibly-forming, 30m bucket dropped). Layer 2 runs on the
-raw 15m candles + the 1H series from mtf_candles. Layer 3 entry, SL/TP and
-exit run on the 5m series passed in via mtf_candles["5m"].
+The public class name, constructor compatibility, Signal metadata and strategy
+callbacks are preserved so this file can replace the previous strategy without
+changes elsewhere in the bot.
 """
 from __future__ import annotations
 
 import math
+import time
 from typing import Optional
 
 import numpy as np
@@ -152,8 +66,8 @@ class TrendConfirmStrategy(BaseStrategy):
         volume_weight: float = 15.0,     # volume expansion vs its SMA
         tf_weight_15m: float = 0.70,
         tf_weight_1h: float = 0.30,
-        layer2_threshold: float = 56.0,        # balanced live threshold; HTF context still protects location
-        layer2_threshold_early: float = 62.0,  # early setups remain stricter without becoming practically unreachable
+        layer2_threshold: float = 60.0,        # balanced live threshold; HTF context still protects location
+        layer2_threshold_early: float = 64.0,  # early setups remain stricter without becoming practically unreachable
         allow_15m_quality_fallback: bool = True,
         single_tf_quality_penalty: float = 4.0,
         # Layer 3 — entry (5m): EMA10/20 cross, price above/below EMA20, within 1.5xATR of EMA50
@@ -164,22 +78,35 @@ class TrendConfirmStrategy(BaseStrategy):
         entry_ema_ref: int = 13,    # price must be above (long) / below (short) this EMA — same line the cross + exit use
         sl_ema_ref: int = 50,       # SL sits at this EMA (5m)
         chase_ema_ref: int = 50,    # chase-guard distance is measured vs this EMA (5m); decoupled from sl_ema_ref
-        fresh_trend_bars: int = 3,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
-        cross_valid_bars: int = 6,  # how many 5m bars a cross stays usable while Layer2 gates settle —
+        fresh_trend_bars: int = 2,  # EMA-cross lookback (in 5m bars) when the trend just confirmed (early trend)
+        cross_valid_bars: int = 2,  # how many 5m bars a cross stays usable while Layer2 gates settle —
                                     #   without this, a cross was only good on the exact bar every gate was
                                     #   already open (quality/location often clear 1-2 bars AFTER the cross,
                                     #   which silently wasted almost every signal)
-        max_dist_atr_mult: float = 2.2,  # EMA-cross chase limit in ATR(5m)
-        breakout_max_dist_atr_mult: float = 2.8,
-        structure_max_dist_atr_mult: float = 2.4,
+        max_dist_atr_mult: float = 1.40,  # EMA-cross chase limit in ATR(5m)
+        breakout_max_dist_atr_mult: float = 1.80,
+        structure_max_dist_atr_mult: float = 1.60,
         # Layer 3 Entry Router — five independent context-aware triggers. Breakout uses
         # retest-only execution (no direct chasing) and structure entry requires
         # a confirmed HH/HL or LH/LL sequence plus a reclaim / micro-BOS trigger.
         use_ema_cross_entry: bool = True,
-        use_breakout_retest_entry: bool = True,
-        use_structure_retest_entry: bool = True,
-        use_price_action_structure_entry: bool = True,
-        use_early_structure_entry: bool = True,
+        use_breakout_retest_entry: bool = False,
+        use_structure_retest_entry: bool = False,
+        use_price_action_structure_entry: bool = False,
+        use_early_structure_entry: bool = False,
+        # Precision EMA-only execution.  When enabled, stale runtime config
+        # cannot silently re-enable the experimental entry engines.
+        ema_only_mode: bool = True,
+        use_closed_entry_bars: bool = True,
+        closed_bar_grace_ms: int = 1500,
+        ema_slow_slope_lookback: int = 2,
+        ema_min_gap_atr: float = 0.02,
+        ema_min_body_atr: float = 0.08,
+        ema_min_close_quality: float = 0.58,
+        ema_min_volume_ratio: float = 0.70,
+        ema_impulse_body_atr: float = 1.20,
+        ema_max_extension_slow_atr: float = 0.90,
+        ema_retest_tolerance_atr: float = 0.22,
         entry_trigger_valid_bars: int = 3,
         breakout_lookback: int = 6,
         breakout_arm_bars: int = 6,
@@ -208,8 +135,8 @@ class TrendConfirmStrategy(BaseStrategy):
         early_structure_min_rejection_wick_atr: float = 0.08,
         early_structure_transition_quality_bonus: float = 4.0,
         entry_stop_buffer_atr: float = 0.10,
-        entry_min_stop_atr: float = 0.50,
-        entry_max_stop_atr: float = 2.20,
+        entry_min_stop_atr: float = 0.75,
+        entry_max_stop_atr: float = 1.80,
         # Position sizing (emitted in the signal so bot.py sizes live orders the
         # same way the paper account does): margin = margin_pct of balance,
         # notional = margin x leverage. e.g. $100 x 5% = $5 x 20 = $100 notional.
@@ -221,9 +148,9 @@ class TrendConfirmStrategy(BaseStrategy):
         structure_pivot_right: int = 2,
         zone_width_atr_1h: float = 0.18,
         zone_width_atr_4h: float = 0.22,
-        hard_zone_distance_atr: float = 0.15,
-        min_structure_room_r: float = 0.25,   # hard-reject below this many R of room to the opposing zone
-        preferred_structure_room_r: float = 0.75,  # below this (but >= min) just penalizes the quality gate
+        hard_zone_distance_atr: float = 0.25,
+        min_structure_room_r: float = 1.20,   # hard-reject below this many R of room to the opposing zone
+        preferred_structure_room_r: float = 1.50,  # below this (but >= min) just penalizes the quality gate
         location_threshold_penalty: float = 3.0,
         max_location_threshold_penalty: float = 8.0,
         reject_midrange_when_choppy: bool = True,
@@ -264,7 +191,7 @@ class TrendConfirmStrategy(BaseStrategy):
         regime_trend_chop_max: float = 61.8,
         regime_min_ema_gap_atr: float = 0.35,
         regime_strong_threshold_discount: float = 3.0,
-        regime_transition_threshold_penalty: float = 3.0,
+        regime_transition_threshold_penalty: float = 2.0,
         allow_structure_entry_in_transition: bool = True,
         require_trend_regime: bool = False,     # if True, HARD-block non-TREND regimes. Default off:
                                                 #   TRANSITION is allowed but must pass the extra gate below.
@@ -273,12 +200,12 @@ class TrendConfirmStrategy(BaseStrategy):
         # usually early-trend, which already carries the stricter early
         # threshold) — the extra confidence comes from momentum + volume, not a
         # sky-high score bar that would block essentially every cross.
-        transition_extra_threshold: float = 0.0,    # no quality stacking (6 blocked ~every cross). The extra
+        transition_extra_threshold: float = 4.0,    # no quality stacking (6 blocked ~every cross). The extra
                                                      #   analysis is momentum + volume below, not a higher bar.
-        transition_min_vol_ratio: float = 0.5,      # only block genuinely dead volume (< 0.5x its SMA)
+        transition_min_vol_ratio: float = 0.80,      # only block genuinely dead volume (< 0.5x its SMA)
         transition_require_momentum: bool = True,   # need MACD histogram pushing in the trend's direction
         transition_momentum_frac: float = 0.3,      # momentum dimension must reach this fraction of its weight
-        transition_min_directional_votes: int = 3,    # 3-of-5 directional evidence; avoids indicator-stacking vetoes
+        transition_min_directional_votes: int = 4,    # 3-of-5 directional evidence; avoids indicator-stacking vetoes
         transition_require_clean_location: bool = True,  # applied candidate-by-candidate after the stop/room is known
         # Sideways / range veto (Layer 2) — hard-block entries when the 15m
         # context looks like a range, not a trend. Designed NOT to kill early
@@ -293,7 +220,7 @@ class TrendConfirmStrategy(BaseStrategy):
         # Exit (5m): EMA10/20 cross-back OR a 5m close past EMA20 closes the runner
         use_close_past_exit: bool = False,   # faster exit: also close when price closes past EMA_slow (before
                                             #   the full EMA8/13 cross-back) — more responsive, protects profit
-        exit_close_confirm_bars: int = 1,   # N consecutive closes past EMA_slow required (1 = fastest)
+        exit_close_confirm_bars: int = 2,   # N consecutive closes past EMA_slow required (1 = fastest)
         signal_exit_requires_tp1: bool = False,  # cross-back exit works immediately (no TP1 to wait for now)
                                                  #   bounds manage the trade until then. On 5m the single-close
                                                  #   slow-EMA exits killed 75% of trades at ~-0.3R before TP1; arming
@@ -311,6 +238,10 @@ class TrendConfirmStrategy(BaseStrategy):
         be_trail_trigger_r: float = 0.8,    # target: move the SL once +0.8R is reached
         be_trail_sl_r: float = 0.5,         # new SL sits at entry +/- 0.5R (BE + 0.5R locked)
         runner_ignore_signal_exit_after_be: bool = True,
+        exit_min_hold_bars: int = 2,
+        exit_failure_confirmations: int = 2,
+        exit_structure_lookback: int = 3,
+        same_direction_rearm_bars: int = 3,
         tp1_r: float = 0.75,                # TP1 at 0.75R (halfway to the 1.5R final TP)
         tp1_close_pct: float = 0.5,         # fraction closed at TP1
         be_offset_r: float = 0.1,           # after TP1, SL -> entry +/- this many R (BE + 0.1R, a small locked profit)
@@ -390,6 +321,17 @@ class TrendConfirmStrategy(BaseStrategy):
         self.use_structure_retest_entry = use_structure_retest_entry
         self.use_price_action_structure_entry = use_price_action_structure_entry
         self.use_early_structure_entry = use_early_structure_entry
+        self.ema_only_mode = bool(ema_only_mode)
+        self.use_closed_entry_bars = bool(use_closed_entry_bars)
+        self.closed_bar_grace_ms = max(0, int(closed_bar_grace_ms))
+        self.ema_slow_slope_lookback = max(1, int(ema_slow_slope_lookback))
+        self.ema_min_gap_atr = max(0.0, float(ema_min_gap_atr))
+        self.ema_min_body_atr = max(0.0, float(ema_min_body_atr))
+        self.ema_min_close_quality = min(0.95, max(0.50, float(ema_min_close_quality)))
+        self.ema_min_volume_ratio = max(0.0, float(ema_min_volume_ratio))
+        self.ema_impulse_body_atr = max(self.ema_min_body_atr, float(ema_impulse_body_atr))
+        self.ema_max_extension_slow_atr = max(0.20, float(ema_max_extension_slow_atr))
+        self.ema_retest_tolerance_atr = max(0.0, float(ema_retest_tolerance_atr))
         self.entry_trigger_valid_bars = max(1, entry_trigger_valid_bars)
         self.breakout_lookback = max(3, breakout_lookback)
         self.breakout_arm_bars = max(1, breakout_arm_bars)
@@ -487,6 +429,10 @@ class TrendConfirmStrategy(BaseStrategy):
         self.be_trail_trigger_r = be_trail_trigger_r
         self.be_trail_sl_r = be_trail_sl_r
         self.runner_ignore_signal_exit_after_be = runner_ignore_signal_exit_after_be
+        self.exit_min_hold_bars = max(0, int(exit_min_hold_bars))
+        self.exit_failure_confirmations = max(2, min(3, int(exit_failure_confirmations)))
+        self.exit_structure_lookback = max(2, int(exit_structure_lookback))
+        self.same_direction_rearm_bars = max(0, int(same_direction_rearm_bars))
         self._be_trailed: bool = False
         self._entry_threshold_bonus: float = 0.0  # bot raises this during post-cooldown strict window
         self.tp1_r = tp1_r
@@ -515,6 +461,12 @@ class TrendConfirmStrategy(BaseStrategy):
         # Apply params passed by the bot/config. Older versions forwarded params
         # to BaseStrategy but silently ignored them in this class.
         self._apply_runtime_params(params)
+        if self.ema_only_mode:
+            self.use_ema_cross_entry = True
+            self.use_breakout_retest_entry = False
+            self.use_structure_retest_entry = False
+            self.use_price_action_structure_entry = False
+            self.use_early_structure_entry = False
 
         self._open_position: Optional[str] = None   # "long" | "short" | None
         self._trend_state: Optional[str] = None      # "up" | "down" | None — Layer 1 result
@@ -538,6 +490,10 @@ class TrendConfirmStrategy(BaseStrategy):
         # Partial-TP tracking for the open position (owned by tick_open_position())
         self._entry_price: Optional[float] = None
         self._entry_sl: Optional[float] = None
+        self._entry_bar_ts: Optional[int] = None
+        self._entry_regime: Optional[str] = None
+        self._last_signal_exit_ts: Optional[int] = None
+        self._last_signal_exit_direction: Optional[str] = None
         self._tp1_done: bool = False
         # HTF zone cache: location is evaluated once per candidate, but the
         # expensive zone scan only needs to rerun when a 1H/4H bar changes.
@@ -609,6 +565,14 @@ class TrendConfirmStrategy(BaseStrategy):
             self.location_threshold_penalty, float(self.max_location_threshold_penalty)
         )
         self.min_4h_context_bars = max(10, int(self.min_4h_context_bars))
+        self.cross_valid_bars = max(1, min(3, int(self.cross_valid_bars)))
+        self.ema_slow_slope_lookback = max(1, int(self.ema_slow_slope_lookback))
+        self.ema_min_close_quality = min(0.95, max(0.50, float(self.ema_min_close_quality)))
+        self.ema_min_volume_ratio = max(0.0, float(self.ema_min_volume_ratio))
+        self.ema_max_extension_slow_atr = max(0.20, float(self.ema_max_extension_slow_atr))
+        self.exit_failure_confirmations = max(2, min(3, int(self.exit_failure_confirmations)))
+        self.exit_structure_lookback = max(2, int(self.exit_structure_lookback))
+        self.same_direction_rearm_bars = max(0, int(self.same_direction_rearm_bars))
 
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
         self._latest_candles = candles  # 15m base (Layer1 30m resample + Layer2 15m)
@@ -624,6 +588,8 @@ class TrendConfirmStrategy(BaseStrategy):
         c5m = mtf.get(self.entry_tf, []) or []
         if not c5m and self.entry_tf == "15m":
             c5m = candles
+        if self.use_closed_entry_bars and c5m:
+            c5m = self._closed_candle_series(c5m, entry_ms, self.closed_bar_grace_ms)
         # Some bot deployments only request 5m/15m data. Build missing HTFs
         # from the 15m series instead of permanently blocking all entries.
         c1h = mtf.get("1h", []) or self._resample_timeframe(candles, 60 * 60_000, 15 * 60_000)
@@ -746,7 +712,9 @@ class TrendConfirmStrategy(BaseStrategy):
             quality_fallback = True
 
         # Entry price is the latest 5m close (the TF the cross fires on).
-        close_price = c5m[-1].close if c5m else candles[-1].close
+        closed_price = c5m[-1].close if c5m else candles[-1].close
+        close_price = (float(current_price) if current_price is not None and
+                       np.isfinite(current_price) and current_price > 0 else float(closed_price))
         dist_atr = (abs(close_price - l3["dist_ema_val"]) / l3["atr_val"]
                    if (l3 is not None and l3["atr_val"] > 0) else None)
 
@@ -821,6 +789,18 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price,
                 "Layer3: an entry was already attempted on this 5m bar — waiting for the next closed bar",
                 metadata=dbg("entry_already_attempted"))
+
+        pending_direction = "long" if trend == "up" else "short"
+        if (bar_ts_5 is not None and self._last_signal_exit_ts is not None
+                and self._last_signal_exit_direction == pending_direction):
+            bars_since_exit = max(0, (bar_ts_5 - self._last_signal_exit_ts) // entry_ms)
+            if bars_since_exit < self.same_direction_rearm_bars:
+                return self._hold(
+                    current_price,
+                    f"EMA rearm: waiting {self.same_direction_rearm_bars - bars_since_exit} closed "
+                    f"{self.entry_tf} bar(s) after a failed {pending_direction.upper()} setup",
+                    metadata=dbg("same_direction_rearm"),
+                )
 
         pending_cross = has_long_candidate or has_short_candidate
         score_note = ((f"(15m={q15['score']:.0f} x{self.tf_weight_15m:.2f} + "
@@ -909,44 +889,37 @@ class TrendConfirmStrategy(BaseStrategy):
         direction = "long" if trend == "up" else "short"
         candidates: list[dict] = []
 
-        # Engine A — EMA cross. Preserve the original behavior, but consume a
-        # cross that reaches Layer3 and fails the current-bar side/distance gate.
+        # Engine A — the only live entry path in Precision EMA mode.  A cross
+        # must be confirmed on a closed candle.  If the cross candle is extended
+        # or the quality/location gates clear a bar later, the first EMA13
+        # retest + reclaim is required instead of chasing a stale cross.
         ema_pending = ema_cross_up if direction == "long" else ema_cross_down
+        cross_ts = self._last_ema_cross_up_ts if direction == "long" else self._last_ema_cross_down_ts
         if not self.use_ema_cross_entry:
             engine_status["EMA_CROSS"] = "disabled"
         elif not ema_pending:
-            engine_status["EMA_CROSS"] = "waiting"
+            engine_status["EMA_CROSS"] = "waiting for fresh confirmed cross"
+        elif (self._last_signal_exit_direction == direction and
+              self._last_signal_exit_ts is not None and
+              (cross_ts is None or cross_ts <= self._last_signal_exit_ts)):
+            engine_status["EMA_CROSS"] = "waiting for a new cross after the previous failed setup"
+        elif not dist_ok:
+            engine_status["EMA_CROSS"] = f"rejected: {dist_disp}xATR from EMA{self.chase_ema_ref}"
+        elif not ((direction == "long" and l3["sl_ema_val"] < close_price)
+                  or (direction == "short" and l3["sl_ema_val"] > close_price)):
+            engine_status["EMA_CROSS"] = f"rejected: EMA{self.sl_ema_ref} is on wrong side of entry"
         else:
-            side_ok = l3["above_ema_ref"] if direction == "long" else l3["below_ema_ref"]
-            if not side_ok:
-                if direction == "long":
-                    self._last_ema_cross_up_ts = None
-                else:
-                    self._last_ema_cross_down_ts = None
-                engine_status["EMA_CROSS"] = f"rejected: price wrong side of EMA{self.entry_ema_ref}"
-            elif not dist_ok:
-                if direction == "long":
-                    self._last_ema_cross_up_ts = None
-                else:
-                    self._last_ema_cross_down_ts = None
-                engine_status["EMA_CROSS"] = f"rejected: {dist_disp}xATR from chase EMA"
-            elif not ((direction == "long" and l3["sl_ema_val"] < close_price)
-                      or (direction == "short" and l3["sl_ema_val"] > close_price)):
-                # Do not mirror an EMA50 that is on the wrong side of entry.
-                # Mirroring hid a bad trend/location read and produced a stop
-                # that was no longer actually anchored to EMA50.
-                if direction == "long":
-                    self._last_ema_cross_up_ts = None
-                else:
-                    self._last_ema_cross_down_ts = None
-                engine_status["EMA_CROSS"] = f"rejected: EMA{self.sl_ema_ref} is on wrong side of entry"
+            ema_setup = self._precision_ema_cross_setup(
+                c5m, direction, cross_ts, close_price, l3["atr_val"], regime.get("state")
+            )
+            if not ema_setup.get("valid"):
+                engine_status["EMA_CROSS"] = ema_setup.get("reason", "waiting for EMA confirmation")
             else:
-                cross_ts = self._last_ema_cross_up_ts if direction == "long" else self._last_ema_cross_down_ts
                 candidates.append({
                     "entry_type": "EMA_CROSS", "direction": direction,
                     "trigger_ts": cross_ts, "raw_stop": l3["sl_ema_val"],
-                    "stop_mode": "ema", "base_edge": 68.0, "min_quality": l2_thr,
-                    "detail": {"cross_bars_ago": ema_up_ago if direction == "long" else ema_down_ago},
+                    "stop_mode": "ema", "base_edge": ema_setup["edge_score"],
+                    "min_quality": l2_thr, "detail": ema_setup,
                 })
                 engine_status["EMA_CROSS"] = "candidate"
 
@@ -1181,6 +1154,8 @@ class TrendConfirmStrategy(BaseStrategy):
 
         self._open_position = direction
         self._entry_price, self._entry_sl, self._tp1_done = close_price, sl, False
+        self._entry_bar_ts = bar_ts_5
+        self._entry_regime = regime.get("state")
         self._be_trailed = False
         meta = dbg("entered")
         meta.update({
@@ -1270,45 +1245,61 @@ class TrendConfirmStrategy(BaseStrategy):
         if self.runner_ignore_signal_exit_after_be and self._be_trailed:
             return PositionUpdate(action="hold", reason=f"Runner {self._open_position.upper()} — +{self.be_trail_sl_r:.1f}R locked, waiting for hard TP/SL")
 
-        # ── 2) Pre-lock emergency trend-failure exit ───────────────────────
+        # ── 2) Pre-lock confirmed trend-failure exit ───────────────────────
+        # A single 5M EMA cross-back is ordinary noise and no longer closes the
+        # trade.  Two independent failures are required on CLOSED bars.
         candles = self._latest_5m
         if not candles:
-            return PositionUpdate(action="hold", reason="Waiting for 5m data")
+            return PositionUpdate(action="hold", reason=f"Waiting for closed {self.entry_tf} data")
         bar_ts = candles[-1].timestamp
         if bar_ts == self._last_exit_bar_ts:
-            return PositionUpdate(action="hold", reason="Waiting for the next 5m bar close")
+            return PositionUpdate(action="hold", reason=f"Waiting for the next closed {self.entry_tf} bar")
 
         l3 = self._layer3_indicators(candles)
         if l3 is None:
-            return PositionUpdate(action="hold", reason="Indicators warming up (5m)")
+            return PositionUpdate(action="hold", reason=f"Indicators warming up ({self.entry_tf})")
         self._last_exit_bar_ts = bar_ts
 
-        # Optionally hold all signal exits until TP1 has banked — before that,
-        # only the hard SL (EMA50) / TP bounds manage the trade. Cuts the
-        # noise exits that killed trades at ~-0.3R before they could develop.
+        bars_held = (self.exit_min_hold_bars if self._entry_bar_ts is None else
+                     max(0, (bar_ts - self._entry_bar_ts) // self._entry_tf_ms()))
+        if bars_held < self.exit_min_hold_bars:
+            return PositionUpdate(
+                action="hold",
+                reason=f"Holding {self._open_position.upper()} — minimum confirmation window "
+                       f"{bars_held}/{self.exit_min_hold_bars} closed bars",
+            )
+
         if self.signal_exit_requires_tp1 and not self._tp1_done:
             return PositionUpdate(action="hold",
                                   reason=f"Holding {self._open_position.upper()} — signal exits armed after TP1")
 
-        cb = self.exit_close_confirm_bars
-        if self._open_position == "long":
-            close_exit = (self.use_close_past_exit
-                          and self._closes_past_ema_slow(candles, "long", cb))
-            if l3["ema_cross_down"] or close_exit:
-                reason = (f"EMA{self.ema_fast} crossed below EMA{self.ema_slow}" if l3["ema_cross_down"]
-                          else f"price closed below EMA{self.ema_slow} (early)")
-                self._reset_position_state()
-                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit LONG: {reason} ({self.entry_tf})")
-        if self._open_position == "short":
-            close_exit = (self.use_close_past_exit
-                          and self._closes_past_ema_slow(candles, "short", cb))
-            if l3["ema_cross_up"] or close_exit:
-                reason = (f"EMA{self.ema_fast} crossed above EMA{self.ema_slow}" if l3["ema_cross_up"]
-                          else f"price closed above EMA{self.ema_slow} (early)")
-                self._reset_position_state()
-                return PositionUpdate(action="close", close_pct=1.0, reason=f"Exit SHORT: {reason} ({self.entry_tf})")
+        side = self._open_position
+        crossback = l3["ema_cross_down"] if side == "long" else l3["ema_cross_up"]
+        wrong_side = self._closes_past_ema_slow(candles, side, max(2, self.exit_close_confirm_bars))
+        structure_fail = self._micro_structure_failure(candles, side, self.exit_structure_lookback)
+        failures = {
+            "EMA cross-back": bool(crossback),
+            f"{max(2, self.exit_close_confirm_bars)} closes through EMA{self.ema_slow}": bool(wrong_side),
+            "micro structure failure": bool(structure_fail),
+        }
+        fired = [name for name, value in failures.items() if value]
+        if len(fired) >= self.exit_failure_confirmations:
+            exiting_side = side
+            self._last_signal_exit_ts = bar_ts
+            self._last_signal_exit_direction = exiting_side
+            self._reset_position_state()
+            return PositionUpdate(
+                action="close", close_pct=1.0,
+                reason=f"Exit {exiting_side.upper()}: confirmed trend failure "
+                       f"({len(fired)}/3: {', '.join(fired)}) ({self.entry_tf})",
+            )
 
-        return PositionUpdate(action="hold", reason=f"Holding {self._open_position.upper()}")
+        status = ", ".join(fired) if fired else "no confirmed failure"
+        return PositionUpdate(
+            action="hold",
+            reason=f"Holding {side.upper()} — failure confirmation "
+                   f"{len(fired)}/{self.exit_failure_confirmations} ({status})",
+        )
 
     def _closes_past_ema_slow(self, candles: list, side: str, n: int) -> bool:
         """True if the last `n` 5m bars ALL closed on the wrong side of EMA20 (ema_slow)
@@ -1331,6 +1322,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self._open_position = None
         self._entry_price = None
         self._entry_sl = None
+        self._entry_bar_ts = None
+        self._entry_regime = None
         self._tp1_done = False
         self._be_trailed = False
 
@@ -1360,6 +1353,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self._open_position = direction
         self._entry_price = entry_price
         self._entry_sl = stop_loss
+        self._entry_bar_ts = self._latest_5m[-1].timestamp if self._latest_5m else None
+        self._entry_regime = None
         self._tp1_done = False
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -1484,20 +1479,19 @@ class TrendConfirmStrategy(BaseStrategy):
         context_reasons: list[str] = []
         one_h_conflict = structure_1h == opposite_structure
         four_h_conflict = self.use_htf_macro_filter and structure_4h == opposite_structure
-        # A single HTF disagreement is common near reversals and should not
-        # silence the bot. Only a confirmed conflict on BOTH 1H and 4H is a
-        # hard veto; one conflicting timeframe raises the required quality.
-        if one_h_conflict and four_h_conflict:
+        # A confirmed 4H conflict is a macro hard veto.  The previous version
+        # only rejected when 1H and 4H disagreed simultaneously, which allowed
+        # repeated longs inside a confirmed 4H bear structure.  A lone 1H pivot
+        # conflict remains a quality penalty because the 1H EMA trend can lead
+        # the slower pivot sequence during a legitimate transition.
+        if four_h_conflict:
             return {**self._neutral_location_context(), "valid": False,
-                    "reason": f"1H and 4H both confirmed {opposite_structure.upper()} structure",
+                    "reason": f"4H confirmed {opposite_structure.upper()} structure conflicts with entry",
                     "structure_1h": structure_1h, "structure_4h": structure_4h,
                     "macro_alignment": "CONFLICT"}
         if one_h_conflict:
             context_penalty += self.htf_single_conflict_penalty
             context_reasons.append(f"1H {opposite_structure} structure conflict")
-        if four_h_conflict:
-            context_penalty += self.htf_single_conflict_penalty
-            context_reasons.append(f"4H {opposite_structure} structure conflict")
 
         levels: list[dict] = []
         for tf, pivots, bars, mult in (
@@ -2216,6 +2210,146 @@ class TrendConfirmStrategy(BaseStrategy):
                         "edge_score": round(edge, 2)}
         return None
 
+    def _entry_tf_ms(self) -> int:
+        return {"5m": 5 * 60_000, "15m": 15 * 60_000, "30m": 30 * 60_000,
+                "1h": 60 * 60_000}.get(self.entry_tf, 5 * 60_000)
+
+    @staticmethod
+    def _closed_candle_series(candles: list, timeframe_ms: int, grace_ms: int = 1500) -> list:
+        """Drop a currently-forming final candle when timestamps are bar-open times.
+
+        Historical/backtest candles are retained.  This prevents intrabar EMA
+        crosses that disappear before the 5M close from becoming live orders.
+        """
+        if not candles:
+            return []
+        last_ts = int(candles[-1].timestamp)
+        last_ms = last_ts * 1000 if last_ts < 10_000_000_000 else last_ts
+        now_ms = int(time.time() * 1000)
+        if last_ms + int(timeframe_ms) > now_ms - max(0, int(grace_ms)):
+            return candles[:-1]
+        return candles
+
+    @staticmethod
+    def _candle_close_quality(candle, direction: str) -> float:
+        rng = max(float(candle.high) - float(candle.low), 1e-12)
+        if direction == "long":
+            return max(0.0, min(1.0, (float(candle.close) - float(candle.low)) / rng))
+        return max(0.0, min(1.0, (float(candle.high) - float(candle.close)) / rng))
+
+    def _precision_ema_cross_setup(self, candles: list, direction: str, cross_ts: Optional[int],
+                                   current_price: float, atr_val: float,
+                                   regime_state: Optional[str]) -> dict:
+        """Validate a fresh closed-bar EMA cross or its first retest/reclaim."""
+        if not candles or cross_ts is None or atr_val <= 0:
+            return {"valid": False, "reason": "waiting for fresh confirmed EMA cross"}
+        idx = next((i for i in range(len(candles) - 1, -1, -1)
+                    if candles[i].timestamp == cross_ts), None)
+        if idx is None:
+            return {"valid": False, "reason": "cross timestamp not present in closed candle series"}
+        age = len(candles) - 1 - idx
+        if age < 0 or age > self.cross_valid_bars:
+            return {"valid": False, "reason": f"cross stale ({age} bars old)"}
+
+        closes = [float(c.close) for c in candles]
+        volumes = [max(0.0, float(getattr(c, "volume", 0.0) or 0.0)) for c in candles]
+        ema_f = self.ema(closes, self.ema_fast)
+        ema_s = self.ema(closes, self.ema_slow)
+        atrs = self.atr(candles, self.atr_period)
+        if any(np.isnan(x) for x in (ema_f[-1], ema_s[-1], atrs[-1])):
+            return {"valid": False, "reason": "EMA execution indicators warming up"}
+
+        slope_lb = min(self.ema_slow_slope_lookback, len(candles) - 1)
+        slow_slope = (float(ema_s[-1]) - float(ema_s[-1 - slope_lb])) / atr_val
+        gap_atr = abs(float(ema_f[-1]) - float(ema_s[-1])) / atr_val
+        gap_prev = abs(float(ema_f[-2]) - float(ema_s[-2])) / atr_val
+        gap_expanding = gap_atr >= gap_prev
+        side_ok = (current_price > float(ema_s[-1]) and closes[-1] > float(ema_s[-1])
+                   if direction == "long" else
+                   current_price < float(ema_s[-1]) and closes[-1] < float(ema_s[-1]))
+        slope_ok = slow_slope > 0 if direction == "long" else slow_slope < 0
+        if not side_ok:
+            return {"valid": False, "reason": f"price not holding the trend side of EMA{self.ema_slow}"}
+        if not slope_ok:
+            return {"valid": False, "reason": f"EMA{self.ema_slow} slope has not turned with the cross"}
+        if gap_atr < self.ema_min_gap_atr and age > 0:
+            return {"valid": False, "reason": f"EMA gap too weak ({gap_atr:.2f}ATR)"}
+        if age > 0 and not gap_expanding:
+            return {"valid": False, "reason": "EMA separation is contracting after the cross"}
+
+        last = candles[-1]
+        body_atr = abs(float(last.close) - float(last.open)) / atr_val
+        close_quality = self._candle_close_quality(last, direction)
+        vol_window = volumes[max(0, len(volumes) - self.volume_sma_period - 1):-1]
+        vol_base = float(np.mean(vol_window)) if vol_window else 0.0
+        vol_ratio = volumes[-1] / vol_base if vol_base > 0 else 1.0
+        candle_direction_ok = (last.close > last.open if direction == "long" else last.close < last.open)
+        min_volume = self.ema_min_volume_ratio + (0.15 if regime_state == "TRANSITION" else 0.0)
+        min_close_quality = self.ema_min_close_quality + (0.05 if regime_state == "TRANSITION" else 0.0)
+        if body_atr < self.ema_min_body_atr:
+            return {"valid": False, "reason": f"cross confirmation body too small ({body_atr:.2f}ATR)"}
+        if close_quality < min_close_quality:
+            return {"valid": False, "reason": f"weak candle close quality ({close_quality:.2f})"}
+        if vol_ratio < min_volume:
+            return {"valid": False, "reason": f"participation too low ({vol_ratio:.2f}x volume)"}
+        if regime_state == "TRANSITION" and not candle_direction_ok:
+            return {"valid": False, "reason": "TRANSITION requires a directional confirmation candle"}
+
+        cross_bar = candles[idx]
+        cross_atr = float(atrs[idx]) if idx < len(atrs) and not np.isnan(atrs[idx]) else atr_val
+        cross_body_atr = abs(float(cross_bar.close) - float(cross_bar.open)) / max(cross_atr, 1e-12)
+        cross_extension = abs(float(cross_bar.close) - float(ema_s[idx])) / max(cross_atr, 1e-12)
+        current_extension = abs(float(current_price) - float(ema_s[-1])) / atr_val
+        impulse_cross = (cross_body_atr > self.ema_impulse_body_atr or
+                         cross_extension > self.ema_max_extension_slow_atr)
+        if current_extension > self.ema_max_extension_slow_atr:
+            return {"valid": False, "reason": f"price extended {current_extension:.2f}ATR from EMA{self.ema_slow}; wait retest"}
+
+        retest = False
+        if age > 0:
+            for j in range(idx + 1, len(candles)):
+                a = float(atrs[j]) if not np.isnan(atrs[j]) else atr_val
+                tol = self.ema_retest_tolerance_atr * a
+                q = self._candle_close_quality(candles[j], direction)
+                if direction == "long":
+                    touched = float(candles[j].low) <= float(ema_s[j]) + tol
+                    reclaimed = float(candles[j].close) > float(ema_s[j]) and candles[j].close > candles[j].open
+                else:
+                    touched = float(candles[j].high) >= float(ema_s[j]) - tol
+                    reclaimed = float(candles[j].close) < float(ema_s[j]) and candles[j].close < candles[j].open
+                if touched and reclaimed and q >= min_close_quality:
+                    retest = True
+                    break
+        if (impulse_cross or age > 0) and not retest:
+            return {"valid": False, "reason": "waiting for first EMA retest + reclaim after cross"}
+
+        execution = "first retest + reclaim" if retest else "direct closed-bar cross"
+        edge = 70.0
+        edge += min(4.0, gap_atr * 8.0)
+        edge += 2.0 if gap_expanding else 0.0
+        edge += min(3.0, max(0.0, vol_ratio - 0.8) * 3.0)
+        edge += 2.0 if retest else 0.0
+        return {
+            "valid": True, "reason": "confirmed", "cross_bars_ago": age,
+            "execution": execution, "ema_gap_atr": round(gap_atr, 3),
+            "ema_slow_slope_atr": round(slow_slope, 3),
+            "body_atr": round(body_atr, 3),
+            "close_quality": round(close_quality, 3),
+            "volume_ratio": round(vol_ratio, 3),
+            "price_extension_atr": round(current_extension, 3),
+            "edge_score": round(edge, 2),
+        }
+
+    @staticmethod
+    def _micro_structure_failure(candles: list, side: str, lookback: int) -> bool:
+        if len(candles) < lookback + 2:
+            return False
+        last = candles[-1]
+        prior = candles[-lookback - 1:-1]
+        if side == "long":
+            return float(last.close) < min(float(c.low) for c in prior)
+        return float(last.close) > max(float(c.high) for c in prior)
+
     def _target_rr(self, entry_type: str, regime_state: Optional[str]) -> float:
         state = regime_state if regime_state in ("TRANSITION", "TREND", "STRONG_TREND") else "TREND"
         table = {
@@ -2264,7 +2398,10 @@ class TrendConfirmStrategy(BaseStrategy):
         detail = candidate.get("detail", {})
         et = candidate.get("entry_type")
         if et == "EMA_CROSS":
-            return f"EMA cross {detail.get('cross_bars_ago')} bar(s) ago"
+            mode = detail.get("execution", "direct")
+            return (f"confirmed EMA cross {detail.get('cross_bars_ago')} bar(s) ago; "
+                    f"{mode}; gap {detail.get('ema_gap_atr')}ATR; "
+                    f"volume {detail.get('volume_ratio')}x")
         if et == "BREAKOUT_RETEST":
             return (f"breakout level {detail.get('breakout_level')} retested; "
                     f"volume {detail.get('volume_ratio')}x; "
@@ -2500,11 +2637,18 @@ class TrendConfirmStrategy(BaseStrategy):
             return None
 
         last = candles[-1]
+        slope_lb = min(self.ema_slow_slope_lookback, len(candles) - 1)
+        gap_now = abs(float(ema_f[-1]) - float(ema_s[-1])) / float(atr_arr[-1])
+        gap_prev = abs(float(ema_f[-2]) - float(ema_s[-2])) / float(atr_arr[-1])
+        slow_slope_atr = (float(ema_s[-1]) - float(ema_s[-1 - slope_lb])) / float(atr_arr[-1])
         return {
             "ema_cross_up":   ema_f[-2] <= ema_s[-2] and ema_f[-1] > ema_s[-1],
             "ema_cross_down": ema_f[-2] >= ema_s[-2] and ema_f[-1] < ema_s[-1],
             "ema_fast_val": float(ema_f[-1]),
             "ema_slow_val": float(ema_s[-1]),
+            "ema_gap_atr": gap_now,
+            "ema_gap_expanding": gap_now >= gap_prev,
+            "ema_slow_slope_atr": slow_slope_atr,
             "ema_bull_aligned": ema_f[-1] > ema_s[-1] and last.close > ema_ref[-1],
             "ema_bear_aligned": ema_f[-1] < ema_s[-1] and last.close < ema_ref[-1],
             "close_below_ema_slow": last.close < ema_s[-1],
