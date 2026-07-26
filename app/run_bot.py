@@ -86,7 +86,7 @@ def build_config() -> dict:
         "symbols":      _env_list("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT"),
         "candle_tf":    os.environ.get("CANDLE_TF",         "15m"),
         "candle_limit": int(os.environ.get("CANDLE_LIMIT",  "300")),
-        "interval":     int(os.environ.get("INTERVAL_SECONDS", "300")),
+        "interval":     300,  # fixed 5-minute main scan cadence
 
         # ── Global FX-week Sleep Mode ─────────────────────────────────────
         # Apply the FX 24/5 weekly calendar to ALL trading symbols, including
