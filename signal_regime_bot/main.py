@@ -28,6 +28,7 @@ from telegram_notifier import TelegramNotifier
 from chart_engine import build_entry_chart
 from ai_exit_engine import AIExitEngine, CLOSE as AI_EXIT_CLOSE, EMERGENCY as AI_EXIT_EMERGENCY, WATCH as AI_EXIT_WATCH
 from entry_engine import EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA
+from market_schedule import FxMarketSleepSchedule
 
 logging.basicConfig(
     level=logging.INFO,
@@ -95,6 +96,7 @@ class Bot:
         self.positions = PositionManager(self.cfg, self.client, self.risk,
                                          self.signal_engine.entry_engine)
         self.telegram = TelegramNotifier(self.cfg.telegram_bot_token, self.cfg.telegram_chat_id)
+        self.fx_schedule = FxMarketSleepSchedule(self.cfg)
 
         self._last_entry_bar: dict[str, pd.Timestamp] = {}
         self._last_signal_by_symbol: dict[str, object] = {}
@@ -103,6 +105,8 @@ class Bot:
         self._cooldown_alert_sent = False
         self._last_status_log_ts = 0.0
         self._last_reconcile_ts = 0.0         # periodic untracked-position safety net
+        self._sleep_state_key = None           # transition-only Sleep Mode logging/Telegram
+        self._current_sleep_status = self.fx_schedule.status()
         self._data_fail_count: dict[str, int] = {}
         self._data_alerted: set[str] = set()
         self._trade_log: list[dict] = []      # closed trades (for /trades, live view)
@@ -234,9 +238,19 @@ class Bot:
             # Confirm in Telegram that a (re)deploy actually came up healthy —
             # otherwise a clean restart is completely silent in the chat and
             # there's no way to tell "still starting" from "crashed".
+            sleep = self.fx_schedule.status()
+            self._current_sleep_status = sleep
+            sleep_line = (
+                f"🌙 Sleep Mode: `ON` — new entries resume `{self.fx_schedule.format_resume(sleep)}`"
+                if sleep.sleeping else
+                (f"🌅 Sleep Mode: `PRE-OPEN` — new entries enabled; regular FX open "
+                 f"`{sleep.next_regular_open.strftime('%H:%M %Z') if sleep.next_regular_open else 'soon'}`"
+                 if sleep.phase == "PREOPEN" else
+                 "☀️ Sleep Mode: `OFF` — new entries enabled"))
             await self.telegram.send_text(
                 f"🤖 *Bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
                 f"State: `persistent recovery enabled`\n"
+                f"{sleep_line}\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT\n"
                 f"Architecture: 4H Regime → 1H Bias → 15M/5M Expert Multi-Entry "
@@ -257,6 +271,7 @@ class Bot:
 
     async def run_forever(self):
         while self._running:
+            sleep_status = await self._update_sleep_mode()
             # Safety net FIRST: adopt any position that exists on OKX but the
             # bot isn't tracking (e.g. an order that filled but whose tracking
             # was lost to a crash/timeout), BEFORE the entry logic runs — so a
@@ -266,6 +281,12 @@ class Bot:
             self.data.new_tick()
             for symbol in self.cfg.symbols:
                 try:
+                    # Sleep Mode blocks NEW entries globally. Open positions
+                    # continue full management (native SL/TP, TP1/BE, AI Exit)
+                    # and therefore still fetch their market data. Flat symbols
+                    # are skipped entirely, reducing weekend API traffic too.
+                    if sleep_status.sleeping and not self.positions.has_position(symbol):
+                        continue
                     await self._process_symbol(symbol)
                     previous_failures = self._data_fail_count.pop(symbol, 0)
                     if symbol in self._data_alerted:
@@ -293,6 +314,50 @@ class Bot:
             await self._check_global_alerts()
             await self._maybe_log_status()
             await asyncio.sleep(self.cfg.poll_interval_sec)
+
+    async def _update_sleep_mode(self):
+        """Refresh global FX Sleep Mode and announce only state transitions."""
+        status = self.fx_schedule.status()
+        self._current_sleep_status = status
+        key = (status.sleeping, status.phase)
+        if key == self._sleep_state_key:
+            return status
+
+        first_observation = self._sleep_state_key is None
+        self._sleep_state_key = key
+        if status.sleeping:
+            resume = self.fx_schedule.format_resume(status)
+            logger.info(
+                "[SLEEP MODE] ON — new entries paused for ALL symbols; open positions remain managed; resume=%s",
+                resume,
+            )
+            # Startup message already contains the state; avoid a duplicate TG
+            # notification on the first loop after start.
+            if not first_observation and self.telegram.enabled:
+                await self.telegram.send_text(
+                    "🌙 *Sleep Mode ON*\n"
+                    "New positions are paused for *all symbols*.\n"
+                    "Existing positions continue normal SL/TP/BE/AI Exit management.\n"
+                    f"New entries resume: `{resume}` (4h before regular FX open)."
+                )
+        else:
+            if status.phase == "PREOPEN":
+                regular = (status.next_regular_open.strftime('%a %Y-%m-%d %H:%M %Z')
+                           if status.next_regular_open else "regular FX open")
+                logger.info("[SLEEP MODE] PRE-OPEN — new entries enabled for ALL symbols; regular FX open=%s", regular)
+                if not first_observation and self.telegram.enabled:
+                    await self.telegram.send_text(
+                        "🌅 *Sleep Mode OFF — PRE-OPEN*\n"
+                        "New positions are enabled for *all symbols* now.\n"
+                        f"This is the configured 4-hour early window before `{regular}`."
+                    )
+            else:
+                logger.info("[SLEEP MODE] OFF — new entries enabled for ALL symbols")
+                if not first_observation and self.telegram.enabled:
+                    await self.telegram.send_text(
+                        "☀️ *Sleep Mode OFF*\nNew positions are enabled for *all symbols*."
+                    )
+        return status
 
     async def _maybe_reconcile(self):
         now = time.time()
@@ -436,6 +501,14 @@ class Bot:
         return event
 
     async def _look_for_entry(self, symbol: str, df_15m, df_5m, sig):
+        # Defense-in-depth: even if a sleep transition happens after the outer
+        # loop decided to process this symbol, no new order can cross this gate.
+        sleep = self.fx_schedule.status()
+        self._current_sleep_status = sleep
+        if sleep.sleeping:
+            logger.debug("[%s] new entry blocked by FX Sleep Mode — %s", symbol, sleep.reason)
+            return
+
         # Actual execution runs once per completed 5M candle. Repeated polls of
         # the same candle must never submit the same setup twice.
         bar_ts = df_5m.index[-1] if (df_5m is not None and len(df_5m)) else None
@@ -906,11 +979,23 @@ class Bot:
         self._last_status_log_ts = now
 
         now_wall = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now))
-        logger.info("=== STATUS [%s UTC] ===", now_wall)
+        sleep = self.fx_schedule.status()
+        self._current_sleep_status = sleep
+        if sleep.sleeping:
+            logger.info("=== STATUS [%s UTC] — SLEEP MODE; new entries paused; resume %s ===",
+                        now_wall, self.fx_schedule.format_resume(sleep))
+        elif sleep.phase == "PREOPEN":
+            logger.info("=== STATUS [%s UTC] — PRE-OPEN; new entries enabled 4h early ===", now_wall)
+        else:
+            logger.info("=== STATUS [%s UTC] ===", now_wall)
         for symbol in self.cfg.symbols:
             sig = self._last_signal_by_symbol.get(symbol)
             pos = self.positions.get(symbol)
             pos_label = f"OPEN {pos.side.upper()} @ {pos.entry_price:.6g}" if pos else "flat"
+            if sleep.sleeping and pos is None:
+                logger.info("  %-16s %-24s SLEEP_MODE — no new positions; resume=%s",
+                            symbol, pos_label, self.fx_schedule.format_resume(sleep))
+                continue
             if sig is None:
                 logger.info("  %-16s %-24s no data yet", symbol, pos_label)
                 continue

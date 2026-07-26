@@ -266,18 +266,26 @@ class Config:
     stats_since_date: str = field(default_factory=lambda: os.environ.get("STATS_SINCE_DATE", "2026-07-16"))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "state"))
 
-    # ── Commodity market hours (XAU / XAG) ──────────────────────────────────
-    # The underlying metals market is closed on weekends — the OKX perp still
-    # quotes, but it's illiquid/frozen and signals are garbage. Block NEW
-    # entries for symbols matching these keywords from Friday
-    # commodity_halt_hour_utc (17:00 UTC = Sat 00:00 Asia/Bangkok) until
-    # Sunday commodity_resume_hour_utc (21:00 UTC = Mon 04:00 ICT — exactly 3
-    # hours before the Mon 07:00 ICT market open the user referenced).
-    # Open positions keep being managed (SL/TP/exits) throughout.
-    commodity_weekend_block_enabled: bool = True
+    # ── Global FX-style Sleep Mode (ALL symbols) ─────────────────────────────
+    # User policy: every configured symbol, including crypto, follows the FX
+    # weekly closure for NEW entries. Standard FX weekly session is treated as
+    # Sunday 17:00 -> Friday 17:00 America/New_York. The bot wakes EARLY and may
+    # open new positions from Sunday 13:00 New York (4 hours before regular FX
+    # open). America/New_York makes this DST-safe. Existing positions continue
+    # normal SL/TP/BE/AI-exit management throughout Sleep Mode.
+    fx_sleep_mode_enabled: bool = True
+    fx_market_timezone: str = "America/New_York"
+    fx_weekly_close_hour: int = 17
+    fx_weekly_open_hour: int = 17
+    fx_preopen_hours: int = 4
+
+    # Legacy XAU/XAG-only weekend gate is superseded by the global Sleep Mode.
+    # Keep the fields for backward compatibility with Pipeline/config imports,
+    # but disable it so metals do not wake later than the other symbols.
+    commodity_weekend_block_enabled: bool = False
     commodity_symbol_keywords: tuple = ("XAU", "XAG")
-    commodity_halt_hour_utc: int = 17     # Friday >= this hour UTC -> halted
-    commodity_resume_hour_utc: int = 21   # Sunday < this hour UTC -> still halted
+    commodity_halt_hour_utc: int = 17
+    commodity_resume_hour_utc: int = 21
 
     # Stop loss / take profit
     sl_atr_period: int = 14

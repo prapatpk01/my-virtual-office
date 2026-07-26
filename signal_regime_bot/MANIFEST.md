@@ -50,3 +50,5 @@ are NOT imported when the bot runs.
 - `main.py` — integrates AI Exit before legacy TP1-gated EMA runner exit.
 - `config.py` — embedded defaults; no new Railway variables required.
 - `telegram_notifier.py` — confirmed/emergency AI exit notifications.
+
+- market_schedule.py ... global FX weekly Sleep Mode for all symbols; DST-safe 4h pre-open wake
