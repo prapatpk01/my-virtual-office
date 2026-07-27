@@ -109,7 +109,7 @@ class Bot:
         self._current_sleep_status = self.fx_schedule.status()
         self._data_fail_count: dict[str, int] = {}
         self._data_alerted: set[str] = set()
-        self._trade_log: list[dict] = []      # closed trades (for /trades, live view)
+        self._trade_log: list[dict] = []      # closed trades (for /trade, live view)
         # Persistent close-journal — one line per closed trade with the exit
         # bucket (TP/BE/SL) the bot observed. Survives restarts and is the ONLY
         # source of the TP/BE/SL breakdown (OKX has no "which target" concept).
@@ -167,7 +167,9 @@ class Bot:
         return out
 
     def _journal_add(self, symbol: str, side: str, pnl: float, exit_type: str,
-                     reason: str, tp1_hit: bool, close_ms: int) -> None:
+                     reason: str, tp1_hit: bool, close_ms: int, *,
+                     entry_price: float = 0.0, exit_price: float = 0.0,
+                     setup_type: str = "", trigger: str = "") -> None:
         """Append one closed trade. Deduped by (symbol, close-minute) so a
         restart-time backfill can't double-count a trade already journaled.
         `reason` keeps the raw event (TP2_HIT / EMA_CROSS_REVERSAL / …) and
@@ -178,7 +180,11 @@ class Bot:
             return
         entry = {"close_ms": int(close_ms), "symbol": symbol, "side": side,
                  "pnl": round(float(pnl), 4), "exit_type": exit_type,
-                 "reason": reason, "tp1_hit": bool(tp1_hit)}
+                 "reason": reason, "tp1_hit": bool(tp1_hit),
+                 "entry_price": float(entry_price or 0.0),
+                 "exit_price": float(exit_price or 0.0),
+                 "setup_type": str(setup_type or ""),
+                 "trigger": str(trigger or "")}
         try:
             os.makedirs(self.cfg.state_dir, exist_ok=True)
             with open(self._journal_path, "a") as f:
@@ -671,7 +677,7 @@ class Bot:
             self._symbol_cooldown_until[symbol] = time.time() + cooldown_sec
             logger.info("[%s] closed (%s) — cooldown %d min before next entry",
                        symbol, ev, cooldown_min)
-            # Trade log for /trades and the live view. A trade is a win only
+            # Trade log for /trade and the live view. A trade is a win only
             # when its final post-fee PnL is positive; TP1 is tracked separately.
             pnl = float(event.get("trade_pnl", event.get("pnl", 0.0)) or 0.0)
             side = event.get("side", "")
@@ -679,20 +685,30 @@ class Bot:
             # (BE/TP2/TP1-then-close can only happen after TP1). SL_HIT ⟺ no TP1.
             tp1_hit = bool(event.get("tp1_hit", False)) or ev in (
                 "TP2_HIT", "BE_HIT", "TP1_THEN_EXTERNAL_CLOSE")
+            pos_obj = event.get("position")
+            setup_type = str(getattr(pos_obj, "setup_type", "") or "")
+            trigger = str(getattr(pos_obj, "trigger", "") or "")
+            entry_price = float(event.get("entry_price", 0.0) or 0.0)
+            exit_price = float(event.get("price", 0.0) or 0.0)
             self._trade_log.append({
                 "time": time.time(), "symbol": symbol,
                 "side": side, "reason": ev,
-                "entry": float(event.get("entry_price", 0.0) or 0.0),
-                "exit": float(event.get("price", 0.0) or 0.0),
+                "entry": entry_price,
+                "exit": exit_price,
+                "setup_type": setup_type,
+                "trigger": trigger,
                 "tp1_hit": tp1_hit,
                 "pnl": pnl,
             })
             del self._trade_log[:-200]   # keep the last 200 trades
-            # Persist the exit info for the /stats breakdown (restart-safe). The
+            # Persist the exit info for /stats + /trade (restart-safe). The
             # event fires the moment the close is detected, so this close_ms is
             # within the 3-min match tolerance of OKX's own close time.
-            self._journal_add(symbol, side, pnl, self._bucket_for_event(ev, pnl),
-                              ev, tp1_hit, int(time.time() * 1000))
+            self._journal_add(
+                symbol, side, pnl, self._bucket_for_event(ev, pnl), ev, tp1_hit,
+                int(time.time() * 1000), entry_price=entry_price,
+                exit_price=exit_price, setup_type=setup_type, trigger=trigger,
+            )
 
     async def _check_global_alerts(self):
         now = time.time()
@@ -750,7 +766,8 @@ class Bot:
                 "/restats — reset stats แล้วเริ่มนับใหม่จากตอนนี้\n"
                 "/balance — ยอด USDT ปัจจุบัน\n"
                 "/positions — position ที่เปิดอยู่\n"
-                "/trades — 5 เทรดล่าสุด\n"
+                "/trade — 15 เทรดล่าสุด พร้อม Entry / Exit / PnL\n"
+                "/trades — alias ของ /trade\n"
                 "/status — regime/bias/score ทุก symbol"
             )
         elif cmd == "/balance":
@@ -779,19 +796,11 @@ class Bot:
                 )
             await self.telegram.send_text(
                 "📊 *Open Positions*\n\n" + ("\n".join(lines) if lines else "no open positions"))
-        elif cmd == "/trades":
-            last = self._trade_log[-5:]
-            if not last:
-                await self.telegram.send_text("no closed trades yet")
-                return
-            lines = []
-            for t in reversed(last):
-                ts = time.strftime("%m-%d %H:%M", time.gmtime(t["time"]))
-                win = t["pnl"] > 0
-                lines.append(
-                    f"{'🟢' if win else '🔴'} `{t['symbol']}` {t['side'].upper()} "
-                    f"{t['reason']}  pnl `{t['pnl']:+.2f}`  {ts}")
-            await self.telegram.send_text("🧾 *Last 5 Trades*\n\n" + "\n".join(lines))
+        elif cmd in ("/trade", "/trades"):
+            # Authoritative latest closes from OKX. /restats intentionally does
+            # NOT affect this command: /trade is a forensic view of the latest
+            # 15 account trades, not a performance-window report.
+            await self.telegram._send_message(await self._build_trade_report(15), _markdown=False)
         elif cmd == "/stats":
             # plain text (no markdown) — separators + emoji, so symbols/numbers
             # never get mangled by Telegram's Markdown parser. Same as HTF.
@@ -838,6 +847,99 @@ class Bot:
             await self.telegram.send_text("📡 *Status*\n\n" + "\n".join(lines))
         else:
             await self.telegram.send_text(f"unknown command: {cmd} — try /help")
+
+    @staticmethod
+    def _fmt_trade_time(ms: int) -> str:
+        if not ms:
+            return "—"
+        return time.strftime("%m-%d %H:%M", time.gmtime(ms / 1000))
+
+    @staticmethod
+    def _fmt_hold(open_ms: int, close_ms: int) -> str:
+        if not open_ms or not close_ms or close_ms < open_ms:
+            return "—"
+        secs = max(0, int((close_ms - open_ms) / 1000))
+        if secs < 3600:
+            return f"{secs // 60}m"
+        if secs < 86400:
+            h, rem = divmod(secs, 3600)
+            return f"{h}h{rem // 60:02d}m"
+        d, rem = divmod(secs, 86400)
+        return f"{d}d{rem // 3600}h"
+
+    async def _build_trade_report(self, limit: int = 15) -> str:
+        """Latest closed trades with actual OKX entry/exit prices.
+
+        OKX positions-history is the authority for side, average entry/exit,
+        timestamps and post-fee realized PnL. The local journal is used only
+        to enrich rows with bot-specific setup/trigger/exit reason when a
+        matching lifecycle event exists.
+        """
+        limit = max(1, min(int(limit), 30))
+        now_ms = int(time.time() * 1000)
+        # Look back one year so /trade remains independent of /restats. The
+        # client paginates positions-history and we only render the newest 15.
+        since_ms = now_ms - 365 * 24 * 60 * 60 * 1000
+        rows: list[dict] = []
+        okx_ok = True
+        if not self.cfg.paper:
+            try:
+                rows = await self.client.fetch_trade_history(since_ms, self.cfg.symbols)
+            except Exception as exc:
+                logger.warning("[TRADE] OKX history fetch failed: %s", exc)
+                okx_ok = False
+
+        # Paper mode / temporary OKX outage fallback. These rows only contain
+        # what this process observed, so entry/exit times can be approximate.
+        if not rows:
+            for t in self._trade_log[-limit:]:
+                close_ms = int(float(t.get("time", 0.0) or 0.0) * 1000)
+                rows.append({
+                    "symbol": t.get("symbol", ""),
+                    "side": t.get("side", ""),
+                    "open_avg_px": float(t.get("entry", 0.0) or 0.0),
+                    "close_avg_px": float(t.get("exit", 0.0) or 0.0),
+                    "pnl": float(t.get("pnl", 0.0) or 0.0),
+                    "open_time_ms": 0,
+                    "close_time_ms": close_ms,
+                    "_local": True,
+                    "reason": t.get("reason", ""),
+                    "setup_type": t.get("setup_type", ""),
+                    "trigger": t.get("trigger", ""),
+                })
+
+        if not rows:
+            return "🧾 LAST 15 TRADES\n\nNo closed trades found."
+
+        latest = sorted(rows, key=lambda r: r.get("close_time_ms", 0), reverse=True)[:limit]
+        matched = self._match_journal([r for r in latest if not r.get("_local")])
+        lines = [f"🧾 LAST {len(latest)} TRADES", "Entry/Exit & Net PnL from OKX", ""]
+        for i, row in enumerate(latest, 1):
+            pnl = float(row.get("pnl", 0.0) or 0.0)
+            icon = "✅" if pnl > 1e-9 else ("❌" if pnl < -1e-9 else "➖")
+            symbol = _sym(str(row.get("symbol", "")))
+            side = str(row.get("side", "") or "—").upper()
+            entry_px = float(row.get("open_avg_px", 0.0) or 0.0)
+            exit_px = float(row.get("close_avg_px", 0.0) or 0.0)
+            open_ms = int(row.get("open_time_ms", 0) or 0)
+            close_ms = int(row.get("close_time_ms", 0) or 0)
+            meta = row if row.get("_local") else (matched.get(id(row)) or {})
+            reason = str(meta.get("reason", "") or "OKX_CLOSE")
+            setup = str(meta.get("setup_type", "") or "—")
+            trigger = str(meta.get("trigger", "") or "—")
+            in_px = f"{entry_px:.8g}" if entry_px > 0 else "—"
+            out_px = f"{exit_px:.8g}" if exit_px > 0 else "—"
+            lines += [
+                f"{i:02d}. {icon} {symbol} {side}  ${pnl:+.2f}",
+                f"IN   {self._fmt_trade_time(open_ms)} @ {in_px}",
+                f"OUT  {self._fmt_trade_time(close_ms)} @ {out_px}  | hold {self._fmt_hold(open_ms, close_ms)}",
+                f"Setup {setup} | Trigger {trigger}",
+                f"Exit  {reason}",
+                "",
+            ]
+        if not okx_ok:
+            lines += ["⚠️ OKX history unavailable; showing local observed trades."]
+        return "\n".join(lines).rstrip()
 
     @staticmethod
     def _month_bounds(now_ms: int) -> tuple:
