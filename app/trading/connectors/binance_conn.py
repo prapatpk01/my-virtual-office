@@ -381,6 +381,98 @@ class BinanceConnector(BaseConnector):
                 logger.warning("[TPSL] failed to set TP on %s: %s", symbol, e)
         return ok
 
+    async def fetch_position_tpsl(self, symbol: str, pos_side: str,
+                                  entry_price: Optional[float] = None) -> dict:
+        """Best-effort recovery of exchange-side TP/SL trigger prices.
+
+        Used during bot restart reconciliation so an already-open position keeps
+        the exact TP/SL that OKX is enforcing instead of being assigned the
+        RiskManager's generic percentage defaults. Returns {"sl": ..., "tp": ...};
+        either value may be None when the exchange/API does not expose it.
+        """
+        if self.paper or not self._futures:
+            return {"sl": None, "tp": None}
+
+        close_side = "sell" if pos_side == "long" else "buy"
+        raw_orders = []
+        seen_ids = set()
+
+        # OKX/CCXT versions expose conditional orders through slightly different
+        # parameter combinations, so try the common paths and merge results.
+        for params in ({"trigger": True}, {"ordType": "conditional"}, {}):
+            try:
+                rows = await self._exchange.fetch_open_orders(symbol, params=params)
+            except Exception as e:
+                logger.debug("[TPSL-Recover] fetch_open_orders %s params=%s failed: %s",
+                             symbol, params, e)
+                continue
+            for r in rows or []:
+                rid = str(r.get("id") or (r.get("info") or {}).get("algoId") or id(r))
+                if rid in seen_ids:
+                    continue
+                seen_ids.add(rid)
+                raw_orders.append(r)
+
+        sl = None
+        tp = None
+
+        def _num(*values):
+            for v in values:
+                if v not in (None, "", "0", 0):
+                    try:
+                        f = float(v)
+                        if f > 0:
+                            return f
+                    except (TypeError, ValueError):
+                        pass
+            return None
+
+        for r in raw_orders:
+            info = r.get("info") or {}
+            side = str(r.get("side") or info.get("side") or "").lower()
+            order_pos_side = str(info.get("posSide") or r.get("posSide") or "").lower()
+            reduce_only = bool(r.get("reduceOnly") or info.get("reduceOnly") in (True, "true", "1"))
+
+            # Ignore obvious orders that cannot be the close trigger for this leg.
+            if side and side != close_side:
+                continue
+            if order_pos_side and order_pos_side not in (pos_side, "net"):
+                continue
+            if side and not reduce_only and order_pos_side not in (pos_side, "net"):
+                continue
+
+            sl_px = _num(
+                r.get("stopLossPrice"), info.get("stopLossPrice"),
+                info.get("slTriggerPx"), info.get("slOrdPx"),
+            )
+            tp_px = _num(
+                r.get("takeProfitPrice"), info.get("takeProfitPrice"),
+                info.get("tpTriggerPx"), info.get("tpOrdPx"),
+            )
+            if sl_px:
+                sl = sl_px
+            if tp_px:
+                tp = tp_px
+
+            # Some CCXT builds expose only triggerPrice for a conditional order.
+            trig = _num(r.get("triggerPrice"), r.get("stopPrice"),
+                        info.get("triggerPx"), info.get("triggerPrice"))
+            if trig and entry_price:
+                if pos_side == "long":
+                    if trig < entry_price and sl is None:
+                        sl = trig
+                    elif trig > entry_price and tp is None:
+                        tp = trig
+                else:
+                    if trig > entry_price and sl is None:
+                        sl = trig
+                    elif trig < entry_price and tp is None:
+                        tp = trig
+
+        logger.info("[TPSL-Recover] %s %s recovered SL=%s TP=%s",
+                    symbol, pos_side, sl, tp)
+        return {"sl": sl, "tp": tp}
+
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         if self.paper:
             self._paper_open_orders = [o for o in self._paper_open_orders if o.order_id != order_id]
