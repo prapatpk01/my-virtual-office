@@ -516,6 +516,13 @@ class TrendConfirmStrategy(BaseStrategy):
         self._entry_price: Optional[float] = None
         self._entry_sl: Optional[float] = None
         self._entry_bar_ts: Optional[int] = None
+        # Reverse-cross freshness guard.  A cross may close a position only on
+        # a CLOSED 15M bar strictly newer than the entry/reference bar.  On
+        # restart, attach_existing_position() arms this to the latest already
+        # closed bar so historical crosses can never immediately close an
+        # adopted live position.
+        self._reverse_cross_arm_after_ts: Optional[int] = None
+        self._adopted_after_restart: bool = False
         self._entry_regime: Optional[str] = None
         self._last_signal_exit_ts: Optional[int] = None
         self._last_signal_exit_direction: Optional[str] = None
@@ -992,6 +999,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self._entry_price = float(current_price)
         self._entry_sl = float(sl)
         self._entry_bar_ts = bar_ts
+        self._reverse_cross_arm_after_ts = bar_ts
+        self._adopted_after_restart = False
         self._entry_regime = ctx["label"]
         self._tp1_done = False
         self._be_trailed = False
@@ -1033,24 +1042,36 @@ class TrendConfirmStrategy(BaseStrategy):
             return None
         from ..engines.position_manager import PositionUpdate
 
-        # A fresh reverse 15M cross closes immediately, regardless of BE state.
+        # Reverse-cross exit uses CLOSED 15M candles only and must be FRESH:
+        # the cross bar must be strictly newer than the entry/restart reference
+        # bar.  This prevents a historical cross from closing a freshly opened
+        # or just-reconciled position.  We also require the close to finish on
+        # the wrong side of EMA13 to reject tiny touch/cross whipsaws.
         candles = self._latest_15m or self._latest_candles
         if candles:
             bar_ts = int(candles[-1].timestamp)
-            if bar_ts != self._last_exit_bar_ts:
+            arm_after = self._reverse_cross_arm_after_ts
+            fresh_bar = arm_after is None or bar_ts > int(arm_after)
+            if fresh_bar and bar_ts != self._last_exit_bar_ts:
                 l15 = self._layer3_indicators(candles)
                 if l15 is not None:
                     self._last_exit_bar_ts = bar_ts
                     crossback = (l15["ema_cross_down"] if self._open_position == "long"
                                  else l15["ema_cross_up"])
-                    if crossback:
+                    close_px = float(candles[-1].close)
+                    ema13 = float(l15["ema_slow_val"])
+                    close_confirm = (close_px < ema13 if self._open_position == "long"
+                                     else close_px > ema13)
+                    if crossback and close_confirm:
                         side = self._open_position
                         self._last_signal_exit_ts = bar_ts
                         self._last_signal_exit_direction = side
                         self._reset_position_state()
                         return PositionUpdate(
                             action="close", close_pct=1.0,
-                            reason=f"15M EMA{self.ema_fast}/{self.ema_slow} reverse cross — close {side.upper()} and wait for new trend-aligned cross",
+                            reason=(f"15M EMA{self.ema_fast}/{self.ema_slow} fresh reverse cross "
+                                    f"+ close past EMA{self.ema_slow} — close {side.upper()} and "
+                                    "wait for new trend-aligned cross"),
                         )
 
         # No partial close. Once +0.8R is touched, lock +0.5R and keep full size.
@@ -1099,6 +1120,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self._entry_price = None
         self._entry_sl = None
         self._entry_bar_ts = None
+        self._reverse_cross_arm_after_ts = None
+        self._adopted_after_restart = False
         self._entry_regime = None
         self._tp1_done = False
         self._be_trailed = False
@@ -1124,11 +1147,18 @@ class TrendConfirmStrategy(BaseStrategy):
         self._entry_price = entry_price
         self._entry_sl = stop_loss
         bars = self._latest_15m or self._latest_candles
-        self._entry_bar_ts = bars[-1].timestamp if bars else None
+        # We do not know the original signal-bar timestamp after a process
+        # restart.  Use the latest ALREADY CLOSED 15M bar as the arming
+        # baseline.  Reverse-cross exit becomes eligible only when a newer
+        # 15M bar closes, so the bot cannot immediately act on old history.
+        restart_ref_ts = int(bars[-1].timestamp) if bars else None
+        self._entry_bar_ts = restart_ref_ts
+        self._reverse_cross_arm_after_ts = restart_ref_ts
+        self._adopted_after_restart = True
         self._entry_regime = None
         self._tp1_done = False
         self._be_trailed = False
-        self._last_exit_bar_ts = None
+        self._last_exit_bar_ts = restart_ref_ts
 
     def _data_quality_context(self, candles: list, expected_ms: int) -> dict:
         """Validate the newest candle window without rejecting normal weekend
