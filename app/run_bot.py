@@ -406,8 +406,9 @@ def _install_trendconfirm_scan_logger(bot) -> None:
         chop1 = ctx.get("chop")
         qctx = f"Q={q1s} ADX={adx1 if adx1 is not None else '--'} CHOP={chop1 if chop1 is not None else '--'}"
 
-        side = meta.get("sideways_15m", {}) or {}
-        side_n = int(side.get("signals", 0) or 0)
+        side_raw = meta.get("sideways_15m")
+        side = side_raw if isinstance(side_raw, dict) else {}
+        side_n = None if side_raw is None else int(side.get("signals", 0) or 0)
         q15 = meta.get("quality_15m", {}) or {}
         b15 = q15.get("breakdown", {}) or {}
         chop15 = b15.get("chop_val")
@@ -420,11 +421,12 @@ def _install_trendconfirm_scan_logger(bot) -> None:
 
         scan_logger.info(
             "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s "
-            "4H=%-12s 1H=%-16s %-24s 15M=%-12s CHOP15=%-5s side=%d/4 "
+            "4H=%-12s 1H=%-16s %-24s 15M=%-12s CHOP15=%-5s side=%-4s "
             "state=%-16s TP=%-5s | %s",
             strategy_name, symbol, price, str(sig_type).upper(),
             t4, t1, qctx, cross,
-            "--" if chop15 is None else f"{float(chop15):.1f}", side_n,
+            "--" if chop15 is None else f"{float(chop15):.1f}",
+            "---" if side_n is None else f"{side_n}/4",
             state, rrs, reason,
         )
 
