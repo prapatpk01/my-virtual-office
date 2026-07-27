@@ -287,15 +287,15 @@ def build_config() -> dict:
         # + funding fee — no local re-derivation, so the numbers always match
         # OKX exactly). Only trades closed on/after this date are counted.
         "adaptive_stats_since": os.environ.get("ADAPTIVE_STATS_SINCE_DATE", "2026-07-16"),
-        # [SIZING MODE] Fixed-margin sizing is the live default. Each new
-        # adaptive position uses ADAPTIVE_MARGIN_USDT of margin, then applies
-        # the configured LEVERAGE to determine notional. Default = $20.
-        # Example at 20x leverage: $20 margin -> about $400 notional.
-        # Set ADAPTIVE_MARGIN_USDT in Railway to change the margin globally.
-        # Per-symbol ADAPTIVE_MARGIN_USDT_<BASE> can still override it.
-        # Keep ADAPTIVE_MARGIN_PCT_MIN/MAX at 0 so fixed-margin mode has
-        # precedence over confidence-weighted %-of-balance sizing.
-        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 20.0),
+        # [SIZING MODE] Back to classic risk-%-of-balance (live default,
+        # ADAPTIVE_RISK_PCT above = 5%): position size is derived from the
+        # SL distance so that a full stop-out loses exactly risk_pct of
+        # current balance, regardless of leverage/notional. This is the
+        # ORIGINAL sizing mode — active whenever both of the following are
+        # 0 (the default). Set ADAPTIVE_MARGIN_USDT>0 for fixed-$ sizing
+        # instead, or both ADAPTIVE_MARGIN_PCT_MIN/MAX>0 for confidence-
+        # weighted %-of-balance sizing (Level 1 Adaptive Risk).
+        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 0.0),
         "adaptive_margin_pct_min": _env_float("ADAPTIVE_MARGIN_PCT_MIN", 0.0),
         "adaptive_margin_pct_max": _env_float("ADAPTIVE_MARGIN_PCT_MAX", 0.0),
         # [MTF-CONFLUENCE] "adaptive" (default) = V9.2 L1/L2/L3/StrategyScorer
@@ -599,8 +599,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         _base_sym = sym.split("/")[0].upper()
         _min_sl_pct = _min_sl_pct_commodity if _base_sym in _commodity_symbols else _min_sl_pct_crypto
         # [PER-SYMBOL SIZING] Fixed-$ margin defaults to ADAPTIVE_MARGIN_USDT
-        # for every symbol (default $20). ADAPTIVE_MARGIN_USDT_<BASE_SYM>
-        # can override a single symbol without changing the global default.
+        # for every symbol (0 = disabled, the current default — see the
+        # [SIZING MODE] comment above; risk_pct-of-balance is active
+        # instead). ADAPTIVE_MARGIN_USDT_<BASE_SYM> still overrides just one
+        # symbol if fixed-$ sizing is ever turned back on.
         _margin_usdt = _env_float(f"ADAPTIVE_MARGIN_USDT_{_base_sym}",
                                   cfg.get("adaptive_margin_usdt", 0.0))
 
@@ -676,8 +678,6 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             f"Adaptive Bot Started\n"
             f"Symbols: {', '.join(symbols)}\n"
             f"Mode: {'PAPER' if cfg['paper'] else 'LIVE'}\n"
-            f"Sizing: fixed margin ${cfg.get('adaptive_margin_usdt', 20.0):.2f} "
-            f"@ {cfg.get('leverage', 20)}x leverage\n"
             f"Regimes: {', '.join(sorted(_TRADEABLE_REGIMES))}\n"
             f"Range: risk×{cfg.get('adaptive_range_risk_multiplier', 0.50):.2f}, "
             f"max positions={max(0, cfg.get('adaptive_max_range_positions', 1))}, "
