@@ -81,8 +81,12 @@ class Config:
     symbols: list[str]       = field(default_factory=lambda: _env_list(
         "SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT"))
     leverage: int             = field(default_factory=lambda: _env_int("LEVERAGE", 20))
-    # Fixed 5% risk per trade (spec). The regime/context size_multiplier scales
-    # DOWN from here in weaker conditions; it never scales up past this.
+    # Position sizing: fixed isolated margin per accepted trade.
+    # With the default 20 USDT margin and 20x leverage, target notional is ~400 USDT.
+    # SL/TP geometry is still structure/ATR based; only quantity sizing changed.
+    fixed_margin_usdt: float  = field(default_factory=lambda: _env_float("FIXED_MARGIN_USDT", 20.0))
+    # Legacy value kept only for backwards compatibility with old deployments/docs.
+    # It is NOT used to size new positions in fixed-margin mode.
     risk_per_trade: float     = field(default_factory=lambda: _env_float("RISK_PER_TRADE", 0.05))
     # Hard cap on TOTAL concurrent positions across all symbols (not per-symbol).
     # Same env var name the previous bot on this Railway service used.
@@ -779,6 +783,7 @@ class Config:
 
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))
+        self.fixed_margin_usdt = max(1.0, float(self.fixed_margin_usdt))
         # Hard cap from MAX_POSITIONS, independent of how many symbols are
         # configured — trading 5 symbols with MAX_POSITIONS=2 still means at
         # most 2 concurrent positions total, not 5.
@@ -809,6 +814,8 @@ class Config:
             problems.append("SYMBOLS is empty")
         if not (0 < self.leverage <= 125):
             problems.append(f"LEVERAGE out of range: {self.leverage}")
+        if self.fixed_margin_usdt <= 0:
+            problems.append(f"FIXED_MARGIN_USDT must be > 0: {self.fixed_margin_usdt}")
         return problems
 
 

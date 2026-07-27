@@ -700,23 +700,23 @@ class PositionManager:
         if balance <= 0:
             logger.warning("[POS] %s invalid balance %.2f", symbol, balance)
             return None
-        amount = self.risk.size_by_risk(
+        amount = self.risk.size_by_fixed_margin(
             balance,
             price,
-            sl,
-            regime.size_multiplier,
-            fee_rate=c.fee_rate,
-            expected_slippage_pct=getattr(c, "expected_slippage_pct", 0.0005),
+            margin_usdt=c.fixed_margin_usdt,
+            leverage=c.leverage,
         )
         if amount <= 0:
             return None
         estimated_risk = self.risk.estimated_risk_cash(amount, price, sl)
+        target_notional = c.fixed_margin_usdt * c.leverage
         logger.info(
-            "[POS] %s %s risk_budget=%.2f (%.1f%% balance) estimated=%.2f qty=%.8f SL=%.8f TP1=%.8f TP2=%.8f RR=%.2f",
+            "[POS] %s %s fixed_margin=%.2f USDT leverage=%dx target_notional=%.2f estimated_stop_loss=%.2f qty=%.8f SL=%.8f TP1=%.8f TP2=%.8f RR=%.2f",
             symbol,
             side.upper(),
-            balance * c.risk_per_trade,
-            c.risk_per_trade * 100,
+            c.fixed_margin_usdt,
+            c.leverage,
+            target_notional,
             estimated_risk,
             amount,
             sl,

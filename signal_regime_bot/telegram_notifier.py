@@ -166,7 +166,7 @@ class TelegramNotifier:
 
     async def entry_signal(self, symbol: str, direction: str, price: float, sl: float,
                            tp1: float, tp2: float, regime, bias, entry_score: float,
-                           risk_pct: float, leverage: int, chart_path: str | None = None,
+                           margin_usdt: float, leverage: int, chart_path: str | None = None,
                            entry_result=None):
         if bias is not None:
             bias_line = f"Bias: `{bias.bias}` ({bias.bull_score if direction=='LONG' else bias.bear_score:.0f})"
@@ -198,8 +198,9 @@ class TelegramNotifier:
             f"Regime: `{regime.name}` ({regime.score:.0f})\n"
             f"{bias_line}\n"
             f"{score_line}{edge_line}\n"
-            f"Risk: `{risk_pct*100:.1f}%`\n"
-            f"Leverage: `{leverage}x`"
+            f"Margin: `{margin_usdt:.2f} USDT`\n"
+            f"Leverage: `{leverage}x`\n"
+            f"Target Notional: `~{margin_usdt * leverage:.2f} USDT`"
         )
         if chart_path:
             await self._send_photo(chart_path, text)

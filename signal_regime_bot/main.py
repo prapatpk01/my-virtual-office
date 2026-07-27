@@ -532,7 +532,7 @@ class Bot:
             self._log_pipeline_block(symbol, sig)
             return
 
-        risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
+        fixed_margin_usdt = self.cfg.fixed_margin_usdt
         # Chart the actual 5M execution frame with EMA8/EMA13.
         chart_path = build_entry_chart(
             symbol, df_5m, sig.direction, sig.price,
@@ -569,7 +569,7 @@ class Bot:
         try:
             await self.telegram.entry_signal(
                 symbol, sig.direction, pos.entry_price, pos.stop_loss, pos.tp1, pos.tp2,
-                sig.regime, sig.bias, sig.entry_score, risk_pct, self.cfg.leverage,
+                sig.regime, sig.bias, sig.entry_score, fixed_margin_usdt, self.cfg.leverage,
                 chart_path, sig.entry)
         except Exception as e:
             logger.error("[%s] entry_signal notify failed: %s", symbol, e, exc_info=True)

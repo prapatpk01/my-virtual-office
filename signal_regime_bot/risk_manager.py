@@ -1,9 +1,8 @@
-"""Portfolio risk and fee-aware position sizing.
+"""Portfolio protection and fixed-margin position sizing.
 
-The user-requested base risk is 5% of balance per accepted trade.  Because two
-positions may be open concurrently, total planned open risk is capped at 10%.
-Position size includes estimated round-trip fees and slippage so the intended
-5% risk is not exceeded by execution costs.
+New positions use a fixed isolated margin budget (default 20 USDT) multiplied
+by configured leverage (default 20x). Stop geometry remains structure/ATR based.
+Daily loss/profit locks and loss-streak cooldown remain unchanged.
 """
 from __future__ import annotations
 
@@ -136,6 +135,43 @@ class RiskManager:
                 f"daily profit lock: {pnl_pct * 100:.1f}% >= +{self.cfg.daily_profit_lock_pct * 100:.1f}%",
             )
         return True, "ok"
+
+
+    def size_by_fixed_margin(
+        self,
+        balance: float,
+        entry_price: float,
+        margin_usdt: float | None = None,
+        leverage: int | None = None,
+    ) -> float:
+        """Return base quantity for a fixed isolated-margin budget.
+
+        quantity = (margin_usdt * leverage) / entry_price
+
+        This deliberately does NOT scale with regime score or stop distance.
+        SL/TP still determine realized risk, but requested capital committed to
+        each accepted trade stays constant.
+        """
+        if balance <= 0 or entry_price <= 0:
+            return 0.0
+        margin = float(self.cfg.fixed_margin_usdt if margin_usdt is None else margin_usdt)
+        lev = int(self.cfg.leverage if leverage is None else leverage)
+        if margin <= 0 or lev <= 0:
+            return 0.0
+
+        # Keep a small free-balance buffer for fees/maintenance. If the account
+        # cannot support the configured fixed margin, reject instead of silently
+        # increasing leverage or changing risk behavior.
+        if balance < margin * 1.05:
+            logger.warning(
+                "[RISK] insufficient balance for fixed margin %.2f USDT (balance %.2f)",
+                margin, balance,
+            )
+            return 0.0
+
+        target_notional = margin * lev
+        quantity = target_notional / entry_price
+        return round(max(quantity, 0.0), 8)
 
     def size_by_risk(
         self,
