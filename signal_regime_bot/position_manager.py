@@ -533,7 +533,7 @@ class PositionManager:
                     logger.error("[POS] %s could not register emergency-close PnL: %s", symbol, exc)
                 self._mark_closed(symbol)
                 self.entry_engine.on_position_closed(
-                    symbol, side.upper(), reason, net
+                    symbol, side.upper(), reason, net, exit_price=exit_price
                 )
                 logger.critical(
                     "[POS] %s emergency-flattened after %s; estimated net PnL %.2f",
@@ -877,7 +877,7 @@ class PositionManager:
         self._mark_closed(pos.symbol)
         self.save_state()
         self.entry_engine.on_position_closed(
-            pos.symbol, pos.side.upper(), reason, trade_pnl
+            pos.symbol, pos.side.upper(), reason, trade_pnl, exit_price=price
         )
         return {
             "event": reason,
@@ -1026,7 +1026,7 @@ class PositionManager:
         self._mark_closed(pos.symbol)
         self.save_state()
         self.entry_engine.on_position_closed(
-            pos.symbol, pos.side.upper(), reason, trade_pnl
+            pos.symbol, pos.side.upper(), reason, trade_pnl, exit_price=leg["exit_price"]
         )
         return {
             "event": reason,

@@ -52,3 +52,6 @@ are NOT imported when the bot runs.
 - `telegram_notifier.py` — confirmed/emergency AI exit notifications.
 
 - market_schedule.py ... global FX weekly Sleep Mode for all symbols; DST-safe 4h pre-open wake
+
+## V3.2.5
+Added post-exit thesis-reset / anti-whipsaw state to `entry_engine.py` and related defaults in `config.py`.

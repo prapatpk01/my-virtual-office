@@ -757,6 +757,17 @@ class Config:
     expert_same_setup_cooldown_15m_bars: int = 1
     expert_reentry_lock_hours: int = 8
 
+    # Post-exit thesis reset / anti-whipsaw. Time cooldown alone is not enough:
+    # after closing a trade the same direction must form a genuinely new 5M/15M
+    # leg before another entry is accepted. This specifically prevents chasing
+    # after a profitable early exit/TP1 runner close like the XAG whipsaw case.
+    expert_post_exit_reset_enabled: bool = True
+    expert_post_exit_reset_hours: float = 6.0
+    expert_post_exit_min_5m_bars: int = 4
+    expert_post_exit_pullback_atr: float = 0.55
+    expert_post_exit_value_max_atr: float = 0.70
+    expert_post_exit_max_chase_atr: float = 1.00
+
     # Setup-specific TP2 geometry. TP1 remains controlled by tp1_r and
     # tp1_fraction in the shared PositionManager.
     expert_tp2_ema_cross_r: float = 2.00

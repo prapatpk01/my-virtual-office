@@ -117,6 +117,13 @@ class _State:
     last_sl_ts: Optional[pd.Timestamp] = None
     reentry_lock_direction: str = ""
     reentry_lock_ts: Optional[pd.Timestamp] = None
+    # Post-exit thesis-reset state. This prevents a profitable/early exit from
+    # being followed by an immediate same-direction chase into the same leg.
+    last_exit_ts: Optional[pd.Timestamp] = None
+    last_exit_direction: str = ""
+    last_exit_price: float = 0.0
+    last_exit_reason: str = ""
+    last_exit_pnl: float = 0.0
 
 
 @dataclass
@@ -182,12 +189,17 @@ class EntryEngine:
                 last_sl_ts=self._ts(d.get("last_sl_ts")),
                 reentry_lock_direction=str(d.get("reentry_lock_direction", "")),
                 reentry_lock_ts=self._ts(d.get("reentry_lock_ts")),
+                last_exit_ts=self._ts(d.get("last_exit_ts")),
+                last_exit_direction=str(d.get("last_exit_direction", "")),
+                last_exit_price=float(d.get("last_exit_price", 0.0) or 0.0),
+                last_exit_reason=str(d.get("last_exit_reason", "")),
+                last_exit_pnl=float(d.get("last_exit_pnl", 0.0) or 0.0),
             )
 
     def _persist_state(self) -> None:
         directory = os.path.dirname(self._state_path) or "."
         os.makedirs(directory, exist_ok=True)
-        payload = {"version": 5, "symbols": {}}
+        payload = {"version": 6, "symbols": {}}
         for symbol, s in self._state.items():
             payload["symbols"][symbol] = {
                 "last_processed_5m": s.last_processed_5m.isoformat() if s.last_processed_5m is not None else None,
@@ -199,6 +211,11 @@ class EntryEngine:
                 "last_sl_ts": s.last_sl_ts.isoformat() if s.last_sl_ts is not None else None,
                 "reentry_lock_direction": s.reentry_lock_direction,
                 "reentry_lock_ts": s.reentry_lock_ts.isoformat() if s.reentry_lock_ts is not None else None,
+                "last_exit_ts": s.last_exit_ts.isoformat() if s.last_exit_ts is not None else None,
+                "last_exit_direction": s.last_exit_direction,
+                "last_exit_price": s.last_exit_price,
+                "last_exit_reason": s.last_exit_reason,
+                "last_exit_pnl": s.last_exit_pnl,
             }
         tmp = self._state_path + ".tmp"
         try:
@@ -228,10 +245,22 @@ class EntryEngine:
         exit_reason: str = "",
         trade_pnl: float = 0.0,
         closed_at: Optional[pd.Timestamp] = None,
+        exit_price: Optional[float] = None,
     ) -> None:
         s = self._get_state(symbol)
         side = str(direction or "").upper()
         now = pd.Timestamp(closed_at) if closed_at is not None else pd.Timestamp.utcnow()
+
+        # Always remember the last completed thesis. A winning early exit must
+        # NOT erase the re-entry context: doing so allowed the bot to close a
+        # tired move and then chase the very same leg a few candles later.
+        if side in (LONG, SHORT):
+            s.last_exit_ts = now
+            s.last_exit_direction = side
+            s.last_exit_price = float(exit_price or 0.0)
+            s.last_exit_reason = str(exit_reason or "").upper()
+            s.last_exit_pnl = float(trade_pnl or 0.0)
+
         is_full_sl = side in (LONG, SHORT) and trade_pnl < 0 and str(exit_reason).upper() in {"SL_HIT", "FALSE_BREAKOUT"}
         if is_full_sl:
             window = pd.Timedelta(hours=max(1, int(self.cfg.expert_reentry_lock_hours)))
@@ -243,6 +272,7 @@ class EntryEngine:
                 s.reentry_lock_direction = side
                 s.reentry_lock_ts = now
         elif trade_pnl > 0:
+            # Reset the LOSS streak only. Keep the post-exit thesis-reset state.
             s.sl_direction = ""
             s.sl_count = 0
             s.last_sl_ts = None
@@ -922,6 +952,112 @@ class EntryEngine:
             return True,"fresh 15M BOS reset re-entry lock"
         return False,"same-side locked after 3 full SLs; waiting for fresh 15M BOS or lock expiry"
 
+    @staticmethod
+    def _epoch(value) -> float:
+        try:
+            return float(pd.Timestamp(value).timestamp())
+        except (TypeError, ValueError, OSError):
+            return 0.0
+
+    def _post_exit_candidate_allowed(
+        self, state: _State, candidate: _Candidate, df15: pd.DataFrame, df5: pd.DataFrame
+    ) -> tuple[bool, str]:
+        """Require a new market cycle before re-entering the same direction.
+
+        The normal symbol cooldown is only a time brake. This gate is a thesis
+        reset: after a position is closed, the bot must see a meaningful
+        counter-trend reset/reclaim or a fresh 15M BOS + retest before it can
+        join the same side again. It also blocks buying materially above a
+        recent long exit (or shorting materially below a recent short exit)
+        without a new structural base.
+        """
+        if not getattr(self.cfg, "expert_post_exit_reset_enabled", True):
+            return True, ""
+        if state.last_exit_ts is None or state.last_exit_direction != candidate.direction:
+            return True, ""
+
+        current_ts = pd.Timestamp(df5.index[-1])
+        age_sec = self._epoch(current_ts) - self._epoch(state.last_exit_ts)
+        if age_sec < 0:
+            # Clock/index mismatch should fail safe without permanently locking.
+            return True, ""
+        lock_hours = float(getattr(self.cfg, "expert_post_exit_reset_hours", 6.0))
+        if age_sec > lock_hours * 3600.0:
+            return True, "post-exit reset window expired"
+
+        exit_epoch = self._epoch(state.last_exit_ts)
+        rows = [self._epoch(x) > exit_epoch for x in df5.index]
+        recent = df5.loc[rows] if any(rows) else df5.iloc[0:0]
+        min_bars = max(2, int(getattr(self.cfg, "expert_post_exit_min_5m_bars", 4)))
+        if len(recent) < min_bars:
+            return False, f"post-exit reset: only {len(recent)}/{min_bars} new 5M bars"
+
+        close = df5["close"].astype(float)
+        atr_v = max(ind.safe_float(ind.atr(df5, 14).iloc[-1]), 1e-12)
+        ema8 = ind.ema(close, 8)
+        ema13 = ind.ema(close, 13)
+        ema20 = ind.ema(close, 20)
+        now_price = float(close.iloc[-1])
+        near_value = abs(now_price - float(ema20.iloc[-1])) / atr_v <= float(
+            getattr(self.cfg, "expert_post_exit_value_max_atr", 0.70)
+        )
+
+        # Did price actually reset against the old trade after the exit?
+        if candidate.direction == LONG:
+            running_extreme = recent["high"].astype(float).cummax()
+            pullback_atr = float(((running_extreme - recent["low"].astype(float)) / atr_v).max())
+        else:
+            running_extreme = recent["low"].astype(float).cummin()
+            pullback_atr = float(((recent["high"].astype(float) - running_extreme) / atr_v).max())
+        pullback_ok = pullback_atr >= float(getattr(self.cfg, "expert_post_exit_pullback_atr", 0.55))
+
+        # A genuine EMA cycle (opposite alignment after exit, then reclaim) is a
+        # useful proxy for a new 5M leg rather than continuation of the old one.
+        after_idx = [i for i, x in enumerate(df5.index) if self._epoch(x) > exit_epoch]
+        ema_cycle = False
+        if after_idx:
+            if candidate.direction == LONG:
+                saw_reset = any(float(ema8.iloc[i]) <= float(ema13.iloc[i]) for i in after_idx[:-1])
+                ema_cycle = saw_reset and float(ema8.iloc[-1]) > float(ema13.iloc[-1])
+            else:
+                saw_reset = any(float(ema8.iloc[i]) >= float(ema13.iloc[i]) for i in after_idx[:-1])
+                ema_cycle = saw_reset and float(ema8.iloc[-1]) < float(ema13.iloc[-1])
+
+        bos15, _ = ind.latest_bos(df15, candidate.direction, 3, 3, 0.12)
+        fresh_bos15 = bool(bos15) and self._epoch(df15.index[-1]) > exit_epoch
+        is_retest = candidate.setup_type == BREAKOUT_RETEST or "RETEST" in candidate.trigger.upper()
+        structural_reentry = fresh_bos15 and is_retest
+
+        # A close caused by momentum/structure invalidation is especially prone
+        # to whipsaw. Do not re-enter via another zone/reclaim signal until the
+        # 5M cycle has reset, or a new 15M breakout has broken and retested.
+        strict_reasons = {
+            EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA, "AI_EXIT",
+            "AI_EXIT_EMERGENCY", "SPIKE_GUARD", "BE_HIT", "SL_HIT",
+            "FALSE_BREAKOUT",
+        }
+        strict = state.last_exit_reason in strict_reasons
+        reset_ok = structural_reentry or ema_cycle or (pullback_ok and near_value and not strict)
+
+        # Explicit no-chase distance from the last exit. A new breakout-retest
+        # may re-enter at a higher/lower price because it establishes a fresh
+        # structure; other setups may not chase the old leg.
+        chase_atr = 0.0
+        if state.last_exit_price > 0:
+            favorable = (now_price - state.last_exit_price) if candidate.direction == LONG else (state.last_exit_price - now_price)
+            chase_atr = favorable / atr_v
+        max_chase = float(getattr(self.cfg, "expert_post_exit_max_chase_atr", 1.00))
+        if chase_atr > max_chase and not structural_reentry:
+            return False, (f"post-exit no-chase: price advanced {chase_atr:.2f}ATR from last "
+                           f"{candidate.direction.lower()} exit; waiting for fresh 15M BOS+retest")
+
+        if not reset_ok:
+            mode = "strict thesis reset" if strict else "pullback/reclaim reset"
+            return False, (f"post-exit {mode} not confirmed: pullback={pullback_atr:.2f}ATR "
+                           f"nearEMA20={int(near_value)} emaCycle={int(ema_cycle)} "
+                           f"fresh15MBOSretest={int(structural_reentry)}")
+        return True, "post-exit thesis reset confirmed"
+
     def _same_setup_cooldown(self,state:_State,candidate:_Candidate,current_ts:pd.Timestamp)->bool:
         if not state.last_setup or state.last_entry_ts is None or candidate.setup_type!=state.last_setup:
             return False
@@ -1020,6 +1156,14 @@ class EntryEngine:
                     if cand is not None: candidates.append(cand)
             diagnostics.append(f"{side}:15Medge={s15['edge']:+.0f} 5Medge={s5['edge']:+.0f} zone={zone['own'].timeframe if zone['own'] else '-'}")
 
+        post_exit_filtered=[]
+        for cand in candidates:
+            ok, why = self._post_exit_candidate_allowed(state, cand, df_15m, df_5m)
+            if ok:
+                post_exit_filtered.append(cand)
+            else:
+                diagnostics.append(f"{cand.direction}:{cand.setup_type} blocked — {why}")
+        candidates=post_exit_filtered
         candidates=[c for c in candidates if not self._same_setup_cooldown(state,c,current_ts)]
         candidates=[c for c in candidates if c.signal_key!=state.last_entry_key]
         if not candidates:
