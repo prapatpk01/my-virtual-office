@@ -373,7 +373,7 @@ async def _fx_sleep_monitor(config: dict):
 
 
 def _install_trendconfirm_scan_logger(bot) -> None:
-    """Use the current TrendConfirm diagnostic schema in Railway View Logs."""
+    """Compact ViewLog for 4H macro -> 1H quality -> 15M EMA cross."""
     original = getattr(bot, "_log_scan", None)
     if original is None or getattr(bot, "_trendconfirm_scan_logger_installed", False):
         return
@@ -389,51 +389,48 @@ def _install_trendconfirm_scan_logger(bot) -> None:
         meta = getattr(sig, "metadata", None) or {}
         is_tc = (
             str(strategy_name).startswith("TrendConfirm")
-            or meta.get("strategy") == "EMA_CROSS_5M"
-            or "trend_1h" in meta
-            or "direction_15m" in meta
+            or meta.get("strategy") == "EMA_CROSS_15M"
+            or "macro_4h" in meta
+            or "quality_1h" in meta
         )
         if not is_tc:
             return original(symbol, strategy_name, price, sig)
 
-        regime = meta.get("regime", "WARMUP")
-        if isinstance(regime, dict):
-            regime = regime.get("state", "UNKNOWN")
-
-        t4 = _text(meta.get("trend_4h"), "N/A").upper()
+        macro = meta.get("macro_4h", {}) or {}
+        t4 = _text(meta.get("trend_4h") or macro.get("state"), "WARMUP").upper()
+        ctx = meta.get("quality_1h", {}) or {}
         t1 = _text(meta.get("trend_1h"), "WARMUP").upper()
+        q1 = ctx.get("score")
+        q1s = "--" if q1 is None else f"{float(q1):.0f}"
+        adx1 = ctx.get("adx")
+        chop1 = ctx.get("chop")
+        qctx = f"Q={q1s} ADX={adx1 if adx1 is not None else '--'} CHOP={chop1 if chop1 is not None else '--'}"
 
-        d15 = meta.get("direction_15m", "WARMUP")
-        if isinstance(d15, dict):
-            if d15.get("full_align"):
-                d15 = "ALIGNED"
-            elif d15.get("early_shift"):
-                d15 = "EARLY_SHIFT"
-            else:
-                d15 = "NOT_READY"
-        d15 = _text(d15, "WARMUP")
-
-        aligned = meta.get("aligned")
-        aligned_s = "YES" if aligned is True else ("NO" if aligned is False else "N/A")
+        side = meta.get("sideways_15m", {}) or {}
+        side_n = int(side.get("signals", 0) or 0)
+        q15 = meta.get("quality_15m", {}) or {}
+        b15 = q15.get("breakdown", {}) or {}
+        chop15 = b15.get("chop_val")
+        cross = _text(meta.get("cross_15m") or meta.get("direction_15m"), "WAIT")
         state = _text(meta.get("entry_state"), "HOLD")
-        strat = _text(meta.get("strategy"), "EMA_CROSS_5M")
-        age = meta.get("cross_age_5m")
-        cross = "WAIT" if age is None else f"{age}b"
-        reason = (getattr(sig, "reason", "") or meta.get("hold_reason", "") or "")[:150]
+        rr = meta.get("rr_ratio")
+        rrs = "--" if rr is None else f"{float(rr):.1f}R"
+        reason = (getattr(sig, "reason", "") or meta.get("hold_reason", "") or "")[:170]
         sig_type = getattr(getattr(sig, "type", None), "value", "HOLD")
 
         scan_logger.info(
             "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s "
-            "regime=%-12s 4H=%-7s 1H=%-7s 15M=%-18s aligned=%-3s "
-            "5M=%-5s state=%-16s strat=%s | %s",
+            "4H=%-12s 1H=%-16s %-24s 15M=%-12s CHOP15=%-5s side=%d/4 "
+            "state=%-16s TP=%-5s | %s",
             strategy_name, symbol, price, str(sig_type).upper(),
-            _text(regime, "WARMUP"), t4, t1, d15, aligned_s,
-            cross, state, strat, reason,
+            t4, t1, qctx, cross,
+            "--" if chop15 is None else f"{float(chop15):.1f}", side_n,
+            state, rrs, reason,
         )
 
     bot._log_scan = _patched
     bot._trendconfirm_scan_logger_installed = True
-    logger.info("TrendConfirm ViewLog formatter installed — no legacy '?' fields")
+    logger.info("TrendConfirm ViewLog formatter installed — 4H/1H/15M cross schema")
 
 def _make_strategies(symbols: list, config: dict):
     mode   = config.get("strategy_mode", "ai_expert")
@@ -616,6 +613,12 @@ async def _run_backtest(crypto_bot, config: dict, telegram):
 
 async def main():
     config = build_config()
+    if config.get("strategy_mode") == "trend_confirm":
+        old_tf = os.environ.get("CANDLE_TF", "15m")
+        if old_tf != "15m":
+            logger.warning("TrendConfirm V4 forces CANDLE_TF=15m (ignoring stale %s)", old_tf)
+        os.environ["CANDLE_TF"] = "15m"
+        config["candle_tf"] = "15m"
     logger.info(
         "=== AI Expert Bot starting [%s] mode=%s symbols=%s ===",
         "PAPER" if config["paper"] else "LIVE",
