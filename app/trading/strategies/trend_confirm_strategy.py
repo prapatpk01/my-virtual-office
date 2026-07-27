@@ -262,7 +262,7 @@ class TrendConfirmStrategy(BaseStrategy):
         early_rr_transition: float = 1.3,
         early_rr_trend: float = 1.6,
         early_rr_strong: float = 1.8,
-        min_sl_pct: float = 0.005,          # floor the SL distance at 0.5% of price — if EMA50 sits right at
+        min_sl_pct: float = 0.005,          # legacy compatibility only; 15M live SL uses ATR floor, not fixed %
                                             #   price the raw SL would be a microscopic noise-stop; R (and TP)
                                             #   is measured from the floored distance
     ):
@@ -2136,9 +2136,17 @@ class TrendConfirmStrategy(BaseStrategy):
                              atr_val: float, mirror_raw_stop: bool = False,
                              rr_ratio: Optional[float] = None
                              ) -> Optional[tuple[float, float, float, float]]:
-        """Normalize a candidate stop. EMA stops keep the legacy absolute
-        distance behavior; structure stops must genuinely sit beyond the retest
-        low/high. Tiny stops are widened, overly large stops are rejected."""
+        """Normalize a 15M structure stop using ATR only.
+
+        The raw stop comes from the latest confirmed 15M swing high/low plus
+        ``entry_stop_buffer_atr``.  A fixed percentage-of-price floor is
+        intentionally NOT used because 0.5% represents very different noise
+        across XAU, BTC, XRP, HYPE, etc.
+
+        Stops narrower than ``entry_min_stop_atr`` are widened to the ATR floor;
+        stops wider than ``entry_max_stop_atr`` are rejected instead of forcing
+        an oversized risk distance.
+        """
         if price <= 0 or atr_val <= 0 or raw_stop is None or np.isnan(raw_stop):
             return None
         if mirror_raw_stop:
@@ -2150,11 +2158,14 @@ class TrendConfirmStrategy(BaseStrategy):
         if raw_distance <= 0:
             return None
 
-        min_distance = max(self.min_sl_pct * price, self.entry_min_stop_atr * atr_val)
-        max_distance = max(min_distance, self.entry_max_stop_atr * atr_val)
+        # 15M volatility-normalized risk bounds.  Keep min_sl_pct only as a
+        # backwards-compatible config field; it no longer changes live stops.
+        min_distance = self.entry_min_stop_atr * atr_val
+        max_distance = self.entry_max_stop_atr * atr_val
         distance = max(raw_distance, min_distance)
         if distance > max_distance:
             return None
+
         rr = max(0.5, float(self.rr_ratio if rr_ratio is None else rr_ratio))
         if direction == "long":
             sl = price - distance
