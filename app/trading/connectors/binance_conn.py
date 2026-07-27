@@ -120,6 +120,24 @@ class BinanceConnector(BaseConnector):
     # Orders
     # ------------------------------------------------------------------
 
+    def _ct_size(self, symbol: str) -> float:
+        """Contract size (ctVal) for a market — how many base-ccy units one
+        contract is worth. 1.0 when unknown (base==contracts)."""
+        try:
+            return float(self._exchange.market(symbol).get("contractSize") or 1) or 1.0
+        except Exception:
+            return 1.0
+
+    def _to_contracts(self, symbol: str, base_amount: float) -> float:
+        """Convert a base-currency size into exchange contracts, rounded to lot
+        precision (OKX order/algo sizes are in contracts)."""
+        ct = self._ct_size(symbol)
+        contracts = base_amount / ct if ct else base_amount
+        try:
+            return float(self._exchange.amount_to_precision(symbol, contracts))
+        except Exception:
+            return contracts
+
     async def create_order(
         self,
         symbol: str,
@@ -140,7 +158,16 @@ class BinanceConnector(BaseConnector):
         if pos_side and self._hedge_mode:
             kwargs["params"] = {"posSide": pos_side}
 
-        raw = await self._exchange.create_order(symbol, order_type, side, amount, **kwargs)
+        # OKX swap/futures orders take the size in CONTRACTS, not base currency.
+        # Convert base -> contracts with the market's contractSize (ctVal): SOL
+        # has ctVal=1 (base==contracts, no-op) but e.g. HYPE has ctVal=0.1, so a
+        # 6-HYPE order is 60 contracts — sending the base amount directly filled
+        # 10x too small. Fills come back in contracts and are converted back to
+        # base below so the rest of the bot keeps accounting in base units.
+        ct_size = self._ct_size(symbol)
+        send_amount = self._to_contracts(symbol, amount)
+
+        raw = await self._exchange.create_order(symbol, order_type, side, send_amount, **kwargs)
         order_id = str(raw.get("id", uuid.uuid4()))
 
         # Post-fill data — the create_order response on OKX carries little
@@ -186,7 +213,7 @@ class BinanceConnector(BaseConnector):
             side=side,
             amount=amount,
             price=avg_px or raw.get("price") or price or 0.0,
-            filled=fill_sz,
+            filled=(fill_sz or 0.0) * ct_size,   # contracts -> base units
             status=status,
             fee=fee_cost,
             realized_pnl=realized_pnl,
@@ -335,7 +362,7 @@ class BinanceConnector(BaseConnector):
         if sl:
             try:
                 await self._exchange.create_order(
-                    symbol, "market", close_side, amount,
+                    symbol, "market", close_side, self._to_contracts(symbol, amount),
                     params={**params_base, "stopLossPrice": sl},
                 )
                 logger.info("[TPSL] SL set on %s %s @ %.6g (sz %.6g)", symbol, pos_side, sl, amount)
@@ -345,7 +372,7 @@ class BinanceConnector(BaseConnector):
         if tp:
             try:
                 await self._exchange.create_order(
-                    symbol, "market", close_side, amount,
+                    symbol, "market", close_side, self._to_contracts(symbol, amount),
                     params={**params_base, "takeProfitPrice": tp},
                 )
                 logger.info("[TPSL] TP set on %s %s @ %.6g (sz %.6g)", symbol, pos_side, tp, amount)
@@ -353,6 +380,98 @@ class BinanceConnector(BaseConnector):
                 ok = False
                 logger.warning("[TPSL] failed to set TP on %s: %s", symbol, e)
         return ok
+
+    async def fetch_position_tpsl(self, symbol: str, pos_side: str,
+                                  entry_price: Optional[float] = None) -> dict:
+        """Best-effort recovery of exchange-side TP/SL trigger prices.
+
+        Used during bot restart reconciliation so an already-open position keeps
+        the exact TP/SL that OKX is enforcing instead of being assigned the
+        RiskManager's generic percentage defaults. Returns {"sl": ..., "tp": ...};
+        either value may be None when the exchange/API does not expose it.
+        """
+        if self.paper or not self._futures:
+            return {"sl": None, "tp": None}
+
+        close_side = "sell" if pos_side == "long" else "buy"
+        raw_orders = []
+        seen_ids = set()
+
+        # OKX/CCXT versions expose conditional orders through slightly different
+        # parameter combinations, so try the common paths and merge results.
+        for params in ({"trigger": True}, {"ordType": "conditional"}, {}):
+            try:
+                rows = await self._exchange.fetch_open_orders(symbol, params=params)
+            except Exception as e:
+                logger.debug("[TPSL-Recover] fetch_open_orders %s params=%s failed: %s",
+                             symbol, params, e)
+                continue
+            for r in rows or []:
+                rid = str(r.get("id") or (r.get("info") or {}).get("algoId") or id(r))
+                if rid in seen_ids:
+                    continue
+                seen_ids.add(rid)
+                raw_orders.append(r)
+
+        sl = None
+        tp = None
+
+        def _num(*values):
+            for v in values:
+                if v not in (None, "", "0", 0):
+                    try:
+                        f = float(v)
+                        if f > 0:
+                            return f
+                    except (TypeError, ValueError):
+                        pass
+            return None
+
+        for r in raw_orders:
+            info = r.get("info") or {}
+            side = str(r.get("side") or info.get("side") or "").lower()
+            order_pos_side = str(info.get("posSide") or r.get("posSide") or "").lower()
+            reduce_only = bool(r.get("reduceOnly") or info.get("reduceOnly") in (True, "true", "1"))
+
+            # Ignore obvious orders that cannot be the close trigger for this leg.
+            if side and side != close_side:
+                continue
+            if order_pos_side and order_pos_side not in (pos_side, "net"):
+                continue
+            if side and not reduce_only and order_pos_side not in (pos_side, "net"):
+                continue
+
+            sl_px = _num(
+                r.get("stopLossPrice"), info.get("stopLossPrice"),
+                info.get("slTriggerPx"), info.get("slOrdPx"),
+            )
+            tp_px = _num(
+                r.get("takeProfitPrice"), info.get("takeProfitPrice"),
+                info.get("tpTriggerPx"), info.get("tpOrdPx"),
+            )
+            if sl_px:
+                sl = sl_px
+            if tp_px:
+                tp = tp_px
+
+            # Some CCXT builds expose only triggerPrice for a conditional order.
+            trig = _num(r.get("triggerPrice"), r.get("stopPrice"),
+                        info.get("triggerPx"), info.get("triggerPrice"))
+            if trig and entry_price:
+                if pos_side == "long":
+                    if trig < entry_price and sl is None:
+                        sl = trig
+                    elif trig > entry_price and tp is None:
+                        tp = trig
+                else:
+                    if trig > entry_price and sl is None:
+                        sl = trig
+                    elif trig < entry_price and tp is None:
+                        tp = trig
+
+        logger.info("[TPSL-Recover] %s %s recovered SL=%s TP=%s",
+                    symbol, pos_side, sl, tp)
+        return {"sl": sl, "tp": tp}
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         if self.paper:
@@ -395,11 +514,75 @@ class BinanceConnector(BaseConnector):
             entry_price = p.get("entryPrice")
             if not entry_price:
                 continue
+            info = p.get("info") or {}
+            def _f(*keys):
+                for src in (p, info):
+                    for k in keys:
+                        v = src.get(k)
+                        if v not in (None, ""):
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+                return None
             out.append({
                 "symbol": p.get("symbol"),
                 "side": side,
-                "amount": abs(float(contracts)),
+                "amount": abs(float(contracts)) * self._ct_size(p.get("symbol")),  # contracts -> base
                 "entry_price": float(entry_price),
+                "mark_price": _f("markPrice", "markPx"),
+                "unrealized_pnl": _f("unrealizedPnl", "upl"),
+                "notional": _f("notional", "notionalUsd"),
+                "margin": _f("initialMargin", "margin", "imr", "mmr"),
+            })
+        return out
+
+    async def fetch_positions_history(self, since: Optional[int] = None,
+                                      limit: int = 100) -> list[dict]:
+        """Closed round-trip positions from OKX positions-history. ONE row per
+        position (open -> fully closed; T1/T2 partials already collapsed by OKX).
+        `realized_pnl` is OKX's own realizedPnl = pnl - fees - funding, so it
+        matches the OKX app exactly — never recompute it. Each dict:
+        symbol/side/realized_pnl/open_ts/close_ts/entry_px/close_px/size/lever.
+        Live only; [] on paper or if the endpoint isn't available."""
+        if self.paper:
+            return []
+        try:
+            raw = await self._exchange.fetch_positions_history(
+                symbols=None, since=since, limit=limit)
+        except Exception as e:
+            logger.warning("[Stats] fetch_positions_history failed: %s", e)
+            return []
+        out = []
+        for p in raw:
+            info = p.get("info") or {}
+            def _f(*keys, src_first=True):
+                for src in ((info, p) if not src_first else (p, info)):
+                    for k in keys:
+                        v = src.get(k)
+                        if v not in (None, ""):
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+                return None
+            rpnl = _f("realizedPnl", src_first=False)
+            if rpnl is None:
+                rpnl = _f("realized_pnl") or (float(info["pnl"]) if info.get("pnl") not in (None, "") else 0.0)
+            # OKX: direction 'long'/'short'; posSide too. ccxt normalizes 'side'.
+            side = (p.get("side") or info.get("direction") or info.get("posSide") or "").lower()
+            open_ts = int(_f("timestamp", src_first=True) or float(info.get("cTime") or 0) or 0)
+            close_ts = int(float(info.get("uTime") or 0) or p.get("lastUpdateTimestamp") or open_ts)
+            out.append({
+                "symbol": p.get("symbol") or info.get("instId"),
+                "side": "long" if side.startswith("l") else "short" if side.startswith("s") else side,
+                "realized_pnl": round(float(rpnl or 0.0), 6),
+                "open_ts": open_ts,
+                "close_ts": close_ts,
+                "entry_px": _f("entryPrice") or (float(info["openAvgPx"]) if info.get("openAvgPx") else None),
+                "close_px": float(info["closeAvgPx"]) if info.get("closeAvgPx") else None,
+                "size": round(abs(float(info.get("closeTotalPos") or 0)) * self._ct_size(p.get("symbol") or info.get("instId") or ""), 8),
+                "lever": _f("leverage") or (float(info["lever"]) if info.get("lever") else None),
             })
         return out
 
