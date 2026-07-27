@@ -433,6 +433,11 @@ class TrendConfirmStrategy(BaseStrategy):
         self.exit_failure_confirmations = max(2, min(3, int(exit_failure_confirmations)))
         self.exit_structure_lookback = max(2, int(exit_structure_lookback))
         self.same_direction_rearm_bars = max(0, int(same_direction_rearm_bars))
+        self._diag_context = {
+            "regime": "WARMUP", "trend_4h": "N/A", "trend_1h": "WARMUP",
+            "aligned": False, "mtf": "WARMUP", "strategy": "EMA_CROSS_5M",
+            "entry_tf": "5m", "direction_15m": "WARMUP", "entry_state": "INIT",
+        }
         self._be_trailed: bool = False
         self._entry_threshold_bonus: float = 0.0  # bot raises this during post-cooldown strict window
         self.tp1_r = tp1_r
@@ -582,6 +587,38 @@ class TrendConfirmStrategy(BaseStrategy):
         self.exit_structure_lookback = max(2, int(self.exit_structure_lookback))
         self.same_direction_rearm_bars = max(0, int(self.same_direction_rearm_bars))
 
+    def _diag_reset(self) -> None:
+        """Reset per-scan diagnostics while keeping stable dashboard keys."""
+        self._diag_context = {
+            "regime": "WARMUP",
+            "trend_4h": "N/A",
+            "trend_1h": "WARMUP",
+            "aligned": False,
+            "mtf": "WARMUP",
+            "strategy": "EMA_CROSS_5M",
+            "entry_tf": "5m",
+            "direction_15m": "WARMUP",
+            "entry_state": "SCANNING",
+        }
+
+    def _diag_update(self, **values) -> None:
+        if not hasattr(self, "_diag_context") or not isinstance(self._diag_context, dict):
+            self._diag_reset()
+        self._diag_context.update(values)
+
+    def _diagnostic_4h_trend(self, candles_4h: list) -> str:
+        """Informational 4H direction only; it is NOT an entry gate."""
+        try:
+            min_bars = max(self.ema2_period + self.ema_slope_lookback,
+                           self.sma_trend, self.macd_slow + self.macd_signal) + 5
+            if not candles_4h or len(candles_4h) < min_bars:
+                return "N/A"
+            ctx = self._layer1_indicators(candles_4h)
+            trend = (ctx or {}).get("trend")
+            return trend.upper() if trend in ("up", "down") else "NEUTRAL"
+        except Exception:
+            return "N/A"
+
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
         """Precision EMA trend continuation engine.
 
@@ -595,6 +632,7 @@ class TrendConfirmStrategy(BaseStrategy):
         and light execution quality. TRANSITION remains tradable, but must show
         an actual 15M directional shift rather than a random 5M cross.
         """
+        self._diag_reset()
         self._latest_candles = candles
         mtf = mtf_candles or {}
         if not candles:
@@ -610,6 +648,7 @@ class TrendConfirmStrategy(BaseStrategy):
         c1h = mtf.get("1h", []) or self._resample_timeframe(candles, 60 * 60_000, 15 * 60_000)
         c4h = mtf.get("4h", []) or self._resample_timeframe(candles, 4 * 60 * 60_000, 15 * 60_000)
         self._latest_5m = c5m
+        self._diag_update(trend_4h=self._diagnostic_4h_trend(c4h))
 
         if len(c5m) < max(self.sl_ema_ref + 5, self.atr_period + 5):
             return self._hold(current_price, f"Entry: need {max(self.sl_ema_ref + 5, self.atr_period + 5)}+ closed 5M bars, have {len(c5m)}")
@@ -634,6 +673,22 @@ class TrendConfirmStrategy(BaseStrategy):
 
         bar_ts_5 = c5m[-1].timestamp
 
+        # Always observe/remember the CLOSED 5M cross BEFORE any 1H/15M gate
+        # can return HOLD. Entry permission is still evaluated top-down later.
+        # This fixes the old bug where a cross occurring while 15M was one bar
+        # away from alignment was never remembered and the bot waited forever
+        # for another cross.
+        l5 = self._layer3_indicators(c5m)
+        if l5 is None:
+            self._diag_update(entry_state="5M_WARMUP", mtf="5M indicators warming")
+            return self._hold(current_price, "5M execution indicators warming up")
+        if bar_ts_5 != self._last_bar_ts_5:
+            self._last_bar_ts_5 = bar_ts_5
+        if l5["ema_cross_up"] and self._last_ema_cross_up_ts != bar_ts_5:
+            self._last_ema_cross_up_ts = bar_ts_5
+        if l5["ema_cross_down"] and self._last_ema_cross_down_ts != bar_ts_5:
+            self._last_ema_cross_down_ts = bar_ts_5
+
         # ── Layer 1: 1H direction ─────────────────────────────────────────
         ctrend = c1h if self.trend_tf == "1h" else self._closed_30m_bars(candles)
         min_htf = max(self.ema2_period + self.ema_slope_lookback,
@@ -652,6 +707,11 @@ class TrendConfirmStrategy(BaseStrategy):
                 self._trend_confirmed_since_ts = bar_ts_5
             self._trend_state = l1["trend"]
         trend = self._trend_state
+        self._diag_update(
+            trend_1h=trend.upper() if trend in ("up", "down") else "NEUTRAL",
+            mtf=f"1H={trend.upper() if trend in ('up','down') else 'NEUTRAL'}",
+            entry_state="1H_CONTEXT",
+        )
 
         if self._open_position is not None:
             return self._hold(current_price, f"Holding {self._open_position.upper()} — managed via tick_open_position()")
@@ -659,6 +719,7 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price,
                 f"1H direction not confirmed ({l1.get('up_votes', 0)} up / {l1.get('down_votes', 0)} down)")
         direction = "long" if trend == "up" else "short"
+        self._diag_update(direction=direction.upper())
 
         # ── Layer 2: 15M direction + regime ───────────────────────────────
         q15 = self._tf_quality(candles, trend)
@@ -720,6 +781,18 @@ class TrendConfirmStrategy(BaseStrategy):
                                     spread_now < spread_prev)
 
         state = regime.get("state", "TRANSITION")
+        direction15_label = (
+            f"{'LONG' if up else 'SHORT'}_ALIGNED" if full_15m_align
+            else (f"{'LONG' if up else 'SHORT'}_EARLY_SHIFT" if early_15m_shift else "NOT_READY")
+        )
+        self._diag_update(
+            regime=state,
+            aligned=bool(full_15m_align),
+            direction_15m=direction15_label,
+            mtf=(f"1H={trend.upper()} | 15M={direction15_label} | 5M=WAIT_TRIGGER"),
+            entry_state="15M_CONTEXT",
+            regime_detail=regime,
+        )
         if state in ("TREND", "STRONG_TREND"):
             if not full_15m_align:
                 return self._hold(current_price,
@@ -740,18 +813,7 @@ class TrendConfirmStrategy(BaseStrategy):
                 return self._hold(current_price, "15M TRANSITION participation too low (<0.65x volume)")
 
         # ── Layer 3: fresh CLOSED 5M EMA8/13 cross ────────────────────────
-        l5 = self._layer3_indicators(c5m)
-        if l5 is None:
-            return self._hold(current_price, "5M execution indicators warming up")
-
-        # Track fresh crosses even if a higher-timeframe gate temporarily blocks
-        # the exact cross candle. The signal remains usable for up to 2 bars.
-        if bar_ts_5 != self._last_bar_ts_5:
-            self._last_bar_ts_5 = bar_ts_5
-        if l5["ema_cross_up"] and self._last_ema_cross_up_ts != bar_ts_5:
-            self._last_ema_cross_up_ts = bar_ts_5
-        if l5["ema_cross_down"] and self._last_ema_cross_down_ts != bar_ts_5:
-            self._last_ema_cross_down_ts = bar_ts_5
+        # l5/cross memory was already updated before HTF gates above.
 
         def bars_ago(ts):
             if ts is None:
@@ -761,6 +823,13 @@ class TrendConfirmStrategy(BaseStrategy):
 
         cross_ts = self._last_ema_cross_up_ts if up else self._last_ema_cross_down_ts
         cross_age = bars_ago(cross_ts)
+        self._diag_update(
+            cross_age_5m=cross_age,
+            cross_side_5m=direction.upper(),
+            entry_state="WAIT_5M_CROSS" if cross_age is None else "5M_CROSS_FOUND",
+            mtf=(f"1H={trend.upper()} | 15M={direction15_label} | "
+                 f"5M={'WAIT_CROSS' if cross_age is None else f'CROSS_AGE_{cross_age}'}"),
+        )
         if cross_age is None or cross_age > self.cross_valid_bars:
             return self._hold(current_price, f"5M: waiting for fresh EMA{self.ema_fast}/{self.ema_slow} cross")
 
@@ -821,7 +890,13 @@ class TrendConfirmStrategy(BaseStrategy):
         self._entry_regime = state
         self._be_trailed = False
 
+        self._diag_update(
+            entry_state="ENTRY_READY",
+            aligned=bool(full_15m_align),
+            mtf=f"1H={trend.upper()} | 15M={direction15_label} | 5M=CROSS_OK",
+        )
         metadata = {
+            **self._diag_context,
             "entry_type": "EMA_CROSS",
             "entry_detail": setup,
             "stop_loss": round(sl, 8),
@@ -2399,7 +2474,33 @@ class TrendConfirmStrategy(BaseStrategy):
         return out
 
     def _hold(self, price: float, reason: str = "", metadata: Optional[dict] = None) -> Signal:
+        # Every HOLD carries a complete, stable diagnostic envelope. The
+        # dashboard/logger can therefore render meaningful values instead of
+        # "?" even when the scan returns early during warm-up or a gate.
+        merged = dict(getattr(self, "_diag_context", {}) or {})
+        incoming = dict(metadata or {})
+        merged.update(incoming)
+
+        # Existing callers sometimes pass the full regime dict. Preserve it
+        # under regime_detail but expose a short scalar under regime, which is
+        # what compact scan logs expect.
+        regime_value = merged.get("regime")
+        if isinstance(regime_value, dict):
+            merged["regime_detail"] = regime_value
+            merged["regime"] = regime_value.get("state", "UNKNOWN")
+
+        merged.setdefault("regime", "WARMUP")
+        merged.setdefault("trend_4h", "N/A")
+        merged.setdefault("trend_1h", "WARMUP")
+        merged.setdefault("aligned", False)
+        merged.setdefault("mtf", "WARMUP")
+        merged.setdefault("strategy", "EMA_CROSS_5M")
+        merged.setdefault("entry_tf", "5m")
+        merged.setdefault("direction_15m", "WARMUP")
+        merged.setdefault("entry_state", "HOLD")
+        merged["hold_reason"] = reason
+
         return Signal(
             type=SignalType.HOLD, symbol=self.symbol, price=price, amount=0.0,
-            reason=reason, confidence=0.0, metadata=metadata or {},
+            reason=reason, confidence=0.0, metadata=merged,
         )
