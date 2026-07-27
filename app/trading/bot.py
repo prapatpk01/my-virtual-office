@@ -376,13 +376,44 @@ class TradingBot:
 
                 entry_price = p["entry_price"]
                 amount = p["amount"]
+
+                # Recover the TP/SL that the exchange is already enforcing.
+                # Never replace an existing live position with generic 3% / 3.6%
+                # RiskManager defaults merely because the process restarted.
+                recovered_sl = None
+                recovered_tp = None
+                if hasattr(self.connector, "fetch_position_tpsl"):
+                    try:
+                        recovered = await self.connector.fetch_position_tpsl(
+                            strategy.symbol, side, entry_price
+                        )
+                        recovered_sl = (recovered or {}).get("sl")
+                        recovered_tp = (recovered or {}).get("tp")
+                    except Exception as e:
+                        logger.warning("[Reconcile] TP/SL recovery failed [%s]: %s",
+                                       strategy_name, e)
+
+                # open_position requires values, but its percentage fallbacks are
+                # not valid for an adopted position. If a level was not recoverable,
+                # clear that fallback immediately after registration rather than
+                # pretending the position has a wide 3% stop / 3.6% target.
                 pos = self.risk.open_position(
                     strategy.symbol, side, entry_price, amount, strategy=strategy_name,
+                    stop_loss=recovered_sl, take_profit=recovered_tp,
                 )
+                if recovered_sl is None:
+                    pos.stop_loss = None
+                if recovered_tp is None:
+                    pos.take_profit = None
+
+                # Portfolio heat needs a numeric stop. When an exchange SL cannot
+                # be read, use entry only for heat accounting (zero synthetic risk);
+                # do NOT create or send a replacement stop to the exchange.
+                portfolio_sl = pos.stop_loss if pos.stop_loss is not None else entry_price
                 self._portfolio.add_position(
                     symbol=strategy.symbol, direction=side,
                     entry_price=entry_price, current_price=entry_price,
-                    amount=amount, stop_loss=pos.stop_loss,
+                    amount=amount, stop_loss=portfolio_sl,
                 )
                 self._position_open_times[f"{strategy.symbol}||{strategy_name}"] = time.time()
 
@@ -398,9 +429,10 @@ class TradingBot:
 
                 logger.warning(
                     "[Reconcile] Found existing %s position on %s (%s) — entry=%.4f amount=%.6f "
-                    "SL=%.4f TP=%.4f (default stops — original unknown) — resuming management",
+                    "SL=%s TP=%s (exchange levels recovered when available) — resuming management",
                     side.upper(), strategy.symbol, strategy_name, entry_price, amount,
-                    pos.stop_loss or 0, pos.take_profit or 0,
+                    f"{pos.stop_loss:.4f}" if pos.stop_loss is not None else "UNKNOWN",
+                    f"{pos.take_profit:.4f}" if pos.take_profit is not None else "UNKNOWN",
                 )
                 if self.telegram:
                     try:
