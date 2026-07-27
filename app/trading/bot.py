@@ -518,7 +518,24 @@ class TradingBot:
 
             strategy_inst = self._resolve_strategy_inst(strategy_name)
 
-            # Layer 7 + 8: AI Expert position management (break-even, trailing, partial TP, exit AI)
+            # TrendConfirm V4 exits on a CLOSED 15M EMA8/13 reverse cross.
+            # Position management runs before the normal strategy scan below,
+            # so refresh its 15M cache here; otherwise a newly closed 15M
+            # cross-back would only be seen on the next 5-minute cycle.
+            if (strategy_inst is not None
+                    and getattr(strategy_inst, "entry_tf", "") == "15m"
+                    and hasattr(strategy_inst, "_latest_15m")):
+                try:
+                    _pm15 = await self.connector.fetch_ohlcv(sym, timeframe="15m", limit=120)
+                    _closer = getattr(strategy_inst, "_closed_candle_series", None)
+                    if callable(_closer):
+                        _pm15 = _closer(_pm15, 15 * 60_000, getattr(strategy_inst, "closed_bar_grace_ms", 1500))
+                    strategy_inst._latest_15m = _pm15 or []
+                    strategy_inst._latest_candles = _pm15 or []
+                except Exception as e:
+                    logger.warning("15M exit-cache refresh failed [%s %s]: %s", strategy_name, sym, e)
+
+            # Strategy position management (BE / cross-back / partials when enabled)
             if hasattr(strategy_inst, "tick_open_position"):
                 try:
                     pos_update = strategy_inst.tick_open_position(
@@ -600,10 +617,9 @@ class TradingBot:
                 mtf_candles = {}
                 _base_tf = os.getenv("CANDLE_TF", "15m")
                 _mtf_specs = [(t, 100) for t in ("1h", "4h") if t != _base_tf]
-                # trend_confirm runs its Layer3 entry/SL/TP/exit on 5m — fetch
-                # enough 5m bars for EMA50 + cross history. Harmless extra data
-                # for strategies that don't read it.
-                if _base_tf != "5m":
+                # Only fetch 5m when this strategy actually uses 5m execution.
+                # TrendConfirm V4 uses the 15m base candles directly.
+                if _base_tf != "5m" and getattr(strategy, "entry_tf", "") == "5m":
                     _mtf_specs.append(("5m", 200))
                 for tf, _lim in _mtf_specs:
                     try:
