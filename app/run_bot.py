@@ -260,8 +260,8 @@ def build_config() -> dict:
         "adaptive_max_positions": _env_int("ADAPTIVE_MAX_POSITIONS", 2),
         # TP geometry dial (None = use bot class defaults 0.7 / 1.5). Lower
         # ADAPTIVE_TP1_R raises win-rate at the cost of average win size.
-        "adaptive_tp1_r": (_env_float("ADAPTIVE_TP1_R", 0.0) or None),
-        "adaptive_tp2_r": (_env_float("ADAPTIVE_TP2_R", 0.0) or None),
+        "adaptive_tp1_r": (_env_float("ADAPTIVE_TP1_R", 0.70) or None),
+        "adaptive_tp2_r": (_env_float("ADAPTIVE_TP2_R", 1.20) or None),
         # T1's SL-move locks in this many R of profit instead of a flat
         # scratch at exactly entry (0R) — e.g. 0.15 means the worst case
         # after T1 is +0.15R, not breakeven.
@@ -271,7 +271,7 @@ def build_config() -> dict:
         # actually wired here — the live bot always used the class default
         # (75%) regardless of that env var. Now genuinely configurable;
         # default lowered to 60% per request (leaves a bigger 40% runner).
-        "adaptive_tp1_close_pct": _env_float("ADAPTIVE_TP1_CLOSE_PCT", 0.60),
+        "adaptive_tp1_close_pct": _env_float("ADAPTIVE_TP1_CLOSE_PCT", 0.50),
         # Fake-signal chop-zone filter (None = default 0.8). Higher = stricter,
         # higher WR, fewer trades (~1.2 pushes WR toward 56%).
         "adaptive_min_ema_dist_atr": (_env_float("ADAPTIVE_MIN_EMA_DIST_ATR", 0.0) or None),
@@ -606,38 +606,57 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         _margin_usdt = _env_float(f"ADAPTIVE_MARGIN_USDT_{_base_sym}",
                                   cfg.get("adaptive_margin_usdt", 0.0))
 
-        bot = AdaptiveBot(
-            account_balance=cfg["adaptive_balance"],
-            min_sl_pct=_min_sl_pct,
-            tp1_close_pct=cfg.get("adaptive_tp1_close_pct", 0.60),
-            base_risk_pct=cfg["adaptive_risk_pct"],
-            daily_loss_limit_pct=cfg["adaptive_daily_loss"],
-            daily_profit_limit_pct=cfg["adaptive_daily_profit"],
-            cooldown_minutes=cfg["adaptive_cooldown_min"],
-            max_loss_streak=cfg["adaptive_max_loss_streak"],
-            startup_warmup_minutes=cfg.get("adaptive_warmup_min", 10),
-            state_file=state_file,
-            execution_callback=_make_callback(sym, okx),
-            enable_swing_reversal=cfg["strategies"].get("swing_reversal_pro", True),
-            enable_mean_reversion=cfg["strategies"].get("mean_reversion", False),
-            tp1_r=cfg.get("adaptive_tp1_r"),
-            tp2_r=cfg.get("adaptive_tp2_r"),
-            breakeven_lock_r=cfg.get("adaptive_breakeven_lock_r"),
-            min_ema_dist_atr=cfg.get("adaptive_min_ema_dist_atr"),
-            entry_spacing_min=cfg.get("adaptive_entry_spacing_min", 60),
-            margin_pct_min=cfg.get("adaptive_margin_pct_min", 0.08),
-            margin_pct_max=cfg.get("adaptive_margin_pct_max", 0.15),
-            margin_usdt=_margin_usdt,
-            sizing_leverage=cfg.get("leverage", 10),
-            expectancy_engine=shared_expectancy,
-            entry_engine=cfg.get("adaptive_entry_engine", "adaptive"),
-            enable_early_trend=cfg.get("adaptive_early_trend", False),
-            macro_ema_fast=cfg.get("adaptive_macro_ema_fast"),
-            macro_ema_slow=cfg.get("adaptive_macro_ema_slow"),
-            max_15m_adx_trend=cfg.get("adaptive_max_15m_adx_trend"),
-            range_risk_multiplier=cfg.get("adaptive_range_risk_multiplier", 0.50),
-            range_cooldown_minutes=cfg.get("adaptive_range_cooldown_min", 90),
+        # Build constructor kwargs once, then keep only arguments supported by
+        # the strategy class actually imported in this deployment.  This makes
+        # run_bot forward/backward compatible with strategy-file revisions and
+        # prevents Railway restart loops from a single keyword mismatch.
+        _bot_kwargs = {
+            "account_balance": cfg["adaptive_balance"],
+            "min_sl_pct": _min_sl_pct,
+            "tp1_close_pct": cfg.get("adaptive_tp1_close_pct", 0.50),
+            "base_risk_pct": cfg["adaptive_risk_pct"],
+            "daily_loss_limit_pct": cfg["adaptive_daily_loss"],
+            "daily_profit_limit_pct": cfg["adaptive_daily_profit"],
+            "cooldown_minutes": cfg["adaptive_cooldown_min"],
+            "max_loss_streak": cfg["adaptive_max_loss_streak"],
+            "startup_warmup_minutes": cfg.get("adaptive_warmup_min", 10),
+            "state_file": state_file,
+            "execution_callback": _make_callback(sym, okx),
+            "enable_swing_reversal": cfg["strategies"].get("swing_reversal_pro", True),
+            "enable_mean_reversion": cfg["strategies"].get("mean_reversion", False),
+            "tp1_r": cfg.get("adaptive_tp1_r"),
+            "tp2_r": cfg.get("adaptive_tp2_r"),
+            "breakeven_lock_r": cfg.get("adaptive_breakeven_lock_r"),
+            "min_ema_dist_atr": cfg.get("adaptive_min_ema_dist_atr"),
+            "entry_spacing_min": cfg.get("adaptive_entry_spacing_min", 60),
+            "margin_pct_min": cfg.get("adaptive_margin_pct_min", 0.08),
+            "margin_pct_max": cfg.get("adaptive_margin_pct_max", 0.15),
+            "margin_usdt": _margin_usdt,
+            "sizing_leverage": cfg.get("leverage", 10),
+            "expectancy_engine": shared_expectancy,
+            "entry_engine": cfg.get("adaptive_entry_engine", "adaptive"),
+            "enable_early_trend": cfg.get("adaptive_early_trend", False),
+            "macro_ema_fast": cfg.get("adaptive_macro_ema_fast"),
+            "macro_ema_slow": cfg.get("adaptive_macro_ema_slow"),
+            "max_15m_adx_trend": cfg.get("adaptive_max_15m_adx_trend"),
+            "range_risk_multiplier": cfg.get("adaptive_range_risk_multiplier", 0.50),
+            "range_cooldown_minutes": cfg.get("adaptive_range_cooldown_min", 90),
+        }
+        import inspect as _inspect
+        _sig = _inspect.signature(AdaptiveBot.__init__)
+        _accepts_var_kw = any(
+            p.kind == _inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values()
         )
+        if not _accepts_var_kw:
+            _supported = set(_sig.parameters) - {"self"}
+            _dropped = sorted(set(_bot_kwargs) - _supported)
+            if _dropped:
+                logger.warning(
+                    "[Adaptive][%s] strategy constructor does not support %s; ignoring them",
+                    sym, ", ".join(_dropped),
+                )
+            _bot_kwargs = {k: v for k, v in _bot_kwargs.items() if k in _supported}
+        bot = AdaptiveBot(**_bot_kwargs)
         bot.load_state(state_file)
         bot.reconcile_with_exchange(sym, okx)
         # [MIN-LOT TP1] tell the bot the smallest closable size (1 contract in
