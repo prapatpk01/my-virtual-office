@@ -1,10 +1,8 @@
-"""DUALCORE V2.0 live bot entry point.
+"""DUALCORE V3.2.9 live bot entry point.
 
-Loop: fetch closed 5M/15M/1H/4H bars, manage open positions every poll, and
-for flat symbols evaluate 4H Macro -> 1H Bias -> 15M Structure/Location ->
-5M EMA timing (Fast Pullback + Major/Base Breakout-Retest).  Entry logic runs once
-per newly-closed 5M candle.  Position management keeps the slower EMA10/EMA20
-5M reversal exit to avoid closing from the faster EMA8/EMA13 entry pair alone.
+Top-down 4H regime -> 1H bias -> 15M context -> closed-5M expert execution,
+with non-compensable location/extension/structure gates, post-exit anti-whipsaw,
+BTC/ETH correlation control, fixed-margin sizing and persistent trade journal.
 """
 from __future__ import annotations
 
@@ -607,6 +605,67 @@ class Bot:
         self.ai_exit.clear(symbol)
         return event
 
+    def _btc_eth_correlation_block(self, symbol: str, direction: str) -> str:
+        """Block stacking BTC and ETH in the same direction.
+
+        The two instruments frequently express the same crypto beta.  The guard
+        prevents one macro thesis from consuming both portfolio slots.
+        """
+        if not getattr(self.cfg, "btc_eth_same_direction_guard", True):
+            return ""
+        root = _sym(symbol).upper()
+        if root not in {"BTC", "ETH"}:
+            return ""
+        other_root = "ETH" if root == "BTC" else "BTC"
+        other_symbol = next((s for s in self.cfg.symbols if _sym(s).upper() == other_root), None)
+        if not other_symbol:
+            return ""
+        other = self.positions.get(other_symbol)
+        if other is None:
+            return ""
+        other_dir = "LONG" if str(other.side).lower() == "long" else "SHORT"
+        if other_dir == str(direction).upper():
+            return f"BTC/ETH correlation guard: {other_root} already {other_dir}"
+        return ""
+
+    def _setup_performance_block(self, symbol: str, sig) -> str:
+        """Use the persistent close journal as a conservative probation gate.
+
+        It only activates after enough *same symbol + same setup* samples have
+        been journaled. Underperforming combinations are not permanently paused;
+        they may still trade when the current setup edge is exceptional.
+        """
+        c = self.cfg
+        if not getattr(c, "setup_performance_guard_enabled", True):
+            return ""
+        entry = getattr(sig, "entry", None)
+        setup = str(getattr(entry, "setup_type", "") or "")
+        if not setup:
+            return ""
+        rows = [r for r in self.journal
+                if r.get("symbol") == symbol and str(r.get("setup_type", "") or "") == setup]
+        lookback = int(getattr(c, "setup_performance_lookback", 20))
+        rows = rows[-lookback:]
+        min_n = int(getattr(c, "setup_performance_min_trades", 8))
+        if len(rows) < min_n:
+            return ""
+        pnls = [float(r.get("pnl", 0.0) or 0.0) for r in rows]
+        wins = sum(1 for x in pnls if x > 0)
+        gross_win = sum(x for x in pnls if x > 0)
+        gross_loss = -sum(x for x in pnls if x < 0)
+        wr = wins / len(pnls) if pnls else 0.0
+        pf = (gross_win / gross_loss) if gross_loss > 1e-12 else 99.0
+        bad = pf < float(getattr(c, "setup_performance_pf_floor", 0.90)) or wr < float(getattr(c, "setup_performance_wr_floor", 0.35))
+        if not bad:
+            return ""
+        threshold = float(getattr(entry, "score_threshold", 0.0) or 0.0)
+        edge = float(getattr(entry, "entry_score", 0.0) or 0.0) - threshold
+        required = float(getattr(c, "setup_performance_required_edge", 6.0))
+        if edge + 1e-9 < required:
+            return (f"setup probation {setup}: n={len(rows)} WR={wr*100:.0f}% PF={pf:.2f}; "
+                    f"current edge={edge:.1f}<{required:.1f}")
+        return ""
+
     async def _look_for_entry(self, symbol: str, df_15m, df_5m, sig):
         # Defense-in-depth: even if a sleep transition happens after the outer
         # loop decided to process this symbol, no new order can cross this gate.
@@ -637,6 +696,16 @@ class Bot:
 
         if sig.direction not in (LONG, SHORT):
             self._log_pipeline_block(symbol, sig)
+            return
+
+        correlation_reason = self._btc_eth_correlation_block(symbol, sig.direction)
+        if correlation_reason:
+            logger.info("[%s] entry blocked: %s", symbol, correlation_reason)
+            return
+
+        perf_reason = self._setup_performance_block(symbol, sig)
+        if perf_reason:
+            logger.info("[%s] entry blocked: %s", symbol, perf_reason)
             return
 
         fixed_margin_usdt = self.cfg.fixed_margin_usdt

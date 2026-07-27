@@ -720,7 +720,7 @@ class Config:
     expert_strong_trend_discount: float = 3.0
     expert_weak_context_add: float = 3.0
     expert_min_local_edge: float = 3.0
-    expert_min_room_r: float = 1.05
+    expert_min_room_r: float = 1.15
     expert_major_level_veto_atr: float = 0.60
     expert_range_min_room_r: float = 0.95
     expert_max_extension_atr_5m: float = 1.10
@@ -746,12 +746,42 @@ class Config:
     expert_smc_edge_min_early: float = 55.0
     expert_smc_edge_max: float = 75.0
     expert_smc_di_spread_min: float = 8.0
-    expert_smc_max_ema20_extension_atr: float = 3.40
+    expert_smc_max_ema20_extension_atr: float = 1.10
     expert_fvg_max_width_pct: float = 0.0065
     expert_1h_zone_requires_15m_structure: bool = True
     expert_smc_rsi_long_max: float = 82.0
     expert_smc_rsi_short_min: float = 18.0
     expert_sweep_edge_max: float = 65.0
+
+    # V3.2.9 precision-quality hard gates. These are deliberately non-
+    # compensable: a 95/100 setup may still be rejected when it is late,
+    # overextended, poorly located or lacks structure confirmation.
+    expert_precision_symbols: tuple[str, ...] = ("BTC", "ETH")
+    expert_precision_max_ema20_extension_atr: float = 0.72
+    expert_precision_require_15m_structure: bool = True
+    expert_smc_require_micro_structure_confirm: bool = True
+    expert_sweep_require_micro_structure_confirm: bool = True
+    expert_initial_chase_guard_enabled: bool = True
+    expert_initial_chase_3bar_atr: float = 1.10
+    expert_initial_chase_ema20_atr: float = 0.60
+    expert_initial_chase_hard_extension_atr: float = 0.90
+    expert_smc_min_room_r: float = 1.25
+    expert_sweep_min_room_r: float = 1.20
+    expert_breakout_retest_min_room_r: float = 1.00
+
+    # Portfolio quality control. BTC and ETH are highly correlated enough that
+    # carrying both in the same direction often doubles one macro bet.
+    btc_eth_same_direction_guard: bool = True
+
+    # Setup×symbol probation. It activates only after enough journaled samples
+    # exist and does not permanently disable a setup: weak historical setups
+    # simply need a larger current score edge to be allowed.
+    setup_performance_guard_enabled: bool = True
+    setup_performance_min_trades: int = 8
+    setup_performance_lookback: int = 20
+    setup_performance_pf_floor: float = 0.90
+    setup_performance_wr_floor: float = 0.35
+    setup_performance_required_edge: float = 6.0
     expert_min_displacement_atr: float = 0.24
     expert_direct_breakout_body_atr: float = 0.42
     expert_direct_breakout_volume_ratio: float = 1.10

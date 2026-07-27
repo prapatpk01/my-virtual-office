@@ -566,6 +566,40 @@ class EntryEngine:
         c = snap["candle"]
         return snap["directional_candle"] and c.body_atr >= min_body and snap["close_quality"] >= min_close
 
+    @staticmethod
+    def _symbol_root(symbol: str) -> str:
+        text = str(symbol or "").upper()
+        return text.split("/")[0].split("-")[0]
+
+    def _is_precision_symbol(self, symbol: str) -> bool:
+        roots = {str(x).upper() for x in getattr(self.cfg, "expert_precision_symbols", ())}
+        return self._symbol_root(symbol) in roots
+
+    def _initial_chase_reason(self, df5: pd.DataFrame, snap: dict, direction: str) -> str:
+        """Return a hard-gate reason when the candidate is late in an impulse.
+
+        This is intentionally independent of the setup score: HTF trend/bias
+        confidence cannot compensate for paying a poor location at the end of a
+        5M displacement leg. Breakout-retests are handled separately and are
+        exempt because they explicitly prove acceptance around a new level.
+        """
+        if not getattr(self.cfg, "expert_initial_chase_guard_enabled", True) or len(df5) < 5:
+            return ""
+        atr_v = max(float(snap.get("atr", 0.0) or 0.0), 1e-12)
+        closes = df5["close"].astype(float)
+        move = (float(closes.iloc[-1]) - float(closes.iloc[-4])) / atr_v
+        if direction == SHORT:
+            move = -move
+        ema_ext = abs(float(snap["price"]) - float(snap["ema20"])) / atr_v
+        hard_ext = float(getattr(self.cfg, "expert_initial_chase_hard_extension_atr", 0.90))
+        if ema_ext >= hard_ext:
+            return f"hard extension {ema_ext:.2f}ATR from EMA20"
+        move_thr = float(getattr(self.cfg, "expert_initial_chase_3bar_atr", 1.10))
+        ext_thr = float(getattr(self.cfg, "expert_initial_chase_ema20_atr", 0.60))
+        if move >= move_thr and ema_ext >= ext_thr:
+            return f"post-impulse chase 3bar={move:.2f}ATR ema20={ema_ext:.2f}ATR"
+        return ""
+
     def _cross_candidate(self, frame: pd.DataFrame, tf: str, direction: str, snap: dict, context: dict, zone: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
         fresh, age = self._fresh_cross(snap["ema8_s"], snap["ema13_s"], direction, 0)
         if not fresh:
@@ -681,9 +715,22 @@ class EntryEngine:
             float(row["high"]) >= z.low and float(row["close"]) < z.low and s5["candle"].upper_wick >= s5["candle"].body*0.8
         )
         micro_break = s5["price"] > float(df5["high"].iloc[-2]) if direction == LONG else s5["price"] < float(df5["low"].iloc[-2])
-        if not (wick_reject or micro_break or s5["bos"]):
+        # A mapped FVG/OB is LOCATION, not a standalone trigger.  The entry
+        # needs a 5M structure confirmation (micro break or BOS); a wick alone
+        # only arms the area and waits for the next confirmed candle.
+        if self.cfg.expert_smc_require_micro_structure_confirm:
+            if not (micro_break or s5["bos"]):
+                return None
+        elif not (wick_reject or micro_break or s5["bos"]):
             return None
         label = getattr(regime,"label","")
+        precision = self._is_precision_symbol(getattr(bias, "symbol", ""))
+        # `BiasResult` does not necessarily carry symbol; the caller adds a
+        # precision marker to the zone context when evaluating BTC/ETH.
+        precision = bool(zone.get("precision_symbol", precision))
+        if precision and self.cfg.expert_precision_require_15m_structure:
+            if not (s15["structure_aligned"] or s15["bos"]):
+                return None
         # Standalone zone reactions are disabled in range/compression by
         # default. Those regimes must use the stricter sweep-at-zone route.
         if label in (RANGE, COMPRESSION) and not self.cfg.expert_allow_range_trades:
@@ -700,7 +747,10 @@ class EntryEngine:
         if s5["di_spread"] < self.cfg.expert_smc_di_spread_min:
             return None
         ema20_extension = abs(s5["price"] - s5["ema20"]) / s5["atr"]
-        if ema20_extension > self.cfg.expert_smc_max_ema20_extension_atr:
+        max_smc_ext = self.cfg.expert_smc_max_ema20_extension_atr
+        if precision:
+            max_smc_ext = min(max_smc_ext, self.cfg.expert_precision_max_ema20_extension_atr)
+        if ema20_extension > max_smc_ext:
             return None
         if direction == LONG and s5["rsi"] > self.cfg.expert_smc_rsi_long_max:
             return None
@@ -729,7 +779,8 @@ class EntryEngine:
             score=score, threshold=threshold, price=s5["price"], atr_v=s5["atr"], invalidation=invalidation,
             desired_r=self.cfg.expert_tp2_smc_r, opposing_level=opposing, bar_ts=pd.Timestamp(df5.index[-1]),
             components={"htf":htf_detail,"structure":structure_pts,"location":location_pts,"trigger":trigger_pts,"momentum":momentum_pts,"quality":quality_pts,"zone_tf":z.timeframe,"zone_source":z.source,"zone_low":z.low,"zone_high":z.high,"local_edge":s5["edge"],"di_spread":round(s5["di_spread"],1),"rsi":round(s5["rsi"],1),"ema20_extension_atr":round(ema20_extension,2)},
-            min_room_r=self.cfg.expert_range_min_room_r if label in (RANGE,COMPRESSION) else None,
+            min_room_r=(self.cfg.expert_range_min_room_r if label in (RANGE,COMPRESSION)
+                        else self.cfg.expert_smc_min_room_r),
         )
 
     def _breakout_candidate(self, frame: pd.DataFrame, tf: str, direction: str, snap: dict, context: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
@@ -808,9 +859,10 @@ class EntryEngine:
             score=score, threshold=threshold, price=snap["price"], atr_v=snap["atr"], invalidation=invalidation,
             desired_r=self.cfg.expert_tp2_breakout_r, opposing_level=opposing, bar_ts=pd.Timestamp(frame.index[-1]),
             components={"htf":htf_detail,"structure":structure_pts,"location":location_pts,"trigger":trigger_pts,"momentum":momentum_pts,"quality":quality_pts,"break_level":level,"break_age":break_age,"extension_atr":round(extension,2),"local_edge":snap["edge"]},
+            min_room_r=(self.cfg.expert_breakout_retest_min_room_r if retest else None),
         )
 
-    def _liquidity_sweep(self, frame: pd.DataFrame, tf: str, direction: str, snap: dict, zone: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
+    def _liquidity_sweep(self, frame: pd.DataFrame, tf: str, direction: str, snap: dict, context: dict, zone: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
         level = snap["swing_low"] if direction == LONG else snap["swing_high"]
         if level is None or (isinstance(level,float) and math.isnan(level)):
             level = float(frame["low"].iloc[-12:-1].min()) if direction==LONG else float(frame["high"].iloc[-12:-1].max())
@@ -822,7 +874,20 @@ class EntryEngine:
         )
         if not swept:
             return None
+        previous_high = float(frame["high"].iloc[-2])
+        previous_low = float(frame["low"].iloc[-2])
+        micro_break = snap["price"] > previous_high if direction == LONG else snap["price"] < previous_low
+        if self.cfg.expert_sweep_require_micro_structure_confirm and not (micro_break or snap["bos"]):
+            return None
         label = getattr(regime,"label","")
+        precision = bool(zone.get("precision_symbol", False))
+        if precision and self.cfg.expert_precision_require_15m_structure:
+            if not (context["structure_aligned"] or context["bos"]):
+                return None
+        if precision:
+            ema_ext = abs(snap["price"] - snap["ema20"]) / max(snap["atr"], 1e-12)
+            if ema_ext > self.cfg.expert_precision_max_ema20_extension_atr:
+                return None
         # A sweep is meaningful only at mapped liquidity/location. This keeps
         # range trading active without treating every wick as institutional SMC.
         if not zone["near_own"]:
@@ -853,8 +918,9 @@ class EntryEngine:
             direction=direction,setup_type=LIQUIDITY_SWEEP,timeframe=tf,trigger="SWEEP_AND_RECLAIM",
             score=score,threshold=threshold,price=snap["price"],atr_v=snap["atr"],invalidation=invalidation,
             desired_r=self.cfg.expert_tp2_smc_r,opposing_level=opposing,bar_ts=pd.Timestamp(frame.index[-1]),
-            components={"htf":htf_detail,"structure":structure_pts,"location":location_pts,"trigger":trigger_pts,"momentum":momentum_pts,"quality":quality_pts,"swept_level":level,"local_edge":snap["edge"]},
-            min_room_r=self.cfg.expert_range_min_room_r if label in (RANGE,COMPRESSION) else None,
+            components={"htf":htf_detail,"structure":structure_pts,"location":location_pts,"trigger":trigger_pts,"momentum":momentum_pts,"quality":quality_pts,"swept_level":level,"local_edge":snap["edge"],"micro_break":micro_break},
+            min_room_r=(self.cfg.expert_range_min_room_r if label in (RANGE,COMPRESSION)
+                        else self.cfg.expert_sweep_min_room_r),
         )
 
     def _continuation(self, df5: pd.DataFrame, direction: str, s5: dict, s15: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
@@ -1123,23 +1189,26 @@ class EntryEngine:
                 (df_15m,"15M",self.cfg.expert_zone_lookback_15m),
                 (df_1h,"1H",self.cfg.expert_zone_lookback_1h),
             ])
-            # Hard room is based on active opposing Supply/Demand, not every
-            # minor swing. Minor pivots are frequently crossed during trend
-            # continuation and treating all of them as hard ceilings caused
-            # the previous bot to reject virtually every setup.
-            # Major pivots are retained for diagnostics/context. Active
-            # opposing SMC zones are the non-compensable hard room gate; minor
-            # pivots are crossed frequently during continuation.
-            support,resistance=self._nearest_structure(s5["price"],[df_15m,df_1h,df_4h])
-            opposing=None
+            zone["precision_symbol"] = self._is_precision_symbol(symbol)
+            # Hard room uses active opposing SMC zones plus confirmed 1H/4H
+            # structure. We deliberately exclude 15M minor pivots here so the
+            # quality gate protects obvious HTF ceilings/floors without
+            # returning to the over-filtered behavior of older versions.
+            support,resistance=self._nearest_structure(s5["price"],[df_1h,df_4h])
+            levels=[]
             if zone["opposing"] is not None:
-                opposing=zone["opposing"].low if side==LONG else zone["opposing"].high
+                levels.append(zone["opposing"].low if side==LONG else zone["opposing"].high)
+            if side==LONG and resistance is not None and resistance>s5["price"]:
+                levels.append(resistance)
+            if side==SHORT and support is not None and support<s5["price"]:
+                levels.append(support)
+            opposing=(min(levels) if side==LONG else max(levels)) if levels else None
 
             if self.cfg.expert_allow_15m_entry:
                 for cand in (
                     self._cross_candidate(df_15m,"15M",side,s15,s15,zone,regime,bias,opposing),
                     self._breakout_candidate(df_15m,"15M",side,s15,s15,regime,bias,opposing),
-                    self._liquidity_sweep(df_15m,"15M",side,s15,zone,regime,bias,opposing),
+                    self._liquidity_sweep(df_15m,"15M",side,s15,s15,zone,regime,bias,opposing),
                 ):
                     if cand is not None: candidates.append(cand)
             if self.cfg.expert_allow_5m_entry:
@@ -1149,12 +1218,32 @@ class EntryEngine:
                      if self.cfg.expert_structure_pullback_enabled else None),
                     self._smc_rejection(df_5m,side,s5,s15,zone,regime,bias,opposing),
                     self._breakout_candidate(df_5m,"5M",side,s5,s15,regime,bias,opposing),
-                    self._liquidity_sweep(df_5m,"5M",side,s5,zone,regime,bias,opposing),
+                    self._liquidity_sweep(df_5m,"5M",side,s5,s15,zone,regime,bias,opposing),
                     self._continuation(df_5m,side,s5,s15,regime,bias,opposing),
                     self._range_reversal(df_15m,df_5m,side,s5,zone,regime,bias,opposing),
                 ):
                     if cand is not None: candidates.append(cand)
             diagnostics.append(f"{side}:15Medge={s15['edge']:+.0f} 5Medge={s5['edge']:+.0f} zone={zone['own'].timeframe if zone['own'] else '-'}")
+
+        # Initial-entry chase protection: unlike the V3.2.5 post-exit gate,
+        # this also protects the FIRST entry of a leg. A breakout-retest is
+        # exempt because the retest itself proves a new accepted location.
+        chase_filtered=[]
+        for cand in candidates:
+            side_snap=self._snapshot(df_5m,cand.direction)
+            chase_reason=self._initial_chase_reason(df_5m,side_snap,cand.direction)
+            if chase_reason and cand.setup_type != BREAKOUT_RETEST:
+                diagnostics.append(f"{cand.direction}:{cand.setup_type} blocked — {chase_reason}")
+                continue
+            # Precision symbols require tighter 5M value location for all
+            # ordinary triggers. This is the BTC/ETH anti-late-entry lane.
+            if self._is_precision_symbol(symbol) and cand.setup_type != BREAKOUT_RETEST:
+                ext=abs(side_snap["price"]-side_snap["ema20"])/max(side_snap["atr"],1e-12)
+                if ext > self.cfg.expert_precision_max_ema20_extension_atr:
+                    diagnostics.append(f"{cand.direction}:{cand.setup_type} blocked — precision extension {ext:.2f}ATR")
+                    continue
+            chase_filtered.append(cand)
+        candidates=chase_filtered
 
         post_exit_filtered=[]
         for cand in candidates:
