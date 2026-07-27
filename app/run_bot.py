@@ -195,7 +195,7 @@ def _view_waiting_reason(status: dict, tradeable_regimes) -> str:
     if st == "COOLDOWN":
         return "cooldown after a loss streak (waits for the cooldown to expire)"
     if st == "BLOCKED":
-        return "legacy BLOCKED state detected — ALWAYS-TRADE mode will clear it"
+        return "daily PnL limit hit — blocked until the next trading day"
     if not status.get("session_gate_open", True):
         return (f"session {status.get('session_state')} — new entries paused "
                 f"(commodity weekend; crypto is unaffected)")
@@ -253,12 +253,8 @@ def build_config() -> dict:
         "use_adaptive": _env_bool("USE_ADAPTIVE", False),
         "adaptive_balance": _env_float("ADAPTIVE_BALANCE", 10000.0),
         "adaptive_risk_pct": _env_float("ADAPTIVE_RISK_PCT", 0.05),
-        # Daily PnL day-halt DISABLED by default (0 = off) so the bot trades
-        # 24/7 and never stops after a profitable day. On a small balance the
-        # old -3%/+8% halted almost immediately. Set a negative loss / positive
-        # profit value again to re-enable the daily brake.
-        "adaptive_daily_loss": _env_float("ADAPTIVE_DAILY_LOSS_PCT", 0.0),
-        "adaptive_daily_profit": _env_float("ADAPTIVE_DAILY_PROFIT_PCT", 0.0),
+        "adaptive_daily_loss": _env_float("ADAPTIVE_DAILY_LOSS_PCT", -3.0),
+        "adaptive_daily_profit": _env_float("ADAPTIVE_DAILY_PROFIT_PCT", 8.0),
         "adaptive_cooldown_min": _env_int("ADAPTIVE_COOLDOWN_MIN", 30),
         "adaptive_max_loss_streak": _env_int("ADAPTIVE_MAX_LOSS_STREAK", 3),
         "adaptive_max_positions": _env_int("ADAPTIVE_MAX_POSITIONS", 2),
@@ -285,25 +281,21 @@ def build_config() -> dict:
         # Startup warmup — no new entries until this many minutes after
         # process start (indicators need a few closed bars to stabilize
         # after a fresh restart). Was hardcoded 45; lowered to 10 by request.
-        # Startup warmup DISABLED by default (0 = off): no post-restart entry
-        # freeze. Indicators are computed from history already loaded before
-        # the first on_tick, so entries are safe immediately. Set a positive
-        # value to re-enable a warmup freeze after each restart/redeploy.
-        "adaptive_warmup_min": _env_int("ADAPTIVE_WARMUP_MIN", 0),
+        "adaptive_warmup_min": _env_int("ADAPTIVE_WARMUP_MIN", 10),
         # /stats now sources trade count/win-rate/PnL straight from OKX's own
         # post-fill positions-history (realizedPnl already nets OKX's trading
         # + funding fee — no local re-derivation, so the numbers always match
         # OKX exactly). Only trades closed on/after this date are counted.
         "adaptive_stats_since": os.environ.get("ADAPTIVE_STATS_SINCE_DATE", "2026-07-16"),
-        # [SIZING MODE] Back to classic risk-%-of-balance (live default,
-        # ADAPTIVE_RISK_PCT above = 5%): position size is derived from the
-        # SL distance so that a full stop-out loses exactly risk_pct of
-        # current balance, regardless of leverage/notional. This is the
-        # ORIGINAL sizing mode — active whenever both of the following are
-        # 0 (the default). Set ADAPTIVE_MARGIN_USDT>0 for fixed-$ sizing
-        # instead, or both ADAPTIVE_MARGIN_PCT_MIN/MAX>0 for confidence-
-        # weighted %-of-balance sizing (Level 1 Adaptive Risk).
-        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 0.0),
+        # [SIZING MODE] Fixed-margin sizing is the live default. Each new
+        # adaptive position uses ADAPTIVE_MARGIN_USDT of margin, then applies
+        # the configured LEVERAGE to determine notional. Default = $20.
+        # Example at 20x leverage: $20 margin -> about $400 notional.
+        # Set ADAPTIVE_MARGIN_USDT in Railway to change the margin globally.
+        # Per-symbol ADAPTIVE_MARGIN_USDT_<BASE> can still override it.
+        # Keep ADAPTIVE_MARGIN_PCT_MIN/MAX at 0 so fixed-margin mode has
+        # precedence over confidence-weighted %-of-balance sizing.
+        "adaptive_margin_usdt": _env_float("ADAPTIVE_MARGIN_USDT", 20.0),
         "adaptive_margin_pct_min": _env_float("ADAPTIVE_MARGIN_PCT_MIN", 0.0),
         "adaptive_margin_pct_max": _env_float("ADAPTIVE_MARGIN_PCT_MAX", 0.0),
         # [MTF-CONFLUENCE] "adaptive" (default) = V9.2 L1/L2/L3/StrategyScorer
@@ -607,77 +599,44 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         _base_sym = sym.split("/")[0].upper()
         _min_sl_pct = _min_sl_pct_commodity if _base_sym in _commodity_symbols else _min_sl_pct_crypto
         # [PER-SYMBOL SIZING] Fixed-$ margin defaults to ADAPTIVE_MARGIN_USDT
-        # for every symbol (0 = disabled, the current default — see the
-        # [SIZING MODE] comment above; risk_pct-of-balance is active
-        # instead). ADAPTIVE_MARGIN_USDT_<BASE_SYM> still overrides just one
-        # symbol if fixed-$ sizing is ever turned back on.
+        # for every symbol (default $20). ADAPTIVE_MARGIN_USDT_<BASE_SYM>
+        # can override a single symbol without changing the global default.
         _margin_usdt = _env_float(f"ADAPTIVE_MARGIN_USDT_{_base_sym}",
                                   cfg.get("adaptive_margin_usdt", 0.0))
 
-        # Build constructor kwargs once, then filter them against the actual
-        # TradingBot signature loaded by Python. This prevents Railway from
-        # crash-looping when run_bot.py and adaptive_trading_bot.py are briefly
-        # out of sync during deployment.
-        _bot_kwargs = {
-            "account_balance": cfg["adaptive_balance"],
-            "min_sl_pct": _min_sl_pct,
-            "tp1_close_pct": cfg.get("adaptive_tp1_close_pct", 0.60),
-            "base_risk_pct": cfg["adaptive_risk_pct"],
-            "daily_loss_limit_pct": 0.0,  # disabled: trade 24/7 regardless of daily PnL
-            "daily_profit_limit_pct": 0.0,  # disabled: trade 24/7 regardless of daily PnL
-            "cooldown_minutes": cfg["adaptive_cooldown_min"],
-            "max_loss_streak": cfg["adaptive_max_loss_streak"],
-            "startup_warmup_minutes": cfg.get("adaptive_warmup_min", 0),
-            "state_file": state_file,
-            "execution_callback": _make_callback(sym, okx),
-            "enable_swing_reversal": cfg["strategies"].get("swing_reversal_pro", True),
-            "enable_mean_reversion": cfg["strategies"].get("mean_reversion", False),
-            "tp1_r": cfg.get("adaptive_tp1_r"),
-            "tp2_r": cfg.get("adaptive_tp2_r"),
-            "breakeven_lock_r": cfg.get("adaptive_breakeven_lock_r"),
-            "min_ema_dist_atr": cfg.get("adaptive_min_ema_dist_atr"),
-            "entry_spacing_min": cfg.get("adaptive_entry_spacing_min", 60),
-            "margin_pct_min": cfg.get("adaptive_margin_pct_min", 0.08),
-            "margin_pct_max": cfg.get("adaptive_margin_pct_max", 0.15),
-            "margin_usdt": _margin_usdt,
-            "sizing_leverage": cfg.get("leverage", 10),
-            "expectancy_engine": shared_expectancy,
-            "entry_engine": cfg.get("adaptive_entry_engine", "adaptive"),
-            "enable_early_trend": cfg.get("adaptive_early_trend", False),
-            "macro_ema_fast": cfg.get("adaptive_macro_ema_fast"),
-            "macro_ema_slow": cfg.get("adaptive_macro_ema_slow"),
-            "max_15m_adx_trend": cfg.get("adaptive_max_15m_adx_trend"),
-            "range_risk_multiplier": cfg.get("adaptive_range_risk_multiplier", 0.50),
-            "range_cooldown_minutes": cfg.get("adaptive_range_cooldown_min", 90),
-        }
-        import inspect as _inspect
-        _sig = _inspect.signature(AdaptiveBot.__init__)
-        _accepts_var_kw = any(
-            p.kind == _inspect.Parameter.VAR_KEYWORD
-            for p in _sig.parameters.values()
+        bot = AdaptiveBot(
+            account_balance=cfg["adaptive_balance"],
+            min_sl_pct=_min_sl_pct,
+            tp1_close_pct=cfg.get("adaptive_tp1_close_pct", 0.60),
+            base_risk_pct=cfg["adaptive_risk_pct"],
+            daily_loss_limit_pct=cfg["adaptive_daily_loss"],
+            daily_profit_limit_pct=cfg["adaptive_daily_profit"],
+            cooldown_minutes=cfg["adaptive_cooldown_min"],
+            max_loss_streak=cfg["adaptive_max_loss_streak"],
+            startup_warmup_minutes=cfg.get("adaptive_warmup_min", 10),
+            state_file=state_file,
+            execution_callback=_make_callback(sym, okx),
+            enable_swing_reversal=cfg["strategies"].get("swing_reversal_pro", True),
+            enable_mean_reversion=cfg["strategies"].get("mean_reversion", False),
+            tp1_r=cfg.get("adaptive_tp1_r"),
+            tp2_r=cfg.get("adaptive_tp2_r"),
+            breakeven_lock_r=cfg.get("adaptive_breakeven_lock_r"),
+            min_ema_dist_atr=cfg.get("adaptive_min_ema_dist_atr"),
+            entry_spacing_min=cfg.get("adaptive_entry_spacing_min", 60),
+            margin_pct_min=cfg.get("adaptive_margin_pct_min", 0.08),
+            margin_pct_max=cfg.get("adaptive_margin_pct_max", 0.15),
+            margin_usdt=_margin_usdt,
+            sizing_leverage=cfg.get("leverage", 10),
+            expectancy_engine=shared_expectancy,
+            entry_engine=cfg.get("adaptive_entry_engine", "adaptive"),
+            enable_early_trend=cfg.get("adaptive_early_trend", False),
+            macro_ema_fast=cfg.get("adaptive_macro_ema_fast"),
+            macro_ema_slow=cfg.get("adaptive_macro_ema_slow"),
+            max_15m_adx_trend=cfg.get("adaptive_max_15m_adx_trend"),
+            range_risk_multiplier=cfg.get("adaptive_range_risk_multiplier", 0.50),
+            range_cooldown_minutes=cfg.get("adaptive_range_cooldown_min", 90),
         )
-        if not _accepts_var_kw:
-            _supported = set(_sig.parameters) - {"self"}
-            _dropped = sorted(set(_bot_kwargs) - _supported)
-            if _dropped:
-                logger.warning(
-                    "[Adaptive][%s] runner/strategy version mismatch; ignored unsupported settings: %s",
-                    sym, ", ".join(_dropped),
-                )
-            _bot_kwargs = {k: v for k, v in _bot_kwargs.items() if k in _supported}
-        bot = AdaptiveBot(**_bot_kwargs)
         bot.load_state(state_file)
-        # [ALWAYS-TRADE MODE] Daily PnL limits are intentionally disabled.
-        # Clear a persisted BLOCKED state from an older deployment so the bot
-        # can resume scanning immediately after restart.
-        bot.daily_loss_limit_pct = 0.0
-        bot.daily_profit_limit_pct = 0.0
-        if getattr(bot, "state", None) == "BLOCKED":
-            bot.state = "SCANNING"
-            try:
-                bot._log_event("ALWAYS-TRADE: cleared stale daily-PnL BLOCKED state", level="warning")
-            except Exception:
-                pass
         bot.reconcile_with_exchange(sym, okx)
         # [MIN-LOT TP1] tell the bot the smallest closable size (1 contract in
         # coins) so an unsplittable TP1 becomes a breakeven-move instead of
@@ -689,7 +648,6 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                             sym, bot.min_close_size)
         except Exception as e:
             logger.warning("[Adaptive][%s] could not fetch contract size: %s", sym, e)
-        bot.symbol = sym
         bots[sym] = (bot, state_file)
         last_bar_ts[sym] = 0
 
@@ -718,13 +676,14 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             f"Adaptive Bot Started\n"
             f"Symbols: {', '.join(symbols)}\n"
             f"Mode: {'PAPER' if cfg['paper'] else 'LIVE'}\n"
+            f"Sizing: fixed margin ${cfg.get('adaptive_margin_usdt', 20.0):.2f} "
+            f"@ {cfg.get('leverage', 20)}x leverage\n"
             f"Regimes: {', '.join(sorted(_TRADEABLE_REGIMES))}\n"
             f"Range: risk×{cfg.get('adaptive_range_risk_multiplier', 0.50):.2f}, "
             f"max positions={max(0, cfg.get('adaptive_max_range_positions', 1))}, "
             f"cooldown={cfg.get('adaptive_range_cooldown_min', 90)}m\n"
-            f"Session gate: ALL symbols follow FX weekly schedule; pre-open 4h; daily PnL gate disabled\n"
-            f"Warmup: {cfg.get('adaptive_warmup_min', 0)}m"
-            f"{' (off — entries allowed immediately)' if not cfg.get('adaptive_warmup_min', 0) else ' — no new entries until indicators stabilize'}"
+            f"Warmup: {cfg.get('adaptive_warmup_min', 10)}m — "
+            f"no new entries until indicators stabilize"
         )
 
     import time as _time
@@ -787,13 +746,17 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         open_hour=_env_int("WEEKLY_OPEN_HOUR", 18),
         close_weekday=os.environ.get("WEEKLY_CLOSE_WEEKDAY", "FRIDAY"),
         close_hour=_env_int("WEEKLY_CLOSE_HOUR", 17),
-        pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 4.0),
-        post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 0.0),
+        pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 3.0),
+        post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 3.0),
     )
-    # Default TRUE: every symbol follows the FX-reference weekly session.
-    # Existing positions remain managed during SLEEP_MODE; only new entries pause.
-    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", True)
-    # The same session state is applied to every configured symbol.
+    # Default FALSE: the weekend/session gate applies ONLY to commodities
+    # (XAU/XAG/CL); crypto trades 24/7 as usual. Set
+    # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=true to also pause crypto on the
+    # commodity weekend.
+    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", False)
+    # _commodity_symbols defined earlier (shared with the min-SL-floor split
+    # above) — with the default above, this is the ONLY set the session gate
+    # touches; crypto's session_gate_open stays True regardless of session.
     last_session_state = None
     last_allow_new_positions = None
 
@@ -894,7 +857,18 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         session = session_engine.evaluate()
         if session.allow_new_positions != last_allow_new_positions:
             if last_allow_new_positions is not None and telegram:
-                scope = "Applies to: ALL symbols (FX-reference weekly schedule)"
+                # Scope note: with crypto exempt (the default), this gate
+                # only pauses commodities — say so, otherwise the message's
+                # "New Positions: DISABLED" reads as a full stop.
+                if _follow_session_for_crypto:
+                    scope = "Applies to: ALL symbols (crypto + commodities)"
+                else:
+                    _commodity_syms_here = sorted(
+                        s.split("/")[0].upper() for s in symbols
+                        if s.split("/")[0].upper() in _commodity_symbols)
+                    scope = ("Applies to: COMMODITIES ONLY "
+                             f"({', '.join(_commodity_syms_here) or 'none configured'}) "
+                             "— crypto keeps trading 24/7")
                 telegram.send(session.view_log_message + "\n" + scope)
             last_allow_new_positions = session.allow_new_positions
         if session.state.value != last_session_state:
@@ -920,20 +894,6 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                 is_new_bar = latest_ts > last_bar_ts[sym]
                 bot, state_file = bots[sym]
 
-                # [BTC/ETH CORRELATION GATE] Do not stack BTC and ETH in the
-                # same direction. The existing position remains untouched; only
-                # the new same-direction entry is vetoed. No risk or cooldown
-                # parameters are changed.
-                bot.blocked_entry_directions = set()
-                base_now = sym.split("/")[0].upper()
-                if base_now in {"BTC", "ETH"}:
-                    sibling = "ETH" if base_now == "BTC" else "BTC"
-                    for other_sym, (other_bot, _) in bots.items():
-                        if other_sym.split("/")[0].upper() == sibling and other_bot.position_open:
-                            d = (other_bot.current_trade or {}).get("direction")
-                            if d in {"LONG", "SHORT"}:
-                                bot.blocked_entry_directions.add(d)
-
                 # [RANGE PORTFOLIO CAP] At most one Range position by default.
                 # This gate is read only by the dedicated Range engine; Trend
                 # and Breakout are never blocked by it and retain priority for
@@ -947,13 +907,15 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     max_range_pos > 0 and range_open_count < max_range_pos
                 )
 
-                # [SESSION CONTROL] FX-reference weekly gate applies to ALL symbols.
-                # Only NEW entries are paused in SLEEP_MODE; existing positions
-                # continue normal SL/TP/position management. Trading resumes during
-                # PRE_OPEN_EXTENSION, 4 hours before the configured FX weekly open.
+                # [SESSION CONTROL] gate only new entries (never position
+                # management — _check_global_gates is the only reader of
+                # session_gate_open). Crypto symbols follow the same
+                # commodity-market schedule by default; set
+                # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=false to exempt them.
                 base_sym = sym.split("/")[0].upper()
-                bot.session_gate_open = bool(session.allow_new_positions)
-                bot.session_state = session.state.value
+                applies = _follow_session_for_crypto or base_sym in _commodity_symbols
+                bot.session_gate_open = session.allow_new_positions if applies else True
+                bot.session_state = session.state.value if applies else "ACTIVE"
 
                 if is_new_bar:
                     last_bar_ts[sym] = latest_ts
