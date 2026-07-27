@@ -2500,6 +2500,22 @@ class TrendConfirmStrategy(BaseStrategy):
         merged.setdefault("entry_state", "HOLD")
         merged["hold_reason"] = reason
 
+        # Compatibility aliases for older TradingBot scan formatters.
+        # Informational only; never used by the trading decision path.
+        _t4 = str(merged.get("trend_4h", "N/A"))
+        _t1 = str(merged.get("trend_1h", "WARMUP"))
+        merged.setdefault("macro_trend", {"bias": _t4, "stage": "INFO", "score": 0.0})
+        merged.setdefault("context_1h", {
+            "dominant_bias": _t1,
+            "stage": str(merged.get("direction_15m", "WARMUP")),
+        })
+        _a14 = (_t4 == _t1) if _t4 in ("UP", "DOWN") and _t1 in ("UP", "DOWN") else None
+        merged.setdefault("mtf_combined", {
+            "aligned_1h_4h": _a14,
+            "pct": 100.0 if _a14 is True else (-100.0 if _a14 is False else 0.0),
+        })
+        merged.setdefault("selected_strategy", merged.get("strategy", "EMA_CROSS_5M"))
+
         return Signal(
             type=SignalType.HOLD, symbol=self.symbol, price=price, amount=0.0,
             reason=reason, confidence=0.0, metadata=merged,
