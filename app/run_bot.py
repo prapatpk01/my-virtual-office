@@ -338,6 +338,7 @@ def _install_fx_sleep_entry_gate(bot, config: dict) -> None:
     risk.can_open = _session_aware_can_open
     risk._fx_sleep_gate_installed = True
     logger.info("FX-week Sleep Mode entry gate installed for ALL symbols")
+    logger.info("TrendConfirm diagnostic metadata enabled: 1H/15M/5M context will be present on HOLD signals")
 
 
 async def _fx_sleep_monitor(config: dict):
