@@ -169,8 +169,14 @@ def render_entry_chart(
             facecolor="#111827",
             figcolor="#111827",
             edgecolor="#374151",
-            rc={"axes.labelcolor": "#e5e7eb", "xtick.color": "#9ca3af",
-                "ytick.color": "#9ca3af", "text.color": "#e5e7eb"},
+            rc={"font.family": "DejaVu Sans",
+                "font.weight": "normal",
+                "axes.titleweight": "bold",
+                "axes.labelweight": "normal",
+                "axes.labelcolor": "#e5e7eb",
+                "xtick.color": "#9ca3af",
+                "ytick.color": "#9ca3af",
+                "text.color": "#e5e7eb"},
         )
 
         out_dir = out_dir or tempfile.gettempdir()
