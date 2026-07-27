@@ -71,6 +71,15 @@ class Position:
     trigger: str = ""
     planned_rr: float = 0.0
     structure_room_r: float = 0.0
+    # Persistent forensic metadata for /trade. These fields do not affect
+    # execution/risk; they only preserve the exact context that approved the
+    # position so a later OKX close can be explained after a restart.
+    regime_score: float = 0.0
+    bias_score: float = 0.0
+    entry_threshold: float = 0.0
+    margin_usdt: float = 0.0
+    leverage: int = 0
+    local_edge: float = 0.0
 
 
 def calc_stop_loss(
@@ -210,6 +219,9 @@ class PositionManager:
             "last_exit_check_bar_ts": self._ts_to_text(pos.last_exit_check_bar_ts),
             "setup_type": pos.setup_type, "trigger": pos.trigger,
             "planned_rr": pos.planned_rr, "structure_room_r": pos.structure_room_r,
+            "regime_score": pos.regime_score, "bias_score": pos.bias_score,
+            "entry_threshold": pos.entry_threshold, "margin_usdt": pos.margin_usdt,
+            "leverage": pos.leverage, "local_edge": pos.local_edge,
         }
 
     def _position_from_dict(self, item: dict) -> Optional[Position]:
@@ -237,6 +249,12 @@ class PositionManager:
                 trigger=str(item.get("trigger", "")),
                 planned_rr=float(item.get("planned_rr", 0.0)),
                 structure_room_r=float(item.get("structure_room_r", 0.0)),
+                regime_score=float(item.get("regime_score", 0.0)),
+                bias_score=float(item.get("bias_score", 0.0)),
+                entry_threshold=float(item.get("entry_threshold", 0.0)),
+                margin_usdt=float(item.get("margin_usdt", 0.0)),
+                leverage=int(item.get("leverage", 0) or 0),
+                local_edge=float(item.get("local_edge", 0.0)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning("[STATE] invalid persisted position skipped: %s", exc)
@@ -817,6 +835,15 @@ class PositionManager:
             trigger=getattr(entry_result, "trigger", ""),
             planned_rr=actual_rr,
             structure_room_r=getattr(entry_result, "structure_room_r", 0.0),
+            regime_score=float(getattr(regime, "score", 0.0) or 0.0),
+            bias_score=float(
+                (getattr(bias, "bull_score", 0.0) if side == LONG else getattr(bias, "bear_score", 0.0))
+                if bias is not None else 0.0
+            ),
+            entry_threshold=float(getattr(entry_result, "score_threshold", 0.0) or 0.0),
+            margin_usdt=float(getattr(self.cfg, "fixed_margin_usdt", 0.0) or 0.0),
+            leverage=int(getattr(self.cfg, "leverage", 0) or 0),
+            local_edge=float((getattr(entry_result, "score_components", {}) or {}).get("local_direction_edge", 0.0) or 0.0),
         )
         self._positions[symbol] = pos
         self.save_state()

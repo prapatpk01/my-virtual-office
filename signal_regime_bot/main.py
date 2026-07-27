@@ -119,6 +119,15 @@ class Bot:
         self.journal: list[dict] = self._load_journal()
         self._journaled_close_ms = {(e["symbol"], int(e["close_ms"] // 60000))
                                     for e in self.journal}   # dedup key: symbol+minute
+        # Entry-context journal is written as soon as an order opens. Unlike a
+        # close-only journal this survives an exchange-side close while the bot
+        # is offline, so /trade can still explain WHY the trade was opened.
+        self._entry_journal_path = os.path.join(self.cfg.state_dir, "trade_entries.jsonl")
+        self.entry_journal: list[dict] = self._load_entry_journal()
+        self._entry_journal_keys = {
+            (e.get("symbol", ""), e.get("side", ""), int(e.get("open_ms", 0) // 60000), round(float(e.get("entry_price", 0.0) or 0.0), 8))
+            for e in self.entry_journal
+        }
         self._stats_reset_ms = _load_stats_reset_ms(self.cfg.state_dir)   # /restats cursor override
         self._cmd_task = None                 # Telegram command polling task
         self._tg_offset = 0
@@ -166,10 +175,74 @@ class Bot:
             logger.warning("[JOURNAL] corrupt line(s) skipped")
         return out
 
+    def _load_entry_journal(self) -> list[dict]:
+        out: list[dict] = []
+        try:
+            with open(self._entry_journal_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning("[TRADE-JOURNAL] corrupt entry-context line skipped")
+        except (FileNotFoundError, OSError):
+            pass
+        return out
+
+    def _entry_journal_add(self, pos) -> None:
+        """Persist the context that approved a newly opened position.
+
+        This file is intentionally append-only. It is diagnostic state only and
+        cannot influence entries/exits. Future /trade rows can therefore recover
+        setup/regime/bias metadata even if the position later closes on OKX while
+        the bot is offline.
+        """
+        if pos is None:
+            return
+        open_ms = int(float(getattr(pos, "opened_at", time.time()) or time.time()) * 1000)
+        entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        side = str(getattr(pos, "side", "") or "")
+        symbol = str(getattr(pos, "symbol", "") or "")
+        key = (symbol, side, int(open_ms // 60000), round(entry_px, 8))
+        if key in self._entry_journal_keys:
+            return
+        row = {
+            "open_ms": open_ms, "symbol": symbol, "side": side,
+            "entry_price": entry_px,
+            "sl": float(getattr(pos, "stop_loss", 0.0) or 0.0),
+            "tp1": float(getattr(pos, "tp1", 0.0) or 0.0),
+            "tp2": float(getattr(pos, "tp2", 0.0) or 0.0),
+            "setup_type": str(getattr(pos, "setup_type", "") or ""),
+            "trigger": str(getattr(pos, "trigger", "") or ""),
+            "regime": str(getattr(pos, "regime_at_entry", "") or ""),
+            "regime_score": float(getattr(pos, "regime_score", 0.0) or 0.0),
+            "bias": str(getattr(pos, "bias_at_entry", "") or ""),
+            "bias_score": float(getattr(pos, "bias_score", 0.0) or 0.0),
+            "entry_score": float(getattr(pos, "entry_score", 0.0) or 0.0),
+            "entry_threshold": float(getattr(pos, "entry_threshold", 0.0) or 0.0),
+            "margin_usdt": float(getattr(pos, "margin_usdt", 0.0) or 0.0),
+            "leverage": int(getattr(pos, "leverage", 0) or 0),
+            "local_edge": float(getattr(pos, "local_edge", 0.0) or 0.0),
+            "planned_rr": float(getattr(pos, "planned_rr", 0.0) or 0.0),
+            "structure_room_r": float(getattr(pos, "structure_room_r", 0.0) or 0.0),
+        }
+        try:
+            os.makedirs(self.cfg.state_dir, exist_ok=True)
+            with open(self._entry_journal_path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+        except OSError as exc:
+            logger.warning("[TRADE-JOURNAL] entry-context write failed: %s", exc)
+            return
+        self.entry_journal.append(row)
+        self._entry_journal_keys.add(key)
+
     def _journal_add(self, symbol: str, side: str, pnl: float, exit_type: str,
                      reason: str, tp1_hit: bool, close_ms: int, *,
                      entry_price: float = 0.0, exit_price: float = 0.0,
-                     setup_type: str = "", trigger: str = "") -> None:
+                     setup_type: str = "", trigger: str = "", position=None,
+                     event: dict | None = None) -> None:
         """Append one closed trade. Deduped by (symbol, close-minute) so a
         restart-time backfill can't double-count a trade already journaled.
         `reason` keeps the raw event (TP2_HIT / EMA_CROSS_REVERSAL / …) and
@@ -178,13 +251,37 @@ class Bot:
         key = (symbol, int(close_ms // 60000))
         if key in self._journaled_close_ms:
             return
+        evmeta = event or {}
+        pos = position
         entry = {"close_ms": int(close_ms), "symbol": symbol, "side": side,
                  "pnl": round(float(pnl), 4), "exit_type": exit_type,
                  "reason": reason, "tp1_hit": bool(tp1_hit),
                  "entry_price": float(entry_price or 0.0),
                  "exit_price": float(exit_price or 0.0),
                  "setup_type": str(setup_type or ""),
-                 "trigger": str(trigger or "")}
+                 "trigger": str(trigger or ""),
+                 "open_ms": int(float(getattr(pos, "opened_at", 0.0) or 0.0) * 1000),
+                 "sl": float(getattr(pos, "stop_loss", 0.0) or 0.0),
+                 "tp1": float(getattr(pos, "tp1", 0.0) or 0.0),
+                 "tp2": float(getattr(pos, "tp2", 0.0) or 0.0),
+                 "regime": str(getattr(pos, "regime_at_entry", "") or ""),
+                 "regime_score": float(getattr(pos, "regime_score", 0.0) or 0.0),
+                 "bias": str(getattr(pos, "bias_at_entry", "") or ""),
+                 "bias_score": float(getattr(pos, "bias_score", 0.0) or 0.0),
+                 "entry_score": float(getattr(pos, "entry_score", 0.0) or 0.0),
+                 "entry_threshold": float(getattr(pos, "entry_threshold", 0.0) or 0.0),
+                 "margin_usdt": float(getattr(pos, "margin_usdt", 0.0) or 0.0),
+                 "leverage": int(getattr(pos, "leverage", 0) or 0),
+                 "local_edge": float(getattr(pos, "local_edge", 0.0) or 0.0),
+                 "planned_rr": float(getattr(pos, "planned_rr", 0.0) or 0.0),
+                 "structure_room_r": float(getattr(pos, "structure_room_r", 0.0) or 0.0),
+                 "exit_score": float(evmeta.get("ai_exit_score", 0.0) or 0.0),
+                 "exit_threshold": float(evmeta.get("ai_exit_threshold", 0.0) or 0.0),
+                 "exit_confirmations": int(evmeta.get("ai_exit_confirmations", 0) or 0),
+                 "exit_persistence": int(evmeta.get("ai_exit_persistence", 0) or 0),
+                 "adverse_r": float(evmeta.get("ai_exit_adverse_r", 0.0) or 0.0),
+                 "exit_signals": list(evmeta.get("ai_exit_signals", []) or []),
+                 "exit_detail": str(evmeta.get("exit_detail", "") or evmeta.get("ai_exit_reason", "") or evmeta.get("spike_reason", "") or "")}
         try:
             os.makedirs(self.cfg.state_dir, exist_ok=True)
             with open(self._journal_path, "a") as f:
@@ -503,6 +600,10 @@ class Bot:
             event["ai_exit_reason"] = result.reason
             event["ai_exit_score"] = result.score
             event["ai_exit_threshold"] = result.threshold
+            event["ai_exit_confirmations"] = result.confirmations
+            event["ai_exit_persistence"] = getattr(result, "persistence", 0)
+            event["ai_exit_adverse_r"] = result.adverse_r
+            event["ai_exit_signals"] = list((result.signals or {}).keys())
         self.ai_exit.clear(symbol)
         return event
 
@@ -555,6 +656,10 @@ class Bot:
             sig.entry_score, df_5m=df_5m, entry_result=sig.entry)
         if pos is None:
             return
+
+        # Persist entry context immediately. This is diagnostic-only state and
+        # makes /trade restart/offline-close safe for setup/regime/bias metadata.
+        self._entry_journal_add(pos)
 
         # Consume the deterministic setup key ONLY now that a position really opened —
         # a blocked/failed open above leaves the setup eligible until it expires.
@@ -708,6 +813,7 @@ class Bot:
                 symbol, side, pnl, self._bucket_for_event(ev, pnl), ev, tp1_hit,
                 int(time.time() * 1000), entry_price=entry_price,
                 exit_price=exit_price, setup_type=setup_type, trigger=trigger,
+                position=pos_obj, event=event,
             )
 
     async def _check_global_alerts(self):
@@ -766,7 +872,7 @@ class Bot:
                 "/restats — reset stats แล้วเริ่มนับใหม่จากตอนนี้\n"
                 "/balance — ยอด USDT ปัจจุบัน\n"
                 "/positions — position ที่เปิดอยู่\n"
-                "/trade — 15 เทรดล่าสุด พร้อม Entry / Exit / PnL\n"
+                "/trade — 15 เทรดล่าสุด พร้อม Setup / Context / Entry / Exit\n"
                 "/trades — alias ของ /trade\n"
                 "/status — regime/bias/score ทุก symbol"
             )
@@ -799,8 +905,11 @@ class Bot:
         elif cmd in ("/trade", "/trades"):
             # Authoritative latest closes from OKX. /restats intentionally does
             # NOT affect this command: /trade is a forensic view of the latest
-            # 15 account trades, not a performance-window report.
-            await self.telegram._send_message(await self._build_trade_report(15), _markdown=False)
+            # 15 account trades, not a performance-window report. Rich details
+            # are paged (5 trades/message) so Telegram's message-size limit can
+            # never truncate the newest forensic context.
+            for page in await self._build_trade_reports(15, page_size=5):
+                await self.telegram._send_message(page, _markdown=False)
         elif cmd == "/stats":
             # plain text (no markdown) — separators + emoji, so symbols/numbers
             # never get mangled by Telegram's Markdown parser. Same as HTF.
@@ -867,18 +976,16 @@ class Bot:
         d, rem = divmod(secs, 86400)
         return f"{d}d{rem // 3600}h"
 
-    async def _build_trade_report(self, limit: int = 15) -> str:
-        """Latest closed trades with actual OKX entry/exit prices.
+    async def _build_trade_reports(self, limit: int = 15, page_size: int = 5) -> list[str]:
+        """Detailed latest trades, paged for Telegram.
 
-        OKX positions-history is the authority for side, average entry/exit,
-        timestamps and post-fee realized PnL. The local journal is used only
-        to enrich rows with bot-specific setup/trigger/exit reason when a
-        matching lifecycle event exists.
+        OKX remains authoritative for side, entry/exit prices, timestamps and
+        post-fee PnL. Persistent bot journals enrich those rows with the exact
+        setup/regime/bias/entry plan and exit decision that the bot observed.
         """
         limit = max(1, min(int(limit), 30))
+        page_size = max(1, min(int(page_size), 10))
         now_ms = int(time.time() * 1000)
-        # Look back one year so /trade remains independent of /restats. The
-        # client paginates positions-history and we only render the newest 15.
         since_ms = now_ms - 365 * 24 * 60 * 60 * 1000
         rows: list[dict] = []
         okx_ok = True
@@ -889,8 +996,6 @@ class Bot:
                 logger.warning("[TRADE] OKX history fetch failed: %s", exc)
                 okx_ok = False
 
-        # Paper mode / temporary OKX outage fallback. These rows only contain
-        # what this process observed, so entry/exit times can be approximate.
         if not rows:
             for t in self._trade_log[-limit:]:
                 close_ms = int(float(t.get("time", 0.0) or 0.0) * 1000)
@@ -909,11 +1014,14 @@ class Bot:
                 })
 
         if not rows:
-            return "🧾 LAST 15 TRADES\n\nNo closed trades found."
+            return ["🧾 LAST 15 TRADES\n\nNo closed trades found."]
 
         latest = sorted(rows, key=lambda r: r.get("close_time_ms", 0), reverse=True)[:limit]
-        matched = self._match_journal([r for r in latest if not r.get("_local")])
-        lines = [f"🧾 LAST {len(latest)} TRADES", "Entry/Exit & Net PnL from OKX", ""]
+        live_rows = [r for r in latest if not r.get("_local")]
+        close_matched = self._match_journal(live_rows)
+        entry_matched = self._match_entry_journal(live_rows)
+
+        rendered: list[list[str]] = []
         for i, row in enumerate(latest, 1):
             pnl = float(row.get("pnl", 0.0) or 0.0)
             icon = "✅" if pnl > 1e-9 else ("❌" if pnl < -1e-9 else "➖")
@@ -923,23 +1031,103 @@ class Bot:
             exit_px = float(row.get("close_avg_px", 0.0) or 0.0)
             open_ms = int(row.get("open_time_ms", 0) or 0)
             close_ms = int(row.get("close_time_ms", 0) or 0)
-            meta = row if row.get("_local") else (matched.get(id(row)) or {})
-            reason = str(meta.get("reason", "") or "OKX_CLOSE")
+
+            if row.get("_local"):
+                meta = dict(row)
+            else:
+                meta = self._merge_trade_meta(
+                    entry_matched.get(id(row), {}), close_matched.get(id(row), {})
+                )
+
             setup = str(meta.get("setup_type", "") or "—")
             trigger = str(meta.get("trigger", "") or "—")
+            regime = str(meta.get("regime", "") or "—")
+            bias = str(meta.get("bias", "") or "—")
+            regime_score = float(meta.get("regime_score", 0.0) or 0.0)
+            bias_score = float(meta.get("bias_score", 0.0) or 0.0)
+            entry_score = float(meta.get("entry_score", 0.0) or 0.0)
+            entry_thr = float(meta.get("entry_threshold", 0.0) or 0.0)
+            sl = float(meta.get("sl", 0.0) or 0.0)
+            tp1 = float(meta.get("tp1", 0.0) or 0.0)
+            tp2 = float(meta.get("tp2", 0.0) or 0.0)
+            margin = float(meta.get("margin_usdt", 0.0) or 0.0)
+            leverage = int(meta.get("leverage", 0) or 0)
+            reason = str(meta.get("reason", "") or "OKX_CLOSE")
+            exit_score = float(meta.get("exit_score", 0.0) or 0.0)
+            exit_thr = float(meta.get("exit_threshold", 0.0) or 0.0)
+            confirms = int(meta.get("exit_confirmations", 0) or 0)
+            persistence = int(meta.get("exit_persistence", 0) or 0)
+            adverse = float(meta.get("adverse_r", 0.0) or 0.0)
+
             in_px = f"{entry_px:.8g}" if entry_px > 0 else "—"
             out_px = f"{exit_px:.8g}" if exit_px > 0 else "—"
-            lines += [
+            plan_parts = []
+            if sl > 0: plan_parts.append(f"SL {sl:.8g}")
+            if tp1 > 0: plan_parts.append(f"TP1 {tp1:.8g}")
+            if tp2 > 0: plan_parts.append(f"TP2 {tp2:.8g}")
+            if margin > 0: plan_parts.append(f"M{margin:.0f}")
+            if leverage > 0: plan_parts.append(f"{leverage}x")
+            plan = " | ".join(plan_parts) if plan_parts else "—"
+
+            ctx_parts = []
+            if regime != "—":
+                ctx_parts.append(f"{regime}({regime_score:.0f})" if regime_score else regime)
+            if bias != "—":
+                ctx_parts.append(f"{bias}({bias_score:.0f})" if bias_score else bias)
+            if entry_score:
+                ctx_parts.append(f"Entry {entry_score:.0f}/{entry_thr:.0f}" if entry_thr else f"Entry {entry_score:.0f}")
+            ctx = " | ".join(ctx_parts) if ctx_parts else "—"
+
+            exit_line = f"EXIT {reason}"
+            if exit_score or exit_thr or confirms or persistence or adverse:
+                detail = []
+                if exit_score or exit_thr:
+                    detail.append(f"score {exit_score:.0f}/{exit_thr:.0f}" if exit_thr else f"score {exit_score:.0f}")
+                if confirms:
+                    detail.append(f"c{confirms}")
+                if persistence:
+                    detail.append(f"p{persistence}")
+                if adverse:
+                    detail.append(f"adv {adverse:.2f}R")
+                exit_line += " | " + " ".join(detail)
+
+            rendered.append([
                 f"{i:02d}. {icon} {symbol} {side}  ${pnl:+.2f}",
-                f"IN   {self._fmt_trade_time(open_ms)} @ {in_px}",
-                f"OUT  {self._fmt_trade_time(close_ms)} @ {out_px}  | hold {self._fmt_hold(open_ms, close_ms)}",
-                f"Setup {setup} | Trigger {trigger}",
-                f"Exit  {reason}",
+                f"IN {self._fmt_trade_time(open_ms)} @{in_px} → OUT {self._fmt_trade_time(close_ms)} @{out_px} | {self._fmt_hold(open_ms, close_ms)}",
+                f"SETUP {setup} | {trigger}",
+                f"CTX {ctx}",
+                f"PLAN {plan}",
+                exit_line,
+            ])
+
+        pages: list[str] = []
+        total_pages = (len(rendered) + page_size - 1) // page_size
+        for page_idx in range(total_pages):
+            a = page_idx * page_size
+            b = min(len(rendered), a + page_size)
+            lines = [
+                f"🧾 LAST {len(rendered)} TRADES — {page_idx + 1}/{total_pages}",
+                "OKX prices/PnL + persistent bot context",
                 "",
             ]
-        if not okx_ok:
-            lines += ["⚠️ OKX history unavailable; showing local observed trades."]
-        return "\n".join(lines).rstrip()
+            for block in rendered[a:b]:
+                lines.extend(block)
+                lines.append("")
+            if page_idx == total_pages - 1:
+                if not okx_ok:
+                    lines.append("⚠️ OKX history unavailable; showing local observed trades.")
+                if any(
+                    str(self._merge_trade_meta(entry_matched.get(id(r), {}), close_matched.get(id(r), {})).get("setup_type", "") or "") == ""
+                    for r in live_rows
+                ):
+                    lines.append("ℹ️ Trades opened before V3.2.8 may show — because setup context was not persisted then.")
+            pages.append("\n".join(lines).rstrip())
+        return pages
+
+    async def _build_trade_report(self, limit: int = 15) -> str:
+        """Backward-compatible single-string view used by tests/tools."""
+        pages = await self._build_trade_reports(limit, page_size=max(1, min(limit, 5)))
+        return "\n\n".join(pages)
 
     @staticmethod
     def _month_bounds(now_ms: int) -> tuple:
@@ -972,6 +1160,50 @@ class Bot:
                 used[best_j] = True
                 out[id(row)] = pool[best_j]
         return out
+
+    def _match_entry_journal(self, okx_rows: list) -> dict:
+        """One-to-one match OKX rows to persisted entry contexts.
+
+        Match on symbol+side and nearest open time (<=5 min), then prefer the
+        closest entry price. Each context can enrich at most one OKX trade.
+        """
+        pool = list(self.entry_journal)
+        used = [False] * len(pool)
+        out = {}
+        for row in sorted(okx_rows, key=lambda r: r.get("open_time_ms", 0)):
+            oms = int(row.get("open_time_ms", 0) or 0)
+            sym = str(row.get("symbol", "") or "")
+            side = str(row.get("side", "") or "").lower()
+            px = float(row.get("open_avg_px", 0.0) or 0.0)
+            best_j, best_key = -1, (5 * 60_000 + 1, float("inf"))
+            for j, e in enumerate(pool):
+                if used[j] or str(e.get("symbol", "")) != sym:
+                    continue
+                eside = str(e.get("side", "") or "").lower()
+                if side and eside and side != eside:
+                    continue
+                eoms = int(e.get("open_ms", 0) or 0)
+                dt = abs(eoms - oms) if oms and eoms else 5 * 60_000 + 1
+                if dt > 5 * 60_000:
+                    continue
+                epx = float(e.get("entry_price", 0.0) or 0.0)
+                price_gap = abs(epx - px) / max(abs(px), 1e-12) if px and epx else 0.0
+                key = (dt, price_gap)
+                if key < best_key:
+                    best_key, best_j = key, j
+            if best_j >= 0:
+                used[best_j] = True
+                out[id(row)] = pool[best_j]
+        return out
+
+    @staticmethod
+    def _merge_trade_meta(entry_meta: dict, close_meta: dict) -> dict:
+        """Close metadata wins for exit fields; entry context fills everything else."""
+        merged = dict(entry_meta or {})
+        for k, v in (close_meta or {}).items():
+            if v not in (None, "", [], {}):
+                merged[k] = v
+        return merged
 
     async def _build_stats_report(self) -> str:
         """/stats — SAME format as the Adaptive bot (this is a 2-TP system too):

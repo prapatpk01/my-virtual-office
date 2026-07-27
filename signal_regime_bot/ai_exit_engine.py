@@ -29,6 +29,7 @@ class ExitDecision:
     reason: str
     signals: Dict[str, float] = field(default_factory=dict)
     confirmations: int = 0
+    persistence: int = 0
 
 @dataclass
 class _WatchState:
@@ -185,8 +186,8 @@ class AIExitEngine:
                     and st.confirmed_bars>=persistence)
         if close_ok:
             reason = f"confirmed exit score={score:.0f}/{threshold:.0f}, confirms={confirmations}/{required_conf}, persistence={st.confirmed_bars}, adverse={adverse_r:.2f}R; " + ", ".join(signals)
-            return ExitDecision(CLOSE,score,threshold,adverse_r,reason,signals,confirmations)
+            return ExitDecision(CLOSE,score,threshold,adverse_r,reason,signals,confirmations,st.confirmed_bars)
         if meaningful:
             return ExitDecision(WATCH,score,threshold,adverse_r,
-                f"watch score={score:.0f}/{threshold:.0f}, confirms={confirmations}/{required_conf}, persistence={st.confirmed_bars}/{persistence}, adverse={adverse_r:.2f}R",signals,confirmations)
+                f"watch score={score:.0f}/{threshold:.0f}, confirms={confirmations}/{required_conf}, persistence={st.confirmed_bars}/{persistence}, adverse={adverse_r:.2f}R",signals,confirmations,st.confirmed_bars)
         return ExitDecision(HOLD,score,threshold,adverse_r,f"hold score={score:.0f}, adverse={adverse_r:.2f}R",signals,confirmations)
