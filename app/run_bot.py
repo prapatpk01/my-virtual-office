@@ -371,6 +371,70 @@ async def _fx_sleep_monitor(config: dict):
         except asyncio.TimeoutError:
             pass
 
+
+def _install_trendconfirm_scan_logger(bot) -> None:
+    """Use the current TrendConfirm diagnostic schema in Railway View Logs."""
+    original = getattr(bot, "_log_scan", None)
+    if original is None or getattr(bot, "_trendconfirm_scan_logger_installed", False):
+        return
+
+    scan_logger = logging.getLogger("trading_bot")
+
+    def _text(value, default="N/A"):
+        if value is None or value == "":
+            return default
+        return str(value)
+
+    def _patched(symbol, strategy_name, price, sig):
+        meta = getattr(sig, "metadata", None) or {}
+        is_tc = (
+            str(strategy_name).startswith("TrendConfirm")
+            or meta.get("strategy") == "EMA_CROSS_5M"
+            or "trend_1h" in meta
+            or "direction_15m" in meta
+        )
+        if not is_tc:
+            return original(symbol, strategy_name, price, sig)
+
+        regime = meta.get("regime", "WARMUP")
+        if isinstance(regime, dict):
+            regime = regime.get("state", "UNKNOWN")
+
+        t4 = _text(meta.get("trend_4h"), "N/A").upper()
+        t1 = _text(meta.get("trend_1h"), "WARMUP").upper()
+
+        d15 = meta.get("direction_15m", "WARMUP")
+        if isinstance(d15, dict):
+            if d15.get("full_align"):
+                d15 = "ALIGNED"
+            elif d15.get("early_shift"):
+                d15 = "EARLY_SHIFT"
+            else:
+                d15 = "NOT_READY"
+        d15 = _text(d15, "WARMUP")
+
+        aligned = meta.get("aligned")
+        aligned_s = "YES" if aligned is True else ("NO" if aligned is False else "N/A")
+        state = _text(meta.get("entry_state"), "HOLD")
+        strat = _text(meta.get("strategy"), "EMA_CROSS_5M")
+        age = meta.get("cross_age_5m")
+        cross = "WAIT" if age is None else f"{age}b"
+        reason = (getattr(sig, "reason", "") or meta.get("hold_reason", "") or "")[:150]
+        sig_type = getattr(getattr(sig, "type", None), "value", "HOLD")
+
+        scan_logger.info(
+            "[SCAN] %-16s %-22s px=%-12.4f sig=%-4s "
+            "regime=%-12s 4H=%-7s 1H=%-7s 15M=%-18s aligned=%-3s "
+            "5M=%-5s state=%-16s strat=%s | %s",
+            strategy_name, symbol, price, str(sig_type).upper(),
+            _text(regime, "WARMUP"), t4, t1, d15, aligned_s,
+            cross, state, strat, reason,
+        )
+
+    bot._log_scan = _patched
+    bot._trendconfirm_scan_logger_installed = True
+    logger.info("TrendConfirm ViewLog formatter installed — no legacy '?' fields")
+
 def _make_strategies(symbols: list, config: dict):
     mode   = config.get("strategy_mode", "ai_expert")
     flags  = config.get("strategies", {})
@@ -484,11 +548,13 @@ def build_crypto_bot(config: dict, telegram):
         post_cooldown_strict_trades=config["post_cooldown_strict_trades"],
         post_cooldown_threshold_bonus=config["post_cooldown_threshold_bonus"],
     )
-    return TradingBot(
+    bot = TradingBot(
         connector=connector, strategies=strategies,
         risk_manager=risk, interval_seconds=config["interval"],
         broadcast_fn=None, telegram=telegram,
     )
+    _install_trendconfirm_scan_logger(bot)
+    return bot
 
 
 def build_forex_bot(config: dict, telegram):
@@ -509,6 +575,7 @@ def build_forex_bot(config: dict, telegram):
         broadcast_fn=None, telegram=telegram,
     )
     bot._skip_telegram_polling = True
+    _install_trendconfirm_scan_logger(bot)
     return bot
 
 
