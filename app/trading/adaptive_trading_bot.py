@@ -1610,6 +1610,16 @@ class TradingBot:
     TP1_R: float = 0.70
     TP2_R: float = 1.30
 
+    # [TREND-TIER GATE] The weaker "Trend" regime tier only enters on a
+    # confirmed CHOCH->BOS->retest; its indicator-vote pullback path is
+    # disabled (StrongTrend is unaffected). Realistic 3m-intrabar backtest
+    # (BTC/ETH/XAU, Jan-Jul 2026): enabling this ~doubled all-symbol net PnL
+    # (+$5.6k -> +$12.0k) and flipped XAU from -$1.7k to +$3.8k — the weak
+    # Trend tier's indicator-vote entries were net-negative at every score
+    # threshold (pullbacks in immature ADX 19-24 trends lose more on full-SL
+    # stops than the small T1 partials bank). See _generate_signal.
+    TREND_TIER_REQUIRE_STRUCTURE: bool = True
+
     def _target_ladder(self) -> List[tuple]:
         """
         (trigger_R, close_pct, new_SL_R) triples, walked in order by
@@ -2616,6 +2626,16 @@ class TradingBot:
                 direction, candle_15m, ind_15m, ind_1h, l1, l2, regime, optional=True)
             if structure_signal is not None:
                 return structure_signal
+            # [TREND-TIER GATE] The weaker "Trend" tier (StrongTrend excluded)
+            # was net-negative across every score threshold in backtest — its
+            # indicator-vote pullback entries in immature (ADX 19-24) trends
+            # lose more on full-SL stops than the small T1 partials bank.
+            # Requiring a confirmed structure retest keeps only the highest-
+            # quality Trend entries and drops the indicator-vote losers.
+            if regime == "Trend" and self.TREND_TIER_REQUIRE_STRUCTURE:
+                self._scan_info[direction] = (
+                    "veto:trend-tier needs structure retest (indicator-vote disabled)")
+                return None
 
         # ── Veto filters (non-MR regimes only) ──────────────────────────────
         if regime not in _MR_REGIMES:
