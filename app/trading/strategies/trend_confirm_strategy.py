@@ -273,6 +273,13 @@ class TrendConfirmStrategy(BaseStrategy):
         early_rr_trend: float = 1.6,
         early_rr_strong: float = 1.8,
         min_sl_pct: float = 0.005,          # legacy compatibility only; 15M live SL uses ATR floor, not fixed %
+        # Cost-aware stop floor. An ATR-only floor collapses in a quiet
+        # consolidation: XRP filled with a 0.25% stop while the round-trip fee
+        # is ~0.10%, i.e. fees ate 40% of R before the trade could work. This
+        # floor is asset-agnostic (it scales with the fee, not with a fixed %)
+        # and keeps the stop far enough out that costs stay a small share of R.
+        round_trip_fee_pct: float = 0.001,  # 0.05% taker per side on OKX = 0.10% round trip
+        min_stop_fee_mult: float = 6.0,     # stop must be >= 6x the round-trip fee (fees <= ~17% of R)
                                             #   price the raw SL would be a microscopic noise-stop; R (and TP)
                                             #   is measured from the floored distance
     ):
@@ -473,6 +480,8 @@ class TrendConfirmStrategy(BaseStrategy):
         self.early_rr_trend = early_rr_trend
         self.early_rr_strong = early_rr_strong
         self.min_sl_pct = min_sl_pct
+        self.round_trip_fee_pct = max(0.0, float(round_trip_fee_pct))
+        self.min_stop_fee_mult = max(0.0, float(min_stop_fee_mult))
 
         # Apply params passed by the bot/config. Older versions forwarded params
         # to BaseStrategy but silently ignored them in this class.
@@ -500,7 +509,7 @@ class TrendConfirmStrategy(BaseStrategy):
             # is what starved the bot of entries. Widened; risk stays bounded by
             # the stop cap and the anti-chase guard still blocks real chasing.
             self.max_dist_atr_mult = 1.70
-            self.entry_min_stop_atr = 0.50
+            self.entry_min_stop_atr = 0.60   # back to 0.60 (0.50 let stops get even tighter)
             self.entry_max_stop_atr = 2.80
             self.use_hard_tp = True
             self.use_partial_tp = False
@@ -2260,10 +2269,17 @@ class TrendConfirmStrategy(BaseStrategy):
 
         # 15M volatility-normalized risk bounds.  Keep min_sl_pct only as a
         # backwards-compatible config field; it no longer changes live stops.
-        min_distance = self.entry_min_stop_atr * atr_val
+        # On top of the ATR floor, a COST floor: in a quiet consolidation ATR
+        # collapses and an ATR-only stop lands a fraction of a percent away,
+        # where the round-trip fee eats most of R. Scaling the floor by the fee
+        # keeps this asset-agnostic (no fixed % that misfits XAU vs XRP).
+        fee_floor = self.min_stop_fee_mult * self.round_trip_fee_pct * price
+        min_distance = max(self.entry_min_stop_atr * atr_val, fee_floor)
         max_distance = self.entry_max_stop_atr * atr_val
         distance = max(raw_distance, min_distance)
         if distance > max_distance:
+            # Too quiet to trade profitably: a cost-viable stop is wider than the
+            # ATR risk cap, so the setup cannot pay for its own fees.
             return None
 
         rr = max(0.5, float(self.rr_ratio if rr_ratio is None else rr_ratio))
