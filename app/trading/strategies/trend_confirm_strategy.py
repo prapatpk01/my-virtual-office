@@ -82,7 +82,9 @@ class TrendConfirmStrategy(BaseStrategy):
                                     #   without this, a cross was only good on the exact bar every gate was
                                     #   already open (quality/location often clear 1-2 bars AFTER the cross,
                                     #   which silently wasted almost every signal)
-        max_dist_atr_mult: float = 1.20,  # EMA-cross chase limit in ATR(5m)
+        max_dist_atr_mult: float = 1.70,  # EMA-cross chase limit in ATR. 1.20 rejected ~24% of otherwise
+                                          #   valid crosses (a cross normally happens a little away from
+                                          #   EMA13), so it is widened while still blocking real chasing.
         breakout_max_dist_atr_mult: float = 1.80,
         structure_max_dist_atr_mult: float = 1.60,
         # Layer 3 Entry Router — five independent context-aware triggers. Breakout uses
@@ -134,8 +136,10 @@ class TrendConfirmStrategy(BaseStrategy):
         early_structure_min_rejection_wick_atr: float = 0.08,
         early_structure_transition_quality_bonus: float = 4.0,
         entry_stop_buffer_atr: float = 0.10,
-        entry_min_stop_atr: float = 0.60,
-        entry_max_stop_atr: float = 2.00,
+        entry_min_stop_atr: float = 0.50,
+        entry_max_stop_atr: float = 2.80,   # the 0.6-2.0 ATR band rejected ~62% of qualified crosses — a 15M
+                                            #   swing stop legitimately lands wider than 2 ATR after an impulse.
+                                            #   Widened; the stop is still capped so risk stays bounded.
         # Position sizing (emitted in the signal so bot.py sizes live orders the
         # same way the paper account does): margin = margin_pct of balance,
         # notional = margin x leverage. e.g. $100 x 5% = $5 x 20 = $100 notional.
@@ -236,6 +240,12 @@ class TrendConfirmStrategy(BaseStrategy):
         use_be_trail: bool = True,
         be_trail_trigger_r: float = 0.8,    # target: move the SL once +0.8R is reached
         be_trail_sl_r: float = 0.5,         # new SL sits at entry +/- 0.5R (BE + 0.5R locked)
+        # Reverse-cross exit arming. While the trade is RED, a reverse EMA8/13
+        # cross is usually just noise in an unclear market — taking it churned a
+        # run of small losses. So the cross exit only fires once the position is
+        # in profit (or past +0.8R); while red, the hard SL/TP manage the trade.
+        crossback_exit_requires_profit: bool = True,
+        crossback_min_profit_r: float = 0.0,   # extra cushion in R before arming (0 = any profit)
         runner_ignore_signal_exit_after_be: bool = False,
         exit_min_hold_bars: int = 0,
         exit_failure_confirmations: int = 2,
@@ -424,6 +434,8 @@ class TrendConfirmStrategy(BaseStrategy):
 
         self.use_hard_tp = use_hard_tp
         self.use_partial_tp = use_partial_tp
+        self.crossback_exit_requires_profit = crossback_exit_requires_profit
+        self.crossback_min_profit_r = max(0.0, float(crossback_min_profit_r))
         self.use_be_trail = use_be_trail
         self.be_trail_trigger_r = be_trail_trigger_r
         self.be_trail_sl_r = be_trail_sl_r
@@ -482,9 +494,14 @@ class TrendConfirmStrategy(BaseStrategy):
             self.require_trend_regime = False
             self.layer2_threshold = 52.0  # normal 4H baseline; strong 4H adapts to 48
             self.sideways_min_signals = 3
-            self.max_dist_atr_mult = 1.20
-            self.entry_min_stop_atr = 0.60
-            self.entry_max_stop_atr = 2.00
+            # Final-gate widths. Measured on a 1,200-bar walk-forward: the old
+            # 1.20 ATR chase limit + 0.60-2.00 ATR stop band rejected 86% of
+            # otherwise-qualified crosses (62% stop-band, 24% anti-chase), which
+            # is what starved the bot of entries. Widened; risk stays bounded by
+            # the stop cap and the anti-chase guard still blocks real chasing.
+            self.max_dist_atr_mult = 1.70
+            self.entry_min_stop_atr = 0.50
+            self.entry_max_stop_atr = 2.80
             self.use_hard_tp = True
             self.use_partial_tp = False
             self.use_be_trail = True
@@ -1081,8 +1098,25 @@ class TrendConfirmStrategy(BaseStrategy):
         # bar.  This prevents a historical cross from closing a freshly opened
         # or just-reconciled position.  We also require the close to finish on
         # the wrong side of EMA13 to reject tiny touch/cross whipsaws.
+        # Arming: while the trade is RED the reverse cross is usually noise, so
+        # only the hard SL/TP manage it. Once in profit (or past +0.8R, where the
+        # +0.5R lock is already in place) the cross exit is armed and a reversal
+        # banks the gain immediately.
+        crossback_armed = True
+        if self.crossback_exit_requires_profit and not self._be_trailed:
+            ep, esl = self._entry_price, self._entry_sl
+            if ep is None:
+                crossback_armed = False
+            else:
+                cushion = 0.0
+                if esl is not None and self.crossback_min_profit_r > 0:
+                    cushion = self.crossback_min_profit_r * abs(float(ep) - float(esl))
+                crossback_armed = (current_price > float(ep) + cushion
+                                   if self._open_position == "long"
+                                   else current_price < float(ep) - cushion)
+
         candles = self._latest_15m or self._latest_candles
-        if candles:
+        if candles and crossback_armed:
             bar_ts = int(candles[-1].timestamp)
             arm_after = self._reverse_cross_arm_after_ts
             fresh_bar = arm_after is None or bar_ts > int(arm_after)
@@ -1129,7 +1163,9 @@ class TrendConfirmStrategy(BaseStrategy):
 
         return PositionUpdate(
             action="hold",
-            reason=f"Holding {self._open_position.upper()} — hard TP/SL active; waiting for 15M reverse cross",
+            reason=(f"Holding {self._open_position.upper()} — hard TP/SL active; "
+                    + ("waiting for 15M reverse cross" if crossback_armed
+                       else "cross exit disarmed while red (SL/TP manage it)")),
         )
 
     def _closes_past_ema_slow(self, candles: list, side: str, n: int) -> bool:
