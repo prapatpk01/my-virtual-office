@@ -480,7 +480,7 @@ class TrendConfirmStrategy(BaseStrategy):
             self.use_location_filter = False
             self.use_supply_demand_zones = False
             self.require_trend_regime = False
-            self.layer2_threshold = 55.0
+            self.layer2_threshold = 52.0  # normal 4H baseline; strong 4H adapts to 48
             self.sideways_min_signals = 3
             self.max_dist_atr_mult = 1.20
             self.entry_min_stop_atr = 0.60
@@ -793,7 +793,10 @@ class TrendConfirmStrategy(BaseStrategy):
         chop_val = float(br.get("chop_val", 100.0) or 100.0)
         score = float(q.get("score", 0.0) or 0.0)
         choppy = chop_val >= 65.0 and adx_val < 18.0
-        ready = score >= float(self.layer2_threshold) and votes >= 2 and not choppy
+        # Final readiness is decided later with the 4H macro strength.
+        # Keeping this object descriptive avoids a fixed 55 + 2/3 gate from
+        # blocking otherwise valid strong-macro continuation setups.
+        ready = False
         label = "VERY_STRONG" if score >= 85.0 else "STRONG" if score >= 70.0 else "TREND"
         return {"ready": ready, "score": round(score, 1), "label": label,
                 "votes": votes, "adx": round(adx_val, 1), "chop": round(chop_val, 1),
@@ -902,6 +905,31 @@ class TrendConfirmStrategy(BaseStrategy):
                               metadata={"macro_4h": macro, "data_quality": data_quality})
 
         one_h_label = f"{'LONG' if ctx_direction == 'long' else 'SHORT'}_{ctx['label']}"
+
+        # Adaptive 1H gate:
+        # Strong 4H trends already provide substantial directional evidence, so
+        # 1H only needs to confirm that the move is not weak/choppy. Normal 4H
+        # trends require a little more 1H quality. Neutral 4H still cannot trade.
+        strong_macro = macro_state in ("STRONG_BULL", "STRONG_BEAR")
+        if strong_macro:
+            ctx_min_quality = 48.0
+            ctx_min_votes = 1
+            ctx_regime_ok = (ctx["adx"] >= 17.0 and ctx["chop"] <= 58.0)
+        else:
+            ctx_min_quality = 52.0
+            ctx_min_votes = 1
+            ctx_regime_ok = (ctx["adx"] >= 18.0 or ctx["chop"] <= 52.0)
+
+        ctx["min_quality"] = ctx_min_quality
+        ctx["min_votes"] = ctx_min_votes
+        ctx["regime_ok"] = bool(ctx_regime_ok)
+        ctx["ready"] = bool(
+            ctx["score"] >= ctx_min_quality
+            and ctx["votes"] >= ctx_min_votes
+            and ctx_regime_ok
+            and not ctx["choppy"]
+        )
+
         macro_aligned = bool(direction in ("long", "short") and ctx_direction == direction and ctx["ready"])
         self._diag_update(
             trend_4h=macro_display,
@@ -923,8 +951,12 @@ class TrendConfirmStrategy(BaseStrategy):
 
         # Layer 2 — 1H context and trend quality in the 4H-selected direction.
         if not ctx["ready"]:
-            reason = (f"1H context not ready: quality={ctx['score']:.0f} (min {self.layer2_threshold:.0f}), "
-                      f"structure={ctx['votes']}/3, ADX={ctx['adx']:.1f}, CHOP={ctx['chop']:.1f}")
+            reason = (
+                f"1H context not ready: quality={ctx['score']:.0f} (min {ctx['min_quality']:.0f}), "
+                f"structure={ctx['votes']}/3 (min {ctx['min_votes']}), "
+                f"ADX={ctx['adx']:.1f}, CHOP={ctx['chop']:.1f}, "
+                f"trend_quality={'OK' if ctx['regime_ok'] else 'WEAK'}"
+            )
             return self._hold(current_price, reason,
                               metadata={"macro_4h": macro, "quality_1h": ctx, "data_quality": data_quality})
 
@@ -937,7 +969,9 @@ class TrendConfirmStrategy(BaseStrategy):
         br15 = (q15 or {}).get("breakdown", {})
         chop15 = float(br15.get("chop_val", 100.0) or 100.0)
         adx15 = float(br15.get("adx_val", 0.0) or 0.0)
-        hard_chop = chop15 >= 65.0 and adx15 < 18.0
+        # 15M safety veto: block genuinely poor trend conditions, not merely
+        # middling CHOP. A clear range still requires >=3/4 independent signals.
+        hard_chop = chop15 >= 61.0 and adx15 < 18.0
         clear_sideways = sideways.get("signals", 0) >= 3
         self._diag_update(direction_15m="WAIT_CROSS", entry_state="15M_FILTER")
         if hard_chop or clear_sideways:
