@@ -575,6 +575,14 @@ class EntryEngine:
         roots = {str(x).upper() for x in getattr(self.cfg, "expert_precision_symbols", ())}
         return self._symbol_root(symbol) in roots
 
+    def _precision_extension_limit(self, regime) -> float:
+        label = str(getattr(regime, "label", "") or "")
+        if label in (STRONG_BULL, STRONG_BEAR):
+            return float(getattr(self.cfg, "expert_precision_extension_strong_atr", 1.20))
+        if label in (EARLY_BULL, EARLY_BEAR):
+            return float(getattr(self.cfg, "expert_precision_extension_early_atr", 0.85))
+        return float(getattr(self.cfg, "expert_precision_extension_trend_atr", 1.00))
+
     def _initial_chase_reason(self, df5: pd.DataFrame, snap: dict, direction: str) -> str:
         """Return a hard-gate reason when the candidate is late in an impulse.
 
@@ -591,11 +599,16 @@ class EntryEngine:
         if direction == SHORT:
             move = -move
         ema_ext = abs(float(snap["price"]) - float(snap["ema20"])) / atr_v
-        hard_ext = float(getattr(self.cfg, "expert_initial_chase_hard_extension_atr", 0.90))
+        hard_ext = float(getattr(self.cfg, "expert_initial_chase_hard_extension_atr", 1.25))
+        move_thr = float(getattr(self.cfg, "expert_initial_chase_3bar_atr", 1.40))
+        ext_thr = float(getattr(self.cfg, "expert_initial_chase_ema20_atr", 0.80))
+        # Strong directional 5M structure gets a wider no-chase envelope.
+        if bool(snap.get("structure_aligned")) and float(snap.get("adx", 0.0) or 0.0) >= 22.0:
+            hard_ext = max(hard_ext, 1.45)
+            move_thr = max(move_thr, 1.70)
+            ext_thr = max(ext_thr, 1.00)
         if ema_ext >= hard_ext:
             return f"hard extension {ema_ext:.2f}ATR from EMA20"
-        move_thr = float(getattr(self.cfg, "expert_initial_chase_3bar_atr", 1.10))
-        ext_thr = float(getattr(self.cfg, "expert_initial_chase_ema20_atr", 0.60))
         if move >= move_thr and ema_ext >= ext_thr:
             return f"post-impulse chase 3bar={move:.2f}ATR ema20={ema_ext:.2f}ATR"
         return ""
@@ -718,8 +731,19 @@ class EntryEngine:
         # A mapped FVG/OB is LOCATION, not a standalone trigger.  The entry
         # needs a 5M structure confirmation (micro break or BOS); a wick alone
         # only arms the area and waits for the next confirmed candle.
+        ema_reclaim = (
+            s5["price"] > s5["ema20"] if direction == LONG
+            else s5["price"] < s5["ema20"]
+        )
+        strong_rejection = (
+            wick_reject
+            and s5["directional_candle"]
+            and s5["close_quality"] >= 0.62
+        )
         if self.cfg.expert_smc_require_micro_structure_confirm:
-            if not (micro_break or s5["bos"]):
+            # Route A: zone + micro BOS/break.
+            # Route B: zone + decisive rejection + EMA20 reclaim.
+            if not (micro_break or s5["bos"] or (strong_rejection and ema_reclaim)):
                 return None
         elif not (wick_reject or micro_break or s5["bos"]):
             return None
@@ -749,7 +773,7 @@ class EntryEngine:
         ema20_extension = abs(s5["price"] - s5["ema20"]) / s5["atr"]
         max_smc_ext = self.cfg.expert_smc_max_ema20_extension_atr
         if precision:
-            max_smc_ext = min(max_smc_ext, self.cfg.expert_precision_max_ema20_extension_atr)
+            max_smc_ext = min(max_smc_ext, self._precision_extension_limit(regime))
         if ema20_extension > max_smc_ext:
             return None
         if direction == LONG and s5["rsi"] > self.cfg.expert_smc_rsi_long_max:
@@ -877,7 +901,18 @@ class EntryEngine:
         previous_high = float(frame["high"].iloc[-2])
         previous_low = float(frame["low"].iloc[-2])
         micro_break = snap["price"] > previous_high if direction == LONG else snap["price"] < previous_low
-        if self.cfg.expert_sweep_require_micro_structure_confirm and not (micro_break or snap["bos"]):
+        ema_reclaim = (
+            snap["price"] > snap["ema20"] if direction == LONG
+            else snap["price"] < snap["ema20"]
+        )
+        displacement_reclaim = (
+            snap["directional_candle"]
+            and snap["close_quality"] >= 0.62
+            and ema_reclaim
+        )
+        if self.cfg.expert_sweep_require_micro_structure_confirm and not (
+            micro_break or snap["bos"] or displacement_reclaim
+        ):
             return None
         label = getattr(regime,"label","")
         precision = bool(zone.get("precision_symbol", False))
@@ -886,7 +921,7 @@ class EntryEngine:
                 return None
         if precision:
             ema_ext = abs(snap["price"] - snap["ema20"]) / max(snap["atr"], 1e-12)
-            if ema_ext > self.cfg.expert_precision_max_ema20_extension_atr:
+            if ema_ext > self._precision_extension_limit(regime):
                 return None
         # A sweep is meaningful only at mapped liquidity/location. This keeps
         # range trading active without treating every wick as institutional SMC.
@@ -1239,8 +1274,9 @@ class EntryEngine:
             # ordinary triggers. This is the BTC/ETH anti-late-entry lane.
             if self._is_precision_symbol(symbol) and cand.setup_type != BREAKOUT_RETEST:
                 ext=abs(side_snap["price"]-side_snap["ema20"])/max(side_snap["atr"],1e-12)
-                if ext > self.cfg.expert_precision_max_ema20_extension_atr:
-                    diagnostics.append(f"{cand.direction}:{cand.setup_type} blocked — precision extension {ext:.2f}ATR")
+                precision_limit = self._precision_extension_limit(regime)
+                if ext > precision_limit:
+                    diagnostics.append(f"{cand.direction}:{cand.setup_type} blocked — precision extension {ext:.2f}ATR>{precision_limit:.2f}")
                     continue
             chase_filtered.append(cand)
         candidates=chase_filtered

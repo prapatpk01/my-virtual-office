@@ -720,7 +720,7 @@ class Config:
     expert_strong_trend_discount: float = 3.0
     expert_weak_context_add: float = 3.0
     expert_min_local_edge: float = 3.0
-    expert_min_room_r: float = 1.15
+    expert_min_room_r: float = 1.05
     expert_major_level_veto_atr: float = 0.60
     expert_range_min_room_r: float = 0.95
     expert_max_extension_atr_5m: float = 1.10
@@ -757,17 +757,22 @@ class Config:
     # compensable: a 95/100 setup may still be rejected when it is late,
     # overextended, poorly located or lacks structure confirmation.
     expert_precision_symbols: tuple[str, ...] = ("BTC", "ETH")
-    expert_precision_max_ema20_extension_atr: float = 0.72
+    expert_precision_max_ema20_extension_atr: float = 1.00
     expert_precision_require_15m_structure: bool = True
+    # V3.3 balanced precision: ordinary BTC/ETH entries get more room as trend
+    # quality strengthens instead of using one 0.72 ATR ceiling everywhere.
+    expert_precision_extension_early_atr: float = 0.85
+    expert_precision_extension_trend_atr: float = 1.00
+    expert_precision_extension_strong_atr: float = 1.20
     expert_smc_require_micro_structure_confirm: bool = True
     expert_sweep_require_micro_structure_confirm: bool = True
     expert_initial_chase_guard_enabled: bool = True
-    expert_initial_chase_3bar_atr: float = 1.10
-    expert_initial_chase_ema20_atr: float = 0.60
-    expert_initial_chase_hard_extension_atr: float = 0.90
-    expert_smc_min_room_r: float = 1.25
-    expert_sweep_min_room_r: float = 1.20
-    expert_breakout_retest_min_room_r: float = 1.00
+    expert_initial_chase_3bar_atr: float = 1.40
+    expert_initial_chase_ema20_atr: float = 0.80
+    expert_initial_chase_hard_extension_atr: float = 1.25
+    expert_smc_min_room_r: float = 1.10
+    expert_sweep_min_room_r: float = 1.10
+    expert_breakout_retest_min_room_r: float = 0.95
 
     # Portfolio quality control. BTC and ETH are highly correlated enough that
     # carrying both in the same direction often doubles one macro bet.
