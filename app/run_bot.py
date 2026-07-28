@@ -805,11 +805,11 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 4.0),
         post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 0.0),
     )
-    # Default FALSE: the weekend/session gate applies ONLY to commodities
-    # (XAU/XAG/CL); crypto trades 24/7 as usual. Set
-    # FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=true to also pause crypto on the
-    # commodity weekend.
-    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", False)
+    # Default TRUE: the whole bot runs 24/5 — crypto ALSO follows the FX/
+    # commodity weekly session (paused on the weekend, opens 4h before the FX
+    # open, stops at the FX close). Set FOLLOW_REFERENCE_SESSION_FOR_CRYPTO=
+    # false to exempt crypto and let it trade 24/7 while only commodities pause.
+    _follow_session_for_crypto = _env_bool("FOLLOW_REFERENCE_SESSION_FOR_CRYPTO", True)
     # _commodity_symbols defined earlier (shared with the min-SL-floor split
     # above) — with the default above, this is the ONLY set the session gate
     # touches; crypto's session_gate_open stays True regardless of session.
