@@ -1619,6 +1619,15 @@ class TradingBot:
     # threshold (pullbacks in immature ADX 19-24 trends lose more on full-SL
     # stops than the small T1 partials bank). See _generate_signal.
     TREND_TIER_REQUIRE_STRUCTURE: bool = True
+    # [CONVICTION FALLBACK] When TREND_TIER_REQUIRE_STRUCTURE is on but no
+    # structure retest is present, the Trend tier may still take an
+    # indicator-vote entry IF the 4H macro leans at least this many points
+    # past 50 in the trade direction (edge), and only at the raised score bar
+    # below. Keeps the common Trend regime active without the low-conviction
+    # losers. Set the edge very high (e.g. 50) to effectively disable this
+    # fallback and require a structure retest for every Trend entry.
+    TREND_TIER_CONVICTION_EDGE: float = 8.0        # macro >= 58 (LONG) / <= 42 (SHORT)
+    TREND_TIER_CONVICTION_THRESHOLD: int = 65      # vs the normal Trend bar of 57
 
     def _target_ladder(self) -> List[tuple]:
         """
@@ -2629,13 +2638,22 @@ class TradingBot:
             # [TREND-TIER GATE] The weaker "Trend" tier (StrongTrend excluded)
             # was net-negative across every score threshold in backtest — its
             # indicator-vote pullback entries in immature (ADX 19-24) trends
-            # lose more on full-SL stops than the small T1 partials bank.
-            # Requiring a confirmed structure retest keeps only the highest-
-            # quality Trend entries and drops the indicator-vote losers.
+            # lose more on full-SL stops than the small T1 partials bank. A
+            # confirmed structure retest (above) is the preferred entry.
+            # [CONVICTION FALLBACK] But requiring structure for EVERY Trend
+            # entry left the most common regime near-silent. So the
+            # indicator-vote path is still allowed WHEN the 4H macro is
+            # decisively aligned (edge >= TREND_TIER_CONVICTION_EDGE past 50),
+            # and only at a RAISED score bar (TREND_TIER_CONVICTION_THRESHOLD)
+            # so just the highest-conviction Trend setups get through.
             if regime == "Trend" and self.TREND_TIER_REQUIRE_STRUCTURE:
-                self._scan_info[direction] = (
-                    "veto:trend-tier needs structure retest (indicator-vote disabled)")
-                return None
+                _edge = (macro_score - 50.0) if direction == "LONG" else (50.0 - macro_score)
+                if _edge < self.TREND_TIER_CONVICTION_EDGE:
+                    self._scan_info[direction] = (
+                        f"veto:trend-tier needs structure retest or strong macro "
+                        f"(edge {_edge:.0f} < {self.TREND_TIER_CONVICTION_EDGE:.0f})")
+                    return None
+                threshold = max(threshold, self.TREND_TIER_CONVICTION_THRESHOLD)
 
         # ── Veto filters (non-MR regimes only) ──────────────────────────────
         if regime not in _MR_REGIMES:
