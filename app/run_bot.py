@@ -12,6 +12,14 @@ import os
 import signal
 import sys
 
+import ccxt
+
+# Transient network/market-data errors — logged as a one-line warning (not a
+# full traceback) in the per-symbol tick loop. ccxt.NetworkError is the base
+# class for RequestTimeout / ExchangeNotAvailable / RateLimitExceeded /
+# DDoSProtection; asyncio.TimeoutError covers the raw await timeout.
+_NETWORK_ERRORS = (ccxt.NetworkError, asyncio.TimeoutError)
+
 
 # ---------------------------------------------------------------------------
 # Load .env if present
@@ -82,6 +90,32 @@ def _fmt_px(v) -> str:
         return f"{float(v):,.4f}".rstrip("0").rstrip(".")
     except (TypeError, ValueError):
         return str(v)
+
+
+# [CORRELATION VETO] Groups of base symbols that move together — the bot will
+# not open the SAME direction on more than one member of a group at the same
+# time (see blocked_entry_directions wiring in _run_adaptive). Configure with
+# ADAPTIVE_CORRELATION_GROUPS as "BTC,ETH;SOL,XRP" (semicolon between groups,
+# comma within). Default: BTC+ETH only. Empty string disables the veto.
+def _parse_correlation_groups(spec: str) -> list:
+    groups = []
+    for grp in (spec or "").split(";"):
+        members = {m.strip().upper() for m in grp.split(",") if m.strip()}
+        if len(members) >= 2:
+            groups.append(members)
+    return groups
+
+
+_CORRELATION_GROUPS = _parse_correlation_groups(
+    os.environ.get("ADAPTIVE_CORRELATION_GROUPS", "BTC,ETH"))
+
+
+def _correlation_group_of(base: str):
+    """Return the correlated-symbol set containing `base` (incl. base), or None."""
+    for g in _CORRELATION_GROUPS:
+        if base in g:
+            return g
+    return None
 
 
 def _open_fill_figures(trade_info: dict, result, leverage: float = 10.0) -> tuple:
@@ -926,6 +960,27 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
                     max_range_pos > 0 and range_open_count < max_range_pos
                 )
 
+                # [CORRELATION VETO] BTC and ETH move together — opening the
+                # same direction on both at once is one doubled bet, not two.
+                # Populate blocked_entry_directions (read by _generate_signal)
+                # with the directions ALREADY open on the other members of this
+                # symbol's correlated group. Empty for non-grouped symbols, so
+                # they are never affected. This only vetoes NEW entries; it
+                # never touches sizing, cooldown, or open-position management.
+                base_here = sym.split("/")[0].upper()
+                group = _correlation_group_of(base_here)
+                if group:
+                    blocked = set()
+                    for _os, (_ob, _) in bots.items():
+                        _ob_base = _os.split("/")[0].upper()
+                        if _ob_base != base_here and _ob_base in group and _ob.position_open:
+                            _d = (getattr(_ob, "current_trade", {}) or {}).get("direction")
+                            if _d:
+                                blocked.add(_d)
+                    bot.blocked_entry_directions = blocked
+                else:
+                    bot.blocked_entry_directions = set()
+
                 # [SESSION CONTROL] gate only new entries (never position
                 # management — _check_global_gates is the only reader of
                 # session_gate_open). Crypto symbols follow the same
@@ -1076,6 +1131,13 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
 
             except asyncio.CancelledError:
                 raise
+            except _NETWORK_ERRORS as e:
+                # Transient market-data/network hiccup (e.g. OKX RequestTimeout).
+                # fetch_ohlcv already retried; this symbol simply skips this
+                # tick and retries next cycle. Log ONE line, not a full
+                # traceback, so a brief OKX slowdown doesn't flood the logs.
+                logger.warning("[Adaptive][%s] market data unavailable this tick "
+                               "(%s) — skipping", sym, type(e).__name__)
             except Exception as e:
                 logger.error("[Adaptive][%s] tick error: %s", sym, e, exc_info=True)
 
