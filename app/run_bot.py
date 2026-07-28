@@ -799,8 +799,11 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         open_hour=_env_int("WEEKLY_OPEN_HOUR", 18),
         close_weekday=os.environ.get("WEEKLY_CLOSE_WEEKDAY", "FRIDAY"),
         close_hour=_env_int("WEEKLY_CLOSE_HOUR", 17),
-        pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 3.0),
-        post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 3.0),
+        # Open NEW entries 4h before the official FX/commodity open; stop new
+        # entries exactly at the FX close (no post-close buffer). Existing
+        # positions are still managed normally after close either way.
+        pre_open_extension_hours=_env_float("PRE_OPEN_EXTENSION_HOURS", 4.0),
+        post_close_extension_hours=_env_float("POST_CLOSE_EXTENSION_HOURS", 0.0),
     )
     # Default FALSE: the weekend/session gate applies ONLY to commodities
     # (XAU/XAG/CL); crypto trades 24/7 as usual. Set
