@@ -15,12 +15,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import random
 import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-import aiohttp
 import ccxt.async_support as ccxt
 
 logger = logging.getLogger("exchange_client")
@@ -72,27 +70,14 @@ class ExchangeClient:
         self._hedge_confirmed = False
         self._paper_balance: dict[str, float] = {"USDT": 10_000.0}
         self._paper_positions: dict[str, dict] = {}
-        self._public_request_lock = asyncio.Lock()
-        # Log live OKX SL/TP only once per symbol/side for each process start.
-        # Periodic safety reconciliation still runs, but repeated unchanged
-        # protection values are kept at DEBUG level to avoid noisy Railway logs.
-        self._protection_logged_once: set[tuple[str, str]] = set()
 
-        # CCXT's default HTTP timeout is too short for occasional OKX/Railway
-        # latency spikes.  A slow public-data response must not crash the whole
-        # symbol cycle or generate a Telegram error every 30 seconds.
-        self._exchange_config = {
+        self._exchange = ccxt.okx({
             "apiKey": api_key,
             "secret": api_secret,
             "password": passphrase,
             "enableRateLimit": True,
-            "timeout": 30_000,
-            "options": {
-                "defaultType": "swap",
-                "adjustForTimeDifference": True,
-            },
-        }
-        self._exchange = ccxt.okx(self._exchange_config)
+            "options": {"defaultType": "swap"},
+        })
 
     async def close(self):
         try:
@@ -189,150 +174,29 @@ class ExchangeClient:
 
     # ── Market data ───────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _is_retryable_network_error(exc: Exception) -> bool:
-        """Only retry transport/rate-limit availability failures.
-
-        Authentication, invalid-symbol and bad-request errors must surface
-        immediately; retrying them only creates noise and delays diagnosis.
-        Using class names as a final fallback keeps this compatible across
-        CCXT minor releases where the async module may expose subclasses from
-        a slightly different import path.
-        """
-        retryable_types = tuple(
-            t for t in (
-                getattr(ccxt, "RequestTimeout", None),
-                getattr(ccxt, "NetworkError", None),
-                getattr(ccxt, "ExchangeNotAvailable", None),
-                getattr(ccxt, "DDoSProtection", None),
-                getattr(ccxt, "RateLimitExceeded", None),
-            ) if isinstance(t, type)
-        )
-        if retryable_types and isinstance(exc, retryable_types):
-            return True
-        return exc.__class__.__name__ in {
-            "RequestTimeout", "NetworkError", "ExchangeNotAvailable",
-            "DDoSProtection", "RateLimitExceeded", "TimeoutError",
-        }
-
-    @staticmethod
-    def _okx_bar(timeframe: str) -> str:
-        mapping = {
-            "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
-            "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H",
-            "6h": "6H", "12h": "12H", "1d": "1Dutc",
-        }
-        return mapping.get(timeframe, timeframe)
-
-    async def _fetch_ohlcv_rest_fallback(
-        self, symbol: str, timeframe: str, limit: int,
-    ) -> list:
-        """Independent public REST fallback when CCXT's session times out.
-
-        The endpoint and payload are OKX's native candle API.  Returning the
-        same six-column, oldest-to-newest shape as CCXT means the rest of the
-        bot does not need a separate code path.
-        """
-        try:
-            market = self._exchange.market(symbol)
-            inst_id = market.get("id") or symbol.replace("/", "-").replace(":USDT", "-SWAP")
-        except Exception:
-            base = symbol.split("/")[0]
-            quote = symbol.split("/")[1].split(":")[0] if "/" in symbol else "USDT"
-            inst_id = f"{base}-{quote}-SWAP"
-
-        params = {
-            "instId": inst_id,
-            "bar": self._okx_bar(timeframe),
-            "limit": str(max(1, min(int(limit), 300))),
-        }
-        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=25)
-        headers = {"User-Agent": "RegimeBiasBot/3.0"}
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(
-                "https://www.okx.com/api/v5/market/candles", params=params,
-            ) as resp:
-                resp.raise_for_status()
-                payload = await resp.json(content_type=None)
-
-        if str(payload.get("code", "0")) != "0":
-            raise RuntimeError(
-                f"OKX candle fallback error code={payload.get('code')} msg={payload.get('msg')}"
-            )
-        rows = payload.get("data") or []
-        parsed = []
-        for row in rows:
-            if len(row) < 6:
-                continue
-            parsed.append([
-                int(row[0]), float(row[1]), float(row[2]),
-                float(row[3]), float(row[4]), float(row[5]),
-            ])
-        parsed.sort(key=lambda x: x[0])
-        return parsed
-
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 300) -> list:
-        """Fetch candles with bounded retry, backoff and an independent fallback.
-
-        A timeout is a data-transport issue, not a strategy error.  The caller
-        can then use its last-known-good cache rather than stopping analysis for
-        every timeframe and flooding Telegram with stack traces.
-        """
-        last_err: Exception | None = None
-        attempts = 4
-        async with self._public_request_lock:
-            for attempt in range(1, attempts + 1):
-                try:
-                    return await self._exchange.fetch_ohlcv(
-                        symbol, timeframe=timeframe, limit=limit,
-                    )
-                except Exception as exc:
-                    last_err = exc
-                    if not self._is_retryable_network_error(exc):
-                        raise
-                    if attempt < attempts:
-                        delay = min(8.0, 0.8 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.35)
-                        logger.warning(
-                            "[DATA] fetch_ohlcv %s %s attempt %d/%d failed (%s); retry in %.1fs",
-                            symbol, timeframe, attempt, attempts,
-                            exc.__class__.__name__, delay,
-                        )
-                        await asyncio.sleep(delay)
-
-            logger.warning(
-                "[DATA] CCXT candle fetch exhausted for %s %s; trying native OKX REST fallback",
-                symbol, timeframe,
-            )
+        # One retry on transient network/timeout errors — OKX candle requests
+        # occasionally time out under load, and without a retry that single
+        # blip skips the whole symbol for this poll cycle instead of just
+        # costing ~1s.
+        last_err = None
+        for attempt in range(2):
             try:
-                rows = await self._fetch_ohlcv_rest_fallback(symbol, timeframe, limit)
-                if rows:
-                    logger.info("[DATA] native OKX fallback recovered %s %s", symbol, timeframe)
-                    return rows
-            except Exception as fallback_err:
-                logger.error(
-                    "[DATA] native fallback failed %s %s: %s",
-                    symbol, timeframe, fallback_err,
-                )
-                if last_err is None:
-                    last_err = fallback_err
-
-        assert last_err is not None
+                return await self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    logger.warning("[DATA] fetch_ohlcv %s %s attempt 1 failed, retrying: %s",
+                                  symbol, timeframe, e)
+                    await asyncio.sleep(1.0)
+        logger.error("[DATA] fetch_ohlcv failed %s %s after retry: %s", symbol, timeframe, last_err)
         raise last_err
 
     async def fetch_ticker(self, symbol: str) -> dict:
-        # Paper mode still needs a live price reference — always hit the real ticker.
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                async with self._public_request_lock:
-                    return await self._exchange.fetch_ticker(symbol)
-            except Exception as exc:
-                last_err = exc
-                if not self._is_retryable_network_error(exc) or attempt == 2:
-                    raise
-                await asyncio.sleep(0.8 * (2 ** attempt))
-        assert last_err is not None
-        raise last_err
+        if self.paper:
+            # Paper mode still needs a live price reference — always hit the real ticker.
+            pass
+        return await self._exchange.fetch_ticker(symbol)
 
     async def fetch_balance_usdt(self) -> float:
         if self.paper:
@@ -451,12 +315,12 @@ class ExchangeClient:
         return None
 
     async def fetch_attached_stops(self, symbol: str, pos_side: str) -> tuple:
-        """Return the live OKX stop-loss and take-profit for an open position.
-
-        OKX can expose attached TP/SL through more than one response shape,
-        depending on how the order was created and whether the parent order has
-        already filled.  Recovery therefore checks both pending algo orders and
-        CCXT's normalized open-order payloads.  No stop/target is invented here.
+        """
+        Current SL/TP prices from OKX's pending algo orders for this leg — used
+        to reconstruct a Position after a restart (we don't know the strategy's
+        original TP1, so an adopted position resumes as single-TP: whatever
+        SL/TP the exchange currently has attached is treated as (SL, TP2)).
+        Returns (sl_price, tp_price), either may be None if not found.
         """
         if self.paper:
             return None, None
@@ -467,110 +331,23 @@ class ExchangeClient:
             logger.warning("[RECONCILE] market lookup failed for %s: %s", symbol, e)
             return None, None
 
-        wanted_side = str(pos_side or "").lower()
-        sl_candidates: list[float] = []
-        tp_candidates: list[float] = []
-
-        def _as_price(value):
+        sl_price, tp_price = None, None
+        for ord_type in ("oco", "conditional", "move_order_stop"):
             try:
-                x = float(value)
-                return x if x > 0 else None
-            except (TypeError, ValueError):
-                return None
-
-        def _side_matches(raw: dict) -> bool:
-            raw_side = str(raw.get("posSide") or raw.get("positionSide") or "").lower()
-            # In OKX one-way/net mode the raw protective-order payload uses
-            # posSide="net" even though CCXT normalizes the live position to
-            # side=long/short.  Rejecting "net" caused valid BTC TP/SL orders
-            # to be invisible during startup reconciliation.  Empty/net are
-            # safe here because the caller already scopes the query by instId
-            # and this bot permits only one live leg per symbol.
-            return raw_side in ("", "net", wanted_side)
-
-        def _collect(raw: dict) -> None:
-            if not isinstance(raw, dict) or not _side_matches(raw):
-                return
-            for key in ("slTriggerPx", "stopLossPrice", "slOrdPx", "stopPrice", "slPx"):
-                px = _as_price(raw.get(key))
-                if px is not None and px != -1:
-                    sl_candidates.append(px)
-                    break
-            for key in ("tpTriggerPx", "takeProfitPrice", "tpOrdPx", "takeProfitPx", "tpPx"):
-                px = _as_price(raw.get(key))
-                if px is not None and px != -1:
-                    tp_candidates.append(px)
-                    break
-            attached = raw.get("attachAlgoOrds") or raw.get("attachAlgoOrders") or []
-            if isinstance(attached, dict):
-                attached = [attached]
-            for child in attached:
-                if isinstance(child, dict):
-                    _collect(child)
-
-        # Primary OKX source: pending algo orders. CCXT has used more than
-        # one implicit-method name for /api/v5/trade/orders-algo-pending across
-        # releases, so resolve it dynamically instead of silently calling a
-        # method that may not exist.
-        algo_method = None
-        for method_name in (
-            "privateGetTradeOrdersAlgoPending",
-            "private_get_trade_orders_algo_pending",
-            "privateGetTradeAlgosPending",
-        ):
-            candidate = getattr(self._exchange, method_name, None)
-            if callable(candidate):
-                algo_method = candidate
-                break
-
-        if algo_method is None:
-            logger.warning("[RECONCILE] this CCXT build exposes no OKX pending-algo method")
-        else:
-            for ord_type in ("conditional", "oco", "trigger", "move_order_stop"):
-                try:
-                    resp = await algo_method({
-                        "instId": inst_id,
-                        "ordType": ord_type,
-                    })
-                    for algo in (resp or {}).get("data", []):
-                        _collect(algo)
-                except Exception as e:
-                    logger.warning("[RECONCILE] pending-algos query (%s) failed: %s", ord_type, e)
-
-        # Secondary source: normalized CCXT open orders and their raw OKX info.
-        try:
-            for order in await self._exchange.fetch_open_orders(symbol):
-                if isinstance(order, dict):
-                    _collect(order)
-                    _collect(order.get("info") or {})
-        except Exception as e:
-            logger.warning("[RECONCILE] open-orders TP/SL query failed %s: %s", symbol, e)
-
-        # Position payloads in newer CCXT/OKX versions may expose attached
-        # prices directly.  Keep this as a final read-only source.
-        try:
-            for pos in await self._exchange.fetch_positions([symbol]):
-                if str(pos.get("side") or "").lower() != wanted_side:
-                    continue
-                _collect(pos)
-                _collect(pos.get("info") or {})
-        except Exception as e:
-            logger.warning("[RECONCILE] position TP/SL query failed %s: %s", symbol, e)
-
-        sl_price = sl_candidates[0] if sl_candidates else None
-        tp_price = tp_candidates[0] if tp_candidates else None
-        log_key = (symbol, wanted_side)
-        if log_key not in self._protection_logged_once:
-            logger.info(
-                "[RECONCILE] live OKX protection %s %s SL=%s TP=%s",
-                symbol, wanted_side, sl_price, tp_price,
-            )
-            self._protection_logged_once.add(log_key)
-        else:
-            logger.debug(
-                "[RECONCILE] protection rechecked %s %s SL=%s TP=%s",
-                symbol, wanted_side, sl_price, tp_price,
-            )
+                resp = await self._exchange.privateGetTradeAlgosPending({
+                    "instId": inst_id, "ordType": ord_type,
+                })
+                for algo in (resp or {}).get("data", []):
+                    if algo.get("posSide") != pos_side:
+                        continue
+                    sl_raw = algo.get("slTriggerPx")
+                    tp_raw = algo.get("tpTriggerPx")
+                    if sl_raw not in (None, "", "0", "0.0") and sl_price is None:
+                        sl_price = float(sl_raw)
+                    if tp_raw not in (None, "", "0", "0.0") and tp_price is None:
+                        tp_price = float(tp_raw)
+            except Exception as e:
+                logger.warning("[RECONCILE] pending-algos query (%s) failed: %s", ord_type, e)
         return sl_price, tp_price
 
     # ── Orders ───────────────────────────────────────────────────────────────

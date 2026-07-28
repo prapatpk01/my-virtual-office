@@ -1,8 +1,10 @@
-"""DUALCORE V3.2.9 live bot entry point.
+"""DUALCORE V2.0 live bot entry point.
 
-Top-down 4H regime -> 1H bias -> 15M context -> closed-5M expert execution,
-with non-compensable location/extension/structure gates, post-exit anti-whipsaw,
-BTC/ETH correlation control, fixed-margin sizing and persistent trade journal.
+Loop: fetch closed 5M/15M/1H/4H bars, manage open positions every poll, and
+for flat symbols evaluate 4H Macro -> 1H Bias -> 15M Structure/Location ->
+5M EMA timing (Fast Pullback + Major/Base Breakout-Retest).  Entry logic runs once
+per newly-closed 5M candle.  Position management keeps the slower EMA10/EMA20
+5M reversal exit to avoid closing from the faster EMA8/EMA13 entry pair alone.
 """
 from __future__ import annotations
 
@@ -18,15 +20,14 @@ import pandas as pd
 
 from config import load_config
 from exchange_client import ExchangeClient
-from data_engine import DataEngine, MarketDataUnavailable
+from data_engine import DataEngine, drop_unclosed_bar, _ohlcv_to_df
 from pipeline import Pipeline, LONG, SHORT
 from risk_manager import RiskManager
 from position_manager import PositionManager
 from telegram_notifier import TelegramNotifier
 from chart_engine import build_entry_chart
-from ai_exit_engine import AIExitEngine, CLOSE as AI_EXIT_CLOSE, EMERGENCY as AI_EXIT_EMERGENCY, WATCH as AI_EXIT_WATCH
+from spike_guard import check_spike, CLOSE as SPIKE_CLOSE
 from entry_engine import EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA
-from market_schedule import FxMarketSleepSchedule
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,12 +90,10 @@ class Bot:
         )
         self.data = DataEngine(self.cfg, self.client)
         self.signal_engine = Pipeline(self.cfg)
-        self.ai_exit = AIExitEngine(self.cfg)
         self.risk = RiskManager(self.cfg)
         self.positions = PositionManager(self.cfg, self.client, self.risk,
                                          self.signal_engine.entry_engine)
         self.telegram = TelegramNotifier(self.cfg.telegram_bot_token, self.cfg.telegram_chat_id)
-        self.fx_schedule = FxMarketSleepSchedule(self.cfg)
 
         self._last_entry_bar: dict[str, pd.Timestamp] = {}
         self._last_signal_by_symbol: dict[str, object] = {}
@@ -103,11 +102,7 @@ class Bot:
         self._cooldown_alert_sent = False
         self._last_status_log_ts = 0.0
         self._last_reconcile_ts = 0.0         # periodic untracked-position safety net
-        self._sleep_state_key = None           # transition-only Sleep Mode logging/Telegram
-        self._current_sleep_status = self.fx_schedule.status()
-        self._data_fail_count: dict[str, int] = {}
-        self._data_alerted: set[str] = set()
-        self._trade_log: list[dict] = []      # closed trades (for /trade, live view)
+        self._trade_log: list[dict] = []      # closed trades (for /trades, live view)
         # Persistent close-journal — one line per closed trade with the exit
         # bucket (TP/BE/SL) the bot observed. Survives restarts and is the ONLY
         # source of the TP/BE/SL breakdown (OKX has no "which target" concept).
@@ -117,45 +112,10 @@ class Bot:
         self.journal: list[dict] = self._load_journal()
         self._journaled_close_ms = {(e["symbol"], int(e["close_ms"] // 60000))
                                     for e in self.journal}   # dedup key: symbol+minute
-        # Entry-context journal is written as soon as an order opens. Unlike a
-        # close-only journal this survives an exchange-side close while the bot
-        # is offline, so /trade can still explain WHY the trade was opened.
-        self._entry_journal_path = os.path.join(self.cfg.state_dir, "trade_entries.jsonl")
-        self.entry_journal: list[dict] = self._load_entry_journal()
-        self._entry_journal_keys = {
-            (e.get("symbol", ""), e.get("side", ""), int(e.get("open_ms", 0) // 60000), round(float(e.get("entry_price", 0.0) or 0.0), 8))
-            for e in self.entry_journal
-        }
         self._stats_reset_ms = _load_stats_reset_ms(self.cfg.state_dir)   # /restats cursor override
         self._cmd_task = None                 # Telegram command polling task
         self._tg_offset = 0
         self._running = False
-        self._ai_exit_state_path = os.path.join(self.cfg.state_dir, "ai_exit_state.json")
-
-    def _save_runtime_state(self) -> None:
-        self.positions.save_state()
-        try:
-            os.makedirs(self.cfg.state_dir, exist_ok=True)
-            path = self._ai_exit_state_path
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"saved_at": time.time(), "state": self.ai_exit.export_state()}, f)
-                f.flush(); os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except OSError as exc:
-            logger.error("[STATE] AI exit state save failed: %s", exc)
-
-    def _load_runtime_state(self) -> tuple[int, int]:
-        positions = self.positions.load_state()
-        watches = 0
-        try:
-            with open(self._ai_exit_state_path) as f:
-                watches = self.ai_exit.import_state(json.load(f).get("state", {}))
-        except FileNotFoundError:
-            pass
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.error("[STATE] AI exit state load failed: %s", exc)
-        return positions, watches
 
     # ── close journal (exit-type breakdown source) ───────────────────────────
 
@@ -173,74 +133,10 @@ class Bot:
             logger.warning("[JOURNAL] corrupt line(s) skipped")
         return out
 
-    def _load_entry_journal(self) -> list[dict]:
-        out: list[dict] = []
-        try:
-            with open(self._entry_journal_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        out.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        logger.warning("[TRADE-JOURNAL] corrupt entry-context line skipped")
-        except (FileNotFoundError, OSError):
-            pass
-        return out
-
-    def _entry_journal_add(self, pos) -> None:
-        """Persist the context that approved a newly opened position.
-
-        This file is intentionally append-only. It is diagnostic state only and
-        cannot influence entries/exits. Future /trade rows can therefore recover
-        setup/regime/bias metadata even if the position later closes on OKX while
-        the bot is offline.
-        """
-        if pos is None:
-            return
-        open_ms = int(float(getattr(pos, "opened_at", time.time()) or time.time()) * 1000)
-        entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
-        side = str(getattr(pos, "side", "") or "")
-        symbol = str(getattr(pos, "symbol", "") or "")
-        key = (symbol, side, int(open_ms // 60000), round(entry_px, 8))
-        if key in self._entry_journal_keys:
-            return
-        row = {
-            "open_ms": open_ms, "symbol": symbol, "side": side,
-            "entry_price": entry_px,
-            "sl": float(getattr(pos, "stop_loss", 0.0) or 0.0),
-            "tp1": float(getattr(pos, "tp1", 0.0) or 0.0),
-            "tp2": float(getattr(pos, "tp2", 0.0) or 0.0),
-            "setup_type": str(getattr(pos, "setup_type", "") or ""),
-            "trigger": str(getattr(pos, "trigger", "") or ""),
-            "regime": str(getattr(pos, "regime_at_entry", "") or ""),
-            "regime_score": float(getattr(pos, "regime_score", 0.0) or 0.0),
-            "bias": str(getattr(pos, "bias_at_entry", "") or ""),
-            "bias_score": float(getattr(pos, "bias_score", 0.0) or 0.0),
-            "entry_score": float(getattr(pos, "entry_score", 0.0) or 0.0),
-            "entry_threshold": float(getattr(pos, "entry_threshold", 0.0) or 0.0),
-            "margin_usdt": float(getattr(pos, "margin_usdt", 0.0) or 0.0),
-            "leverage": int(getattr(pos, "leverage", 0) or 0),
-            "local_edge": float(getattr(pos, "local_edge", 0.0) or 0.0),
-            "planned_rr": float(getattr(pos, "planned_rr", 0.0) or 0.0),
-            "structure_room_r": float(getattr(pos, "structure_room_r", 0.0) or 0.0),
-        }
-        try:
-            os.makedirs(self.cfg.state_dir, exist_ok=True)
-            with open(self._entry_journal_path, "a") as f:
-                f.write(json.dumps(row) + "\n")
-        except OSError as exc:
-            logger.warning("[TRADE-JOURNAL] entry-context write failed: %s", exc)
-            return
-        self.entry_journal.append(row)
-        self._entry_journal_keys.add(key)
-
     def _journal_add(self, symbol: str, side: str, pnl: float, exit_type: str,
-                     reason: str, tp1_hit: bool, close_ms: int, *,
-                     entry_price: float = 0.0, exit_price: float = 0.0,
-                     setup_type: str = "", trigger: str = "", position=None,
-                     event: dict | None = None) -> None:
+                     reason: str, tp1_hit: bool, close_ms: int,
+                     setup_type: str = "", trigger: str = "",
+                     mfe_r: float = 0.0, mae_r: float = 0.0, result_r: float = 0.0) -> None:
         """Append one closed trade. Deduped by (symbol, close-minute) so a
         restart-time backfill can't double-count a trade already journaled.
         `reason` keeps the raw event (TP2_HIT / EMA_CROSS_REVERSAL / …) and
@@ -249,37 +145,13 @@ class Bot:
         key = (symbol, int(close_ms // 60000))
         if key in self._journaled_close_ms:
             return
-        evmeta = event or {}
-        pos = position
         entry = {"close_ms": int(close_ms), "symbol": symbol, "side": side,
                  "pnl": round(float(pnl), 4), "exit_type": exit_type,
                  "reason": reason, "tp1_hit": bool(tp1_hit),
-                 "entry_price": float(entry_price or 0.0),
-                 "exit_price": float(exit_price or 0.0),
-                 "setup_type": str(setup_type or ""),
-                 "trigger": str(trigger or ""),
-                 "open_ms": int(float(getattr(pos, "opened_at", 0.0) or 0.0) * 1000),
-                 "sl": float(getattr(pos, "stop_loss", 0.0) or 0.0),
-                 "tp1": float(getattr(pos, "tp1", 0.0) or 0.0),
-                 "tp2": float(getattr(pos, "tp2", 0.0) or 0.0),
-                 "regime": str(getattr(pos, "regime_at_entry", "") or ""),
-                 "regime_score": float(getattr(pos, "regime_score", 0.0) or 0.0),
-                 "bias": str(getattr(pos, "bias_at_entry", "") or ""),
-                 "bias_score": float(getattr(pos, "bias_score", 0.0) or 0.0),
-                 "entry_score": float(getattr(pos, "entry_score", 0.0) or 0.0),
-                 "entry_threshold": float(getattr(pos, "entry_threshold", 0.0) or 0.0),
-                 "margin_usdt": float(getattr(pos, "margin_usdt", 0.0) or 0.0),
-                 "leverage": int(getattr(pos, "leverage", 0) or 0),
-                 "local_edge": float(getattr(pos, "local_edge", 0.0) or 0.0),
-                 "planned_rr": float(getattr(pos, "planned_rr", 0.0) or 0.0),
-                 "structure_room_r": float(getattr(pos, "structure_room_r", 0.0) or 0.0),
-                 "exit_score": float(evmeta.get("ai_exit_score", 0.0) or 0.0),
-                 "exit_threshold": float(evmeta.get("ai_exit_threshold", 0.0) or 0.0),
-                 "exit_confirmations": int(evmeta.get("ai_exit_confirmations", 0) or 0),
-                 "exit_persistence": int(evmeta.get("ai_exit_persistence", 0) or 0),
-                 "adverse_r": float(evmeta.get("ai_exit_adverse_r", 0.0) or 0.0),
-                 "exit_signals": list(evmeta.get("ai_exit_signals", []) or []),
-                 "exit_detail": str(evmeta.get("exit_detail", "") or evmeta.get("ai_exit_reason", "") or evmeta.get("spike_reason", "") or "")}
+                 "setup_type": setup_type, "trigger": trigger,
+                 "mfe_r": round(float(mfe_r or 0.0), 3),
+                 "mae_r": round(float(mae_r or 0.0), 3),
+                 "result_r": round(float(result_r or 0.0), 3)}
         try:
             os.makedirs(self.cfg.state_dir, exist_ok=True)
             with open(self._journal_path, "a") as f:
@@ -324,13 +196,10 @@ class Bot:
         if not self.telegram.enabled:
             logger.warning("Telegram not configured — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing")
 
-        # Restore lifecycle state first, then validate it against live OKX.
-        # Local state preserves TP1/banked PnL/AI-exit persistence; OKX remains
-        # authoritative for whether a position exists and its live SL/TP/size.
-        restored_positions, restored_watches = self._load_runtime_state()
-        logger.info("[STATE] startup restored positions=%d ai_exit_watches=%d", restored_positions, restored_watches)
-        await self._reconcile_positions(context="STARTUP", startup=True)
-        self._save_runtime_state()
+        # Adopt any position that already exists on OKX but isn't tracked —
+        # this bot's state is in-memory only, so a restart would otherwise
+        # orphan every open position (no more SL/TP/health management for it).
+        await self._reconcile_positions(context="STARTUP")
 
         self._running = True
         if self.telegram.enabled:
@@ -339,28 +208,16 @@ class Bot:
             # Confirm in Telegram that a (re)deploy actually came up healthy —
             # otherwise a clean restart is completely silent in the chat and
             # there's no way to tell "still starting" from "crashed".
-            sleep = self.fx_schedule.status()
-            self._current_sleep_status = sleep
-            sleep_line = (
-                f"🌙 Sleep Mode: `ON` — new entries resume `{self.fx_schedule.format_resume(sleep)}`"
-                if sleep.sleeping else
-                (f"🌅 Sleep Mode: `PRE-OPEN` — new entries enabled; regular FX open "
-                 f"`{sleep.next_regular_open.strftime('%H:%M %Z') if sleep.next_regular_open else 'soon'}`"
-                 if sleep.phase == "PREOPEN" else
-                 "☀️ Sleep Mode: `OFF` — new entries enabled"))
             await self.telegram.send_text(
                 f"🤖 *Bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
-                f"State: `persistent recovery enabled`\n"
-                f"{sleep_line}\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT\n"
-                f"Architecture: 4H Regime → 1H Bias → 15M/5M Expert Multi-Entry "
-                f"→ SMC/Structure/EMA → AI Exit Engine"
+                f"Architecture: 4H Regime → 1H Bias → 15M Context → 5M EMA Dual Entry "
+                f"(Fast Pullback + Momentum Breakout/Retest)"
             )
 
     async def stop(self):
         self._running = False
-        self._save_runtime_state()
         if self._cmd_task:
             self._cmd_task.cancel()
             try:
@@ -372,43 +229,15 @@ class Bot:
 
     async def run_forever(self):
         while self._running:
-            sleep_status = await self._update_sleep_mode()
             # Safety net FIRST: adopt any position that exists on OKX but the
             # bot isn't tracking (e.g. an order that filled but whose tracking
             # was lost to a crash/timeout), BEFORE the entry logic runs — so a
             # symbol that's actually in a position is never re-opened, and the
             # user is always told about a live position within ~one cycle.
             await self._maybe_reconcile()
-            self.data.new_tick()
             for symbol in self.cfg.symbols:
                 try:
-                    # Sleep Mode blocks NEW entries globally. Open positions
-                    # continue full management (native SL/TP, TP1/BE, AI Exit)
-                    # and therefore still fetch their market data. Flat symbols
-                    # are skipped entirely, reducing weekend API traffic too.
-                    if sleep_status.sleeping and not self.positions.has_position(symbol):
-                        continue
                     await self._process_symbol(symbol)
-                    previous_failures = self._data_fail_count.pop(symbol, 0)
-                    if symbol in self._data_alerted:
-                        self._data_alerted.discard(symbol)
-                        await self.telegram.send_text(
-                            f"✅ *OKX market data recovered* `{_sym(symbol)}`\n"
-                            f"Candles are available again after {previous_failures} failed cycle(s)."
-                        )
-                except MarketDataUnavailable as e:
-                    count = self._data_fail_count.get(symbol, 0) + 1
-                    self._data_fail_count[symbol] = count
-                    logger.warning("[%s] market data unavailable cycle=%d: %s", symbol, count, e)
-                    # A single timeout is routine. Alert only after three full
-                    # symbol cycles fail, then stay quiet until recovery.
-                    if count >= 3 and symbol not in self._data_alerted:
-                        self._data_alerted.add(symbol)
-                        await self.telegram.send_text(
-                            f"⚠️ *OKX market data delayed* `{_sym(symbol)}`\n"
-                            "The bot is retrying automatically and will skip new entries "
-                            "until complete candle data is available. Existing native SL/TP remain active."
-                        )
                 except Exception as e:
                     logger.error("[%s] unhandled error: %s", symbol, e, exc_info=True)
                     await self.telegram.error(symbol, str(e))
@@ -416,111 +245,49 @@ class Bot:
             await self._maybe_log_status()
             await asyncio.sleep(self.cfg.poll_interval_sec)
 
-    async def _update_sleep_mode(self):
-        """Refresh global FX Sleep Mode and announce only state transitions."""
-        status = self.fx_schedule.status()
-        self._current_sleep_status = status
-        key = (status.sleeping, status.phase)
-        if key == self._sleep_state_key:
-            return status
-
-        first_observation = self._sleep_state_key is None
-        self._sleep_state_key = key
-        if status.sleeping:
-            resume = self.fx_schedule.format_resume(status)
-            logger.info(
-                "[SLEEP MODE] ON — new entries paused for ALL symbols; open positions remain managed; resume=%s",
-                resume,
-            )
-            # Startup message already contains the state; avoid a duplicate TG
-            # notification on the first loop after start.
-            if not first_observation and self.telegram.enabled:
-                await self.telegram.send_text(
-                    "🌙 *Sleep Mode ON*\n"
-                    "New positions are paused for *all symbols*.\n"
-                    "Existing positions continue normal SL/TP/BE/AI Exit management.\n"
-                    f"New entries resume: `{resume}` (4h before regular FX open)."
-                )
-        else:
-            if status.phase == "PREOPEN":
-                regular = (status.next_regular_open.strftime('%a %Y-%m-%d %H:%M %Z')
-                           if status.next_regular_open else "regular FX open")
-                logger.info("[SLEEP MODE] PRE-OPEN — new entries enabled for ALL symbols; regular FX open=%s", regular)
-                if not first_observation and self.telegram.enabled:
-                    await self.telegram.send_text(
-                        "🌅 *Sleep Mode OFF — PRE-OPEN*\n"
-                        "New positions are enabled for *all symbols* now.\n"
-                        f"This is the configured 4-hour early window before `{regular}`."
-                    )
-            else:
-                logger.info("[SLEEP MODE] OFF — new entries enabled for ALL symbols")
-                if not first_observation and self.telegram.enabled:
-                    await self.telegram.send_text(
-                        "☀️ *Sleep Mode OFF*\nNew positions are enabled for *all symbols*."
-                    )
-        return status
-
     async def _maybe_reconcile(self):
         now = time.time()
         if now - self._last_reconcile_ts < self.cfg.reconcile_interval_sec:
             return
         self._last_reconcile_ts = now
         try:
-            await self._reconcile_positions(context="SAFETY-NET", startup=False)
+            await self._reconcile_positions(context="SAFETY-NET")
         except Exception as e:
             logger.warning("[RECONCILE] periodic sweep failed: %s", e)
 
-    async def _reconcile_positions(self, context: str, startup: bool = False):
-        """Synchronize live OKX positions with local lifecycle state.
-
-        Startup discoveries are reported as resumed positions. Only positions
-        that appear unexpectedly while the bot is already running are labelled
-        as adopted/untracked.
-        """
-        events = await self.positions.reconcile_with_exchange(
-            self.cfg.symbols, startup=startup
-        )
-        if not events:
+    async def _reconcile_positions(self, context: str):
+        """Adopt untracked OKX positions and ALERT for each. Runs at startup
+        and every reconcile_interval_sec — the single guard against a position
+        living on OKX while the bot flies blind (no SL/TP management, no
+        notification, and — worst — re-opening because it thinks it's flat)."""
+        adopted = await self.positions.reconcile_with_exchange(self.cfg.symbols)
+        if not adopted:
             return
-
-        logger.warning("[%s] reconciliation events: %s", context, events)
-        for event in events:
-            if event.get("action") == "warning":
-                await self.telegram.send_text(
-                    f"⚠️ *Reconcile* ({context})\n\n"
-                    f"`{event.get('message', 'unknown warning')}`"
-                )
-                continue
-
-            sym = str(event.get("symbol", ""))
+        logger.warning("[%s] Adopted %d untracked position(s): %s", context, len(adopted), adopted)
+        for entry in adopted:
+            # reconcile returns "SYMBOL SIDE" strings; _positions is keyed by
+            # the bare symbol (which itself contains no spaces).
+            sym = entry.rsplit(" ", 1)[0]
             pos = self.positions.get(sym)
             if pos is None:
+                # e.g. a hedge-conflict warning string — surface it as-is so an
+                # unmanaged leg is never silently dropped.
+                await self.telegram.send_text(f"⚠️ *Reconcile* ({context})\n\n`{entry}`")
                 continue
-
-            if event.get("action") == "resumed":
-                await self.telegram.send_text(
-                    f"🔄 *Position resumed from OKX* `{sym}`\n\n"
-                    "Existing live position recovered after restart.\n"
-                    "SL/TP synchronized and persistent state saved.\n"
-                    f"Side: `{pos.side}`  Entry: `{pos.entry_price:.6f}`\n"
-                    f"SL: `{pos.stop_loss:.6f}`  TP2: `{pos.tp2:.6f}`  "
-                    f"TP1: `{pos.tp1 if pos.tp1 else 'hit'}`\n"
-                    f"Amount: `{pos.amount:.6f}`"
-                )
-            else:
-                await self.telegram.send_text(
-                    f"⚠️ *Adopted unexpected position* `{sym}` ({context})\n\n"
-                    "This position appeared on OKX while the bot was already running. "
-                    "It is now being managed with the live OKX SL/TP.\n"
-                    f"Side: `{pos.side}`  Entry: `{pos.entry_price:.6f}`\n"
-                    f"SL: `{pos.stop_loss:.6f}`  TP2: `{pos.tp2:.6f}`  "
-                    f"TP1: `{pos.tp1 if pos.tp1 else 'hit'}`\n"
-                    f"Amount: `{pos.amount:.6f}`"
-                )
+            await self.telegram.send_text(
+                f"⚠️ *Adopted untracked position* `{sym}` ({context})\n\n"
+                f"This position was live on OKX but the bot wasn't tracking it — "
+                f"now managing SL/TP.\n"
+                f"Side: `{pos.side}`  Entry: `{pos.entry_price:.6f}`\n"
+                f"SL: `{pos.stop_loss:.6f}`  TP2: `{pos.tp2:.6f}`  "
+                f"TP1: `{pos.tp1 if pos.tp1 else 'hit'}`\n"
+                f"Amount: `{pos.amount:.6f}`"
+            )
 
     # ── Per-symbol processing ────────────────────────────────────────────────
 
     async def _process_symbol(self, symbol: str):
+        self.data.new_tick()
         frames = await self.data.fetch_all(symbol)
         if not self.data.has_min_bars(frames):
             logger.debug("[%s] insufficient bars (<%d) on one or more TFs — skip",
@@ -537,18 +304,7 @@ class Bot:
         # the entry check below AND by the 5-minute status log, so the exit
         # branch and the entry branch never re-run the layers separately.
         sig = self.signal_engine.evaluate(df_1h, df_4h, df_15m, df_5m, df_30m=df_30m, symbol=symbol)
-
-        # Do not replace the last meaningful status snapshot with the duplicate
-        # guard result produced by later polls inside the same 5M candle.  This
-        # keeps the most recent evaluated setup/score/reason visible in Railway.
-        # After a cold restart there may be no prior snapshot, so retain the
-        # duplicate result (it now contains real EMA values from entry_engine).
-        duplicate_bar = (
-            sig.entry is not None
-            and sig.entry.reason == "5M bar already processed"
-        )
-        if not duplicate_bar or symbol not in self._last_signal_by_symbol:
-            self._last_signal_by_symbol[symbol] = sig
+        self._last_signal_by_symbol[symbol] = sig
 
         if self.positions.has_position(symbol):
             await self._manage_open_position(symbol, df_15m, df_5m)
@@ -569,11 +325,12 @@ class Bot:
             await self._handle_event(event)
             return   # position fully or partially closed this tick — exit check waits for next
 
-        # AI Exit Engine — every tick, but a spike alone only starts WATCH.
-        if self.cfg.ai_exit_enabled:
-            exit_event = await self._check_ai_exit(symbol, pos, price, df_15m, df_5m)
-            if exit_event:
-                await self._handle_event(exit_event)
+        # SpikeGuard — EVERY tick, 5m/15m closed bars + live price. The fast
+        # layer: force-close before a V-reversal eats the full SL (+slippage).
+        if self.cfg.spike_guard_enabled:
+            spike_event = await self._check_spike_guard(symbol, pos, price)
+            if spike_event:
+                await self._handle_event(spike_event)
                 return
 
         # EMA early-exit check — once per newly-closed 5m bar only.
@@ -581,100 +338,30 @@ class Bot:
         if eevent:
             await self._handle_event(eevent)
 
-    async def _check_ai_exit(self, symbol: str, pos, price: float, df_15m, df_5m):
-        if df_5m is None or df_15m is None:
+    async def _check_spike_guard(self, symbol: str, pos, price: float):
+        """Fetch 5m/15m closed bars and run the spike check. Non-fatal on data errors."""
+        import time as _t
+        c = self.cfg
+        now_ms = int(_t.time() * 1000)
+        try:
+            raw5 = await self.client.fetch_ohlcv(symbol, c.spike_tf_fast, limit=c.spike_fetch_limit)
+            raw15 = await self.client.fetch_ohlcv(symbol, c.spike_tf_slow, limit=c.spike_fetch_limit)
+        except Exception as e:
+            logger.warning("[%s] spike-guard data fetch failed (skipping this tick): %s", symbol, e)
             return None
-        result = self.ai_exit.evaluate(symbol, pos, df_5m, df_15m, price)
-        self._save_runtime_state()
-        if result.action == AI_EXIT_WATCH:
-            logger.info("[%s] AI EXIT WATCH: %s", symbol, result.reason)
+        df5 = drop_unclosed_bar(_ohlcv_to_df(raw5), c.spike_tf_fast, now_ms)
+        df15 = drop_unclosed_bar(_ohlcv_to_df(raw15), c.spike_tf_slow, now_ms)
+
+        result = check_spike(pos.side, pos.entry_price, pos.one_r, df5, df15, price, c)
+        if result.action != SPIKE_CLOSE:
             return None
-        if result.action not in (AI_EXIT_CLOSE, AI_EXIT_EMERGENCY):
-            return None
-        reason_code = "AI_EXIT_EMERGENCY" if result.action == AI_EXIT_EMERGENCY else "AI_EXIT"
-        logger.warning("[%s] %s firing: %s", symbol, reason_code, result.reason)
-        event = await self.positions._close_full(pos, price, reason_code)
-        if event.get("event") == reason_code:
-            event["ai_exit_reason"] = result.reason
-            event["ai_exit_score"] = result.score
-            event["ai_exit_threshold"] = result.threshold
-            event["ai_exit_confirmations"] = result.confirmations
-            event["ai_exit_persistence"] = getattr(result, "persistence", 0)
-            event["ai_exit_adverse_r"] = result.adverse_r
-            event["ai_exit_signals"] = list((result.signals or {}).keys())
-        self.ai_exit.clear(symbol)
+        logger.warning("[%s] SPIKE GUARD firing: %s", symbol, result.reason)
+        event = await self.positions._close_full(pos, price, "SPIKE_GUARD")
+        if event.get("event") == "SPIKE_GUARD":
+            event["spike_reason"] = result.reason
         return event
 
-    def _btc_eth_correlation_block(self, symbol: str, direction: str) -> str:
-        """Block stacking BTC and ETH in the same direction.
-
-        The two instruments frequently express the same crypto beta.  The guard
-        prevents one macro thesis from consuming both portfolio slots.
-        """
-        if not getattr(self.cfg, "btc_eth_same_direction_guard", True):
-            return ""
-        root = _sym(symbol).upper()
-        if root not in {"BTC", "ETH"}:
-            return ""
-        other_root = "ETH" if root == "BTC" else "BTC"
-        other_symbol = next((s for s in self.cfg.symbols if _sym(s).upper() == other_root), None)
-        if not other_symbol:
-            return ""
-        other = self.positions.get(other_symbol)
-        if other is None:
-            return ""
-        other_dir = "LONG" if str(other.side).lower() == "long" else "SHORT"
-        if other_dir == str(direction).upper():
-            return f"BTC/ETH correlation guard: {other_root} already {other_dir}"
-        return ""
-
-    def _setup_performance_block(self, symbol: str, sig) -> str:
-        """Use the persistent close journal as a conservative probation gate.
-
-        It only activates after enough *same symbol + same setup* samples have
-        been journaled. Underperforming combinations are not permanently paused;
-        they may still trade when the current setup edge is exceptional.
-        """
-        c = self.cfg
-        if not getattr(c, "setup_performance_guard_enabled", True):
-            return ""
-        entry = getattr(sig, "entry", None)
-        setup = str(getattr(entry, "setup_type", "") or "")
-        if not setup:
-            return ""
-        rows = [r for r in self.journal
-                if r.get("symbol") == symbol and str(r.get("setup_type", "") or "") == setup]
-        lookback = int(getattr(c, "setup_performance_lookback", 20))
-        rows = rows[-lookback:]
-        min_n = int(getattr(c, "setup_performance_min_trades", 8))
-        if len(rows) < min_n:
-            return ""
-        pnls = [float(r.get("pnl", 0.0) or 0.0) for r in rows]
-        wins = sum(1 for x in pnls if x > 0)
-        gross_win = sum(x for x in pnls if x > 0)
-        gross_loss = -sum(x for x in pnls if x < 0)
-        wr = wins / len(pnls) if pnls else 0.0
-        pf = (gross_win / gross_loss) if gross_loss > 1e-12 else 99.0
-        bad = pf < float(getattr(c, "setup_performance_pf_floor", 0.90)) or wr < float(getattr(c, "setup_performance_wr_floor", 0.35))
-        if not bad:
-            return ""
-        threshold = float(getattr(entry, "score_threshold", 0.0) or 0.0)
-        edge = float(getattr(entry, "entry_score", 0.0) or 0.0) - threshold
-        required = float(getattr(c, "setup_performance_required_edge", 6.0))
-        if edge + 1e-9 < required:
-            return (f"setup probation {setup}: n={len(rows)} WR={wr*100:.0f}% PF={pf:.2f}; "
-                    f"current edge={edge:.1f}<{required:.1f}")
-        return ""
-
     async def _look_for_entry(self, symbol: str, df_15m, df_5m, sig):
-        # Defense-in-depth: even if a sleep transition happens after the outer
-        # loop decided to process this symbol, no new order can cross this gate.
-        sleep = self.fx_schedule.status()
-        self._current_sleep_status = sleep
-        if sleep.sleeping:
-            logger.debug("[%s] new entry blocked by FX Sleep Mode — %s", symbol, sleep.reason)
-            return
-
         # Actual execution runs once per completed 5M candle. Repeated polls of
         # the same candle must never submit the same setup twice.
         bar_ts = df_5m.index[-1] if (df_5m is not None and len(df_5m)) else None
@@ -698,17 +385,7 @@ class Bot:
             self._log_pipeline_block(symbol, sig)
             return
 
-        correlation_reason = self._btc_eth_correlation_block(symbol, sig.direction)
-        if correlation_reason:
-            logger.info("[%s] entry blocked: %s", symbol, correlation_reason)
-            return
-
-        perf_reason = self._setup_performance_block(symbol, sig)
-        if perf_reason:
-            logger.info("[%s] entry blocked: %s", symbol, perf_reason)
-            return
-
-        fixed_margin_usdt = self.cfg.fixed_margin_usdt
+        risk_pct = self.cfg.risk_per_trade * sig.regime.size_multiplier
         # Chart the actual 5M execution frame with EMA8/EMA13.
         chart_path = build_entry_chart(
             symbol, df_5m, sig.direction, sig.price,
@@ -725,10 +402,6 @@ class Bot:
             sig.entry_score, df_5m=df_5m, entry_result=sig.entry)
         if pos is None:
             return
-
-        # Persist entry context immediately. This is diagnostic-only state and
-        # makes /trade restart/offline-close safe for setup/regime/bias metadata.
-        self._entry_journal_add(pos)
 
         # Consume the deterministic setup key ONLY now that a position really opened —
         # a blocked/failed open above leaves the setup eligible until it expires.
@@ -749,7 +422,7 @@ class Bot:
         try:
             await self.telegram.entry_signal(
                 symbol, sig.direction, pos.entry_price, pos.stop_loss, pos.tp1, pos.tp2,
-                sig.regime, sig.bias, sig.entry_score, fixed_margin_usdt, self.cfg.leverage,
+                sig.regime, sig.bias, sig.entry_score, risk_pct, self.cfg.leverage,
                 chart_path, sig.entry)
         except Exception as e:
             logger.error("[%s] entry_signal notify failed: %s", symbol, e, exc_info=True)
@@ -809,7 +482,7 @@ class Bot:
     # partially closes and leaves the runner open) — each one starts this
     # symbol's post-close cooldown.
     _TERMINAL_EVENTS = {"TP2_HIT", "SL_HIT", "BE_HIT", EMA_CROSS_REVERSAL,
-                        PRICE_OPEN_BEYOND_EMA, "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD", "AI_EXIT", "AI_EXIT_EMERGENCY"}
+                        PRICE_OPEN_BEYOND_EMA, "TP1_THEN_EXTERNAL_CLOSE", "SPIKE_GUARD"}
 
     async def _handle_event(self, event: dict):
         ev = event.get("event")
@@ -825,9 +498,6 @@ class Bot:
         elif ev in (EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA):
             await self.telegram.early_exit(symbol, event["price"], event.get("trade_pnl", event["pnl"]),
                                            ev, event.get("exit_detail", ""), ev=event)
-        elif ev in ("AI_EXIT", "AI_EXIT_EMERGENCY"):
-            await self.telegram.ai_exit(symbol, event["price"], event.get("trade_pnl", event["pnl"]),
-                                        event.get("ai_exit_reason", ""), ev == "AI_EXIT_EMERGENCY", ev=event)
         elif ev == "SPIKE_GUARD":
             await self.telegram.spike_guard(symbol, event["price"], event.get("trade_pnl", event["pnl"]),
                                             event.get("spike_reason", ""), ev=event)
@@ -840,7 +510,6 @@ class Bot:
             await self.telegram.error(symbol, event.get("detail", "unknown error"))
 
         if ev in self._TERMINAL_EVENTS and symbol:
-            self.ai_exit.clear(symbol)
             if ev == "SL_HIT":
                 cooldown_min = getattr(self.cfg, "symbol_sl_cooldown_min", 90)
             elif ev == "BE_HIT":
@@ -851,7 +520,7 @@ class Bot:
             self._symbol_cooldown_until[symbol] = time.time() + cooldown_sec
             logger.info("[%s] closed (%s) — cooldown %d min before next entry",
                        symbol, ev, cooldown_min)
-            # Trade log for /trade and the live view. A trade is a win only
+            # Trade log for /trades and the live view. A trade is a win only
             # when its final post-fee PnL is positive; TP1 is tracked separately.
             pnl = float(event.get("trade_pnl", event.get("pnl", 0.0)) or 0.0)
             side = event.get("side", "")
@@ -859,30 +528,26 @@ class Bot:
             # (BE/TP2/TP1-then-close can only happen after TP1). SL_HIT ⟺ no TP1.
             tp1_hit = bool(event.get("tp1_hit", False)) or ev in (
                 "TP2_HIT", "BE_HIT", "TP1_THEN_EXTERNAL_CLOSE")
-            pos_obj = event.get("position")
-            setup_type = str(getattr(pos_obj, "setup_type", "") or "")
-            trigger = str(getattr(pos_obj, "trigger", "") or "")
-            entry_price = float(event.get("entry_price", 0.0) or 0.0)
-            exit_price = float(event.get("price", 0.0) or 0.0)
             self._trade_log.append({
                 "time": time.time(), "symbol": symbol,
                 "side": side, "reason": ev,
-                "entry": entry_price,
-                "exit": exit_price,
-                "setup_type": setup_type,
-                "trigger": trigger,
+                "entry": float(event.get("entry_price", 0.0) or 0.0),
+                "exit": float(event.get("price", 0.0) or 0.0),
                 "tp1_hit": tp1_hit,
                 "pnl": pnl,
             })
             del self._trade_log[:-200]   # keep the last 200 trades
-            # Persist the exit info for /stats + /trade (restart-safe). The
+            # Persist the exit info for the /stats breakdown (restart-safe). The
             # event fires the moment the close is detected, so this close_ms is
             # within the 3-min match tolerance of OKX's own close time.
             self._journal_add(
-                symbol, side, pnl, self._bucket_for_event(ev, pnl), ev, tp1_hit,
-                int(time.time() * 1000), entry_price=entry_price,
-                exit_price=exit_price, setup_type=setup_type, trigger=trigger,
-                position=pos_obj, event=event,
+                symbol, side, pnl, self._bucket_for_event(ev, pnl),
+                ev, tp1_hit, int(time.time() * 1000),
+                setup_type=str(event.get("setup_type", "") or ""),
+                trigger=str(event.get("trigger", "") or ""),
+                mfe_r=float(event.get("mfe_r", 0.0) or 0.0),
+                mae_r=float(event.get("mae_r", 0.0) or 0.0),
+                result_r=float(event.get("result_r", 0.0) or 0.0),
             )
 
     async def _check_global_alerts(self):
@@ -941,8 +606,7 @@ class Bot:
                 "/restats — reset stats แล้วเริ่มนับใหม่จากตอนนี้\n"
                 "/balance — ยอด USDT ปัจจุบัน\n"
                 "/positions — position ที่เปิดอยู่\n"
-                "/trade — 15 เทรดล่าสุด พร้อม Setup / Context / Entry / Exit\n"
-                "/trades — alias ของ /trade\n"
+                "/trades — 5 เทรดล่าสุด\n"
                 "/status — regime/bias/score ทุก symbol"
             )
         elif cmd == "/balance":
@@ -956,8 +620,6 @@ class Bot:
                 f"`{self.cfg.max_open_positions}`"
             )
         elif cmd == "/positions":
-            # Refresh live OKX protection before displaying internal state.
-            await self.positions.reconcile_with_exchange(self.cfg.symbols)
             lines = []
             for sym in self.cfg.symbols:
                 pos = self.positions.get(sym)
@@ -971,14 +633,19 @@ class Bot:
                 )
             await self.telegram.send_text(
                 "📊 *Open Positions*\n\n" + ("\n".join(lines) if lines else "no open positions"))
-        elif cmd in ("/trade", "/trades"):
-            # Authoritative latest closes from OKX. /restats intentionally does
-            # NOT affect this command: /trade is a forensic view of the latest
-            # 15 account trades, not a performance-window report. Rich details
-            # are paged (5 trades/message) so Telegram's message-size limit can
-            # never truncate the newest forensic context.
-            for page in await self._build_trade_reports(15, page_size=5):
-                await self.telegram._send_message(page, _markdown=False)
+        elif cmd == "/trades":
+            last = self._trade_log[-5:]
+            if not last:
+                await self.telegram.send_text("no closed trades yet")
+                return
+            lines = []
+            for t in reversed(last):
+                ts = time.strftime("%m-%d %H:%M", time.gmtime(t["time"]))
+                win = t["pnl"] > 0
+                lines.append(
+                    f"{'🟢' if win else '🔴'} `{t['symbol']}` {t['side'].upper()} "
+                    f"{t['reason']}  pnl `{t['pnl']:+.2f}`  {ts}")
+            await self.telegram.send_text("🧾 *Last 5 Trades*\n\n" + "\n".join(lines))
         elif cmd == "/stats":
             # plain text (no markdown) — separators + emoji, so symbols/numbers
             # never get mangled by Telegram's Markdown parser. Same as HTF.
@@ -1027,178 +694,6 @@ class Bot:
             await self.telegram.send_text(f"unknown command: {cmd} — try /help")
 
     @staticmethod
-    def _fmt_trade_time(ms: int) -> str:
-        if not ms:
-            return "—"
-        return time.strftime("%m-%d %H:%M", time.gmtime(ms / 1000))
-
-    @staticmethod
-    def _fmt_hold(open_ms: int, close_ms: int) -> str:
-        if not open_ms or not close_ms or close_ms < open_ms:
-            return "—"
-        secs = max(0, int((close_ms - open_ms) / 1000))
-        if secs < 3600:
-            return f"{secs // 60}m"
-        if secs < 86400:
-            h, rem = divmod(secs, 3600)
-            return f"{h}h{rem // 60:02d}m"
-        d, rem = divmod(secs, 86400)
-        return f"{d}d{rem // 3600}h"
-
-    async def _build_trade_reports(self, limit: int = 15, page_size: int = 5) -> list[str]:
-        """Detailed latest trades, paged for Telegram.
-
-        OKX remains authoritative for side, entry/exit prices, timestamps and
-        post-fee PnL. Persistent bot journals enrich those rows with the exact
-        setup/regime/bias/entry plan and exit decision that the bot observed.
-        """
-        limit = max(1, min(int(limit), 30))
-        page_size = max(1, min(int(page_size), 10))
-        now_ms = int(time.time() * 1000)
-        since_ms = now_ms - 365 * 24 * 60 * 60 * 1000
-        rows: list[dict] = []
-        okx_ok = True
-        if not self.cfg.paper:
-            try:
-                rows = await self.client.fetch_trade_history(since_ms, self.cfg.symbols)
-            except Exception as exc:
-                logger.warning("[TRADE] OKX history fetch failed: %s", exc)
-                okx_ok = False
-
-        if not rows:
-            for t in self._trade_log[-limit:]:
-                close_ms = int(float(t.get("time", 0.0) or 0.0) * 1000)
-                rows.append({
-                    "symbol": t.get("symbol", ""),
-                    "side": t.get("side", ""),
-                    "open_avg_px": float(t.get("entry", 0.0) or 0.0),
-                    "close_avg_px": float(t.get("exit", 0.0) or 0.0),
-                    "pnl": float(t.get("pnl", 0.0) or 0.0),
-                    "open_time_ms": 0,
-                    "close_time_ms": close_ms,
-                    "_local": True,
-                    "reason": t.get("reason", ""),
-                    "setup_type": t.get("setup_type", ""),
-                    "trigger": t.get("trigger", ""),
-                })
-
-        if not rows:
-            return ["🧾 LAST 15 TRADES\n\nNo closed trades found."]
-
-        latest = sorted(rows, key=lambda r: r.get("close_time_ms", 0), reverse=True)[:limit]
-        live_rows = [r for r in latest if not r.get("_local")]
-        close_matched = self._match_journal(live_rows)
-        entry_matched = self._match_entry_journal(live_rows)
-
-        rendered: list[list[str]] = []
-        for i, row in enumerate(latest, 1):
-            pnl = float(row.get("pnl", 0.0) or 0.0)
-            icon = "✅" if pnl > 1e-9 else ("❌" if pnl < -1e-9 else "➖")
-            symbol = _sym(str(row.get("symbol", "")))
-            side = str(row.get("side", "") or "—").upper()
-            entry_px = float(row.get("open_avg_px", 0.0) or 0.0)
-            exit_px = float(row.get("close_avg_px", 0.0) or 0.0)
-            open_ms = int(row.get("open_time_ms", 0) or 0)
-            close_ms = int(row.get("close_time_ms", 0) or 0)
-
-            if row.get("_local"):
-                meta = dict(row)
-            else:
-                meta = self._merge_trade_meta(
-                    entry_matched.get(id(row), {}), close_matched.get(id(row), {})
-                )
-
-            setup = str(meta.get("setup_type", "") or "—")
-            trigger = str(meta.get("trigger", "") or "—")
-            regime = str(meta.get("regime", "") or "—")
-            bias = str(meta.get("bias", "") or "—")
-            regime_score = float(meta.get("regime_score", 0.0) or 0.0)
-            bias_score = float(meta.get("bias_score", 0.0) or 0.0)
-            entry_score = float(meta.get("entry_score", 0.0) or 0.0)
-            entry_thr = float(meta.get("entry_threshold", 0.0) or 0.0)
-            sl = float(meta.get("sl", 0.0) or 0.0)
-            tp1 = float(meta.get("tp1", 0.0) or 0.0)
-            tp2 = float(meta.get("tp2", 0.0) or 0.0)
-            margin = float(meta.get("margin_usdt", 0.0) or 0.0)
-            leverage = int(meta.get("leverage", 0) or 0)
-            reason = str(meta.get("reason", "") or "OKX_CLOSE")
-            exit_score = float(meta.get("exit_score", 0.0) or 0.0)
-            exit_thr = float(meta.get("exit_threshold", 0.0) or 0.0)
-            confirms = int(meta.get("exit_confirmations", 0) or 0)
-            persistence = int(meta.get("exit_persistence", 0) or 0)
-            adverse = float(meta.get("adverse_r", 0.0) or 0.0)
-
-            in_px = f"{entry_px:.8g}" if entry_px > 0 else "—"
-            out_px = f"{exit_px:.8g}" if exit_px > 0 else "—"
-            plan_parts = []
-            if sl > 0: plan_parts.append(f"SL {sl:.8g}")
-            if tp1 > 0: plan_parts.append(f"TP1 {tp1:.8g}")
-            if tp2 > 0: plan_parts.append(f"TP2 {tp2:.8g}")
-            if margin > 0: plan_parts.append(f"M{margin:.0f}")
-            if leverage > 0: plan_parts.append(f"{leverage}x")
-            plan = " | ".join(plan_parts) if plan_parts else "—"
-
-            ctx_parts = []
-            if regime != "—":
-                ctx_parts.append(f"{regime}({regime_score:.0f})" if regime_score else regime)
-            if bias != "—":
-                ctx_parts.append(f"{bias}({bias_score:.0f})" if bias_score else bias)
-            if entry_score:
-                ctx_parts.append(f"Entry {entry_score:.0f}/{entry_thr:.0f}" if entry_thr else f"Entry {entry_score:.0f}")
-            ctx = " | ".join(ctx_parts) if ctx_parts else "—"
-
-            exit_line = f"EXIT {reason}"
-            if exit_score or exit_thr or confirms or persistence or adverse:
-                detail = []
-                if exit_score or exit_thr:
-                    detail.append(f"score {exit_score:.0f}/{exit_thr:.0f}" if exit_thr else f"score {exit_score:.0f}")
-                if confirms:
-                    detail.append(f"c{confirms}")
-                if persistence:
-                    detail.append(f"p{persistence}")
-                if adverse:
-                    detail.append(f"adv {adverse:.2f}R")
-                exit_line += " | " + " ".join(detail)
-
-            rendered.append([
-                f"{i:02d}. {icon} {symbol} {side}  ${pnl:+.2f}",
-                f"IN {self._fmt_trade_time(open_ms)} @{in_px} → OUT {self._fmt_trade_time(close_ms)} @{out_px} | {self._fmt_hold(open_ms, close_ms)}",
-                f"SETUP {setup} | {trigger}",
-                f"CTX {ctx}",
-                f"PLAN {plan}",
-                exit_line,
-            ])
-
-        pages: list[str] = []
-        total_pages = (len(rendered) + page_size - 1) // page_size
-        for page_idx in range(total_pages):
-            a = page_idx * page_size
-            b = min(len(rendered), a + page_size)
-            lines = [
-                f"🧾 LAST {len(rendered)} TRADES — {page_idx + 1}/{total_pages}",
-                "OKX prices/PnL + persistent bot context",
-                "",
-            ]
-            for block in rendered[a:b]:
-                lines.extend(block)
-                lines.append("")
-            if page_idx == total_pages - 1:
-                if not okx_ok:
-                    lines.append("⚠️ OKX history unavailable; showing local observed trades.")
-                if any(
-                    str(self._merge_trade_meta(entry_matched.get(id(r), {}), close_matched.get(id(r), {})).get("setup_type", "") or "") == ""
-                    for r in live_rows
-                ):
-                    lines.append("ℹ️ Trades opened before V3.2.8 may show — because setup context was not persisted then.")
-            pages.append("\n".join(lines).rstrip())
-        return pages
-
-    async def _build_trade_report(self, limit: int = 15) -> str:
-        """Backward-compatible single-string view used by tests/tools."""
-        pages = await self._build_trade_reports(limit, page_size=max(1, min(limit, 5)))
-        return "\n\n".join(pages)
-
-    @staticmethod
     def _month_bounds(now_ms: int) -> tuple:
         """(this_month_start_ms, prev_month_start_ms, prev_month_label) in UTC."""
         import datetime as dt
@@ -1229,50 +724,6 @@ class Bot:
                 used[best_j] = True
                 out[id(row)] = pool[best_j]
         return out
-
-    def _match_entry_journal(self, okx_rows: list) -> dict:
-        """One-to-one match OKX rows to persisted entry contexts.
-
-        Match on symbol+side and nearest open time (<=5 min), then prefer the
-        closest entry price. Each context can enrich at most one OKX trade.
-        """
-        pool = list(self.entry_journal)
-        used = [False] * len(pool)
-        out = {}
-        for row in sorted(okx_rows, key=lambda r: r.get("open_time_ms", 0)):
-            oms = int(row.get("open_time_ms", 0) or 0)
-            sym = str(row.get("symbol", "") or "")
-            side = str(row.get("side", "") or "").lower()
-            px = float(row.get("open_avg_px", 0.0) or 0.0)
-            best_j, best_key = -1, (5 * 60_000 + 1, float("inf"))
-            for j, e in enumerate(pool):
-                if used[j] or str(e.get("symbol", "")) != sym:
-                    continue
-                eside = str(e.get("side", "") or "").lower()
-                if side and eside and side != eside:
-                    continue
-                eoms = int(e.get("open_ms", 0) or 0)
-                dt = abs(eoms - oms) if oms and eoms else 5 * 60_000 + 1
-                if dt > 5 * 60_000:
-                    continue
-                epx = float(e.get("entry_price", 0.0) or 0.0)
-                price_gap = abs(epx - px) / max(abs(px), 1e-12) if px and epx else 0.0
-                key = (dt, price_gap)
-                if key < best_key:
-                    best_key, best_j = key, j
-            if best_j >= 0:
-                used[best_j] = True
-                out[id(row)] = pool[best_j]
-        return out
-
-    @staticmethod
-    def _merge_trade_meta(entry_meta: dict, close_meta: dict) -> dict:
-        """Close metadata wins for exit fields; entry context fills everything else."""
-        merged = dict(entry_meta or {})
-        for k, v in (close_meta or {}).items():
-            if v not in (None, "", [], {}):
-                merged[k] = v
-        return merged
 
     async def _build_stats_report(self) -> str:
         """/stats — SAME format as the Adaptive bot (this is a 2-TP system too):
@@ -1382,23 +833,11 @@ class Bot:
         self._last_status_log_ts = now
 
         now_wall = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now))
-        sleep = self.fx_schedule.status()
-        self._current_sleep_status = sleep
-        if sleep.sleeping:
-            logger.info("=== STATUS [%s UTC] — SLEEP MODE; new entries paused; resume %s ===",
-                        now_wall, self.fx_schedule.format_resume(sleep))
-        elif sleep.phase == "PREOPEN":
-            logger.info("=== STATUS [%s UTC] — PRE-OPEN; new entries enabled 4h early ===", now_wall)
-        else:
-            logger.info("=== STATUS [%s UTC] ===", now_wall)
+        logger.info("=== STATUS [%s UTC] ===", now_wall)
         for symbol in self.cfg.symbols:
             sig = self._last_signal_by_symbol.get(symbol)
             pos = self.positions.get(symbol)
             pos_label = f"OPEN {pos.side.upper()} @ {pos.entry_price:.6g}" if pos else "flat"
-            if sleep.sleeping and pos is None:
-                logger.info("  %-16s %-24s SLEEP_MODE — no new positions; resume=%s",
-                            symbol, pos_label, self.fx_schedule.format_resume(sleep))
-                continue
             if sig is None:
                 logger.info("  %-16s %-24s no data yet", symbol, pos_label)
                 continue
@@ -1413,7 +852,7 @@ class Bot:
                 bias_label = "—"
             entry_label = (
                 f"{sig.entry.setup_type or 'WAIT'} score={_entry_score_text(sig.entry)} "
-                f"EMA8/13={sig.entry.ema_fast:.6f}/{sig.entry.ema_slow:.6f}"
+                f"EMA8/13={sig.entry.ema_fast:.4f}/{sig.entry.ema_slow:.4f}"
                 if sig.entry is not None else "-"
             )
             # Surface WHY a flat symbol isn't triggering — the blocking layer's

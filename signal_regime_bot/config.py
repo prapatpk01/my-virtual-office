@@ -81,12 +81,8 @@ class Config:
     symbols: list[str]       = field(default_factory=lambda: _env_list(
         "SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT"))
     leverage: int             = field(default_factory=lambda: _env_int("LEVERAGE", 20))
-    # Position sizing: fixed isolated margin per accepted trade.
-    # With the default 20 USDT margin and 20x leverage, target notional is ~400 USDT.
-    # SL/TP geometry is still structure/ATR based; only quantity sizing changed.
-    fixed_margin_usdt: float  = field(default_factory=lambda: _env_float("FIXED_MARGIN_USDT", 20.0))
-    # Legacy value kept only for backwards compatibility with old deployments/docs.
-    # It is NOT used to size new positions in fixed-margin mode.
+    # Fixed 5% risk per trade (spec). The regime/context size_multiplier scales
+    # DOWN from here in weaker conditions; it never scales up past this.
     risk_per_trade: float     = field(default_factory=lambda: _env_float("RISK_PER_TRADE", 0.05))
     # Hard cap on TOTAL concurrent positions across all symbols (not per-symbol).
     # Same env var name the previous bot on this Railway service used.
@@ -270,26 +266,18 @@ class Config:
     stats_since_date: str = field(default_factory=lambda: os.environ.get("STATS_SINCE_DATE", "2026-07-16"))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "state"))
 
-    # ── Global FX-style Sleep Mode (ALL symbols) ─────────────────────────────
-    # User policy: every configured symbol, including crypto, follows the FX
-    # weekly closure for NEW entries. Standard FX weekly session is treated as
-    # Sunday 17:00 -> Friday 17:00 America/New_York. The bot wakes EARLY and may
-    # open new positions from Sunday 13:00 New York (4 hours before regular FX
-    # open). America/New_York makes this DST-safe. Existing positions continue
-    # normal SL/TP/BE/AI-exit management throughout Sleep Mode.
-    fx_sleep_mode_enabled: bool = True
-    fx_market_timezone: str = "America/New_York"
-    fx_weekly_close_hour: int = 17
-    fx_weekly_open_hour: int = 17
-    fx_preopen_hours: int = 4
-
-    # Legacy XAU/XAG-only weekend gate is superseded by the global Sleep Mode.
-    # Keep the fields for backward compatibility with Pipeline/config imports,
-    # but disable it so metals do not wake later than the other symbols.
-    commodity_weekend_block_enabled: bool = False
+    # ── Commodity market hours (XAU / XAG) ──────────────────────────────────
+    # The underlying metals market is closed on weekends — the OKX perp still
+    # quotes, but it's illiquid/frozen and signals are garbage. Block NEW
+    # entries for symbols matching these keywords from Friday
+    # commodity_halt_hour_utc (17:00 UTC = Sat 00:00 Asia/Bangkok) until
+    # Sunday commodity_resume_hour_utc (21:00 UTC = Mon 04:00 ICT — exactly 3
+    # hours before the Mon 07:00 ICT market open the user referenced).
+    # Open positions keep being managed (SL/TP/exits) throughout.
+    commodity_weekend_block_enabled: bool = True
     commodity_symbol_keywords: tuple = ("XAU", "XAG")
-    commodity_halt_hour_utc: int = 17
-    commodity_resume_hour_utc: int = 21
+    commodity_halt_hour_utc: int = 17     # Friday >= this hour UTC -> halted
+    commodity_resume_hour_utc: int = 21   # Sunday < this hour UTC -> still halted
 
     # Stop loss / take profit
     sl_atr_period: int = 14
@@ -340,21 +328,6 @@ class Config:
     spike_tf_fast: str = "5m"
     spike_tf_slow: str = "15m"
     spike_fetch_limit: int = 60
-
-    # ── AI Exit Engine (multi-factor replacement for one-spike close) ────────
-    ai_exit_enabled: bool = True
-    ai_exit_grace_bars: int = 2
-    ai_exit_watch_score: float = 45.0
-    ai_exit_close_score: float = 70.0
-    ai_exit_confirmations: int = 2
-    ai_exit_persistence_bars: int = 2
-    ai_exit_min_adverse_r: float = 0.30
-    ai_exit_watch_live_atr: float = 1.80
-    ai_exit_emergency_live_atr: float = 2.80
-    ai_exit_emergency_adverse_r: float = 0.82
-    ai_exit_absolute_emergency_r: float = 0.94
-    ai_exit_structure_lookback: int = 6
-    ai_exit_volume_ratio: float = 1.80
 
     # ══ Hard Gate + Soft Score + Adaptive Threshold pipeline ════════════════
     # Layer 1 — Regime (HARD GATE, 4H + 1H)
@@ -746,47 +719,12 @@ class Config:
     expert_smc_edge_min_early: float = 55.0
     expert_smc_edge_max: float = 75.0
     expert_smc_di_spread_min: float = 8.0
-    expert_smc_max_ema20_extension_atr: float = 1.10
+    expert_smc_max_ema20_extension_atr: float = 3.40
     expert_fvg_max_width_pct: float = 0.0065
     expert_1h_zone_requires_15m_structure: bool = True
     expert_smc_rsi_long_max: float = 82.0
     expert_smc_rsi_short_min: float = 18.0
     expert_sweep_edge_max: float = 65.0
-
-    # V3.2.9 precision-quality hard gates. These are deliberately non-
-    # compensable: a 95/100 setup may still be rejected when it is late,
-    # overextended, poorly located or lacks structure confirmation.
-    expert_precision_symbols: tuple[str, ...] = ("BTC", "ETH")
-    expert_precision_max_ema20_extension_atr: float = 1.00
-    expert_precision_require_15m_structure: bool = True
-    # V3.3 balanced precision: ordinary BTC/ETH entries get more room as trend
-    # quality strengthens instead of using one 0.72 ATR ceiling everywhere.
-    expert_precision_extension_early_atr: float = 0.85
-    expert_precision_extension_trend_atr: float = 1.00
-    expert_precision_extension_strong_atr: float = 1.20
-    expert_smc_require_micro_structure_confirm: bool = True
-    expert_sweep_require_micro_structure_confirm: bool = True
-    expert_initial_chase_guard_enabled: bool = True
-    expert_initial_chase_3bar_atr: float = 1.40
-    expert_initial_chase_ema20_atr: float = 0.80
-    expert_initial_chase_hard_extension_atr: float = 1.25
-    expert_smc_min_room_r: float = 1.10
-    expert_sweep_min_room_r: float = 1.10
-    expert_breakout_retest_min_room_r: float = 0.95
-
-    # Portfolio quality control. BTC and ETH are highly correlated enough that
-    # carrying both in the same direction often doubles one macro bet.
-    btc_eth_same_direction_guard: bool = True
-
-    # Setup×symbol probation. It activates only after enough journaled samples
-    # exist and does not permanently disable a setup: weak historical setups
-    # simply need a larger current score edge to be allowed.
-    setup_performance_guard_enabled: bool = True
-    setup_performance_min_trades: int = 8
-    setup_performance_lookback: int = 20
-    setup_performance_pf_floor: float = 0.90
-    setup_performance_wr_floor: float = 0.35
-    setup_performance_required_edge: float = 6.0
     expert_min_displacement_atr: float = 0.24
     expert_direct_breakout_body_atr: float = 0.42
     expert_direct_breakout_volume_ratio: float = 1.10
@@ -796,16 +734,25 @@ class Config:
     expert_same_setup_cooldown_15m_bars: int = 1
     expert_reentry_lock_hours: int = 8
 
-    # Post-exit thesis reset / anti-whipsaw. Time cooldown alone is not enough:
-    # after closing a trade the same direction must form a genuinely new 5M/15M
-    # leg before another entry is accepted. This specifically prevents chasing
-    # after a profitable early exit/TP1 runner close like the XAG whipsaw case.
-    expert_post_exit_reset_enabled: bool = True
-    expert_post_exit_reset_hours: float = 6.0
-    expert_post_exit_min_5m_bars: int = 4
-    expert_post_exit_pullback_atr: float = 0.55
-    expert_post_exit_value_max_atr: float = 0.70
-    expert_post_exit_max_chase_atr: float = 1.00
+    # V3.3.1 — adaptive quality controls. These are deliberately local:
+    # they do not tighten every symbol/setup globally.
+    expert_trend_lifecycle_enabled: bool = True
+    expert_lifecycle_mature_bars: int = 18
+    expert_lifecycle_extended_bars: int = 30
+    expert_lifecycle_exhaustion_extension_atr: float = 1.35
+    expert_lifecycle_mature_threshold_add: float = 2.0
+    expert_lifecycle_extended_threshold_add: float = 5.0
+    expert_lifecycle_exhausting_threshold_add: float = 8.0
+
+    expert_leg_budget_enabled: bool = True
+    expert_leg_second_entry_add: float = 4.0
+    expert_leg_third_entry_add: float = 8.0
+    expert_leg_require_new_structure_after: int = 2
+
+    expert_xau_probation_enabled: bool = True
+    expert_xau_probation_threshold_add: float = 5.0
+    expert_xau_require_15m_confirm: bool = True
+    expert_xau_15m_min_edge: float = 6.0
 
     # Setup-specific TP2 geometry. TP1 remains controlled by tp1_r and
     # tp1_fraction in the shared PositionManager.
@@ -818,7 +765,6 @@ class Config:
 
     def __post_init__(self):
         self.risk_per_trade = max(self.risk_min_pct, min(self.risk_max_pct, self.risk_per_trade))
-        self.fixed_margin_usdt = max(1.0, float(self.fixed_margin_usdt))
         # Hard cap from MAX_POSITIONS, independent of how many symbols are
         # configured — trading 5 symbols with MAX_POSITIONS=2 still means at
         # most 2 concurrent positions total, not 5.
@@ -849,8 +795,6 @@ class Config:
             problems.append("SYMBOLS is empty")
         if not (0 < self.leverage <= 125):
             problems.append(f"LEVERAGE out of range: {self.leverage}")
-        if self.fixed_margin_usdt <= 0:
-            problems.append(f"FIXED_MARGIN_USDT must be > 0: {self.fixed_margin_usdt}")
         return problems
 
 

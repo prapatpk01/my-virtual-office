@@ -166,7 +166,7 @@ class TelegramNotifier:
 
     async def entry_signal(self, symbol: str, direction: str, price: float, sl: float,
                            tp1: float, tp2: float, regime, bias, entry_score: float,
-                           margin_usdt: float, leverage: int, chart_path: str | None = None,
+                           risk_pct: float, leverage: int, chart_path: str | None = None,
                            entry_result=None):
         if bias is not None:
             bias_line = f"Bias: `{bias.bias}` ({bias.bull_score if direction=='LONG' else bias.bear_score:.0f})"
@@ -198,9 +198,8 @@ class TelegramNotifier:
             f"Regime: `{regime.name}` ({regime.score:.0f})\n"
             f"{bias_line}\n"
             f"{score_line}{edge_line}\n"
-            f"Margin: `{margin_usdt:.2f} USDT`\n"
-            f"Leverage: `{leverage}x`\n"
-            f"Target Notional: `~{margin_usdt * leverage:.2f} USDT`"
+            f"Risk: `{risk_pct*100:.1f}%`\n"
+            f"Leverage: `{leverage}x`"
         )
         if chart_path:
             await self._send_photo(chart_path, text)
@@ -261,17 +260,6 @@ class TelegramNotifier:
         label = "Breakeven Stop" if at_breakeven else "Stop Loss Hit"
         await self._send_message(
             f"🛑 *{label}* `{symbol}`\n\n"
-            f"Price: `{price:.6f}`\n{self._net_block(pnl, ev)}"
-        )
-
-    async def ai_exit(self, symbol: str, price: float, pnl: float, reason: str,
-                      emergency: bool = False, ev: Optional[dict] = None):
-        title = "AI Exit — Emergency Close" if emergency else "AI Exit — Confirmed Reversal"
-        icon = "🚨" if emergency else "🧠"
-        await self._send_message(
-            f"{icon} *{title}* `{symbol}`\n\n"
-            f"Multi-factor exit decision.\n"
-            f"`{reason}`\n"
             f"Price: `{price:.6f}`\n{self._net_block(pnl, ev)}"
         )
 

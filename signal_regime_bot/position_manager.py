@@ -7,10 +7,7 @@ risk accounting is registered once, when the full trade closes.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -29,22 +26,6 @@ logger = logging.getLogger("position_manager")
 
 LONG = "long"
 SHORT = "short"
-
-
-# One-time restart recovery for the currently open ETH short reported by the
-# user.  It applies only when symbol, side, entry and amount all match closely,
-# so it cannot affect later trades.  Live OKX SL/TP still takes precedence.
-_RECOVERY_OVERRIDES = (
-    {
-        "symbol": "ETH/USDT:USDT",
-        "side": SHORT,
-        "entry": 1857.85,
-        "amount": 0.349,
-        "sl": 1872.08,
-        "tp1": 1846.88,
-        "tp2": 1828.88,
-    },
-)
 
 
 @dataclass
@@ -71,15 +52,8 @@ class Position:
     trigger: str = ""
     planned_rr: float = 0.0
     structure_room_r: float = 0.0
-    # Persistent forensic metadata for /trade. These fields do not affect
-    # execution/risk; they only preserve the exact context that approved the
-    # position so a later OKX close can be explained after a restart.
-    regime_score: float = 0.0
-    bias_score: float = 0.0
-    entry_threshold: float = 0.0
-    margin_usdt: float = 0.0
-    leverage: int = 0
-    local_edge: float = 0.0
+    mfe_r: float = 0.0
+    mae_r: float = 0.0
 
 
 def calc_stop_loss(
@@ -184,132 +158,6 @@ class PositionManager:
         self.entry_engine = entry_engine
         self._positions: dict[str, Position] = {}
         self._recently_closed: dict[str, float] = {}
-        self._state_path = os.path.join(self.cfg.state_dir, "open_positions.json")
-        self._state_version = 1
-
-    @staticmethod
-    def _ts_to_text(value):
-        if value is None:
-            return None
-        try:
-            return pd.Timestamp(value).isoformat()
-        except Exception:
-            return None
-
-    @staticmethod
-    def _text_to_ts(value):
-        if not value:
-            return None
-        try:
-            return pd.Timestamp(value)
-        except Exception:
-            return None
-
-    def _position_to_dict(self, pos: Position) -> dict:
-        return {
-            "symbol": pos.symbol, "side": pos.side,
-            "entry_price": pos.entry_price, "amount": pos.amount,
-            "full_amount": pos.full_amount, "stop_loss": pos.stop_loss,
-            "tp1": pos.tp1, "tp2": pos.tp2, "one_r": pos.one_r,
-            "tp1_hit": pos.tp1_hit, "realized_pnl": pos.realized_pnl,
-            "opened_at": pos.opened_at, "regime_at_entry": pos.regime_at_entry,
-            "bias_at_entry": pos.bias_at_entry, "entry_score": pos.entry_score,
-            "entry_fee": pos.entry_fee,
-            "entry_bar_ts": self._ts_to_text(pos.entry_bar_ts),
-            "last_exit_check_bar_ts": self._ts_to_text(pos.last_exit_check_bar_ts),
-            "setup_type": pos.setup_type, "trigger": pos.trigger,
-            "planned_rr": pos.planned_rr, "structure_room_r": pos.structure_room_r,
-            "regime_score": pos.regime_score, "bias_score": pos.bias_score,
-            "entry_threshold": pos.entry_threshold, "margin_usdt": pos.margin_usdt,
-            "leverage": pos.leverage, "local_edge": pos.local_edge,
-        }
-
-    def _position_from_dict(self, item: dict) -> Optional[Position]:
-        try:
-            side = str(item["side"]).lower()
-            if side not in (LONG, SHORT):
-                return None
-            return Position(
-                symbol=str(item["symbol"]), side=side,
-                entry_price=float(item["entry_price"]), amount=float(item["amount"]),
-                full_amount=float(item.get("full_amount", item["amount"])),
-                stop_loss=float(item["stop_loss"]),
-                tp1=(None if item.get("tp1") is None else float(item["tp1"])),
-                tp2=float(item["tp2"]), one_r=float(item["one_r"]),
-                tp1_hit=bool(item.get("tp1_hit", False)),
-                realized_pnl=float(item.get("realized_pnl", 0.0)),
-                opened_at=float(item.get("opened_at", time.time())),
-                regime_at_entry=str(item.get("regime_at_entry", "")),
-                bias_at_entry=str(item.get("bias_at_entry", "")),
-                entry_score=float(item.get("entry_score", 0.0)),
-                entry_fee=float(item.get("entry_fee", 0.0)),
-                entry_bar_ts=self._text_to_ts(item.get("entry_bar_ts")),
-                last_exit_check_bar_ts=self._text_to_ts(item.get("last_exit_check_bar_ts")),
-                setup_type=str(item.get("setup_type", "")),
-                trigger=str(item.get("trigger", "")),
-                planned_rr=float(item.get("planned_rr", 0.0)),
-                structure_room_r=float(item.get("structure_room_r", 0.0)),
-                regime_score=float(item.get("regime_score", 0.0)),
-                bias_score=float(item.get("bias_score", 0.0)),
-                entry_threshold=float(item.get("entry_threshold", 0.0)),
-                margin_usdt=float(item.get("margin_usdt", 0.0)),
-                leverage=int(item.get("leverage", 0) or 0),
-                local_edge=float(item.get("local_edge", 0.0)),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            logger.warning("[STATE] invalid persisted position skipped: %s", exc)
-            return None
-
-    def save_state(self) -> None:
-        """Atomically persist every open position and lifecycle field."""
-        try:
-            os.makedirs(self.cfg.state_dir, exist_ok=True)
-            payload = {
-                "version": self._state_version,
-                "saved_at": time.time(),
-                "positions": [self._position_to_dict(p) for p in self._positions.values()],
-                "recently_closed": self._recently_closed,
-            }
-            fd, tmp = tempfile.mkstemp(prefix="open_positions.", suffix=".tmp", dir=self.cfg.state_dir)
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(payload, f, separators=(",", ":"), sort_keys=True)
-                    f.flush(); os.fsync(f.fileno())
-                os.replace(tmp, self._state_path)
-            finally:
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
-        except OSError as exc:
-            logger.error("[STATE] position state save failed: %s", exc)
-
-    def load_state(self) -> int:
-        """Restore local lifecycle state before OKX reconciliation.
-
-        OKX remains authoritative. Reconciliation validates every restored item
-        and discards stale local records.
-        """
-        try:
-            with open(self._state_path) as f:
-                payload = json.load(f)
-        except FileNotFoundError:
-            return 0
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.error("[STATE] position state load failed: %s", exc)
-            return 0
-        loaded = 0
-        self._positions.clear()
-        for item in payload.get("positions", []):
-            pos = self._position_from_dict(item)
-            if pos is not None:
-                self._positions[pos.symbol] = pos
-                loaded += 1
-        now = time.time()
-        self._recently_closed = {
-            str(k): float(v) for k, v in payload.get("recently_closed", {}).items()
-            if now - float(v) < max(getattr(self.cfg, "reconcile_settle_grace_sec", 20), 20) * 10
-        }
-        logger.info("[STATE] restored %d persisted open position(s)", loaded)
-        return loaded
 
     def get(self, symbol: str) -> Optional[Position]:
         return self._positions.get(symbol)
@@ -336,80 +184,13 @@ class PositionManager:
                 return False
         return True
 
-    @staticmethod
-    def _matching_recovery_override(symbol: str, side: str, entry: float, amount: float):
-        for item in _RECOVERY_OVERRIDES:
-            if item["symbol"] != symbol or item["side"] != side:
-                continue
-            entry_ok = abs(entry - item["entry"]) <= max(0.02, item["entry"] * 0.00002)
-            amount_ok = abs(amount - item["amount"]) <= max(0.0005, item["amount"] * 0.01)
-            if entry_ok and amount_ok:
-                return item
-        return None
-
-    async def _sync_live_protection(self, pos: Position) -> bool:
-        """Refresh an already tracked position from live OKX TP/SL values."""
-        sl, tp = await self.client.fetch_attached_stops(pos.symbol, pos.side)
-        override = self._matching_recovery_override(
-            pos.symbol, pos.side, pos.entry_price, pos.full_amount
-        )
-        if sl is None and override is not None:
-            sl = float(override["sl"])
-        if tp is None and override is not None:
-            tp = float(override["tp2"])
-        if sl is None or tp is None:
-            logger.error(
-                "[RECONCILE] %s tracked position cannot be synced: live SL=%s TP=%s",
-                pos.symbol, sl, tp,
-            )
-            return False
-
-        pos.stop_loss = float(sl)
-        pos.tp2 = float(tp)
-        pos.one_r = abs(pos.entry_price - pos.stop_loss)
-        if override is not None and not pos.tp1_hit:
-            pos.tp1 = float(override["tp1"])
-        elif not pos.tp1_hit:
-            pos.tp1 = calc_take_profits(
-                pos.side, pos.entry_price, pos.stop_loss,
-                self.cfg.tp1_r, self.cfg.tp2_r,
-            )[0]
-        return True
-
-    async def reconcile_with_exchange(self, symbols: list[str], *, startup: bool = False) -> list[dict]:
-        """Synchronize local state with live OKX positions.
-
-        At startup, newly discovered positions are treated as *resumed from
-        OKX* rather than "untracked".  During normal runtime, a newly appearing
-        exchange position is still classified as externally adopted so the
-        operator is warned about a genuinely unexpected fill/manual trade.
-        """
-        recovered: list[dict] = []
+    async def reconcile_with_exchange(self, symbols: list[str]) -> list[str]:
+        adopted: list[str] = []
         now = time.time()
         c = self.cfg
         for symbol in symbols:
-            # A periodic reconciliation must also repair a tracked position
-            # whose internal SL/TP was reconstructed incorrectly on startup.
-            existing = self.get(symbol)
-            if existing is not None:
-                details = await self.client.fetch_position_details(symbol, existing.side)
-                if not details or float(details.get("amount", 0.0)) <= 0:
-                    logger.warning("[STATE] removing stale persisted %s %s; no live OKX position", symbol, existing.side)
-                    self._positions.pop(symbol, None)
-                    self.save_state()
-                    continue
-                # OKX is authoritative for live quantity and average entry, while
-                # persisted lifecycle fields (TP1 hit, banked PnL, setup metadata) survive.
-                existing.amount = float(details.get("amount", existing.amount))
-                if not existing.tp1_hit:
-                    existing.full_amount = max(existing.full_amount, existing.amount)
-                live_entry = float(details.get("entry_price", existing.entry_price) or existing.entry_price)
-                if live_entry > 0:
-                    existing.entry_price = live_entry
-                if await self._sync_live_protection(existing):
-                    self.save_state()
+            if self.has_position(symbol):
                 continue
-
             closed_at = self._recently_closed.get(symbol)
             if closed_at is not None and now - closed_at < c.reconcile_settle_grace_sec:
                 continue
@@ -421,49 +202,26 @@ class PositionManager:
             if not open_sides:
                 continue
             if len(open_sides) > 1:
-                recovered.append({
-                    "action": "warning",
-                    "message": (
-                        f"{symbol} ⚠️ HEDGE conflict — only "
-                        f"{open_sides[0][0].upper()} can be managed; close the other leg manually"
-                    ),
-                })
+                adopted.append(
+                    f"{symbol} ⚠️ HEDGE conflict — only {open_sides[0][0].upper()} adopted; close other leg manually"
+                )
                 logger.error("[RECONCILE] %s has both long and short open", symbol)
-
             side, details = open_sides[0]
             entry = float(details["entry_price"])
             amount = float(details["amount"])
-            override = self._matching_recovery_override(symbol, side, entry, amount)
             sl, tp = await self.client.fetch_attached_stops(symbol, side)
-
-            # Never invent a 3% emergency stop.  For the currently open ETH
-            # position, use the exact verified protection values if an OKX API
-            # response is temporarily incomplete.  Other positions are not
-            # adopted until their live protection can be verified.
-            if sl is None and override is not None:
-                sl = float(override["sl"])
-                logger.warning("[RECONCILE] %s using verified recovery SL %.8f", symbol, sl)
-            if tp is None and override is not None:
-                tp = float(override["tp2"])
-                logger.warning("[RECONCILE] %s using verified recovery TP2 %.8f", symbol, tp)
-            if sl is None or tp is None:
-                msg = f"{symbol} {side.upper()} ⚠️ MANUAL REVIEW — live OKX SL/TP unavailable; not adopted"
-                recovered.append({"action": "warning", "message": msg})
-                logger.error("[RECONCILE] %s; SL=%s TP=%s", msg, sl, tp)
-                continue
-
+            if sl is None:
+                sl = entry * (0.97 if side == LONG else 1.03)
+                logger.error("[RECONCILE] %s has no attached SL; using emergency 3%% stop", symbol)
             one_r = abs(entry - float(sl))
+            if tp is None:
+                _, tp = calc_take_profits(side, entry, float(sl), c.tp1_r, c.tp2_r)
+            # Stop at/through fee-adjusted breakeven implies TP1 already banked.
             be_tolerance = max(one_r * getattr(c, "be_lock_r", 0.08), entry * c.fee_rate * 2)
             tp1_hit = (
                 float(sl) >= entry - be_tolerance if side == LONG else float(sl) <= entry + be_tolerance
             )
-            if tp1_hit:
-                tp1 = None
-            elif override is not None:
-                tp1 = float(override["tp1"])
-            else:
-                tp1 = calc_take_profits(side, entry, float(sl), c.tp1_r, c.tp2_r)[0]
-
+            tp1 = None if tp1_hit else calc_take_profits(side, entry, float(sl), c.tp1_r, c.tp2_r)[0]
             self._positions[symbol] = Position(
                 symbol=symbol,
                 side=side,
@@ -475,19 +233,12 @@ class PositionManager:
                 tp2=float(tp),
                 one_r=one_r,
                 tp1_hit=tp1_hit,
-                regime_at_entry=("RESUMED_OKX" if startup else "ADOPTED_OKX"),
-                bias_at_entry=("RESUMED_OKX" if startup else "ADOPTED_OKX"),
-                setup_type=("RESUMED_OKX" if startup else "ADOPTED_OKX"),
+                regime_at_entry="ADOPTED",
+                bias_at_entry="ADOPTED",
+                setup_type="ADOPTED",
             )
-            recovered.append({
-                "action": ("resumed" if startup else "adopted"),
-                "symbol": symbol,
-                "side": side.upper(),
-            })
-            # Persist immediately so a second restart can load this lifecycle
-            # state when STATE_DIR is backed by a Railway Volume.
-            self.save_state()
-        return recovered
+            adopted.append(f"{symbol} {side.upper()}")
+        return adopted
 
     async def _emergency_flatten_new_fill(
         self,
@@ -551,7 +302,7 @@ class PositionManager:
                     logger.error("[POS] %s could not register emergency-close PnL: %s", symbol, exc)
                 self._mark_closed(symbol)
                 self.entry_engine.on_position_closed(
-                    symbol, side.upper(), reason, net, exit_price=exit_price
+                    symbol, side.upper(), reason, net
                 )
                 logger.critical(
                     "[POS] %s emergency-flattened after %s; estimated net PnL %.2f",
@@ -632,7 +383,6 @@ class PositionManager:
             structure_room_r=getattr(entry_result, "structure_room_r", 0.0),
         )
         self._positions[symbol] = pos
-        self.save_state()
         return pos
 
     async def open_position(
@@ -718,23 +468,23 @@ class PositionManager:
         if balance <= 0:
             logger.warning("[POS] %s invalid balance %.2f", symbol, balance)
             return None
-        amount = self.risk.size_by_fixed_margin(
+        amount = self.risk.size_by_risk(
             balance,
             price,
-            margin_usdt=c.fixed_margin_usdt,
-            leverage=c.leverage,
+            sl,
+            regime.size_multiplier,
+            fee_rate=c.fee_rate,
+            expected_slippage_pct=getattr(c, "expected_slippage_pct", 0.0005),
         )
         if amount <= 0:
             return None
         estimated_risk = self.risk.estimated_risk_cash(amount, price, sl)
-        target_notional = c.fixed_margin_usdt * c.leverage
         logger.info(
-            "[POS] %s %s fixed_margin=%.2f USDT leverage=%dx target_notional=%.2f estimated_stop_loss=%.2f qty=%.8f SL=%.8f TP1=%.8f TP2=%.8f RR=%.2f",
+            "[POS] %s %s risk_budget=%.2f (%.1f%% balance) estimated=%.2f qty=%.8f SL=%.8f TP1=%.8f TP2=%.8f RR=%.2f",
             symbol,
             side.upper(),
-            c.fixed_margin_usdt,
-            c.leverage,
-            target_notional,
+            balance * c.risk_per_trade,
+            c.risk_per_trade * 100,
             estimated_risk,
             amount,
             sl,
@@ -835,18 +585,8 @@ class PositionManager:
             trigger=getattr(entry_result, "trigger", ""),
             planned_rr=actual_rr,
             structure_room_r=getattr(entry_result, "structure_room_r", 0.0),
-            regime_score=float(getattr(regime, "score", 0.0) or 0.0),
-            bias_score=float(
-                (getattr(bias, "bull_score", 0.0) if side == LONG else getattr(bias, "bear_score", 0.0))
-                if bias is not None else 0.0
-            ),
-            entry_threshold=float(getattr(entry_result, "score_threshold", 0.0) or 0.0),
-            margin_usdt=float(getattr(self.cfg, "fixed_margin_usdt", 0.0) or 0.0),
-            leverage=int(getattr(self.cfg, "leverage", 0) or 0),
-            local_edge=float((getattr(entry_result, "score_components", {}) or {}).get("local_direction_edge", 0.0) or 0.0),
         )
         self._positions[symbol] = pos
-        self.save_state()
         return pos
 
     async def check_exits_live(self, symbol: str, current_price: float) -> Optional[dict]:
@@ -854,6 +594,11 @@ class PositionManager:
         if pos is None:
             return None
         is_long = pos.side == LONG
+        if pos.one_r > 0:
+            favorable = ((current_price - pos.entry_price) if is_long else (pos.entry_price - current_price)) / pos.one_r
+            adverse = ((pos.entry_price - current_price) if is_long else (current_price - pos.entry_price)) / pos.one_r
+            pos.mfe_r = max(pos.mfe_r, float(favorable))
+            pos.mae_r = max(pos.mae_r, float(adverse))
         if (current_price <= pos.stop_loss) if is_long else (current_price >= pos.stop_loss):
             return await self._close_full(pos, current_price, "BE_HIT" if pos.tp1_hit else "SL_HIT")
         if not pos.tp1_hit and pos.tp1 is not None:
@@ -902,9 +647,8 @@ class PositionManager:
         self.risk.register_trade_result(trade_pnl, balance, time.time())
         del self._positions[pos.symbol]
         self._mark_closed(pos.symbol)
-        self.save_state()
         self.entry_engine.on_position_closed(
-            pos.symbol, pos.side.upper(), reason, trade_pnl, exit_price=price
+            pos.symbol, pos.side.upper(), reason, trade_pnl
         )
         return {
             "event": reason,
@@ -918,6 +662,11 @@ class PositionManager:
             "entry_fee_alloc": leg["entry_fee_alloc"],
             "tp1_hit": pos.tp1_hit,
             "entry_price": pos.entry_price,
+            "mfe_r": pos.mfe_r,
+            "mae_r": pos.mae_r,
+            "result_r": trade_pnl / max(pos.one_r * pos.full_amount, 1e-12),
+            "setup_type": pos.setup_type,
+            "trigger": pos.trigger,
             "position": pos,
             "approximate": True,
         }
@@ -1007,7 +756,6 @@ class PositionManager:
             pos.amount,
             tp_price=pos.tp2,
         )
-        self.save_state()
         return {
             "event": "TP1_HIT",
             "symbol": pos.symbol,
@@ -1051,9 +799,8 @@ class PositionManager:
         self.risk.register_trade_result(trade_pnl, balance, time.time())
         del self._positions[pos.symbol]
         self._mark_closed(pos.symbol)
-        self.save_state()
         self.entry_engine.on_position_closed(
-            pos.symbol, pos.side.upper(), reason, trade_pnl, exit_price=leg["exit_price"]
+            pos.symbol, pos.side.upper(), reason, trade_pnl
         )
         return {
             "event": reason,
@@ -1067,6 +814,11 @@ class PositionManager:
             "entry_fee_alloc": leg["entry_fee_alloc"],
             "tp1_hit": pos.tp1_hit,
             "entry_price": pos.entry_price,
+            "mfe_r": pos.mfe_r,
+            "mae_r": pos.mae_r,
+            "result_r": trade_pnl / max(pos.one_r * pos.full_amount, 1e-12),
+            "setup_type": pos.setup_type,
+            "trigger": pos.trigger,
             "position": pos,
         }
 
@@ -1084,7 +836,6 @@ class PositionManager:
         if pos.last_exit_check_bar_ts is not None and bar_ts <= pos.last_exit_check_bar_ts:
             return None
         pos.last_exit_check_bar_ts = bar_ts
-        self.save_state()
         bars_since = (
             int((df_5m.index > pos.entry_bar_ts).sum())
             if pos.entry_bar_ts is not None

@@ -117,13 +117,9 @@ class _State:
     last_sl_ts: Optional[pd.Timestamp] = None
     reentry_lock_direction: str = ""
     reentry_lock_ts: Optional[pd.Timestamp] = None
-    # Post-exit thesis-reset state. This prevents a profitable/early exit from
-    # being followed by an immediate same-direction chase into the same leg.
-    last_exit_ts: Optional[pd.Timestamp] = None
-    last_exit_direction: str = ""
-    last_exit_price: float = 0.0
-    last_exit_reason: str = ""
-    last_exit_pnl: float = 0.0
+    leg_direction: str = ""
+    leg_entries: int = 0
+    leg_anchor_ts: Optional[pd.Timestamp] = None
 
 
 @dataclass
@@ -189,11 +185,9 @@ class EntryEngine:
                 last_sl_ts=self._ts(d.get("last_sl_ts")),
                 reentry_lock_direction=str(d.get("reentry_lock_direction", "")),
                 reentry_lock_ts=self._ts(d.get("reentry_lock_ts")),
-                last_exit_ts=self._ts(d.get("last_exit_ts")),
-                last_exit_direction=str(d.get("last_exit_direction", "")),
-                last_exit_price=float(d.get("last_exit_price", 0.0) or 0.0),
-                last_exit_reason=str(d.get("last_exit_reason", "")),
-                last_exit_pnl=float(d.get("last_exit_pnl", 0.0) or 0.0),
+                leg_direction=str(d.get("leg_direction", "")),
+                leg_entries=int(d.get("leg_entries", 0)),
+                leg_anchor_ts=self._ts(d.get("leg_anchor_ts")),
             )
 
     def _persist_state(self) -> None:
@@ -211,11 +205,9 @@ class EntryEngine:
                 "last_sl_ts": s.last_sl_ts.isoformat() if s.last_sl_ts is not None else None,
                 "reentry_lock_direction": s.reentry_lock_direction,
                 "reentry_lock_ts": s.reentry_lock_ts.isoformat() if s.reentry_lock_ts is not None else None,
-                "last_exit_ts": s.last_exit_ts.isoformat() if s.last_exit_ts is not None else None,
-                "last_exit_direction": s.last_exit_direction,
-                "last_exit_price": s.last_exit_price,
-                "last_exit_reason": s.last_exit_reason,
-                "last_exit_pnl": s.last_exit_pnl,
+                "leg_direction": s.leg_direction,
+                "leg_entries": s.leg_entries,
+                "leg_anchor_ts": s.leg_anchor_ts.isoformat() if s.leg_anchor_ts is not None else None,
             }
         tmp = self._state_path + ".tmp"
         try:
@@ -245,22 +237,10 @@ class EntryEngine:
         exit_reason: str = "",
         trade_pnl: float = 0.0,
         closed_at: Optional[pd.Timestamp] = None,
-        exit_price: Optional[float] = None,
     ) -> None:
         s = self._get_state(symbol)
         side = str(direction or "").upper()
         now = pd.Timestamp(closed_at) if closed_at is not None else pd.Timestamp.utcnow()
-
-        # Always remember the last completed thesis. A winning early exit must
-        # NOT erase the re-entry context: doing so allowed the bot to close a
-        # tired move and then chase the very same leg a few candles later.
-        if side in (LONG, SHORT):
-            s.last_exit_ts = now
-            s.last_exit_direction = side
-            s.last_exit_price = float(exit_price or 0.0)
-            s.last_exit_reason = str(exit_reason or "").upper()
-            s.last_exit_pnl = float(trade_pnl or 0.0)
-
         is_full_sl = side in (LONG, SHORT) and trade_pnl < 0 and str(exit_reason).upper() in {"SL_HIT", "FALSE_BREAKOUT"}
         if is_full_sl:
             window = pd.Timedelta(hours=max(1, int(self.cfg.expert_reentry_lock_hours)))
@@ -272,7 +252,6 @@ class EntryEngine:
                 s.reentry_lock_direction = side
                 s.reentry_lock_ts = now
         elif trade_pnl > 0:
-            # Reset the LOSS streak only. Keep the post-exit thesis-reset state.
             s.sl_direction = ""
             s.sl_count = 0
             s.last_sl_ts = None
@@ -566,53 +545,6 @@ class EntryEngine:
         c = snap["candle"]
         return snap["directional_candle"] and c.body_atr >= min_body and snap["close_quality"] >= min_close
 
-    @staticmethod
-    def _symbol_root(symbol: str) -> str:
-        text = str(symbol or "").upper()
-        return text.split("/")[0].split("-")[0]
-
-    def _is_precision_symbol(self, symbol: str) -> bool:
-        roots = {str(x).upper() for x in getattr(self.cfg, "expert_precision_symbols", ())}
-        return self._symbol_root(symbol) in roots
-
-    def _precision_extension_limit(self, regime) -> float:
-        label = str(getattr(regime, "label", "") or "")
-        if label in (STRONG_BULL, STRONG_BEAR):
-            return float(getattr(self.cfg, "expert_precision_extension_strong_atr", 1.20))
-        if label in (EARLY_BULL, EARLY_BEAR):
-            return float(getattr(self.cfg, "expert_precision_extension_early_atr", 0.85))
-        return float(getattr(self.cfg, "expert_precision_extension_trend_atr", 1.00))
-
-    def _initial_chase_reason(self, df5: pd.DataFrame, snap: dict, direction: str) -> str:
-        """Return a hard-gate reason when the candidate is late in an impulse.
-
-        This is intentionally independent of the setup score: HTF trend/bias
-        confidence cannot compensate for paying a poor location at the end of a
-        5M displacement leg. Breakout-retests are handled separately and are
-        exempt because they explicitly prove acceptance around a new level.
-        """
-        if not getattr(self.cfg, "expert_initial_chase_guard_enabled", True) or len(df5) < 5:
-            return ""
-        atr_v = max(float(snap.get("atr", 0.0) or 0.0), 1e-12)
-        closes = df5["close"].astype(float)
-        move = (float(closes.iloc[-1]) - float(closes.iloc[-4])) / atr_v
-        if direction == SHORT:
-            move = -move
-        ema_ext = abs(float(snap["price"]) - float(snap["ema20"])) / atr_v
-        hard_ext = float(getattr(self.cfg, "expert_initial_chase_hard_extension_atr", 1.25))
-        move_thr = float(getattr(self.cfg, "expert_initial_chase_3bar_atr", 1.40))
-        ext_thr = float(getattr(self.cfg, "expert_initial_chase_ema20_atr", 0.80))
-        # Strong directional 5M structure gets a wider no-chase envelope.
-        if bool(snap.get("structure_aligned")) and float(snap.get("adx", 0.0) or 0.0) >= 22.0:
-            hard_ext = max(hard_ext, 1.45)
-            move_thr = max(move_thr, 1.70)
-            ext_thr = max(ext_thr, 1.00)
-        if ema_ext >= hard_ext:
-            return f"hard extension {ema_ext:.2f}ATR from EMA20"
-        if move >= move_thr and ema_ext >= ext_thr:
-            return f"post-impulse chase 3bar={move:.2f}ATR ema20={ema_ext:.2f}ATR"
-        return ""
-
     def _cross_candidate(self, frame: pd.DataFrame, tf: str, direction: str, snap: dict, context: dict, zone: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
         fresh, age = self._fresh_cross(snap["ema8_s"], snap["ema13_s"], direction, 0)
         if not fresh:
@@ -728,33 +660,9 @@ class EntryEngine:
             float(row["high"]) >= z.low and float(row["close"]) < z.low and s5["candle"].upper_wick >= s5["candle"].body*0.8
         )
         micro_break = s5["price"] > float(df5["high"].iloc[-2]) if direction == LONG else s5["price"] < float(df5["low"].iloc[-2])
-        # A mapped FVG/OB is LOCATION, not a standalone trigger.  The entry
-        # needs a 5M structure confirmation (micro break or BOS); a wick alone
-        # only arms the area and waits for the next confirmed candle.
-        ema_reclaim = (
-            s5["price"] > s5["ema20"] if direction == LONG
-            else s5["price"] < s5["ema20"]
-        )
-        strong_rejection = (
-            wick_reject
-            and s5["directional_candle"]
-            and s5["close_quality"] >= 0.62
-        )
-        if self.cfg.expert_smc_require_micro_structure_confirm:
-            # Route A: zone + micro BOS/break.
-            # Route B: zone + decisive rejection + EMA20 reclaim.
-            if not (micro_break or s5["bos"] or (strong_rejection and ema_reclaim)):
-                return None
-        elif not (wick_reject or micro_break or s5["bos"]):
+        if not (wick_reject or micro_break or s5["bos"]):
             return None
         label = getattr(regime,"label","")
-        precision = self._is_precision_symbol(getattr(bias, "symbol", ""))
-        # `BiasResult` does not necessarily carry symbol; the caller adds a
-        # precision marker to the zone context when evaluating BTC/ETH.
-        precision = bool(zone.get("precision_symbol", precision))
-        if precision and self.cfg.expert_precision_require_15m_structure:
-            if not (s15["structure_aligned"] or s15["bos"]):
-                return None
         # Standalone zone reactions are disabled in range/compression by
         # default. Those regimes must use the stricter sweep-at-zone route.
         if label in (RANGE, COMPRESSION) and not self.cfg.expert_allow_range_trades:
@@ -771,10 +679,7 @@ class EntryEngine:
         if s5["di_spread"] < self.cfg.expert_smc_di_spread_min:
             return None
         ema20_extension = abs(s5["price"] - s5["ema20"]) / s5["atr"]
-        max_smc_ext = self.cfg.expert_smc_max_ema20_extension_atr
-        if precision:
-            max_smc_ext = min(max_smc_ext, self._precision_extension_limit(regime))
-        if ema20_extension > max_smc_ext:
+        if ema20_extension > self.cfg.expert_smc_max_ema20_extension_atr:
             return None
         if direction == LONG and s5["rsi"] > self.cfg.expert_smc_rsi_long_max:
             return None
@@ -803,8 +708,7 @@ class EntryEngine:
             score=score, threshold=threshold, price=s5["price"], atr_v=s5["atr"], invalidation=invalidation,
             desired_r=self.cfg.expert_tp2_smc_r, opposing_level=opposing, bar_ts=pd.Timestamp(df5.index[-1]),
             components={"htf":htf_detail,"structure":structure_pts,"location":location_pts,"trigger":trigger_pts,"momentum":momentum_pts,"quality":quality_pts,"zone_tf":z.timeframe,"zone_source":z.source,"zone_low":z.low,"zone_high":z.high,"local_edge":s5["edge"],"di_spread":round(s5["di_spread"],1),"rsi":round(s5["rsi"],1),"ema20_extension_atr":round(ema20_extension,2)},
-            min_room_r=(self.cfg.expert_range_min_room_r if label in (RANGE,COMPRESSION)
-                        else self.cfg.expert_smc_min_room_r),
+            min_room_r=self.cfg.expert_range_min_room_r if label in (RANGE,COMPRESSION) else None,
         )
 
     def _breakout_candidate(self, frame: pd.DataFrame, tf: str, direction: str, snap: dict, context: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
@@ -883,10 +787,9 @@ class EntryEngine:
             score=score, threshold=threshold, price=snap["price"], atr_v=snap["atr"], invalidation=invalidation,
             desired_r=self.cfg.expert_tp2_breakout_r, opposing_level=opposing, bar_ts=pd.Timestamp(frame.index[-1]),
             components={"htf":htf_detail,"structure":structure_pts,"location":location_pts,"trigger":trigger_pts,"momentum":momentum_pts,"quality":quality_pts,"break_level":level,"break_age":break_age,"extension_atr":round(extension,2),"local_edge":snap["edge"]},
-            min_room_r=(self.cfg.expert_breakout_retest_min_room_r if retest else None),
         )
 
-    def _liquidity_sweep(self, frame: pd.DataFrame, tf: str, direction: str, snap: dict, context: dict, zone: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
+    def _liquidity_sweep(self, frame: pd.DataFrame, tf: str, direction: str, snap: dict, zone: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
         level = snap["swing_low"] if direction == LONG else snap["swing_high"]
         if level is None or (isinstance(level,float) and math.isnan(level)):
             level = float(frame["low"].iloc[-12:-1].min()) if direction==LONG else float(frame["high"].iloc[-12:-1].max())
@@ -898,31 +801,7 @@ class EntryEngine:
         )
         if not swept:
             return None
-        previous_high = float(frame["high"].iloc[-2])
-        previous_low = float(frame["low"].iloc[-2])
-        micro_break = snap["price"] > previous_high if direction == LONG else snap["price"] < previous_low
-        ema_reclaim = (
-            snap["price"] > snap["ema20"] if direction == LONG
-            else snap["price"] < snap["ema20"]
-        )
-        displacement_reclaim = (
-            snap["directional_candle"]
-            and snap["close_quality"] >= 0.62
-            and ema_reclaim
-        )
-        if self.cfg.expert_sweep_require_micro_structure_confirm and not (
-            micro_break or snap["bos"] or displacement_reclaim
-        ):
-            return None
         label = getattr(regime,"label","")
-        precision = bool(zone.get("precision_symbol", False))
-        if precision and self.cfg.expert_precision_require_15m_structure:
-            if not (context["structure_aligned"] or context["bos"]):
-                return None
-        if precision:
-            ema_ext = abs(snap["price"] - snap["ema20"]) / max(snap["atr"], 1e-12)
-            if ema_ext > self._precision_extension_limit(regime):
-                return None
         # A sweep is meaningful only at mapped liquidity/location. This keeps
         # range trading active without treating every wick as institutional SMC.
         if not zone["near_own"]:
@@ -953,9 +832,8 @@ class EntryEngine:
             direction=direction,setup_type=LIQUIDITY_SWEEP,timeframe=tf,trigger="SWEEP_AND_RECLAIM",
             score=score,threshold=threshold,price=snap["price"],atr_v=snap["atr"],invalidation=invalidation,
             desired_r=self.cfg.expert_tp2_smc_r,opposing_level=opposing,bar_ts=pd.Timestamp(frame.index[-1]),
-            components={"htf":htf_detail,"structure":structure_pts,"location":location_pts,"trigger":trigger_pts,"momentum":momentum_pts,"quality":quality_pts,"swept_level":level,"local_edge":snap["edge"],"micro_break":micro_break},
-            min_room_r=(self.cfg.expert_range_min_room_r if label in (RANGE,COMPRESSION)
-                        else self.cfg.expert_sweep_min_room_r),
+            components={"htf":htf_detail,"structure":structure_pts,"location":location_pts,"trigger":trigger_pts,"momentum":momentum_pts,"quality":quality_pts,"swept_level":level,"local_edge":snap["edge"]},
+            min_room_r=self.cfg.expert_range_min_room_r if label in (RANGE,COMPRESSION) else None,
         )
 
     def _continuation(self, df5: pd.DataFrame, direction: str, s5: dict, s15: dict, regime, bias, opposing: Optional[float]) -> Optional[_Candidate]:
@@ -1039,6 +917,53 @@ class EntryEngine:
             min_room_r=self.cfg.expert_range_min_room_r,
         )
 
+    def _trend_lifecycle(self, df5: pd.DataFrame, direction: str) -> tuple[str, float]:
+        """Approximate the current directional leg age + extension.
+
+        This is intentionally execution-frame local. It distinguishes a fresh
+        trend from a mature/extended leg so a 100 regime score cannot by itself
+        justify chasing the third continuation entry.
+        """
+        if df5 is None or len(df5) < 40:
+            return "DEVELOPING", 0.0
+        close = df5["close"].astype(float)
+        ema20 = ind.ema(close, 20)
+        atrs = ind.atr(df5, 14)
+        atrv = max(float(atrs.iloc[-1]), 1e-12)
+        aligned = (close > ema20) if direction == LONG else (close < ema20)
+        age = 0
+        for ok in reversed(aligned.iloc[-48:].tolist()):
+            if not bool(ok):
+                break
+            age += 1
+        ext = abs(float(close.iloc[-1] - ema20.iloc[-1])) / atrv
+        if ext >= float(getattr(self.cfg, "expert_lifecycle_exhaustion_extension_atr", 1.35)):
+            return "EXHAUSTING", ext
+        if age >= int(getattr(self.cfg, "expert_lifecycle_extended_bars", 30)):
+            return "EXTENDED", ext
+        if age >= int(getattr(self.cfg, "expert_lifecycle_mature_bars", 18)):
+            return "MATURE", ext
+        if age <= 6:
+            return "EARLY", ext
+        return "DEVELOPING", ext
+
+    def _adaptive_candidate_threshold(self, candidate: _Candidate, lifecycle: str, state: _State, symbol: str) -> float:
+        add = 0.0
+        if bool(getattr(self.cfg, "expert_trend_lifecycle_enabled", True)):
+            add += {
+                "MATURE": float(getattr(self.cfg, "expert_lifecycle_mature_threshold_add", 2.0)),
+                "EXTENDED": float(getattr(self.cfg, "expert_lifecycle_extended_threshold_add", 5.0)),
+                "EXHAUSTING": float(getattr(self.cfg, "expert_lifecycle_exhausting_threshold_add", 8.0)),
+            }.get(lifecycle, 0.0)
+        if bool(getattr(self.cfg, "expert_leg_budget_enabled", True)) and state.leg_direction == candidate.direction:
+            if state.leg_entries == 1:
+                add += float(getattr(self.cfg, "expert_leg_second_entry_add", 4.0))
+            elif state.leg_entries >= 2:
+                add += float(getattr(self.cfg, "expert_leg_third_entry_add", 8.0))
+        if bool(getattr(self.cfg, "expert_xau_probation_enabled", True)) and "XAU" in str(symbol).upper():
+            add += float(getattr(self.cfg, "expert_xau_probation_threshold_add", 5.0))
+        return candidate.threshold + add
+
     def _reentry_allowed(self, state: _State, direction: str, df15: pd.DataFrame) -> tuple[bool,str]:
         if state.reentry_lock_direction != direction or state.reentry_lock_ts is None:
             return True,""
@@ -1052,112 +977,6 @@ class EntryEngine:
             state.reentry_lock_direction=""; state.reentry_lock_ts=None
             return True,"fresh 15M BOS reset re-entry lock"
         return False,"same-side locked after 3 full SLs; waiting for fresh 15M BOS or lock expiry"
-
-    @staticmethod
-    def _epoch(value) -> float:
-        try:
-            return float(pd.Timestamp(value).timestamp())
-        except (TypeError, ValueError, OSError):
-            return 0.0
-
-    def _post_exit_candidate_allowed(
-        self, state: _State, candidate: _Candidate, df15: pd.DataFrame, df5: pd.DataFrame
-    ) -> tuple[bool, str]:
-        """Require a new market cycle before re-entering the same direction.
-
-        The normal symbol cooldown is only a time brake. This gate is a thesis
-        reset: after a position is closed, the bot must see a meaningful
-        counter-trend reset/reclaim or a fresh 15M BOS + retest before it can
-        join the same side again. It also blocks buying materially above a
-        recent long exit (or shorting materially below a recent short exit)
-        without a new structural base.
-        """
-        if not getattr(self.cfg, "expert_post_exit_reset_enabled", True):
-            return True, ""
-        if state.last_exit_ts is None or state.last_exit_direction != candidate.direction:
-            return True, ""
-
-        current_ts = pd.Timestamp(df5.index[-1])
-        age_sec = self._epoch(current_ts) - self._epoch(state.last_exit_ts)
-        if age_sec < 0:
-            # Clock/index mismatch should fail safe without permanently locking.
-            return True, ""
-        lock_hours = float(getattr(self.cfg, "expert_post_exit_reset_hours", 6.0))
-        if age_sec > lock_hours * 3600.0:
-            return True, "post-exit reset window expired"
-
-        exit_epoch = self._epoch(state.last_exit_ts)
-        rows = [self._epoch(x) > exit_epoch for x in df5.index]
-        recent = df5.loc[rows] if any(rows) else df5.iloc[0:0]
-        min_bars = max(2, int(getattr(self.cfg, "expert_post_exit_min_5m_bars", 4)))
-        if len(recent) < min_bars:
-            return False, f"post-exit reset: only {len(recent)}/{min_bars} new 5M bars"
-
-        close = df5["close"].astype(float)
-        atr_v = max(ind.safe_float(ind.atr(df5, 14).iloc[-1]), 1e-12)
-        ema8 = ind.ema(close, 8)
-        ema13 = ind.ema(close, 13)
-        ema20 = ind.ema(close, 20)
-        now_price = float(close.iloc[-1])
-        near_value = abs(now_price - float(ema20.iloc[-1])) / atr_v <= float(
-            getattr(self.cfg, "expert_post_exit_value_max_atr", 0.70)
-        )
-
-        # Did price actually reset against the old trade after the exit?
-        if candidate.direction == LONG:
-            running_extreme = recent["high"].astype(float).cummax()
-            pullback_atr = float(((running_extreme - recent["low"].astype(float)) / atr_v).max())
-        else:
-            running_extreme = recent["low"].astype(float).cummin()
-            pullback_atr = float(((recent["high"].astype(float) - running_extreme) / atr_v).max())
-        pullback_ok = pullback_atr >= float(getattr(self.cfg, "expert_post_exit_pullback_atr", 0.55))
-
-        # A genuine EMA cycle (opposite alignment after exit, then reclaim) is a
-        # useful proxy for a new 5M leg rather than continuation of the old one.
-        after_idx = [i for i, x in enumerate(df5.index) if self._epoch(x) > exit_epoch]
-        ema_cycle = False
-        if after_idx:
-            if candidate.direction == LONG:
-                saw_reset = any(float(ema8.iloc[i]) <= float(ema13.iloc[i]) for i in after_idx[:-1])
-                ema_cycle = saw_reset and float(ema8.iloc[-1]) > float(ema13.iloc[-1])
-            else:
-                saw_reset = any(float(ema8.iloc[i]) >= float(ema13.iloc[i]) for i in after_idx[:-1])
-                ema_cycle = saw_reset and float(ema8.iloc[-1]) < float(ema13.iloc[-1])
-
-        bos15, _ = ind.latest_bos(df15, candidate.direction, 3, 3, 0.12)
-        fresh_bos15 = bool(bos15) and self._epoch(df15.index[-1]) > exit_epoch
-        is_retest = candidate.setup_type == BREAKOUT_RETEST or "RETEST" in candidate.trigger.upper()
-        structural_reentry = fresh_bos15 and is_retest
-
-        # A close caused by momentum/structure invalidation is especially prone
-        # to whipsaw. Do not re-enter via another zone/reclaim signal until the
-        # 5M cycle has reset, or a new 15M breakout has broken and retested.
-        strict_reasons = {
-            EMA_CROSS_REVERSAL, PRICE_OPEN_BEYOND_EMA, "AI_EXIT",
-            "AI_EXIT_EMERGENCY", "SPIKE_GUARD", "BE_HIT", "SL_HIT",
-            "FALSE_BREAKOUT",
-        }
-        strict = state.last_exit_reason in strict_reasons
-        reset_ok = structural_reentry or ema_cycle or (pullback_ok and near_value and not strict)
-
-        # Explicit no-chase distance from the last exit. A new breakout-retest
-        # may re-enter at a higher/lower price because it establishes a fresh
-        # structure; other setups may not chase the old leg.
-        chase_atr = 0.0
-        if state.last_exit_price > 0:
-            favorable = (now_price - state.last_exit_price) if candidate.direction == LONG else (state.last_exit_price - now_price)
-            chase_atr = favorable / atr_v
-        max_chase = float(getattr(self.cfg, "expert_post_exit_max_chase_atr", 1.00))
-        if chase_atr > max_chase and not structural_reentry:
-            return False, (f"post-exit no-chase: price advanced {chase_atr:.2f}ATR from last "
-                           f"{candidate.direction.lower()} exit; waiting for fresh 15M BOS+retest")
-
-        if not reset_ok:
-            mode = "strict thesis reset" if strict else "pullback/reclaim reset"
-            return False, (f"post-exit {mode} not confirmed: pullback={pullback_atr:.2f}ATR "
-                           f"nearEMA20={int(near_value)} emaCycle={int(ema_cycle)} "
-                           f"fresh15MBOSretest={int(structural_reentry)}")
-        return True, "post-exit thesis reset confirmed"
 
     def _same_setup_cooldown(self,state:_State,candidate:_Candidate,current_ts:pd.Timestamp)->bool:
         if not state.last_setup or state.last_entry_ts is None or candidate.setup_type!=state.last_setup:
@@ -1185,24 +1004,8 @@ class EntryEngine:
         state=self._get_state(symbol)
         current_ts=pd.Timestamp(df_5m.index[-1])
         price=float(df_5m["close"].iloc[-1])
-
-        # Status/logging may call the pipeline several times while the same
-        # closed 5M candle is still current.  The duplicate-bar guard must block
-        # a second order evaluation, but it must not return the dataclass
-        # defaults (0.0/0.0) for EMA8/EMA13.  Calculate the lightweight display
-        # snapshot before the guard so Railway status always shows real values.
-        close_5m = df_5m["close"].astype(float)
-        ema8_now = ind.safe_float(ind.ema(close_5m, 8).iloc[-1])
-        ema13_now = ind.safe_float(ind.ema(close_5m, 13).iloc[-1])
-        _, _, macd_hist_s = ind.macd(close_5m, 12, 26, 9)
-        macd_hist_now = ind.safe_float(macd_hist_s.iloc[-1])
-
         if state.last_processed_5m==current_ts:
-            return EntryResult(
-                NONE, False, "5M bar already processed", price=price,
-                ema_fast=ema8_now, ema_slow=ema13_now,
-                macd_hist=macd_hist_now, score_evaluated=False,
-            )
+            return EntryResult(NONE,False,"5M bar already processed",price=price)
         state.last_processed_5m=current_ts
 
         label=getattr(regime,"label","")
@@ -1224,26 +1027,23 @@ class EntryEngine:
                 (df_15m,"15M",self.cfg.expert_zone_lookback_15m),
                 (df_1h,"1H",self.cfg.expert_zone_lookback_1h),
             ])
-            zone["precision_symbol"] = self._is_precision_symbol(symbol)
-            # Hard room uses active opposing SMC zones plus confirmed 1H/4H
-            # structure. We deliberately exclude 15M minor pivots here so the
-            # quality gate protects obvious HTF ceilings/floors without
-            # returning to the over-filtered behavior of older versions.
-            support,resistance=self._nearest_structure(s5["price"],[df_1h,df_4h])
-            levels=[]
+            # Hard room is based on active opposing Supply/Demand, not every
+            # minor swing. Minor pivots are frequently crossed during trend
+            # continuation and treating all of them as hard ceilings caused
+            # the previous bot to reject virtually every setup.
+            # Major pivots are retained for diagnostics/context. Active
+            # opposing SMC zones are the non-compensable hard room gate; minor
+            # pivots are crossed frequently during continuation.
+            support,resistance=self._nearest_structure(s5["price"],[df_15m,df_1h,df_4h])
+            opposing=None
             if zone["opposing"] is not None:
-                levels.append(zone["opposing"].low if side==LONG else zone["opposing"].high)
-            if side==LONG and resistance is not None and resistance>s5["price"]:
-                levels.append(resistance)
-            if side==SHORT and support is not None and support<s5["price"]:
-                levels.append(support)
-            opposing=(min(levels) if side==LONG else max(levels)) if levels else None
+                opposing=zone["opposing"].low if side==LONG else zone["opposing"].high
 
             if self.cfg.expert_allow_15m_entry:
                 for cand in (
                     self._cross_candidate(df_15m,"15M",side,s15,s15,zone,regime,bias,opposing),
                     self._breakout_candidate(df_15m,"15M",side,s15,s15,regime,bias,opposing),
-                    self._liquidity_sweep(df_15m,"15M",side,s15,s15,zone,regime,bias,opposing),
+                    self._liquidity_sweep(df_15m,"15M",side,s15,zone,regime,bias,opposing),
                 ):
                     if cand is not None: candidates.append(cand)
             if self.cfg.expert_allow_5m_entry:
@@ -1253,44 +1053,61 @@ class EntryEngine:
                      if self.cfg.expert_structure_pullback_enabled else None),
                     self._smc_rejection(df_5m,side,s5,s15,zone,regime,bias,opposing),
                     self._breakout_candidate(df_5m,"5M",side,s5,s15,regime,bias,opposing),
-                    self._liquidity_sweep(df_5m,"5M",side,s5,s15,zone,regime,bias,opposing),
+                    self._liquidity_sweep(df_5m,"5M",side,s5,zone,regime,bias,opposing),
                     self._continuation(df_5m,side,s5,s15,regime,bias,opposing),
                     self._range_reversal(df_15m,df_5m,side,s5,zone,regime,bias,opposing),
                 ):
                     if cand is not None: candidates.append(cand)
             diagnostics.append(f"{side}:15Medge={s15['edge']:+.0f} 5Medge={s5['edge']:+.0f} zone={zone['own'].timeframe if zone['own'] else '-'}")
 
-        # Initial-entry chase protection: unlike the V3.2.5 post-exit gate,
-        # this also protects the FIRST entry of a leg. A breakout-retest is
-        # exempt because the retest itself proves a new accepted location.
-        chase_filtered=[]
-        for cand in candidates:
-            side_snap=self._snapshot(df_5m,cand.direction)
-            chase_reason=self._initial_chase_reason(df_5m,side_snap,cand.direction)
-            if chase_reason and cand.setup_type != BREAKOUT_RETEST:
-                diagnostics.append(f"{cand.direction}:{cand.setup_type} blocked — {chase_reason}")
-                continue
-            # Precision symbols require tighter 5M value location for all
-            # ordinary triggers. This is the BTC/ETH anti-late-entry lane.
-            if self._is_precision_symbol(symbol) and cand.setup_type != BREAKOUT_RETEST:
-                ext=abs(side_snap["price"]-side_snap["ema20"])/max(side_snap["atr"],1e-12)
-                precision_limit = self._precision_extension_limit(regime)
-                if ext > precision_limit:
-                    diagnostics.append(f"{cand.direction}:{cand.setup_type} blocked — precision extension {ext:.2f}ATR>{precision_limit:.2f}")
-                    continue
-            chase_filtered.append(cand)
-        candidates=chase_filtered
-
-        post_exit_filtered=[]
-        for cand in candidates:
-            ok, why = self._post_exit_candidate_allowed(state, cand, df_15m, df_5m)
-            if ok:
-                post_exit_filtered.append(cand)
-            else:
-                diagnostics.append(f"{cand.direction}:{cand.setup_type} blocked — {why}")
-        candidates=post_exit_filtered
         candidates=[c for c in candidates if not self._same_setup_cooldown(state,c,current_ts)]
         candidates=[c for c in candidates if c.signal_key!=state.last_entry_key]
+
+        # V3.3.1 local adaptation: lifecycle, trend-leg budget and XAU probation.
+        adapted=[]
+        for cand in candidates:
+            lifecycle, lifecycle_ext = self._trend_lifecycle(df_5m, cand.direction)
+            # XAU must have meaningful 15M confirmation while on probation.
+            if (
+                bool(getattr(self.cfg, "expert_xau_probation_enabled", True))
+                and "XAU" in str(symbol).upper()
+                and bool(getattr(self.cfg, "expert_xau_require_15m_confirm", True))
+            ):
+                x15=self._snapshot(df_15m,cand.direction)
+                if x15["edge"] < float(getattr(self.cfg, "expert_xau_15m_min_edge", 6.0)):
+                    diagnostics.append(f"{cand.direction}:{cand.setup_type} XAU probation 15M edge {x15['edge']:+.0f}")
+                    continue
+
+            # After two entries in one directional leg, require genuinely fresh
+            # 15M structure before allowing another continuation attempt.
+            if (
+                bool(getattr(self.cfg, "expert_leg_budget_enabled", True))
+                and state.leg_direction == cand.direction
+                and state.leg_entries >= int(getattr(self.cfg, "expert_leg_require_new_structure_after", 2))
+            ):
+                bos,_=ind.latest_bos(df_15m,cand.direction,3,3,0.12)
+                fresh_bos = bool(bos) and (
+                    state.leg_anchor_ts is None or pd.Timestamp(df_15m.index[-1]) > state.leg_anchor_ts
+                )
+                if not fresh_bos:
+                    diagnostics.append(f"{cand.direction}:{cand.setup_type} leg budget {state.leg_entries} waiting fresh 15M BOS")
+                    continue
+                state.leg_entries=0
+                state.leg_anchor_ts=pd.Timestamp(df_15m.index[-1])
+
+            effective_thr=self._adaptive_candidate_threshold(cand,lifecycle,state,symbol)
+            if cand.score < effective_thr:
+                diagnostics.append(
+                    f"{cand.direction}:{cand.setup_type} lifecycle={lifecycle} "
+                    f"score {cand.score:.0f}<{effective_thr:.0f}"
+                )
+                continue
+            cand.threshold=round(effective_thr,1)
+            cand.components["trend_lifecycle"]=lifecycle
+            cand.components["lifecycle_extension_atr"]=round(lifecycle_ext,2)
+            cand.components["leg_entry_no"]=(state.leg_entries+1 if state.leg_direction==cand.direction else 1)
+            adapted.append(cand)
+        candidates=adapted
         if not candidates:
             self._persist_state()
             s5=self._snapshot(df_5m,sides[0])
@@ -1341,6 +1158,14 @@ class EntryEngine:
         try:
             s.last_entry_ts=pd.Timestamp(cross_ts[0])
             s.last_setup=str(cross_ts[2])
+            direction=str(cross_ts[1])
+            if s.leg_direction == direction:
+                s.leg_entries += 1
+            else:
+                s.leg_direction = direction
+                s.leg_entries = 1
+            if s.leg_anchor_ts is None:
+                s.leg_anchor_ts = s.last_entry_ts
         except (TypeError,ValueError,IndexError):
             s.last_entry_ts=pd.Timestamp.utcnow()
         self._persist_state()
