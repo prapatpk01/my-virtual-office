@@ -504,6 +504,7 @@ class TradingBot:
         await self._reconcile_positions()
 
         while self.state.running:
+            cycle_start = time.monotonic()
             try:
                 await self._tick()
             except asyncio.CancelledError:
@@ -511,7 +512,21 @@ class TradingBot:
             except Exception as e:
                 logger.error("Bot tick error: %s", e, exc_info=True)
                 self.state.error = str(e)
-            await asyncio.sleep(self.interval)
+            # Keep a FIXED scan cadence. Sleeping a flat `interval` after the
+            # tick made the real period `tick + interval`: scanning 7 symbols x
+            # 3 timeframes takes minutes, so a 5-minute setting was producing
+            # ~10-minute rounds. Subtract the work time instead.
+            elapsed = time.monotonic() - cycle_start
+            delay = self.interval - elapsed
+            if delay <= 0:
+                logger.warning(
+                    "Scan cycle took %.0fs, longer than the %ds interval — "
+                    "starting the next scan immediately", elapsed, self.interval,
+                )
+                delay = 1.0
+            else:
+                logger.info("Scan cycle done in %.0fs — next scan in %.0fs", elapsed, delay)
+            await asyncio.sleep(delay)
 
     async def _tick(self):
         self.state.error = ""
