@@ -510,14 +510,13 @@ class TrendConfirmStrategy(BaseStrategy):
             # the stop cap and the anti-chase guard still blocks real chasing.
             self.max_dist_atr_mult = 1.70
             self.entry_min_stop_atr = 0.60   # back to 0.60 (0.50 let stops get even tighter)
-            self.entry_max_stop_atr = 2.00
+            self.entry_max_stop_atr = 2.80
             self.use_hard_tp = True
             self.use_partial_tp = False
             self.use_be_trail = True
-            self.be_trail_trigger_r = 1.0
-            self.be_trail_sl_r = 0.5
+            self.be_trail_trigger_r = 0.6  # compatibility only; live trail uses +0.6% price move
+            self.be_trail_sl_r = 0.3       # compatibility only; live lock uses +0.3% from entry
             self.runner_ignore_signal_exit_after_be = False
-            self.crossback_exit_requires_profit = False
 
         self._open_position: Optional[str] = None   # "long" | "short" | None
         self._trend_state: Optional[str] = None      # "up" | "down" | None — Layer 1 result
@@ -1006,12 +1005,16 @@ class TrendConfirmStrategy(BaseStrategy):
                 metadata={"macro_4h": macro, "quality_1h": ctx, "data_quality": data_quality},
             )
 
-        # Layer 2 — 1H context is advisory once 4H has confirmed direction.
-        # Do NOT discard a fresh 15M trend-aligned cross only because the
-        # composite 1H quality score missed an arbitrary threshold.  We keep
-        # the score/votes in diagnostics and let the explicit CHOP/sideways
-        # safety gate below decide whether market quality is actually poor.
-        ctx["quality_gate_passed"] = bool(ctx["ready"])
+        # Layer 2 — 1H context and trend quality in the 4H-selected direction.
+        if not ctx["ready"]:
+            reason = (
+                f"1H context not ready: quality={ctx['score']:.0f} (min {ctx['min_quality']:.0f}), "
+                f"structure={ctx['votes']}/3 (min {ctx['min_votes']}), "
+                f"ADX={ctx['adx']:.1f}, CHOP={ctx['chop']:.1f}, "
+                f"trend_quality={'OK' if ctx['regime_ok'] else 'WEAK'}"
+            )
+            return self._hold(current_price, reason,
+                              metadata={"macro_4h": macro, "quality_1h": ctx, "data_quality": data_quality})
 
         # Layer 3 — clear 15M CHOP/sideways veto. Do not stack more indicators.
         trend_key = "up" if direction == "long" else "down"
@@ -1073,13 +1076,21 @@ class TrendConfirmStrategy(BaseStrategy):
         if dist_atr > self.max_dist_atr_mult:
             return self._hold(current_price, f"15M anti-chase: {dist_atr:.2f}ATR from EMA{self.ema_slow} > {self.max_dist_atr_mult:.2f}")
 
-        rr = 2.5  # fixed hard TP; reverse cross may close the trade earlier
-        raw_stop = self._structure_stop_15m(c15, direction, atr15)
-        risk_plan = self._compute_entry_sl_tp(direction, float(current_price), raw_stop, atr15,
-                                              mirror_raw_stop=False, rr_ratio=rr)
-        if risk_plan is None:
-            return self._hold(current_price, "15M structure SL outside 0.6–2.0 ATR safety range")
-        sl, tp, _risk_distance, risk_atr = risk_plan
+        # Fixed-percentage 15M trade plan.
+        # Initial SL = 1.0% from entry; hard TP = 1.3% from entry.
+        # A fresh 15M reverse EMA cross can still close the position early.
+        entry_px = float(current_price)
+        sl_pct = 0.010
+        tp_pct = 0.013
+        if direction == "long":
+            sl = entry_px * (1.0 - sl_pct)
+            tp = entry_px * (1.0 + tp_pct)
+        else:
+            sl = entry_px * (1.0 + sl_pct)
+            tp = entry_px * (1.0 - tp_pct)
+        _risk_distance = abs(entry_px - sl)
+        risk_atr = (_risk_distance / atr15) if atr15 > 0 else 0.0
+        rr = tp_pct / sl_pct  # 1.30 reward/risk
 
         self._last_entry_attempt_bar_ts = bar_ts
         self._open_position = direction
@@ -1103,13 +1114,14 @@ class TrendConfirmStrategy(BaseStrategy):
             "take_profit": round(float(tp), 8),
             "rr_ratio": round(float(rr), 2),
             "risk_atr": round(float(risk_atr), 3),
-            "be_trigger_r": round(float(self.be_trail_trigger_r), 2),
-            "be_lock_r": 0.5,
+            "sl_pct": 1.0,
+            "tp_pct": 1.3,
+            "trail_trigger_pct": 0.6,
+            "trail_lock_pct": 0.3,
             "sizing_mode": self.sizing_mode,
             "margin_pct": self.margin_pct,
             "macro_4h": macro,
             "quality_1h": ctx,
-            "quality_gate_mode": "ADVISORY",
             "quality_15m": q15,
             "sideways_15m": sideways,
             "cross_15m": cross_label,
@@ -1125,7 +1137,7 @@ class TrendConfirmStrategy(BaseStrategy):
         )
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
-        """Manage 2.5R hard TP, structure SL (max 2.0 ATR), +1.0R -> SL +0.5R, and fresh CLOSED 15M reverse-cross exit."""
+        """Manage one hard TP/SL, +0.8R -> SL +0.5R, and CLOSED 15M reverse-cross exit."""
         if self._open_position is None:
             return None
         from ..engines.position_manager import PositionUpdate
@@ -1179,28 +1191,30 @@ class TrendConfirmStrategy(BaseStrategy):
                                     "wait for new trend-aligned cross"),
                         )
 
-        # No partial close. Once +0.8R is touched, lock +0.5R and keep full size.
+        # No partial close. Once price moves +0.6% from entry, lock +0.3%
+        # from entry and keep the full position open toward the 1.3% hard TP.
         if (self.use_be_trail and not self._be_trailed
                 and self._entry_price is not None and self._entry_sl is not None):
-            r = abs(float(self._entry_price) - float(self._entry_sl))
-            if r > 0:
-                hit = ((self._open_position == "long"
-                        and current_price >= self._entry_price + self.be_trail_trigger_r * r)
-                       or (self._open_position == "short"
-                           and current_price <= self._entry_price - self.be_trail_trigger_r * r))
-                if hit:
-                    self._be_trailed = True
-                    new_sl = (self._entry_price + self.be_trail_sl_r * r
-                              if self._open_position == "long"
-                              else self._entry_price - self.be_trail_sl_r * r)
-                    return PositionUpdate(
-                        action="move_sl", new_sl=float(new_sl),
-                        reason=f"+{self.be_trail_trigger_r:.1f}R reached — SL -> +{self.be_trail_sl_r:.1f}R; full position remains open",
-                    )
+            trigger_pct = 0.006
+            lock_pct = 0.003
+            entry_px = float(self._entry_price)
+            hit = ((self._open_position == "long"
+                    and current_price >= entry_px * (1.0 + trigger_pct))
+                   or (self._open_position == "short"
+                       and current_price <= entry_px * (1.0 - trigger_pct)))
+            if hit:
+                self._be_trailed = True
+                new_sl = (entry_px * (1.0 + lock_pct)
+                          if self._open_position == "long"
+                          else entry_px * (1.0 - lock_pct))
+                return PositionUpdate(
+                    action="move_sl", new_sl=float(new_sl),
+                    reason="+0.6% reached — SL -> +0.3%; full position remains open toward 1.3% TP",
+                )
 
         return PositionUpdate(
             action="hold",
-            reason=(f"Holding {self._open_position.upper()} — hard TP/SL active; "
+            reason=(f"Holding {self._open_position.upper()} — SL 1.0% / TP 1.3% active; "
                     + ("waiting for 15M reverse cross" if crossback_armed
                        else "cross exit disarmed while red (SL/TP manage it)")),
         )
