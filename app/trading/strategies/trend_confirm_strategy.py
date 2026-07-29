@@ -510,13 +510,14 @@ class TrendConfirmStrategy(BaseStrategy):
             # the stop cap and the anti-chase guard still blocks real chasing.
             self.max_dist_atr_mult = 1.70
             self.entry_min_stop_atr = 0.60   # back to 0.60 (0.50 let stops get even tighter)
-            self.entry_max_stop_atr = 2.80
+            self.entry_max_stop_atr = 2.00
             self.use_hard_tp = True
             self.use_partial_tp = False
             self.use_be_trail = True
-            self.be_trail_trigger_r = 0.8
+            self.be_trail_trigger_r = 1.0
             self.be_trail_sl_r = 0.5
             self.runner_ignore_signal_exit_after_be = False
+            self.crossback_exit_requires_profit = False
 
         self._open_position: Optional[str] = None   # "long" | "short" | None
         self._trend_state: Optional[str] = None      # "up" | "down" | None — Layer 1 result
@@ -1005,16 +1006,12 @@ class TrendConfirmStrategy(BaseStrategy):
                 metadata={"macro_4h": macro, "quality_1h": ctx, "data_quality": data_quality},
             )
 
-        # Layer 2 — 1H context and trend quality in the 4H-selected direction.
-        if not ctx["ready"]:
-            reason = (
-                f"1H context not ready: quality={ctx['score']:.0f} (min {ctx['min_quality']:.0f}), "
-                f"structure={ctx['votes']}/3 (min {ctx['min_votes']}), "
-                f"ADX={ctx['adx']:.1f}, CHOP={ctx['chop']:.1f}, "
-                f"trend_quality={'OK' if ctx['regime_ok'] else 'WEAK'}"
-            )
-            return self._hold(current_price, reason,
-                              metadata={"macro_4h": macro, "quality_1h": ctx, "data_quality": data_quality})
+        # Layer 2 — 1H context is advisory once 4H has confirmed direction.
+        # Do NOT discard a fresh 15M trend-aligned cross only because the
+        # composite 1H quality score missed an arbitrary threshold.  We keep
+        # the score/votes in diagnostics and let the explicit CHOP/sideways
+        # safety gate below decide whether market quality is actually poor.
+        ctx["quality_gate_passed"] = bool(ctx["ready"])
 
         # Layer 3 — clear 15M CHOP/sideways veto. Do not stack more indicators.
         trend_key = "up" if direction == "long" else "down"
@@ -1076,7 +1073,7 @@ class TrendConfirmStrategy(BaseStrategy):
         if dist_atr > self.max_dist_atr_mult:
             return self._hold(current_price, f"15M anti-chase: {dist_atr:.2f}ATR from EMA{self.ema_slow} > {self.max_dist_atr_mult:.2f}")
 
-        rr = min(2.5, self._rr_from_quality(ctx["score"]))
+        rr = 2.5  # fixed hard TP; reverse cross may close the trade earlier
         raw_stop = self._structure_stop_15m(c15, direction, atr15)
         risk_plan = self._compute_entry_sl_tp(direction, float(current_price), raw_stop, atr15,
                                               mirror_raw_stop=False, rr_ratio=rr)
@@ -1106,12 +1103,13 @@ class TrendConfirmStrategy(BaseStrategy):
             "take_profit": round(float(tp), 8),
             "rr_ratio": round(float(rr), 2),
             "risk_atr": round(float(risk_atr), 3),
-            "be_trigger_r": 0.8,
+            "be_trigger_r": round(float(self.be_trail_trigger_r), 2),
             "be_lock_r": 0.5,
             "sizing_mode": self.sizing_mode,
             "margin_pct": self.margin_pct,
             "macro_4h": macro,
             "quality_1h": ctx,
+            "quality_gate_mode": "ADVISORY",
             "quality_15m": q15,
             "sideways_15m": sideways,
             "cross_15m": cross_label,
@@ -1127,7 +1125,7 @@ class TrendConfirmStrategy(BaseStrategy):
         )
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
-        """Manage one hard TP/SL, +0.8R -> SL +0.5R, and CLOSED 15M reverse-cross exit."""
+        """Manage 2.5R hard TP, structure SL (max 2.0 ATR), +1.0R -> SL +0.5R, and fresh CLOSED 15M reverse-cross exit."""
         if self._open_position is None:
             return None
         from ..engines.position_manager import PositionUpdate
