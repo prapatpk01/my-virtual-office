@@ -715,7 +715,13 @@ class TrendConfirmStrategy(BaseStrategy):
         ema_gap = float(e20[-1] - e50[-1])
         slope_delta = float(e20[-1] - e20[-1-lb])
         price_delta = float(close - e20[-1])
-        macd_hist = float(macd_line[-1] - macd_sig[-1])
+        # Direction gate reads the MACD LINE vs zero (the "MACD 4C" zero-line
+        # read), not the histogram. The histogram is MACD minus its signal —
+        # an acceleration measure that flips sign repeatedly inside a healthy
+        # sustained trend. Harmless as a soft 15-point factor, but as a HARD
+        # gate it halved the opportunities (gate open 50% vs 87% measured over
+        # 60 synthetic markets) by calling strong trends NEUTRAL.
+        macd_hist = float(macd_line[-1])
         dmi_gap = float(plus_di[-1] - minus_di[-1])
 
         # 1) EMA20/50 direction — 30 points.
@@ -753,27 +759,51 @@ class TrendConfirmStrategy(BaseStrategy):
             "dmi": (10.0, dmi_dir),
             "structure": (10.0, structure),
         }
+        # The score is kept for display/diagnostics only — it no longer decides
+        # the direction.
         score = sum(w * v for w, v in weighted.values())
         score = round(max(0.0, min(100.0, score)), 1)
 
-        if score >= 75.0:
-            state, direction = "STRONG_BULL", "long"
-        elif score >= 60.0:
-            state, direction = "BULL", "long"
-        elif score <= 24.0:
-            state, direction = "STRONG_BEAR", "short"
-        elif score <= 39.0:
-            state, direction = "BEAR", "short"
+        # ── HARD GATE ────────────────────────────────────────────────────
+        # Direction requires UNANIMOUS agreement of the four core trend reads:
+        # EMA20/50 alignment, EMA20 slope, MACD and DMI. A soft score let a
+        # trade through on partial evidence (e.g. 3 bullish factors outvoting a
+        # bearish MACD); one disagreeing factor now means NEUTRAL = no trade.
+        # Each factor is still measured with its ATR deadband, so a flat market
+        # reads NEUTRAL rather than being forced bull/bear by noise.
+        gate = {"ema_align": ema_align, "ema20_slope": ema_slope,
+                "macd": macd_dir, "dmi": dmi_dir}
+        all_bull = all(v >= 1.0 for v in gate.values())
+        all_bear = all(v <= 0.0 for v in gate.values())
+        # price_location + structure don't gate; they only separate a fully
+        # confirmed trend (STRONG) from a merely aligned one.
+        extras_bull = price_loc >= 1.0 and structure >= 1.0
+        extras_bear = price_loc <= 0.0 and structure <= 0.0
+
+        if all_bull:
+            state, direction = ("STRONG_BULL" if extras_bull else "BULL"), "long"
+        elif all_bear:
+            state, direction = ("STRONG_BEAR" if extras_bear else "BEAR"), "short"
         else:
             state, direction = "NEUTRAL", None
+        # When NEUTRAL, name the factors that broke unanimity so the scan log
+        # says WHY there is no trade (e.g. "blocked by: macd, dmi").
+        n_bull = sum(1 for v in gate.values() if v >= 1.0)
+        n_bear = sum(1 for v in gate.values() if v <= 0.0)
+        lean_bull = n_bull >= n_bear
+        blockers = [k for k, v in gate.items()
+                    if (v < 1.0 if lean_bull else v > 0.0)] if direction is None else []
 
         factor_labels = {
             k: ("BULL" if v > 0.5 else "BEAR" if v < 0.5 else "NEUTRAL")
             for k, (_w, v) in weighted.items()
         }
+        gate_summary = ("UNANIMOUS_BULL" if all_bull else "UNANIMOUS_BEAR" if all_bear
+                        else "SPLIT(" + ",".join(blockers) + ")")
         return {
             "state": state, "direction": direction, "score": score,
             "adx": round(float(adx_arr[-1]), 1), "factors": factor_labels,
+            "gate": gate_summary, "gate_blockers": blockers,
             "structure": "HH_HL" if structure > 0.5 else "LH_LL" if structure < 0.5 else "MIXED",
             "ema20": round(float(e20[-1]), 8), "ema50": round(float(e50[-1]), 8),
             "atr": round(atr4, 8),
