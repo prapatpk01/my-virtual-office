@@ -2303,13 +2303,19 @@ class TrendConfirmStrategy(BaseStrategy):
         # collapses and an ATR-only stop lands a fraction of a percent away,
         # where the round-trip fee eats most of R. Scaling the floor by the fee
         # keeps this asset-agnostic (no fixed % that misfits XAU vs XRP).
-        fee_floor = self.min_stop_fee_mult * self.round_trip_fee_pct * price
-        min_distance = max(self.entry_min_stop_atr * atr_val, fee_floor)
         max_distance = self.entry_max_stop_atr * atr_val
+        # The cost floor must never exceed the ATR risk cap, or it rejects every
+        # setup on low-relative-volatility symbols: BTC/XAU run ATR(15m) ~0.12-
+        # 0.15% of price, so a flat 0.60% floor sat above 2.8xATR and blocked
+        # them entirely. Clamp it to the cap — the stop is pushed as wide as the
+        # risk budget allows (which is what improves the fee/R ratio) instead of
+        # cancelling the trade.
+        fee_floor = min(self.min_stop_fee_mult * self.round_trip_fee_pct * price,
+                        max_distance)
+        min_distance = max(self.entry_min_stop_atr * atr_val, fee_floor)
         distance = max(raw_distance, min_distance)
         if distance > max_distance:
-            # Too quiet to trade profitably: a cost-viable stop is wider than the
-            # ATR risk cap, so the setup cannot pay for its own fees.
+            # The structure stop itself is wider than the risk cap.
             return None
 
         rr = max(0.5, float(self.rr_ratio if rr_ratio is None else rr_ratio))
