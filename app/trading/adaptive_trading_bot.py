@@ -1,47 +1,18 @@
 """
-Adaptive Trading Bot — v9.6 Transition + Market Structure Engine
-============================================================
-3-layer pipeline replacing the old 8-state flat classifier:
+Adaptive Trading Bot v10 — Clean Architecture Reset
 
-  L1  4H MacroTrendEngine
-      EMA20/50 cross · EMA slope · ADX+DI direction · efficiency ratio
-      ATR regime · structure score
-      → Trend Score 0-100 · 5-level label (STRONG_BULL … STRONG_BEAR)
+Pipeline:
+4H Macro -> 1H Bias/Structure -> 15m Regime -> Location -> Price Action Trigger
+-> Momentum Confirm -> Structure Room/R:R -> Entry
 
-  L2  1H ContextBiasEngine
-      7 weighted components: structure(20%) · pattern(20%) · liquidity(15%)
-      · EMA pullback(15%) · RSI(10%) · MACD(10%) · volume(10%)
-      → separate Bull score and Bear score 0-100
+Entry engines:
+1) Trend Pullback (StrongTrend/Trend)
+2) Breakout Retest (never chase the breakout candle)
+3) Range Edge Reversal
+4) Transition is a market state only and may enter via Structure Retest.
 
-  L3  RegimeClassifier
-      Combines L1 + L2 + 15M ADX/ATR/BB/RSI/efficiency
-      → 5 regimes: Trend · Range · Breakout · Reversal · Exhaustion
-
-  Dynamic Strategy Selection (4 strategies per regime):
-      Trend     → EMA_Pullback · ADX_Trend · MACD_Trend · HMA_Trend
-      Range     → RSI_Bounce · BB_Revert · VWAP_Rev · Mean_Rev
-      Breakout  → Volume_Break · ATR_Expand · BOS_Break · BB_Squeeze
-      Reversal  → RSI_Diverge · QM_Pattern · CHOCH_Rev · Exhaust_Rev
-      Exhaustion→ RSI_Diverge · CHOCH_Rev · BB_Revert · QM_Pattern
-
-  Dynamic Weighting (weights shift per regime):
-      Trend: EMA25% · ADX20% · Momentum20% · Volume15% · Liquidity10% · Pattern10%
-      Range: RSI25% · BB20% · VWAP20% · Volume15% · Liquidity10% · Pattern10%
-      Breakout: Volume25% · ATR20% · Momentum20% · EMA15% · Pattern10% · Liquidity10%
-      Reversal/Exhaustion: RSI25% · Pattern20% · Structure20% · Momentum15% …
-
-  Confidence Engine selects single highest-scoring strategy per signal.
-
-V8 execution infrastructure preserved:
-  - State machine SCANNING→FILTERING→PENDING_ORDER→IN_POSITION→EXITING
-  - 2-target TP: T1=0.5R close 50% + SL→breakeven, T2=1.2R full close
-  - Position Health Calculator, reversal spike / trend-fade protection
-  - save_state / load_state / reconcile_with_exchange
-  - Daily PnL limits · cooldown · win-streak risk reduction
-  - ConditionLearningEngine (Level 0/2/3 adaptive learning)
-  - PatternLearningEngine (per-entry-type WR tracking)
+Goals: prevent counter-trend entries, late-trend chasing, and duplicated confirmation gates.
 """
-
 import numpy as np
 import datetime
 import json
@@ -204,6 +175,26 @@ def compute_early_trend(candles_4h: List, candles_1h: List) -> Dict:
         "confirmed": confirmed,
     }
 
+
+
+# --- v10 clean-entry policy -------------------------------------------------
+V10_TREND_LONG_MACRO_MIN = 55.0
+V10_TREND_SHORT_MACRO_MAX = 45.0
+V10_TRANSITION_LONG_MACRO_MIN = 50.0
+V10_TRANSITION_SHORT_MACRO_MAX = 50.0
+V10_IDEAL_EMA_DIST_MIN_ATR = 0.10
+V10_IDEAL_EMA_DIST_MAX_ATR = 0.45
+V10_MAX_TREND_EXTENSION_ATR = 0.70
+V10_MAX_TRIGGER_BODY_ATR = 0.75
+V10_LONG_RSI_CHASE_MAX = 68.0
+V10_SHORT_RSI_CHASE_MIN = 32.0
+V10_BREAKOUT_RETEST_MIN_BARS = 1
+V10_BREAKOUT_RETEST_MAX_BARS = 4
+V10_BREAKOUT_CLOSE_THROUGH_ATR = 0.12
+V10_BREAKOUT_VOLUME_RATIO_MIN = 1.20
+V10_MIN_STRUCTURE_ROOM_R = 1.20
+V10_TRANSITION_MIN_STRUCTURE_ROOM_R = 1.15
+# -----------------------------------------------------------------------------
 
 class MacroTrendEngine:
     """
@@ -4666,3 +4657,45 @@ class TradingBot:
             }
             self.position_open = True
             self.state         = "IN_POSITION"
+
+
+
+def _v10_direction_gate(regime, side, macro_score, structure_aligned):
+    r, s, m = str(regime or "").lower(), str(side or "").lower(), float(macro_score)
+    if r in {"strongtrend", "strong_trend", "trend"}:
+        if s == "long" and m < V10_TREND_LONG_MACRO_MIN:
+            return False, "trend long macro conflict"
+        if s == "short" and m > V10_TREND_SHORT_MACRO_MAX:
+            return False, "trend short macro conflict"
+        if not structure_aligned:
+            return False, "1h structure not aligned"
+    elif r == "transition":
+        if s == "long" and (m < V10_TRANSITION_LONG_MACRO_MIN or not structure_aligned):
+            return False, "transition long lacks structure"
+        if s == "short" and (m > V10_TRANSITION_SHORT_MACRO_MAX or not structure_aligned):
+            return False, "transition short lacks structure"
+    return True, "ok"
+
+def _v10_chase_gate(side, ema_dist_atr, body_atr, rsi):
+    d, b, x = abs(float(ema_dist_atr)), abs(float(body_atr)), float(rsi)
+    if d > V10_MAX_TREND_EXTENSION_ATR:
+        return False, "late trend: EMA extension"
+    if b > V10_MAX_TRIGGER_BODY_ATR:
+        return False, "late trend: oversized trigger"
+    if str(side).lower() == "long" and x > V10_LONG_RSI_CHASE_MAX:
+        return False, "late trend: RSI chase"
+    if str(side).lower() == "short" and x < V10_SHORT_RSI_CHASE_MIN:
+        return False, "late trend: RSI chase"
+    return True, "ok"
+
+def _v10_entry_route(regime):
+    r = str(regime or "").lower()
+    if r in {"strongtrend", "strong_trend", "trend"}:
+        return ("Structure_Retest", "Trend_Pullback")
+    if r == "transition":
+        return ("Structure_Retest",)
+    if r == "breakout":
+        return ("Breakout_Retest",)
+    if r == "range":
+        return ("Range_Edge_Reversal",)
+    return ()
