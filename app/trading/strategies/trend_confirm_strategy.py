@@ -36,7 +36,7 @@ class TrendConfirmStrategy(BaseStrategy):
         self,
         symbol: str,
         params: Optional[dict] = None,
-        # Layer 1 — trend direction (30m)
+        # Layer 1 — 4H trend direction
         sma_trend: int = 30,
         ema1_period: int = 10,
         ema2_period: int = 20,
@@ -46,7 +46,7 @@ class TrendConfirmStrategy(BaseStrategy):
         macd_signal: int = 9,
         layer1_min_agreement: int = 3,  # 3-of-4 direction vote; EMA10/20 remains mandatory
         layer1_require_ema_alignment: bool = True,
-        # Layer 2 — trend quality (15m + 1H)
+        # Layer 2 — 1H context / trend quality
         quality_ema_fast: int = 20,
         quality_ema_slow: int = 50,
         rsi_period: int = 14,
@@ -948,19 +948,43 @@ class TrendConfirmStrategy(BaseStrategy):
         macro_display = f"{macro_state}({votes}/4)"
 
         if direction not in ("long", "short"):
+            # 4H remains the authority and still blocks new entries while
+            # NEUTRAL/WARMUP.  Evaluate 1H only for diagnostics so the live log
+            # does not misleadingly show 1H=WAIT/--- when valid 1H data exists.
+            best_ctx = self._best_context_1h(c1h)
+            if best_ctx and best_ctx.get("context"):
+                diag_dir = best_ctx["direction"]
+                diag_ctx = best_ctx["context"]
+                one_h_diag = (
+                    f"{'LONG' if diag_dir == 'long' else 'SHORT'}_{diag_ctx['label']}"
+                )
+                mtf_diag = (
+                    f"4H={macro_display} | 1H={one_h_diag} "
+                    f"ADX={diag_ctx['adx']:.1f} CHOP={diag_ctx['chop']:.1f}"
+                )
+                metadata = {
+                    "macro_4h": macro,
+                    "context_1h": diag_ctx,
+                    "data_quality": data_quality,
+                }
+            else:
+                one_h_diag = "WARMUP"
+                mtf_diag = f"4H={macro_display} | 1H=WARMUP"
+                metadata = {"macro_4h": macro, "data_quality": data_quality}
+
             self._diag_update(
                 trend_4h=macro_display,
-                trend_1h="WAIT",
+                trend_1h=one_h_diag,
                 regime=macro_state,
                 aligned=False,
                 direction_15m="WAIT_CROSS",
-                mtf=f"4H={macro_display}",
+                mtf=mtf_diag,
                 entry_state="4H_TREND",
             )
             return self._hold(
                 current_price,
                 f"4H trend not confirmed: {macro_display}",
-                metadata={"macro_4h": macro, "data_quality": data_quality},
+                metadata=metadata,
             )
 
         # ---------------- Layer 2: 1H Context ----------------
