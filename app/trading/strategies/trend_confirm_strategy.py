@@ -487,8 +487,7 @@ class TrendConfirmStrategy(BaseStrategy):
         # to BaseStrategy but silently ignored them in this class.
         self._apply_runtime_params(params)
         if self.ema_only_mode:
-            # V4 live core is deliberately fixed: 4H macro -> 1H quality ->
-            # 15M closed-bar EMA8/13 cross. Stale runtime config cannot turn
+            # Live core: 4H trend -> 1H context/bias -> 15M closed-bar EMA8/13 cross. Stale runtime config cannot turn
             # the strategy back into the old 5M/multi-entry engine.
             self.entry_tf = "15m"
             self.trend_tf = "4h"
@@ -656,157 +655,111 @@ class TrendConfirmStrategy(BaseStrategy):
         ctx = self._macro_trend_4h(candles_4h)
         return ctx.get("state", "WARMUP") if ctx else "WARMUP"
 
+    @staticmethod
+    def _hma_last(values: list[float], period: int = 16) -> float:
+        """Return the latest Hull Moving Average value using closed-bar data."""
+        n = max(2, int(period))
+        if values is None or len(values) < n + int(np.sqrt(n)) + 2:
+            return float("nan")
+
+        arr = np.asarray(values, dtype=float)
+
+        def _wma_series(a: np.ndarray, length: int) -> np.ndarray:
+            length = max(1, int(length))
+            out = np.full(len(a), np.nan, dtype=float)
+            weights = np.arange(1, length + 1, dtype=float)
+            denom = float(weights.sum())
+            for idx in range(length - 1, len(a)):
+                window = a[idx - length + 1:idx + 1]
+                if np.isnan(window).any():
+                    continue
+                out[idx] = float(np.dot(window, weights) / denom)
+            return out
+
+        half = max(1, n // 2)
+        root = max(1, int(round(np.sqrt(n))))
+        fast = _wma_series(arr, half)
+        slow = _wma_series(arr, n)
+        raw = 2.0 * fast - slow
+        hma = _wma_series(raw, root)
+        return float(hma[-1])
+
     def _macro_trend_4h(self, candles_4h: list) -> dict:
-        """Soft 4H macro-bias score (0=strong bear, 100=strong bull).
+        """Layer 1 — 4H trend authority.
 
-        The previous implementation required ``close > EMA20 > EMA50`` (or
-        the bearish mirror) as a hard core condition before the market could
-        even be called a trend.  That made normal pullbacks and early trend
-        transitions look NEUTRAL for too long.
+        Four independent closed-bar signals:
+        1) EMA20 vs EMA50
+        2) EMA20 slope
+        3) MACD line vs signal
+        4) price vs HMA16
 
-        V4.1 scores six *independent-ish* pieces of evidence instead:
-          EMA20/50 direction  30
-          EMA20 slope         20
-          price location      15
-          MACD direction      15
-          DMI direction       10
-          simple 4H structure 10
-
-        Each factor contributes bullish=1, neutral=0.5, bearish=0.  The
-        resulting bullness score maps to STRONG_BULL/BULL/NEUTRAL/BEAR/
-        STRONG_BEAR.  NEUTRAL still blocks new entries, but it no longer stops
-        the 1H analysis/diagnostics from running.
+        3/4 aligned = tradable trend, 4/4 = strong trend.
+        2/4 or mixed = NEUTRAL, so no new position is opened.
         """
         lb = max(2, int(self.ema_slope_lookback))
-        # Structure uses two 6-bar windows; the indicator warmup usually
-        # dominates this minimum anyway.
-        min_needed = max(self.quality_ema_slow + lb + 2,
-                         2 * self.adx_period + 2,
-                         self.macd_slow + self.macd_signal + 2,
-                         14)
+        min_needed = max(
+            self.quality_ema_slow + lb + 3,
+            self.macd_slow + self.macd_signal + 3,
+            24,
+        )
         if not candles_4h or len(candles_4h) < min_needed:
-            return {"state": "WARMUP", "direction": None, "score": None,
-                    "adx": None, "factors": {}, "bars": len(candles_4h or [])}
+            return {
+                "state": "WARMUP", "direction": None, "score": None,
+                "bull_votes": 0, "bear_votes": 0, "signals": {}, "bars": len(candles_4h or []),
+            }
 
         closes = [float(c.close) for c in candles_4h]
         e20 = self.ema(closes, self.quality_ema_fast)
         e50 = self.ema(closes, self.quality_ema_slow)
-        macd_line, macd_sig, _ = self.macd(closes, self.macd_fast, self.macd_slow, self.macd_signal)
-        adx_arr, plus_di, minus_di = self.adx(candles_4h, self.adx_period)
-        atr_arr = self.atr(candles_4h, self.atr_period)
-        needed = (e20[-1], e50[-1], e20[-1-lb], macd_line[-1], macd_sig[-1],
-                  adx_arr[-1], plus_di[-1], minus_di[-1], atr_arr[-1])
-        if any(np.isnan(v) for v in needed):
-            return {"state": "WARMUP", "direction": None, "score": None,
-                    "adx": None, "factors": {}, "bars": len(candles_4h)}
+        macd_line, macd_sig, _ = self.macd(
+            closes, self.macd_fast, self.macd_slow, self.macd_signal
+        )
+        hma16 = self._hma_last(closes, 16)
 
-        def ternary(bull: bool, bear: bool) -> float:
-            if bull and not bear:
-                return 1.0
-            if bear and not bull:
-                return 0.0
-            return 0.5
+        vals = (
+            e20[-1], e50[-1], e20[-1 - lb],
+            macd_line[-1], macd_sig[-1], hma16,
+        )
+        if any(np.isnan(v) for v in vals):
+            return {
+                "state": "WARMUP", "direction": None, "score": None,
+                "bull_votes": 0, "bear_votes": 0, "signals": {}, "bars": len(candles_4h),
+            }
 
         close = closes[-1]
-        atr4 = max(float(atr_arr[-1]), 1e-12)
-
-        # Small ATR-scaled deadbands stop microscopic EMA/MACD differences in
-        # a flat market from becoming a false STRONG_BULL/STRONG_BEAR score.
-        ema_gap = float(e20[-1] - e50[-1])
-        slope_delta = float(e20[-1] - e20[-1-lb])
-        price_delta = float(close - e20[-1])
-        # Direction gate reads the MACD LINE vs zero (the "MACD 4C" zero-line
-        # read), not the histogram. The histogram is MACD minus its signal —
-        # an acceleration measure that flips sign repeatedly inside a healthy
-        # sustained trend. Harmless as a soft 15-point factor, but as a HARD
-        # gate it halved the opportunities (gate open 50% vs 87% measured over
-        # 60 synthetic markets) by calling strong trends NEUTRAL.
-        macd_hist = float(macd_line[-1])
-        dmi_gap = float(plus_di[-1] - minus_di[-1])
-
-        # 1) EMA20/50 direction — 30 points.
-        ema_align = ternary(ema_gap > 0.05 * atr4, ema_gap < -0.05 * atr4)
-        # 2) EMA20 slope — 20 points.
-        ema_slope = ternary(slope_delta > 0.03 * atr4, slope_delta < -0.03 * atr4)
-        # 3) Price location vs EMA20 — 15 points. A shallow pullback around the
-        #    average is neutral, not an automatic bearish vote.
-        price_loc = ternary(price_delta > 0.25 * atr4, price_delta < -0.25 * atr4)
-        # 4) MACD direction — 15 points.
-        macd_dir = ternary(macd_hist > 0.05 * atr4, macd_hist < -0.05 * atr4)
-        # 5) DMI direction — 10 points; ignore tiny DI spreads.
-        dmi_dir = ternary(dmi_gap > 2.0, dmi_gap < -2.0)
-
-        # 6) Simple confirmed-ish structure — compare the latest 6 closed 4H
-        #    bars with the preceding 6.  HH+HL = bull, LH+LL = bear, mixed =
-        #    neutral. This avoids making a fragile pivot detector a hard gate.
-        recent = candles_4h[-6:]
-        prior = candles_4h[-12:-6]
-        recent_hi = max(float(c.high) for c in recent)
-        recent_lo = min(float(c.low) for c in recent)
-        prior_hi = max(float(c.high) for c in prior)
-        prior_lo = min(float(c.low) for c in prior)
-        hh = recent_hi > prior_hi
-        hl = recent_lo > prior_lo
-        lh = recent_hi < prior_hi
-        ll = recent_lo < prior_lo
-        structure = ternary(hh and hl, lh and ll)
-
-        weighted = {
-            "ema_align": (30.0, ema_align),
-            "ema20_slope": (20.0, ema_slope),
-            "price_location": (15.0, price_loc),
-            "macd": (15.0, macd_dir),
-            "dmi": (10.0, dmi_dir),
-            "structure": (10.0, structure),
+        signals = {
+            "ema20_50": 1 if e20[-1] > e50[-1] else -1 if e20[-1] < e50[-1] else 0,
+            "ema20_slope": 1 if e20[-1] > e20[-1 - lb] else -1 if e20[-1] < e20[-1 - lb] else 0,
+            "macd": 1 if macd_line[-1] > macd_sig[-1] else -1 if macd_line[-1] < macd_sig[-1] else 0,
+            "price_hma16": 1 if close > hma16 else -1 if close < hma16 else 0,
         }
-        # The score is kept for display/diagnostics only — it no longer decides
-        # the direction.
-        score = sum(w * v for w, v in weighted.values())
-        score = round(max(0.0, min(100.0, score)), 1)
+        bull_votes = sum(v > 0 for v in signals.values())
+        bear_votes = sum(v < 0 for v in signals.values())
 
-        # ── HARD GATE ────────────────────────────────────────────────────
-        # Direction requires UNANIMOUS agreement of the four core trend reads:
-        # EMA20/50 alignment, EMA20 slope, MACD and DMI. A soft score let a
-        # trade through on partial evidence (e.g. 3 bullish factors outvoting a
-        # bearish MACD); one disagreeing factor now means NEUTRAL = no trade.
-        # Each factor is still measured with its ATR deadband, so a flat market
-        # reads NEUTRAL rather than being forced bull/bear by noise.
-        gate = {"ema_align": ema_align, "ema20_slope": ema_slope,
-                "macd": macd_dir, "dmi": dmi_dir}
-        all_bull = all(v >= 1.0 for v in gate.values())
-        all_bear = all(v <= 0.0 for v in gate.values())
-        # price_location + structure don't gate; they only separate a fully
-        # confirmed trend (STRONG) from a merely aligned one.
-        extras_bull = price_loc >= 1.0 and structure >= 1.0
-        extras_bear = price_loc <= 0.0 and structure <= 0.0
-
-        if all_bull:
-            state, direction = ("STRONG_BULL" if extras_bull else "BULL"), "long"
-        elif all_bear:
-            state, direction = ("STRONG_BEAR" if extras_bear else "BEAR"), "short"
+        if bull_votes == 4:
+            state, direction, score = "STRONG_BULL", "long", 100.0
+        elif bull_votes >= 3 and bear_votes <= 1:
+            state, direction, score = "BULL", "long", 75.0
+        elif bear_votes == 4:
+            state, direction, score = "STRONG_BEAR", "short", 0.0
+        elif bear_votes >= 3 and bull_votes <= 1:
+            state, direction, score = "BEAR", "short", 25.0
         else:
-            state, direction = "NEUTRAL", None
-        # When NEUTRAL, name the factors that broke unanimity so the scan log
-        # says WHY there is no trade (e.g. "blocked by: macd, dmi").
-        n_bull = sum(1 for v in gate.values() if v >= 1.0)
-        n_bear = sum(1 for v in gate.values() if v <= 0.0)
-        lean_bull = n_bull >= n_bear
-        blockers = [k for k, v in gate.items()
-                    if (v < 1.0 if lean_bull else v > 0.0)] if direction is None else []
+            state, direction, score = "NEUTRAL", None, 50.0
 
-        factor_labels = {
-            k: ("BULL" if v > 0.5 else "BEAR" if v < 0.5 else "NEUTRAL")
-            for k, (_w, v) in weighted.items()
-        }
-        gate_summary = ("UNANIMOUS_BULL" if all_bull else "UNANIMOUS_BEAR" if all_bear
-                        else "SPLIT(" + ",".join(blockers) + ")")
         return {
-            "state": state, "direction": direction, "score": score,
-            "adx": round(float(adx_arr[-1]), 1), "factors": factor_labels,
-            "gate": gate_summary, "gate_blockers": blockers,
-            "structure": "HH_HL" if structure > 0.5 else "LH_LL" if structure < 0.5 else "MIXED",
-            "ema20": round(float(e20[-1]), 8), "ema50": round(float(e50[-1]), 8),
-            "atr": round(atr4, 8),
+            "state": state,
+            "direction": direction,
+            "score": score,
+            "bull_votes": bull_votes,
+            "bear_votes": bear_votes,
+            "signals": signals,
+            "ema20": round(float(e20[-1]), 8),
+            "ema50": round(float(e50[-1]), 8),
+            "hma16": round(float(hma16), 8),
+            "macd": round(float(macd_line[-1]), 8),
+            "macd_signal": round(float(macd_sig[-1]), 8),
+            "close": round(float(close), 8),
         }
 
     def _best_context_1h(self, candles_1h: list) -> Optional[dict]:
@@ -825,38 +778,85 @@ class TrendConfirmStrategy(BaseStrategy):
         return {"direction": "short", "context": short_ctx}
 
     def _context_1h(self, candles_1h: list, direction: str) -> Optional[dict]:
-        """1H context + quality. Soft score plus 2/3 structural agreement."""
-        trend = "up" if direction == "long" else "down"
-        q = self._tf_quality(candles_1h, trend)
-        if q is None:
+        """Layer 2 — 1H context/bias.
+
+        The 1H layer does not try to predict a new direction. It asks only:
+        "Does current context agree with the 4H trend, and is the market
+        directional enough to participate?"
+
+        Bias = at least 2/3 directional votes from:
+        - EMA20 vs EMA50
+        - close vs EMA20
+        - MACD line vs signal
+
+        Market quality:
+        - ADX >= 15
+        - CHOP <= 61.8
+
+        There is deliberately no composite quality score hard gate.
+        """
+        if direction not in ("long", "short"):
             return None
+
+        min_needed = max(
+            self.quality_ema_slow + 3,
+            2 * self.adx_period + 3,
+            self.chop_period + 3,
+            self.macd_slow + self.macd_signal + 3,
+        )
+        if not candles_1h or len(candles_1h) < min_needed:
+            return None
+
         closes = [float(c.close) for c in candles_1h]
         e20 = self.ema(closes, self.quality_ema_fast)
         e50 = self.ema(closes, self.quality_ema_slow)
-        lb = max(2, int(self.ema_slope_lookback))
-        vals = (e20[-1], e50[-1], e50[-1-lb])
+        macd_line, macd_sig, _ = self.macd(
+            closes, self.macd_fast, self.macd_slow, self.macd_signal
+        )
+        adx_arr, plus_di, minus_di = self.adx(candles_1h, self.adx_period)
+        chop_arr = self.choppiness(candles_1h, self.chop_period)
+
+        vals = (
+            e20[-1], e50[-1], macd_line[-1], macd_sig[-1],
+            adx_arr[-1], chop_arr[-1],
+        )
         if any(np.isnan(v) for v in vals):
             return None
-        up = direction == "long"
-        structural = [
-            (closes[-1] > e20[-1]) == up,
-            (e20[-1] > e50[-1]) == up,
-            (e50[-1] > e50[-1-lb]) == up,
-        ]
-        votes = sum(bool(x) for x in structural)
-        br = q.get("breakdown", {})
-        adx_val = float(br.get("adx_val", 0.0) or 0.0)
-        chop_val = float(br.get("chop_val", 100.0) or 100.0)
-        score = float(q.get("score", 0.0) or 0.0)
-        choppy = chop_val >= 65.0 and adx_val < 18.0
-        # Final readiness is decided later with the 4H macro strength.
-        # Keeping this object descriptive avoids a fixed 55 + 2/3 gate from
-        # blocking otherwise valid strong-macro continuation setups.
-        ready = False
-        label = "VERY_STRONG" if score >= 85.0 else "STRONG" if score >= 70.0 else "TREND"
-        return {"ready": ready, "score": round(score, 1), "label": label,
-                "votes": votes, "adx": round(adx_val, 1), "chop": round(chop_val, 1),
-                "quality": q, "choppy": choppy}
+
+        close = closes[-1]
+        bull_votes = int(e20[-1] > e50[-1]) + int(close > e20[-1]) + int(macd_line[-1] > macd_sig[-1])
+        bear_votes = int(e20[-1] < e50[-1]) + int(close < e20[-1]) + int(macd_line[-1] < macd_sig[-1])
+
+        bias = "long" if bull_votes >= 2 else "short" if bear_votes >= 2 else "neutral"
+        bias_aligned = bias == direction
+        adx_val = float(adx_arr[-1])
+        chop_val = float(chop_arr[-1])
+        adx_ok = adx_val >= 15.0
+        chop_ok = chop_val <= 61.8
+        ready = bool(bias_aligned and adx_ok and chop_ok)
+
+        # Compatibility score is diagnostic only; it never gates the trade.
+        direction_votes = bull_votes if direction == "long" else bear_votes
+        score = round((direction_votes / 3.0) * 60.0 + min(adx_val, 40.0) / 40.0 * 20.0
+                      + max(0.0, min(20.0, (61.8 - chop_val) / 61.8 * 20.0)), 1)
+
+        label = "ALIGNED" if ready else "CONFLICT"
+        return {
+            "ready": ready,
+            "score": score,
+            "label": label,
+            "bias": bias,
+            "bias_aligned": bias_aligned,
+            "bull_votes": bull_votes,
+            "bear_votes": bear_votes,
+            "votes": direction_votes,
+            "adx": round(adx_val, 1),
+            "chop": round(chop_val, 1),
+            "adx_ok": adx_ok,
+            "chop_ok": chop_ok,
+            "ema20": round(float(e20[-1]), 8),
+            "ema50": round(float(e50[-1]), 8),
+        }
 
     def _rr_from_quality(self, quality_score: float) -> float:
         """Single hard TP, capped at 2.5R."""
@@ -897,188 +897,212 @@ class TrendConfirmStrategy(BaseStrategy):
         return pivot + self.entry_stop_buffer_atr * atr_val
 
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
-        """4H macro -> 1H context/quality -> 15M CHOP/range -> EMA8/13 cross."""
+        """Simple 3-layer live system.
+
+        Layer 1: 4H trend direction.
+        Layer 2: 1H context/bias + ADX/CHOP agreement.
+        Layer 3: fresh CLOSED 15M EMA8/13 cross in the 4H direction.
+        """
         self._diag_reset()
         mtf = mtf_candles or {}
         if not candles:
             return self._hold(current_price, "Data Quality: empty 15M candle series")
 
-        # Only CLOSED candles may create a cross signal.
         c15 = self._closed_candle_series(candles, 15 * 60_000, self.closed_bar_grace_ms)
         c1h_raw = mtf.get("1h", []) or self._resample_timeframe(c15, 60 * 60_000, 15 * 60_000)
         c4h_raw = mtf.get("4h", []) or self._resample_timeframe(c15, 4 * 60 * 60_000, 15 * 60_000)
         c1h = self._closed_candle_series(c1h_raw, 60 * 60_000, self.closed_bar_grace_ms)
         c4h = self._closed_candle_series(c4h_raw, 4 * 60 * 60_000, self.closed_bar_grace_ms)
+
         self._latest_candles = c15
         self._latest_15m = c15
         self._latest_5m = c15  # compatibility only
 
-        min15 = max(self.quality_ema_slow + self.ema_slope_lookback + 3,
-                    2 * self.adx_period + 3, self.macd_slow + self.macd_signal + 3)
+        min15 = max(self.ema_slow + 3, self.atr_period + 3)
         if len(c15) < min15:
             return self._hold(current_price, f"15M warm-up: need {min15}+ closed bars, have {len(c15)}")
 
-        # Data quality is safety, not a signal filter.
         data_quality = {}
         if self.use_data_quality_gate:
             for tf_name, series, expected_ms in (
-                ("15m", c15, 15 * 60_000), ("1h", c1h, 60 * 60_000), ("4h", c4h, 4 * 60 * 60_000)
+                ("15m", c15, 15 * 60_000),
+                ("1h", c1h, 60 * 60_000),
+                ("4h", c4h, 4 * 60 * 60_000),
             ):
                 qd = self._data_quality_context(series, expected_ms) if series else {
                     "valid": False, "reason": "missing", "bars": 0
                 }
                 data_quality[tf_name] = qd
                 if not qd.get("valid"):
-                    return self._hold(current_price, f"Data Quality FAIL {tf_name}: {qd.get('reason')}",
-                                      metadata={"data_quality": data_quality})
+                    return self._hold(
+                        current_price,
+                        f"Data Quality FAIL {tf_name}: {qd.get('reason')}",
+                        metadata={"data_quality": data_quality},
+                    )
 
-        # Layer 1 — 4H macro bias is the directional authority, but 1H is
-        # ALWAYS evaluated before any macro HOLD so the log shows the real
-        # context instead of a misleading WARMUP placeholder.
+        # ---------------- Layer 1: 4H Trend ----------------
         macro = self._macro_trend_4h(c4h)
         macro_state = macro.get("state", "WARMUP")
-        macro_score = macro.get("score")
         direction = macro.get("direction")
-        macro_display = (f"{macro_state}({macro_score:.0f})"
-                         if isinstance(macro_score, (int, float)) else macro_state)
+        votes = max(int(macro.get("bull_votes", 0)), int(macro.get("bear_votes", 0)))
+        macro_display = f"{macro_state}({votes}/4)"
 
-        if direction in ("long", "short"):
-            ctx = self._context_1h(c1h, direction)
-            ctx_direction = direction
-        else:
-            best = self._best_context_1h(c1h)
-            ctx_direction = best.get("direction") if best else None
-            ctx = best.get("context") if best else None
-
-        if ctx is None:
-            one_h_label = "WARMUP"
+        if direction not in ("long", "short"):
             self._diag_update(
-                trend_4h=macro_display, trend_1h=one_h_label, regime="WARMUP",
-                aligned=False, mtf=f"4H={macro_display} | 1H=WARMUP",
-                entry_state="1H_WARMUP",
+                trend_4h=macro_display,
+                trend_1h="WAIT",
+                regime=macro_state,
+                aligned=False,
+                direction_15m="WAIT_CROSS",
+                mtf=f"4H={macro_display}",
+                entry_state="4H_TREND",
             )
-            return self._hold(current_price, "1H context/quality genuinely warming up",
-                              metadata={"macro_4h": macro, "data_quality": data_quality})
+            return self._hold(
+                current_price,
+                f"4H trend not confirmed: {macro_display}",
+                metadata={"macro_4h": macro, "data_quality": data_quality},
+            )
 
-        one_h_label = f"{'LONG' if ctx_direction == 'long' else 'SHORT'}_{ctx['label']}"
+        # ---------------- Layer 2: 1H Context ----------------
+        ctx = self._context_1h(c1h, direction)
+        if ctx is None:
+            self._diag_update(
+                trend_4h=macro_display,
+                trend_1h="WARMUP",
+                regime=macro_state,
+                aligned=False,
+                direction_15m="WAIT_CROSS",
+                mtf=f"4H={macro_display} | 1H=WARMUP",
+                entry_state="1H_CONTEXT",
+            )
+            return self._hold(
+                current_price,
+                "1H context warming up",
+                metadata={"macro_4h": macro, "data_quality": data_quality},
+            )
 
-        # Adaptive 1H gate:
-        # Strong 4H trends already provide substantial directional evidence, so
-        # 1H only needs to confirm that the move is not weak/choppy. Normal 4H
-        # trends require a little more 1H quality. Neutral 4H still cannot trade.
-        strong_macro = macro_state in ("STRONG_BULL", "STRONG_BEAR")
-        if strong_macro:
-            ctx_min_quality = 48.0
-            ctx_min_votes = 1
-            ctx_regime_ok = (ctx["adx"] >= 17.0 and ctx["chop"] <= 58.0)
-        else:
-            ctx_min_quality = 52.0
-            ctx_min_votes = 1
-            ctx_regime_ok = (ctx["adx"] >= 18.0 or ctx["chop"] <= 52.0)
-
-        ctx["min_quality"] = ctx_min_quality
-        ctx["min_votes"] = ctx_min_votes
-        ctx["regime_ok"] = bool(ctx_regime_ok)
-        ctx["ready"] = bool(
-            ctx["score"] >= ctx_min_quality
-            and ctx["votes"] >= ctx_min_votes
-            and ctx_regime_ok
-            and not ctx["choppy"]
+        one_h_label = (
+            f"{'LONG' if direction == 'long' else 'SHORT'}_{ctx['label']}"
         )
-
-        macro_aligned = bool(direction in ("long", "short") and ctx_direction == direction and ctx["ready"])
         self._diag_update(
             trend_4h=macro_display,
             trend_1h=one_h_label,
-            regime=ctx["label"],
-            aligned=macro_aligned,
-            mtf=f"4H={macro_display} | 1H={one_h_label} {ctx['score']:.0f}",
+            regime=macro_state,
+            aligned=bool(ctx["ready"]),
+            direction_15m="WAIT_CROSS",
+            mtf=(
+                f"4H={macro_display} | 1H={one_h_label} "
+                f"ADX={ctx['adx']:.1f} CHOP={ctx['chop']:.1f}"
+            ),
             entry_state="1H_CONTEXT",
         )
 
-        # A neutral/warming 4H still blocks entries, but only AFTER 1H has been
-        # computed and logged.
-        if direction not in ("long", "short"):
-            return self._hold(
-                current_price,
-                f"4H macro {macro_display} — 1H={one_h_label} quality {ctx['score']:.0f}; waiting for 4H score to leave NEUTRAL",
-                metadata={"macro_4h": macro, "quality_1h": ctx, "data_quality": data_quality},
-            )
-
-        # Layer 2 — 1H context and trend quality in the 4H-selected direction.
         if not ctx["ready"]:
-            reason = (
-                f"1H context not ready: quality={ctx['score']:.0f} (min {ctx['min_quality']:.0f}), "
-                f"structure={ctx['votes']}/3 (min {ctx['min_votes']}), "
-                f"ADX={ctx['adx']:.1f}, CHOP={ctx['chop']:.1f}, "
-                f"trend_quality={'OK' if ctx['regime_ok'] else 'WEAK'}"
-            )
-            return self._hold(current_price, reason,
-                              metadata={"macro_4h": macro, "quality_1h": ctx, "data_quality": data_quality})
-
-        # Layer 3 — clear 15M CHOP/sideways veto. Do not stack more indicators.
-        trend_key = "up" if direction == "long" else "down"
-        q15 = self._tf_quality(c15, trend_key)
-        sideways = self._sideways_context(c15) if self.use_sideways_filter else {
-            "is_sideways": False, "signals": 0, "detail": {}
-        }
-        br15 = (q15 or {}).get("breakdown", {})
-        chop15 = float(br15.get("chop_val", 100.0) or 100.0)
-        adx15 = float(br15.get("adx_val", 0.0) or 0.0)
-        # 15M safety veto: block genuinely poor trend conditions, not merely
-        # middling CHOP. A clear range still requires >=3/4 independent signals.
-        hard_chop = chop15 >= 61.0 and adx15 < 18.0
-        clear_sideways = sideways.get("signals", 0) >= 3
-        self._diag_update(direction_15m="WAIT_CROSS", entry_state="15M_FILTER")
-        if hard_chop or clear_sideways:
+            conflict = []
+            if not ctx["bias_aligned"]:
+                conflict.append(f"bias={ctx['bias']} conflicts with 4H {direction}")
+            if not ctx["adx_ok"]:
+                conflict.append(f"ADX={ctx['adx']:.1f}<15")
+            if not ctx["chop_ok"]:
+                conflict.append(f"CHOP={ctx['chop']:.1f}>61.8")
             return self._hold(
                 current_price,
-                f"15M CHOP/SIDEWAY block: CHOP={chop15:.1f}, ADX={adx15:.1f}, "
-                f"range_signals={sideways.get('signals', 0)}/4",
-                metadata={"macro_4h": macro, "quality_1h": ctx, "quality_15m": q15,
-                          "sideways_15m": sideways, "data_quality": data_quality},
+                "1H context conflict: " + ", ".join(conflict),
+                metadata={
+                    "macro_4h": macro,
+                    "context_1h": ctx,
+                    "quality_1h": ctx,
+                    "data_quality": data_quality,
+                },
             )
 
-        # Existing position: keep refreshing closed 15M candles for the reverse-cross exit.
         if self._open_position is not None:
-            return self._hold(current_price, f"Holding {self._open_position.upper()} — 15M cross-back/SL/TP management active",
-                              metadata={"macro_4h": macro, "quality_1h": ctx, "quality_15m": q15,
-                                        "sideways_15m": sideways, "data_quality": data_quality})
+            return self._hold(
+                current_price,
+                f"Holding {self._open_position.upper()} — 15M cross-back/SL/TP management active",
+                metadata={
+                    "macro_4h": macro,
+                    "context_1h": ctx,
+                    "quality_1h": ctx,
+                    "data_quality": data_quality,
+                },
+            )
 
-        # Layer 4 — the only entry trigger: fresh CLOSED 15M EMA8/13 cross.
+        # ---------------- Layer 3: 15M EMA8/13 Cross ----------------
         l15 = self._layer3_indicators(c15)
         if l15 is None:
             return self._hold(current_price, "15M EMA8/13 indicators warming up")
+
         bar_ts = int(c15[-1].timestamp)
         cross_ok = l15["ema_cross_up"] if direction == "long" else l15["ema_cross_down"]
         cross_label = "UP" if l15["ema_cross_up"] else "DOWN" if l15["ema_cross_down"] else "WAIT"
-        self._diag_update(direction_15m=f"CROSS_{cross_label}", entry_state="WAIT_15M_CROSS",
-                          mtf=f"4H={macro_display} | 1H={one_h_label} {ctx['score']:.0f} | 15M={cross_label}")
+        self._diag_update(
+            direction_15m=f"CROSS_{cross_label}",
+            entry_state="WAIT_15M_CROSS",
+            mtf=(
+                f"4H={macro_display} | 1H={one_h_label} "
+                f"ADX={ctx['adx']:.1f} CHOP={ctx['chop']:.1f} | 15M={cross_label}"
+            ),
+        )
+
         if not cross_ok:
-            return self._hold(current_price, f"15M: waiting EMA{self.ema_fast}/{self.ema_slow} cross {direction.upper()}",
-                              metadata={"macro_4h": macro, "quality_1h": ctx, "quality_15m": q15,
-                                        "sideways_15m": sideways, "cross_15m": cross_label,
-                                        "data_quality": data_quality})
+            return self._hold(
+                current_price,
+                f"15M waiting EMA{self.ema_fast}/{self.ema_slow} cross {direction.upper()}",
+                metadata={
+                    "macro_4h": macro,
+                    "context_1h": ctx,
+                    "quality_1h": ctx,
+                    "cross_15m": cross_label,
+                    "data_quality": data_quality,
+                },
+            )
+
         if self._last_entry_attempt_bar_ts == bar_ts:
-            return self._hold(current_price, "15M cross already processed — waiting for a new cross",
-                              metadata={"cross_15m": cross_label})
+            return self._hold(
+                current_price,
+                "15M cross already processed — waiting for a new cross",
+                metadata={"cross_15m": cross_label},
+            )
 
         atr_arr = self.atr(c15, self.atr_period)
         atr15 = float(atr_arr[-1]) if len(atr_arr) and not np.isnan(atr_arr[-1]) else 0.0
         if atr15 <= 0:
             return self._hold(current_price, "15M ATR unavailable")
+
         ema13 = float(l15["ema_slow_val"])
         if direction == "long" and current_price <= ema13:
-            return self._hold(current_price, f"15M cross occurred but price fell back below EMA{self.ema_slow}")
+            return self._hold(current_price, f"15M bullish cross but price closed below EMA{self.ema_slow}")
         if direction == "short" and current_price >= ema13:
-            return self._hold(current_price, f"15M cross occurred but price reclaimed above EMA{self.ema_slow}")
-        dist_atr = abs(float(current_price) - ema13) / atr15
-        if dist_atr > self.max_dist_atr_mult:
-            return self._hold(current_price, f"15M anti-chase: {dist_atr:.2f}ATR from EMA{self.ema_slow} > {self.max_dist_atr_mult:.2f}")
+            return self._hold(current_price, f"15M bearish cross but price closed above EMA{self.ema_slow}")
 
-        # Fixed-percentage 15M trade plan.
-        # Initial SL = 1.0% from entry; hard TP = 1.3% from entry.
-        # A fresh 15M reverse EMA cross can still close the position early.
+        # 15M anti-chase uses SMA30 so the entry trigger (EMA8/13) and
+        # location filter remain independent. This rejects late entries after
+        # price has stretched too far from the 15M mean.
+        closes15 = [float(c.close) for c in c15]
+        sma30_arr = self.sma(closes15, 30)
+        sma30 = float(sma30_arr[-1]) if len(sma30_arr) and not np.isnan(sma30_arr[-1]) else float("nan")
+        if np.isnan(sma30):
+            return self._hold(current_price, "15M SMA30 anti-chase warming up")
+
+        chase_distance_atr = abs(float(current_price) - sma30) / atr15
+        # <=0.8 ATR = ideal, 0.8-1.2 ATR = acceptable, >1.2 ATR = chase.
+        if chase_distance_atr > 1.20:
+            return self._hold(
+                current_price,
+                f"15M anti-chase: price is {chase_distance_atr:.2f}ATR from SMA30 (>1.20ATR)",
+                metadata={
+                    "macro_4h": macro,
+                    "context_1h": ctx,
+                    "quality_1h": ctx,
+                    "cross_15m": cross_label,
+                    "sma30_15m": round(sma30, 8),
+                    "chase_distance_atr": round(chase_distance_atr, 3),
+                    "data_quality": data_quality,
+                },
+            )
+
+        # Existing fixed-percentage position plan remains unchanged.
         entry_px = float(current_price)
         sl_pct = 0.010
         tp_pct = 0.013
@@ -1088,23 +1112,28 @@ class TrendConfirmStrategy(BaseStrategy):
         else:
             sl = entry_px * (1.0 + sl_pct)
             tp = entry_px * (1.0 - tp_pct)
-        _risk_distance = abs(entry_px - sl)
-        risk_atr = (_risk_distance / atr15) if atr15 > 0 else 0.0
-        rr = tp_pct / sl_pct  # 1.30 reward/risk
+
+        risk_distance = abs(entry_px - sl)
+        risk_atr = risk_distance / atr15 if atr15 > 0 else 0.0
+        rr = tp_pct / sl_pct
 
         self._last_entry_attempt_bar_ts = bar_ts
         self._open_position = direction
-        self._entry_price = float(current_price)
+        self._entry_price = entry_px
         self._entry_sl = float(sl)
         self._entry_bar_ts = bar_ts
         self._reverse_cross_arm_after_ts = bar_ts
         self._adopted_after_restart = False
-        self._entry_regime = ctx["label"]
+        self._entry_regime = macro_state
         self._tp1_done = False
         self._be_trailed = False
         self._last_exit_bar_ts = None
 
-        self._diag_update(entry_state="ENTRY_READY", direction_15m=f"CROSS_{cross_label}")
+        self._diag_update(
+            entry_state="ENTRY_READY",
+            direction_15m=f"CROSS_{cross_label}",
+            aligned=True,
+        )
         metadata = {
             **self._diag_context,
             "strategy": "EMA_CROSS_15M",
@@ -1118,22 +1147,27 @@ class TrendConfirmStrategy(BaseStrategy):
             "tp_pct": 1.3,
             "trail_trigger_pct": 0.6,
             "trail_lock_pct": 0.3,
-            "sizing_mode": self.sizing_mode,
-            "margin_pct": self.margin_pct,
             "macro_4h": macro,
+            "context_1h": ctx,
             "quality_1h": ctx,
-            "quality_15m": q15,
-            "sideways_15m": sideways,
             "cross_15m": cross_label,
-            "distance_from_ema13_atr": round(dist_atr, 3),
+            "sma30_15m": round(sma30, 8),
+            "chase_distance_atr": round(chase_distance_atr, 3),
             "data_quality": data_quality,
         }
-        reason = (f"4H {macro_display} + 1H {ctx['label']} quality {ctx['score']:.0f} + "
-                  f"15M EMA{self.ema_fast}/{self.ema_slow} cross {cross_label}; TP={rr:.1f}R")
+        reason = (
+            f"4H {macro_state} {votes}/4 + 1H bias aligned "
+            f"(ADX {ctx['adx']:.1f}, CHOP {ctx['chop']:.1f}) + "
+            f"15M EMA{self.ema_fast}/{self.ema_slow} cross {cross_label}"
+        )
         return Signal(
             type=SignalType.BUY if direction == "long" else SignalType.SELL,
-            symbol=self.symbol, price=float(current_price), amount=0.0,
-            reason=reason, confidence=min(1.0, max(0.55, ctx["score"] / 100.0)), metadata=metadata,
+            symbol=self.symbol,
+            price=entry_px,
+            amount=0.0,
+            reason=reason,
+            confidence=0.80 if "STRONG" in macro_state else 0.70,
+            metadata=metadata,
         )
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
