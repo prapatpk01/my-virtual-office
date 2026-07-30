@@ -134,9 +134,7 @@ class Bot:
         return out
 
     def _journal_add(self, symbol: str, side: str, pnl: float, exit_type: str,
-                     reason: str, tp1_hit: bool, close_ms: int,
-                     setup_type: str = "", trigger: str = "",
-                     mfe_r: float = 0.0, mae_r: float = 0.0, result_r: float = 0.0) -> None:
+                     reason: str, tp1_hit: bool, close_ms: int) -> None:
         """Append one closed trade. Deduped by (symbol, close-minute) so a
         restart-time backfill can't double-count a trade already journaled.
         `reason` keeps the raw event (TP2_HIT / EMA_CROSS_REVERSAL / …) and
@@ -147,11 +145,7 @@ class Bot:
             return
         entry = {"close_ms": int(close_ms), "symbol": symbol, "side": side,
                  "pnl": round(float(pnl), 4), "exit_type": exit_type,
-                 "reason": reason, "tp1_hit": bool(tp1_hit),
-                 "setup_type": setup_type, "trigger": trigger,
-                 "mfe_r": round(float(mfe_r or 0.0), 3),
-                 "mae_r": round(float(mae_r or 0.0), 3),
-                 "result_r": round(float(result_r or 0.0), 3)}
+                 "reason": reason, "tp1_hit": bool(tp1_hit)}
         try:
             os.makedirs(self.cfg.state_dir, exist_ok=True)
             with open(self._journal_path, "a") as f:
@@ -540,15 +534,8 @@ class Bot:
             # Persist the exit info for the /stats breakdown (restart-safe). The
             # event fires the moment the close is detected, so this close_ms is
             # within the 3-min match tolerance of OKX's own close time.
-            self._journal_add(
-                symbol, side, pnl, self._bucket_for_event(ev, pnl),
-                ev, tp1_hit, int(time.time() * 1000),
-                setup_type=str(event.get("setup_type", "") or ""),
-                trigger=str(event.get("trigger", "") or ""),
-                mfe_r=float(event.get("mfe_r", 0.0) or 0.0),
-                mae_r=float(event.get("mae_r", 0.0) or 0.0),
-                result_r=float(event.get("result_r", 0.0) or 0.0),
-            )
+            self._journal_add(symbol, side, pnl, self._bucket_for_event(ev, pnl),
+                              ev, tp1_hit, int(time.time() * 1000))
 
     async def _check_global_alerts(self):
         now = time.time()

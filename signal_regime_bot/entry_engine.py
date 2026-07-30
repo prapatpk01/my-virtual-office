@@ -117,9 +117,6 @@ class _State:
     last_sl_ts: Optional[pd.Timestamp] = None
     reentry_lock_direction: str = ""
     reentry_lock_ts: Optional[pd.Timestamp] = None
-    leg_direction: str = ""
-    leg_entries: int = 0
-    leg_anchor_ts: Optional[pd.Timestamp] = None
 
 
 @dataclass
@@ -185,15 +182,12 @@ class EntryEngine:
                 last_sl_ts=self._ts(d.get("last_sl_ts")),
                 reentry_lock_direction=str(d.get("reentry_lock_direction", "")),
                 reentry_lock_ts=self._ts(d.get("reentry_lock_ts")),
-                leg_direction=str(d.get("leg_direction", "")),
-                leg_entries=int(d.get("leg_entries", 0)),
-                leg_anchor_ts=self._ts(d.get("leg_anchor_ts")),
             )
 
     def _persist_state(self) -> None:
         directory = os.path.dirname(self._state_path) or "."
         os.makedirs(directory, exist_ok=True)
-        payload = {"version": 6, "symbols": {}}
+        payload = {"version": 5, "symbols": {}}
         for symbol, s in self._state.items():
             payload["symbols"][symbol] = {
                 "last_processed_5m": s.last_processed_5m.isoformat() if s.last_processed_5m is not None else None,
@@ -205,9 +199,6 @@ class EntryEngine:
                 "last_sl_ts": s.last_sl_ts.isoformat() if s.last_sl_ts is not None else None,
                 "reentry_lock_direction": s.reentry_lock_direction,
                 "reentry_lock_ts": s.reentry_lock_ts.isoformat() if s.reentry_lock_ts is not None else None,
-                "leg_direction": s.leg_direction,
-                "leg_entries": s.leg_entries,
-                "leg_anchor_ts": s.leg_anchor_ts.isoformat() if s.leg_anchor_ts is not None else None,
             }
         tmp = self._state_path + ".tmp"
         try:
@@ -917,53 +908,6 @@ class EntryEngine:
             min_room_r=self.cfg.expert_range_min_room_r,
         )
 
-    def _trend_lifecycle(self, df5: pd.DataFrame, direction: str) -> tuple[str, float]:
-        """Approximate the current directional leg age + extension.
-
-        This is intentionally execution-frame local. It distinguishes a fresh
-        trend from a mature/extended leg so a 100 regime score cannot by itself
-        justify chasing the third continuation entry.
-        """
-        if df5 is None or len(df5) < 40:
-            return "DEVELOPING", 0.0
-        close = df5["close"].astype(float)
-        ema20 = ind.ema(close, 20)
-        atrs = ind.atr(df5, 14)
-        atrv = max(float(atrs.iloc[-1]), 1e-12)
-        aligned = (close > ema20) if direction == LONG else (close < ema20)
-        age = 0
-        for ok in reversed(aligned.iloc[-48:].tolist()):
-            if not bool(ok):
-                break
-            age += 1
-        ext = abs(float(close.iloc[-1] - ema20.iloc[-1])) / atrv
-        if ext >= float(getattr(self.cfg, "expert_lifecycle_exhaustion_extension_atr", 1.35)):
-            return "EXHAUSTING", ext
-        if age >= int(getattr(self.cfg, "expert_lifecycle_extended_bars", 30)):
-            return "EXTENDED", ext
-        if age >= int(getattr(self.cfg, "expert_lifecycle_mature_bars", 18)):
-            return "MATURE", ext
-        if age <= 6:
-            return "EARLY", ext
-        return "DEVELOPING", ext
-
-    def _adaptive_candidate_threshold(self, candidate: _Candidate, lifecycle: str, state: _State, symbol: str) -> float:
-        add = 0.0
-        if bool(getattr(self.cfg, "expert_trend_lifecycle_enabled", True)):
-            add += {
-                "MATURE": float(getattr(self.cfg, "expert_lifecycle_mature_threshold_add", 2.0)),
-                "EXTENDED": float(getattr(self.cfg, "expert_lifecycle_extended_threshold_add", 5.0)),
-                "EXHAUSTING": float(getattr(self.cfg, "expert_lifecycle_exhausting_threshold_add", 8.0)),
-            }.get(lifecycle, 0.0)
-        if bool(getattr(self.cfg, "expert_leg_budget_enabled", True)) and state.leg_direction == candidate.direction:
-            if state.leg_entries == 1:
-                add += float(getattr(self.cfg, "expert_leg_second_entry_add", 4.0))
-            elif state.leg_entries >= 2:
-                add += float(getattr(self.cfg, "expert_leg_third_entry_add", 8.0))
-        if bool(getattr(self.cfg, "expert_xau_probation_enabled", True)) and "XAU" in str(symbol).upper():
-            add += float(getattr(self.cfg, "expert_xau_probation_threshold_add", 5.0))
-        return candidate.threshold + add
-
     def _reentry_allowed(self, state: _State, direction: str, df15: pd.DataFrame) -> tuple[bool,str]:
         if state.reentry_lock_direction != direction or state.reentry_lock_ts is None:
             return True,""
@@ -1062,52 +1006,6 @@ class EntryEngine:
 
         candidates=[c for c in candidates if not self._same_setup_cooldown(state,c,current_ts)]
         candidates=[c for c in candidates if c.signal_key!=state.last_entry_key]
-
-        # V3.3.1 local adaptation: lifecycle, trend-leg budget and XAU probation.
-        adapted=[]
-        for cand in candidates:
-            lifecycle, lifecycle_ext = self._trend_lifecycle(df_5m, cand.direction)
-            # XAU must have meaningful 15M confirmation while on probation.
-            if (
-                bool(getattr(self.cfg, "expert_xau_probation_enabled", True))
-                and "XAU" in str(symbol).upper()
-                and bool(getattr(self.cfg, "expert_xau_require_15m_confirm", True))
-            ):
-                x15=self._snapshot(df_15m,cand.direction)
-                if x15["edge"] < float(getattr(self.cfg, "expert_xau_15m_min_edge", 6.0)):
-                    diagnostics.append(f"{cand.direction}:{cand.setup_type} XAU probation 15M edge {x15['edge']:+.0f}")
-                    continue
-
-            # After two entries in one directional leg, require genuinely fresh
-            # 15M structure before allowing another continuation attempt.
-            if (
-                bool(getattr(self.cfg, "expert_leg_budget_enabled", True))
-                and state.leg_direction == cand.direction
-                and state.leg_entries >= int(getattr(self.cfg, "expert_leg_require_new_structure_after", 2))
-            ):
-                bos,_=ind.latest_bos(df_15m,cand.direction,3,3,0.12)
-                fresh_bos = bool(bos) and (
-                    state.leg_anchor_ts is None or pd.Timestamp(df_15m.index[-1]) > state.leg_anchor_ts
-                )
-                if not fresh_bos:
-                    diagnostics.append(f"{cand.direction}:{cand.setup_type} leg budget {state.leg_entries} waiting fresh 15M BOS")
-                    continue
-                state.leg_entries=0
-                state.leg_anchor_ts=pd.Timestamp(df_15m.index[-1])
-
-            effective_thr=self._adaptive_candidate_threshold(cand,lifecycle,state,symbol)
-            if cand.score < effective_thr:
-                diagnostics.append(
-                    f"{cand.direction}:{cand.setup_type} lifecycle={lifecycle} "
-                    f"score {cand.score:.0f}<{effective_thr:.0f}"
-                )
-                continue
-            cand.threshold=round(effective_thr,1)
-            cand.components["trend_lifecycle"]=lifecycle
-            cand.components["lifecycle_extension_atr"]=round(lifecycle_ext,2)
-            cand.components["leg_entry_no"]=(state.leg_entries+1 if state.leg_direction==cand.direction else 1)
-            adapted.append(cand)
-        candidates=adapted
         if not candidates:
             self._persist_state()
             s5=self._snapshot(df_5m,sides[0])
@@ -1158,14 +1056,6 @@ class EntryEngine:
         try:
             s.last_entry_ts=pd.Timestamp(cross_ts[0])
             s.last_setup=str(cross_ts[2])
-            direction=str(cross_ts[1])
-            if s.leg_direction == direction:
-                s.leg_entries += 1
-            else:
-                s.leg_direction = direction
-                s.leg_entries = 1
-            if s.leg_anchor_ts is None:
-                s.leg_anchor_ts = s.last_entry_ts
         except (TypeError,ValueError,IndexError):
             s.last_entry_ts=pd.Timestamp.utcnow()
         self._persist_state()

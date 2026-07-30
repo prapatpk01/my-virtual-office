@@ -52,8 +52,6 @@ class Position:
     trigger: str = ""
     planned_rr: float = 0.0
     structure_room_r: float = 0.0
-    mfe_r: float = 0.0
-    mae_r: float = 0.0
 
 
 def calc_stop_loss(
@@ -594,11 +592,6 @@ class PositionManager:
         if pos is None:
             return None
         is_long = pos.side == LONG
-        if pos.one_r > 0:
-            favorable = ((current_price - pos.entry_price) if is_long else (pos.entry_price - current_price)) / pos.one_r
-            adverse = ((pos.entry_price - current_price) if is_long else (current_price - pos.entry_price)) / pos.one_r
-            pos.mfe_r = max(pos.mfe_r, float(favorable))
-            pos.mae_r = max(pos.mae_r, float(adverse))
         if (current_price <= pos.stop_loss) if is_long else (current_price >= pos.stop_loss):
             return await self._close_full(pos, current_price, "BE_HIT" if pos.tp1_hit else "SL_HIT")
         if not pos.tp1_hit and pos.tp1 is not None:
@@ -662,11 +655,6 @@ class PositionManager:
             "entry_fee_alloc": leg["entry_fee_alloc"],
             "tp1_hit": pos.tp1_hit,
             "entry_price": pos.entry_price,
-            "mfe_r": pos.mfe_r,
-            "mae_r": pos.mae_r,
-            "result_r": trade_pnl / max(pos.one_r * pos.full_amount, 1e-12),
-            "setup_type": pos.setup_type,
-            "trigger": pos.trigger,
             "position": pos,
             "approximate": True,
         }
@@ -814,11 +802,6 @@ class PositionManager:
             "entry_fee_alloc": leg["entry_fee_alloc"],
             "tp1_hit": pos.tp1_hit,
             "entry_price": pos.entry_price,
-            "mfe_r": pos.mfe_r,
-            "mae_r": pos.mae_r,
-            "result_r": trade_pnl / max(pos.one_r * pos.full_amount, 1e-12),
-            "setup_type": pos.setup_type,
-            "trigger": pos.trigger,
             "position": pos,
         }
 
