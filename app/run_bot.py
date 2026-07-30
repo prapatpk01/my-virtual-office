@@ -299,7 +299,7 @@ def build_config() -> dict:
         # T1's SL-move locks in this many R of profit instead of a flat
         # scratch at exactly entry (0R) — e.g. 0.15 means the worst case
         # after T1 is +0.15R, not breakeven.
-        "adaptive_breakeven_lock_r": _env_float("ADAPTIVE_BREAKEVEN_LOCK_R", 0.15),
+        "adaptive_breakeven_lock_r": _env_float("ADAPTIVE_BREAKEVEN_LOCK_R", 0.30),
         # Fraction of the position closed at T1 (rest runs to T2). Was
         # documented as ADAPTIVE_TP1_CLOSE_PCT in .env.example but never
         # actually wired here — the live bot always used the class default

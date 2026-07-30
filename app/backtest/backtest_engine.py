@@ -54,8 +54,8 @@ class BacktestConfig:
 
     # TP/SL structure (must match live bot)
     tp1_r:           float = 0.6           # TP1 at 0.6R (widened from 0.5R)
-    tp2_r:           float = 1.2           # TP2 at 1.2R (widened from 1.0R)
-    breakeven_lock_r: float = 0.15         # T1's SL-move locks in this much R (was flat 0R)
+    tp2_r:           float = 1.3           # TP2 at 1.2R (widened from 1.0R)
+    breakeven_lock_r: float = 0.30         # T1's SL-move locks in this much R (was flat 0R)
 
     # Risk limits
     daily_loss_pct:   float = -3.0

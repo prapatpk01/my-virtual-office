@@ -1591,14 +1591,14 @@ class TradingBot:
     # and moves the stop to BREAKEVEN_LOCK_R (locks in a small win instead of
     # a flat scratch at exactly entry), T2 closes what's left (matches the
     # exchange-attached TP2, unchanged).
-    BREAKEVEN_LOCK_R: float = 0.15
+    BREAKEVEN_LOCK_R: float = 0.30
     # TP geometry — widened from 0.5R/1.0R to 0.6R/1.2R by request. Bar-close
     # A/B backtest (8 symbols, Jan–Jul 2026, same tp1_close_pct 60% /
     # breakeven-lock 0.15 / min-SL 1.2%): aggregate PnL improved by the
     # equivalent of +$4.3k (mainly XAU +$3.5k, XRP +$1.7k; SOL/XAG/CL a bit
     # worse) at the cost of ~3pp win-rate (66.8% → 63.4%) — targets sit
     # further out so fewer trades reach T1/T2, but each banked leg is bigger.
-    TP1_R: float = 0.70
+    TP1_R: float = 0.60
     TP2_R: float = 1.30
 
     # [TREND-TIER GATE] The weaker "Trend" regime tier only enters on a
