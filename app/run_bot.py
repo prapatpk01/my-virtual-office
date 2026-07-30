@@ -292,13 +292,15 @@ def build_config() -> dict:
         "adaptive_cooldown_min": _env_int("ADAPTIVE_COOLDOWN_MIN", 30),
         "adaptive_max_loss_streak": _env_int("ADAPTIVE_MAX_LOSS_STREAK", 3),
         "adaptive_max_positions": _env_int("ADAPTIVE_MAX_POSITIONS", 2),
-        # TP geometry dial (None = use bot class defaults 0.7 / 1.5). Lower
-        # ADAPTIVE_TP1_R raises win-rate at the cost of average win size.
-        "adaptive_tp1_r": (_env_float("ADAPTIVE_TP1_R", 0.70) or None),
-        "adaptive_tp2_r": (_env_float("ADAPTIVE_TP2_R", 1.20) or None),
+        # TP geometry dial. Fallback 0.0 -> None -> use the bot CLASS defaults
+        # (TP1_R=0.6 / TP2_R=1.3) as the single source of truth; a non-zero
+        # env value overrides. (Previously these fell back to 0.70/1.20, which
+        # silently overrode the class defaults on live regardless of the code.)
+        "adaptive_tp1_r": (_env_float("ADAPTIVE_TP1_R", 0.0) or None),
+        "adaptive_tp2_r": (_env_float("ADAPTIVE_TP2_R", 0.0) or None),
         # T1's SL-move locks in this many R of profit instead of a flat
-        # scratch at exactly entry (0R) — e.g. 0.15 means the worst case
-        # after T1 is +0.15R, not breakeven.
+        # scratch at exactly entry (0R) — 0.30 means the worst case after T1
+        # is +0.3R, not breakeven.
         "adaptive_breakeven_lock_r": _env_float("ADAPTIVE_BREAKEVEN_LOCK_R", 0.30),
         # Fraction of the position closed at T1 (rest runs to T2). Was
         # documented as ADAPTIVE_TP1_CLOSE_PCT in .env.example but never
@@ -529,6 +531,7 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
         strategy = regime = l1_level = ""
         l1_score = 0.0
         close_pct = 0.75
+        tp1_r, tp2_r, be_lock = 0.6, 1.3, 0.30   # fallbacks; read live values below
         if bot_ref is not None:
             t = getattr(bot_ref, "current_trade", {}) or {}
             strategy  = t.get("strategy", "") or ""
@@ -536,6 +539,10 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             l1_level  = getattr(bot_ref, "current_regime_bias", "")
             l1_score  = float(getattr(bot_ref, "regime_score", 0.0) or 0.0)
             close_pct = float(getattr(bot_ref, "tp1_close_pct", 0.75) or 0.75)
+            # Real R-multiples so the alert never shows a stale hardcoded label.
+            tp1_r   = float(getattr(bot_ref, "TP1_R", tp1_r) or tp1_r)
+            tp2_r   = float(getattr(bot_ref, "TP2_R", tp2_r) or tp2_r)
+            be_lock = float(getattr(bot_ref, "BREAKEVEN_LOCK_R", be_lock) or be_lock)
 
         chart_path = render_entry_chart(
             candles, sym, direction, entry, sl, tp1, tp2,
@@ -551,8 +558,8 @@ async def _run_adaptive(cfg, connector, telegram, stop_event):
             "━━━━━━━━━━━━━━━",
             f"📍 Entry : <code>{_fmt_px(entry)}</code>",
             f"🛑 SL : <code>{_fmt_px(sl)}</code> (-{sl_pct:.2f}%)",
-            f"🎯 T1 : <code>{_fmt_px(tp1)}</code> (0.5R · close {close_pct:.0%} · SL→BE)",
-            f"🏁 T2 : <code>{_fmt_px(tp2)}</code> (1.0R · close rest)",
+            f"🎯 T1 : <code>{_fmt_px(tp1)}</code> ({tp1_r:g}R · close {close_pct:.0%} · SL→BE+{be_lock:g}R)",
+            f"🏁 T2 : <code>{_fmt_px(tp2)}</code> ({tp2_r:g}R · close rest)",
             f"💰 Size : {size:.4f} (≈${order_value:,.2f})",
             f"📥 Margin : ${margin:,.2f}  Fee : ${fee:,.4f}",
         ]
