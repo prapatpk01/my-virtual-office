@@ -937,16 +937,11 @@ class EntryEngine:
                 break
             age += 1
         ext = abs(float(close.iloc[-1] - ema20.iloc[-1])) / atrv
-        mature_bars = int(getattr(self.cfg, "expert_lifecycle_mature_bars", 18))
-        extended_bars = int(getattr(self.cfg, "expert_lifecycle_extended_bars", 30))
-        exhaust_ext = float(getattr(self.cfg, "expert_lifecycle_exhaustion_extension_atr", 1.35))
-        # A fresh impulse can be far from EMA20 without being an exhausted trend.
-        # Only mature legs can be labelled EXHAUSTING.
-        if age >= mature_bars and ext >= exhaust_ext:
+        if ext >= float(getattr(self.cfg, "expert_lifecycle_exhaustion_extension_atr", 1.35)):
             return "EXHAUSTING", ext
-        if age >= extended_bars or (age >= mature_bars and ext >= 1.00):
+        if age >= int(getattr(self.cfg, "expert_lifecycle_extended_bars", 30)):
             return "EXTENDED", ext
-        if age >= mature_bars:
+        if age >= int(getattr(self.cfg, "expert_lifecycle_mature_bars", 18)):
             return "MATURE", ext
         if age <= 6:
             return "EARLY", ext
@@ -1083,6 +1078,23 @@ class EntryEngine:
                     diagnostics.append(f"{cand.direction}:{cand.setup_type} XAU probation 15M edge {x15['edge']:+.0f}")
                     continue
 
+            # After two entries in one directional leg, require genuinely fresh
+            # 15M structure before allowing another continuation attempt.
+            if (
+                bool(getattr(self.cfg, "expert_leg_budget_enabled", True))
+                and state.leg_direction == cand.direction
+                and state.leg_entries >= int(getattr(self.cfg, "expert_leg_require_new_structure_after", 2))
+            ):
+                bos,_=ind.latest_bos(df_15m,cand.direction,3,3,0.12)
+                fresh_bos = bool(bos) and (
+                    state.leg_anchor_ts is None or pd.Timestamp(df_15m.index[-1]) > state.leg_anchor_ts
+                )
+                if not fresh_bos:
+                    diagnostics.append(f"{cand.direction}:{cand.setup_type} leg budget {state.leg_entries} waiting fresh 15M BOS")
+                    continue
+                state.leg_entries=0
+                state.leg_anchor_ts=pd.Timestamp(df_15m.index[-1])
+
             effective_thr=self._adaptive_candidate_threshold(cand,lifecycle,state,symbol)
             if cand.score < effective_thr:
                 diagnostics.append(
@@ -1099,8 +1111,7 @@ class EntryEngine:
         if not candidates:
             self._persist_state()
             s5=self._snapshot(df_5m,sides[0])
-            diag_text = "; ".join(diagnostics[-8:]) if diagnostics else "no setup trigger formed"
-            return EntryResult(NONE,False,f"no valid expert setup | regime={label} | {diag_text}",price=price,ema_fast=s5["ema8"],ema_slow=s5["ema13"],entry_score=0.0)
+            return EntryResult(NONE,False,f"no valid expert setup | regime={label} | {'; '.join(diagnostics)}",price=price,ema_fast=s5["ema8"],ema_slow=s5["ema13"],entry_score=0.0)
 
         # Candidate edge is primary; score and higher timeframe are tie-breakers.
         candidates.sort(key=lambda x:(x.edge,x.score,1 if x.timeframe=="15M" else 0),reverse=True)

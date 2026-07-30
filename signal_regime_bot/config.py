@@ -313,10 +313,11 @@ class Config:
     symbol_sl_cooldown_min: int = 90  # longer pause after full SL to avoid repeated same-symbol churn
     symbol_be_cooldown_min: int = 20  # pause after fee-adjusted runner stop
 
-    # ── SpikeGuard (fast 5m/15m reversal-spike protection) ───────────────────
-    # Runs EVERY poll tick while a position is open — the slow 30m health
-    # monitor cannot react to a V-reversal that eats the SL in minutes.
-    spike_guard_enabled: bool = True
+    # ── SpikeGuard (disabled by default) ─────────────────────────────────────
+    # AI Exit Engine is now the primary discretionary exit layer.
+    # Set Railway variable SPIKE_GUARD_ENABLED=true only to re-enable this
+    # legacy fast-close path. Native OKX SL/TP remain active regardless.
+    spike_guard_enabled: bool = field(default_factory=lambda: _env_bool("SPIKE_GUARD_ENABLED", False))
     spike_5m_atr_mult: float = 2.5     # 5m bar range >= this x ATR14(5m) = spike
     spike_15m_atr_mult: float = 2.0    # 15m bar range >= this x ATR14(15m) = spike
     spike_15m_cum_atr_mult: float = 2.5  # 3-bar cumulative 15m thrust vs ATR
@@ -740,19 +741,19 @@ class Config:
     expert_lifecycle_mature_bars: int = 18
     expert_lifecycle_extended_bars: int = 30
     expert_lifecycle_exhaustion_extension_atr: float = 1.35
-    expert_lifecycle_mature_threshold_add: float = 1.0
-    expert_lifecycle_extended_threshold_add: float = 2.0
-    expert_lifecycle_exhausting_threshold_add: float = 4.0
+    expert_lifecycle_mature_threshold_add: float = 2.0
+    expert_lifecycle_extended_threshold_add: float = 5.0
+    expert_lifecycle_exhausting_threshold_add: float = 8.0
 
     expert_leg_budget_enabled: bool = True
-    expert_leg_second_entry_add: float = 2.0
-    expert_leg_third_entry_add: float = 4.0
-    expert_leg_require_new_structure_after: int = 99
+    expert_leg_second_entry_add: float = 4.0
+    expert_leg_third_entry_add: float = 8.0
+    expert_leg_require_new_structure_after: int = 2
 
     expert_xau_probation_enabled: bool = True
-    expert_xau_probation_threshold_add: float = 3.0
+    expert_xau_probation_threshold_add: float = 5.0
     expert_xau_require_15m_confirm: bool = True
-    expert_xau_15m_min_edge: float = 3.0
+    expert_xau_15m_min_edge: float = 6.0
 
     # Setup-specific TP2 geometry. TP1 remains controlled by tp1_r and
     # tp1_fraction in the shared PositionManager.
