@@ -44,8 +44,15 @@ def main() -> None:
         if not os.path.isfile(os.path.join(target_dir, "main.py")):
             print(f"FATAL: htf_bot/main.py not found under {HERE}", flush=True)
             sys.exit(1)
+    elif mode in ("hma", "hma16", "trendfollow"):
+        target_dir = os.path.join(HERE, "hma_bot")
+        argv = [sys.executable, "main.py"]
+        name = "HMA16 Trend-Follow (15M)"
+        if not os.path.isfile(os.path.join(target_dir, "main.py")):
+            print(f"FATAL: hma_bot/main.py not found under {HERE}", flush=True)
+            sys.exit(1)
     else:
-        print(f"FATAL: unknown MODE={mode!r} — use MODE=dual, MODE=regime or MODE=htf", flush=True)
+        print(f"FATAL: unknown MODE={mode!r} — use MODE=dual, regime, htf or hma", flush=True)
         sys.exit(1)
 
     print(f"{banner}\nLAUNCHER: MODE={mode} -> {name}\n"
