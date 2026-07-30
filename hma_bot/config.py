@@ -61,10 +61,10 @@ class Config:
         s.strip() for s in os.environ.get(
             "SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT").split(",") if s.strip()])
     leverage: int = field(default_factory=lambda: _env_int("LEVERAGE", 20))
-    # Same 5% default as the dual/regime/htf bots. Sizing is risk-based against
-    # the fixed 1.5% stop (see main._size). Backtest maxDD ~13R -> at 5% a bad
-    # stretch draws down deeply; the startup warning below stays.
-    risk_per_trade: float = field(default_factory=lambda: _env_float("RISK_PER_TRADE", 0.05))
+    # Fixed-margin sizing: each new position uses $20 margin at x20 leverage
+    # by default, i.e. about $400 notional per position.
+    margin_per_position_usd: float = field(
+        default_factory=lambda: _env_float("MARGIN_PER_POSITION_USD", 20.0))
     max_positions: int = field(default_factory=lambda: _env_int("MAX_POSITIONS", 2))
 
     fee_rate: float = 0.0005      # verified 0.05% OKX taker per fill
@@ -114,10 +114,12 @@ class Config:
                     problems.append(f"{k} missing")
         if not self.symbols:
             problems.append("SYMBOLS empty")
-        if self.risk_per_trade > 0.02:
-            logger.warning("[CONFIG] RISK_PER_TRADE=%.1f%% — this strategy backtested "
-                           "NEGATIVE (BTC -6R / XAU -13R). Consider a much smaller "
-                           "risk while forward-testing.", self.risk_per_trade * 100)
+        if self.margin_per_position_usd <= 0:
+            problems.append("MARGIN_PER_POSITION_USD must be > 0")
+        if self.leverage <= 0:
+            problems.append("LEVERAGE must be > 0")
+        if self.max_positions <= 0:
+            problems.append("MAX_POSITIONS must be > 0")
         return problems
 
     def stats_since_ms(self) -> int:

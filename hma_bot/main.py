@@ -4,7 +4,7 @@ One 15m strategy (strategy.py, the user's HMA16TrendFollowStrategy) driving the
 regime bot's battle-tested infrastructure: OKX ExchangeClient (hedge mode, native
 SL/TP), TelegramNotifier, chart engine, and the OKX-accurate /stats + persistent
 close-journal. Entry = EMA20/50 trend + HMA16 flip + soft ADX/CHOP/DMI quality.
-Exit = opposite HMA16 flip (per closed 15m bar) or the native 1.5% TP/SL.
+Exit = opposite HMA16 flip (per closed 15m bar) or the native 1.5% TP/SL. Position sizing is fixed at $20 margin with x20 leverage by default.
 
 ⚠️ Backtested NEGATIVE on BTC+XAU (see config.py); shipped at user direction.
 """
@@ -157,9 +157,10 @@ class Bot:
             if not await self.client.ensure_hedge_mode():
                 raise RuntimeError("Could not confirm OKX hedge mode.")
         balance = await self.client.fetch_balance_usdt()
-        logger.info("=== HMA16 bot [%s] symbols=%s risk=%.1f%% balance=%.2f ===",
+        logger.info("=== HMA16 bot [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
                     "PAPER" if self.cfg.paper else "LIVE", self.cfg.symbols,
-                    self.cfg.risk_per_trade * 100, balance)
+                    self.cfg.margin_per_position_usd, self.cfg.leverage,
+                    self.cfg.max_positions, balance)
         await self._reconcile_startup()
         self._running = True
         if self.tg.enabled:
@@ -167,7 +168,8 @@ class Bot:
             await self.tg.send_text(
                 f"🤖 *HMA16 Trend-Follow bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
-                f"Balance: `{balance:.2f}` USDT | Risk `{self.cfg.risk_per_trade*100:.1f}%`/trade\n"
+                f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
+                f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n"
                 f"Strategy: 15M EMA20/50 trend → HMA16 flip → TP/SL {self.cfg.take_profit_pct*100:.1f}% "
                 f"+ HMA flip exit")
 
@@ -280,10 +282,27 @@ class Bot:
         tp = fill_ref * (1 + self.cfg.take_profit_pct) if direction == "long" \
             else fill_ref * (1 - self.cfg.take_profit_pct)
         risk = abs(fill_ref - sl)
+
+        # Fixed-margin sizing:
+        #   margin $20 × leverage x20 = ~$400 notional per position.
+        # `amount` here is the generic base-asset quantity. ExchangeClient is
+        # responsible for converting/rounding it to the instrument contract rules.
         balance = await self.client.fetch_balance_usdt()
-        amount = (balance * self.cfg.risk_per_trade) / risk if risk > 0 else 0
-        if amount * fill_ref < 5:
-            logger.info("[%s] size too small (%.2f USDT) — skip", symbol, amount * fill_ref)
+        required_margin = float(self.cfg.margin_per_position_usd)
+        notional = required_margin * float(self.cfg.leverage)
+
+        if balance < required_margin:
+            logger.info("[%s] insufficient balance %.2f < required margin %.2f — skip",
+                        symbol, balance, required_margin)
+            self._view[symbol] = (
+                f"insufficient balance ${balance:.2f} for ${required_margin:.2f} margin"
+            )
+            return
+
+        amount = notional / fill_ref if fill_ref > 0 else 0.0
+        if amount <= 0 or amount * fill_ref < 5:
+            logger.info("[%s] size too small/notional invalid (%.2f USDT) — skip",
+                        symbol, amount * fill_ref)
             return
 
         side = "buy" if direction == "long" else "sell"
@@ -302,6 +321,8 @@ class Bot:
             else fill * (1 - self.cfg.take_profit_pct)
         st["pos"] = {"side": direction, "entry": fill, "sl": sl, "tp": tp,
                      "risk": abs(fill - sl), "amount": order.amount or amount,
+                     "margin_usd": required_margin, "leverage": self.cfg.leverage,
+                     "notional_usd": notional,
                      "opened_ms": int(time.time() * 1000), "exit_bar": None}
         self._save_state()
         logger.info("[%s] OPEN %s @ %.6g sl=%.6g tp=%.6g Q=%.0f",
@@ -310,7 +331,9 @@ class Bot:
             f"🟢 *{_sym(symbol)} {direction.upper()}* @ `{fill:.6g}`\n"
             f"SL `{sl:.6g}` (−{self.cfg.stop_loss_pct*100:.1f}%)  "
             f"TP `{tp:.6g}` (+{self.cfg.take_profit_pct*100:.1f}%)\n"
-            f"Size `{st['pos']['amount']:.6g}` | exit on opposite HMA16 flip\n"
+            f"Size `{st['pos']['amount']:.6g}` | Margin `${required_margin:.2f}` × `x{self.cfg.leverage}` "
+            f"≈ `${notional:.2f}` notional\n"
+            f"Exit on opposite HMA16 flip\n"
             f"15M {sig.trend.value} + HMA flip | Q={sig.trend_quality:.0f}/100 "
             f"ADX={sig.adx:.0f} CHOP={sig.chop:.0f}")
         chart = self._build_chart(symbol, df, direction, fill, sl, tp)
