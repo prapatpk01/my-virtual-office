@@ -1036,6 +1036,18 @@ class TrendConfirmStrategy(BaseStrategy):
             return self._hold(current_price, "15M EMA8/13 indicators warming up")
 
         bar_ts = int(c15[-1].timestamp)
+
+        # Fresh-cross-only rule: the EMA8/13 cross may trigger an entry only
+        # immediately after the 15M candle that CREATED the cross has closed.
+        # With the bot scanning every 5 minutes, a 7-minute post-close window
+        # allows normal scheduler/API delay but prevents using a cross that is
+        # already old (late-trend/chase entry). Timestamps are candle-open times.
+        bar_open_ms = bar_ts * 1000 if bar_ts < 10_000_000_000 else bar_ts
+        bar_close_ms = bar_open_ms + 15 * 60_000
+        now_ms = int(time.time() * 1000)
+        cross_age_after_close_ms = max(0, now_ms - bar_close_ms)
+        fresh_cross_window_ms = 7 * 60_000
+
         cross_ok = l15["ema_cross_up"] if direction == "long" else l15["ema_cross_down"]
         cross_label = "UP" if l15["ema_cross_up"] else "DOWN" if l15["ema_cross_down"] else "WAIT"
         self._diag_update(
@@ -1056,6 +1068,23 @@ class TrendConfirmStrategy(BaseStrategy):
                     "context_1h": ctx,
                     "quality_1h": ctx,
                     "cross_15m": cross_label,
+                    "data_quality": data_quality,
+                },
+            )
+
+        if cross_age_after_close_ms > fresh_cross_window_ms:
+            # Consume this old cross so it cannot be reused on a later scan.
+            self._last_entry_attempt_bar_ts = bar_ts
+            age_min = cross_age_after_close_ms / 60_000.0
+            return self._hold(
+                current_price,
+                f"15M cross expired ({age_min:.1f}m after close) — wait for a NEW EMA{self.ema_fast}/{self.ema_slow} cross",
+                metadata={
+                    "macro_4h": macro,
+                    "context_1h": ctx,
+                    "cross_15m": cross_label,
+                    "cross_age_min": round(age_min, 2),
+                    "fresh_cross_window_min": 7.0,
                     "data_quality": data_quality,
                 },
             )
@@ -1153,6 +1182,8 @@ class TrendConfirmStrategy(BaseStrategy):
             "context_1h": ctx,
             "quality_1h": ctx,
             "cross_15m": cross_label,
+            "cross_age_min": round(cross_age_after_close_ms / 60_000.0, 2),
+            "fresh_cross_window_min": 7.0,
             "sma30_15m": round(sma30, 8),
             "chase_distance_atr": round(chase_distance_atr, 3),
             "data_quality": data_quality,
@@ -1160,7 +1191,7 @@ class TrendConfirmStrategy(BaseStrategy):
         reason = (
             f"4H {macro_state} {votes}/4 + 1H bias aligned "
             f"(ADX {ctx['adx']:.1f}, CHOP {ctx['chop']:.1f}) + "
-            f"15M EMA{self.ema_fast}/{self.ema_slow} cross {cross_label}"
+            f"15M FRESH EMA{self.ema_fast}/{self.ema_slow} cross {cross_label}"
         )
         return Signal(
             type=SignalType.BUY if direction == "long" else SignalType.SELL,
