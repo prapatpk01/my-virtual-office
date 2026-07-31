@@ -1057,6 +1057,11 @@ def _v11_bb(values, length=20, std_mult=2.0):
     }
 
 class TradingBot:
+    def set_paper_mode(self, enabled: bool = True) -> None:
+        """Disable private-exchange reconciliation when simulating."""
+        self.paper_mode = bool(enabled)
+
+
     """
     V8 state-machine trading bot.
     SwingReversalPro with all 7 V8 improvements.
@@ -4135,14 +4140,7 @@ class TradingBot:
                                                    ind_4h, atr_4h)
 
             elif self.state == "ERROR":
-                # Do NOT call async code here: on_tick() is synchronous.
-                # run_bot.py already calls reconcile_with_exchange() outside
-                # this method. That reconciliation safely clears stale ERROR
-                # only after OKX confirms the exchange is flat.
-                self._log_event(
-                    "Bot in ERROR state — waiting for exchange reconciliation",
-                    level="warning",
-                )
+                self._log_event("Bot in ERROR state — manual check required", level="error")
                 break
 
         self.save_state(self._state_file)
