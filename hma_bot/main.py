@@ -1,11 +1,9 @@
-"""MTF Structure Trend bot — live entry point (MODE=hma).
+"""Precision Trend Structure V2 bot.
 
-One 15m strategy (strategy.py, the user's HMA16TrendFollowStrategy) driving the
-regime bot's battle-tested infrastructure: OKX ExchangeClient (hedge mode, native
-SL/TP), TelegramNotifier, chart engine, and the OKX-accurate /stats + persistent
-close-journal. 4H EMA20/50+HMA16 selects direction; 1H ADX+CHOP Q confirms quality; 15M market structure/micro-BOS triggers entry. Profit locks: +0.6%->SL +0.3%, +1.0%->SL +0.7%, runner to +1.5%; initial SL -1.5%.
-
-⚠️ Backtested NEGATIVE on BTC+XAU (see config.py); shipped at user direction.
+4H EMA20/50 + HMA16 selects trade side, 1H ADX+CHOP Q confirms market quality,
+15M location/setup is armed before a micro-structure trigger. Uses fixed $20
+margin, x20 isolated leverage, max 2 positions, staged profit locks, and
+structure/HTF invalidation exits.
 """
 from __future__ import annotations
 
@@ -35,7 +33,7 @@ except Exception:
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stdout, force=True)
-logger = logging.getLogger("hma")
+logger = logging.getLogger("precision_structure")
 
 _TF_MIN = 15
 
@@ -76,7 +74,7 @@ def _metal_halted(symbol: str, ts: pd.Timestamp) -> bool:
 class Bot:
     def __init__(self):
         self.cfg = Config()
-        self.strat = S.MTFStructureStrategy(self.cfg.strategy_config())
+        self.strat = S.PrecisionTrendStructureV2(self.cfg.strategy_config())
         self.client = ExchangeClient(
             api_key=self.cfg.okx_api_key, api_secret=self.cfg.okx_secret,
             passphrase=self.cfg.okx_passphrase, paper=self.cfg.paper,
@@ -169,8 +167,8 @@ class Bot:
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n"
-                f"Strategy: 15M EMA20/50 trend → HMA16 flip → TP/SL {self.cfg.take_profit_pct*100:.1f}% "
-                f"+ HMA flip exit")
+                f"Strategy: 4H Trend → 1H Q≥{self.cfg.min_trend_quality:.0f} → 15M Setup → Trigger\n"
+                f"T1 +0.6%→SL +0.3% | T2 +1.0%→SL +0.7% | TP +1.5%")
 
     async def _reconcile_startup(self):
         for symbol in self.cfg.symbols:
@@ -248,7 +246,7 @@ class Bot:
             elif q.q < self.cfg.min_trend_quality:
                 why = f"WAIT Q<{self.cfg.min_trend_quality:.0f}"
             else:
-                why = "WAIT 15M structure BOS"
+                why = "WAIT 15M location/trigger"
             px = float(df15["close"].iloc[-1]) if len(df15) else 0.0
             self._view[symbol] = (
                 f"4H={t.trend.value} HMA={'UP' if t.hma_state>0 else 'DOWN' if t.hma_state<0 else 'FLAT'} "
@@ -333,20 +331,22 @@ class Bot:
             "lock_stage": 0,
             "setup": sig.setup,
             "q_1h": sig.q_1h,
-            "entry_score": sig.entry_score,
+            "room_pct": sig.room_pct,
+            "trigger": sig.trigger,
         }
         self._save_state()
 
         logger.info(
-            "[%s] OPEN %s @ %.6g sl=%.6g tp=%.6g 4H=%s Q=%.0f Score=%.0f %s",
+            "[%s] OPEN %s @ %.6g sl=%.6g tp=%.6g 4H=%s Q=%.0f setup=%s trigger=%s room=%.2f%%",
             symbol, direction.upper(), fill, sl, tp, sig.trend_4h.value,
-            sig.q_1h, sig.entry_score, sig.setup
+            sig.q_1h, sig.setup.value, sig.trigger, sig.room_pct * 100
         )
         caption = (
             f"🟢 *{_sym(symbol)} {direction.upper()}* @ `{fill:.6g}`\n"
             f"4H `{sig.trend_4h.value}` | 1H Q `{sig.q_1h:.0f}` "
             f"(ADX {sig.adx_1h:.1f}, CHOP {sig.chop_1h:.1f})\n"
-            f"15M `{sig.setup}` | Score `{sig.entry_score:.0f}` | {sig.reason}\n"
+            f"15M `{sig.setup.value}` → `{sig.trigger}` | Room `{sig.room_pct*100:.2f}%`\n"
+            f"{sig.reason}\n"
             f"SL `{sl:.6g}` (−1.5%) | Final TP `{tp:.6g}` (+1.5%)\n"
             f"T1 `+0.6%` → lock `+0.3%` | T2 `+1.0%` → lock `+0.7%`\n"
             f"Margin `${required_margin:.2f}` × `x{self.cfg.leverage}` ≈ `${notional:.2f}` notional"

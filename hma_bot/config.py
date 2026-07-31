@@ -5,10 +5,7 @@ StrategyConfig so live and backtest share one source). Reuses the regime bot's
 ExchangeClient / TelegramNotifier / chart engine via sys.path, exactly like the
 HTF bot.
 
-⚠️ Backtest note (BTC+XAU, Jan–May 2026, fee 0.05%): this strategy was
-net-NEGATIVE (BTC −6.2R PF 0.76, XAU −13.0R PF 0.31) — HMA16-flip whipsaw plus
-fee drag on ~130 trades/symbol. Shipped at the user's explicit direction; run
-small risk and forward-test before trusting it.
+Precision Trend Structure V2: 4H direction -> 1H quality -> 15M location/setup -> trigger.
 """
 from __future__ import annotations
 
@@ -76,8 +73,10 @@ class Config:
     entry_tf: str = "15m"
 
     min_trend_quality: float = field(default_factory=lambda: _env_float("MIN_TREND_QUALITY", 55.0))
-    min_entry_score: float = field(default_factory=lambda: _env_float("MIN_ENTRY_SCORE", 60.0))
     max_chase_atr: float = field(default_factory=lambda: _env_float("MAX_CHASE_ATR", 0.75))
+    min_room_pct: float = field(default_factory=lambda: _env_float("MIN_ROOM_PCT", 0.008))
+    setup_lookback_bars: int = field(default_factory=lambda: _env_int("SETUP_LOOKBACK_BARS", 8))
+    invalidation_confirm_bars: int = field(default_factory=lambda: _env_int("INVALIDATION_CONFIRM_BARS", 2))
 
     stop_loss_pct: float = field(default_factory=lambda: _env_float("SL_PCT", 0.015))
     take_profit_pct: float = field(default_factory=lambda: _env_float("TP_PCT", 0.015))
@@ -100,8 +99,10 @@ class Config:
             quality_tf=self.quality_tf,
             entry_tf=self.entry_tf,
             min_trend_quality=self.min_trend_quality,
-            min_entry_score=self.min_entry_score,
             max_chase_atr=self.max_chase_atr,
+            min_room_pct=self.min_room_pct,
+            setup_lookback_bars=self.setup_lookback_bars,
+            invalidation_confirm_bars=self.invalidation_confirm_bars,
             stop_loss_pct=self.stop_loss_pct,
             final_take_profit_pct=self.take_profit_pct,
             target1_trigger_pct=self.target1_trigger_pct,
