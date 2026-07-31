@@ -74,7 +74,7 @@ class Config:
     timeframe: str = "15m"
     take_profit_pct: float = field(default_factory=lambda: _env_float("TP_PCT", 0.015))
     stop_loss_pct: float = field(default_factory=lambda: _env_float("SL_PCT", 0.015))
-    min_trend_quality: float = field(default_factory=lambda: _env_float("MIN_TREND_QUALITY", 45.0))
+    min_trend_quality: float = field(default_factory=lambda: _env_float("MIN_TREND_QUALITY", 55.0))
     min_ema_separation_atr: float = field(default_factory=lambda: _env_float("MIN_EMA_SEP_ATR", 0.15))
     min_hma_slope_atr: float = field(default_factory=lambda: _env_float("MIN_HMA_SLOPE_ATR", 0.03))
     max_chase_atr: float = field(default_factory=lambda: _env_float("MAX_CHASE_ATR", 0.80))

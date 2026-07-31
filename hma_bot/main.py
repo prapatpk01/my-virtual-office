@@ -240,7 +240,7 @@ class Bot:
             elif trend == S.Trend.NEUTRAL:
                 why = "no EMA20/50 trend"
             elif not gate:
-                why = f"quality gate blocked (sep/slope/adx/chop) Q={q_long:.0f}"
+                why = f"pre-gate blocked (EMA sep/HMA slope) Q={q_long:.0f}"
             else:
                 need = "HMA↑ flip" if trend == S.Trend.BULL else "HMA↓ flip"
                 why = f"trend {trend.value} — waiting {need}"

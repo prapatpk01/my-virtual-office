@@ -13,7 +13,7 @@ Core architecture
    - EMA separation >= 0.15 ATR
    - HMA16 slope magnitude >= 0.03 ATR
    - Price extension from EMA20 <= 0.80 ATR
-   - Trend Quality >= 45/100
+   - Trend Quality >= 55/100
 7) Closed-candle logic only for indicator-driven entries/exits.
 
 ADX/CHOP/DMI are intentionally permissive. Their job is to reject weak/choppy
@@ -66,7 +66,7 @@ class StrategyConfig:
     min_hma_slope_atr: float = 0.03
     max_chase_atr: float = 0.80
 
-    min_trend_quality: float = 45.0
+    min_trend_quality: float = 55.0
 
     # Loose fail-safes only. These are not intended to make the strategy strict.
     adx_hard_floor: float = 10.0
@@ -336,25 +336,16 @@ class HMA16TrendFollowStrategy:
 
     def trend_quality_score(self, row: pd.Series, side: Side) -> float:
         """
-        Soft 0..100 score:
-          ADX 0..50
-          CHOP 0..50
-          DMI aligned +10 / opposite -10
+        Trend Quality Q = ADX score + CHOP score only, range 0..100.
+
+        DMI (+DI/-DI) is still calculated and reported as confirmation,
+        but it does NOT increase or reduce Q.
+
+        Entry requires Q >= min_trend_quality (default 55).
         """
         adx = float(row["adx"])
         chop = float(row["chop"])
-        plus_di = float(row["plus_di"])
-        minus_di = float(row["minus_di"])
-
         score = self._adx_score(adx) + self._chop_score(chop)
-
-        dmi_aligned = (
-            plus_di > minus_di
-            if side == Side.LONG
-            else minus_di > plus_di
-        )
-        score += 10.0 if dmi_aligned else -10.0
-
         return float(np.clip(score, 0.0, 100.0))
 
     def _quality_gate_common(self, row: pd.Series) -> bool:
@@ -375,12 +366,6 @@ class HMA16TrendFollowStrategy:
         if row["ema_separation_atr"] < self.cfg.min_ema_separation_atr:
             return False
         if row["hma_slope_atr"] < self.cfg.min_hma_slope_atr:
-            return False
-
-        # Only reject clearly weak/choppy conditions.
-        if row["adx"] < self.cfg.adx_hard_floor:
-            return False
-        if row["chop"] > self.cfg.chop_hard_ceiling:
             return False
 
         return True
