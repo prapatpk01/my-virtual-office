@@ -1,4 +1,4 @@
-"""HMA16 Trend-Follow bot configuration (MODE=hma).
+"""MTF Structure Trend bot configuration (MODE=hma).
 
 Deployment knobs + the strategy's own tunables (mirrored from strategy.py's
 StrategyConfig so live and backtest share one source). Reuses the regime bot's
@@ -70,17 +70,23 @@ class Config:
     fee_rate: float = 0.0005      # verified 0.05% OKX taker per fill
     margin_mode: str = "isolated"
 
-    # ── strategy tunables (mirror strategy.StrategyConfig; env-overridable) ──
-    timeframe: str = "15m"
-    take_profit_pct: float = field(default_factory=lambda: _env_float("TP_PCT", 0.015))
-    stop_loss_pct: float = field(default_factory=lambda: _env_float("SL_PCT", 0.015))
+    # ── MTF strategy tunables ─────────────────────────────────────────────
+    trend_tf: str = "4h"
+    quality_tf: str = "1h"
+    entry_tf: str = "15m"
+
     min_trend_quality: float = field(default_factory=lambda: _env_float("MIN_TREND_QUALITY", 55.0))
-    min_ema_separation_atr: float = field(default_factory=lambda: _env_float("MIN_EMA_SEP_ATR", 0.15))
-    min_hma_slope_atr: float = field(default_factory=lambda: _env_float("MIN_HMA_SLOPE_ATR", 0.03))
-    max_chase_atr: float = field(default_factory=lambda: _env_float("MAX_CHASE_ATR", 0.80))
-    adx_hard_floor: float = field(default_factory=lambda: _env_float("ADX_HARD_FLOOR", 10.0))
-    chop_hard_ceiling: float = field(default_factory=lambda: _env_float("CHOP_HARD_CEILING", 62.0))
-    # optional per-symbol re-entry cooldown (bars of `timeframe`); 0 = off.
+    min_entry_score: float = field(default_factory=lambda: _env_float("MIN_ENTRY_SCORE", 60.0))
+    max_chase_atr: float = field(default_factory=lambda: _env_float("MAX_CHASE_ATR", 0.75))
+
+    stop_loss_pct: float = field(default_factory=lambda: _env_float("SL_PCT", 0.015))
+    take_profit_pct: float = field(default_factory=lambda: _env_float("TP_PCT", 0.015))
+
+    target1_trigger_pct: float = field(default_factory=lambda: _env_float("T1_TRIGGER_PCT", 0.006))
+    target1_lock_pct: float = field(default_factory=lambda: _env_float("T1_LOCK_PCT", 0.003))
+    target2_trigger_pct: float = field(default_factory=lambda: _env_float("T2_TRIGGER_PCT", 0.010))
+    target2_lock_pct: float = field(default_factory=lambda: _env_float("T2_LOCK_PCT", 0.007))
+
     reentry_cooldown_bars: int = field(default_factory=lambda: _env_int("REENTRY_COOLDOWN_BARS", 0))
 
     poll_interval_sec: int = 30
@@ -89,19 +95,19 @@ class Config:
     stats_since_date: str = field(default_factory=lambda: os.environ.get("STATS_SINCE_DATE", "2026-07-30"))
 
     def strategy_config(self) -> "S.StrategyConfig":
-        """Build the pure strategy config from these knobs — the exact object
-        the live bot's strategy uses (and that a backtest can pass in too)."""
         return S.StrategyConfig(
-            timeframe=self.timeframe,
-            hma_len=16,
-            min_ema_separation_atr=self.min_ema_separation_atr,
-            min_hma_slope_atr=self.min_hma_slope_atr,
-            max_chase_atr=self.max_chase_atr,
+            trend_tf=self.trend_tf,
+            quality_tf=self.quality_tf,
+            entry_tf=self.entry_tf,
             min_trend_quality=self.min_trend_quality,
-            adx_hard_floor=self.adx_hard_floor,
-            chop_hard_ceiling=self.chop_hard_ceiling,
-            take_profit_pct=self.take_profit_pct,
+            min_entry_score=self.min_entry_score,
+            max_chase_atr=self.max_chase_atr,
             stop_loss_pct=self.stop_loss_pct,
+            final_take_profit_pct=self.take_profit_pct,
+            target1_trigger_pct=self.target1_trigger_pct,
+            target1_lock_pct=self.target1_lock_pct,
+            target2_trigger_pct=self.target2_trigger_pct,
+            target2_lock_pct=self.target2_lock_pct,
         )
 
     def validate_live(self) -> list:

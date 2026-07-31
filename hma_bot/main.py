@@ -1,10 +1,9 @@
-"""HMA16 Trend-Follow bot — live entry point (MODE=hma).
+"""MTF Structure Trend bot — live entry point (MODE=hma).
 
 One 15m strategy (strategy.py, the user's HMA16TrendFollowStrategy) driving the
 regime bot's battle-tested infrastructure: OKX ExchangeClient (hedge mode, native
 SL/TP), TelegramNotifier, chart engine, and the OKX-accurate /stats + persistent
-close-journal. Entry = EMA20/50 trend + HMA16 flip + soft ADX/CHOP/DMI quality.
-Exit = opposite HMA16 flip (per closed 15m bar) or the native 1.5% TP/SL. Position sizing is fixed at $20 margin with x20 leverage by default.
+close-journal. 4H EMA20/50+HMA16 selects direction; 1H ADX+CHOP Q confirms quality; 15M market structure/micro-BOS triggers entry. Profit locks: +0.6%->SL +0.3%, +1.0%->SL +0.7%, runner to +1.5%; initial SL -1.5%.
 
 ⚠️ Backtested NEGATIVE on BTC+XAU (see config.py); shipped at user direction.
 """
@@ -77,7 +76,7 @@ def _metal_halted(symbol: str, ts: pd.Timestamp) -> bool:
 class Bot:
     def __init__(self):
         self.cfg = Config()
-        self.strat = S.HMA16TrendFollowStrategy(self.cfg.strategy_config())
+        self.strat = S.MTFStructureStrategy(self.cfg.strategy_config())
         self.client = ExchangeClient(
             api_key=self.cfg.okx_api_key, api_secret=self.cfg.okx_secret,
             passphrase=self.cfg.okx_passphrase, paper=self.cfg.paper,
@@ -166,7 +165,7 @@ class Bot:
         if self.tg.enabled:
             asyncio.create_task(self._command_loop())
             await self.tg.send_text(
-                f"🤖 *HMA16 Trend-Follow bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
+                f"🤖 *MTF Structure Trend bot started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n"
@@ -218,49 +217,59 @@ class Bot:
         else:
             await self._look_for_entry(symbol, st)
 
-    async def _frame15(self, symbol: str) -> pd.DataFrame:
+    async def _frame(self, symbol: str, tf: str, minutes: int, limit: int = 300) -> pd.DataFrame:
         now_ms = int(time.time() * 1000)
-        return _drop_unclosed(_ohlcv_to_df(
-            await self.client.fetch_ohlcv(symbol, "15m", limit=300)), now_ms)
+        raw = await self.client.fetch_ohlcv(symbol, tf, limit=limit)
+        df = _ohlcv_to_df(raw)
+        if df.empty:
+            return df
+        close_ms = (df.index.as_unit("ns").asi8 // 1_000_000) + minutes * 60_000
+        return df[close_ms <= now_ms]
 
-    def _set_view(self, symbol: str, df):
+    async def _frames(self, symbol: str):
+        df15, df1h, df4h = await asyncio.gather(
+            self._frame(symbol, "15m", 15, 320),
+            self._frame(symbol, "1h", 60, 240),
+            self._frame(symbol, "4h", 240, 220),
+        )
+        return df15, df1h, df4h
+
+    def _set_view(self, symbol: str, df15, df1h, df4h):
         try:
-            d = self.strat.add_indicators(df)
-            row = d.iloc[-1]
-            trend = self.strat.classify_trend(row)
-            hs = int(row["hma_state"])
-            hlabel = {1: "HMA↑blue", -1: "HMA↓orange", 0: "HMA flat"}[hs]
-            q_long = self.strat.trend_quality_score(row, S.Side.LONG)
-            gate = self.strat._quality_gate_common(row)
-            px = float(row["close"])
+            t = self.strat.trend_state_4h(df4h)
+            q = self.strat.quality_state_1h(df1h)
+            dmi = "DMI+" if q.plus_di > q.minus_di else "DMI-"
             if _metal_halted(symbol, pd.Timestamp.now(tz="UTC")):
-                why = "HALT (metal weekend)"
+                why = "HALT"
             elif self.open_position_count() >= self.cfg.max_positions:
-                why = f"max {self.cfg.max_positions} positions open"
-            elif trend == S.Trend.NEUTRAL:
-                why = "no EMA20/50 trend"
-            elif not gate:
-                why = f"pre-gate blocked (EMA sep/HMA slope) Q={q_long:.0f}"
+                why = f"MAX {self.cfg.max_positions}"
+            elif t.trend == S.Trend.NEUTRAL:
+                why = "WAIT 4H trend"
+            elif q.q < self.cfg.min_trend_quality:
+                why = f"WAIT Q<{self.cfg.min_trend_quality:.0f}"
             else:
-                need = "HMA↑ flip" if trend == S.Trend.BULL else "HMA↓ flip"
-                why = f"trend {trend.value} — waiting {need}"
-            self._view[symbol] = (f"{trend.value} {hlabel} px={px:.6g} "
-                                  f"ADX={row['adx']:.0f} CHOP={row['chop']:.0f} Q={q_long:.0f} | {why}")
-        except Exception as e:
-            self._view[symbol] = f"view error: {str(e)[:60]}"
+                why = "WAIT 15M structure BOS"
+            px = float(df15["close"].iloc[-1]) if len(df15) else 0.0
+            self._view[symbol] = (
+                f"4H={t.trend.value} HMA={'UP' if t.hma_state>0 else 'DOWN' if t.hma_state<0 else 'FLAT'} "
+                f"| 1H Q={q.q:.0f} ADX={q.adx:.1f} CHOP={q.chop:.1f} {dmi} "
+                f"| 15M px={px:.6g} | {why}"
+            )
+        except Exception as exc:
+            self._view[symbol] = f"view error: {str(exc)[:80]}"
 
     async def _look_for_entry(self, symbol: str, st: dict):
-        df = await self._frame15(symbol)
-        min_bars = max(self.cfg.strategy_config().ema_slow_len + 5, 80)
-        if len(df) < min_bars:
-            self._view[symbol] = f"warming up ({len(df)}×15M)"
+        df15, df1h, df4h = await self._frames(symbol)
+        if len(df15) < 80 or len(df1h) < 60 or len(df4h) < 60:
+            self._view[symbol] = f"warming up 15M={len(df15)} 1H={len(df1h)} 4H={len(df4h)}"
             return
-        self._set_view(symbol, df)
 
-        bar_key = df.index[-1].isoformat()
+        self._set_view(symbol, df15, df1h, df4h)
+
+        bar_key = df15.index[-1].isoformat()
         if st.get("last_bar") == bar_key:
             return
-        st["last_bar"] = bar_key       # one evaluation per closed 15M bar
+        st["last_bar"] = bar_key
         self._save_state()
 
         if _metal_halted(symbol, pd.Timestamp.now(tz="UTC")):
@@ -270,73 +279,79 @@ class Bot:
         if time.time() < self._cooldown_until.get(symbol, 0):
             return
 
-        sig = self.strat.generate_entry(df, has_open_position=False)
+        sig = self.strat.generate_entry(df4h, df1h, df15, has_open_position=False)
         if sig is None:
             return
 
         direction = "long" if sig.side == S.Side.LONG else "short"
         ticker = await self.client.fetch_ticker(symbol)
         fill_ref = float(ticker["last"])
-        sl = fill_ref * (1 - self.cfg.stop_loss_pct) if direction == "long" \
-            else fill_ref * (1 + self.cfg.stop_loss_pct)
-        tp = fill_ref * (1 + self.cfg.take_profit_pct) if direction == "long" \
-            else fill_ref * (1 - self.cfg.take_profit_pct)
-        risk = abs(fill_ref - sl)
 
-        # Fixed-margin sizing:
-        #   margin $20 × leverage x20 = ~$400 notional per position.
-        # `amount` here is the generic base-asset quantity. ExchangeClient is
-        # responsible for converting/rounding it to the instrument contract rules.
+        sl = fill_ref * (1 - self.cfg.stop_loss_pct) if direction == "long" else fill_ref * (1 + self.cfg.stop_loss_pct)
+        tp = fill_ref * (1 + self.cfg.take_profit_pct) if direction == "long" else fill_ref * (1 - self.cfg.take_profit_pct)
+
         balance = await self.client.fetch_balance_usdt()
         required_margin = float(self.cfg.margin_per_position_usd)
         notional = required_margin * float(self.cfg.leverage)
-
         if balance < required_margin:
-            logger.info("[%s] insufficient balance %.2f < required margin %.2f — skip",
-                        symbol, balance, required_margin)
-            self._view[symbol] = (
-                f"insufficient balance ${balance:.2f} for ${required_margin:.2f} margin"
-            )
+            self._view[symbol] = f"insufficient balance ${balance:.2f} for ${required_margin:.2f} margin"
             return
 
         amount = notional / fill_ref if fill_ref > 0 else 0.0
         if amount <= 0 or amount * fill_ref < 5:
-            logger.info("[%s] size too small/notional invalid (%.2f USDT) — skip",
-                        symbol, amount * fill_ref)
             return
 
         side = "buy" if direction == "long" else "sell"
         try:
-            order = await self.client.create_order(symbol, side, amount, pos_side=direction,
-                                                   tp_price=tp, sl_price=sl)
-        except Exception as e:
-            logger.error("[%s] order failed: %s", symbol, e)
-            await self.tg.send_text(f"❌ `{_sym(symbol)}` entry order failed: {str(e)[:150]}")
+            order = await self.client.create_order(
+                symbol, side, amount, pos_side=direction,
+                tp_price=tp, sl_price=sl
+            )
+        except Exception as exc:
+            logger.error("[%s] order failed: %s", symbol, exc)
+            await self.tg.send_text(f"❌ `{_sym(symbol)}` entry order failed: {str(exc)[:150]}")
             return
 
         fill = order.avg_price or fill_ref
-        sl = fill * (1 - self.cfg.stop_loss_pct) if direction == "long" \
-            else fill * (1 + self.cfg.stop_loss_pct)
-        tp = fill * (1 + self.cfg.take_profit_pct) if direction == "long" \
-            else fill * (1 - self.cfg.take_profit_pct)
-        st["pos"] = {"side": direction, "entry": fill, "sl": sl, "tp": tp,
-                     "risk": abs(fill - sl), "amount": order.amount or amount,
-                     "margin_usd": required_margin, "leverage": self.cfg.leverage,
-                     "notional_usd": notional,
-                     "opened_ms": int(time.time() * 1000), "exit_bar": None}
+        sl = fill * (1 - self.cfg.stop_loss_pct) if direction == "long" else fill * (1 + self.cfg.stop_loss_pct)
+        tp = fill * (1 + self.cfg.take_profit_pct) if direction == "long" else fill * (1 - self.cfg.take_profit_pct)
+
+        st["pos"] = {
+            "side": direction,
+            "entry": fill,
+            "sl": sl,
+            "initial_sl": sl,
+            "tp": tp,
+            "risk": abs(fill - sl),
+            "amount": order.amount or amount,
+            "margin_usd": required_margin,
+            "leverage": self.cfg.leverage,
+            "notional_usd": notional,
+            "opened_ms": int(time.time() * 1000),
+            "exit_bar": None,
+            "best_price": fill,
+            "lock_stage": 0,
+            "setup": sig.setup,
+            "q_1h": sig.q_1h,
+            "entry_score": sig.entry_score,
+        }
         self._save_state()
-        logger.info("[%s] OPEN %s @ %.6g sl=%.6g tp=%.6g Q=%.0f",
-                    symbol, direction.upper(), fill, sl, tp, sig.trend_quality)
+
+        logger.info(
+            "[%s] OPEN %s @ %.6g sl=%.6g tp=%.6g 4H=%s Q=%.0f Score=%.0f %s",
+            symbol, direction.upper(), fill, sl, tp, sig.trend_4h.value,
+            sig.q_1h, sig.entry_score, sig.setup
+        )
         caption = (
             f"🟢 *{_sym(symbol)} {direction.upper()}* @ `{fill:.6g}`\n"
-            f"SL `{sl:.6g}` (−{self.cfg.stop_loss_pct*100:.1f}%)  "
-            f"TP `{tp:.6g}` (+{self.cfg.take_profit_pct*100:.1f}%)\n"
-            f"Size `{st['pos']['amount']:.6g}` | Margin `${required_margin:.2f}` × `x{self.cfg.leverage}` "
-            f"≈ `${notional:.2f}` notional\n"
-            f"Exit on opposite HMA16 flip\n"
-            f"15M {sig.trend.value} + HMA flip | Q={sig.trend_quality:.0f}/100 "
-            f"ADX={sig.adx:.0f} CHOP={sig.chop:.0f}")
-        chart = self._build_chart(symbol, df, direction, fill, sl, tp)
+            f"4H `{sig.trend_4h.value}` | 1H Q `{sig.q_1h:.0f}` "
+            f"(ADX {sig.adx_1h:.1f}, CHOP {sig.chop_1h:.1f})\n"
+            f"15M `{sig.setup}` | Score `{sig.entry_score:.0f}` | {sig.reason}\n"
+            f"SL `{sl:.6g}` (−1.5%) | Final TP `{tp:.6g}` (+1.5%)\n"
+            f"T1 `+0.6%` → lock `+0.3%` | T2 `+1.0%` → lock `+0.7%`\n"
+            f"Margin `${required_margin:.2f}` × `x{self.cfg.leverage}` ≈ `${notional:.2f}` notional"
+        )
+        chart = self._build_chart(symbol, df15, direction, fill, sl, tp)
         if chart:
             await self.tg._send_photo(chart, caption)
         else:
@@ -359,35 +374,81 @@ class Bot:
         if amt <= 0:
             await self._report_close(symbol, st)
             return
+
         ticker = await self.client.fetch_ticker(symbol)
         price = float(ticker["last"])
         longp = side == "long"
+        entry = float(pos["entry"])
 
-        # safety net if the native algo detached
+        # Best favorable price since entry.
+        if longp:
+            pos["best_price"] = max(float(pos.get("best_price", entry)), price)
+            strat_side = S.Side.LONG
+        else:
+            pos["best_price"] = min(float(pos.get("best_price", entry)), price)
+            strat_side = S.Side.SHORT
+
+        # Two-stage profit lock. Stop can only move toward profit, never backward.
+        desired_sl, desired_stage = self.strat.locked_stop(
+            strat_side, entry, float(pos["best_price"])
+        )
+        current_stage = int(pos.get("lock_stage", 0))
+
+        if desired_stage > current_stage:
+            old_sl = float(pos["sl"])
+            if longp:
+                pos["sl"] = max(old_sl, desired_sl)
+            else:
+                pos["sl"] = min(old_sl, desired_sl)
+            pos["lock_stage"] = desired_stage
+            self._save_state()
+
+            if desired_stage == 1:
+                msg = (
+                    f"🔒 *{_sym(symbol)} T1 reached* `+0.6%`\n"
+                    f"SL moved to lock `+0.3%` → `{pos['sl']:.6g}`"
+                )
+            else:
+                msg = (
+                    f"🔒 *{_sym(symbol)} T2 reached* `+1.0%`\n"
+                    f"SL moved to lock `+0.7%` → `{pos['sl']:.6g}`\n"
+                    f"Runner active to final TP `+1.5%`"
+                )
+            logger.info("[%s] profit lock stage %d: SL %.6g -> %.6g",
+                        symbol, desired_stage, old_sl, pos["sl"])
+            await self.tg.send_text(msg)
+
+        # Local dynamic SL enforcement. The original exchange-native -1.5% SL
+        # remains the disaster/offline safety net; these profit locks are managed
+        # by the running bot unless the exchange adapter supports SL amendment.
         if pos["sl"] and ((price <= pos["sl"]) if longp else (price >= pos["sl"])):
-            await self._close_market(symbol, st, "SL")
+            why = "LOCK_SL" if int(pos.get("lock_stage", 0)) > 0 else "SL"
+            await self._close_market(symbol, st, why)
             return
+
         if pos["tp"] and ((price >= pos["tp"]) if longp else (price <= pos["tp"])):
             await self._close_market(symbol, st, "TP")
             return
-        if pos.get("adopted"):
-            return   # unknown levels — leave native SL/TP to protect it
 
-        # HMA16 opposite-flip exit — once per newly-closed 15M bar
-        df = await self._frame15(symbol)
-        if len(df) < 40:
+        if pos.get("adopted"):
             return
-        bar_key = df.index[-1].isoformat()
+
+        # 15M structure invalidation + opposite 4H trend invalidation.
+        df15, _, df4h = await self._frames(symbol)
+        if len(df15) < 40 or len(df4h) < 60:
+            return
+
+        bar_key = df15.index[-1].isoformat()
         if pos.get("exit_bar") == bar_key:
             return
         pos["exit_bar"] = bar_key
         self._save_state()
-        ps = S.PositionState(S.Side.LONG if longp else S.Side.SHORT,
-                             pos["entry"], pos["sl"], pos["tp"])
-        ex = self.strat.evaluate_exit(df, ps, current_price=None)
-        if ex.should_exit and ex.reason == S.ExitReason.HMA_FLIP:
-            logger.info("[%s] HMA16 opposite flip — closing", symbol)
-            await self._close_market(symbol, st, "FLIP")
+
+        ex = self.strat.evaluate_structure_exit(strat_side, df4h, df15)
+        if ex.should_exit:
+            reason = "HTF_FLIP" if ex.reason == S.ExitReason.HTF_TREND_INVALIDATION else "STRUCTURE"
+            logger.info("[%s] early exit: %s", symbol, reason)
+            await self._close_market(symbol, st, reason)
 
     async def _close_market(self, symbol: str, st: dict, why: str):
         pos = st["pos"]
@@ -398,7 +459,7 @@ class Bot:
         except Exception as e:
             if "position" not in str(e).lower():
                 logger.warning("[%s] market close failed: %s", symbol, e)
-        if why == "FLIP" and self.cfg.reentry_cooldown_bars > 0:
+        if why in ("STRUCTURE", "HTF_FLIP") and self.cfg.reentry_cooldown_bars > 0:
             self._cooldown_until[symbol] = time.time() + self.cfg.reentry_cooldown_bars * _TF_MIN * 60
         await self._report_close(symbol, st, hint=why)
 
@@ -406,7 +467,7 @@ class Bot:
         """TP / SL / FLIP / UNTRACKED. Bot-driven closes carry a hint; a native
         (exchange TP/SL) or offline close is classified by the actual close price
         vs the stored tp/sl."""
-        if hint in ("TP", "SL", "FLIP"):
+        if hint in ("TP", "SL", "LOCK_SL", "STRUCTURE", "HTF_FLIP"):
             return hint
         if pos.get("adopted") or not pos.get("entry") or not pos.get("risk"):
             return "UNTRACKED"
@@ -416,7 +477,7 @@ class Bot:
                 return "TP"
             if abs(close_px - pos["sl"]) <= tol:
                 return "SL"
-        return "FLIP" if abs(pnl) >= 0 else "SL"   # otherwise it was an in-between close
+        return "STRUCTURE" if pnl >= 0 else "SL"   # otherwise it was an in-between close
 
     async def _report_close(self, symbol: str, st: dict, hint: str = ""):
         pos = st["pos"]

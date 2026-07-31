@@ -1,25 +1,21 @@
 """
-HMA16 Trend-Follow Bot v3
-Timeframe: 15m
+MTF Structure Trend Bot Strategy
+Architecture:
+  Layer 1 — 4H trend direction: EMA20/EMA50 + EMA20 slope + HMA16 state
+  Layer 2 — 1H quality: Q = ADX score + CHOP score, Q >= 55
+  Layer 3 — 15M structure entry: HH/HL/LH/LL, sweep/rejection, micro BOS, chase gate
 
-Core architecture
------------------
-1) EMA20/EMA50 selects trade direction only.
-2) ADX + CHOP + DMI form a soft Trend Quality filter.
-3) HMA16 color/state flip triggers entries.
-4) HMA16 opposite flip is the primary early exit.
-5) Hard TP/SL are both 1.5% from entry as spike protection.
-6) Quality filters:
-   - EMA separation >= 0.15 ATR
-   - HMA16 slope magnitude >= 0.03 ATR
-   - Price extension from EMA20 <= 0.80 ATR
-   - Trend Quality >= 55/100
-7) Closed-candle logic only for indicator-driven entries/exits.
+Position management:
+  Initial SL 1.5%
+  Final TP 1.5%
+  T1 at +0.6% => lock +0.3%
+  T2 at +1.0% => lock +0.7%
+  Runner continues to final TP
+  15M opposite micro-BOS/structure invalidation can exit early
+  4H opposite trend invalidation can exit early
 
-ADX/CHOP/DMI are intentionally permissive. Their job is to reject weak/choppy
-HMA flips, not replace the EMA trend gate or HMA16 trigger.
+All indicator-driven decisions use closed candles.
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -43,39 +39,68 @@ class Trend(str, Enum):
 
 
 class ExitReason(str, Enum):
-    HMA_FLIP = "HMA_FLIP"
+    STRUCTURE_INVALIDATION = "STRUCTURE_INVALIDATION"
+    HTF_TREND_INVALIDATION = "HTF_TREND_INVALIDATION"
     TAKE_PROFIT = "TAKE_PROFIT"
     STOP_LOSS = "STOP_LOSS"
 
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    timeframe: str = "15m"
+    trend_tf: str = "4h"
+    quality_tf: str = "1h"
+    entry_tf: str = "15m"
 
     ema_fast_len: int = 20
     ema_slow_len: int = 50
-    ema_slope_lookback: int = 1
-
     hma_len: int = 16
     atr_len: int = 14
     dmi_len: int = 14
     adx_len: int = 14
     chop_len: int = 14
 
-    min_ema_separation_atr: float = 0.15
-    min_hma_slope_atr: float = 0.03
-    max_chase_atr: float = 0.80
-
     min_trend_quality: float = 55.0
 
-    # Loose fail-safes only. These are not intended to make the strategy strict.
-    adx_hard_floor: float = 10.0
-    chop_hard_ceiling: float = 62.0
+    major_swing_left: int = 3
+    major_swing_right: int = 3
+    micro_swing_left: int = 2
+    micro_swing_right: int = 2
 
-    take_profit_pct: float = 0.015
+    min_bos_body_atr: float = 0.15
+    max_bos_body_atr: float = 1.20
+    max_chase_atr: float = 0.75
+    location_atr: float = 0.60
+    min_entry_score: float = 60.0
+
     stop_loss_pct: float = 0.015
+    final_take_profit_pct: float = 0.015
 
-    require_closed_candle: bool = True
+    target1_trigger_pct: float = 0.006
+    target1_lock_pct: float = 0.003
+    target2_trigger_pct: float = 0.010
+    target2_lock_pct: float = 0.007
+
+
+@dataclass
+class TrendState:
+    trend: Trend
+    ema20: float
+    ema50: float
+    ema20_slope: float
+    hma16: float
+    hma_state: int
+
+
+@dataclass
+class QualityState:
+    q: float
+    adx: float
+    chop: float
+    plus_di: float
+    minus_di: float
+
+    def dmi_aligned(self, side: Side) -> bool:
+        return self.plus_di > self.minus_di if side == Side.LONG else self.minus_di > self.plus_di
 
 
 @dataclass
@@ -84,643 +109,449 @@ class EntrySignal:
     entry_price: float
     stop_loss: float
     take_profit: float
-    trend: Trend
-
-    ema20: float
-    ema50: float
-    hma16: float
-    atr14: float
-
-    adx: float
-    plus_di: float
-    minus_di: float
-    chop: float
-    trend_quality: float
-
-    ema_separation_atr: float
-    hma_slope_atr: float
-    chase_atr: float
-
+    trend_4h: Trend
+    q_1h: float
+    adx_1h: float
+    chop_1h: float
+    dmi_aligned: bool
+    setup: str
+    entry_score: float
+    micro_bos_level: float
+    atr15: float
     reason: str
 
 
 @dataclass
-class PositionState:
-    side: Side
-    entry_price: float
-    stop_loss: float
-    take_profit: float
-    opened_bar_time: Optional[pd.Timestamp] = None
-
-
-@dataclass
-class ExitSignal:
+class StructureExit:
     should_exit: bool
     reason: Optional[ExitReason] = None
-    exit_price: Optional[float] = None
+    level: Optional[float] = None
 
 
-class HMA16TrendFollowStrategy:
-    """
-    15m trend-follow strategy.
-
-    Trend direction:
-      Bull = EMA20 > EMA50 and EMA20 slope > 0
-      Bear = EMA20 < EMA50 and EMA20 slope < 0
-
-    Soft trend quality:
-      ADX + CHOP = 0..100 base quality
-      DMI alignment = +/-10 adjustment, clamped to 0..100
-      Default minimum = 45
-
-    Entry:
-      Long = Bull + HMA16 DOWN->UP + quality filters
-      Short = Bear + HMA16 UP->DOWN + quality filters
-
-    Exit:
-      Primary = opposite HMA16 flip on closed candle
-      Safety  = live hard TP/SL at +/-1.5%
-    """
-
+class MTFStructureStrategy:
     def __init__(self, config: Optional[StrategyConfig] = None) -> None:
         self.cfg = config or StrategyConfig()
 
     @staticmethod
     def _wma(series: pd.Series, length: int) -> pd.Series:
-        if length <= 0:
-            raise ValueError("WMA length must be > 0")
         weights = np.arange(1, length + 1, dtype=float)
-        weight_sum = float(weights.sum())
         return series.rolling(length).apply(
-            lambda values: float(np.dot(values, weights) / weight_sum),
-            raw=True,
+            lambda x: float(np.dot(x, weights) / weights.sum()), raw=True
         )
 
     @classmethod
     def _hma(cls, series: pd.Series, length: int) -> pd.Series:
-        if length < 2:
-            raise ValueError("HMA length must be >= 2")
         half = max(1, length // 2)
         root = max(1, int(round(sqrt(length))))
         raw = 2.0 * cls._wma(series, half) - cls._wma(series, length)
         return cls._wma(raw, root)
 
     @staticmethod
-    def _true_range(df: pd.DataFrame) -> pd.Series:
-        prev_close = df["close"].shift(1)
+    def _tr(df: pd.DataFrame) -> pd.Series:
+        pc = df["close"].shift(1)
         return pd.concat(
             [
                 (df["high"] - df["low"]).abs(),
-                (df["high"] - prev_close).abs(),
-                (df["low"] - prev_close).abs(),
+                (df["high"] - pc).abs(),
+                (df["low"] - pc).abs(),
             ],
             axis=1,
         ).max(axis=1)
 
     @staticmethod
     def _rma(series: pd.Series, length: int) -> pd.Series:
-        if length <= 0:
-            raise ValueError("RMA length must be > 0")
         return series.ewm(alpha=1.0 / length, adjust=False).mean()
 
     @classmethod
     def _atr(cls, df: pd.DataFrame, length: int) -> pd.Series:
-        return cls._rma(cls._true_range(df), length)
+        return cls._rma(cls._tr(df), length)
 
     @classmethod
-    def _dmi_adx(
-        cls,
-        df: pd.DataFrame,
-        dmi_len: int,
-        adx_len: int,
-    ) -> tuple[pd.Series, pd.Series, pd.Series]:
-        """Wilder DMI/ADX. Returns (+DI, -DI, ADX)."""
-        up_move = df["high"].diff()
-        down_move = -df["low"].diff()
+    def _dmi_adx(cls, df: pd.DataFrame, dmi_len: int, adx_len: int):
+        up = df["high"].diff()
+        down = -df["low"].diff()
 
         plus_dm = pd.Series(
-            np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
-            index=df.index,
-            dtype=float,
+            np.where((up > down) & (up > 0), up, 0.0), index=df.index, dtype=float
         )
         minus_dm = pd.Series(
-            np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
-            index=df.index,
-            dtype=float,
+            np.where((down > up) & (down > 0), down, 0.0), index=df.index, dtype=float
         )
 
-        tr_rma = cls._rma(cls._true_range(df), dmi_len).replace(0, np.nan)
-        plus_di = 100.0 * cls._rma(plus_dm, dmi_len) / tr_rma
-        minus_di = 100.0 * cls._rma(minus_dm, dmi_len) / tr_rma
-
-        di_sum = (plus_di + minus_di).replace(0, np.nan)
-        dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+        atr = cls._rma(cls._tr(df), dmi_len).replace(0, np.nan)
+        plus_di = 100.0 * cls._rma(plus_dm, dmi_len) / atr
+        minus_di = 100.0 * cls._rma(minus_dm, dmi_len) / atr
+        denom = (plus_di + minus_di).replace(0, np.nan)
+        dx = 100.0 * (plus_di - minus_di).abs() / denom
         adx = cls._rma(dx.fillna(0.0), adx_len)
-
         return plus_di, minus_di, adx
 
     @classmethod
-    def _choppiness(cls, df: pd.DataFrame, length: int) -> pd.Series:
-        """
-        CHOP = 100 * log10(sum(TR,n)/(HH(n)-LL(n))) / log10(n)
-        """
-        if length <= 1:
-            raise ValueError("CHOP length must be > 1")
-
-        tr_sum = cls._true_range(df).rolling(length).sum()
+    def _chop(cls, df: pd.DataFrame, length: int) -> pd.Series:
+        tr_sum = cls._tr(df).rolling(length).sum()
         hh = df["high"].rolling(length).max()
         ll = df["low"].rolling(length).min()
-        price_range = (hh - ll).replace(0, np.nan)
-
-        ratio = (tr_sum / price_range).clip(lower=1.0)
-        chop = 100.0 * np.log10(ratio) / np.log10(float(length))
-        return chop.clip(lower=0.0, upper=100.0)
-
-    def add_indicators(self, candles: pd.DataFrame) -> pd.DataFrame:
-        required = {"open", "high", "low", "close"}
-        missing = required.difference(candles.columns)
-        if missing:
-            raise ValueError(f"Missing candle columns: {sorted(missing)}")
-
-        df = candles.copy()
-
-        for col in required:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        if df[list(required)].isna().any().any():
-            raise ValueError("OHLC data contains NaN or non-numeric values")
-
-        df["ema20"] = df["close"].ewm(
-            span=self.cfg.ema_fast_len,
-            adjust=False,
-        ).mean()
-        df["ema50"] = df["close"].ewm(
-            span=self.cfg.ema_slow_len,
-            adjust=False,
-        ).mean()
-        df["hma16"] = self._hma(df["close"], self.cfg.hma_len)
-        df["atr14"] = self._atr(df, self.cfg.atr_len)
-
-        plus_di, minus_di, adx = self._dmi_adx(
-            df,
-            self.cfg.dmi_len,
-            self.cfg.adx_len,
-        )
-        df["plus_di"] = plus_di
-        df["minus_di"] = minus_di
-        df["adx"] = adx
-        df["adx_rising"] = df["adx"] > df["adx"].shift(1)
-        df["chop"] = self._choppiness(df, self.cfg.chop_len)
-
-        lb = self.cfg.ema_slope_lookback
-        df["ema20_slope"] = df["ema20"] - df["ema20"].shift(lb)
-        df["hma16_slope"] = df["hma16"] - df["hma16"].shift(1)
-
-        # HMA state/color:
-        # +1 = blue/up, -1 = orange/down, 0 = flat.
-        df["hma_state"] = np.select(
-            [df["hma16_slope"] > 0, df["hma16_slope"] < 0],
-            [1, -1],
-            default=0,
-        )
-
-        atr_safe = df["atr14"].replace(0, np.nan)
-        df["ema_separation_atr"] = (
-            (df["ema20"] - df["ema50"]).abs() / atr_safe
-        )
-        df["hma_slope_atr"] = df["hma16_slope"].abs() / atr_safe
-        df["distance_ema20_atr"] = (
-            (df["close"] - df["ema20"]).abs() / atr_safe
-        )
-
-        return df
-
-    def classify_trend(self, row: pd.Series) -> Trend:
-        if row["ema20"] > row["ema50"] and row["ema20_slope"] > 0:
-            return Trend.BULL
-        if row["ema20"] < row["ema50"] and row["ema20_slope"] < 0:
-            return Trend.BEAR
-        return Trend.NEUTRAL
-
-    @staticmethod
-    def _flip_up(prev_row: pd.Series, row: pd.Series) -> bool:
-        return int(prev_row["hma_state"]) <= 0 and int(row["hma_state"]) > 0
-
-    @staticmethod
-    def _flip_down(prev_row: pd.Series, row: pd.Series) -> bool:
-        return int(prev_row["hma_state"]) >= 0 and int(row["hma_state"]) < 0
+        rng = (hh - ll).replace(0, np.nan)
+        ratio = (tr_sum / rng).clip(lower=1.0)
+        return (100.0 * np.log10(ratio) / np.log10(float(length))).clip(0, 100)
 
     @staticmethod
     def _adx_score(adx: float) -> float:
-        if adx < 12:
-            return 0.0
-        if adx < 15:
-            return 15.0
-        if adx < 20:
-            return 30.0
-        if adx < 25:
-            return 40.0
-        return 50.0
+        # Continuous, deliberately soft: ADX 10 -> 0, ADX 30 -> 50.
+        return float(np.clip((adx - 10.0) / 20.0 * 50.0, 0.0, 50.0))
 
     @staticmethod
     def _chop_score(chop: float) -> float:
-        if chop < 45:
-            return 50.0
-        if chop < 50:
-            return 40.0
-        if chop < 55:
-            return 30.0
-        if chop < 60:
-            return 15.0
-        return 0.0
+        # Continuous: CHOP 62 -> 0, CHOP 45 -> 50.
+        return float(np.clip((62.0 - chop) / 17.0 * 50.0, 0.0, 50.0))
 
-    def trend_quality_score(self, row: pd.Series, side: Side) -> float:
-        """
-        Trend Quality Q = ADX score + CHOP score only, range 0..100.
-
-        DMI (+DI/-DI) is still calculated and reported as confirmation,
-        but it does NOT increase or reduce Q.
-
-        Entry requires Q >= min_trend_quality (default 55).
-        """
-        adx = float(row["adx"])
-        chop = float(row["chop"])
-        score = self._adx_score(adx) + self._chop_score(chop)
-        return float(np.clip(score, 0.0, 100.0))
-
-    def _quality_gate_common(self, row: pd.Series) -> bool:
-        values = [
-            row["ema_separation_atr"],
-            row["hma_slope_atr"],
-            row["atr14"],
-            row["adx"],
-            row["plus_di"],
-            row["minus_di"],
-            row["chop"],
-        ]
-        if any(pd.isna(v) for v in values):
-            return False
-
-        if row["atr14"] <= 0:
-            return False
-        if row["ema_separation_atr"] < self.cfg.min_ema_separation_atr:
-            return False
-        if row["hma_slope_atr"] < self.cfg.min_hma_slope_atr:
-            return False
-
-        return True
-
-    def _long_chase_ok(self, row: pd.Series) -> tuple[bool, float]:
-        chase = max(
-            0.0,
-            float((row["close"] - row["ema20"]) / row["atr14"]),
+    def add_trend_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out["ema20"] = out["close"].ewm(span=self.cfg.ema_fast_len, adjust=False).mean()
+        out["ema50"] = out["close"].ewm(span=self.cfg.ema_slow_len, adjust=False).mean()
+        out["ema20_slope"] = out["ema20"] - out["ema20"].shift(1)
+        out["hma16"] = self._hma(out["close"], self.cfg.hma_len)
+        out["hma_slope"] = out["hma16"] - out["hma16"].shift(1)
+        out["hma_state"] = np.select(
+            [out["hma_slope"] > 0, out["hma_slope"] < 0], [1, -1], default=0
         )
-        return chase <= self.cfg.max_chase_atr, chase
+        return out
 
-    def _short_chase_ok(self, row: pd.Series) -> tuple[bool, float]:
-        chase = max(
-            0.0,
-            float((row["ema20"] - row["close"]) / row["atr14"]),
+    def trend_state_4h(self, df4h: pd.DataFrame) -> TrendState:
+        if len(df4h) < max(self.cfg.ema_slow_len + 5, self.cfg.hma_len * 2):
+            return TrendState(Trend.NEUTRAL, np.nan, np.nan, np.nan, np.nan, 0)
+
+        d = self.add_trend_indicators(df4h)
+        r = d.iloc[-1]
+
+        if r["ema20"] > r["ema50"] and r["ema20_slope"] > 0 and int(r["hma_state"]) > 0:
+            trend = Trend.BULL
+        elif r["ema20"] < r["ema50"] and r["ema20_slope"] < 0 and int(r["hma_state"]) < 0:
+            trend = Trend.BEAR
+        else:
+            trend = Trend.NEUTRAL
+
+        return TrendState(
+            trend=trend,
+            ema20=float(r["ema20"]),
+            ema50=float(r["ema50"]),
+            ema20_slope=float(r["ema20_slope"]),
+            hma16=float(r["hma16"]),
+            hma_state=int(r["hma_state"]),
         )
-        return chase <= self.cfg.max_chase_atr, chase
+
+    def quality_state_1h(self, df1h: pd.DataFrame) -> QualityState:
+        if len(df1h) < 60:
+            return QualityState(0.0, 0.0, 100.0, 0.0, 0.0)
+
+        plus_di, minus_di, adx = self._dmi_adx(df1h, self.cfg.dmi_len, self.cfg.adx_len)
+        chop = self._chop(df1h, self.cfg.chop_len)
+
+        a = float(adx.iloc[-1])
+        c = float(chop.iloc[-1])
+        p = float(plus_di.iloc[-1])
+        m = float(minus_di.iloc[-1])
+        q = self._adx_score(a) + self._chop_score(c)
+
+        return QualityState(q=float(q), adx=a, chop=c, plus_di=p, minus_di=m)
+
+    @staticmethod
+    def _confirmed_pivots(series: pd.Series, left: int, right: int, mode: str) -> list[tuple[int, float]]:
+        vals = series.to_numpy(dtype=float)
+        pivots: list[tuple[int, float]] = []
+        if len(vals) < left + right + 1:
+            return pivots
+        for i in range(left, len(vals) - right):
+            window = vals[i - left : i + right + 1]
+            v = vals[i]
+            if mode == "high":
+                if np.isfinite(v) and v >= np.nanmax(window):
+                    pivots.append((i, float(v)))
+            else:
+                if np.isfinite(v) and v <= np.nanmin(window):
+                    pivots.append((i, float(v)))
+        return pivots
+
+    @staticmethod
+    def _bull_rejection(row: pd.Series) -> bool:
+        body = abs(float(row["close"] - row["open"]))
+        lower = min(float(row["open"]), float(row["close"])) - float(row["low"])
+        return row["close"] > row["open"] and lower >= max(body * 0.5, 1e-12)
+
+    @staticmethod
+    def _bear_rejection(row: pd.Series) -> bool:
+        body = abs(float(row["close"] - row["open"]))
+        upper = float(row["high"]) - max(float(row["open"]), float(row["close"]))
+        return row["close"] < row["open"] and upper >= max(body * 0.5, 1e-12)
+
+    def _structure_context(self, df15: pd.DataFrame) -> dict:
+        major_highs = self._confirmed_pivots(
+            df15["high"], self.cfg.major_swing_left, self.cfg.major_swing_right, "high"
+        )
+        major_lows = self._confirmed_pivots(
+            df15["low"], self.cfg.major_swing_left, self.cfg.major_swing_right, "low"
+        )
+        micro_highs = self._confirmed_pivots(
+            df15["high"], self.cfg.micro_swing_left, self.cfg.micro_swing_right, "high"
+        )
+        micro_lows = self._confirmed_pivots(
+            df15["low"], self.cfg.micro_swing_left, self.cfg.micro_swing_right, "low"
+        )
+
+        bull_structure = (
+            len(major_highs) >= 2 and len(major_lows) >= 2
+            and major_highs[-1][1] > major_highs[-2][1]
+            and major_lows[-1][1] > major_lows[-2][1]
+        )
+        bear_structure = (
+            len(major_highs) >= 2 and len(major_lows) >= 2
+            and major_highs[-1][1] < major_highs[-2][1]
+            and major_lows[-1][1] < major_lows[-2][1]
+        )
+
+        return {
+            "major_highs": major_highs,
+            "major_lows": major_lows,
+            "micro_highs": micro_highs,
+            "micro_lows": micro_lows,
+            "bull_structure": bull_structure,
+            "bear_structure": bear_structure,
+        }
 
     def generate_entry(
         self,
-        candles: pd.DataFrame,
+        df4h: pd.DataFrame,
+        df1h: pd.DataFrame,
+        df15: pd.DataFrame,
         has_open_position: bool = False,
     ) -> Optional[EntrySignal]:
-        """Evaluate the latest CLOSED 15m candle."""
-        if has_open_position:
+        if has_open_position or len(df15) < 80:
             return None
 
-        min_bars = max(
-            self.cfg.ema_slow_len + 5,
-            self.cfg.hma_len * 2,
-            self.cfg.atr_len + 5,
-            self.cfg.dmi_len + self.cfg.adx_len + 5,
-            self.cfg.chop_len + 5,
-        )
-        if len(candles) < min_bars:
+        trend = self.trend_state_4h(df4h)
+        if trend.trend == Trend.NEUTRAL:
             return None
 
-        df = self.add_indicators(candles)
-        prev_row = df.iloc[-2]
-        row = df.iloc[-1]
-
-        if not self._quality_gate_common(row):
+        quality = self.quality_state_1h(df1h)
+        if quality.q < self.cfg.min_trend_quality:
             return None
 
-        trend = self.classify_trend(row)
-        entry = float(row["close"])
+        side = Side.LONG if trend.trend == Trend.BULL else Side.SHORT
 
-        if trend == Trend.BULL and self._flip_up(prev_row, row):
-            chase_ok, chase_atr = self._long_chase_ok(row)
-            if not chase_ok:
+        d = df15.copy()
+        d["atr"] = self._atr(d, self.cfg.atr_len)
+        d["ema20"] = d["close"].ewm(span=20, adjust=False).mean()
+        row = d.iloc[-1]
+        prev = d.iloc[-2]
+        atr = float(row["atr"])
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+
+        ctx = self._structure_context(d)
+        micro_highs = ctx["micro_highs"]
+        micro_lows = ctx["micro_lows"]
+        major_highs = ctx["major_highs"]
+        major_lows = ctx["major_lows"]
+        body_atr = abs(float(row["close"] - row["open"])) / atr
+
+        if side == Side.LONG:
+            if not micro_highs:
+                return None
+            bos_level = micro_highs[-1][1]
+            micro_bos = float(row["close"]) > bos_level and float(prev["close"]) <= bos_level
+            if not micro_bos or body_atr < self.cfg.min_bos_body_atr:
                 return None
 
-            quality = self.trend_quality_score(row, Side.LONG)
-            if quality < self.cfg.min_trend_quality:
+            chase = (float(row["close"]) - bos_level) / atr
+            if chase > self.cfg.max_chase_atr or body_atr > self.cfg.max_bos_body_atr:
                 return None
 
+            score = 30.0  # mandatory micro BOS
+            tags = ["MICRO_BOS"]
+
+            if ctx["bull_structure"]:
+                score += 20.0
+                tags.append("HH_HL")
+
+            last_low = major_lows[-1][1] if major_lows else None
+            near_hl = last_low is not None and abs(float(row["low"]) - last_low) <= self.cfg.location_atr * atr
+            if near_hl:
+                score += 20.0
+                tags.append("HL_LOCATION")
+
+            ref_low = micro_lows[-1][1] if micro_lows else last_low
+            sweep = (
+                ref_low is not None
+                and float(row["low"]) < ref_low
+                and float(row["close"]) > ref_low
+            )
+            if sweep:
+                score += 20.0
+                tags.append("SWEEP")
+
+            if self._bull_rejection(row):
+                score += 15.0
+                tags.append("REJECTION")
+
+            if abs(float(row["close"]) - float(row["ema20"])) <= self.cfg.location_atr * atr:
+                score += 10.0
+                tags.append("EMA20_LOCATION")
+
+            dmi_ok = quality.dmi_aligned(side)
+            if dmi_ok:
+                score += 5.0
+                tags.append("DMI")
+
+            if score < self.cfg.min_entry_score:
+                return None
+
+            entry = float(row["close"])
+            setup = "SWEEP_RECLAIM" if sweep else ("HL_RECLAIM" if near_hl else "STRUCTURE_BOS")
             return EntrySignal(
-                side=Side.LONG,
+                side=side,
                 entry_price=entry,
                 stop_loss=entry * (1.0 - self.cfg.stop_loss_pct),
-                take_profit=entry * (1.0 + self.cfg.take_profit_pct),
-                trend=trend,
-                ema20=float(row["ema20"]),
-                ema50=float(row["ema50"]),
-                hma16=float(row["hma16"]),
-                atr14=float(row["atr14"]),
-                adx=float(row["adx"]),
-                plus_di=float(row["plus_di"]),
-                minus_di=float(row["minus_di"]),
-                chop=float(row["chop"]),
-                trend_quality=quality,
-                ema_separation_atr=float(row["ema_separation_atr"]),
-                hma_slope_atr=float(row["hma_slope_atr"]),
-                chase_atr=chase_atr,
-                reason=(
-                    "BULL EMA20/50 trend + HMA16 orange->blue flip + "
-                    f"TrendQuality={quality:.0f}/100 "
-                    f"(ADX={row['adx']:.1f}, CHOP={row['chop']:.1f}, "
-                    f"+DI={row['plus_di']:.1f}, -DI={row['minus_di']:.1f})"
-                ),
+                take_profit=entry * (1.0 + self.cfg.final_take_profit_pct),
+                trend_4h=trend.trend,
+                q_1h=quality.q,
+                adx_1h=quality.adx,
+                chop_1h=quality.chop,
+                dmi_aligned=dmi_ok,
+                setup=setup,
+                entry_score=score,
+                micro_bos_level=bos_level,
+                atr15=atr,
+                reason=" + ".join(tags),
             )
 
-        if trend == Trend.BEAR and self._flip_down(prev_row, row):
-            chase_ok, chase_atr = self._short_chase_ok(row)
-            if not chase_ok:
-                return None
+        # SHORT
+        if not micro_lows:
+            return None
+        bos_level = micro_lows[-1][1]
+        micro_bos = float(row["close"]) < bos_level and float(prev["close"]) >= bos_level
+        if not micro_bos or body_atr < self.cfg.min_bos_body_atr:
+            return None
 
-            quality = self.trend_quality_score(row, Side.SHORT)
-            if quality < self.cfg.min_trend_quality:
-                return None
+        chase = (bos_level - float(row["close"])) / atr
+        if chase > self.cfg.max_chase_atr or body_atr > self.cfg.max_bos_body_atr:
+            return None
 
-            return EntrySignal(
-                side=Side.SHORT,
-                entry_price=entry,
-                stop_loss=entry * (1.0 + self.cfg.stop_loss_pct),
-                take_profit=entry * (1.0 - self.cfg.take_profit_pct),
-                trend=trend,
-                ema20=float(row["ema20"]),
-                ema50=float(row["ema50"]),
-                hma16=float(row["hma16"]),
-                atr14=float(row["atr14"]),
-                adx=float(row["adx"]),
-                plus_di=float(row["plus_di"]),
-                minus_di=float(row["minus_di"]),
-                chop=float(row["chop"]),
-                trend_quality=quality,
-                ema_separation_atr=float(row["ema_separation_atr"]),
-                hma_slope_atr=float(row["hma_slope_atr"]),
-                chase_atr=chase_atr,
-                reason=(
-                    "BEAR EMA20/50 trend + HMA16 blue->orange flip + "
-                    f"TrendQuality={quality:.0f}/100 "
-                    f"(ADX={row['adx']:.1f}, CHOP={row['chop']:.1f}, "
-                    f"+DI={row['plus_di']:.1f}, -DI={row['minus_di']:.1f})"
-                ),
-            )
+        score = 30.0
+        tags = ["MICRO_BOS"]
 
-        return None
+        if ctx["bear_structure"]:
+            score += 20.0
+            tags.append("LH_LL")
 
-    def evaluate_exit(
-        self,
-        candles: pd.DataFrame,
-        position: PositionState,
-        current_price: Optional[float] = None,
-    ) -> ExitSignal:
-        """
-        Exit precedence:
-          1) Live TP/SL for spike protection.
-          2) Opposite HMA16 flip on latest closed 15m candle.
+        last_high = major_highs[-1][1] if major_highs else None
+        near_lh = last_high is not None and abs(float(row["high"]) - last_high) <= self.cfg.location_atr * atr
+        if near_lh:
+            score += 20.0
+            tags.append("LH_LOCATION")
 
-        ADX/CHOP/DMI are entry filters only and do not force exits.
-        """
-        if current_price is not None:
-            px = float(current_price)
+        ref_high = micro_highs[-1][1] if micro_highs else last_high
+        sweep = (
+            ref_high is not None
+            and float(row["high"]) > ref_high
+            and float(row["close"]) < ref_high
+        )
+        if sweep:
+            score += 20.0
+            tags.append("SWEEP")
 
-            if position.side == Side.LONG:
-                if px <= position.stop_loss:
-                    return ExitSignal(True, ExitReason.STOP_LOSS, px)
-                if px >= position.take_profit:
-                    return ExitSignal(True, ExitReason.TAKE_PROFIT, px)
-            else:
-                if px >= position.stop_loss:
-                    return ExitSignal(True, ExitReason.STOP_LOSS, px)
-                if px <= position.take_profit:
-                    return ExitSignal(True, ExitReason.TAKE_PROFIT, px)
+        if self._bear_rejection(row):
+            score += 15.0
+            tags.append("REJECTION")
 
-        min_bars = max(self.cfg.hma_len * 2, 5)
-        if len(candles) < min_bars:
-            return ExitSignal(False)
+        if abs(float(row["close"]) - float(row["ema20"])) <= self.cfg.location_atr * atr:
+            score += 10.0
+            tags.append("EMA20_LOCATION")
 
-        df = self.add_indicators(candles)
-        prev_row = df.iloc[-2]
-        row = df.iloc[-1]
+        dmi_ok = quality.dmi_aligned(side)
+        if dmi_ok:
+            score += 5.0
+            tags.append("DMI")
 
-        if position.side == Side.LONG and self._flip_down(prev_row, row):
-            return ExitSignal(True, ExitReason.HMA_FLIP, float(row["close"]))
+        if score < self.cfg.min_entry_score:
+            return None
 
-        if position.side == Side.SHORT and self._flip_up(prev_row, row):
-            return ExitSignal(True, ExitReason.HMA_FLIP, float(row["close"]))
-
-        return ExitSignal(False)
-
-
-def build_position_from_signal(
-    signal: EntrySignal,
-    opened_bar_time: Optional[pd.Timestamp] = None,
-) -> PositionState:
-    return PositionState(
-        side=signal.side,
-        entry_price=signal.entry_price,
-        stop_loss=signal.stop_loss,
-        take_profit=signal.take_profit,
-        opened_bar_time=opened_bar_time,
-    )
-
-
-
-# ============================================================
-# PORTFOLIO / EXECUTION DEFAULTS
-# ============================================================
-
-@dataclass(frozen=True)
-class ExecutionConfig:
-    max_open_positions: int = 2
-    margin_per_position_usd: float = 20.0
-    leverage: int = 20
-    margin_mode: str = "isolated"
-    max_positions_per_symbol: int = 1
-
-    @property
-    def notional_per_position_usd(self) -> float:
-        return self.margin_per_position_usd * self.leverage
-
-    @property
-    def max_total_margin_usd(self) -> float:
-        return self.max_open_positions * self.margin_per_position_usd
-
-    @property
-    def max_total_notional_usd(self) -> float:
-        return self.max_open_positions * self.notional_per_position_usd
-
-
-@dataclass(frozen=True)
-class OpenPosition:
-    symbol: str
-    side: Side
-    entry_price: float
-    size: float
-    margin_usd: float
-    leverage: int
-
-
-@dataclass(frozen=True)
-class OrderPlan:
-    allowed: bool
-    symbol: str
-    side: Optional[Side] = None
-    entry_price: Optional[float] = None
-    quantity: Optional[float] = None
-    notional_usd: Optional[float] = None
-    margin_usd: Optional[float] = None
-    leverage: Optional[int] = None
-    margin_mode: Optional[str] = None
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    reason: str = ""
-
-
-class PortfolioRiskManager:
-    """
-    Portfolio-level gate for execution.
-
-    Defaults:
-      - max 2 open positions total
-      - max 1 position per symbol
-      - $20 margin per position
-      - x20 leverage
-      - isolated margin
-      - approx. $400 notional per position
-    """
-
-    def __init__(self, config: Optional[ExecutionConfig] = None) -> None:
-        self.cfg = config or ExecutionConfig()
-
-    def can_open(
-        self,
-        symbol: str,
-        open_positions: list[OpenPosition],
-    ) -> tuple[bool, str]:
-        if len(open_positions) >= self.cfg.max_open_positions:
-            return False, "MAX_OPEN_POSITIONS_REACHED"
-
-        same_symbol = sum(1 for p in open_positions if p.symbol == symbol)
-        if same_symbol >= self.cfg.max_positions_per_symbol:
-            return False, "SYMBOL_ALREADY_HAS_POSITION"
-
-        return True, "OK"
-
-    def build_order_plan(
-        self,
-        symbol: str,
-        signal: EntrySignal,
-        open_positions: list[OpenPosition],
-    ) -> OrderPlan:
-        allowed, reason = self.can_open(symbol, open_positions)
-        if not allowed:
-            return OrderPlan(
-                allowed=False,
-                symbol=symbol,
-                reason=reason,
-            )
-
-        entry = float(signal.entry_price)
-        notional = float(self.cfg.notional_per_position_usd)
-
-        if entry <= 0:
-            return OrderPlan(
-                allowed=False,
-                symbol=symbol,
-                reason="INVALID_ENTRY_PRICE",
-            )
-
-        # Generic base-asset quantity. Exchange adapter should round this
-        # to the instrument's lot size / contract size before order placement.
-        quantity = notional / entry
-
-        return OrderPlan(
-            allowed=True,
-            symbol=symbol,
-            side=signal.side,
+        entry = float(row["close"])
+        setup = "SWEEP_REJECT" if sweep else ("LH_REJECT" if near_lh else "STRUCTURE_BOS")
+        return EntrySignal(
+            side=side,
             entry_price=entry,
-            quantity=quantity,
-            notional_usd=notional,
-            margin_usd=self.cfg.margin_per_position_usd,
-            leverage=self.cfg.leverage,
-            margin_mode=self.cfg.margin_mode,
-            stop_loss=float(signal.stop_loss),
-            take_profit=float(signal.take_profit),
-            reason="ENTRY_APPROVED",
+            stop_loss=entry * (1.0 + self.cfg.stop_loss_pct),
+            take_profit=entry * (1.0 - self.cfg.final_take_profit_pct),
+            trend_4h=trend.trend,
+            q_1h=quality.q,
+            adx_1h=quality.adx,
+            chop_1h=quality.chop,
+            dmi_aligned=dmi_ok,
+            setup=setup,
+            entry_score=score,
+            micro_bos_level=bos_level,
+            atr15=atr,
+            reason=" + ".join(tags),
         )
 
-
-class HMA16TrendFollowBot:
-    """
-    Thin orchestration layer combining:
-      - HMA16TrendFollowStrategy
-      - PortfolioRiskManager
-
-    This still does NOT place exchange orders by itself.
-    Your OKX adapter should:
-      1) set isolated margin mode
-      2) set leverage to x20
-      3) round quantity to exchange lot/contract rules
-      4) place entry + protective TP/SL
-      5) keep HMA16 flip exit active on each closed 15m candle
-    """
-
-    def __init__(
+    def evaluate_structure_exit(
         self,
-        strategy_config: Optional[StrategyConfig] = None,
-        execution_config: Optional[ExecutionConfig] = None,
-    ) -> None:
-        self.strategy = HMA16TrendFollowStrategy(strategy_config)
-        self.risk = PortfolioRiskManager(execution_config)
+        side: Side,
+        df4h: pd.DataFrame,
+        df15: pd.DataFrame,
+    ) -> StructureExit:
+        trend = self.trend_state_4h(df4h)
 
-    def evaluate_symbol(
-        self,
-        symbol: str,
-        candles: pd.DataFrame,
-        open_positions: list[OpenPosition],
-    ) -> OrderPlan:
-        has_symbol_position = any(p.symbol == symbol for p in open_positions)
+        if side == Side.LONG and trend.trend == Trend.BEAR:
+            return StructureExit(True, ExitReason.HTF_TREND_INVALIDATION)
+        if side == Side.SHORT and trend.trend == Trend.BULL:
+            return StructureExit(True, ExitReason.HTF_TREND_INVALIDATION)
 
-        signal = self.strategy.generate_entry(
-            candles,
-            has_open_position=has_symbol_position,
-        )
+        if len(df15) < 40:
+            return StructureExit(False)
 
-        if signal is None:
-            return OrderPlan(
-                allowed=False,
-                symbol=symbol,
-                reason="NO_VALID_ENTRY_SIGNAL",
-            )
+        d = df15.copy()
+        d["atr"] = self._atr(d, self.cfg.atr_len)
+        row, prev = d.iloc[-1], d.iloc[-2]
+        atr = float(row["atr"])
+        if not np.isfinite(atr) or atr <= 0:
+            return StructureExit(False)
 
-        return self.risk.build_order_plan(
-            symbol=symbol,
-            signal=signal,
-            open_positions=open_positions,
-        )
+        ctx = self._structure_context(d)
+        body_atr = abs(float(row["close"] - row["open"])) / atr
 
+        if side == Side.LONG and ctx["micro_lows"]:
+            level = ctx["micro_lows"][-1][1]
+            broke = float(row["close"]) < level and float(prev["close"]) >= level
+            if broke and body_atr >= self.cfg.min_bos_body_atr:
+                return StructureExit(True, ExitReason.STRUCTURE_INVALIDATION, level)
 
-DEFAULT_STRATEGY_CONFIG = StrategyConfig()
-DEFAULT_EXECUTION_CONFIG = ExecutionConfig()
+        if side == Side.SHORT and ctx["micro_highs"]:
+            level = ctx["micro_highs"][-1][1]
+            broke = float(row["close"]) > level and float(prev["close"]) <= level
+            if broke and body_atr >= self.cfg.min_bos_body_atr:
+                return StructureExit(True, ExitReason.STRUCTURE_INVALIDATION, level)
 
+        return StructureExit(False)
 
-if __name__ == "__main__":
-    print("HMA16 Trend-Follow v2 (ADX + CHOP + DMI) module loaded.")
+    def locked_stop(self, side: Side, entry: float, best_price: float) -> tuple[float, int]:
+        """
+        Returns (stop_price, stage)
+          stage 0 = initial -1.5%
+          stage 1 = T1 hit (+0.6%), lock +0.3%
+          stage 2 = T2 hit (+1.0%), lock +0.7%
+        """
+        if side == Side.LONG:
+            favorable = best_price / entry - 1.0
+            if favorable >= self.cfg.target2_trigger_pct:
+                return entry * (1.0 + self.cfg.target2_lock_pct), 2
+            if favorable >= self.cfg.target1_trigger_pct:
+                return entry * (1.0 + self.cfg.target1_lock_pct), 1
+            return entry * (1.0 - self.cfg.stop_loss_pct), 0
+
+        favorable = entry / best_price - 1.0
+        if favorable >= self.cfg.target2_trigger_pct:
+            return entry * (1.0 - self.cfg.target2_lock_pct), 2
+        if favorable >= self.cfg.target1_trigger_pct:
+            return entry * (1.0 - self.cfg.target1_lock_pct), 1
+        return entry * (1.0 + self.cfg.stop_loss_pct), 0
