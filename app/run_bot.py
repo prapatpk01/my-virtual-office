@@ -390,6 +390,35 @@ def _make_strategies(symbols: list, flags: dict, cfg: dict,
 # Shared ccxt-async shutdown helper
 # ---------------------------------------------------------------------------
 
+
+def _is_paper_mode(cfg) -> bool:
+    """True when execution should be simulated and no private exchange API should be used."""
+    mode = str(getattr(cfg, "mode", "") or getattr(cfg, "trading_mode", "") or "").strip().lower()
+    if mode:
+        return mode == "paper"
+    import os
+    return os.getenv("TRADING_MODE", os.getenv("MODE", "live")).strip().lower() == "paper"
+
+
+
+async def _filter_supported_symbols(connector, symbols):
+    """Skip symbols unavailable on the connected exchange instead of crashing paper/live scans."""
+    try:
+        ex = getattr(connector, "_exchange", connector)
+        markets = getattr(ex, "markets", None)
+        if not markets and hasattr(ex, "load_markets"):
+            markets = await ex.load_markets()
+        if not markets:
+            return list(symbols)
+        supported = []
+        for s in symbols:
+            if s in markets:
+                supported.append(s)
+        return supported
+    except Exception:
+        return list(symbols)
+
+
 async def _force_close_ccxt_async(exchange, label: str = "") -> None:
     """
     Belt-and-suspenders shutdown for a ccxt.async_support exchange instance.
