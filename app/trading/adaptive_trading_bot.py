@@ -1,5 +1,5 @@
 """
-Adaptive Trading Bot v10 — Clean Architecture Reset
+Adaptive Trading Bot v11 — Simple CDC + Bollinger Architecture
 
 Pipeline:
 4H Macro -> 1H Bias/Structure -> 15m Regime -> Location -> Price Action Trigger
@@ -1009,6 +1009,53 @@ class PositionHealthCalculator:
 # TRADING BOT — V8
 # ──────────────────────────────────────────────────────────────────────────────
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V11 SIMPLE ENTRY ARCHITECTURE
+# 4H Macro -> 1H Bias -> CDC Action Zone -> Bollinger Location -> Price Action
+# ══════════════════════════════════════════════════════════════════════════════
+
+V11_MACRO_LONG_MIN = 55.0
+V11_MACRO_SHORT_MAX = 45.0
+V11_1H_BIAS_EDGE = 8.0
+
+V11_CDC_FAST = 12
+V11_CDC_SLOW = 26
+V11_BB_LEN = 20
+V11_BB_STD = 2.0
+
+V11_MIN_ADX_TREND = 14.0
+V11_MAX_RSI_LONG = 70.0
+V11_MIN_RSI_SHORT = 30.0
+V11_MAX_EXTENSION_ATR = 0.75
+V11_MAX_TRIGGER_BODY_ATR = 0.85
+V11_MIN_BREAKOUT_VOL = 1.15
+V11_MIN_BREAKOUT_BODY_ATR = 0.20
+
+def _v11_ema(values, length):
+    vals = [float(x) for x in values]
+    if not vals:
+        return []
+    alpha = 2.0 / (float(length) + 1.0)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(alpha * v + (1.0 - alpha) * out[-1])
+    return out
+
+def _v11_bb(values, length=20, std_mult=2.0):
+    vals = [float(x) for x in values]
+    if len(vals) < length:
+        return None
+    window = np.asarray(vals[-length:], dtype=float)
+    mid = float(np.mean(window))
+    std = float(np.std(window))
+    return {
+        "mid": mid,
+        "upper": mid + std_mult * std,
+        "lower": mid - std_mult * std,
+        "width": (2.0 * std_mult * std) / max(abs(mid), 1e-9),
+    }
+
 class TradingBot:
     """
     V8 state-machine trading bot.
@@ -1591,14 +1638,14 @@ class TradingBot:
     # and moves the stop to BREAKEVEN_LOCK_R (locks in a small win instead of
     # a flat scratch at exactly entry), T2 closes what's left (matches the
     # exchange-attached TP2, unchanged).
-    BREAKEVEN_LOCK_R: float = 0.30
+    BREAKEVEN_LOCK_R: float = 0.15
     # TP geometry — widened from 0.5R/1.0R to 0.6R/1.2R by request. Bar-close
     # A/B backtest (8 symbols, Jan–Jul 2026, same tp1_close_pct 60% /
     # breakeven-lock 0.15 / min-SL 1.2%): aggregate PnL improved by the
     # equivalent of +$4.3k (mainly XAU +$3.5k, XRP +$1.7k; SOL/XAG/CL a bit
     # worse) at the cost of ~3pp win-rate (66.8% → 63.4%) — targets sit
     # further out so fewer trades reach T1/T2, but each banked leg is bigger.
-    TP1_R: float = 0.60
+    TP1_R: float = 0.70
     TP2_R: float = 1.30
 
     # [TREND-TIER GATE] The weaker "Trend" regime tier only enters on a
@@ -2581,249 +2628,239 @@ class TradingBot:
                          ind_1h: Dict, ind_4h: Dict,
                          l1: Dict, l2: Dict, l3: Dict) -> Optional[Dict]:
         """
-        V9 3-layer signal pipeline.
-        Scores all regime strategies, selects the best, combines with L2 context
-        and L1 macro fit, gates on REGIME_THRESHOLDS.
+        V11 SIMPLE ENTRY ENGINE
+
+        No strategy voting and no multi-layer composite score.
+
+        Direction:
+          4H Macro + 1H Bias
+
+        State / momentum:
+          CDC Action Zone = EMA12 vs EMA26 on 15m
+
+        Location / timing:
+          Bollinger Band mid/outer bands + simple price action
+
+        Entry families:
+          1) Trend Pullback
+          2) CDC Transition
+          3) Bollinger Breakout
+          4) Bollinger Range Reversal
+
+        This intentionally prefers an understandable early trigger over waiting
+        for many lagging confirmations.
         """
-        regime     = l3["regime"]
-        threshold  = REGIME_THRESHOLDS.get(regime, 62)
-
-        if direction in self.blocked_entry_directions:
-            self._scan_info[direction] = "veto:correlated BTC/ETH exposure already open"
+        side = str(direction).upper()
+        if side not in ("LONG", "SHORT"):
             return None
 
-        # Trend is a continuation engine, so it must not trade against a
-        # materially opposing 4H macro. Breakout keeps its dedicated transition
-        # rules and Range keeps its isolated edge-fade rules.
-        macro_score = float(l1.get("score", 50.0))
-        if regime in ("StrongTrend", "Trend"):
-            if direction == "LONG" and macro_score < 45.0:
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_macro"] += 1
-                self._scan_info[direction] = f"veto:trend macro conflict (LONG macro={macro_score:.0f}<45)"
-                return None
-            if direction == "SHORT" and macro_score > 55.0:
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_macro"] += 1
-                self._scan_info[direction] = f"veto:trend macro conflict (SHORT macro={macro_score:.0f}>55)"
-                return None
-
-        # Range and Breakout each have a dedicated isolated engine — keeping
-        # these branches first guarantees the add-ons cannot modify Trend's
-        # veto/scoring path (Trend still falls through to the pipeline below).
-        if regime == "Range":
-            return self._generate_range_signal(direction, candle_15m, ind_15m, l1, l2)
-        if regime == "Breakout":
-            return self._generate_breakout_signal(direction, candle_15m, ind_15m, ind_1h, l1, l2)
-        if regime == "Transition":
-            return self._generate_market_structure_signal(
-                direction, candle_15m, ind_15m, ind_1h, l1, l2, regime)
-
-        # In mature trends, a completed structure retest has priority over the
-        # indicator-vote entry. If absent, the existing Trend pipeline runs.
-        if regime in ("StrongTrend", "Trend"):
-            structure_signal = self._generate_market_structure_signal(
-                direction, candle_15m, ind_15m, ind_1h, l1, l2, regime, optional=True)
-            if structure_signal is not None:
-                return structure_signal
-            # [TREND-TIER GATE] The weaker "Trend" tier (StrongTrend excluded)
-            # was net-negative across every score threshold in backtest — its
-            # indicator-vote pullback entries in immature (ADX 19-24) trends
-            # lose more on full-SL stops than the small T1 partials bank. A
-            # confirmed structure retest (above) is the preferred entry.
-            # [CONVICTION FALLBACK] But requiring structure for EVERY Trend
-            # entry left the most common regime near-silent. So the
-            # indicator-vote path is still allowed WHEN the 4H macro is
-            # decisively aligned (edge >= TREND_TIER_CONVICTION_EDGE past 50),
-            # and only at a RAISED score bar (TREND_TIER_CONVICTION_THRESHOLD)
-            # so just the highest-conviction Trend setups get through.
-            if regime == "Trend" and self.TREND_TIER_REQUIRE_STRUCTURE:
-                _edge = (macro_score - 50.0) if direction == "LONG" else (50.0 - macro_score)
-                if _edge < self.TREND_TIER_CONVICTION_EDGE:
-                    self._scan_info[direction] = (
-                        f"veto:trend-tier needs structure retest or strong macro "
-                        f"(edge {_edge:.0f} < {self.TREND_TIER_CONVICTION_EDGE:.0f})")
-                    return None
-                threshold = max(threshold, self.TREND_TIER_CONVICTION_THRESHOLD)
-
-        # ── Veto filters (non-MR regimes only) ──────────────────────────────
-        if regime not in _MR_REGIMES:
-            _px  = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
-            _e20 = ind_15m.get("ema20", _px)
-            _atr = max(ind_15m.get("atr", 1e-9), 1e-9)
-            if abs(_px - _e20) / _atr < self.MIN_EMA_DIST_ATR:
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_chop"] += 1
-                self._scan_info[direction] = (
-                    f"veto:chop-zone (dist {abs(_px-_e20)/_atr:.2f} "
-                    f"< {self.MIN_EMA_DIST_ATR} ATR)")
-                return None
-
-            _rng = float(candle_15m.get("high", _px)) - float(candle_15m.get("low", _px))
-            if _rng > self.CLIMAX_BAR_ATR * _atr:
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_climax"] += 1
-                self._scan_info[direction] = (
-                    f"veto:climax-bar (range {_rng/_atr:.1f} > {self.CLIMAX_BAR_ATR} ATR)")
-                return None
-
-            # 1H efficiency confirms a Trend pullback. It must NOT veto a
-            # Breakout, which naturally begins from compression/chop before expansion.
-            if regime in ("StrongTrend", "Trend"):
-                _eff_1h = ind_1h.get("eff_ratio", 0.5)
-                if self.MIN_1H_EFFICIENCY > 0 and _eff_1h < self.MIN_1H_EFFICIENCY:
-                    self._filter_stats["checked"] += 1
-                    self._filter_stats["veto_1h_chop"] += 1
-                    self._scan_info[direction] = (
-                        f"veto:1h-chop (eff {_eff_1h:.2f} < {self.MIN_1H_EFFICIENCY})")
-                    return None
-
-        # ── [V9.2 QUALITY] Macro-conviction veto ─────────────────────────────
-        # A 15m "Trend" classification with a NEUTRAL 4H macro behind it is a
-        # trend with no higher-timeframe fuel. Clean-run evidence: L1 score in
-        # the neutral middle third → 44% WR (-$1,217); decisive L1 either
-        # direction → 79-82% WR (+$945).
-        # [V9.3 ACTIVE] A broad NEUTRAL label covers L1 scores 40-59. The old
-        # hard veto rejected even 58/42, which already carries useful directional
-        # lean. Only reject a truly flat macro when 1H context is also weak;
-        # otherwise allow it with a bounded score penalty below.
-        _macro_soft_penalty = 0.0
-        if regime in ("StrongTrend", "Trend") and l1.get("level") == "NEUTRAL":
-            _l1_score = float(l1.get("score", 50.0))
-            _dir_edge = ((_l1_score - 50.0) if direction == "LONG"
-                         else (50.0 - _l1_score))
-            _l2_preview = (l2.get("bull_score", 50.0) if direction == "LONG"
-                           else l2.get("bear_score", 50.0))
-            if _dir_edge < 4.0 and _l2_preview < 60.0:
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_macro"] += 1
-                self._scan_info[direction] = (
-                    f"veto:flat-macro (L1 {_l1_score:.0f}, edge {_dir_edge:.1f}, "
-                    f"L2 {_l2_preview:.0f})")
-                return None
-            _macro_soft_penalty = float(np.clip((8.0 - max(_dir_edge, 0.0)) * 0.75, 0.0, 6.0))
-
-        # ── [V9.1 QUALITY] Trend pullback + RSI-chase vetoes ─────────────────
-        # Enter the QUIET phase of a 4H trend (15m ADX still low = pullback),
-        # never the extended leg. Backtest: ADX≤22 → 68.9% WR, ADX>30 → 47%.
-        if regime in ("StrongTrend", "Trend"):
-            # [FAST-TREND EXEMPTION] StrongTrend (decisive/expanded trend) skips
-            # the displacement-retest gate — its impulse IS the intended entry,
-            # so it must not be double-blocked by _trend_retest_gate. The weaker
-            # "Trend" tier still requires the retest. (Structure_Retest signals
-            # already bypass this whole pipeline by returning earlier.)
-            if regime == "Trend" and not self._trend_retest_gate(direction, candle_15m, ind_15m):
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_chase"] += 1
-                return None
-            _adx15 = ind_15m.get("adx", 20.0)
-            if _adx15 > self.MAX_15M_ADX_TREND:
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_chase"] += 1
-                self._scan_info[direction] = (
-                    f"veto:late-trend (15m ADX {_adx15:.0f} > "
-                    f"{self.MAX_15M_ADX_TREND:.0f} — leg already extended)")
-                return None
-
-            _rsi15 = ind_15m.get("rsi", 50.0)
-            if ((direction == "LONG" and _rsi15 > self.TREND_RSI_CHASE_HI) or
-                    (direction == "SHORT" and _rsi15 < self.TREND_RSI_CHASE_LO)):
-                self._filter_stats["checked"] += 1
-                self._filter_stats["veto_chase"] += 1
-                self._scan_info[direction] = (
-                    f"veto:rsi-chase (rsi {_rsi15:.0f} — entering into extreme)")
-                return None
-
-        # ── Strategy scoring (expectancy-blocked combos excluded) ────────────
-        strategy_scores = {
-            s: self.strategy_scorer.score(s, direction, ind_15m, l1, l2, regime)
-            for s in REGIME_STRATEGIES.get(regime, REGIME_STRATEGIES["Trend"])
-            if not self.expectancy_engine.is_blocked(regime, s)
-            and not self._symbol_strategy_blocked(regime, s)
-        }
-        best = self.confidence_engine.select_best(strategy_scores)
-        if best is None:
-            self._filter_stats["checked"] += 1
-            self._filter_stats["strategy_fail"] += 1
-            return None
-        best_strategy, best_score = best
-
-        if best_score < 30.0:
-            self._filter_stats["checked"] += 1
-            self._filter_stats["strategy_fail"] += 1
-            self._scan_info[direction] = f"strategy_fail: best={best_strategy} {best_score:.0f}"
+        if side in self.blocked_entry_directions:
+            self._scan_info[side] = "veto:correlated exposure already open"
             return None
 
-        # ── L1 fit + L2 context ──────────────────────────────────────────────
-        l1_fit  = self._compute_l1_fit(l1, direction, regime)
-        l2_ctx  = l2["bull_score"] if direction == "LONG" else l2["bear_score"]
+        close = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
+        open_ = float(candle_15m.get("open", close))
+        high = float(candle_15m.get("high", close))
+        low = float(candle_15m.get("low", close))
+        atr = max(float(ind_15m.get("atr", 0.0)), 1e-9)
+        rsi = float(ind_15m.get("rsi", 50.0))
+        adx = float(ind_15m.get("adx", 20.0))
+        volume = float(ind_15m.get("volume", 0.0))
+        vol_avg = max(float(ind_15m.get("vol_avg", volume or 1.0)), 1e-9)
+        vol_ratio = volume / vol_avg
+        ema20 = float(ind_15m.get("ema20", close))
+        body_atr = abs(close - open_) / atr
+        extension = abs(close - ema20) / atr
 
-        # ── Condition penalty (Level 2/3 adaptive learning) ──────────────────
-        _px_now      = float(candle_15m.get("close", ind_15m.get("close", 0.0)))
-        _atr_now     = max(ind_15m.get("atr", 1e-9), 1e-9)
-        _ema_dist    = abs(_px_now - ind_15m.get("ema20", _px_now)) / _atr_now
-        _atr_exp     = ind_15m.get("atr", 0.0) / max(ind_15m.get("atr_avg", ind_15m.get("atr", 1.0)), 1e-9)
-        _vol_ratio   = ind_15m.get("volume", 0.0) / max(ind_15m.get("vol_avg", ind_15m.get("volume", 1.0)), 1e-9)
-        _now_ts      = self._bar_now or datetime.datetime.now(datetime.timezone.utc)
-        _current_tags = self._diagnose_conditions(
-            direction=direction, ema_dist_atr=_ema_dist,
-            rsi=ind_15m.get("rsi", 50.0), atr_exp=_atr_exp,
-            vol_ratio=_vol_ratio, adx=ind_15m.get("adx", 25.0), now=_now_ts,
-        )
-        _condition_penalty = (self.condition_engine.get_penalty(_current_tags)
-                              + self._active_strategy_penalty(_current_tags, _now_ts)
-                              + _macro_soft_penalty)
+        # Use raw closed 15m candles when available. If not, derive a minimal
+        # state from current scalar indicators without failing startup.
+        raw15 = []
+        try:
+            raw15 = list((self._raw_candles or {}).get("15m", []) or [])
+        except Exception:
+            raw15 = []
 
-        # ── Composite score ──────────────────────────────────────────────────
-        total = best_score * 0.40 + l2_ctx * 0.30 + l1_fit * 0.30 - _condition_penalty
+        closes = []
+        highs = []
+        lows = []
+        opens = []
+        for c in raw15:
+            try:
+                closes.append(float(getattr(c, "close", c.get("close"))))
+                highs.append(float(getattr(c, "high", c.get("high"))))
+                lows.append(float(getattr(c, "low", c.get("low"))))
+                opens.append(float(getattr(c, "open", c.get("open"))))
+            except Exception:
+                continue
 
-        self._filter_stats["checked"] += 1
-        self._scan_info[direction] = (
-            f"total {total:.0f}/{threshold} regime={regime} "
-            f"strat={best_strategy}({best_score:.0f}) l2={l2_ctx:.0f} l1fit={l1_fit:.0f}"
-            + (f" pen=-{_condition_penalty:.0f}" if _condition_penalty > 0 else "")
-            + (" → SIGNAL" if total >= threshold else "")
-        )
+        # Guarantee current closed candle is represented.
+        if not closes or abs(closes[-1] - close) > max(abs(close) * 1e-10, 1e-10):
+            closes.append(close)
+            highs.append(high)
+            lows.append(low)
+            opens.append(open_)
 
-        if total < threshold:
-            self._filter_stats["threshold_fail"] += 1
-            self._log_event(
-                f"\n{'='*36}\n"
-                f"  ENTRY CHECK ({direction} | {regime})\n"
-                f"  Strategy   : {best_strategy} {best_score:.0f}/100\n"
-                f"  L2 Context : {l2_ctx:.0f}/100\n"
-                f"  L1 Fit     : {l1_fit:.0f}/100\n"
-                f"  Total      : {total:.0f} / {threshold}\n"
-                f"  Result     : NO TRADE\n"
-                f"{'='*36}",
-                level="debug",
-            )
+        if len(closes) < 30:
+            self._scan_info[side] = "waiting:need >=30 closed 15m bars"
             return None
 
-        self._filter_stats["passed"] += 1
-        sl_price   = self._compute_sl_price(ind_15m, candle_15m, direction, regime)
-        entry_type = _REGIME_ENTRY_TYPE.get(regime, "trend_follow")
+        ema_fast = _v11_ema(closes, V11_CDC_FAST)
+        ema_slow = _v11_ema(closes, V11_CDC_SLOW)
+        cdc_fast = ema_fast[-1]
+        cdc_slow = ema_slow[-1]
+        prev_fast = ema_fast[-2]
+        prev_slow = ema_slow[-2]
+
+        cdc_bull = cdc_fast > cdc_slow
+        cdc_bear = cdc_fast < cdc_slow
+        cdc_cross_up = prev_fast <= prev_slow and cdc_fast > cdc_slow
+        cdc_cross_dn = prev_fast >= prev_slow and cdc_fast < cdc_slow
+
+        bb = _v11_bb(closes, V11_BB_LEN, V11_BB_STD)
+        prev_bb = _v11_bb(closes[:-1], V11_BB_LEN, V11_BB_STD)
+        if bb is None or prev_bb is None:
+            self._scan_info[side] = "waiting:bollinger history"
+            return None
+
+        mid, upper, lower = bb["mid"], bb["upper"], bb["lower"]
+        prev_close = closes[-2]
+        prev_high = highs[-2]
+        prev_low = lows[-2]
+
+        macro = float(l1.get("score", 50.0))
+        bull_ctx = float(l2.get("bull_score", 50.0))
+        bear_ctx = float(l2.get("bear_score", 50.0))
+        bias_edge = bull_ctx - bear_ctx
+
+        macro_long = macro >= V11_MACRO_LONG_MIN
+        macro_short = macro <= V11_MACRO_SHORT_MAX
+        bias_long = bias_edge >= V11_1H_BIAS_EDGE
+        bias_short = bias_edge <= -V11_1H_BIAS_EDGE
+
+        bullish_bar = close > open_
+        bearish_bar = close < open_
+
+        # Simple price-action triggers.
+        micro_bos_long = close > prev_high
+        micro_bos_short = close < prev_low
+        reclaim_mid_long = prev_close <= prev_bb["mid"] and close > mid and bullish_bar
+        reclaim_mid_short = prev_close >= prev_bb["mid"] and close < mid and bearish_bar
+
+        # Avoid late chase. This is a hard safety gate, not another score.
+        if extension > V11_MAX_EXTENSION_ATR or body_atr > V11_MAX_TRIGGER_BODY_ATR:
+            self._scan_info[side] = (
+                f"veto:late entry ext={extension:.2f}ATR body={body_atr:.2f}ATR")
+            return None
+        if side == "LONG" and rsi > V11_MAX_RSI_LONG:
+            self._scan_info[side] = f"veto:long RSI chase {rsi:.0f}"
+            return None
+        if side == "SHORT" and rsi < V11_MIN_RSI_SHORT:
+            self._scan_info[side] = f"veto:short RSI chase {rsi:.0f}"
+            return None
+
+        regime = None
+        strategy = None
+        entry_type = None
+        quality = 0.0
+
+        # ── 1) TREND PULLBACK ───────────────────────────────────────────────
+        # HTF direction + CDC alignment. Trigger as soon as price reclaims BB
+        # mid / EMA area or makes a micro BOS. No MACD/ADX voting.
+        if side == "LONG" and macro_long and bias_long and cdc_bull:
+            near_value = (close >= mid * 0.998) and (close <= upper)
+            if adx >= V11_MIN_ADX_TREND and near_value and (reclaim_mid_long or micro_bos_long):
+                regime, strategy, entry_type = "Trend", "CDC_BB_Pullback", "trend_pullback"
+                quality = 68 + min(max(adx - 14.0, 0.0), 12.0)
+        elif side == "SHORT" and macro_short and bias_short and cdc_bear:
+            near_value = (close <= mid * 1.002) and (close >= lower)
+            if adx >= V11_MIN_ADX_TREND and near_value and (reclaim_mid_short or micro_bos_short):
+                regime, strategy, entry_type = "Trend", "CDC_BB_Pullback", "trend_pullback"
+                quality = 68 + min(max(adx - 14.0, 0.0), 12.0)
+
+        # ── 2) EARLY TRANSITION ─────────────────────────────────────────────
+        # CDC cross + BB mid reclaim. Macro must not strongly oppose it, but
+        # does not need to be a mature trend yet.
+        if regime is None:
+            if side == "LONG" and macro >= 48.0 and bias_edge >= 5.0:
+                if cdc_cross_up and close > mid and bullish_bar:
+                    regime, strategy, entry_type = "Transition", "CDC_Cross_Reclaim", "transition"
+                    quality = 66.0
+            elif side == "SHORT" and macro <= 52.0 and bias_edge <= -5.0:
+                if cdc_cross_dn and close < mid and bearish_bar:
+                    regime, strategy, entry_type = "Transition", "CDC_Cross_Reclaim", "transition"
+                    quality = 66.0
+
+        # ── 3) BOLLINGER BREAKOUT ───────────────────────────────────────────
+        # A close outside the band is allowed only with HTF direction, CDC,
+        # volume, and a controlled candle body. This catches the expansion
+        # early without waiting for several retest/score stages.
+        if regime is None and body_atr >= V11_MIN_BREAKOUT_BODY_ATR and vol_ratio >= V11_MIN_BREAKOUT_VOL:
+            if side == "LONG" and macro_long and bias_long and cdc_bull:
+                if prev_close <= prev_bb["upper"] and close > upper:
+                    regime, strategy, entry_type = "Breakout", "BB_CDC_Breakout", "breakout"
+                    quality = 70.0 + min((vol_ratio - 1.15) * 10.0, 8.0)
+            elif side == "SHORT" and macro_short and bias_short and cdc_bear:
+                if prev_close >= prev_bb["lower"] and close < lower:
+                    regime, strategy, entry_type = "Breakout", "BB_CDC_Breakout", "breakout"
+                    quality = 70.0 + min((vol_ratio - 1.15) * 10.0, 8.0)
+
+        # ── 4) RANGE EDGE REVERSAL ──────────────────────────────────────────
+        # Only when HTF is neutral and 15m trend strength is weak.
+        if regime is None and 45.0 <= macro <= 55.0 and adx < 20.0:
+            if side == "LONG":
+                swept = low <= lower and close > lower
+                if swept and bullish_bar and rsi <= 45.0:
+                    regime, strategy, entry_type = "Range", "BB_Edge_Reversal", "mean_revert"
+                    quality = 67.0
+            else:
+                swept = high >= upper and close < upper
+                if swept and bearish_bar and rsi >= 55.0:
+                    regime, strategy, entry_type = "Range", "BB_Edge_Reversal", "mean_revert"
+                    quality = 67.0
+
+        if regime is None:
+            self._scan_info[side] = (
+                f"waiting:v11 macro={macro:.0f} biasEdge={bias_edge:.0f} "
+                f"CDC={'BULL' if cdc_bull else 'BEAR'} "
+                f"BBpos={(close-mid)/atr:+.2f}ATR")
+            return None
+
+        # Direction-fit values remain compatible with existing journal/status.
+        l1_fit = macro if side == "LONG" else (100.0 - macro)
+        l2_ctx = bull_ctx if side == "LONG" else bear_ctx
+        total = float(np.clip(quality * 0.60 + l1_fit * 0.20 + l2_ctx * 0.20, 0.0, 100.0))
+
+        # One low final bar only. The real filters above are boolean gates.
+        if total < 62.0:
+            self._scan_info[side] = f"veto:v11 quality {total:.0f}<62"
+            return None
+
+        sl_price = self._compute_sl_price(ind_15m, candle_15m, side, regime)
+        self._scan_info[side] = (
+            f"SIGNAL:{strategy} total={total:.0f} macro={macro:.0f} "
+            f"biasEdge={bias_edge:.0f} CDC={'BULL' if cdc_bull else 'BEAR'}")
 
         return {
-            "direction":         direction,
-            "sl_price":          sl_price,
-            "health_score":      best_score,
-            "confidence_score":  (l2_ctx + l1_fit) / 2.0,
-            "total_score":       total,
-            "entry_score":       best_score,
-            "context_score":     l2_ctx,
-            "direction_fit":     l1_fit,
-            "entry_type":        entry_type,
-            "strategy":          best_strategy,
-            "regime":            regime,
-            "l1_score":          l1["score"],
-            "l1_level":          l1["level"],
-            "l2_bull":           l2["bull_score"],
-            "l2_bear":           l2["bear_score"],
-            "all_strategies":    strategy_scores,
-            "condition_penalty": _condition_penalty,
-            "entry_tags":        _current_tags,
+            "direction": side,
+            "sl_price": sl_price,
+            "health_score": quality,
+            "confidence_score": (l2_ctx + l1_fit) / 2.0,
+            "total_score": total,
+            "entry_score": quality,
+            "context_score": l2_ctx,
+            "direction_fit": l1_fit,
+            "entry_type": entry_type,
+            "strategy": strategy,
+            "regime": regime,
+            "l1_score": macro,
+            "l1_level": l1.get("level", "NEUTRAL"),
+            "l2_bull": bull_ctx,
+            "l2_bear": bear_ctx,
+            "all_strategies": {strategy: quality},
+            "condition_penalty": 0.0,
+            "entry_tags": [],
         }
+
 
     # ── [MTF-CONFLUENCE] Alternate entry engine ───────────────────────────────
 

@@ -2,7 +2,7 @@
 IndicatorEngine — converts raw OHLCV candles → indicator dicts for AdaptiveTradingBot.
 
 All *_score fields are 0–100.
-Computes: EMA5/20/50, RSI14, ADX14, MACD(12,26,9), ATR14, Bollinger, volume avg,
+Computes: EMA5/12/20/26/50, CDC Action Zone, RSI14, ADX14, MACD(12,26,9), ATR14, Bollinger, volume avg,
           efficiency ratio, ATR expansion, BB width, and all 12 condition scores.
 """
 import math
@@ -20,6 +20,7 @@ SWING_LOOKBACK = 15  # bars for swing high/low (5→15 = 3.75h lookback, wider S
 EFF_PERIOD     = 10  # Kaufman efficiency ratio lookback
 ATR_EXP_PERIOD = 20  # ATR expansion window
 BB_PERIOD      = 20  # Bollinger period
+BB_STD_MULT    = 2.0 # Bollinger standard deviations
 
 
 class IndicatorEngine:
@@ -76,11 +77,15 @@ class IndicatorEngine:
 
         # ── Standard indicators ─────────────────────────────────────────────
         ema5_arr  = BaseStrategy.ema(closes, 5)
+        ema12_arr = BaseStrategy.ema(closes, 12)
         ema20_arr = BaseStrategy.ema(closes, 20)
+        ema26_arr = BaseStrategy.ema(closes, 26)
         ema50_arr = BaseStrategy.ema(closes, 50) if len(closes) >= 50 else ema20_arr
 
         ema5  = self._safe(ema5_arr,  n)
+        ema12 = self._safe(ema12_arr, n)
         ema20 = self._safe(ema20_arr, n)
+        ema26 = self._safe(ema26_arr, n)
         ema50 = self._safe(ema50_arr, n)
         price = closes[n]
 
@@ -106,7 +111,20 @@ class IndicatorEngine:
         # ── Derived metrics ─────────────────────────────────────────────────
         eff_ratio = self._efficiency_ratio(closes, EFF_PERIOD)
         atr_exp   = self._atr_expansion(atr_arr, n, ATR_EXP_PERIOD)
-        bb_width  = self._bb_width(closes, n, BB_PERIOD)
+        bb_mid, bb_upper, bb_lower, bb_width = self._bollinger(
+            closes, n, BB_PERIOD, BB_STD_MULT
+        )
+        bb_position = (price - bb_lower) / max(bb_upper - bb_lower, 1e-9)
+        bb_position = float(np.clip(bb_position, 0.0, 1.0))
+
+        # CDC Action Zone: fast EMA12 vs slow EMA26.
+        ema12_prev = self._safe(ema12_arr, max(0, n - 1), ema12)
+        ema26_prev = self._safe(ema26_arr, max(0, n - 1), ema26)
+        cdc_bull = ema12 > ema26
+        cdc_bear = ema12 < ema26
+        cdc_cross_up = ema12_prev <= ema26_prev and ema12 > ema26
+        cdc_cross_down = ema12_prev >= ema26_prev and ema12 < ema26
+        cdc_spread_atr = (ema12 - ema26) / max(atr, 1e-9)
 
         ema20_prev  = self._safe(ema20_arr, max(0, n - 5), ema20)
         ema20_slope = (ema20 - ema20_prev) / max(abs(ema20_prev), 1e-9)
@@ -191,15 +209,27 @@ class IndicatorEngine:
             "macd_signal": macd_sig,
             "macd_hist":   macd_hist,
             "ema5":        ema5,
+            "ema12":       ema12,
             "ema20":       ema20,
+            "ema26":       ema26,
             "ema50":       ema50,
+            # CDC Action Zone
+            "cdc_bull":       cdc_bull,
+            "cdc_bear":       cdc_bear,
+            "cdc_cross_up":   cdc_cross_up,
+            "cdc_cross_down": cdc_cross_down,
+            "cdc_spread_atr": cdc_spread_atr,
             "atr":         atr,
             "volume":      vol_cur,
             "vol_avg":     vol_avg,
             # Derived
             "eff_ratio":   eff_ratio,
             "atr_exp":     atr_exp,
+            "bb_mid":      bb_mid,
+            "bb_upper":    bb_upper,
+            "bb_lower":    bb_lower,
             "bb_width":    bb_width,
+            "bb_position": bb_position,
             # Condition scores
             "trend_score":      trend_score,
             "momentum_score":   momentum_score,
@@ -251,10 +281,24 @@ class IndicatorEngine:
         return cur / max(avg, 1e-9)
 
     @staticmethod
-    def _bb_width(closes: List[float], n: int, period: int) -> float:
+    def _bollinger(
+        closes: List[float], n: int, period: int, std_mult: float = 2.0
+    ) -> Tuple[float, float, float, float]:
+        """Return Bollinger mid, upper, lower and normalized width."""
         window = closes[max(0, n - period + 1):n + 1]
+        if not window:
+            price = float(closes[n]) if closes else 0.0
+            return price, price, price, 0.0
+        mean = sum(window) / len(window)
         if len(window) < 2:
-            return 0.5
-        mean  = sum(window) / len(window)
+            return mean, mean, mean, 0.0
         stdev = math.sqrt(sum((x - mean) ** 2 for x in window) / len(window))
-        return float(np.clip((4 * stdev) / max(mean, 1e-9), 0, 1))
+        upper = mean + std_mult * stdev
+        lower = mean - std_mult * stdev
+        width = float(np.clip((upper - lower) / max(abs(mean), 1e-9), 0, 1))
+        return float(mean), float(upper), float(lower), width
+
+    @staticmethod
+    def _bb_width(closes: List[float], n: int, period: int) -> float:
+        # Backward-compatible helper for any older caller.
+        return IndicatorEngine._bollinger(closes, n, period, BB_STD_MULT)[3]
