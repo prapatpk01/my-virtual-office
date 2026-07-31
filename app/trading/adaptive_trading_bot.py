@@ -4135,14 +4135,14 @@ class TradingBot:
                                                    ind_4h, atr_4h)
 
             elif self.state == "ERROR":
-                # Retry exchange reconciliation. Existing reconcile logic safely
-                # clears stale ERROR when OKX confirms the bot is flat.
-                try:
-                    await self._reconcile_position()
-                except Exception as e:
-                    self._log_event(f"ERROR recovery reconcile failed: {e}", level="error")
-                if self.state == "ERROR":
-                    self._log_event("Bot in ERROR state — waiting for safe reconciliation", level="error")
+                # Do NOT call async code here: on_tick() is synchronous.
+                # run_bot.py already calls reconcile_with_exchange() outside
+                # this method. That reconciliation safely clears stale ERROR
+                # only after OKX confirms the exchange is flat.
+                self._log_event(
+                    "Bot in ERROR state — waiting for exchange reconciliation",
+                    level="warning",
+                )
                 break
 
         self.save_state(self._state_file)
