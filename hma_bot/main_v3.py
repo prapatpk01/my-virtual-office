@@ -1,7 +1,8 @@
-"""HMA Expert MTF V3 runtime.
+"""HMA Expert MTF V3.1 Balanced runtime.
 
-Reuses the production HMA bot's reconciliation, management, Telegram and stats,
-but upgrades entry execution to 4H -> 1H -> 15M location -> 5M trigger.
+4H direction -> 1H Q + soft DMI veto -> 15M location/structure -> recent 5M execution.
+The 5M trigger may come from the latest 3 closed bars so a trigger that occurred
+inside the just-closed 15M setup candle is not silently missed.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ class Bot(base.Bot):
                 raise RuntimeError("Could not confirm OKX hedge mode.")
         balance = await self.client.fetch_balance_usdt()
         base.logger.info(
-            "=== HMA EXPERT MTF V3 [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
+            "=== HMA EXPERT MTF V3.1 BALANCED [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE", self.cfg.symbols,
             self.cfg.margin_per_position_usd, self.cfg.leverage,
             self.cfg.max_positions, balance,
@@ -38,11 +39,11 @@ class Bot(base.Bot):
         if self.tg.enabled:
             asyncio.create_task(self._command_loop())
             await self.tg.send_text(
-                f"🤖 *HMA Expert MTF V3 started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
+                f"🤖 *HMA Expert MTF V3.1 Balanced started* [{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n"
-                f"4H Direction → 1H Q+DMI → 15M Location/Structure → 5M Execution\n"
+                f"4H Direction → 1H Q+soft DMI → 15M Location → recent 5M Execution\n"
                 f"SL: 15M structure + ATR buffer | T1 +0.6%→lock +0.3% | T2 +1.0%→lock +0.7% | TP +1.5%"
             )
 
@@ -59,20 +60,18 @@ class Bot(base.Bot):
         try:
             t = self.strat.trend_state_4h(df4h)
             q = self.strat.quality_state_1h(df1h)
-            dmi_ok = (q.plus_di > q.minus_di) if t.trend == S.Trend.BULL else (q.minus_di > q.plus_di)
-            dmi = "DMI✓" if dmi_ok else "DMI×"
+            side = S.Side.LONG if t.trend == S.Trend.BULL else S.Side.SHORT
+            dmi_edge = self.strat._dmi_edge(q, side) if t.trend != S.Trend.NEUTRAL else 0.0
+            dmi_ok = self.strat._dmi_aligned(q, side) if t.trend != S.Trend.NEUTRAL else False
+            dmi = f"DMI{'✓' if dmi_ok else '×'}({dmi_edge:+.1f})"
+
             if base._metal_halted(symbol, pd.Timestamp.now(tz="UTC")):
                 why = "HALT"
             elif self.open_position_count() >= self.cfg.max_positions:
                 why = f"MAX {self.cfg.max_positions}"
-            elif t.trend == S.Trend.NEUTRAL:
-                why = "WAIT 4H trend"
-            elif q.q < self.cfg.min_trend_quality:
-                why = f"WAIT Q<{self.cfg.min_trend_quality:.0f}"
-            elif not dmi_ok:
-                why = "WAIT 1H DMI align"
             else:
-                why = "WAIT 15M location / 5M trigger"
+                why = self.strat.entry_status(df4h, df1h, df15, df5)
+
             px = float(df5["close"].iloc[-1]) if len(df5) else 0.0
             self._view[symbol] = (
                 f"4H={t.trend.value} HMA={'UP' if t.hma_state>0 else 'DOWN' if t.hma_state<0 else 'FLAT'} "
@@ -80,7 +79,7 @@ class Bot(base.Bot):
                 f"| 5M px={px:.6g} | {why}"
             )
         except Exception as exc:
-            self._view[symbol] = f"view error: {str(exc)[:80]}"
+            self._view[symbol] = f"view error: {str(exc)[:100]}"
 
     async def _look_for_entry(self, symbol: str, st: dict):
         df5, df15, df1h, df4h = await self._entry_frames(symbol)
@@ -171,7 +170,7 @@ class Bot(base.Bot):
         )
         caption = (
             f"🟢 *{base._sym(symbol)} {direction.upper()}* @ `{fill:.6g}`\n"
-            f"4H `{sig.trend_4h.value}` | 1H Q `{sig.q_1h:.0f}` + DMI aligned "
+            f"4H `{sig.trend_4h.value}` | 1H Q `{sig.q_1h:.0f}` "
             f"(ADX {sig.adx_1h:.1f}, CHOP {sig.chop_1h:.1f})\n"
             f"15M `{sig.setup.value}` → 5M `{sig.trigger}` | Room `{sig.room_pct*100:.2f}%`\n"
             f"{sig.reason}\n"
