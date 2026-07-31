@@ -4135,7 +4135,14 @@ class TradingBot:
                                                    ind_4h, atr_4h)
 
             elif self.state == "ERROR":
-                self._log_event("Bot in ERROR state — manual check required", level="error")
+                # Retry exchange reconciliation. Existing reconcile logic safely
+                # clears stale ERROR when OKX confirms the bot is flat.
+                try:
+                    await self._reconcile_position()
+                except Exception as e:
+                    self._log_event(f"ERROR recovery reconcile failed: {e}", level="error")
+                if self.state == "ERROR":
+                    self._log_event("Bot in ERROR state — waiting for safe reconciliation", level="error")
                 break
 
         self.save_state(self._state_file)
