@@ -14,6 +14,8 @@ from trading.adaptive_trading_bot import TradingBot
 from trading.indicator_engine import compute
 
 
+BUILD_ID = "adaptive-v12-interface-fix-2026-08-01"
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -104,7 +106,7 @@ async def main() -> None:
             pass
 
     logger.info("=" * 64)
-    logger.info("Adaptive Bot v12 | mode=%s", "PAPER" if paper else "LIVE")
+    logger.info("Adaptive Bot v12 | build=%s | mode=%s", BUILD_ID, "PAPER" if paper else "LIVE")
     logger.info("margin=$%.2f leverage=%dx notional≈$%.2f", margin_usdt, leverage, margin_usdt * leverage)
     logger.info("symbols=%s", symbols)
     logger.info("entries: Trend Pullback | CDC Transition | BB Breakout")
