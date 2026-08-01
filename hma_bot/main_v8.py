@@ -158,31 +158,18 @@ class Bot(v7.Bot):
             okx_sl, okx_tp = await self.client.fetch_attached_stops(symbol, side)
             sl = self._valid_price(okx_sl)
             tp = self._valid_price(okx_tp)
-            used_fallback = False
 
-            if sl <= 0.0:
-                used_fallback = True
-                sl = (
-                    entry * (1.0 - self.cfg.stop_loss_pct)
-                    if side == "long"
-                    else entry * (1.0 + self.cfg.stop_loss_pct)
-                )
-            if tp <= 0.0:
-                used_fallback = True
-                tp = (
-                    entry * (1.0 + self.cfg.take_profit_pct)
-                    if side == "long"
-                    else entry * (1.0 - self.cfg.take_profit_pct)
-                )
+            # Retry once before declaring the native target state unavailable.
+            if (sl <= 0.0 or tp <= 0.0) and not self.cfg.paper:
+                await asyncio.sleep(1.0)
+                retry_sl, retry_tp = await self.client.fetch_attached_stops(symbol, side)
+                sl = sl or self._valid_price(retry_sl)
+                tp = tp or self._valid_price(retry_tp)
 
-            # If one native leg was missing, restore a complete exchange OCO using
-            # the recovered leg plus the configured disaster-stop/final-TP fallback.
-            protection_ok = True
-            if used_fallback and not self.cfg.paper:
-                protection_ok = await self.client.move_sl_to_breakeven(
-                    symbol, side, sl, amount, tp_price=tp
-                )
-
+            # Never invent or overwrite a live exchange stop after a read failure.
+            # A partially recovered position is quarantined: no double-entry and
+            # no local target calculations, while OKX remains source of truth.
+            recovery_quarantine = sl <= 0.0 or tp <= 0.0
             stage = self._infer_lock_stage(side, entry, sl)
             ticker = await self.client.fetch_ticker(symbol)
             current_price = self._valid_price((ticker or {}).get("last"))
@@ -220,23 +207,31 @@ class Bot(v7.Bot):
                 "trigger": "RESTART_RECOVERY",
                 "recovered": True,
                 "adopted": False,
+                "recovery_quarantine": recovery_quarantine,
                 "recovery_source": (
                     "OKX_POSITION+OKX_ALGO"
-                    if not used_fallback
-                    else "OKX_POSITION+CONFIG_FALLBACK"
+                    if not recovery_quarantine
+                    else "OKX_POSITION+TARGET_READ_INCOMPLETE"
                 ),
             }
             recovered += 1
 
             source = (
                 "OKX position + native SL/TP"
-                if not used_fallback
-                else "OKX position + restored fallback protection"
+                if not recovery_quarantine
+                else "OKX position; native target read incomplete"
             )
-            extra = "" if protection_ok else "\n⚠️ Native OCO restore failed; check Railway log/OKX."
+            extra = (
+                ""
+                if not recovery_quarantine
+                else "\n⚠️ Target recovery quarantined: no local stage/exit management "
+                     "and no exchange orders were changed. Check OKX pending TP/SL."
+            )
+            sl_txt = f"{sl:.6g}" if sl > 0.0 else "unavailable"
+            tp_txt = f"{tp:.6g}" if tp > 0.0 else "unavailable"
             await self.tg.send_text(
                 f"♻️ *{v7.v5.v4.v3.base._sym(symbol)} {side.upper()} recovered after restart*\n"
-                f"Entry `{entry:.6g}` | SL `{sl:.6g}` | Final TP `{tp:.6g}`\n"
+                f"Entry `{entry:.6g}` | SL `{sl_txt}` | Final TP `{tp_txt}`\n"
                 f"Lock stage `{stage}` | Amount `{amount:.8g}`\n"
                 f"Source: `{source}`{extra}"
             )
@@ -247,6 +242,21 @@ class Bot(v7.Bot):
     async def _manage(self, symbol: str, st: dict):
         """Mirror every local stage lock to OKX-native OCO protection."""
         before = st.get("pos") or {}
+
+        if before.get("recovery_quarantine"):
+            side = str(before.get("side") or "")
+            amount = await self.client.fetch_position_amount(symbol, side)
+            if amount <= 0.0:
+                await self._report_close(symbol, st)
+                return
+            ticker = await self.client.fetch_ticker(symbol)
+            price = self._valid_price((ticker or {}).get("last"))
+            self._view[symbol] = (
+                f"OPEN {side.upper()} recovered/quarantined | px={price:.8g} | "
+                f"OKX native orders authoritative"
+            )
+            return
+
         old_stage = int(before.get("lock_stage", 0))
         await super()._manage(symbol, st)
 
