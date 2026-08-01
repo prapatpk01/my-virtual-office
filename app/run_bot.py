@@ -27,7 +27,6 @@ def env_bool(key: str, default: bool = False) -> bool:
 
 
 def fx_entry_window_open(now: datetime) -> bool:
-    """Allow entries while FX is open and from Sunday 13:00 New York (4h pre-open)."""
     try:
         from zoneinfo import ZoneInfo
         new_york = now.astimezone(ZoneInfo("America/New_York"))
@@ -46,14 +45,9 @@ def fx_entry_window_open(now: datetime) -> bool:
 
 async def main() -> None:
     paper = env_bool("PAPER_TRADING", True) or os.getenv("TRADING_MODE", "").lower() == "paper"
-    symbols = [
-        symbol.strip()
-        for symbol in os.getenv(
-            "SYMBOLS",
-            "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT",
-        ).split(",")
-        if symbol.strip()
-    ]
+    symbols = [s.strip() for s in os.getenv(
+        "SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT"
+    ).split(",") if s.strip()]
     leverage = int(os.getenv("LEVERAGE", "20"))
     margin_usdt = float(os.getenv("ADAPTIVE_MARGIN_USDT", "20"))
     interval_seconds = int(os.getenv("INTERVAL_SECONDS", "60"))
@@ -92,8 +86,7 @@ async def main() -> None:
             leverage=leverage,
             paper=paper,
             state_file=os.path.join(
-                state_directory,
-                symbol.replace("/", "_").replace(":", "_") + ".json",
+                state_directory, symbol.replace("/", "_").replace(":", "_") + ".json"
             ),
             execution_callback=executor,
         )
@@ -145,15 +138,10 @@ async def main() -> None:
                     continue
 
                 event = bot.on_bar(
-                    indicators_15m,
-                    indicators_1h,
-                    indicators_4h,
+                    indicators_15m, indicators_1h, indicators_4h,
                     float(indicators_15m.get("close", 0.0)),
                 )
-                if event:
-                    logger.info("[%s] %s", symbol, event)
-                else:
-                    logger.info("[%s] %s", symbol, bot.last_signal)
+                logger.info("[%s] %s", symbol, event if event else bot.last_signal)
 
             except ccxt.BadSymbol as error:
                 disabled_symbols.add(symbol)
