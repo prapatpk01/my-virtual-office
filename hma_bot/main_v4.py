@@ -1,11 +1,12 @@
 """HMA Expert MTF V3.2 recovery-safe runtime.
 
-Fixes two production issues without changing entry logic:
-1) Positions adopted after a Railway restart have entry=0 in local state. They
-   must stay exchange-managed until close; running percentage/R calculations on
-   them caused ``float division by zero``.
-2) Repeated per-poll failures are rate-limited in Telegram while full errors
-   continue to be written to Railway logs.
+Production safeguards:
+1) Positions adopted after a Railway restart have no reliable local entry/SL/TP.
+   They remain protected by OKX-native SL/TP and are never passed into percentage
+   or R calculations that require a non-zero entry.
+2) Repeated per-poll failures are rate-limited in Telegram while full tracebacks
+   remain available in Railway logs.
+3) Startup and status output clearly identify V3.2 and adopted positions.
 """
 from __future__ import annotations
 
@@ -23,27 +24,75 @@ class Bot(v3.Bot):
         self._error_notified_at: dict[str, float] = {}
 
     async def start(self):
-        await super().start()
+        """Start V3.2 directly so Telegram does not show the inherited V3.1 banner."""
+        problems = self.cfg.validate_live()
+        if problems:
+            raise RuntimeError("Cannot start: " + "; ".join(problems))
+
+        if not self.cfg.paper:
+            if not await self.client.ensure_hedge_mode():
+                raise RuntimeError("Could not confirm OKX hedge mode.")
+
+        balance = await self.client.fetch_balance_usdt()
+        v3.base.logger.info(
+            "=== HMA EXPERT MTF V3.2 RECOVERY-SAFE [%s] symbols=%s margin=$%.2f "
+            "leverage=x%d max_pos=%d balance=%.2f ===",
+            "PAPER" if self.cfg.paper else "LIVE",
+            self.cfg.symbols,
+            self.cfg.margin_per_position_usd,
+            self.cfg.leverage,
+            self.cfg.max_positions,
+            balance,
+        )
+
+        await self._reconcile_startup()
+        self._running = True
+
+        if self.tg.enabled:
+            asyncio.create_task(self._command_loop())
+            await self.tg.send_text(
+                f"🤖 *HMA Expert MTF V3.2 Recovery-Safe started* "
+                f"[{'PAPER' if self.cfg.paper else 'LIVE'}]\n"
+                f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
+                f"Balance: `{balance:.2f}` USDT | Margin "
+                f"`${self.cfg.margin_per_position_usd:.2f}`/position | "
+                f"Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n"
+                f"4H Direction → 1H Q+soft DMI → 15M Location → recent 5M Execution\n"
+                f"SL: 15M structure + ATR buffer | T1 +0.6%→lock +0.3% | "
+                f"T2 +1.0%→lock +0.7% | TP +1.5%\n"
+                f"Restarted positions: OKX-native SL/TP management until close"
+            )
+
         v3.base.logger.info(
             "HMA V3.2 recovery guard active: adopted positions are exchange-managed; "
             "Telegram error alerts limited to once per symbol per 15 minutes"
         )
 
-    async def _manage(self, symbol: str, st: dict):
-        """Safely manage locally tracked and restart-adopted positions.
+    @staticmethod
+    def _is_adopted_position(pos: dict) -> bool:
+        try:
+            entry = float(pos.get("entry") or 0.0)
+        except (TypeError, ValueError):
+            entry = 0.0
+        return bool(pos.get("adopted")) or entry <= 0.0
 
-        A position discovered on OKX after restart is stored with entry/sl/tp=0
-        because the old process state is unavailable. The inherited manager calls
-        locked_stop() before checking ``adopted`` and therefore divides by zero.
-        Keep such positions protected by their existing OKX-native SL/TP and only
-        watch for the exchange position to close.
-        """
+    def _view_line(self, symbol: str) -> str:
+        """Never display adopted positions as a fake entry price of zero."""
+        st = self.state.get(symbol) or {}
+        pos = st.get("pos")
+        if pos and self._is_adopted_position(pos):
+            side = str(pos.get("side") or "?").upper()
+            amount = float(pos.get("amount") or 0.0)
+            live = self._view.get(symbol, "OKX native SL/TP managing")
+            return f"OPEN {side} adopted/restart | amount={amount:.8g} | {live}"
+        return super()._view_line(symbol)
+
+    async def _manage(self, symbol: str, st: dict):
+        """Safely manage locally tracked and restart-adopted positions."""
         pos = st.get("pos") or {}
         side = str(pos.get("side") or "").lower()
-        entry = float(pos.get("entry") or 0.0)
-        adopted = bool(pos.get("adopted")) or entry <= 0.0
 
-        if adopted:
+        if self._is_adopted_position(pos):
             if side not in ("long", "short"):
                 v3.base.logger.warning("[%s] invalid adopted position side=%r", symbol, side)
                 return
@@ -56,7 +105,6 @@ class Bot(v3.Bot):
             ticker = await self.client.fetch_ticker(symbol)
             price = float(ticker.get("last") or 0.0)
             self._view[symbol] = (
-                f"OPEN {side.upper()} adopted/restart | amount={amount:.8g} "
                 f"px={price:.8g} | OKX native SL/TP managing"
             )
             return
