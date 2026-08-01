@@ -95,46 +95,26 @@ def compute(candles) -> Dict[str, Any]:
     current_atr = atr(candles)
     volume_average = float(np.mean(volumes[-20:]))
     return {
-        "open": opens[-1],
-        "high": highs[-1],
-        "low": lows[-1],
-        "close": closes[-1],
-        "prev_close": closes[-2],
-        "prev_high": highs[-2],
-        "prev_low": lows[-2],
-        "ema8": ema8[-1],
-        "ema13": ema13[-1],
-        "ema20": ema20[-1],
-        "ema50": ema50[-1],
-        "ema8_prev": ema8[-2],
-        "ema13_prev": ema13[-2],
-        "ema12": ema12[-1],
-        "ema26": ema26[-1],
-        "ema12_prev": ema12[-2],
-        "ema26_prev": ema26[-2],
+        "open": opens[-1], "high": highs[-1], "low": lows[-1], "close": closes[-1],
+        "prev_close": closes[-2], "prev_high": highs[-2], "prev_low": lows[-2],
+        "ema8": ema8[-1], "ema13": ema13[-1], "ema20": ema20[-1], "ema50": ema50[-1],
+        "ema8_prev": ema8[-2], "ema13_prev": ema13[-2],
+        "ema12": ema12[-1], "ema26": ema26[-1],
+        "ema12_prev": ema12[-2], "ema26_prev": ema26[-2],
         "cdc_bull": ema12[-1] > ema26[-1],
         "cdc_bear": ema12[-1] < ema26[-1],
         "cdc_cross_up": ema12[-2] <= ema26[-2] and ema12[-1] > ema26[-1],
         "cdc_cross_down": ema12[-2] >= ema26[-2] and ema12[-1] < ema26[-1],
-        "bb_mid": bands["mid"],
-        "bb_upper": bands["upper"],
-        "bb_lower": bands["lower"],
-        "bb_width": bands["width"],
-        "atr": current_atr,
-        "adx": adx(candles),
-        "rsi": rsi(closes),
-        "volume": volumes[-1],
-        "vol_avg": volume_average,
+        "bb_mid": bands["mid"], "bb_upper": bands["upper"], "bb_lower": bands["lower"],
+        "bb_width": bands["width"], "atr": current_atr, "adx": adx(candles),
+        "rsi": rsi(closes), "volume": volumes[-1], "vol_avg": volume_average,
         "body_atr": abs(closes[-1] - opens[-1]) / max(current_atr, 1e-12),
         "extension_atr": abs(closes[-1] - ema20[-1]) / max(current_atr, 1e-12),
-        "swing_high": max(highs[-10:-1]),
-        "swing_low": min(lows[-10:-1]),
+        "swing_high": max(highs[-10:-1]), "swing_low": min(lows[-10:-1]),
     }
 
 
 class IndicatorEngine:
-    """Compatibility wrapper for callers that still expect the old class API."""
-
     @staticmethod
     def _candle(candles) -> Dict[str, Any]:
         if not candles:
@@ -150,10 +130,6 @@ class IndicatorEngine:
 
     def compute(self, c15m, c1h, c4h) -> Tuple[Dict, Dict, Dict, Dict, Dict, Dict]:
         return (
-            self._candle(c15m),
-            self._candle(c1h),
-            self._candle(c4h),
-            compute(c15m),
-            compute(c1h),
-            compute(c4h),
+            self._candle(c15m), self._candle(c1h), self._candle(c4h),
+            compute(c15m), compute(c1h), compute(c4h),
         )
