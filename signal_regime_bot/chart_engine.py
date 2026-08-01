@@ -1,5 +1,5 @@
 """
-Chart Engine — renders a candlestick PNG (mplfinance) with EMA/HMA overlays,
+Chart Engine — renders a candlestick PNG (mplfinance) with EMA overlays,
 recent swing support/resistance, and entry/SL/TP markers, for Telegram alerts.
 """
 from __future__ import annotations
@@ -20,45 +20,90 @@ import indicators as ind
 logger = logging.getLogger("chart_engine")
 
 
+def _mplfinance_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a clean frame using the canonical mplfinance column names.
+
+    Exchange frames in this project use lowercase OHLCV names. mplfinance's
+    default column resolver expects Open/High/Low/Close/Volume, so passing the
+    raw frame can silently make chart creation fall back to a text alert.
+    """
+    required = ("open", "high", "low", "close")
+    if df is None or df.empty or any(col not in df.columns for col in required):
+        return pd.DataFrame()
+
+    cols = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
+    out = df.loc[:, cols].copy()
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
+    out = out[~out.index.isna()]
+    out = out.rename(columns={
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    })
+    for col in out.columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out.dropna(subset=["Open", "High", "Low", "Close"])
+
+
 def build_entry_chart(symbol: str, df: pd.DataFrame, direction: str,
                       entry: float, sl: float, tp1: float, tp2: float,
                       out_dir: Optional[str] = None,
                       ema_fast_len: int = 10, ema_slow_len: int = 20,
                       tf_label: str = "5M") -> Optional[str]:
-    """Save a candlestick chart of the L3c timeframe (5M) with the EMA10/20
-    pair that both times the entry and gates the exit, plus entry/SL/TP lines.
-    Returns the file path, or None on failure."""
+    """Save a candlestick entry chart and return its file path.
+
+    The input dataframe may use lowercase exchange-style OHLCV columns. The
+    function normalizes those names before calling mplfinance.
+    """
     try:
-        plot_df = df.tail(120).copy()
-        if plot_df.empty:
+        raw = df.tail(120).copy() if df is not None else pd.DataFrame()
+        if raw.empty:
             return None
 
-        closes = plot_df["close"]
+        closes = pd.to_numeric(raw["close"], errors="coerce")
         ema_fast = ind.ema(closes, ema_fast_len)
         ema_slow = ind.ema(closes, ema_slow_len)
-        swing_high, swing_low = ind.recent_swing_levels(plot_df["high"], plot_df["low"], 3, 3)
+        swing_high, swing_low = ind.recent_swing_levels(raw["high"], raw["low"], 3, 3)
 
+        plot_df = _mplfinance_frame(raw)
+        if plot_df.empty:
+            logger.warning("[CHART] no valid OHLC rows for %s", symbol)
+            return None
+
+        # Align overlays to the cleaned/sorted plotting index.
+        ema_fast = ema_fast.reindex(plot_df.index)
+        ema_slow = ema_slow.reindex(plot_df.index)
         addplots = [
-            mpf.make_addplot(ema_fast, color="#00d4ff", width=1.1),   # EMA10 (L3c fast)
-            mpf.make_addplot(ema_slow, color="#ff5d8f", width=1.1),   # EMA20 (L3c slow)
+            mpf.make_addplot(ema_fast, color="#00d4ff", width=1.1),
+            mpf.make_addplot(ema_slow, color="#ff5d8f", width=1.1),
         ]
 
+        levels = [float(entry), float(sl), float(tp1), float(tp2)]
+        colors = ["#ffffff", "#ff4d4f", "#3fb950", "#3fb950"]
+        linestyles = ["--", "-", "-", "-"]
+        linewidths = [1.0, 1.2, 1.0, 1.2]
+
+        if pd.notna(swing_high):
+            levels.append(float(swing_high))
+            colors.append("#8b949e")
+            linestyles.append(":")
+            linewidths.append(0.8)
+        if pd.notna(swing_low):
+            levels.append(float(swing_low))
+            colors.append("#8b949e")
+            linestyles.append(":")
+            linewidths.append(0.8)
+
         hlines = dict(
-            hlines=[entry, sl, tp1, tp2],
-            colors=["#ffffff", "#ff4d4f", "#3fb950", "#3fb950"],
-            linestyle=["--", "-", "-", "-"],
-            linewidths=[1.0, 1.2, 1.0, 1.2],
+            hlines=levels,
+            colors=colors,
+            linestyle=linestyles,
+            linewidths=linewidths,
         )
-        if swing_high == swing_high:  # not NaN
-            hlines["hlines"].append(swing_high)
-            hlines["colors"].append("#8b949e")
-            hlines["linestyle"].append(":")
-            hlines["linewidths"].append(0.8)
-        if swing_low == swing_low:
-            hlines["hlines"].append(swing_low)
-            hlines["colors"].append("#8b949e")
-            hlines["linestyle"].append(":")
-            hlines["linewidths"].append(0.8)
 
         mc = mpf.make_marketcolors(up="#3fb950", down="#f85149", edge="inherit",
                                    wick="inherit", volume="in")
@@ -71,10 +116,24 @@ def build_entry_chart(symbol: str, df: pd.DataFrame, direction: str,
         fname = f"{symbol.replace('/', '_').replace(':', '_')}_{int(time.time())}.png"
         path = os.path.join(out_dir, fname)
 
-        title = f"{symbol}  {direction}  {tf_label} EMA{ema_fast_len}/{ema_slow_len}  entry={entry:.4f}"
-        mpf.plot(plot_df, type="candle", style=style, addplot=addplots, hlines=hlines,
-                 volume=True, title=title, savefig=dict(fname=path, dpi=130, bbox_inches="tight"))
+        title = (
+            f"{symbol}  {direction}  {tf_label} EMA{ema_fast_len}/{ema_slow_len}  "
+            f"entry={entry:.4f}"
+        )
+        mpf.plot(
+            plot_df,
+            type="candle",
+            style=style,
+            addplot=addplots,
+            hlines=hlines,
+            volume="Volume" in plot_df.columns,
+            title=title,
+            savefig=dict(fname=path, dpi=130, bbox_inches="tight"),
+        )
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            logger.warning("[CHART] output file missing/empty for %s", symbol)
+            return None
         return path
     except Exception as e:
-        logger.warning("[CHART] build_entry_chart failed for %s: %s", symbol, e)
+        logger.warning("[CHART] build_entry_chart failed for %s: %s", symbol, e, exc_info=True)
         return None
