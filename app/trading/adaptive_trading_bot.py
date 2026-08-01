@@ -86,7 +86,6 @@ class TradingBot:
         bias = self._bias(indicators_1h)
         close = indicators_15m["close"]
 
-        # Hard late-entry guard. No score stacking.
         if indicators_15m["extension_atr"] > 0.75 or indicators_15m["body_atr"] > 0.85:
             self.last_signal = (
                 f"WAIT late ext={indicators_15m['extension_atr']:.2f}ATR "
@@ -97,7 +96,6 @@ class TradingBot:
         long_allowed = macro == "BULL" and bias == "BULL"
         short_allowed = macro == "BEAR" and bias == "BEAR"
 
-        # 1) Trend pullback: HTF direction + CDC + immediate price-action trigger.
         if long_allowed and indicators_15m["cdc_bull"] and indicators_15m["adx"] >= 14 and indicators_15m["rsi"] <= 70:
             trigger = (
                 indicators_15m["prev_close"] <= indicators_15m["bb_mid"] < close
@@ -114,13 +112,11 @@ class TradingBot:
             if trigger and close >= indicators_15m["bb_lower"]:
                 return self._build("SHORT", "trend_pullback", close, indicators_15m)
 
-        # 2) Early transition: CDC cross + Bollinger mid reclaim.
         if macro != "BEAR" and indicators_1h["cdc_bull"] and indicators_15m["cdc_cross_up"] and close > indicators_15m["bb_mid"]:
             return self._build("LONG", "cdc_transition", close, indicators_15m)
         if macro != "BULL" and indicators_1h["cdc_bear"] and indicators_15m["cdc_cross_down"] and close < indicators_15m["bb_mid"]:
             return self._build("SHORT", "cdc_transition", close, indicators_15m)
 
-        # 3) Bollinger breakout: HTF direction + CDC + volume expansion.
         volume_ratio = indicators_15m["volume"] / max(indicators_15m["vol_avg"], 1e-12)
         if long_allowed and indicators_15m["cdc_bull"] and indicators_15m["prev_close"] <= indicators_15m["bb_upper"] < close and volume_ratio >= 1.15:
             return self._build("LONG", "bb_breakout", close, indicators_15m)
@@ -208,7 +204,6 @@ class TradingBot:
         return {"event": "OPEN", **payload}
 
 
-# Compatibility exports used by older imports. They are intentionally simple.
 _TRADEABLE_REGIMES = frozenset({"Trend", "Transition", "Breakout"})
 
 
