@@ -178,10 +178,33 @@ class Bot(base.Bot):
             f"T1 `+0.6%` → lock `+0.3%` | T2 `+1.0%` → lock `+0.7%`\n"
             f"Margin `${required_margin:.2f}` × `x{self.cfg.leverage}` ≈ `${notional:.2f}` notional"
         )
-        chart = self._build_chart(symbol, df15, direction, fill, sl, tp)
+
+        # HMA V3 executes on 5M, so its alert chart must use the same 5M candles
+        # and EMA8/13 pair. Fall back to the inherited 15M chart only if needed.
+        chart = None
+        if base.build_entry_chart is not None:
+            try:
+                chart = base.build_entry_chart(
+                    symbol,
+                    df5,
+                    direction.upper(),
+                    fill,
+                    sl,
+                    tp,
+                    tp,
+                    ema_fast_len=8,
+                    ema_slow_len=13,
+                    tf_label="5M",
+                )
+            except Exception as exc:
+                base.logger.warning("[%s] HMA V3 5M chart failed: %s", symbol, exc, exc_info=True)
+        if not chart:
+            chart = self._build_chart(symbol, df15, direction, fill, sl, tp)
+
         if chart:
             await self.tg._send_photo(chart, caption)
         else:
+            base.logger.warning("[%s] chart unavailable; sending text-only entry alert", symbol)
             await self.tg.send_text(caption)
 
 
