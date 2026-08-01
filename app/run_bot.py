@@ -45,8 +45,6 @@ def fx_entry_window_open(now: datetime) -> bool:
 
 
 async def main() -> None:
-    # PAPER_TRADING=true is the recommended Railway setting. Paper is also the
-    # default so a missing variable can never accidentally enable live orders.
     paper = env_bool("PAPER_TRADING", True) or os.getenv("TRADING_MODE", "").lower() == "paper"
     symbols = [
         symbol.strip()
@@ -60,8 +58,6 @@ async def main() -> None:
     margin_usdt = float(os.getenv("ADAPTIVE_MARGIN_USDT", "20"))
     interval_seconds = int(os.getenv("INTERVAL_SECONDS", "60"))
 
-    # Public market data connector. It is always initialized in paper mode so
-    # market-data collection never requires private OKX position permissions.
     connector = BinanceConnector(
         api_key="" if paper else os.getenv("EXCHANGE_API_KEY", ""),
         api_secret="" if paper else os.getenv("EXCHANGE_API_SECRET", ""),
@@ -144,8 +140,6 @@ async def main() -> None:
                 indicators_4h = compute(candles_4h)
                 bot = bots[symbol]
 
-                # Sleep mode blocks only NEW positions. Existing paper/live
-                # positions continue through TP/SL/CDC-flip management.
                 if not entries_allowed and not bot.position_open:
                     logger.info("[%s] SLEEP_MODE — no new position", symbol)
                     continue
