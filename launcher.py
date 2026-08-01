@@ -3,7 +3,7 @@
     MODE=dual    -> DUAL ENTRY PRECISION V1.4   (default)
     MODE=regime  -> Signal Regime Bias bot (legacy)
     MODE=htf     -> HTF pullback bot (1H/4H, backtest-validated)
-    MODE=hma     -> HMA Expert MTF V3.5 (4H→1H→15M→5M)
+    MODE=hma     -> HMA Expert MTF V3.6 (4H→1H→15M→5M)
 
 This file is baked into the Docker image AS /app/main.py, so it runs no
 matter which start command Railway uses (`python main.py`, the image CMD,
@@ -47,10 +47,10 @@ def main() -> None:
             sys.exit(1)
     elif mode in ("hma", "hma16", "trendfollow"):
         target_dir = os.path.join(HERE, "hma_bot")
-        argv = [sys.executable, "main_v7.py"]
-        name = "HMA Expert MTF V3.5 (balanced two-stage)"
-        if not os.path.isfile(os.path.join(target_dir, "main_v7.py")):
-            print(f"FATAL: hma_bot/main_v7.py not found under {HERE}", flush=True)
+        argv = [sys.executable, "main_v8.py"]
+        name = "HMA Expert MTF V3.6 (OKX recovery + auditable stats)"
+        if not os.path.isfile(os.path.join(target_dir, "main_v8.py")):
+            print(f"FATAL: hma_bot/main_v8.py not found under {HERE}", flush=True)
             sys.exit(1)
     else:
         print(f"FATAL: unknown MODE={mode!r} — use MODE=dual, regime, htf or hma", flush=True)
