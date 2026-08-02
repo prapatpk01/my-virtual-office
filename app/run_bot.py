@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 from datetime import datetime, timezone
 
 import ccxt
@@ -14,11 +15,17 @@ from trading.adaptive_trading_bot import TradingBot
 from trading.indicator_engine import compute
 
 
-BUILD_ID = "adaptive-v12-interface-fix-2026-08-01"
+BUILD_ID = "adaptive-v12-stdout-logging-2026-08-02"
 
+# Railway visually marks stderr output in red. Python logging defaults to stderr,
+# even for INFO messages. Route the bot's complete log stream to stdout so
+# normal status messages such as SLEEP_MODE appear as ordinary INFO logs.
+# force=True also replaces handlers that may have been installed by imports.
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger("adaptive_v12")
 
