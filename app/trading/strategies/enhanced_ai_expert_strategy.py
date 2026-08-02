@@ -8,6 +8,7 @@ entry-quality layer before an order is allowed to leave the strategy:
 3. Strategy-specific SMA30/ATR anti-chase limits.
 4. Recalculate live reward/risk from the actual current price.
 5. Reduce risk while expectancy history is still immature.
+6. Add a compact, structured decision trace for Railway/Telegram diagnostics.
 
 The wrapper deliberately does not change open-position management, exit logic,
 trade journaling, regime classification, or strategy selection.
@@ -36,7 +37,6 @@ _DEFAULT_CHASE_ATR = {
     "trend_continuation": 1.10,
     "momentum_expansion": 1.40,
     "breakout": 1.50,
-    # Mean reversion naturally starts farther from the mean.
     "mean_reversion": 2.00,
     "swing_reversal": 1.20,
 }
@@ -51,7 +51,7 @@ _DEFAULT_MIN_LIVE_RR = {
 
 
 class EnhancedAIExpertStrategy(AIExpertStrategy):
-    """AI Expert with fresh-entry, anti-chase and low-sample risk controls."""
+    """AI Expert with fresh-entry, anti-chase and explainability controls."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -98,6 +98,114 @@ class EnhancedAIExpertStrategy(AIExpertStrategy):
             return float("nan")
         return float(np.mean(np.asarray(tr[-period:], dtype=float)))
 
+    @staticmethod
+    def _pick(mapping: dict, *keys, default=None):
+        for key in keys:
+            value = mapping.get(key)
+            if value is not None and value != "":
+                return value
+        return default
+
+    @staticmethod
+    def _short_reason(reason: str, limit: int = 100) -> str:
+        text = " ".join(str(reason or "").split())
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    def _build_decision_trace(self, signal: Signal) -> dict:
+        """Build stable explainability fields without rerunning strategy engines."""
+        metadata = dict(getattr(signal, "metadata", None) or {})
+        macro = dict(metadata.get("macro", {}) or {})
+        context = dict(metadata.get("context", {}) or {})
+        regime = dict(metadata.get("regime", {}) or {})
+        selection = dict(metadata.get("selection", {}) or {})
+        setup = dict(metadata.get("strategy_setup", {}) or {})
+        confidence = dict(metadata.get("confidence", {}) or {})
+        expectancy = dict(metadata.get("expectancy", {}) or {})
+        dynamic = dict(metadata.get("dynamic_risk", {}) or {})
+        entry_quality = dict(metadata.get("entry_quality", {}) or {})
+
+        strategy_name = str(
+            self._pick(
+                selection,
+                "strategy",
+                "selected",
+                "selected_strategy",
+                default=entry_quality.get("strategy", "none"),
+            )
+            or "none"
+        )
+        setup_score = float(setup.get("raw_score", 0.0) or 0.0)
+        setup_progress = max(0, min(100, int(round(setup_score))))
+        setup_valid = bool(setup.get("valid", False))
+        setup_reason = str(setup.get("reason") or getattr(signal, "reason", "") or "")
+
+        trace = {
+            "macro_state": str(self._pick(macro, "state", "label", "trend", default="?")),
+            "macro_score": self._pick(macro, "score", default=None),
+            "context_bias": str(self._pick(context, "dominant_bias", "bias", "state", default="?")),
+            "context_score": self._pick(context, "quality", "score", "bias_score", default=None),
+            "regime": str(self._pick(regime, "primary", "state", "label", default="?")),
+            "volatility_state": str(self._pick(regime, "secondary", "volatility", default="?")),
+            "strategy": strategy_name,
+            "setup_valid": setup_valid,
+            "setup_score": round(setup_score, 1),
+            "setup_progress_pct": setup_progress,
+            "waiting_for": self._short_reason(setup_reason),
+            "confidence": self._pick(confidence, "score", default=None),
+            "confidence_level": self._pick(confidence, "level", default=None),
+            "expectancy_r": self._pick(expectancy, "expectancy_r", default=None),
+            "expectancy_samples": int(expectancy.get("sample_size", 0) or 0),
+            "expected_rr": metadata.get("rr_ratio"),
+            "live_rr": entry_quality.get("live_rr"),
+            "risk_multiplier": self._pick(dynamic, "risk_multiplier", default=None),
+            "decision": str(getattr(signal.type, "value", signal.type)).upper(),
+        }
+        return trace
+
+    @staticmethod
+    def _fmt_value(value, digits: int = 0, fallback: str = "?") -> str:
+        if value is None:
+            return fallback
+        try:
+            number = float(value)
+            return f"{number:.{digits}f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _trace_summary(self, trace: dict) -> str:
+        macro_score = self._fmt_value(trace.get("macro_score"), 0)
+        context_score = self._fmt_value(trace.get("context_score"), 0)
+        confidence = self._fmt_value(trace.get("confidence"), 0, "---")
+        expected_rr = trace.get("live_rr")
+        if expected_rr is None:
+            expected_rr = trace.get("expected_rr")
+        rr_text = self._fmt_value(expected_rr, 2, "---")
+        expectancy_r = trace.get("expectancy_r")
+        exp_text = self._fmt_value(expectancy_r, 2, "---")
+
+        return (
+            f"L1={trace.get('macro_state')}({macro_score}) "
+            f"L2={trace.get('context_bias')}({context_score}) "
+            f"L3={trace.get('regime')}/{trace.get('volatility_state')} "
+            f"L4={trace.get('strategy')} "
+            f"SETUP={trace.get('setup_progress_pct', 0)}% "
+            f"CONF={confidence} EXP={exp_text}R RR={rr_text} | "
+            f"{trace.get('waiting_for') or trace.get('decision')}"
+        )
+
+    def _attach_decision_trace(self, signal: Signal, replace_hold_reason: bool = True) -> Signal:
+        metadata = dict(getattr(signal, "metadata", None) or {})
+        signal.metadata = metadata
+        trace = self._build_decision_trace(signal)
+        metadata["decision_trace"] = trace
+        metadata["setup_progress_pct"] = trace["setup_progress_pct"]
+        metadata["waiting_for"] = trace["waiting_for"]
+        metadata["expected_rr"] = trace.get("live_rr") or trace.get("expected_rr")
+
+        if replace_hold_reason and signal.type == SignalType.HOLD:
+            signal.reason = self._trace_summary(trace)
+        return signal
+
     def _cancel_generated_entry(self, reason: str) -> None:
         """Undo AIExpertStrategy's optimistic internal open-state assignment."""
         cancel = getattr(self, "cancel_pending_entry", None)
@@ -115,7 +223,8 @@ class EnhancedAIExpertStrategy(AIExpertStrategy):
         metadata.setdefault("entry_quality", {}).update(extra)
         metadata["entry_quality"]["passed"] = False
         metadata["entry_quality"]["block_reason"] = reason
-        return self._hold(float(signal.price), reason=reason, metadata=metadata)
+        hold = self._hold(float(signal.price), reason=reason, metadata=metadata)
+        return self._attach_decision_trace(hold, replace_hold_reason=True)
 
     async def analyze(
         self,
@@ -124,6 +233,7 @@ class EnhancedAIExpertStrategy(AIExpertStrategy):
         mtf_candles: dict = None,
     ) -> Signal:
         signal = await super().analyze(candles, current_price, mtf_candles)
+        signal = self._attach_decision_trace(signal, replace_hold_reason=True)
         if signal.type not in (SignalType.BUY, SignalType.SELL):
             return signal
 
@@ -132,9 +242,6 @@ class EnhancedAIExpertStrategy(AIExpertStrategy):
         confidence_score = float(entry.get("decision_score", 0.0) or 0.0)
         bar_ts = self._latest_bar_ts(candles)
 
-        # A valid setup can remain true for several five-minute scans. Accept it
-        # only once for the latest 15m bar; a rejected order is reset by the bot
-        # via cancel_pending_entry and may be reconsidered only on a new bar.
         if bar_ts and self._last_accepted_entry_bar_ts == bar_ts:
             return self._blocked_hold(
                 signal,
@@ -244,4 +351,4 @@ class EnhancedAIExpertStrategy(AIExpertStrategy):
             self._open_entry["entry_bar_ts"] = bar_ts
 
         self._last_accepted_entry_bar_ts = bar_ts or self._last_accepted_entry_bar_ts
-        return signal
+        return self._attach_decision_trace(signal, replace_hold_reason=False)
