@@ -2,6 +2,12 @@
 
 Normalizes only fields that are truly mappings and maps explainability to the
 actual metadata contract emitted by AIExpertStrategy._base_metadata().
+
+It also applies a final 15M stop-distance guard after a valid AI Expert signal:
+- preserve the strategy's structural stop when it is already wide enough;
+- widen stops that are too close using both ATR and percentage floors;
+- reject entries whose required structural stop exceeds the configured cap;
+- rebuild TP from the final stop distance and the strategy's original R:R.
 """
 from __future__ import annotations
 
@@ -11,8 +17,17 @@ from .base import Signal, SignalType
 from .enhanced_ai_expert_strategy import EnhancedAIExpertStrategy
 
 
+_STOP_RULES = {
+    "trend_continuation": {"pct_floor": 0.55, "atr_floor": 0.80, "cap_pct": 1.20},
+    "momentum_expansion": {"pct_floor": 0.65, "atr_floor": 1.00, "cap_pct": 1.20},
+    "breakout": {"pct_floor": 0.70, "atr_floor": 1.00, "cap_pct": 1.20},
+    "mean_reversion": {"pct_floor": 0.60, "atr_floor": 0.90, "cap_pct": 1.20},
+    "swing_reversal": {"pct_floor": 0.75, "atr_floor": 1.10, "cap_pct": 1.20},
+}
+
+
 class SafeEnhancedAIExpertStrategy(EnhancedAIExpertStrategy):
-    """Enhanced AI Expert with type-safe, contract-aware diagnostics."""
+    """Enhanced AI Expert with safe diagnostics and 15M stop-distance floors."""
 
     _MAPPING_FIELDS = (
         "market_quality",
@@ -84,10 +99,7 @@ class SafeEnhancedAIExpertStrategy(EnhancedAIExpertStrategy):
             if token in lower:
                 passed.append(label)
 
-        # Keep the engine's exact reason as the authoritative missing/waiting
-        # explanation; merely shorten it for Railway readability.
-        waiting = text
-        return passed[:6], waiting
+        return passed[:6], text
 
     def _build_decision_trace(self, signal: Signal) -> dict:
         metadata = self._normalize_metadata(signal)
@@ -118,8 +130,6 @@ class SafeEnhancedAIExpertStrategy(EnhancedAIExpertStrategy):
         regime_secondary = metadata.get("regime_secondary") or "?"
 
         confidence_score = confidence.get("score")
-        # Before Layer 6 runs, show the selector/regime confidence rather than
-        # an empty value. This is diagnostic only and does not alter gating.
         if confidence_score is None:
             confidence_score = metadata.get("strategy_confidence")
 
@@ -202,3 +212,121 @@ class SafeEnhancedAIExpertStrategy(EnhancedAIExpertStrategy):
         metadata["entry_quality"] = entry_quality
         hold = self._hold(float(signal.price), reason=reason, metadata=metadata)
         return self._attach_decision_trace(hold, replace_hold_reason=True)
+
+    def _stop_rule(self, strategy_type: str) -> dict:
+        base = dict(_STOP_RULES.get(strategy_type, {
+            "pct_floor": 0.60, "atr_floor": 0.90, "cap_pct": 1.20,
+        }))
+        key = strategy_type.upper() if strategy_type else "DEFAULT"
+        base["pct_floor"] = self._env_float(
+            f"AI_SL_MIN_PCT_{key}", base["pct_floor"]
+        )
+        base["atr_floor"] = self._env_float(
+            f"AI_SL_MIN_ATR_{key}", base["atr_floor"]
+        )
+        base["cap_pct"] = self._env_float(
+            f"AI_SL_MAX_PCT_{key}", base["cap_pct"]
+        )
+        return base
+
+    def _apply_stop_distance_guard(self, signal: Signal, candles: list) -> Signal:
+        """Widen too-tight SLs and rebuild TP while preserving strategy R:R."""
+        if signal.type not in (SignalType.BUY, SignalType.SELL):
+            return signal
+
+        metadata = self._normalize_metadata(signal)
+        entry = self._open_entry or {}
+        strategy_type = str(
+            entry.get("strategy_type") or metadata.get("selected_strategy") or ""
+        ).lower()
+        direction = str(entry.get("direction") or (
+            "long" if signal.type == SignalType.BUY else "short"
+        )).lower()
+        price = float(signal.price)
+        original_sl = self._safe_float(
+            metadata.get("stop_loss", entry.get("stop_loss")), 0.0
+        )
+        original_tp = self._safe_float(
+            metadata.get("take_profit", entry.get("take_profit")), 0.0
+        )
+        original_rr = self._safe_float(metadata.get("rr_ratio"), 0.0)
+
+        if original_sl <= 0 or price <= 0:
+            return self._blocked_hold(
+                signal,
+                "Stop guard: invalid entry or stop price",
+                {"strategy": strategy_type, "original_sl": original_sl},
+            )
+
+        atr14 = self._atr(candles, 14)
+        rule = self._stop_rule(strategy_type)
+        pct_floor_distance = price * rule["pct_floor"] / 100.0
+        atr_floor_distance = atr14 * rule["atr_floor"] if atr14 > 0 else 0.0
+        min_distance = max(pct_floor_distance, atr_floor_distance)
+        max_distance = price * rule["cap_pct"] / 100.0
+        original_distance = abs(price - original_sl)
+
+        # A structure stop beyond the cap is not compressed toward price;
+        # the setup is rejected because doing so would invalidate the strategy.
+        if original_distance > max_distance:
+            return self._blocked_hold(
+                signal,
+                (
+                    f"Stop guard: structural SL {original_distance / price * 100:.2f}% "
+                    f"> max {rule['cap_pct']:.2f}%"
+                ),
+                {
+                    "strategy": strategy_type,
+                    "original_sl_pct": round(original_distance / price * 100, 3),
+                    "max_sl_pct": rule["cap_pct"],
+                },
+            )
+
+        final_distance = max(original_distance, min(min_distance, max_distance))
+        final_sl = price - final_distance if direction == "long" else price + final_distance
+
+        # Preserve the engine's intended R:R. If metadata is unavailable,
+        # derive it from its original TP/SL, then fall back to 1.2R.
+        if original_rr <= 0 and original_tp > 0 and original_distance > 0:
+            original_reward = abs(original_tp - price)
+            original_rr = original_reward / original_distance
+        target_rr = max(original_rr, 1.0)
+        final_tp = price + target_rr * final_distance if direction == "long" else price - target_rr * final_distance
+
+        metadata["stop_loss"] = round(final_sl, 8)
+        metadata["take_profit"] = round(final_tp, 8)
+        metadata["rr_ratio"] = round(target_rr, 2)
+        entry_quality = metadata["entry_quality"]
+        entry_quality["stop_guard"] = {
+            "applied": final_distance > original_distance + 1e-12,
+            "strategy": strategy_type,
+            "original_sl": round(original_sl, 8),
+            "final_sl": round(final_sl, 8),
+            "final_tp": round(final_tp, 8),
+            "original_sl_pct": round(original_distance / price * 100, 3),
+            "final_sl_pct": round(final_distance / price * 100, 3),
+            "pct_floor": rule["pct_floor"],
+            "atr_floor": rule["atr_floor"],
+            "max_pct": rule["cap_pct"],
+            "atr14": round(atr14, 8),
+            "target_rr": round(target_rr, 2),
+        }
+        entry_quality["live_rr"] = round(target_rr, 3)
+        metadata["entry_quality"] = entry_quality
+        signal.metadata = metadata
+
+        if self._open_entry is not None:
+            self._open_entry["stop_loss"] = round(final_sl, 8)
+            self._open_entry["take_profit"] = round(final_tp, 8)
+            self._open_entry["stop_guard_applied"] = final_distance > original_distance + 1e-12
+
+        return self._attach_decision_trace(signal, replace_hold_reason=False)
+
+    async def analyze(
+        self,
+        candles: list,
+        current_price: float,
+        mtf_candles: dict = None,
+    ) -> Signal:
+        signal = await super().analyze(candles, current_price, mtf_candles)
+        return self._apply_stop_distance_guard(signal, candles)
