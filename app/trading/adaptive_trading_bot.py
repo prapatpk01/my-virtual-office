@@ -126,7 +126,24 @@ class TradingBot:
             cdc_flip = (p.direction == "LONG" and i15["cdc_bear"]) or (p.direction == "SHORT" and i15["cdc_bull"])
             if hit_sl or hit_tp or cdc_flip:
                 reason = "SL" if hit_sl else ("TP" if hit_tp else "CDC_FLIP")
-                payload = {"symbol": self.symbol, "direction": p.direction, "price": price, "size": p.size, "reason": reason}
+                pnl = (price - p.entry) * p.size if p.direction == "LONG" else (p.entry - price) * p.size
+                risk = abs(p.entry - p.sl) * p.size
+                r_multiple = pnl / risk if risk > 0 else 0.0
+                payload = {
+                    "symbol": self.symbol,
+                    "direction": p.direction,
+                    "price": price,
+                    "entry": p.entry,
+                    "sl": p.sl,
+                    "tp": p.tp,
+                    "size": p.size,
+                    "strategy": p.strategy,
+                    "opened_at": p.opened_at,
+                    "closed_at": time.time(),
+                    "reason": reason,
+                    "pnl": pnl,
+                    "r_multiple": r_multiple,
+                }
                 if self.execution_callback:
                     self.execution_callback("CLOSE_" + p.direction, payload)
                 self.position = None
