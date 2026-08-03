@@ -1,4 +1,4 @@
-"""Adaptive Bot v12 runner with Telegram alerts, /stats, and trade charts."""
+"""Adaptive Bot v12 runner with Telegram alerts, dashboard stats, and charts."""
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +20,7 @@ from trading.connectors.binance_conn import BinanceConnector
 from trading.adaptive_trading_bot import TradingBot
 from trading.indicator_engine import compute
 
-BUILD_ID = "adaptive-v12-stats-chart-2026-08-03"
+BUILD_ID = "adaptive-v12-stats-dashboard-v2-2026-08-04"
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -82,6 +82,18 @@ def candle_field(candle: Any, name: str, index: int) -> float:
     return float(value or 0.0)
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
 def format_trade(order_type: str, payload: Dict[str, Any], paper: bool) -> str:
     mode = "PAPER" if paper else "LIVE"
     direction = str(payload.get("direction", ""))
@@ -104,19 +116,89 @@ def format_trade(order_type: str, payload: Dict[str, Any], paper: bool) -> str:
     )
 
 
-def render_stats(trades: List[Dict[str, Any]], bots: Dict[str, TradingBot], paper: bool) -> str:
+def render_stats(
+    trades: List[Dict[str, Any]],
+    bots: Dict[str, TradingBot],
+    current_prices: Dict[str, float],
+    paper: bool,
+    margin_usdt: float,
+) -> str:
     closed = [t for t in trades if t.get("event") == "CLOSE"]
     wins = [t for t in closed if float(t.get("pnl", 0)) > 0]
     losses = [t for t in closed if float(t.get("pnl", 0)) < 0]
     net = sum(float(t.get("pnl", 0)) for t in closed)
-    wr = (100 * len(wins) / len(closed)) if closed else 0.0
+    wr = 100 * len(wins) / len(closed) if closed else 0.0
+
+    open_rows: List[Dict[str, Any]] = []
+    floating_total = 0.0
+    open_risk_total = 0.0
+    long_count = 0
+    short_count = 0
+    now = time.time()
+
+    for symbol, bot in bots.items():
+        position = bot.position
+        if position is None:
+            continue
+        current = float(current_prices.get(symbol, position.entry))
+        if position.direction == "LONG":
+            floating = (current - position.entry) * position.size
+            long_count += 1
+        else:
+            floating = (position.entry - current) * position.size
+            short_count += 1
+        risk_usd = abs(position.entry - position.sl) * position.size
+        current_r = floating / risk_usd if risk_usd > 0 else 0.0
+        floating_total += floating
+        open_risk_total += risk_usd
+        open_rows.append({
+            "symbol": symbol,
+            "direction": position.direction,
+            "entry": position.entry,
+            "current": current,
+            "sl": position.sl,
+            "tp": position.tp,
+            "size": position.size,
+            "strategy": position.strategy,
+            "held": format_duration(now - position.opened_at),
+            "pnl": floating,
+            "r": current_r,
+        })
+
     lines = [
         "📊 Adaptive Bot v12 Stats",
         "",
         f"Mode: {'PAPER' if paper else 'LIVE'}",
-        f"Open positions: {sum(1 for bot in bots.values() if bot.position_open)}",
         "",
+        f"OPEN POSITIONS ({len(open_rows)})",
         "――――――――――――――――",
+    ]
+
+    if open_rows:
+        for row in open_rows:
+            icon = "🟢" if row["direction"] == "LONG" else "🔴"
+            lines += [
+                f"{icon} {row['symbol'].split('/')[0]} {row['direction']}",
+                f"Entry : {row['entry']:,.6f}",
+                f"Now   : {row['current']:,.6f}",
+                f"PnL   : ${row['pnl']:+.2f} ({row['r']:+.2f}R)",
+                f"SL    : {row['sl']:,.6f}",
+                f"TP    : {row['tp']:,.6f}",
+                f"Strategy: {row['strategy']}",
+                f"Held  : {row['held']}",
+                "",
+            ]
+    else:
+        lines += ["No open positions", ""]
+
+    lines += [
+        "EXPOSURE",
+        "――――――――――――――――",
+        f"Long / Short : {long_count} / {short_count}",
+        f"Margin Used  : ${len(open_rows) * margin_usdt:.2f}",
+        f"Floating PnL : ${floating_total:+.2f}",
+        f"Open Risk    : ${open_risk_total:.2f}",
+        "",
         "OVERALL",
         "――――――――――――――――",
         f"Trades   : {len(closed)}  ({len(wins)}W / {len(losses)}L)",
@@ -126,20 +208,24 @@ def render_stats(trades: List[Dict[str, Any]], bots: Dict[str, TradingBot], pape
         f"CDC exit : {sum(t.get('reason') == 'CDC_FLIP' for t in closed)}/{len(closed)}",
         f"Net PnL  : ${net:+.2f}",
     ]
+
     if closed:
-        lines += ["", "――――――――――――――――", "BY SYMBOL", "――――――――――――――――"]
+        lines += ["", "BY SYMBOL", "――――――――――――――――"]
         for symbol in sorted({str(t.get("symbol", "")) for t in closed}):
             rows = [t for t in closed if t.get("symbol") == symbol]
             row_wins = sum(float(t.get("pnl", 0)) > 0 for t in rows)
             row_net = sum(float(t.get("pnl", 0)) for t in rows)
-            lines.append(f"{symbol.split('/')[0]:<6} {len(rows):>3} trades {100*row_wins/len(rows):>3.0f}%WR ${row_net:+.2f}")
-        lines += ["", "――――――――――――――――", "LAST 5 TRADES", "――――――――――――――――"]
+            lines.append(
+                f"{symbol.split('/')[0]:<6} {len(rows):>3} trades "
+                f"{100 * row_wins / len(rows):>3.0f}%WR ${row_net:+.2f}"
+            )
+        lines += ["", "LAST 5 TRADES", "――――――――――――――――"]
         for i, trade in enumerate(reversed(closed[-5:]), 1):
             pnl = float(trade.get("pnl", 0))
             icon = "✅" if pnl > 0 else ("❌" if pnl < 0 else "➖")
             lines.append(
-                f"{i}. {icon} {str(trade.get('symbol','')).split('/')[0]} "
-                f"{trade.get('direction','')} ${pnl:+.2f} — {trade.get('reason','')}"
+                f"{i}. {icon} {str(trade.get('symbol', '')).split('/')[0]} "
+                f"{trade.get('direction', '')} ${pnl:+.2f} — {trade.get('reason', '')}"
             )
     return "\n".join(lines)
 
@@ -156,7 +242,10 @@ def create_chart(candles: List[Any], payload: Dict[str, Any], path: str) -> bool
     rows = list(candles[-80:])
     if len(rows) < 10:
         return False
-    fig, (ax, volume_ax) = plt.subplots(2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [4, 1]})
+    fig, (ax, volume_ax) = plt.subplots(
+        2, 1, figsize=(10, 7), sharex=True,
+        gridspec_kw={"height_ratios": [4, 1]},
+    )
     for i, candle in enumerate(rows):
         o = candle_field(candle, "open", 1)
         h = candle_field(candle, "high", 2)
@@ -165,7 +254,11 @@ def create_chart(candles: List[Any], payload: Dict[str, Any], path: str) -> bool
         v = candle_field(candle, "volume", 5)
         color = "#26a69a" if c >= o else "#ef5350"
         ax.vlines(i, l, h, color=color, linewidth=1)
-        ax.add_patch(Rectangle((i - 0.3, min(o, c)), 0.6, max(abs(c-o), max(c,1)*1e-6), facecolor=color, edgecolor=color))
+        ax.add_patch(Rectangle(
+            (i - 0.3, min(o, c)), 0.6,
+            max(abs(c - o), max(c, 1) * 1e-6),
+            facecolor=color, edgecolor=color,
+        ))
         volume_ax.bar(i, v, width=0.7, color=color)
     for key, label in (("entry", "Entry"), ("sl", "SL"), ("tp", "TP")):
         value = float(payload.get(key, 0))
@@ -184,7 +277,9 @@ def create_chart(candles: List[Any], payload: Dict[str, Any], path: str) -> bool
 
 async def main() -> None:
     paper = env_bool("PAPER_TRADING", True) or os.getenv("TRADING_MODE", "").lower() == "paper"
-    symbols = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT").split(",") if s.strip()]
+    symbols = [s.strip() for s in os.getenv(
+        "SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT"
+    ).split(",") if s.strip()]
     leverage = int(os.getenv("LEVERAGE", "20"))
     margin_usdt = float(os.getenv("ADAPTIVE_MARGIN_USDT", "20"))
     interval_seconds = int(os.getenv("INTERVAL_SECONDS", "60"))
@@ -199,11 +294,14 @@ async def main() -> None:
     ledger_file = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger.json"))
     trades: List[Dict[str, Any]] = load_json(ledger_file, [])
     latest_candles: Dict[str, List[Any]] = {}
+    current_prices: Dict[str, float] = {}
 
     def telegram_api(method: str, fields: Dict[str, Any], photo_path: str = "") -> Dict[str, Any]:
         url = f"https://api.telegram.org/bot{token}/{method}"
         if not photo_path:
-            request = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), method="POST")
+            request = urllib.request.Request(
+                url, data=urllib.parse.urlencode(fields).encode(), method="POST"
+            )
         else:
             boundary = "----Adaptive" + uuid.uuid4().hex
             parts: List[bytes] = []
@@ -211,23 +309,18 @@ async def main() -> None:
                 parts += [
                     f"--{boundary}\r\n".encode(),
                     f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(),
-                    str(value).encode(),
-                    b"\r\n",
+                    str(value).encode(), b"\r\n",
                 ]
             with open(photo_path, "rb") as file:
                 image = file.read()
             parts += [
                 f"--{boundary}\r\n".encode(),
                 b'Content-Disposition: form-data; name="photo"; filename="chart.png"\r\n',
-                b"Content-Type: image/png\r\n\r\n",
-                image,
-                b"\r\n",
+                b"Content-Type: image/png\r\n\r\n", image, b"\r\n",
                 f"--{boundary}--\r\n".encode(),
             ]
             request = urllib.request.Request(
-                url,
-                data=b"".join(parts),
-                method="POST",
+                url, data=b"".join(parts), method="POST",
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             )
         with urllib.request.urlopen(request, timeout=20) as response:
@@ -241,13 +334,19 @@ async def main() -> None:
             item = await telegram_queue.get()
             try:
                 if item["kind"] == "photo":
-                    await asyncio.to_thread(telegram_api, "sendPhoto", {"chat_id": chat_id, "caption": item["caption"]}, item["path"])
+                    await asyncio.to_thread(
+                        telegram_api, "sendPhoto",
+                        {"chat_id": chat_id, "caption": item["caption"]}, item["path"],
+                    )
                     try:
                         os.remove(item["path"])
                     except OSError:
                         pass
                 else:
-                    await asyncio.to_thread(telegram_api, "sendMessage", {"chat_id": chat_id, "text": item["text"], "disable_web_page_preview": "true"})
+                    await asyncio.to_thread(
+                        telegram_api, "sendMessage",
+                        {"chat_id": chat_id, "text": item["text"], "disable_web_page_preview": "true"},
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -281,7 +380,10 @@ async def main() -> None:
             if order_type.startswith("OPEN_"):
                 chart_path = f"/tmp/adaptive_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
                 if create_chart(latest_candles.get(str(payload.get("symbol")), []), payload, chart_path):
-                    telegram_queue.put_nowait({"kind": "photo", "path": chart_path, "caption": f"{payload.get('symbol')} {payload.get('direction')} | {payload.get('strategy')}"})
+                    telegram_queue.put_nowait({
+                        "kind": "photo", "path": chart_path,
+                        "caption": f"{payload.get('symbol')} {payload.get('direction')} | {payload.get('strategy')}",
+                    })
         if paper:
             logger.info("[PAPER] %s %s", order_type, payload)
             return {"paper": True}
@@ -295,7 +397,9 @@ async def main() -> None:
             margin_usdt=margin_usdt,
             leverage=leverage,
             paper=paper,
-            state_file=os.path.join(state_dir, symbol.replace("/", "_").replace(":", "_") + ".json"),
+            state_file=os.path.join(
+                state_dir, symbol.replace("/", "_").replace(":", "_") + ".json"
+            ),
             execution_callback=executor,
         )
         for symbol in symbols
@@ -306,7 +410,9 @@ async def main() -> None:
         if not telegram_enabled:
             return
         try:
-            result = await asyncio.to_thread(telegram_api, "getUpdates", {"timeout": 0, "offset": update_offset})
+            result = await asyncio.to_thread(
+                telegram_api, "getUpdates", {"timeout": 0, "offset": update_offset}
+            )
             for update in result.get("result", []):
                 update_offset = max(update_offset, int(update.get("update_id", 0)) + 1)
                 message = update.get("message") or {}
@@ -314,7 +420,10 @@ async def main() -> None:
                     continue
                 text = str(message.get("text", "")).strip().lower()
                 if text.startswith("/stats") or text.startswith("/restats"):
-                    telegram_queue.put_nowait({"kind": "text", "text": render_stats(trades, bots, paper)})
+                    telegram_queue.put_nowait({
+                        "kind": "text",
+                        "text": render_stats(trades, bots, current_prices, paper, margin_usdt),
+                    })
         except Exception as error:
             logger.warning("Telegram polling failed: %s", error)
 
@@ -332,11 +441,18 @@ async def main() -> None:
 
     logger.info("=" * 64)
     logger.info("Adaptive Bot v12 | build=%s | mode=%s", BUILD_ID, "PAPER" if paper else "LIVE")
-    logger.info("telegram=%s /stats=ENABLED chart=ENABLED", "CONNECTED" if telegram_enabled else "DISABLED")
+    logger.info("telegram=%s /stats=V2 chart=ENABLED", "CONNECTED" if telegram_enabled else "DISABLED")
     logger.info("=" * 64)
 
     if telegram_enabled:
-        telegram_queue.put_nowait({"kind": "text", "text": f"🤖 Adaptive Bot v12 started\nMode: {'PAPER' if paper else 'LIVE'}\nMargin: ${margin_usdt:.2f}\nLeverage: {leverage}x\nSymbols: {', '.join(symbols)}\nCommand: /stats"})
+        telegram_queue.put_nowait({
+            "kind": "text",
+            "text": (
+                f"🤖 Adaptive Bot v12 started\nMode: {'PAPER' if paper else 'LIVE'}\n"
+                f"Margin: ${margin_usdt:.2f}\nLeverage: {leverage}x\n"
+                f"Symbols: {', '.join(symbols)}\nCommand: /stats"
+            ),
+        })
 
     try:
         while not stop_event.is_set():
@@ -361,11 +477,12 @@ async def main() -> None:
                     last_timestamp[symbol] = timestamp
 
                     i15, i1, i4 = compute(candles_15m), compute(candles_1h), compute(candles_4h)
+                    current_prices[symbol] = float(i15.get("close", 0))
                     bot = bots[symbol]
                     if not entries_allowed and not bot.position_open:
                         logger.info("[%s] SLEEP_MODE — no new position", symbol)
                         continue
-                    event = bot.on_bar(i15, i1, i4, float(i15.get("close", 0)))
+                    event = bot.on_bar(i15, i1, i4, current_prices[symbol])
                     if event:
                         trades.append({**event, "timestamp": time.time()})
                         save_json(ledger_file, trades[-1000:])
@@ -378,7 +495,10 @@ async def main() -> None:
                 except Exception as error:
                     logger.exception("[%s] tick failed", symbol)
                     if telegram_enabled:
-                        telegram_queue.put_nowait({"kind": "text", "text": f"❌ Adaptive v12 error\nSymbol: {symbol}\n{type(error).__name__}: {error}"})
+                        telegram_queue.put_nowait({
+                            "kind": "text",
+                            "text": f"❌ Adaptive v12 error\nSymbol: {symbol}\n{type(error).__name__}: {error}",
+                        })
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
             except asyncio.TimeoutError:
