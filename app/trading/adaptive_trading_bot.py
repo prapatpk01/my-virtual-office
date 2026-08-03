@@ -7,6 +7,14 @@ import os
 import time
 
 
+# Entry filters are intentionally configurable so Paper results can be tuned
+# without rewriting the strategy again.
+EXTENSION_MAX_ATR = float(os.getenv("V12_EXTENSION_MAX_ATR", "1.00"))
+BODY_MAX_ATR = float(os.getenv("V12_BODY_MAX_ATR", "1.20"))
+TREND_ADX_MIN = float(os.getenv("V12_TREND_ADX_MIN", "12"))
+BREAKOUT_VOLUME_MIN = float(os.getenv("V12_BREAKOUT_VOLUME_MIN", "1.05"))
+
+
 @dataclass
 class Position:
     direction: str
@@ -89,30 +97,57 @@ class TradingBot:
 
     def _signal(self, i15: Dict, i1: Dict, i4: Dict) -> Optional[Dict]:
         macro, bias, close = self._macro(i4), self._bias(i1), i15["close"]
-        if i15["extension_atr"] > 0.75 or i15["body_atr"] > 0.85:
-            self.last_signal = f"WAIT late ext={i15['extension_atr']:.2f} body={i15['body_atr']:.2f}"
-            return None
-        long_ok, short_ok = macro == bias == "BULL", macro == bias == "BEAR"
 
-        if long_ok and i15["cdc_bull"] and i15["adx"] >= 14 and i15["rsi"] <= 70:
-            if (i15["prev_close"] <= i15["bb_mid"] < close or close > i15["prev_high"]) and close <= i15["bb_upper"]:
+        # Chase guard remains active, but is no longer so tight that normal
+        # continuation candles are rejected.
+        if i15["extension_atr"] > EXTENSION_MAX_ATR or i15["body_atr"] > BODY_MAX_ATR:
+            self.last_signal = (
+                f"WAIT late ext={i15['extension_atr']:.2f}/{EXTENSION_MAX_ATR:.2f} "
+                f"body={i15['body_atr']:.2f}/{BODY_MAX_ATR:.2f}"
+            )
+            return None
+
+        # 4H is now a hard anti-trend gate rather than requiring exact 4H/1H
+        # agreement. 1H controls direction; 4H only blocks the opposite side.
+        long_ok = bias == "BULL" and macro != "BEAR"
+        short_ok = bias == "BEAR" and macro != "BULL"
+        atr = max(float(i15["atr"]), close * 0.001)
+
+        # 1) Trend pullback / continuation.
+        if long_ok and i15["cdc_bull"] and i15["adx"] >= TREND_ADX_MIN and i15["rsi"] <= 72:
+            trigger = i15["prev_close"] <= i15["bb_mid"] < close or close > i15["prev_high"]
+            location_ok = close <= i15["bb_upper"] + 0.10 * atr
+            if trigger and location_ok:
                 return self._build("LONG", "trend_pullback", close, i15)
-        if short_ok and i15["cdc_bear"] and i15["adx"] >= 14 and i15["rsi"] >= 30:
-            if (i15["prev_close"] >= i15["bb_mid"] > close or close < i15["prev_low"]) and close >= i15["bb_lower"]:
+
+        if short_ok and i15["cdc_bear"] and i15["adx"] >= TREND_ADX_MIN and i15["rsi"] >= 28:
+            trigger = i15["prev_close"] >= i15["bb_mid"] > close or close < i15["prev_low"]
+            location_ok = close >= i15["bb_lower"] - 0.10 * atr
+            if trigger and location_ok:
                 return self._build("SHORT", "trend_pullback", close, i15)
 
+        # 2) Early CDC transition. Opposite 4H direction remains prohibited.
         if macro != "BEAR" and i1["cdc_bull"] and i15["cdc_cross_up"] and close > i15["bb_mid"]:
             return self._build("LONG", "cdc_transition", close, i15)
         if macro != "BULL" and i1["cdc_bear"] and i15["cdc_cross_down"] and close < i15["bb_mid"]:
             return self._build("SHORT", "cdc_transition", close, i15)
 
-        vr = i15["volume"] / max(i15["vol_avg"], 1e-12)
-        if long_ok and i15["cdc_bull"] and i15["prev_close"] <= i15["bb_upper"] < close and vr >= 1.15:
-            return self._build("LONG", "bb_breakout", close, i15)
-        if short_ok and i15["cdc_bear"] and i15["prev_close"] >= i15["bb_lower"] > close and vr >= 1.15:
-            return self._build("SHORT", "bb_breakout", close, i15)
+        # 3) Bollinger breakout. Require supportive 1H direction and only a
+        # modest volume expansion; the global chase guard still prevents
+        # entering oversized breakout candles.
+        volume_ratio = i15["volume"] / max(i15["vol_avg"], 1e-12)
+        if long_ok and i15["cdc_bull"] and i15["prev_close"] <= i15["bb_upper"] < close:
+            if volume_ratio >= BREAKOUT_VOLUME_MIN:
+                return self._build("LONG", "bb_breakout", close, i15)
+        if short_ok and i15["cdc_bear"] and i15["prev_close"] >= i15["bb_lower"] > close:
+            if volume_ratio >= BREAKOUT_VOLUME_MIN:
+                return self._build("SHORT", "bb_breakout", close, i15)
 
-        self.last_signal = f"WAIT macro={macro} bias={bias} cdc={'BULL' if i15['cdc_bull'] else 'BEAR'}"
+        self.last_signal = (
+            f"WAIT macro={macro} bias={bias} "
+            f"cdc={'BULL' if i15['cdc_bull'] else 'BEAR'} "
+            f"adx={i15['adx']:.1f} vr={volume_ratio:.2f}"
+        )
         return None
 
     def on_bar(self, i15: Dict, i1: Dict, i4: Dict, price: float) -> Optional[Dict]:
