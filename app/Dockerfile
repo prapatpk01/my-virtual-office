@@ -2,8 +2,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies
-RUN pip install --no-cache-dir websockets
+# Install dependencies used by the service and Adaptive v12 Telegram charts.
+RUN pip install --no-cache-dir websockets matplotlib
 
 # Copy application files
 COPY . .
