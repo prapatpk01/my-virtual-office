@@ -15,7 +15,7 @@ from typing import Optional
 
 @dataclass
 class PositionUpdate:
-    action: str = "hold"          # "modify_sl" | "close" | "hold"
+    action: str = "hold"          # "partial_tp" | "close" | "hold"
     new_sl: Optional[float] = None
     close_pct: float = 0.0
     reason: str = ""
@@ -31,7 +31,6 @@ class PositionManager:
         partial_tp_2_rr: float = 1.2,
         close_exit_score: float = 70.0,
         tp1_lock_rr: float = 0.3,
-        # Legacy parameters retained for call-site compatibility.
         be_atr_mult: float = 1.0,
         trail_atr_mult: float = 2.0,
     ):
@@ -61,9 +60,7 @@ class PositionManager:
             "initial_risk": abs(entry_price - stop_loss),
             "tp1_rr": tp1_rr if tp1_rr is not None else self.tp1_rr,
             "tp2_rr": tp2_rr if tp2_rr is not None else self.tp2_rr,
-            "tp1_lock_rr": (
-                tp1_lock_rr if tp1_lock_rr is not None else self.tp1_lock_rr
-            ),
+            "tp1_lock_rr": tp1_lock_rr if tp1_lock_rr is not None else self.tp1_lock_rr,
             "tp1_done": False,
             "tp2_done": False,
             "opened_at": time.time(),
@@ -93,8 +90,7 @@ class PositionManager:
         if exit_score >= self.close_exit_thr:
             pos["tp2_done"] = True
             return PositionUpdate(
-                action="close",
-                close_pct=1.0,
+                action="close", close_pct=1.0,
                 reason=f"Exit AI {exit_score:.0f} ≥ {self.close_exit_thr:.0f}",
                 exit_score=exit_score,
             )
@@ -102,24 +98,24 @@ class PositionManager:
         if not pos["tp2_done"] and current_rr >= tp2_rr:
             pos["tp2_done"] = True
             return PositionUpdate(
-                action="close",
-                close_pct=1.0,
+                action="close", close_pct=1.0,
                 reason=f"Final TP @ {current_rr:.2f}R (target {tp2_rr:.2f}R)",
                 exit_score=exit_score,
             )
 
         if not pos["tp1_done"] and current_rr >= tp1_rr:
             pos["tp1_done"] = True
-            if direction == "long":
-                locked_sl = entry + lock_rr * init_risk
-            else:
-                locked_sl = entry - lock_rr * init_risk
+            locked_sl = (
+                entry + lock_rr * init_risk
+                if direction == "long"
+                else entry - lock_rr * init_risk
+            )
             locked_sl = round(locked_sl, 8)
             pos["sl"] = locked_sl
+            # Keep the existing action name so the production bot follows its
+            # established SL-modification path. close_pct=0 prevents any sale.
             return PositionUpdate(
-                action="modify_sl",
-                close_pct=0.0,
-                new_sl=locked_sl,
+                action="partial_tp", close_pct=0.0, new_sl=locked_sl,
                 reason=(
                     f"T1 @ {current_rr:.2f}R (≥{tp1_rr:.2f}R) → "
                     f"no partial close, SL locks +{lock_rr:.2f}R"
