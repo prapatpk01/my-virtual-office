@@ -1,10 +1,10 @@
-"""Adaptive v13.2 indicators: trend, structure, EMA and price-action triggers."""
+"""Adaptive v13.2 indicators: trend, structure, EMA, MACD and price-action triggers."""
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 import math
 import numpy as np
 
-ENGINE_SCHEMA = "adaptive-v13.2-price-action-v1"
+ENGINE_SCHEMA = "adaptive-v13.2-price-action-macd-v1"
 
 def _v(c: Any, name: str, idx: int) -> float:
     value = getattr(c, name, None)
@@ -66,6 +66,10 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
     if len(candles) < 80: return {}
     o,h,l,c,vol = _s(candles,"open",1),_s(candles,"high",2),_s(candles,"low",3),_s(candles,"close",4),_s(candles,"volume",5)
     e8,e13,e20,e50 = (ema(c,n) for n in (8,13,20,50)); a=max(atr(candles),c[-1]*0.0005)
+    macd_fast, macd_slow = ema(c,12), ema(c,26)
+    macd_series = [fast-slow for fast,slow in zip(macd_fast,macd_slow)]
+    macd_signal_series = ema(macd_series,9)
+    macd_value = macd_series[-1]; macd_signal = macd_signal_series[-1]; macd_hist = macd_value-macd_signal
     ph,pl=_pivots(h[-60:],True),_pivots(l[-60:],False); hs=[v for _,v in ph[-2:]]; ls=[v for _,v in pl[-2:]]
     last_high=hs[-1] if hs else max(h[-12:-1]); prev_high=hs[-2] if len(hs)>1 else max(h[-24:-12])
     last_low=ls[-1] if ls else min(l[-12:-1]); prev_low=ls[-2] if len(ls)>1 else min(l[-24:-12])
@@ -92,7 +96,9 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
     return {
         "schema":ENGINE_SCHEMA,"open":o[-1],"high":h[-1],"low":l[-1],"close":c[-1],"prev_open":o[-2],"prev_high":h[-2],"prev_low":l[-2],"prev_close":c[-2],
         "ema8":e8[-1],"ema13":e13[-1],"ema20":e20[-1],"ema50":e50[-1],"ema8_series":e8[-80:],"ema13_series":e13[-80:],"ema20_series":e20[-80:],
-        "ema20_slope_atr":(e20[-1]-e20[-4])/a,"cross_up":up_flags[-1],"cross_down":down_flags[-1],"cross_up_age":_age(up_flags),"cross_down_age":_age(down_flags),
+        "ema20_slope_atr":(e20[-1]-e20[-4])/a,"macd":macd_value,"macd_signal":macd_signal,"macd_hist":macd_hist,
+        "macd_bull":macd_value>macd_signal and macd_hist>0,"macd_bear":macd_value<macd_signal and macd_hist<0,
+        "cross_up":up_flags[-1],"cross_down":down_flags[-1],"cross_up_age":_age(up_flags),"cross_down_age":_age(down_flags),
         "atr":a,"adx":adx(candles),"chop":choppiness(candles),"body_atr":body/a,"extension_atr":abs(c[-1]-e20[-1])/a,"volume":vol[-1],"vol_avg":float(np.mean(vol[-20:])),
         "last_swing_high":last_high,"previous_swing_high":prev_high,"last_swing_low":last_low,"previous_swing_low":prev_low,"higher_high":hh,"higher_low":hl,"lower_high":lh,"lower_low":ll,"structure":structure,
         "long_pullback_age":_age(lp),"short_pullback_age":_age(sp),"long_trigger":long_trigger,"short_trigger":short_trigger,"long_trigger_name":long_name,"short_trigger_name":short_name,
