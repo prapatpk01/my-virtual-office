@@ -1,4 +1,10 @@
-"""HMA Expert MTF V5.1 — smoother weighted Sentinel runtime."""
+"""HMA Expert MTF V5.1 — smoother weighted Sentinel runtime.
+
+Startup is intentionally implemented here instead of chaining every inherited
+``start()`` method.  The strategy classes still inherit the proven execution,
+recovery and position-management code, but Telegram receives one authoritative
+V5.1 startup message only.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -47,18 +53,56 @@ class Bot(v14.Bot):
             self._view[symbol] = f"V5.1 view error: {str(exc)[:140]}"
 
     async def start(self):
-        await super().start()
+        """Initialize production services once and emit one V5.1 startup alert."""
+        problems = self.cfg.validate_live()
+        if problems:
+            raise RuntimeError("Cannot start: " + "; ".join(problems))
+
+        if not self.cfg.paper:
+            if not await self.client.ensure_hedge_mode():
+                raise RuntimeError("Could not confirm OKX hedge mode.")
+
+        balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "HMA V5.1 active: weights 1H=40 location=30 execution=20 macro=10; "
-            "graduated S/R scores S1/R1=65 corridor=75 S2/R2=90"
+            "=== HMA V5.1 SMOOTH SENTINEL [%s] symbols=%s margin=$%.2f "
+            "leverage=x%d max_pos=%d balance=%.2f ===",
+            "PAPER" if self.cfg.paper else "LIVE",
+            self.cfg.symbols,
+            self.cfg.margin_per_position_usd,
+            self.cfg.leverage,
+            self.cfg.max_positions,
+            balance,
         )
-        await self.tg.send_text(
-            "⚡ *HMA V5.1 Smooth Sentinel — ACTIVE*\n"
-            "Trade Score: `1H 40% · Location 30% · Execution 20% · 4H 10%`\n"
-            "Graduated Location: `S1/R1=65 · corridor=75 · S2/R2=90`\n"
-            "The bot still requires a valid S/R setup and a recent closed-5M trigger.\n"
-            f"Normal entry: `≥{self.strat.v5_entry_score:.0f}`\n"
-            f"Conditional entry: `≥{self.strat.v5_conditional_score:.0f}` with Location `≥{self.strat.v5_conditional_location:.0f}` at corridor, S2/R2 or sweep."
+
+        # Restore/synchronise any live OKX position before scans begin.
+        await self._reconcile_startup()
+        self._running = True
+
+        if self.tg.enabled:
+            asyncio.create_task(self._command_loop())
+
+            mode = "PAPER" if self.cfg.paper else "LIVE"
+            await self.tg.send_text(
+                f"⚡ *HMA V5.1 Smooth Sentinel — {mode}*\n"
+                f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
+                f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
+                f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
+                "Pipeline: `1H Direction + Quality → 15M Sentinel S/R → 5M Trigger`\n"
+                "4H: `soft macro bias only` — never a hard entry gate\n"
+                "Trade Score: `1H 40% · Location 30% · Execution 20% · 4H 10%`\n"
+                "Location: `S1/R1=65 · corridor=75 · S2/R2=90`\n"
+                f"Normal entry: `≥{self.strat.v5_entry_score:.0f}`\n"
+                f"Conditional: `≥{self.strat.v5_conditional_score:.0f}` with Location "
+                f"`≥{self.strat.v5_conditional_location:.0f}` at corridor, S2/R2 or sweep\n"
+                "Risk: `15M structure + ATR buffer` | Stage 1 `+0.7%→lock +0.4%` "
+                "| Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
+                "Schedule: `FX 24/5 new entries` | Existing positions managed `24/7`\n"
+                "Recovery: `OKX-native SL/TP synchronised after restart`"
+            )
+
+        _LOG.info(
+            "HMA V5.1 startup complete: one notification only; "
+            "weights 1H=40 location=30 execution=20 macro=10"
         )
 
 
