@@ -5,7 +5,7 @@ from datetime import datetime,timezone
 from typing import Any,Dict,List
 import ccxt
 from trading.connectors.binance_conn import BinanceConnector
-from trading.adaptive_trading_bot import TradingBot
+from trading.adaptive_trading_bot import TradingBot,TP_R
 from trading.indicator_engine import compute,ema
 
 BUILD_ID="adaptive-v13.2-price-action-2026-08-04"
@@ -53,8 +53,8 @@ def trade_text(order_type,p,paper):
     if order_type.startswith("OPEN_"):
         return (f"{'🟢' if direction=='LONG' else '🔴'} [{mode}] OPEN {direction} {symbol}\n"
                 f"Strategy: {p.get('strategy','unknown')}\nTrigger: {p.get('trigger','unknown')}\n"
-                f"Entry: {float(p.get('entry',0)):,.6f}\nSL: {float(p.get('sl',0)):,.6f}\nTP: {float(p.get('tp',0)):,.6f} (2.00R)\n"
-                f"Room: {float(p.get('room_r',0)):.2f}R\nSize: {float(p.get('size',0)):.6f}")
+                f"Entry: {float(p.get('entry',0)):,.6f}\nSL: {float(p.get('sl',0)):,.6f} ({float(p.get('sl_pct',0)):.2f}%)\nTP: {float(p.get('tp',0)):,.6f} ({TP_R:.2f}R)\n"
+                f"Room: {float(p.get('room_r',0)):.2f}R\nSize: {float(p.get('size',0)):.6f}  Risk: ${float(p.get('risk_usdt',0)):.2f}")
     pnl=float(p.get("pnl",0)); return (f"{'✅' if pnl>=0 else '❌'} [{mode}] CLOSE {direction} {symbol}\nPrice: {float(p.get('price',0)):,.6f}\nReason: {p.get('reason','unknown')}\nPnL: ${pnl:+.2f} ({float(p.get('r_multiple',0)):+.2f}R)")
 def stats_text(trades,bots,prices,paper,margin):
     closed=[t for t in trades if t.get("event")=="CLOSE"]; wins=[t for t in closed if float(t.get("pnl",0))>0]; net=sum(float(t.get("pnl",0)) for t in closed)
@@ -87,7 +87,7 @@ def chart(candles,payload,path):
     for i,(o,h,l,c,v) in enumerate(zip(opens,highs,lows,closes,volumes)):
         color="#26a69a" if c>=o else "#ef5350"; ax.vlines(i,l,h,color=color,linewidth=1); ax.add_patch(Rectangle((i-.3,min(o,c)),.6,max(abs(c-o),max(c,1)*1e-6),facecolor=color,edgecolor=color)); vax.bar(i,v,width=.7,color=color)
     ax.plot(e8,label="EMA8",linewidth=1.0); ax.plot(e13,label="EMA13",linewidth=1.0); ax.plot(e20,label="EMA20",linewidth=1.2)
-    for key,label in (("entry","ENTRY"),("sl","SL"),("tp","TP 2R")):
+    for key,label in (("entry","ENTRY"),("sl","SL"),("tp",f"TP {TP_R:g}R")):
         value=float(payload.get(key,0)); ax.axhline(value,linestyle="--",linewidth=1.3,label=f"{label} {value:,.4f}")
     entry=float(payload.get("entry",0)); ax.scatter(len(rows)-1,entry,marker="^" if payload.get("direction")=="LONG" else "v",s=100,zorder=6)
     swing=float(payload.get("structure_level",payload.get("sl",0))); ax.scatter(len(rows)-3,swing,marker="o",s=45,zorder=5,label="Structure")
@@ -168,7 +168,7 @@ async def main():
     task=asyncio.create_task(worker()) if tg else None; last={}; disabled=set(); reconciled={}
     RECONCILE_SECS=int(os.getenv("V132_RECONCILE_SECONDS","300"))
     logger.info("Adaptive Bot v13.2 | build=%s | mode=%s | telegram=%s chart=MANDATORY",BUILD_ID,"PAPER" if paper else "LIVE","CONNECTED" if tg else "DISABLED")
-    if tg:queue.put_nowait({"kind":"text","text":f"🤖 Adaptive Bot v13.2 started\nMode: {'PAPER' if paper else 'LIVE'}\nLogic: 4H Trend → 1H Quality → 15M Location + Price Action\nTriggers: EMA8/13, Engulfing, Hammer, Inside Break, Continuation\nSL: Swing+ATR | TP: 2R | BE: 1R\nCommand: /stats"})
+    if tg:queue.put_nowait({"kind":"text","text":f"🤖 Adaptive Bot v13.2 started\nMode: {'PAPER' if paper else 'LIVE'}\nLogic: 4H Trend → 1H Quality → 15M Location + Price Action\nTriggers: EMA8/13, Engulfing, Hammer, Inside Break, Continuation\nSL: Swing+ATR (min 1.2%) | TP: {TP_R:g}R | BE: 1R | Risk: ${risk_usdt:.0f}/trade\nCommand: /stats"})
     try:
         while not stop.is_set():
             await commands(); entries=fx_open(datetime.now(timezone.utc))

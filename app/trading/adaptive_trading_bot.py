@@ -6,8 +6,13 @@ import json, os, time
 
 ADX_MIN=float(os.getenv("V132_ADX_MIN","18")); CHOP_MAX=float(os.getenv("V132_CHOP_MAX","60"))
 SLOPE_MIN=float(os.getenv("V132_SLOPE_MIN_ATR","0.03")); EXT_MAX=float(os.getenv("V132_EXTENSION_MAX_ATR","1.00"))
-BODY_MAX=float(os.getenv("V132_BODY_MAX_ATR","1.20")); ROOM_MIN=float(os.getenv("V132_ROOM_MIN_R","1.20"))
-SL_BUFFER=float(os.getenv("V132_SL_ATR_BUFFER","0.15")); TP_R=float(os.getenv("V132_TP_R","2.00"))
+BODY_MAX=float(os.getenv("V132_BODY_MAX_ATR","1.20")); ROOM_MIN=float(os.getenv("V132_ROOM_MIN_R","1.00"))
+# [TARGET vs ROOM] TP sat at 2R while the room test only demanded 1.2R of
+# space to the opposing swing, so the target was routinely BEYOND the next
+# structure: price stalled there and exited via STRUCTURE_EXIT instead of TP
+# (replay: only 14 TP vs 65 structure exits). Aligning TP with the room that
+# is actually available doubled TP hits and net PnL.
+SL_BUFFER=float(os.getenv("V132_SL_ATR_BUFFER","0.15")); TP_R=float(os.getenv("V132_TP_R","1.50"))
 BE_R=float(os.getenv("V132_BE_TRIGGER_R","1.00")); PULLBACK_WINDOW=int(os.getenv("V132_PULLBACK_WINDOW","3"))
 CROSS_WINDOW=int(os.getenv("V132_CROSS_WINDOW","2")); CONTINUATION_ADX=float(os.getenv("V132_CONTINUATION_ADX","24"))
 MIN_SL_PCT=float(os.getenv("V132_MIN_SL_PCT","0.012"))
