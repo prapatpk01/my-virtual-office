@@ -1,10 +1,13 @@
 """HMA Simple Sentinel production runtime.
 
 Startup is standalone so Telegram receives one authoritative message only.
+Railway shutdown is graceful: stop the processing loop first, then close the
+OKX client once the active symbol operation has returned.
 """
 from __future__ import annotations
 
 import asyncio
+import time
 
 import main_v15 as v15
 import strategy_v12 as S
@@ -16,6 +19,72 @@ class Bot(v15.Bot):
     def __init__(self):
         super().__init__()
         self.strat = S.PrecisionTrendStructureV12(self.cfg.strategy_config())
+        self._shutdown_requested = False
+        self._client_closed = False
+
+    def request_shutdown(self) -> None:
+        """Ask the loops to finish without closing OKX underneath active work."""
+        if not self._shutdown_requested:
+            _LOG.info("Graceful shutdown requested; finishing active symbol work")
+        self._shutdown_requested = True
+        self._running = False
+
+    async def stop(self):
+        """Close OKX exactly once, after run_forever has stopped using it."""
+        self.request_shutdown()
+        if self._client_closed:
+            return
+        self._client_closed = True
+        try:
+            await self.client.close()
+        except Exception as exc:
+            text = str(exc).lower()
+            if "closed by the user" not in text and "already closed" not in text:
+                _LOG.warning("OKX close during shutdown failed: %s", exc)
+        _LOG.info("HMA Simple Sentinel shutdown complete")
+
+    async def run_forever(self):
+        """Process symbols without reporting expected redeploy shutdown as errors."""
+        while self._running:
+            for symbol in self.cfg.symbols:
+                if not self._running:
+                    break
+                try:
+                    await self._process(symbol)
+                except asyncio.CancelledError:
+                    self.request_shutdown()
+                    raise
+                except Exception as exc:
+                    if self._shutdown_requested or not self._running:
+                        _LOG.info(
+                            "[%s] active operation ended during graceful shutdown: %s",
+                            symbol,
+                            exc,
+                        )
+                        break
+
+                    _LOG.error("[%s] unhandled: %s", symbol, exc, exc_info=True)
+                    now = time.time()
+                    last = self._error_notified_at.get(symbol, 0.0)
+                    if now - last >= self.ERROR_NOTIFY_COOLDOWN_SEC:
+                        self._error_notified_at[symbol] = now
+                        try:
+                            await self.tg.send_text(
+                                f"❌ `{v15.v14.v13.v12.v11.v10.v9.v8.v7.v5.v4.v3.base._sym(symbol)}` "
+                                f"error: {str(exc)[:150]}\n"
+                                "Telegram repeats muted for 15 minutes; Railway log has traceback."
+                            )
+                        except Exception:
+                            pass
+
+            if not self._running:
+                break
+            self._maybe_status_log()
+            try:
+                await asyncio.sleep(self.cfg.poll_interval_sec)
+            except asyncio.CancelledError:
+                self.request_shutdown()
+                raise
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
@@ -89,10 +158,11 @@ async def _main():
                     v15.v14.v13.v12.v11.v10.v9.v8.v7.v5.v4.v3.base._signal,
                     sig_name,
                 ),
-                lambda: asyncio.ensure_future(bot.stop()),
+                bot.request_shutdown,
             )
         except (NotImplementedError, AttributeError):
             pass
+
     await bot.start()
     try:
         await bot.run_forever()
