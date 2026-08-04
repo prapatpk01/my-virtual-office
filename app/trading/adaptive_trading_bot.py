@@ -163,34 +163,40 @@ class TradingBot:
             checks.append(f"ema8/13={'PASS' if trigger_ok else 'WAIT'}")
         if room_r is not None:
             checks.append(f"room={room_r:.2f}R")
-        setup_line = " | ".join(checks) if checks else "not evaluated"
 
-        context_line = (
-            f"ADX={i1['adx']:.1f}/{ADX_MIN:.1f} {'PASS' if context and context['adx'] else 'FAIL'} | "
-            f"CHOP={i1['chop']:.1f}/{CHOP_MAX:.1f} {'PASS' if context and context['chop'] else 'FAIL'} | "
-            f"EMA={'PASS' if context and context['aligned'] else 'FAIL'} | "
-            f"Structure={i1['structure']} {'PASS' if context and context['structure'] else 'FAIL'}"
-            if context else
-            f"ADX={i1['adx']:.1f} | CHOP={i1['chop']:.1f} | Structure={i1['structure']}"
-        )
+        if checks:
+            setup_line = f"{direction} " + ",".join(checks)
+        else:
+            setup_line = f"SKIPPED({reason})"
+
+        if context:
+            context_line = (
+                f"adx={i1['adx']:.1f}/{ADX_MIN:.1f}:{'PASS' if context['adx'] else 'FAIL'},"
+                f"chop={i1['chop']:.1f}/{CHOP_MAX:.1f}:{'PASS' if context['chop'] else 'FAIL'},"
+                f"ema={'PASS' if context['aligned'] else 'FAIL'},"
+                f"structure={i1['structure']}:{'PASS' if context['structure'] else 'FAIL'}"
+            )
+        else:
+            context_line = (
+                f"adx={i1['adx']:.1f},chop={i1['chop']:.1f},"
+                f"structure={i1['structure']},status=SKIPPED"
+            )
 
         return (
-            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{self.symbol} | 15M DECISION\n"
-            f"4H  macro={macro} | EMA20/50={'PASS' if macro_align else 'FAIL'} | "
-            f"slope={i4['ema20_slope_atr']:+.2f}ATR (need ±{SLOPE_MIN_ATR:.2f}) | structure={i4['structure']}\n"
-            f"1H  {context_line}\n"
-            f"15M price={i15['close']:.6f} | ext={i15['extension_atr']:.2f}/{LOCATION_MAX_ATR:.2f}ATR | "
-            f"body={i15['body_atr']:.2f}/{BODY_MAX_ATR:.2f}ATR | structure={i15['structure']}\n"
-            f"SETUP {direction}: {setup_line}\n"
-            f"RESULT: {result} | reason={reason}\n"
-            f"COUNTERS scans={self.debug_counts['scans']} qualified={self.debug_counts['qualified']} "
-            f"entries={self.debug_counts['entries']} rejects="
-            f"4H:{self.debug_counts['4H']} 1H:{self.debug_counts['1H']} "
-            f"chase:{self.debug_counts['CHASE']} location:{self.debug_counts['LOCATION']} "
-            f"structure:{self.debug_counts['STRUCTURE']} cross:{self.debug_counts['CROSS']} "
-            f"room:{self.debug_counts['ROOM']}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            f"DECISION symbol={self.symbol} tf=15m"
+            f" | 4H[macro={macro},ema20/50={'PASS' if macro_align else 'FAIL'},"
+            f"slope={i4['ema20_slope_atr']:+.2f}/{SLOPE_MIN_ATR:.2f}ATR,structure={i4['structure']}]"
+            f" | 1H[{context_line}]"
+            f" | 15M[price={i15['close']:.6f},ext={i15['extension_atr']:.2f}/{LOCATION_MAX_ATR:.2f}ATR,"
+            f"body={i15['body_atr']:.2f}/{BODY_MAX_ATR:.2f}ATR,structure={i15['structure']}]"
+            f" | SETUP[{setup_line}]"
+            f" | RESULT[{result}:{reason}]"
+            f" | SYMBOL_COUNTERS[scans={self.debug_counts['scans']},qualified={self.debug_counts['qualified']},"
+            f"entries={self.debug_counts['entries']},reject4H={self.debug_counts['4H']},"
+            f"reject1H={self.debug_counts['1H']},large_bar={self.debug_counts['LARGE_BAR']},"
+            f"chase={self.debug_counts['CHASE']},location={self.debug_counts['LOCATION']},"
+            f"structure={self.debug_counts['STRUCTURE']},cross={self.debug_counts['CROSS']},"
+            f"room={self.debug_counts['ROOM']}]"
         )
 
     def _build(self, direction: str, entry: float, i15: Dict, i1: Dict, i4: Dict, macro: str) -> Optional[Dict]:
