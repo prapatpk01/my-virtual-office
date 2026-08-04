@@ -1,12 +1,17 @@
-"""Corrected WaveTrend calculation for the unified Trend Confirm strategy.
+"""Corrected WaveTrend and T1 management for unified Trend Confirm.
 
-The previous implementation fed an array containing leading NaN values into
-BaseStrategy.ema(). That helper seeds from the first period, so a NaN seed
-propagated through the complete deviation series. The division step then
-replaced unavailable values with zero, producing WT1=0 and WT2=0 indefinitely.
+Architecture remains one strategy family:
+- Layer 1: 4H trend direction.
+- Layer 2: 1H context with ADX/CHOP quality gate.
+- Layer 3: 15M EMA8/13 cross OR WaveTrend extreme cross, with price on the
+  correct side of EMA20.
 
-This class keeps all Trend Confirm gates, position management and diagnostics
-unchanged, and only replaces WaveTrend with a finite-value-aware EMA.
+WaveTrend is finite-value aware, so leading NaNs cannot poison WT1/WT2.
+Position management is shared by EMA and WT entries:
+- T1 at +0.6% from entry.
+- Close 40% at T1.
+- Move SL on the remaining 60% to +0.3% from entry.
+- Keep the remaining size toward the +1.3% final TP or EMA cross-back exit.
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from .trend_confirm_wt_strategy import TrendConfirmWTStrategy
 
 
 class TrendConfirmWTFixedStrategy(TrendConfirmWTStrategy):
-    """Trend Confirm with a real, NaN-safe 15M WaveTrend oscillator."""
+    """Trend Confirm with NaN-safe WT and a 40% T1 profit trim."""
 
     def __init__(
         self,
@@ -27,17 +32,56 @@ class TrendConfirmWTFixedStrategy(TrendConfirmWTStrategy):
         wt_overbought: float = 48.0,
         **kwargs,
     ):
-        # Long remains oversold <= -45. Short is now overbought >= +48.
+        # Long remains oversold <= -45. Short is overbought >= +48.
         super().__init__(
             symbol=symbol,
             params=params,
             wt_overbought=wt_overbought,
             **kwargs,
         )
+        self.t1_trigger_pct = 0.006
+        self.t1_trim_pct = 0.40
+        self.t1_lock_pct = 0.003
+
+    async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None):
+        """Attach the live T1 plan to every EMA- or WT-generated signal."""
+        signal = await super().analyze(candles, current_price, mtf_candles)
+        if isinstance(getattr(signal, "metadata", None), dict):
+            signal.metadata.update({
+                "t1_trigger_pct": self.t1_trigger_pct * 100.0,
+                "t1_trim_pct": self.t1_trim_pct * 100.0,
+                "t1_lock_pct": self.t1_lock_pct * 100.0,
+                "runner_pct_after_t1": (1.0 - self.t1_trim_pct) * 100.0,
+                "partial_tp_enabled": True,
+            })
+        return signal
+
+    def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
+        """Convert Trend Confirm's T1 SL-only update into trim + SL lock.
+
+        The inherited manager already validates the +0.6% trigger, marks T1 as
+        consumed and calculates the correct +0.3% stop for long/short. The live
+        bot's existing ``partial_tp`` execution path closes the requested size,
+        updates accounting, then re-places SL/TP on the remaining position.
+        """
+        update = super().tick_open_position(current_price, position_key)
+        if update is None:
+            return None
+
+        # The inherited Trend Confirm emits move_sl only for its +0.6% T1.
+        if update.action == "move_sl" and update.new_sl is not None:
+            self._tp1_done = True
+            update.action = "partial_tp"
+            update.close_pct = self.t1_trim_pct
+            update.reason = (
+                "+0.6% T1 reached — take profit on 40%, move SL to +0.3%; "
+                "keep the remaining 60% toward the +1.3% final TP or EMA cross-back"
+            )
+        return update
 
     @staticmethod
     def _ema_finite(values, period: int) -> np.ndarray:
-        """EMA that starts after `period` finite observations.
+        """EMA that starts after ``period`` finite observations.
 
         Leading NaNs are preserved rather than poisoning the whole series.
         Once seeded, later non-finite samples keep the prior EMA value.
