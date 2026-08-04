@@ -1,18 +1,20 @@
 """Production entry point for merged Trend Confirm + WaveTrend entry.
 
-The bot now loads one strategy family only:
-- 4H Trend direction
-- 1H Context + ADX/CHOP gate
-- 15M entry: EMA8/13 cross OR WaveTrend extreme cross
-- 15M price must remain on the correct side of EMA20
+One strategy family only:
+- Layer 1: 4H trend direction
+- Layer 2: 1H context + ADX/CHOP quality gate
+- Layer 3: 15M EMA8/13 cross OR WaveTrend extreme cross
+- 15M price must be on the correct side of EMA20
 
-The existing filename and Railway start command are retained.
+WT is an entry trigger inside Trend Confirm, not a second strategy. The existing
+filename and Railway start command are retained.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 
-import run_dual_bot  # keeps existing risk, sleep, exchange and lifecycle patches
+import run_dual_bot  # keeps exchange, sleep, risk and lifecycle patches
 import run_bot
 
 
@@ -27,9 +29,30 @@ def _make_merged_trend_confirm(symbols: list, config: dict):
     return [TrendConfirmWTStrategy(symbol) for symbol in symbols]
 
 
-# Replace the old two-strategy factory. WT is now an entry trigger inside
-# Trend Confirm, not a second strategy with separate 4H/1H state.
+def _build_merged_config() -> dict:
+    # Bypass the old dual quota sum. There is now only one strategy family.
+    config = run_dual_bot._ORIGINAL_BUILD_CONFIG()
+    if not run_dual_bot._env_bool("ENABLE_TREND_CONFIRM", True):
+        raise RuntimeError(
+            "Merged Trend Confirm is disabled. Set ENABLE_TREND_CONFIRM=true"
+        )
+
+    strategy_limit = max(1, int(os.getenv("TREND_CONFIRM_MAX_POSITIONS", "2")))
+    requested_global = max(1, int(os.getenv("MAX_POSITIONS", str(strategy_limit))))
+    config["max_positions"] = min(requested_global, strategy_limit)
+    config["strategy_mode"] = "trend_confirm_ema_or_wt"
+    config["enable_trend_confirm"] = True
+    config["enable_wt_trend"] = False  # separate WT engine is intentionally disabled
+    config["enable_ai_expert"] = False
+    os.environ["CANDLE_TF"] = "15m"
+    config["candle_tf"] = "15m"
+    return config
+
+
+# Replace the old two-strategy factory/config. WT now shares Trend Confirm's
+# real Layer 1/2 state, diagnostics, exits, TP/SL and position ownership.
 run_bot._make_strategies = _make_merged_trend_confirm
+run_bot.build_config = _build_merged_config
 
 
 if __name__ == "__main__":
