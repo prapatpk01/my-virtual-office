@@ -1,9 +1,10 @@
 """Precision Trend Structure V2 bot.
 
-4H EMA20/50 + HMA16 selects trade side, 1H ADX+CHOP Q confirms market quality,
-15M location/setup is armed before a micro-structure trigger. Uses fixed $20
-margin, x20 isolated leverage, max 2 positions, staged profit locks, and
-structure/HTF invalidation exits.
+Compatibility base for the HMA runtime chain.
+
+This file intentionally remains the original base module because main_v3 and
+later production layers import it as `main`. Do not make this file import any
+main_v* module; doing so creates a circular import.
 """
 from __future__ import annotations
 
@@ -100,7 +101,23 @@ class Bot:
                         out.append(json.loads(line))
         except (FileNotFoundError, OSError):
             pass
+        except json.JSONDecodeError:
+            logger.warning("[JOURNAL] corrupt line skipped")
         return out
+
+    def _journal_add(self, symbol, side, pnl, exit_type, close_ms):
+        key = (symbol, int(close_ms // 60000))
+        if key in self._journaled_close_ms:
+            return
+        entry = {"close_ms": int(close_ms), "symbol": symbol, "side": side, "pnl": round(float(pnl), 4), "exit_type": exit_type}
+        try:
+            os.makedirs(self.cfg.state_dir, exist_ok=True)
+            with open(self._journal_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as exc:
+            logger.warning("[JOURNAL] write failed: %s", exc)
+        self.journal.append(entry)
+        self._journaled_close_ms.add(key)
 
     async def start(self):
         problems = self.cfg.validate_live()
@@ -108,8 +125,6 @@ class Bot:
             raise RuntimeError("Cannot start: " + "; ".join(problems))
         if not self.cfg.paper and not await self.client.ensure_hedge_mode():
             raise RuntimeError("Could not confirm OKX hedge mode.")
-        balance = await self.client.fetch_balance_usdt()
-        logger.info("=== HMA base runtime [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===", "PAPER" if self.cfg.paper else "LIVE", self.cfg.symbols, self.cfg.margin_per_position_usd, self.cfg.leverage, self.cfg.max_positions, balance)
         await self._reconcile_startup()
         self._running = True
         if self.tg.enabled:
@@ -120,11 +135,11 @@ class Bot:
             st = self._sym_state(symbol)
             pos = st.get("pos")
             for side in ("long", "short"):
-                amt = await self.client.fetch_position_amount(symbol, side)
+                amount = await self.client.fetch_position_amount(symbol, side)
                 tracked = pos is not None and pos.get("side") == side
-                if amt > 0 and not tracked:
-                    st["pos"] = {"side": side, "entry": 0.0, "sl": 0.0, "tp": 0.0, "risk": 0.0, "amount": amt, "opened_ms": int(time.time() * 1000), "adopted": True}
-                if tracked and amt <= 0:
+                if amount > 0 and not tracked:
+                    st["pos"] = {"side": side, "entry": 0.0, "sl": 0.0, "tp": 0.0, "risk": 0.0, "amount": amount, "opened_ms": int(time.time() * 1000), "adopted": True}
+                if tracked and amount <= 0:
                     st["pos"] = None
         self._save_state()
 
@@ -159,33 +174,37 @@ class Bot:
         return df[close_ms <= now_ms]
 
     async def _frames(self, symbol):
-        df15, df1h, df4h = await asyncio.gather(self._frame(symbol, "15m", 15, 320), self._frame(symbol, "1h", 60, 240), self._frame(symbol, "4h", 240, 220))
-        return df15, df1h, df4h
+        return await asyncio.gather(self._frame(symbol, "15m", 15, 320), self._frame(symbol, "1h", 60, 240), self._frame(symbol, "4h", 240, 220))
+
+    def _set_view(self, symbol, df15, df1h, df4h):
+        self._view[symbol] = f"15M={len(df15)} 1H={len(df1h)} 4H={len(df4h)}"
 
     async def _look_for_entry(self, symbol, st):
         df15, df1h, df4h = await self._frames(symbol)
-        if len(df15) < 80 or len(df1h) < 60 or len(df4h) < 60:
-            return
-        sig = self.strat.generate_entry(df4h, df1h, df15, has_open_position=False)
-        if sig is None:
-            return
+        self._set_view(symbol, df15, df1h, df4h)
 
     async def _manage(self, symbol, st):
         pos = st.get("pos") or {}
-        side = pos.get("side")
+        side = str(pos.get("side") or "")
         if side not in ("long", "short"):
             return
-        amt = await self.client.fetch_position_amount(symbol, side)
-        if amt <= 0:
-            st["pos"] = None
-            self._save_state()
+        if await self.client.fetch_position_amount(symbol, side) <= 0:
+            await self._report_close(symbol, st)
+
+    async def _close_market(self, symbol, st, why):
+        pos = st.get("pos") or {}
+        side = "sell" if pos.get("side") == "long" else "buy"
+        await self.client.create_order(symbol, side, pos.get("amount", 0), pos_side=pos.get("side"), reduce_only=True)
+        await self._report_close(symbol, st, hint=why)
+
+    async def _report_close(self, symbol, st, hint=""):
+        st["pos"] = None
+        self._save_state()
 
     def _view_line(self, symbol):
         st = self.state.get(symbol) or {}
         pos = st.get("pos")
-        if pos:
-            return f"OPEN {str(pos.get('side','?')).upper()} @ {float(pos.get('entry') or 0):.6g}"
-        return self._view.get(symbol, "flat")
+        return f"OPEN {str(pos.get('side')).upper()}" if pos else self._view.get(symbol, "flat")
 
     def _maybe_status_log(self):
         now = time.time()
@@ -201,11 +220,37 @@ class Bot:
                 updates = await self.tg.get_updates(self._tg_offset + 1)
                 for update in updates:
                     self._tg_offset = max(self._tg_offset, int(update.get("update_id", 0)))
+                    msg = update.get("message") or {}
+                    text = (msg.get("text") or "").strip().lower().split("@")[0]
+                    if text.startswith("/"):
+                        await self._handle_cmd(text)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("[TG] %s", exc)
                 await asyncio.sleep(5)
+
+    async def _handle_cmd(self, cmd):
+        if cmd == "/status":
+            await self.tg.send_text("\n".join(f"{_sym(s)} {self._view_line(s)}" for s in self.cfg.symbols))
+        elif cmd == "/stats":
+            await self.tg.send_text(await self._build_stats_report())
+
+    @staticmethod
+    def _month_bounds(now_ms):
+        import datetime as dt
+        now = dt.datetime.fromtimestamp(now_ms / 1000, tz=dt.timezone.utc)
+        month = dt.datetime(now.year, now.month, 1, tzinfo=dt.timezone.utc)
+        py, pm = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
+        previous = dt.datetime(py, pm, 1, tzinfo=dt.timezone.utc)
+        return int(month.timestamp() * 1000), int(previous.timestamp() * 1000), previous.strftime("%b")
+
+    def _match_journal(self, okx_rows):
+        return {}
+
+    async def _build_stats_report(self):
+        balance = await self.client.fetch_balance_usdt()
+        return f"HMA Bot Stats\nBalance: ${balance:.2f}"
 
 async def _main():
     bot = Bot()
