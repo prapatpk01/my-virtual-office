@@ -30,7 +30,6 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
         if len(df4h) < 60 or len(df1h) < 60 or len(df15) < 90 or len(df5) < 70:
             return super().evaluate(df4h, df1h, df15, df5)
 
-        # Gate 1: 1H selects the trading side. 4H is not consulted here.
         direction, quality = self._one_h_direction(df1h)
         if direction.side is None:
             why = (
@@ -40,8 +39,6 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
             )
             return DecisionState(False, "G1_1H_DIRECTION", why, direction, quality, None, None, None, 0.0)
 
-        # Gate 2: quality must independently pass; a high trend score cannot
-        # compensate for weak Q or materially opposing DMI.
         if quality.q < self.cfg.min_trend_quality:
             return DecisionState(False, "G2_1H_QUALITY", f"Q {quality.q:.0f}<{self.cfg.min_trend_quality:.0f}", direction, quality, None, None, None, 0.0)
         if direction.tier == "EARLY" and quality.q < self.early_quality_min:
@@ -63,11 +60,8 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
         loc = context.location
         macro_score, macro_label, macro_edge = self._macro_bias(df4h, direction.side)
         is_long = direction.side == Side.LONG
-
-        # Diagnostic confidence only. It is shown in logs but never bypasses a gate.
         confidence = self._v51_trade_score(direction.score, loc.score, False, macro_score)
 
-        # Gate 3: authoritative Sentinel S/R location.
         if direction.tier == "EARLY":
             zone_ok = loc.near_s2 if is_long else loc.near_r2
             required = "S2" if is_long else "R2"
@@ -93,42 +87,59 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
             needed = "demand/rejection or sweep" if is_long else "supply/rejection or sweep"
             return DecisionState(False, "G3_15M_LOCATION", f"{loc.zone} needs {needed}", direction, quality, context, setup_type, None, confidence)
 
-        # Gate 4: there must be enough structural room before the opposing level.
         if loc.room_atr < self.sentinel_min_room_atr:
             blocker = f"room {loc.room_atr:.2f}<{self.sentinel_min_room_atr:.2f} ATR"
             return DecisionState(False, "G4_ROOM", blocker, direction, quality, context, setup_type, None, confidence)
 
-        # Gate 5: a recent closed 5M trigger is compulsory.
         execution = self._execution_trigger(df5, direction.side, setup_type)
         confidence = self._v51_trade_score(direction.score, loc.score, execution is not None, macro_score)
         if execution is None:
             return DecisionState(False, "G5_5M_TRIGGER", f"{loc.zone} armed; waiting recent closed-5M trigger", direction, quality, context, setup_type, None, confidence)
 
-        # No final score gate: every required market condition has passed.
         return DecisionState(True, "READY", f"all gates passed | 4H {macro_label} {macro_edge:+.0f}", direction, quality, context, setup_type, execution, confidence)
 
+    @staticmethod
+    def _stage_label(stage: str) -> str:
+        return {
+            "G1_1H_DIRECTION": "DIRECTION",
+            "G2_1H_QUALITY": "QUALITY",
+            "G3_15M_LOCATION": "LOCATION",
+            "G4_ROOM": "ROOM",
+            "G5_5M_TRIGGER": "TRIGGER",
+            "READY": "READY",
+        }.get(stage, stage)
+
     def entry_status(self, df4h, df1h, df15, df5) -> str:
+        """Compact production log: one readable status line per symbol."""
         d = self.evaluate(df4h, df1h, df15, df5)
         side = d.side.value if d.side else "NONE"
-        text = (
-            f"V5.2 {d.stage} | {side} 1H={d.direction.score:.0f}/{d.direction.tier} "
-            f"edge={d.direction.edge:+.0f}"
-        )
+        stage = self._stage_label(d.stage)
+        status = "READY" if d.ready else "WAIT"
+
+        parts = [
+            f"V5.2 {status}",
+            side,
+            f"Trend={d.direction.score:.0f}/{d.direction.tier}",
+            f"Edge={d.direction.edge:+.0f}",
+        ]
+
         if d.quality is not None:
-            q = d.quality
-            text += f" Q={q.q:.0f} ADX={q.adx:.1f} CHOP={q.chop:.1f}"
+            parts.append(f"Q={d.quality.q:.0f}")
+
         if d.context is not None:
             loc = d.context.location
             trigger = d.execution[0] if d.execution else "WAIT"
-            _, macro_label, macro_edge = self._macro_bias(df4h, d.side)
-            text += (
-                f" | 15M={loc.zone} Loc={loc.score:.0f} Room={loc.room_atr:.2f}ATR"
-                f" | 5M={trigger} | 4H={macro_label}({macro_edge:+.0f})"
-                f" | Confidence={d.trade_score:.0f}"
-            )
-        if d.blocker:
-            text += f" | {'INFO' if d.ready else 'BLOCK'} {d.blocker}"
-        return text
+            parts.extend([
+                f"Zone={loc.zone}",
+                f"Loc={loc.score:.0f}",
+                f"Room={loc.room_atr:.2f}ATR",
+                f"Trigger={trigger}",
+                f"Conf={d.trade_score:.0f}",
+            ])
+
+        reason = d.blocker or "all gates passed"
+        parts.extend([f"Stage={stage}", f"Reason={reason}"])
+        return " | ".join(parts)
 
 
 MTFStructureStrategyV12 = PrecisionTrendStructureV12
