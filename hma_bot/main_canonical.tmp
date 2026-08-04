@@ -1,0 +1,67 @@
+"""Canonical HMA Gate Sentinel production runtime.
+
+Railway launches this file directly. Historical runtime layers have semantic
+module names and are loaded behind compatibility aliases so the proven live
+behavior is preserved without any ``main_v*.py`` files.
+"""
+from __future__ import annotations
+
+import asyncio
+import importlib
+import signal
+import sys
+
+_ENTRY_MODULE = sys.modules[__name__]
+_base = importlib.import_module("runtime_base")
+sys.modules["main"] = _base
+
+_ALIAS_ORDER = (
+    ("main_v3", "runtime_chart"),
+    ("main_v4", "runtime_management"),
+    ("main_v5", "runtime_two_stage"),
+    ("main_v7", "runtime_balanced"),
+    ("main_v8", "runtime_recovery"),
+    ("main_v9", "runtime_fx"),
+    ("main_v10", "runtime_sentinel"),
+    ("main_v11", "runtime_adaptive"),
+    ("main_v12", "runtime_clean"),
+    ("main_v13", "runtime_sr_entry"),
+    ("main_v14", "runtime_one_hour"),
+    ("main_v15", "runtime_smooth"),
+    ("main_v16", "runtime_gate"),
+)
+
+for _legacy_name, _module_name in _ALIAS_ORDER:
+    _module = importlib.import_module(_module_name)
+    sys.modules[_legacy_name] = _module
+
+_latest = sys.modules["main_v16"]
+Bot = _latest.Bot
+BOT_VERSION = "5.2"
+BOT_NAME = "HMA Gate Sentinel"
+
+if __name__ != "__main__":
+    sys.modules["main"] = _ENTRY_MODULE
+
+
+async def _main() -> None:
+    bot = Bot()
+    loop = asyncio.get_running_loop()
+    for sig_name in ("SIGINT", "SIGTERM"):
+        try:
+            loop.add_signal_handler(
+                getattr(signal, sig_name),
+                lambda: asyncio.ensure_future(bot.stop()),
+            )
+        except (NotImplementedError, AttributeError):
+            pass
+
+    await bot.start()
+    try:
+        await bot.run_forever()
+    finally:
+        await bot.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
