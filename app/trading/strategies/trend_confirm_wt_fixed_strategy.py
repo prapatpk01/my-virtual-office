@@ -53,16 +53,18 @@ class TrendConfirmWTFixedStrategy(TrendConfirmWTStrategy):
                 "t1_lock_pct": self.t1_lock_pct * 100.0,
                 "runner_pct_after_t1": (1.0 - self.t1_trim_pct) * 100.0,
                 "partial_tp_enabled": True,
+                "partial_tp_pct": self.t1_trim_pct * 100.0,
+                "tp1_close_pct": self.t1_trim_pct,
             })
         return signal
 
     def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
         """Convert Trend Confirm's T1 SL-only update into trim + SL lock.
 
-        The inherited manager already validates the +0.6% trigger, marks T1 as
-        consumed and calculates the correct +0.3% stop for long/short. The live
-        bot's existing ``partial_tp`` execution path closes the requested size,
-        updates accounting, then re-places SL/TP on the remaining position.
+        The inherited manager validates the +0.6% trigger, consumes T1 and
+        calculates the correct +0.3% stop for long/short. The bot's existing
+        ``partial_tp`` path closes 40%, updates accounting and re-places the
+        SL/TP on the remaining 60%.
         """
         update = super().tick_open_position(current_price, position_key)
         if update is None:
@@ -78,6 +80,36 @@ class TrendConfirmWTFixedStrategy(TrendConfirmWTStrategy):
                 "keep the remaining 60% toward the +1.3% final TP or EMA cross-back"
             )
         return update
+
+    def attach_existing_position(
+        self,
+        direction: str,
+        entry_price: float,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+    ) -> None:
+        """Recover a live position without repeating an already completed T1.
+
+        After T1, the exchange SL is moved to roughly +0.3% from entry. If that
+        protected SL is present during restart reconciliation, mark the T1 trim
+        as completed so the remaining 60% cannot be trimmed again.
+        """
+        super().attach_existing_position(direction, entry_price, stop_loss, take_profit)
+        if stop_loss is None or entry_price <= 0:
+            return
+
+        lock_tolerance = 0.0002  # tolerate exchange tick-size rounding
+        if direction == "long":
+            protected = stop_loss >= entry_price * (
+                1.0 + self.t1_lock_pct - lock_tolerance
+            )
+        else:
+            protected = stop_loss <= entry_price * (
+                1.0 - self.t1_lock_pct + lock_tolerance
+            )
+        if protected:
+            self._tp1_done = True
+            self._be_trailed = True
 
     @staticmethod
     def _ema_finite(values, period: int) -> np.ndarray:
