@@ -10,14 +10,23 @@ BODY_MAX=float(os.getenv("V132_BODY_MAX_ATR","1.20")); ROOM_MIN=float(os.getenv(
 SL_BUFFER=float(os.getenv("V132_SL_ATR_BUFFER","0.15")); TP_R=float(os.getenv("V132_TP_R","2.00"))
 BE_R=float(os.getenv("V132_BE_TRIGGER_R","1.00")); PULLBACK_WINDOW=int(os.getenv("V132_PULLBACK_WINDOW","3"))
 CROSS_WINDOW=int(os.getenv("V132_CROSS_WINDOW","2")); CONTINUATION_ADX=float(os.getenv("V132_CONTINUATION_ADX","24"))
+# [RISK] Swing-based stops alone produced a 0.37% MEDIAN stop distance in a
+# 6-month replay (min 0.0025%) — far inside 15m noise, so ~35% of trades died
+# on SL. Never allow a stop tighter than this fraction of entry price.
+MIN_SL_PCT=float(os.getenv("V132_MIN_SL_PCT","0.012"))
+# [RISK] Size from RISK, not from a fixed notional. Fixed notional made the $
+# risk swing 1000x across trades ($0.01-$12.76) because it ignored stop
+# distance. size = RISK_USDT / stop_distance, capped by the margin budget.
+RISK_USDT=float(os.getenv("V132_RISK_USDT","5.0"))
 
 @dataclass
 class Position:
     direction:str; entry:float; sl:float; initial_sl:float; tp:float; size:float; strategy:str; trigger:str; opened_at:float; be_moved:bool=False
 
 class TradingBot:
-    def __init__(self,symbol:str,margin_usdt:float=20.0,leverage:int=20,paper:bool=True,state_file:str="",execution_callback:Optional[Callable]=None):
+    def __init__(self,symbol:str,margin_usdt:float=20.0,leverage:int=20,paper:bool=True,state_file:str="",execution_callback:Optional[Callable]=None,risk_usdt:float=RISK_USDT):
         self.symbol=symbol; self.margin_usdt=float(margin_usdt); self.leverage=int(leverage); self.paper=bool(paper)
+        self.risk_usdt=float(risk_usdt)
         self.state_file=state_file; self.execution_callback=execution_callback; self.position:Optional[Position]=None; self.last_signal="WARMUP"
         self.counts={k:0 for k in ("scans","entries","4H","1H","CHASE","LOCATION","TRIGGER","ROOM")}; self.load_state()
     @property
@@ -50,20 +59,26 @@ class TradingBot:
                 f"| 15M[ext={i15['extension_atr']:.2f}/{EXT_MAX:.2f},body={i15['body_atr']:.2f}/{BODY_MAX:.2f},structure={i15['structure']}] | SETUP[{direction}:{setup}] | RESULT[{result}:{reason}] "
                 f"| COUNTERS[scans={self.counts['scans']},entries={self.counts['entries']},4H={self.counts['4H']},1H={self.counts['1H']},chase={self.counts['CHASE']},location={self.counts['LOCATION']},trigger={self.counts['TRIGGER']},room={self.counts['ROOM']}]" )
     def _build(self,direction,entry,i15,strategy,trigger)->Optional[Dict]:
-        a=max(float(i15["atr"]),entry*0.0005)
+        a=max(float(i15["atr"]),entry*0.0005); floor=MIN_SL_PCT*entry
         if direction=="LONG":
-            sl=float(i15["last_swing_low"])-SL_BUFFER*a
+            # Widen to the floor when the swing stop sits inside 15m noise.
+            sl=min(float(i15["last_swing_low"])-SL_BUFFER*a, entry-floor)
             if sl>=entry: return None
             risk=entry-sl; opposing=float(i15["last_swing_high"]); room=(opposing-entry)/max(risk,1e-12)
             if opposing>entry and room<ROOM_MIN: return None
             tp=entry+TP_R*risk
         else:
-            sl=float(i15["last_swing_high"])+SL_BUFFER*a
+            sl=max(float(i15["last_swing_high"])+SL_BUFFER*a, entry+floor)
             if sl<=entry: return None
             risk=sl-entry; opposing=float(i15["last_swing_low"]); room=(entry-opposing)/max(risk,1e-12)
             if opposing<entry and room<ROOM_MIN: return None
             tp=entry-TP_R*risk
-        return {"direction":direction,"strategy":strategy,"trigger":trigger,"entry":entry,"sl":sl,"tp":tp,"room_r":room,"size":(self.margin_usdt*self.leverage)/max(entry,1e-12)}
+        # Risk-first sizing: every trade risks ~RISK_USDT at its stop. The
+        # margin budget stays a hard notional cap so leverage never blows out.
+        size=min(self.risk_usdt/max(risk,1e-12), (self.margin_usdt*self.leverage)/max(entry,1e-12))
+        if size<=0: return None
+        return {"direction":direction,"strategy":strategy,"trigger":trigger,"entry":entry,"sl":sl,"tp":tp,"room_r":room,
+                "size":size,"risk_usdt":size*risk,"sl_pct":100*risk/max(entry,1e-12)}
     def _signal(self,i15:Dict,i1:Dict,i4:Dict)->Optional[Dict]:
         self.counts["scans"]+=1; macro=self._macro(i4); close=float(i15["close"])
         if macro=="NEUTRAL": self.counts["4H"]+=1; self.last_signal=self._debug(macro,i15,i1,"NONE","WAIT","4H_NEUTRAL"); return None
@@ -100,17 +115,42 @@ class TradingBot:
         payload={"symbol":self.symbol,"direction":p.direction,"price":price,"entry":p.entry,"sl":p.sl,"tp":p.tp,"size":p.size,"strategy":p.strategy,"trigger":p.trigger,"opened_at":p.opened_at,"closed_at":time.time(),"reason":reason,"pnl":pnl,"r_multiple":r}
         if self.execution_callback: self.execution_callback("CLOSE_"+p.direction,payload)
         self.position=None; self.save_state(); self.last_signal=f"CLOSE {p.direction} {reason} pnl=${pnl:+.2f} r={r:+.2f}R"; return {"event":"CLOSE",**payload}
+    def current_r(self,price:float)->float:
+        p=self.position
+        if not p: return 0.0
+        risk=abs(p.entry-p.initial_sl)
+        return ((price-p.entry)/max(risk,1e-12)) if p.direction=="LONG" else ((p.entry-price)/max(risk,1e-12))
+    def check_price(self,price:float)->Optional[Dict]:
+        """Price-only protection (BE move / SL / TP). Safe to call on EVERY
+        poll — needs no indicators — so a spike between 15m closes is acted on
+        instead of waiting up to 15 minutes for the next bar."""
+        p=self.position
+        if not p: return None
+        r=self.current_r(price)
+        if not p.be_moved and r>=BE_R: p.sl=p.entry; p.be_moved=True; self.save_state()
+        if (price<=p.sl if p.direction=="LONG" else price>=p.sl): return self._close(price,"BE" if p.be_moved else "SL")
+        if (price>=p.tp if p.direction=="LONG" else price<=p.tp): return self._close(price,"TP")
+        return None
+    def reconcile_flat(self,price:float,reason:str="EXCHANGE_CLOSED")->Optional[Dict]:
+        """The exchange reports no position while we think one is open (its
+        attached SL/TP fired, or it was closed by hand). Record the close
+        locally WITHOUT sending another order, so state can't drift."""
+        p=self.position
+        if not p: return None
+        pnl=(price-p.entry)*p.size if p.direction=="LONG" else (p.entry-price)*p.size
+        risk=abs(p.entry-p.initial_sl)*p.size; r=pnl/risk if risk>0 else 0.0
+        payload={"symbol":self.symbol,"direction":p.direction,"price":price,"entry":p.entry,"sl":p.sl,"tp":p.tp,"size":p.size,
+                 "strategy":p.strategy,"trigger":p.trigger,"opened_at":p.opened_at,"closed_at":time.time(),"reason":reason,"pnl":pnl,"r_multiple":r}
+        self.position=None; self.save_state(); self.last_signal=f"RECONCILE {reason} pnl=${pnl:+.2f}"
+        return {"event":"CLOSE",**payload}
     def on_bar(self,i15:Dict,i1:Dict,i4:Dict,price:float)->Optional[Dict]:
         if not i15 or not i1 or not i4: self.last_signal="WAIT indicator warmup"; return None
         if self.position:
-            p=self.position; risk=abs(p.entry-p.initial_sl)
-            current_r=((price-p.entry)/max(risk,1e-12)) if p.direction=="LONG" else ((p.entry-price)/max(risk,1e-12))
-            if not p.be_moved and current_r>=BE_R: p.sl=p.entry; p.be_moved=True; self.save_state()
-            hit_sl=price<=p.sl if p.direction=="LONG" else price>=p.sl; hit_tp=price>=p.tp if p.direction=="LONG" else price<=p.tp
+            closed=self.check_price(price)
+            if closed: return closed
+            p=self.position; current_r=self.current_r(price)
             structure_exit=(p.direction=="LONG" and i15["close_below_ema13_2"] and price<i15["last_swing_low"]) or (p.direction=="SHORT" and i15["close_above_ema13_2"] and price>i15["last_swing_high"])
             ema_trail_exit=(p.direction=="LONG" and i15["close_below_ema13_2"] and current_r>0) or (p.direction=="SHORT" and i15["close_above_ema13_2"] and current_r>0)
-            if hit_sl: return self._close(price,"BE" if p.be_moved else "SL")
-            if hit_tp: return self._close(price,"TP")
             if structure_exit: return self._close(price,"STRUCTURE_EXIT")
             if ema_trail_exit: return self._close(price,"EMA13_TRAIL")
             self.last_signal=f"MANAGE {p.direction} current={current_r:+.2f}R entry={p.entry:.6f} sl={p.sl:.6f} tp={p.tp:.6f} be={int(p.be_moved)}"; return None

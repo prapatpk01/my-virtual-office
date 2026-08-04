@@ -27,7 +27,7 @@ def fx_open(now):
     if ny.weekday()<4:return True
     if ny.weekday()==4:return ny.hour<17
     if ny.weekday()==5:return False
-    return ny.hour>=13
+    return ny.hour>=14
 def load_json(path,default):
     try:return json.load(open(path,encoding="utf-8"))
     except Exception:return default
@@ -128,6 +128,10 @@ async def main():
     def execute(order_type,payload):
         if order_type.startswith("OPEN_"):
             payload["structure_level"]=payload["sl"]
+            # OKXAdapter attaches the exchange-side take-profit from "tp2";
+            # without this alias the TP order is silently never placed, so an
+            # offline bot would run with a stop but no target.
+            payload["tp2"]=payload["tp"]
             if tg:
                 path=f"/tmp/v132_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
                 if not chart(latest.get(str(payload.get("symbol")),[]),payload,path):raise RuntimeError("Mandatory Telegram chart failed")
@@ -135,8 +139,17 @@ async def main():
         elif tg:queue.put_nowait({"kind":"text","text":trade_text(order_type,payload,paper)})
         if paper:logger.info("[PAPER] %s %s",order_type,payload);return {"paper":True}
         if live is None:raise RuntimeError("Live adapter unavailable")
-        return live.execute(order_type,payload)
-    bots={s:TradingBot(s,margin,leverage,paper,os.path.join(state_dir,s.replace("/","_").replace(":","_")+".json"),execute) for s in symbols}
+        # OKXAdapter only understands CLOSE_PARTIAL/CLOSE_FULL. Sending the
+        # bot's CLOSE_LONG/CLOSE_SHORT verbatim made it log "Unknown
+        # order_type" and return None — the bot went flat locally while the
+        # real position stayed open on OKX. Map to a full close.
+        adapter_type="CLOSE_FULL" if order_type.startswith("CLOSE_") else order_type
+        result=live.execute(adapter_type,payload)
+        if adapter_type=="CLOSE_FULL" and result is None:
+            raise RuntimeError(f"Exchange close failed for {payload.get('symbol')} — position may still be open")
+        return result
+    risk_usdt=float(os.getenv("V132_RISK_USDT","5.0"))
+    bots={s:TradingBot(s,margin,leverage,paper,os.path.join(state_dir,s.replace("/","_").replace(":","_")+".json"),execute,risk_usdt) for s in symbols}
     async def commands():
         nonlocal offset
         if not tg:return
@@ -152,7 +165,8 @@ async def main():
     for sig in (signal.SIGINT,signal.SIGTERM):
         try:loop.add_signal_handler(sig,stop.set)
         except NotImplementedError:pass
-    task=asyncio.create_task(worker()) if tg else None; last={}; disabled=set()
+    task=asyncio.create_task(worker()) if tg else None; last={}; disabled=set(); reconciled={}
+    RECONCILE_SECS=int(os.getenv("V132_RECONCILE_SECONDS","300"))
     logger.info("Adaptive Bot v13.2 | build=%s | mode=%s | telegram=%s chart=MANDATORY",BUILD_ID,"PAPER" if paper else "LIVE","CONNECTED" if tg else "DISABLED")
     if tg:queue.put_nowait({"kind":"text","text":f"🤖 Adaptive Bot v13.2 started\nMode: {'PAPER' if paper else 'LIVE'}\nLogic: 4H Trend → 1H Quality → 15M Location + Price Action\nTriggers: EMA8/13, Engulfing, Hammer, Inside Break, Continuation\nSL: Swing+ATR | TP: 2R | BE: 1R\nCommand: /stats"})
     try:
@@ -164,10 +178,32 @@ async def main():
                     r15=await connector.fetch_ohlcv(symbol,"15m",300); r1=await connector.fetch_ohlcv(symbol,"1h",200); r4=await connector.fetch_ohlcv(symbol,"4h",200)
                     if len(r15)<82 or len(r1)<82 or len(r4)<82:continue
                     c15,c1,c4=list(r15[:-1]),list(r1[:-1]),list(r4[:-1]); latest[symbol]=c15; ts=timestamp(c15[-1])
+                    bot=bots[symbol]; live_px=field(r15[-1],"close",4) or float(prices.get(symbol,0))
+                    if live_px:prices[symbol]=live_px
+                    if bot.position_open and live_px:
+                        # [RECONCILE] exchange-side SL/TP may have already closed
+                        # this position — clear local state before acting on it.
+                        if live is not None and time.time()-reconciled.get(symbol,0)>=RECONCILE_SECS:
+                            reconciled[symbol]=time.time()
+                            try:
+                                pos=await asyncio.to_thread(live.fetch_open_position,symbol)
+                                if not float((pos or {}).get("contracts") or 0):
+                                    ev=bot.reconcile_flat(live_px)
+                                    if ev:
+                                        trades.append({**ev,"timestamp":time.time(),"version":"v13.2"});save_json(ledger,trades[-2000:])
+                                        logger.info("[%s] RECONCILE exchange flat -> local cleared",symbol)
+                                        if tg:queue.put_nowait({"kind":"text","text":trade_text("CLOSE_"+ev["direction"],ev,paper)})
+                            except Exception as error:logger.warning("[%s] reconcile: %s",symbol,error)
+                        # [INTRABAR] act on SL/TP/BE between 15m closes instead
+                        # of waiting up to 15 minutes for the next bar.
+                        if bot.position_open:
+                            ev=bot.check_price(live_px)
+                            if ev:
+                                trades.append({**ev,"timestamp":time.time(),"version":"v13.2"});save_json(ledger,trades[-2000:])
+                                logger.info("[%s] %s",symbol,ev)
                     if ts==last.get(symbol):continue
                     last[symbol]=ts; i15,i1,i4=compute(c15),compute(c1),compute(c4)
                     if not i15 or not i1 or not i4:continue
-                    prices[symbol]=float(i15["close"]); bot=bots[symbol]
                     if not bot.position_open:
                         if not entries:logger.info("[%s] SLEEP_MODE",symbol);continue
                         if sum(int(b.position_open) for b in bots.values())>=max_positions:logger.info("[%s] WAIT max positions",symbol);continue
