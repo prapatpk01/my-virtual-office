@@ -1,4 +1,4 @@
-"""Production entry point for merged Trend Confirm + WaveTrend entry.
+"""Production entry point for merged Trend Confirm + corrected WaveTrend entry.
 
 One strategy family only:
 - Layer 1: 4H trend direction
@@ -24,9 +24,11 @@ def _make_merged_trend_confirm(symbols: list, config: dict):
             "Merged Trend Confirm is disabled. Set ENABLE_TREND_CONFIRM=true"
         )
 
-    from trading.strategies.trend_confirm_wt_strategy import TrendConfirmWTStrategy
+    from trading.strategies.trend_confirm_wt_fixed_strategy import (
+        TrendConfirmWTFixedStrategy,
+    )
 
-    return [TrendConfirmWTStrategy(symbol) for symbol in symbols]
+    return [TrendConfirmWTFixedStrategy(symbol) for symbol in symbols]
 
 
 def _build_merged_config() -> dict:
@@ -42,15 +44,13 @@ def _build_merged_config() -> dict:
     config["max_positions"] = min(requested_global, strategy_limit)
     config["strategy_mode"] = "trend_confirm_ema_or_wt"
     config["enable_trend_confirm"] = True
-    config["enable_wt_trend"] = False  # separate WT engine is intentionally disabled
+    config["enable_wt_trend"] = False
     config["enable_ai_expert"] = False
     os.environ["CANDLE_TF"] = "15m"
     config["candle_tf"] = "15m"
     return config
 
 
-# Replace the old two-strategy factory/config. WT now shares Trend Confirm's
-# real Layer 1/2 state, diagnostics, exits, TP/SL and position ownership.
 run_bot._make_strategies = _make_merged_trend_confirm
 run_bot.build_config = _build_merged_config
 
