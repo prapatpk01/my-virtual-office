@@ -3,15 +3,11 @@
     MODE=dual    -> DUAL ENTRY PRECISION V1.4   (default)
     MODE=regime  -> Signal Regime Bias bot (legacy)
     MODE=htf     -> HTF pullback bot (1H/4H, backtest-validated)
-    MODE=hma     -> HMA Gate Sentinel production
+    MODE=hma     -> HMA Gate Sentinel
 
 This file is baked into the Docker image AS /app/main.py, so it runs no
-matter which start command Railway uses (`python main.py`, the image CMD,
-or railway.json's startCommand) — switching systems is ONLY an env-var
-change + redeploy, never a Dockerfile/start-command hunt.
-
-Pure stdlib; replaces itself with the chosen bot via os.execv so signals
-and restart policies behave exactly as if the bot was started directly.
+matter which start command Railway uses. Switching systems is only an env-var
+change plus redeploy.
 """
 from __future__ import annotations
 
@@ -28,36 +24,35 @@ def main() -> None:
         target_dir = HERE
         argv = [sys.executable, "-m", "dual_entry_v14.main"]
         name = "DUAL ENTRY PRECISION V1.4"
-        if not os.path.isdir(os.path.join(HERE, "dual_entry_v14")):
-            print(f"FATAL: dual_entry_v14/ not found under {HERE}", flush=True)
-            sys.exit(1)
+        required = os.path.join(HERE, "dual_entry_v14")
     elif mode in ("regime", "regime_bias", "legacy", "old"):
         target_dir = os.path.join(HERE, "signal_regime_bot")
         argv = [sys.executable, "main.py"]
         name = "Signal Regime Bias (legacy)"
-        if not os.path.isfile(os.path.join(target_dir, "main.py")):
-            print(f"FATAL: signal_regime_bot/main.py not found under {HERE}", flush=True)
-            sys.exit(1)
+        required = os.path.join(target_dir, "main.py")
     elif mode in ("htf", "htf_pullback", "simple"):
         target_dir = os.path.join(HERE, "htf_bot")
         argv = [sys.executable, "main.py"]
         name = "HTF Pullback (1H/4H, backtest-validated)"
-        if not os.path.isfile(os.path.join(target_dir, "main.py")):
-            print(f"FATAL: htf_bot/main.py not found under {HERE}", flush=True)
-            sys.exit(1)
+        required = os.path.join(target_dir, "main.py")
     elif mode in ("hma", "hma16", "trendfollow"):
         target_dir = os.path.join(HERE, "hma_bot")
-        argv = [sys.executable, "production.py"]
-        name = "HMA Gate Sentinel (canonical production entrypoint)"
-        if not os.path.isfile(os.path.join(target_dir, "production.py")):
-            print(f"FATAL: hma_bot/production.py not found under {HERE}", flush=True)
-            sys.exit(1)
+        argv = [sys.executable, "main.py"]
+        name = "HMA Gate Sentinel"
+        required = os.path.join(target_dir, "main.py")
     else:
         print(f"FATAL: unknown MODE={mode!r} — use MODE=dual, regime, htf or hma", flush=True)
         sys.exit(1)
 
-    print(f"{banner}\nLAUNCHER: MODE={mode} -> {name}\n"
-          f"  cwd:  {target_dir}\n  exec: {' '.join(argv)}\n{banner}", flush=True)
+    if not os.path.exists(required):
+        print(f"FATAL: required target not found: {required}", flush=True)
+        sys.exit(1)
+
+    print(
+        f"{banner}\nLAUNCHER: MODE={mode} -> {name}\n"
+        f"  cwd:  {target_dir}\n  exec: {' '.join(argv)}\n{banner}",
+        flush=True,
+    )
 
     if os.environ.get("LAUNCHER_DRY_RUN") == "1":
         print("LAUNCHER_DRY_RUN=1 — not executing.", flush=True)
