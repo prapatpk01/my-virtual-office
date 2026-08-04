@@ -1,0 +1,232 @@
+name: HMA one-time production flatten
+
+on:
+  push:
+    branches:
+      - claude/railway-trading-bot-kvn686
+    paths:
+      - .github/workflows/hma_flatten.yml
+
+permissions:
+  contents: write
+
+jobs:
+  flatten:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/railway-trading-bot-kvn686
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Rename version modules and create canonical entrypoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path('hma_bot')
+
+          runtime_moves = {
+              'main.py': 'runtime_base.py',
+              'main_v3.py': 'runtime_chart.py',
+              'main_v4.py': 'runtime_management.py',
+              'main_v5.py': 'runtime_two_stage.py',
+              'main_v7.py': 'runtime_balanced.py',
+              'main_v8.py': 'runtime_recovery.py',
+              'main_v9.py': 'runtime_fx.py',
+              'main_v10.py': 'runtime_sentinel.py',
+              'main_v11.py': 'runtime_adaptive.py',
+              'main_v12.py': 'runtime_clean.py',
+              'main_v13.py': 'runtime_sr_entry.py',
+              'main_v14.py': 'runtime_one_hour.py',
+              'main_v15.py': 'runtime_smooth.py',
+              'main_v16.py': 'runtime_gate.py',
+          }
+          strategy_moves = {
+              'strategy.py': 'strategy_base.py',
+              'strategy_v3.py': 'strategy_structure.py',
+              'strategy_v5.py': 'strategy_balanced.py',
+              'strategy_v6.py': 'strategy_sentinel.py',
+              'strategy_v7.py': 'strategy_adaptive.py',
+              'strategy_v8.py': 'strategy_clean.py',
+              'strategy_v9.py': 'strategy_sr_entry.py',
+              'strategy_v10.py': 'strategy_one_hour.py',
+              'strategy_v11.py': 'strategy_smooth.py',
+              'strategy_v12.py': 'strategy_gate.py',
+          }
+
+          for old, new in {**runtime_moves, **strategy_moves}.items():
+              src, dst = root / old, root / new
+              if not src.exists():
+                  raise SystemExit(f'missing required source: {src}')
+              if dst.exists():
+                  dst.unlink()
+              src.rename(dst)
+
+          strategy_entry = r'''"""Canonical HMA strategy entrypoint.
+
+The production strategy is exported from this file. Historical implementation
+layers have semantic module names; no version-numbered files are used.
+"""
+from __future__ import annotations
+
+import importlib
+import sys
+
+# Publish the original stable API first because the first enhancement module
+# imports ``strategy`` while this canonical module is still initializing.
+import strategy_base as _base
+for _name, _value in vars(_base).items():
+    if not _name.startswith("__"):
+        globals()[_name] = _value
+
+_ALIAS_ORDER = (
+    ("strategy_v3", "strategy_structure"),
+    ("strategy_v5", "strategy_balanced"),
+    ("strategy_v6", "strategy_sentinel"),
+    ("strategy_v7", "strategy_adaptive"),
+    ("strategy_v8", "strategy_clean"),
+    ("strategy_v9", "strategy_sr_entry"),
+    ("strategy_v10", "strategy_one_hour"),
+    ("strategy_v11", "strategy_smooth"),
+    ("strategy_v12", "strategy_gate"),
+)
+
+for _legacy_name, _module_name in _ALIAS_ORDER:
+    _module = importlib.import_module(_module_name)
+    sys.modules[_legacy_name] = _module
+
+_latest = sys.modules["strategy_v12"]
+for _name, _value in vars(_latest).items():
+    if not _name.startswith("__"):
+        globals()[_name] = _value
+
+# Stable names for all future code.
+PrecisionTrendStructure = _latest.PrecisionTrendStructureV12
+MTFStructureStrategy = PrecisionTrendStructure
+BOT_STRATEGY_VERSION = "5.2"
+'''
+
+          main_entry = r'''"""Canonical HMA Gate Sentinel production runtime.
+
+Railway launches this file directly. Historical runtime layers have semantic
+module names and are loaded behind compatibility aliases so the proven live
+behavior is preserved without any ``main_v*.py`` files.
+"""
+from __future__ import annotations
+
+import asyncio
+import importlib
+import signal
+import sys
+
+_ENTRY_MODULE = sys.modules[__name__]
+
+# The oldest enhancement imports ``main`` as its base. Point that legacy name
+# at the renamed base runtime before importing the enhancement chain.
+_base = importlib.import_module("runtime_base")
+sys.modules["main"] = _base
+
+_ALIAS_ORDER = (
+    ("main_v3", "runtime_chart"),
+    ("main_v4", "runtime_management"),
+    ("main_v5", "runtime_two_stage"),
+    ("main_v7", "runtime_balanced"),
+    ("main_v8", "runtime_recovery"),
+    ("main_v9", "runtime_fx"),
+    ("main_v10", "runtime_sentinel"),
+    ("main_v11", "runtime_adaptive"),
+    ("main_v12", "runtime_clean"),
+    ("main_v13", "runtime_sr_entry"),
+    ("main_v14", "runtime_one_hour"),
+    ("main_v15", "runtime_smooth"),
+    ("main_v16", "runtime_gate"),
+)
+
+for _legacy_name, _module_name in _ALIAS_ORDER:
+    _module = importlib.import_module(_module_name)
+    sys.modules[_legacy_name] = _module
+
+_latest = sys.modules["main_v16"]
+Bot = _latest.Bot
+BOT_VERSION = "5.2"
+BOT_NAME = "HMA Gate Sentinel"
+
+# When imported for tests/tools, restore this canonical module under ``main``.
+# Runtime layers already retain direct references to runtime_base.
+if __name__ != "__main__":
+    sys.modules["main"] = _ENTRY_MODULE
+
+
+async def _main() -> None:
+    bot = Bot()
+    loop = asyncio.get_running_loop()
+    for sig_name in ("SIGINT", "SIGTERM"):
+        try:
+            loop.add_signal_handler(
+                getattr(signal, sig_name),
+                lambda: asyncio.ensure_future(bot.stop()),
+            )
+        except (NotImplementedError, AttributeError):
+            pass
+
+    await bot.start()
+    try:
+        await bot.run_forever()
+    finally:
+        await bot.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
+'''
+
+          (root / 'strategy.py').write_text(strategy_entry, encoding='utf-8')
+          (root / 'main.py').write_text(main_entry, encoding='utf-8')
+
+          launcher = Path('launcher.py')
+          text = launcher.read_text(encoding='utf-8')
+          text = text.replace('argv = [sys.executable, "main_v16.py"]',
+                              'argv = [sys.executable, "main.py"]')
+          text = text.replace('hma_bot/main_v16.py', 'hma_bot/main.py')
+          launcher.write_text(text, encoding='utf-8')
+
+          leftovers = sorted(root.glob('main_v*.py')) + sorted(root.glob('strategy_v*.py'))
+          if leftovers:
+              raise SystemExit('version files remain: ' + ', '.join(map(str, leftovers)))
+          PY
+
+      - name: Validate imports and syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile hma_bot/*.py launcher.py
+          (
+            cd hma_bot
+            python - <<'PY'
+          import main
+          import strategy
+          assert main.Bot is not None
+          assert strategy.PrecisionTrendStructure is not None
+          print('HMA canonical import OK:', main.BOT_VERSION, strategy.BOT_STRATEGY_VERSION)
+          PY
+          )
+          MODE=hma LAUNCHER_DRY_RUN=1 python launcher.py
+          test -z "$(find hma_bot -maxdepth 1 -type f \( -name 'main_v*.py' -o -name 'strategy_v*.py' \) -print -quit)"
+
+      - name: Commit flattened production layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/hma_flatten.yml
+          git add hma_bot launcher.py
+          git commit -m "Flatten HMA production modules and remove version files"
+          git push origin HEAD:claude/railway-trading-bot-kvn686
