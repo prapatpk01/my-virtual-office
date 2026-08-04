@@ -1,7 +1,7 @@
 name: HMA one-time production flatten
 
 on:
-  push:
+  pull_request:
     branches:
       - claude/railway-trading-bot-kvn686
     paths:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: claude/railway-trading-bot-kvn686
+          ref: claude/hma-flatten-cleanup
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -79,8 +79,6 @@ from __future__ import annotations
 import importlib
 import sys
 
-# Publish the original stable API first because the first enhancement module
-# imports ``strategy`` while this canonical module is still initializing.
 import strategy_base as _base
 for _name, _value in vars(_base).items():
     if not _name.startswith("__"):
@@ -107,7 +105,6 @@ for _name, _value in vars(_latest).items():
     if not _name.startswith("__"):
         globals()[_name] = _value
 
-# Stable names for all future code.
 PrecisionTrendStructure = _latest.PrecisionTrendStructureV12
 MTFStructureStrategy = PrecisionTrendStructure
 BOT_STRATEGY_VERSION = "5.2"
@@ -127,9 +124,6 @@ import signal
 import sys
 
 _ENTRY_MODULE = sys.modules[__name__]
-
-# The oldest enhancement imports ``main`` as its base. Point that legacy name
-# at the renamed base runtime before importing the enhancement chain.
 _base = importlib.import_module("runtime_base")
 sys.modules["main"] = _base
 
@@ -158,8 +152,6 @@ Bot = _latest.Bot
 BOT_VERSION = "5.2"
 BOT_NAME = "HMA Gate Sentinel"
 
-# When imported for tests/tools, restore this canonical module under ``main``.
-# Runtime layers already retain direct references to runtime_base.
 if __name__ != "__main__":
     sys.modules["main"] = _ENTRY_MODULE
 
@@ -229,4 +221,4 @@ if __name__ == "__main__":
           git rm .github/workflows/hma_flatten.yml
           git add hma_bot launcher.py
           git commit -m "Flatten HMA production modules and remove version files"
-          git push origin HEAD:claude/railway-trading-bot-kvn686
+          git push origin HEAD:claude/hma-flatten-cleanup
