@@ -21,6 +21,35 @@ class Bot(v15.Bot):
         self.strat = S.PrecisionTrendStructureV12(self.cfg.strategy_config())
         self._shutdown_requested = False
         self._client_closed = False
+        self._risk_symbol = ""
+
+        # XAU needs more breathing room than crypto on 5M execution. Keep the
+        # structure-selected direction, but enforce a 15M ATR floor/cap for the
+        # actual stop used by status, risk validation and live order creation.
+        original_risk_plan = self.strat._risk_plan
+
+        def adaptive_risk_plan(decision, df15, df5):
+            plan = original_risk_plan(decision, df15, df5)
+            if plan is None:
+                return None
+
+            entry, sl, tp, atr15, structure_level, rr = plan
+            symbol = str(self._risk_symbol).upper()
+            if symbol.startswith("XAU") and atr15 > 0:
+                min_atr = 1.20
+                max_atr = 1.80
+                raw_distance = abs(float(entry) - float(sl))
+                stop_distance = max(min_atr * atr15, min(raw_distance, max_atr * atr15))
+                sl = (
+                    float(entry) - stop_distance
+                    if decision.side == S.Side.LONG
+                    else float(entry) + stop_distance
+                )
+                rr = abs(float(tp) - float(entry)) / max(stop_distance, 1e-12)
+
+            return entry, sl, tp, atr15, structure_level, rr
+
+        self.strat._risk_plan = adaptive_risk_plan
 
     def request_shutdown(self) -> None:
         """Ask the loops to finish without closing OKX underneath active work."""
@@ -88,6 +117,7 @@ class Bot(v15.Bot):
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
+            self._risk_symbol = symbol
             if self.open_position_count() >= self.cfg.max_positions:
                 self._view[symbol] = f"POSITION LIMIT | MAX {self.cfg.max_positions}"
                 return
@@ -98,6 +128,10 @@ class Bot(v15.Bot):
             )
         except Exception as exc:
             self._view[symbol] = f"view error: {str(exc)[:140]}"
+
+    async def _look_for_entry(self, symbol: str, st: dict):
+        self._risk_symbol = symbol
+        return await super()._look_for_entry(symbol, st)
 
     async def start(self):
         problems = self.cfg.validate_live()
@@ -136,6 +170,7 @@ class Bot(v15.Bot):
                 f"`Layer 2 · 15M Setup` S/R within `{self.strat.setup_proximity_atr:.2f} ATR` or aligned EMA20 pullback\n"
                 f"`Layer 3 · 5M Trigger` EMA8/13, BOS/CHOCH or continuation within `{self.strat.exec_trigger_lookback}` closed bars\n"
                 f"`Risk Check` Room `≥{self.strat.min_room_atr:.2f} ATR` and actual R:R `≥{self.strat.min_actual_rr:.2f}`\n"
+                "`XAU Stop` 15M structure with `1.20–1.80 ATR` distance\n"
                 "4H and Confidence are diagnostic only; neither can block an entry.\n"
                 "Risk management: Stage 1 `+0.7%→lock +0.4%` | Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
                 "Schedule: `FX 24/5 new entries` | Existing positions managed `24/7`\n"
@@ -144,7 +179,8 @@ class Bot(v15.Bot):
 
         _LOG.info(
             "HMA Simple Sentinel startup complete: 3 layers + 1 risk check; "
-            "status and order creation use the same decision"
+            "XAU structure stop uses 1.20-1.80 ATR; status and order creation "
+            "use the same decision"
         )
 
 
