@@ -1,4 +1,4 @@
-"""HMA Expert MTF V5.2 — gate-based Sentinel production runtime.
+"""HMA Gate Sentinel production runtime.
 
 Startup is standalone so Telegram receives one authoritative message only.
 """
@@ -20,12 +20,12 @@ class Bot(v15.Bot):
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
             if self.open_position_count() >= self.cfg.max_positions:
-                self._view[symbol] = f"V5.2 POSITION LIMIT | MAX {self.cfg.max_positions}"
+                self._view[symbol] = f"POSITION LIMIT | MAX {self.cfg.max_positions}"
                 return
             px = float(df5["close"].iloc[-1]) if len(df5) else 0.0
             self._view[symbol] = f"5M px={px:.6g} | {self.strat.entry_status(df4h, df1h, df15, df5)}"
         except Exception as exc:
-            self._view[symbol] = f"V5.2 view error: {str(exc)[:140]}"
+            self._view[symbol] = f"view error: {str(exc)[:140]}"
 
     async def start(self):
         problems = self.cfg.validate_live()
@@ -38,7 +38,7 @@ class Bot(v15.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== HMA V5.2 GATE SENTINEL [%s] symbols=%s margin=$%.2f "
+            "=== HMA GATE SENTINEL [%s] symbols=%s margin=$%.2f "
             "leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE",
             self.cfg.symbols,
@@ -55,27 +55,28 @@ class Bot(v15.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"🧭 *HMA V5.2 Gate Sentinel — {mode}*\n"
+                f"🧭 *HMA Gate Sentinel — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
-                "Authoritative entry gates:\n"
-                "`G1` 1H direction (`score ≥60`, edge confirmed)\n"
-                "`G2` 1H quality (`Q`, ADX/CHOP and soft-DMI alignment)\n"
-                "`G3` 15M Sentinel location (`LONG S1/S2 · SHORT R1/R2`)\n"
-                "`G4` Structural room (`≥0.70 ATR`)\n"
-                "`G5` Recent closed-5M trigger (`EMA8/13 · BOS/CHOCH · continuation`)\n"
+                "Single authoritative entry pipeline:\n"
+                f"`Direction` 1H score `≥{self.strat.one_h_early_min:.0f}` and edge `≥{self.strat.one_h_direction_edge_min:.0f}`\n"
+                f"`Quality` Q `≥{self.strat.quality_min:.0f}`; EARLY Q `≥{self.strat.early_quality_min:.0f}`; DMI is a soft veto\n"
+                "`Location` LONG at S1/S2 · SHORT at R1/R2; EARLY S1/R1 requires confirmation and Location ≥70\n"
+                f"`Room` at least `{self.strat.sentinel_min_room_atr:.2f} ATR`\n"
+                f"`Trigger` recent `{self.strat.exec_trigger_lookback}` closed 5M bars: EMA8/13, BOS/CHOCH or continuation\n"
+                f"`Risk` actual R:R `≥{self.strat.min_actual_rr:.2f}`\n"
                 "4H is informational soft macro context only and never blocks entry.\n"
-                "Confidence is displayed for diagnosis only — it is no longer an entry gate.\n"
-                "S1/R1 and corridor require rejection/demand-supply or liquidity sweep; "
-                "EARLY trend uses deep S2/R2 only.\n"
-                "Risk: `15M structure + ATR buffer` | Stage 1 `+0.7%→lock +0.4%` "
-                "| Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
+                "Confidence is diagnostic only and is not an entry gate.\n"
+                "Risk management: Stage 1 `+0.7%→lock +0.4%` | Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
                 "Schedule: `FX 24/5 new entries` | Existing positions managed `24/7`\n"
                 "Recovery: `OKX-native SL/TP synchronised after restart`"
             )
 
-        _LOG.info("HMA V5.2 startup complete: gate logic active; one notification only")
+        _LOG.info(
+            "HMA startup complete: status and real order creation use one decision; "
+            "legacy hidden entry gates disabled"
+        )
 
 
 async def _main():
