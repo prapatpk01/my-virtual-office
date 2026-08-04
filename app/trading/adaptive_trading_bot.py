@@ -10,13 +10,7 @@ BODY_MAX=float(os.getenv("V132_BODY_MAX_ATR","1.20")); ROOM_MIN=float(os.getenv(
 SL_BUFFER=float(os.getenv("V132_SL_ATR_BUFFER","0.15")); TP_R=float(os.getenv("V132_TP_R","2.00"))
 BE_R=float(os.getenv("V132_BE_TRIGGER_R","1.00")); PULLBACK_WINDOW=int(os.getenv("V132_PULLBACK_WINDOW","3"))
 CROSS_WINDOW=int(os.getenv("V132_CROSS_WINDOW","2")); CONTINUATION_ADX=float(os.getenv("V132_CONTINUATION_ADX","24"))
-# [RISK] Swing-based stops alone produced a 0.37% MEDIAN stop distance in a
-# 6-month replay (min 0.0025%) — far inside 15m noise, so ~35% of trades died
-# on SL. Never allow a stop tighter than this fraction of entry price.
 MIN_SL_PCT=float(os.getenv("V132_MIN_SL_PCT","0.012"))
-# [RISK] Size from RISK, not from a fixed notional. Fixed notional made the $
-# risk swing 1000x across trades ($0.01-$12.76) because it ignored stop
-# distance. size = RISK_USDT / stop_distance, capped by the margin budget.
 RISK_USDT=float(os.getenv("V132_RISK_USDT","5.0"))
 
 @dataclass
@@ -28,6 +22,7 @@ class TradingBot:
         self.symbol=symbol; self.margin_usdt=float(margin_usdt); self.leverage=int(leverage); self.paper=bool(paper)
         self.risk_usdt=float(risk_usdt)
         self.state_file=state_file; self.execution_callback=execution_callback; self.position:Optional[Position]=None; self.last_signal="WARMUP"
+        self._last_i4:Dict={}
         self.counts={k:0 for k in ("scans","entries","4H","1H","CHASE","LOCATION","TRIGGER","ROOM")}; self.load_state()
     @property
     def position_open(self): return self.position is not None
@@ -46,8 +41,18 @@ class TradingBot:
         os.replace(tmp,self.state_file)
     @staticmethod
     def _macro(i4:Dict)->str:
-        if i4["close"]>i4["ema20"]>i4["ema50"] and i4["ema20_slope_atr"]>=SLOPE_MIN: return "BULL"
-        if i4["close"]<i4["ema20"]<i4["ema50"] and i4["ema20_slope_atr"]<=-SLOPE_MIN: return "BEAR"
+        bull=(
+            i4["ema20"]>i4["ema50"]
+            and i4["ema20_slope_atr"]>=SLOPE_MIN
+            and bool(i4.get("macd_bull",False))
+        )
+        bear=(
+            i4["ema20"]<i4["ema50"]
+            and i4["ema20_slope_atr"]<=-SLOPE_MIN
+            and bool(i4.get("macd_bear",False))
+        )
+        if bull: return "BULL"
+        if bear: return "BEAR"
         return "NEUTRAL"
     @staticmethod
     def _context(i1:Dict,direction:str)->bool:
@@ -55,13 +60,15 @@ class TradingBot:
         if direction=="LONG": return quality and i1["close"]>i1["ema20"]>i1["ema50"] and i1["ema20_slope_atr"]>0 and i1["structure"]!="BEAR"
         return quality and i1["close"]<i1["ema20"]<i1["ema50"] and i1["ema20_slope_atr"]<0 and i1["structure"]!="BULL"
     def _debug(self,macro,i15,i1,direction,result,reason,setup="-"):
-        return (f"DECISION symbol={self.symbol} tf=15m | 4H[macro={macro}] | 1H[adx={i1['adx']:.1f}/{ADX_MIN:.1f},chop={i1['chop']:.1f}/{CHOP_MAX:.1f},structure={i1['structure']}] "
+        i4=self._last_i4
+        macd=f"macd={float(i4.get('macd',0)):+.5f},signal={float(i4.get('macd_signal',0)):+.5f},hist={float(i4.get('macd_hist',0)):+.5f}"
+        ema=f"ema20/50={'BULL' if i4.get('ema20',0)>i4.get('ema50',0) else 'BEAR' if i4.get('ema20',0)<i4.get('ema50',0) else 'FLAT'},slope={float(i4.get('ema20_slope_atr',0)):+.2f}/{SLOPE_MIN:.2f}ATR"
+        return (f"DECISION symbol={self.symbol} tf=15m | 4H[macro={macro},{ema},{macd}] | 1H[adx={i1['adx']:.1f}/{ADX_MIN:.1f},chop={i1['chop']:.1f}/{CHOP_MAX:.1f},structure={i1['structure']}] "
                 f"| 15M[ext={i15['extension_atr']:.2f}/{EXT_MAX:.2f},body={i15['body_atr']:.2f}/{BODY_MAX:.2f},structure={i15['structure']}] | SETUP[{direction}:{setup}] | RESULT[{result}:{reason}] "
                 f"| COUNTERS[scans={self.counts['scans']},entries={self.counts['entries']},4H={self.counts['4H']},1H={self.counts['1H']},chase={self.counts['CHASE']},location={self.counts['LOCATION']},trigger={self.counts['TRIGGER']},room={self.counts['ROOM']}]" )
     def _build(self,direction,entry,i15,strategy,trigger)->Optional[Dict]:
         a=max(float(i15["atr"]),entry*0.0005); floor=MIN_SL_PCT*entry
         if direction=="LONG":
-            # Widen to the floor when the swing stop sits inside 15m noise.
             sl=min(float(i15["last_swing_low"])-SL_BUFFER*a, entry-floor)
             if sl>=entry: return None
             risk=entry-sl; opposing=float(i15["last_swing_high"]); room=(opposing-entry)/max(risk,1e-12)
@@ -73,15 +80,13 @@ class TradingBot:
             risk=sl-entry; opposing=float(i15["last_swing_low"]); room=(entry-opposing)/max(risk,1e-12)
             if opposing<entry and room<ROOM_MIN: return None
             tp=entry-TP_R*risk
-        # Risk-first sizing: every trade risks ~RISK_USDT at its stop. The
-        # margin budget stays a hard notional cap so leverage never blows out.
         size=min(self.risk_usdt/max(risk,1e-12), (self.margin_usdt*self.leverage)/max(entry,1e-12))
         if size<=0: return None
         return {"direction":direction,"strategy":strategy,"trigger":trigger,"entry":entry,"sl":sl,"tp":tp,"room_r":room,
                 "size":size,"risk_usdt":size*risk,"sl_pct":100*risk/max(entry,1e-12)}
     def _signal(self,i15:Dict,i1:Dict,i4:Dict)->Optional[Dict]:
-        self.counts["scans"]+=1; macro=self._macro(i4); close=float(i15["close"])
-        if macro=="NEUTRAL": self.counts["4H"]+=1; self.last_signal=self._debug(macro,i15,i1,"NONE","WAIT","4H_NEUTRAL"); return None
+        self.counts["scans"]+=1; self._last_i4=i4; macro=self._macro(i4); close=float(i15["close"])
+        if macro=="NEUTRAL": self.counts["4H"]+=1; self.last_signal=self._debug(macro,i15,i1,"NONE","WAIT","4H_EMA_SLOPE_MACD_NOT_ALIGNED"); return None
         direction="LONG" if macro=="BULL" else "SHORT"
         if not self._context(i1,direction): self.counts["1H"]+=1; self.last_signal=self._debug(macro,i15,i1,direction,"WAIT","1H_CONTEXT"); return None
         if i15["body_atr"]>BODY_MAX or i15["extension_atr"]>EXT_MAX:
@@ -121,9 +126,6 @@ class TradingBot:
         risk=abs(p.entry-p.initial_sl)
         return ((price-p.entry)/max(risk,1e-12)) if p.direction=="LONG" else ((p.entry-price)/max(risk,1e-12))
     def check_price(self,price:float)->Optional[Dict]:
-        """Price-only protection (BE move / SL / TP). Safe to call on EVERY
-        poll — needs no indicators — so a spike between 15m closes is acted on
-        instead of waiting up to 15 minutes for the next bar."""
         p=self.position
         if not p: return None
         r=self.current_r(price)
@@ -132,9 +134,6 @@ class TradingBot:
         if (price>=p.tp if p.direction=="LONG" else price<=p.tp): return self._close(price,"TP")
         return None
     def reconcile_flat(self,price:float,reason:str="EXCHANGE_CLOSED")->Optional[Dict]:
-        """The exchange reports no position while we think one is open (its
-        attached SL/TP fired, or it was closed by hand). Record the close
-        locally WITHOUT sending another order, so state can't drift."""
         p=self.position
         if not p: return None
         pnl=(price-p.entry)*p.size if p.direction=="LONG" else (p.entry-price)*p.size
