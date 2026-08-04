@@ -20,6 +20,21 @@ from .trend_confirm_wt_strategy import TrendConfirmWTStrategy
 class TrendConfirmWTFixedStrategy(TrendConfirmWTStrategy):
     """Trend Confirm with a real, NaN-safe 15M WaveTrend oscillator."""
 
+    def __init__(
+        self,
+        symbol: str,
+        params: Optional[dict] = None,
+        wt_overbought: float = 48.0,
+        **kwargs,
+    ):
+        # Long remains oversold <= -45. Short is now overbought >= +48.
+        super().__init__(
+            symbol=symbol,
+            params=params,
+            wt_overbought=wt_overbought,
+            **kwargs,
+        )
+
     @staticmethod
     def _ema_finite(values, period: int) -> np.ndarray:
         """EMA that starts after `period` finite observations.
