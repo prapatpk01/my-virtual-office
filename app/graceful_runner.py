@@ -7,15 +7,109 @@ import logging
 from typing import Any
 
 import run_bot
+import trading.adaptive_trading_bot as strategy
 from trading.connectors.binance_conn import BinanceConnector
 
-# Force all runtime logs to use the current strategy name even though the
-# legacy run_bot module filename is retained for Railway compatibility.
+# Keep the legacy run_bot filename for Railway compatibility, but expose only
+# the current strategy name in runtime logs and Telegram metadata.
 run_bot.BUILD_ID = "adaptive-momentum-v3-2026-08-06"
 run_bot.logger = logging.getLogger("adaptive_momentum_v3")
 
 logger = logging.getLogger("adaptive_momentum_v3_shutdown")
 _TRACKED: list[Any] = []
+
+
+def _install_readable_logs() -> None:
+    """Replace the dense raw debug dump with a gate-by-gate summary."""
+    bot_class = run_bot.TradingBot
+    original = bot_class._debug
+    if getattr(original, "_momentum_v3_readable", False):
+        return
+
+    gate_order = [
+        "trend", "cross", "macd", "hist", "adx", "chop", "structure", "location"
+    ]
+    reason_gate = {
+        "EMA20_50_TREND": "trend",
+        "EMA8_13_CROSS": "cross",
+        "MACD_SIGNAL": "macd",
+        "MACD_HIST_2BAR_EXPANSION": "hist",
+        "ADX_NOT_STRONG_RISING": "adx",
+        "CHOP_TOO_HIGH": "chop",
+        "STRUCTURE_BREAK": "structure",
+        "LOCATION": "location",
+        "COOLDOWN": "cooldown",
+        "RISK_BUILD": "risk",
+    }
+
+    def readable(self: Any, i15: dict, result: str, reason: str) -> str:
+        direction = "LONG" if bool(i15.get("trend_bull")) else "SHORT" if bool(i15.get("trend_bear")) else "NONE"
+        failed_gate = reason_gate.get(reason)
+        fail_index = gate_order.index(failed_gate) if failed_gate in gate_order else len(gate_order)
+
+        def icon(gate: str) -> str:
+            index = gate_order.index(gate)
+            if result == "ENTRY":
+                return "✅"
+            if failed_gate == gate:
+                return "❌"
+            if index < fail_index:
+                return "✅"
+            return "➖"
+
+        cross_side = "UP" if direction == "LONG" else "DOWN"
+        macd_side = "ABOVE" if direction == "LONG" else "BELOW"
+        structure_level = float(i15.get("recent_high", 0)) if direction == "LONG" else float(i15.get("recent_low", 0))
+        location = float(i15.get("distance_ema13_atr", 0))
+        adx = float(i15.get("adx", 0))
+        chop = float(i15.get("chop", 0))
+
+        details = {
+            "trend": f"EMA20 {'>' if direction == 'LONG' else '<' if direction == 'SHORT' else '?'} EMA50",
+            "cross": f"EMA8/13 fresh cross {cross_side}",
+            "macd": f"MACD {macd_side} Signal",
+            "hist": "Histogram expanding 2 bars",
+            "adx": f"ADX {adx:.1f} (need ≥{strategy.ADX_MIN:g} and rising)",
+            "chop": f"CHOP {chop:.1f} (need ≤{strategy.CHOP_MAX:g})",
+            "structure": f"Structure break @ {structure_level:.6f}",
+            "location": f"Distance {location:.2f} ATR (max {strategy.LOCATION_MAX_ATR:g})",
+        }
+        labels = {
+            "trend": "TREND", "cross": "EMA8/13", "macd": "MACD",
+            "hist": "HISTOGRAM", "adx": "ADX", "chop": "CHOP",
+            "structure": "STRUCTURE", "location": "LOCATION",
+        }
+        lines = [
+            f"MOMENTUM V3 | {self.symbol} | 15M | Direction: {direction}",
+        ]
+        for gate in gate_order:
+            lines.append(f"{icon(gate)} {labels[gate]} — {details[gate]}")
+
+        if reason == "COOLDOWN":
+            lines.append(f"⏳ COOLDOWN — {self.cooldown_remaining} bars remaining")
+        elif reason == "RISK_BUILD":
+            lines.append("❌ RISK — unable to build valid SL/size")
+
+        readable_reason = {
+            "EMA20_50_TREND": "WAIT TREND",
+            "EMA8_13_CROSS": "WAIT EMA CROSS",
+            "MACD_SIGNAL": "WAIT MACD",
+            "MACD_HIST_2BAR_EXPANSION": "WAIT HISTOGRAM EXPANSION",
+            "ADX_NOT_STRONG_RISING": "WAIT ADX",
+            "CHOP_TOO_HIGH": "WAIT CHOP",
+            "STRUCTURE_BREAK": "WAIT STRUCTURE BREAK",
+            "LOCATION": "WAIT LOCATION",
+            "COOLDOWN": "WAIT COOLDOWN",
+            "RISK_BUILD": "WAIT RISK BUILD",
+            "LONG": "ENTRY LONG",
+            "SHORT": "ENTRY SHORT",
+        }.get(reason, f"{result} {reason}")
+        lines.append(f"RESULT: {readable_reason}")
+        return "\n".join(lines)
+
+    readable._momentum_v3_readable = True  # type: ignore[attr-defined]
+    bot_class._debug = readable
+    logger.info("Installed Momentum v3 gate-by-gate readable logs")
 
 
 def _track_class(cls: type) -> None:
@@ -65,6 +159,7 @@ async def _close_resource(resource: Any) -> None:
 
 
 async def main() -> None:
+    _install_readable_logs()
     _track_class(BinanceConnector)
 
     try:
