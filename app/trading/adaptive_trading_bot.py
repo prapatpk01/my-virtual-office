@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Callable, Dict, Optional
 import json
+import logging
 import os
+import sys
 import time
 
 TP1_R = float(os.getenv("MOM_TP1_R", "1.0"))
@@ -63,7 +65,20 @@ class TradingBot:
             "scans", "entries", "cooldown", "trend", "cross", "macd",
             "hist", "adx", "chop", "structure", "location"
         )}
+        self._apply_runtime_identity()
         self.load_state()
+
+    @staticmethod
+    def _apply_runtime_identity() -> None:
+        """Rename the legacy runner logger/build without depending on its entrypoint."""
+        try:
+            runner = sys.modules.get("run_bot") or sys.modules.get("__main__")
+            if runner is not None and hasattr(runner, "logger"):
+                runner.logger = logging.getLogger("adaptive_momentum_v3")
+            if runner is not None and hasattr(runner, "BUILD_ID"):
+                runner.BUILD_ID = "adaptive-momentum-v3-2026-08-06"
+        except Exception:
+            pass
 
     @property
     def position_open(self) -> bool:
@@ -98,8 +113,7 @@ class TradingBot:
         os.replace(temp, self.state_file)
 
     def _debug(self, i15: Dict, result: str, reason: str) -> str:
-        """Human-readable ordered gate log; no raw indicator dump or counters."""
-        gate_order = ["trend", "cross", "macd", "hist", "adx", "chop", "structure", "location"]
+        """One scan produces exactly one Railway log line."""
         reason_gate = {
             "EMA20_50_TREND": "trend",
             "EMA8_13_CROSS": "cross",
@@ -110,69 +124,69 @@ class TradingBot:
             "STRUCTURE_BREAK": "structure",
             "LOCATION": "location",
         }
+        gate_order = ["trend", "cross", "macd", "hist", "adx", "chop", "structure", "location"]
         failed_gate = reason_gate.get(reason)
         failed_index = gate_order.index(failed_gate) if failed_gate in gate_order else len(gate_order)
 
         trend_bull = bool(i15.get("trend_bull"))
         trend_bear = bool(i15.get("trend_bear"))
         direction = "LONG" if trend_bull else "SHORT" if trend_bear else "NEUTRAL"
+        symbol = self.symbol.split("/")[0]
         is_long = direction == "LONG"
 
-        details = {
-            "trend": f"EMA20 {'>' if is_long else '<' if trend_bear else '≈'} EMA50",
-            "cross": f"fresh {'UP' if is_long else 'DOWN'} cross",
-            "macd": f"line {'above' if is_long else 'below'} signal",
-            "hist": "expanding 2 bars",
-            "adx": f"{float(i15.get('adx', 0.0)):.1f} (need ≥{ADX_MIN:g} + rising)",
-            "chop": f"{float(i15.get('chop', 100.0)):.1f} (max {CHOP_MAX:g})",
-            "structure": "break confirmed",
-            "location": f"{float(i15.get('distance_ema13_atr', 99.0)):.2f} ATR (max {LOCATION_MAX_ATR:g})",
-        }
-        labels = {
-            "trend": "TREND",
-            "cross": "EMA8/13",
-            "macd": "MACD",
-            "hist": "HISTOGRAM",
-            "adx": "ADX",
-            "chop": "CHOP",
-            "structure": "STRUCTURE",
-            "location": "LOCATION",
-        }
+        adx = float(i15.get("adx", 0.0))
+        chop = float(i15.get("chop", 100.0))
+        distance = float(i15.get("distance_ema13_atr", 99.0))
+        adx_rising = bool(i15.get("adx_rising"))
 
-        lines = [f"MOMENTUM V3 | {self.symbol} | 15M | Direction: {direction}"]
-        for index, gate in enumerate(gate_order):
-            if result == "ENTRY" or index < failed_index:
-                icon = "✅"
-            elif index == failed_index:
-                icon = "❌"
-            else:
-                icon = "➖"
-            lines.append(f"{icon} {labels[gate]} — {details[gate]}")
+        passed_text = {
+            "trend": f"✅ Trend EMA20 {'>' if is_long else '<'} EMA50",
+            "cross": f"✅ EMA8/13 {'UP' if is_long else 'DOWN'} cross",
+            "macd": f"✅ MACD {'>' if is_long else '<'} Signal",
+            "hist": "✅ Histogram expanding",
+            "adx": f"✅ ADX {adx:.1f} rising",
+            "chop": f"✅ CHOP {chop:.1f}",
+            "structure": "✅ Structure break",
+            "location": f"✅ Location {distance:.2f}ATR",
+        }
+        failed_text = {
+            "trend": "❌ No EMA20/50 trend",
+            "cross": f"❌ Wait fresh EMA8/13 {'UP' if is_long else 'DOWN'} cross",
+            "macd": f"❌ MACD not {'above' if is_long else 'below'} Signal",
+            "hist": "❌ Histogram not expanding 2 bars",
+            "adx": f"❌ ADX {adx:.1f}/{ADX_MIN:g} rising={'YES' if adx_rising else 'NO'}",
+            "chop": f"❌ CHOP {chop:.1f}>{CHOP_MAX:g}",
+            "structure": "❌ Wait structure break",
+            "location": f"❌ Location {distance:.2f}>{LOCATION_MAX_ATR:g}ATR",
+        }
 
         if reason == "COOLDOWN":
-            lines = [
-                f"MOMENTUM V3 | {self.symbol} | 15M",
-                f"⏳ COOLDOWN — {self.cooldown_remaining} bars remaining",
-            ]
-        elif reason == "RISK_BUILD":
-            lines.append("❌ RISK — unable to build valid SL/size")
+            return f"MOMENTUM V3 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bars · RESULT: WAIT"
+        if reason == "RISK_BUILD":
+            return f"MOMENTUM V3 · {symbol} · 15M · {direction} · ❌ Invalid SL/size · RESULT: WAIT RISK BUILD"
+
+        parts = [f"MOMENTUM V3 · {symbol} · 15M · {direction}"]
+        if result == "ENTRY":
+            parts.extend(passed_text[gate] for gate in gate_order)
+        else:
+            parts.extend(passed_text[gate] for gate in gate_order[:failed_index])
+            if failed_gate:
+                parts.append(failed_text[failed_gate])
 
         result_text = {
             "EMA20_50_TREND": "WAIT TREND",
             "EMA8_13_CROSS": "WAIT EMA CROSS",
-            "MACD_SIGNAL": "WAIT MACD SIGNAL",
-            "MACD_HIST_2BAR_EXPANSION": "WAIT HISTOGRAM EXPANSION",
+            "MACD_SIGNAL": "WAIT MACD",
+            "MACD_HIST_2BAR_EXPANSION": "WAIT HISTOGRAM",
             "ADX_NOT_STRONG_RISING": "WAIT ADX",
             "CHOP_TOO_HIGH": "WAIT CHOP",
-            "STRUCTURE_BREAK": "WAIT STRUCTURE BREAK",
+            "STRUCTURE_BREAK": "WAIT STRUCTURE",
             "LOCATION": "WAIT LOCATION",
-            "COOLDOWN": "WAIT COOLDOWN",
-            "RISK_BUILD": "WAIT RISK BUILD",
             "LONG": "ENTRY LONG",
             "SHORT": "ENTRY SHORT",
         }.get(reason, f"{result} {reason}")
-        lines.append(f"RESULT: {result_text}")
-        return "\n".join(lines)
+        parts.append(f"RESULT: {result_text}")
+        return " · ".join(parts)
 
     def _build(self, i15: Dict, direction: str):
         entry = float(i15["close"])
