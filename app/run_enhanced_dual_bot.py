@@ -6,6 +6,10 @@ One strategy family only:
 - Layer 3: 15M EMA8/13 cross OR WaveTrend extreme cross
 - 15M price must be on the correct side of EMA20
 
+WaveTrend entry extremes used in production:
+- Long cross from oversold <= -42
+- Short cross from overbought >= +45
+
 WT is an entry trigger inside Trend Confirm, not a second strategy. The existing
 filename and Railway start command are retained.
 """
@@ -28,7 +32,14 @@ def _make_merged_trend_confirm(symbols: list, config: dict):
         TrendConfirmWTFixedStrategy,
     )
 
-    return [TrendConfirmWTFixedStrategy(symbol) for symbol in symbols]
+    return [
+        TrendConfirmWTFixedStrategy(
+            symbol,
+            wt_oversold=-42.0,
+            wt_overbought=45.0,
+        )
+        for symbol in symbols
+    ]
 
 
 def _build_merged_config() -> dict:
@@ -46,6 +57,8 @@ def _build_merged_config() -> dict:
     config["enable_trend_confirm"] = True
     config["enable_wt_trend"] = False
     config["enable_ai_expert"] = False
+    config["wt_oversold"] = -42.0
+    config["wt_overbought"] = 45.0
     os.environ["CANDLE_TF"] = "15m"
     config["candle_tf"] = "15m"
     return config
