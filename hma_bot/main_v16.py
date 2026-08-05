@@ -10,6 +10,9 @@ Quality policy:
 
 The TPC trading logic is identical for every symbol. Asset profiles adjust
 only execution-zone width and the structure-stop ATR floor/cap.
+
+CTR is an isolated fallback engine. TPC is always evaluated first; CTR may
+only enter when TPC has no valid signal for that symbol and no position exists.
 """
 from __future__ import annotations
 
@@ -40,6 +43,13 @@ class Bot(v15.Bot):
         "XAG": {"zone_atr5": 0.30, "sl_min_atr15": 1.20, "sl_max_atr15": 1.90},
         "CL": {"zone_atr5": 0.30, "sl_min_atr15": 1.30, "sl_max_atr15": 2.00},
     }
+
+    CTR_MARGIN_MULTIPLIER = 0.40
+    CTR_MIN_Q = 55.0
+    CTR_MIN_TREND = 60.0
+    CTR_MAX_STOP_ATR15 = 1.00
+    CTR_MIN_RR = 0.80
+    CTR_MAX_TP_PCT = 0.007
 
     def __init__(self):
         super().__init__()
@@ -143,6 +153,22 @@ class Bot(v15.Bot):
 
         self.strat._risk_plan = adaptive_risk_plan
 
+        # Keep the primary TPC generator untouched. CTR is called only when
+        # TPC returns no signal, so the original entry logic remains dominant.
+        self._tpc_generate_entry = self.strat.generate_entry
+
+        def combined_generate_entry(
+            df4h, df1h, df15, df5, has_open_position: bool = False
+        ):
+            tpc_signal = self._tpc_generate_entry(
+                df4h, df1h, df15, df5, has_open_position=has_open_position
+            )
+            if tpc_signal is not None or has_open_position:
+                return tpc_signal
+            return self._ctr_generate_entry(df4h, df1h, df15, df5)
+
+        self.strat.generate_entry = combined_generate_entry
+
     @staticmethod
     def _base_symbol(symbol: str) -> str:
         text = str(symbol or "").upper().strip()
@@ -232,6 +258,200 @@ class Bot(v15.Bot):
         except Exception as exc:
             _LOG.debug("Quality diagnostics unavailable: %s", exc)
             return "QData=ERROR_BLOCKED"
+
+    @staticmethod
+    def _wma(values, length: int):
+        weights = np.arange(1, length + 1, dtype=float)
+        return values.rolling(length).apply(
+            lambda x: float(np.dot(x, weights) / weights.sum()), raw=True
+        )
+
+    @classmethod
+    def _hma16(cls, close):
+        half = cls._wma(close, 8)
+        full = cls._wma(close, 16)
+        return cls._wma(2.0 * half - full, 4)
+
+    @staticmethod
+    def _rsi14(close) -> float:
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rs = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        value = float(rsi.iloc[-1])
+        return value if math.isfinite(value) else 50.0
+
+    def _ctr_generate_entry(self, df4h, df1h, df15, df5):
+        """Create a small, short-horizon counter-trend signal.
+
+        This does not modify TPC. It requires an established 1H trend, an
+        opposing S/R extreme, HMA16 reversal and at least two exhaustion clues.
+        """
+        if len(df1h) < 60 or len(df15) < 90 or len(df5) < 20:
+            return None
+
+        primary, quality = self.strat._simple_direction(df1h)
+        if (
+            primary.side is None
+            or primary.score < self.CTR_MIN_TREND
+            or quality.q < self.CTR_MIN_Q
+        ):
+            return None
+
+        counter_side = (
+            S.Side.SHORT if primary.side == S.Side.LONG else S.Side.LONG
+        )
+        context = build_context(
+            df15=df15,
+            df1h=df1h,
+            df4h=df4h,
+            side="short" if counter_side == S.Side.SHORT else "long",
+        )
+        levels = self.strat._side_levels(context.location, counter_side)
+        if not levels:
+            return None
+
+        d15 = df15.copy()
+        d15["atr"] = self.strat._atr(d15, self.strat.cfg.atr_len)
+        close = d15["close"].astype(float)
+        atr15 = float(d15["atr"].iloc[-1])
+        if not math.isfinite(atr15) or atr15 <= 0.0:
+            return None
+
+        hma = self._hma16(close)
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        basis = close.rolling(20).mean()
+        std = close.rolling(20).std(ddof=0)
+        upper = basis + 2.0 * std
+        lower = basis - 2.0 * std
+        values = [hma.iloc[-1], hma.iloc[-2], ema20.iloc[-1], upper.iloc[-1], lower.iloc[-1]]
+        if not all(math.isfinite(float(v)) for v in values):
+            return None
+
+        current = d15.iloc[-1]
+        previous = d15.iloc[-2]
+        entry = float(current["close"])
+        zone = max(float(self._active_profile["zone_atr5"]) * atr15, abs(entry) * 1e-6)
+
+        candidates = []
+        for name, level in levels:
+            if counter_side == S.Side.SHORT:
+                touched = max(float(current["high"]), float(previous["high"])) >= level - zone
+                valid_side = entry <= level + zone
+            else:
+                touched = min(float(current["low"]), float(previous["low"])) <= level + zone
+                valid_side = entry >= level - zone
+            if touched and valid_side:
+                candidates.append((name, float(level), abs(entry - float(level))))
+        if not candidates:
+            return None
+        level_name, level, _ = min(candidates, key=lambda item: item[2])
+
+        body = abs(float(current["close"]) - float(current["open"]))
+        candle_range = max(float(current["high"]) - float(current["low"]), 1e-12)
+        upper_wick = float(current["high"]) - max(float(current["open"]), float(current["close"]))
+        lower_wick = min(float(current["open"]), float(current["close"])) - float(current["low"])
+
+        recent_high = float(d15["high"].iloc[-3:].max())
+        recent_low = float(d15["low"].iloc[-3:].min())
+        rsi = self._rsi14(close)
+
+        if counter_side == S.Side.SHORT:
+            hma_flip = entry < float(hma.iloc[-1]) and float(hma.iloc[-1]) < float(hma.iloc[-2])
+            rejection = (
+                float(current["close"]) < float(current["open"])
+                or upper_wick >= max(body, 0.30 * candle_range)
+            )
+            exhaustion = [
+                (recent_high - float(ema20.iloc[-1])) / atr15 >= 1.20,
+                (recent_high - float(hma.iloc[-1])) / atr15 >= 0.80,
+                rsi >= 68.0,
+                recent_high >= float(upper.iloc[-1]),
+            ]
+            if not hma_flip or not rejection:
+                return None
+            required = 3 if quality.q >= 85.0 else 2
+            if sum(bool(x) for x in exhaustion) < required:
+                return None
+            raw_sl = max(level, float(d15["high"].iloc[-5:].max())) + 0.15 * atr15
+            risk = raw_sl - entry
+            if risk <= 0.0 or risk > self.CTR_MAX_STOP_ATR15 * atr15:
+                return None
+            risk = max(risk, 0.35 * atr15)
+            sl = entry + risk
+            reward = min(risk, entry * self.CTR_MAX_TP_PCT)
+            ema_reward = entry - float(ema20.iloc[-1])
+            if 0.80 * risk <= ema_reward <= reward:
+                reward = ema_reward
+            rr = reward / max(risk, 1e-12)
+            if rr < self.CTR_MIN_RR:
+                return None
+            tp = entry - reward
+            trigger = f"CTR_{level_name}_HMA16_REJECTION_SHORT"
+            compat_trend = S.Trend.BULL
+        else:
+            hma_flip = entry > float(hma.iloc[-1]) and float(hma.iloc[-1]) > float(hma.iloc[-2])
+            rejection = (
+                float(current["close"]) > float(current["open"])
+                or lower_wick >= max(body, 0.30 * candle_range)
+            )
+            exhaustion = [
+                (float(ema20.iloc[-1]) - recent_low) / atr15 >= 1.20,
+                (float(hma.iloc[-1]) - recent_low) / atr15 >= 0.80,
+                rsi <= 32.0,
+                recent_low <= float(lower.iloc[-1]),
+            ]
+            if not hma_flip or not rejection:
+                return None
+            required = 3 if quality.q >= 85.0 else 2
+            if sum(bool(x) for x in exhaustion) < required:
+                return None
+            raw_sl = min(level, float(d15["low"].iloc[-5:].min())) - 0.15 * atr15
+            risk = entry - raw_sl
+            if risk <= 0.0 or risk > self.CTR_MAX_STOP_ATR15 * atr15:
+                return None
+            risk = max(risk, 0.35 * atr15)
+            sl = entry - risk
+            reward = min(risk, entry * self.CTR_MAX_TP_PCT)
+            ema_reward = float(ema20.iloc[-1]) - entry
+            if 0.80 * risk <= ema_reward <= reward:
+                reward = ema_reward
+            rr = reward / max(risk, 1e-12)
+            if rr < self.CTR_MIN_RR:
+                return None
+            tp = entry + reward
+            trigger = f"CTR_{level_name}_HMA16_REJECTION_LONG"
+            compat_trend = S.Trend.BEAR
+
+        setup = self.strat._setup_from_context(context)
+        if setup is None:
+            return None
+        structure_level = level
+        room_pct = abs(tp - entry) / max(entry, 1e-12)
+        reason = (
+            f"CTR Counter-Trend Reversion {counter_side.value} | "
+            f"primary 1H {primary.side.value} Trend {primary.score:.0f} "
+            f"Q {quality.q:.0f} | 15M {level_name} rejection | "
+            f"HMA16 flip | exhaustion {sum(bool(x) for x in exhaustion)}/4 | "
+            f"RR {rr:.2f} | margin {self.CTR_MARGIN_MULTIPLIER:.0%} of TPC"
+        )
+        return S.EntrySignal(
+            side=counter_side,
+            entry_price=entry,
+            stop_loss=sl,
+            take_profit=tp,
+            trend_4h=compat_trend,
+            q_1h=quality.q,
+            adx_1h=quality.adx,
+            chop_1h=quality.chop,
+            setup=setup,
+            trigger=trigger,
+            room_pct=room_pct,
+            atr15=atr15,
+            structure_level=structure_level,
+            reason=reason,
+        )
 
     def request_shutdown(self) -> None:
         if not self._shutdown_requested:
@@ -343,17 +563,37 @@ class Bot(v15.Bot):
             zone = self._entry_zone_status(df5, df15, df1h, df4h)
             q = self._quality_status(df1h)
             status = self.strat.entry_status(df4h, df1h, df15, df5)
+            ctr = self._ctr_generate_entry(df4h, df1h, df15, df5)
+            ctr_part = "CTR=READY" if ctr is not None else "CTR=WAIT"
             zone_part = f" | {zone}" if zone else ""
             self._view[symbol] = (
                 f"5M px={px:.6g} | {self._asset_profile_status()}"
-                f"{zone_part} | {q} | {status}"
+                f"{zone_part} | {q} | {status} | {ctr_part}"
             )
         except Exception as exc:
             self._view[symbol] = f"view error: {str(exc)[:140]}"
 
     async def _look_for_entry(self, symbol: str, st: dict):
         self._apply_asset_profile(symbol)
-        return await super()._look_for_entry(symbol, st)
+        original_margin = float(self.cfg.margin_per_position_usd)
+        try:
+            # Preflight only determines sizing. The inherited production entry
+            # path still performs all normal schedule, cooldown, order, chart,
+            # reconciliation and position-limit checks.
+            try:
+                df5, df15, df1h, df4h = await self._entry_frames(symbol)
+                preview = self.strat.generate_entry(
+                    df4h, df1h, df15, df5, has_open_position=False
+                )
+                if preview is not None and str(preview.trigger).startswith("CTR_"):
+                    self.cfg.margin_per_position_usd = max(
+                        5.0, original_margin * self.CTR_MARGIN_MULTIPLIER
+                    )
+            except Exception as exc:
+                _LOG.debug("[%s] CTR sizing preflight unavailable: %s", symbol, exc)
+            return await super()._look_for_entry(symbol, st)
+        finally:
+            self.cfg.margin_per_position_usd = original_margin
 
     async def start(self):
         problems = self.cfg.validate_live()
@@ -383,22 +623,23 @@ class Bot(v15.Bot):
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
+                "Primary TPC: unchanged `1H Direction + Q → 15M S/R → 5M Hold/Reclaim`\n"
                 "Quality: `ADX 45 + CHOP 35 + directional DMI 20`\n"
                 "`Q ≥60` normal S1/S2 or R1/R2 hold/reclaim\n"
                 "`Q 45–59` only S2/R2, or reclaim at S1/R1\n"
                 "`Q <45` no trade\n"
-                "LONG uses adaptive 15M `S1/S2`; SHORT uses `R1/R2`\n"
-                "Hold: touch without closing through, then next closed 5M candle confirms\n"
-                "Reclaim: close through, then first closed 5M candle reclaims the level\n"
-                "Asset profiles: execution-zone width + ATR stop only; entry logic is unchanged\n"
+                "CTR fallback: opposing S/R + 15M HMA16 flip + rejection + exhaustion `2/4`\n"
+                "CTR uses `40%` margin, stop ≤`1.0 ATR15`, TP ≤`0.7%`, RR ≥`0.8`\n"
+                "CTR never opens when TPC has a valid signal or the symbol already has a position\n"
+                "Asset profiles: execution-zone width + ATR stop only\n"
                 "Prepared: `BTC ETH SOL HYPE XRP TRX XAU XAG CL`\n"
-                "Stage 1 `+0.7%→lock +0.4%` | Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
+                "TPC Stage 1 `+0.7%→lock +0.4%` | Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
                 "4H and Confidence are diagnostic only."
             )
 
         _LOG.info(
-            "TPC Sentinel v1.0 startup complete: continuous Q 45/35/20; "
-            "multi-asset execution/risk profiles active"
+            "TPC Sentinel v1.0 startup complete: TPC primary unchanged; "
+            "CTR isolated fallback active; multi-asset risk profiles active"
         )
 
 
