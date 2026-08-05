@@ -1,10 +1,10 @@
-"""Adaptive Momentum v2.1 indicator engine for closed 15-minute candles."""
+"""Adaptive Momentum v3 indicator engine for closed 15-minute candles."""
 from __future__ import annotations
 
 from typing import Any, Dict, List
 import math
 
-ENGINE_SCHEMA = "adaptive-momentum-v2.1-15m"
+ENGINE_SCHEMA = "adaptive-momentum-v3-15m"
 
 
 def _v(candle: Any, name: str, index: int) -> float:
@@ -17,7 +17,7 @@ def _v(candle: Any, name: str, index: int) -> float:
 
 
 def _series(candles: List[Any], name: str, index: int) -> List[float]:
-    return [_v(c, name, index) for c in candles]
+    return [_v(candle, name, index) for candle in candles]
 
 
 def ema(values: List[float], length: int) -> List[float]:
@@ -43,7 +43,11 @@ def _rma(values: List[float], length: int) -> List[float]:
 def _true_ranges(highs: List[float], lows: List[float], closes: List[float]) -> List[float]:
     output = [max(highs[0] - lows[0], 0.0)]
     for index in range(1, len(closes)):
-        output.append(max(highs[index] - lows[index], abs(highs[index] - closes[index - 1]), abs(lows[index] - closes[index - 1])))
+        output.append(max(
+            highs[index] - lows[index],
+            abs(highs[index] - closes[index - 1]),
+            abs(lows[index] - closes[index - 1]),
+        ))
     return output
 
 
@@ -55,7 +59,9 @@ def _adx(highs: List[float], lows: List[float], closes: List[float], length: int
         down = lows[index - 1] - lows[index]
         plus_dm.append(up if up > down and up > 0 else 0.0)
         minus_dm.append(down if down > up and down > 0 else 0.0)
-    atr_rma, plus_rma, minus_rma = _rma(tr, length), _rma(plus_dm, length), _rma(minus_dm, length)
+    atr_rma = _rma(tr, length)
+    plus_rma = _rma(plus_dm, length)
+    minus_rma = _rma(minus_dm, length)
     dx: List[float] = []
     for atr_value, plus_value, minus_value in zip(atr_rma, plus_rma, minus_rma):
         if atr_value <= 1e-12:
@@ -76,19 +82,22 @@ def _chop(highs: List[float], lows: List[float], closes: List[float], length: in
     return 100.0 * math.log10(tr_sum / span) / math.log10(length)
 
 
-def _recent_flip_up(hist: List[float], bars: int = 3) -> bool:
-    start = max(1, len(hist) - bars)
-    return any(hist[i] > 0 and hist[i - 1] <= 0 for i in range(start, len(hist)))
+def _cross_up_recent(fast: List[float], slow: List[float], bars: int = 2) -> bool:
+    start = max(1, len(fast) - bars)
+    return any(fast[index] > slow[index] and fast[index - 1] <= slow[index - 1]
+               for index in range(start, len(fast)))
 
 
-def _recent_flip_down(hist: List[float], bars: int = 3) -> bool:
-    start = max(1, len(hist) - bars)
-    return any(hist[i] < 0 and hist[i - 1] >= 0 for i in range(start, len(hist)))
+def _cross_down_recent(fast: List[float], slow: List[float], bars: int = 2) -> bool:
+    start = max(1, len(fast) - bars)
+    return any(fast[index] < slow[index] and fast[index - 1] >= slow[index - 1]
+               for index in range(start, len(fast)))
 
 
 def compute(candles: List[Any]) -> Dict[str, Any]:
     if len(candles) < 80:
         return {}
+
     opens = _series(candles, "open", 1)
     highs = _series(candles, "high", 2)
     lows = _series(candles, "low", 3)
@@ -103,14 +112,15 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
     atr_value = max(atr_series[-1], closes[-1] * 0.0005)
     adx_series = _adx(highs, lows, closes, 14)
     chop_value = _chop(highs, lows, closes, 14)
+
+    recent_high = max(highs[-6:-1])
+    recent_low = min(lows[-6:-1])
     distance_atr = abs(closes[-1] - e13[-1]) / atr_value
 
-    hist_flip_up_recent = _recent_flip_up(macd_hist, 3)
-    hist_flip_down_recent = _recent_flip_down(macd_hist, 3)
-    hist_expanding_up = macd_hist[-1] > macd_hist[-2]
-    hist_expanding_down = macd_hist[-1] < macd_hist[-2]
-    macd_state_bull = hist_flip_up_recent or macd_line[-1] > macd_signal[-1]
-    macd_state_bear = hist_flip_down_recent or macd_line[-1] < macd_signal[-1]
+    hist_expand_up_2 = macd_hist[-1] > macd_hist[-2] > macd_hist[-3]
+    hist_expand_down_2 = macd_hist[-1] < macd_hist[-2] < macd_hist[-3]
+    hist_weaken_long_2 = macd_hist[-1] < macd_hist[-2] < macd_hist[-3]
+    hist_weaken_short_2 = macd_hist[-1] > macd_hist[-2] > macd_hist[-3]
 
     return {
         "schema": ENGINE_SCHEMA,
@@ -118,25 +128,31 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
         "prev_open": opens[-2], "prev_high": highs[-2], "prev_low": lows[-2], "prev_close": closes[-2],
         "ema8": e8[-1], "ema13": e13[-1], "ema20": e20[-1], "ema50": e50[-1],
         "ema8_prev": e8[-2], "ema13_prev": e13[-2],
-        "ema8_series": e8[-100:], "ema13_series": e13[-100:], "ema20_series": e20[-100:], "ema50_series": e50[-100:],
+        "ema8_series": e8[-100:], "ema13_series": e13[-100:],
+        "ema20_series": e20[-100:], "ema50_series": e50[-100:],
         "trend_bull": e20[-1] > e50[-1], "trend_bear": e20[-1] < e50[-1],
         "entry_bull": e8[-1] > e13[-1], "entry_bear": e8[-1] < e13[-1],
         "ema_cross_up": e8[-1] > e13[-1] and e8[-2] <= e13[-2],
         "ema_cross_down": e8[-1] < e13[-1] and e8[-2] >= e13[-2],
+        "ema_cross_up_recent": _cross_up_recent(e8, e13, 2),
+        "ema_cross_down_recent": _cross_down_recent(e8, e13, 2),
         "macd": macd_line[-1], "macd_signal": macd_signal[-1],
         "macd_hist": macd_hist[-1], "macd_hist_prev": macd_hist[-2],
-        "macd_hist_flip_up_recent": hist_flip_up_recent,
-        "macd_hist_flip_down_recent": hist_flip_down_recent,
-        "macd_hist_expanding_up": hist_expanding_up,
-        "macd_hist_expanding_down": hist_expanding_down,
-        "macd_state_bull": macd_state_bull,
-        "macd_state_bear": macd_state_bear,
-        "adx": adx_series[-1], "adx_prev": adx_series[-2], "adx_rising": adx_series[-1] > adx_series[-2],
+        "macd_bull": macd_line[-1] > macd_signal[-1],
+        "macd_bear": macd_line[-1] < macd_signal[-1],
+        "macd_hist_expand_up_2": hist_expand_up_2,
+        "macd_hist_expand_down_2": hist_expand_down_2,
+        "macd_hist_weaken_long_2": hist_weaken_long_2,
+        "macd_hist_weaken_short_2": hist_weaken_short_2,
+        "adx": adx_series[-1], "adx_prev": adx_series[-2],
+        "adx_rising": adx_series[-1] > adx_series[-2],
         "chop": chop_value, "atr": atr_value,
         "distance_ema13_atr": distance_atr,
-        "location_long": closes[-1] >= e13[-1] and distance_atr <= 1.0,
-        "location_short": closes[-1] <= e13[-1] and distance_atr <= 1.0,
-        "recent_low": min(lows[-6:-1]), "recent_high": max(highs[-6:-1]),
+        "location_long": closes[-1] >= e13[-1] and distance_atr <= 0.8,
+        "location_short": closes[-1] <= e13[-1] and distance_atr <= 0.8,
+        "recent_low": recent_low, "recent_high": recent_high,
+        "structure_long": closes[-1] > recent_high,
+        "structure_short": closes[-1] < recent_low,
         "volume": volumes[-1],
     }
 
