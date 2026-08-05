@@ -12,7 +12,7 @@ WaveTrend entry extremes used in production:
 
 WT is an entry trigger inside Trend Confirm, not a second strategy. Telegram
 order alerts receive the exact entry-trigger owner from signal metadata and
-show the matching entry trigger and signal-exit rule.
+show the matching trigger, T1 plan, signal-exit rule and strategy name.
 """
 from __future__ import annotations
 
@@ -49,11 +49,13 @@ def _entry_trigger_label(signal) -> str | None:
 
 
 def _append_entry_trigger(text: str, label: str | None) -> str:
-    """Show the entry trigger and its matching signal exit in an order alert."""
+    """Rewrite a Trend Confirm order alert so every displayed rule is exact."""
     if not label:
         return text
 
     lines = str(text).splitlines()
+
+    # Show the exact Layer-3 trigger next to the fill/entry.
     if not any("Entry Trigger" in line for line in lines):
         trigger_line = f"⚡ Entry Trigger : `{label}`"
         insert_at = 1
@@ -63,6 +65,19 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
                 break
         lines.insert(insert_at, trigger_line)
 
+    # The live manager uses percentages, not R: T1 +0.6%, trim 40%, lock +0.3%.
+    target_index = None
+    for index, line in enumerate(lines):
+        if line.startswith("🎯 Target") or line.startswith("🎯 T1"):
+            target_index = index
+            break
+    if target_index is not None:
+        lines[target_index] = "🎯 T1 : `+0.6%` → take profit `40%`"
+        runner_line = "🔒 Runner `60%` : SL → `+0.3%` | TP Final → `+1.3%`"
+        if not any(line.startswith("🔒 Runner") for line in lines):
+            lines.insert(target_index + 1, runner_line)
+
+    # Enter with X, exit with the matching X.
     exit_text = (
         "🏁 Signal Exit : `WT opposite cross`"
         if label == "WT Cross"
@@ -72,6 +87,20 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
         if line.startswith("🏁 Exit") or line.startswith("🏁 Signal Exit"):
             lines[index] = exit_text
             break
+
+    # EMA and WT are entry triggers inside one Trend Confirm strategy family.
+    for index, line in enumerate(lines):
+        if line.startswith("📊 Strategy:"):
+            regime_suffix = ""
+            if "| Regime:" in line:
+                regime_suffix = " | Regime:" + line.split("| Regime:", 1)[1]
+            lines[index] = f"📊 Strategy: `Trend Confirm`{regime_suffix}"
+            break
+
+    # A missing macro score was previously rendered as a misleading 0/100.
+    for index, line in enumerate(lines):
+        if line.startswith("🧭 4H Macro:") and " (0/100)" in line:
+            lines[index] = line.replace(" (0/100)", "")
 
     return "\n".join(lines)
 
@@ -105,8 +134,11 @@ def _install_telegram_entry_trigger_patch() -> None:
         # Also covers bot.py's minimal fallback alert if chart/caption delivery
         # fails after the live order has already opened.
         label = _TG_ENTRY_TRIGGER.get()
-        if label and ("Order Executed" in str(text) or "OPEN LONG" in str(text)
-                      or "OPEN SHORT" in str(text)):
+        if label and (
+            "Order Executed" in str(text)
+            or "OPEN LONG" in str(text)
+            or "OPEN SHORT" in str(text)
+        ):
             text = _append_entry_trigger(str(text), label)
         return original_notify(self, text)
 
