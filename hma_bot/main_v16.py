@@ -13,6 +13,8 @@ only execution-zone width and the structure-stop ATR floor/cap.
 
 CTR is an isolated fallback engine. TPC is always evaluated first; CTR may
 only enter when TPC has no valid signal for that symbol and no position exists.
+CTR also requires enough open distance to the pending primary TPC zone, and
+its target must finish before that zone.
 """
 from __future__ import annotations
 
@@ -50,6 +52,9 @@ class Bot(v15.Bot):
     CTR_MAX_STOP_ATR15 = 1.00
     CTR_MIN_RR = 0.80
     CTR_MAX_TP_PCT = 0.007
+    CTR_MIN_TPC_GAP_PCT = 0.009
+    CTR_MIN_TPC_GAP_ATR15 = 1.20
+    CTR_TPC_ZONE_BUFFER_ATR15 = 0.10
 
     def __init__(self):
         super().__init__()
@@ -282,11 +287,96 @@ class Bot(v15.Bot):
         value = float(rsi.iloc[-1])
         return value if math.isfinite(value) else 50.0
 
+    def _tpc_gap_plan(self, df4h, df1h, df15, primary, entry: float, atr15: float):
+        """Measure free counter-trend travel before the nearest primary TPC zone."""
+        if primary.side is None or entry <= 0.0 or atr15 <= 0.0:
+            return None
+
+        primary_context = build_context(
+            df15=df15,
+            df1h=df1h,
+            df4h=df4h,
+            side="long" if primary.side == S.Side.LONG else "short",
+        )
+        levels = self.strat._side_levels(primary_context.location, primary.side)
+        if not levels:
+            return None
+
+        zone_half = max(
+            float(self._active_profile["zone_atr5"]) * atr15,
+            abs(entry) * 1e-6,
+        )
+        buffer = self.CTR_TPC_ZONE_BUFFER_ATR15 * atr15
+
+        if primary.side == S.Side.LONG:
+            valid = [(name, level) for name, level in levels if float(level) < entry]
+            if not valid:
+                return None
+            name, level = max(valid, key=lambda item: float(item[1]))
+            zone_edge = float(level) + zone_half
+            gap = entry - zone_edge
+            target_guard = zone_edge + buffer
+            available_reward = entry - target_guard
+        else:
+            valid = [(name, level) for name, level in levels if float(level) > entry]
+            if not valid:
+                return None
+            name, level = min(valid, key=lambda item: float(item[1]))
+            zone_edge = float(level) - zone_half
+            gap = zone_edge - entry
+            target_guard = zone_edge - buffer
+            available_reward = target_guard - entry
+
+        if gap <= 0.0 or available_reward <= 0.0:
+            return None
+
+        gap_pct = gap / max(entry, 1e-12)
+        gap_atr = gap / max(atr15, 1e-12)
+        eligible = (
+            gap_pct >= self.CTR_MIN_TPC_GAP_PCT
+            or gap_atr >= self.CTR_MIN_TPC_GAP_ATR15
+        )
+        return {
+            "name": str(name),
+            "level": float(level),
+            "zone_edge": float(zone_edge),
+            "target_guard": float(target_guard),
+            "gap": float(gap),
+            "gap_pct": float(gap_pct),
+            "gap_atr": float(gap_atr),
+            "available_reward": float(available_reward),
+            "eligible": bool(eligible),
+        }
+
+    def _ctr_gap_status(self, df4h, df1h, df15) -> str:
+        try:
+            if len(df1h) < 60 or len(df15) < 90:
+                return "TPCGap=WARMUP"
+            primary, _ = self.strat._simple_direction(df1h)
+            if primary.side is None:
+                return "TPCGap=NO_DIRECTION"
+            d15 = df15.copy()
+            d15["atr"] = self.strat._atr(d15, self.strat.cfg.atr_len)
+            atr15 = float(d15["atr"].iloc[-1])
+            entry = float(d15["close"].iloc[-1])
+            plan = self._tpc_gap_plan(df4h, df1h, d15, primary, entry, atr15)
+            if plan is None:
+                return "TPCGap=UNAVAILABLE"
+            state = "OK" if plan["eligible"] else "SMALL"
+            return (
+                f"TPCGap={plan['name']} {plan['gap_pct'] * 100:.2f}%/"
+                f"{plan['gap_atr']:.2f}ATR {state}"
+            )
+        except Exception as exc:
+            _LOG.debug("TPC-gap diagnostics unavailable: %s", exc)
+            return "TPCGap=ERROR"
+
     def _ctr_generate_entry(self, df4h, df1h, df15, df5):
         """Create a small, short-horizon counter-trend signal.
 
-        This does not modify TPC. It requires an established 1H trend, an
-        opposing S/R extreme, HMA16 reversal and at least two exhaustion clues.
+        TPC remains primary. CTR needs an established 1H trend, opposing S/R,
+        HMA16 reversal, rejection, exhaustion and sufficient distance to the
+        pending primary TPC zone. Its TP is capped before that zone.
         """
         if len(df1h) < 60 or len(df15) < 90 or len(df5) < 20:
             return None
@@ -325,22 +415,41 @@ class Bot(v15.Bot):
         std = close.rolling(20).std(ddof=0)
         upper = basis + 2.0 * std
         lower = basis - 2.0 * std
-        values = [hma.iloc[-1], hma.iloc[-2], ema20.iloc[-1], upper.iloc[-1], lower.iloc[-1]]
+        values = [
+            hma.iloc[-1],
+            hma.iloc[-2],
+            ema20.iloc[-1],
+            upper.iloc[-1],
+            lower.iloc[-1],
+        ]
         if not all(math.isfinite(float(v)) for v in values):
             return None
 
         current = d15.iloc[-1]
         previous = d15.iloc[-2]
         entry = float(current["close"])
-        zone = max(float(self._active_profile["zone_atr5"]) * atr15, abs(entry) * 1e-6)
+        tpc_gap = self._tpc_gap_plan(df4h, df1h, d15, primary, entry, atr15)
+        if tpc_gap is None or not tpc_gap["eligible"]:
+            return None
+
+        zone = max(
+            float(self._active_profile["zone_atr5"]) * atr15,
+            abs(entry) * 1e-6,
+        )
 
         candidates = []
         for name, level in levels:
             if counter_side == S.Side.SHORT:
-                touched = max(float(current["high"]), float(previous["high"])) >= level - zone
+                touched = (
+                    max(float(current["high"]), float(previous["high"]))
+                    >= level - zone
+                )
                 valid_side = entry <= level + zone
             else:
-                touched = min(float(current["low"]), float(previous["low"])) <= level + zone
+                touched = (
+                    min(float(current["low"]), float(previous["low"]))
+                    <= level + zone
+                )
                 valid_side = entry >= level - zone
             if touched and valid_side:
                 candidates.append((name, float(level), abs(entry - float(level))))
@@ -349,16 +458,25 @@ class Bot(v15.Bot):
         level_name, level, _ = min(candidates, key=lambda item: item[2])
 
         body = abs(float(current["close"]) - float(current["open"]))
-        candle_range = max(float(current["high"]) - float(current["low"]), 1e-12)
-        upper_wick = float(current["high"]) - max(float(current["open"]), float(current["close"]))
-        lower_wick = min(float(current["open"]), float(current["close"])) - float(current["low"])
+        candle_range = max(
+            float(current["high"]) - float(current["low"]), 1e-12
+        )
+        upper_wick = float(current["high"]) - max(
+            float(current["open"]), float(current["close"])
+        )
+        lower_wick = min(
+            float(current["open"]), float(current["close"])
+        ) - float(current["low"])
 
         recent_high = float(d15["high"].iloc[-3:].max())
         recent_low = float(d15["low"].iloc[-3:].min())
         rsi = self._rsi14(close)
 
         if counter_side == S.Side.SHORT:
-            hma_flip = entry < float(hma.iloc[-1]) and float(hma.iloc[-1]) < float(hma.iloc[-2])
+            hma_flip = (
+                entry < float(hma.iloc[-1])
+                and float(hma.iloc[-1]) < float(hma.iloc[-2])
+            )
             rejection = (
                 float(current["close"]) < float(current["open"])
                 or upper_wick >= max(body, 0.30 * candle_range)
@@ -374,24 +492,36 @@ class Bot(v15.Bot):
             required = 3 if quality.q >= 85.0 else 2
             if sum(bool(x) for x in exhaustion) < required:
                 return None
-            raw_sl = max(level, float(d15["high"].iloc[-5:].max())) + 0.15 * atr15
+            raw_sl = (
+                max(level, float(d15["high"].iloc[-5:].max()))
+                + 0.15 * atr15
+            )
             risk = raw_sl - entry
             if risk <= 0.0 or risk > self.CTR_MAX_STOP_ATR15 * atr15:
                 return None
             risk = max(risk, 0.35 * atr15)
             sl = entry + risk
-            reward = min(risk, entry * self.CTR_MAX_TP_PCT)
+            reward = min(
+                risk,
+                entry * self.CTR_MAX_TP_PCT,
+                float(tpc_gap["available_reward"]),
+            )
             ema_reward = entry - float(ema20.iloc[-1])
             if 0.80 * risk <= ema_reward <= reward:
                 reward = ema_reward
             rr = reward / max(risk, 1e-12)
-            if rr < self.CTR_MIN_RR:
+            if reward <= 0.0 or rr < self.CTR_MIN_RR:
                 return None
             tp = entry - reward
+            if tp <= float(tpc_gap["target_guard"]):
+                return None
             trigger = f"CTR_{level_name}_HMA16_REJECTION_SHORT"
             compat_trend = S.Trend.BULL
         else:
-            hma_flip = entry > float(hma.iloc[-1]) and float(hma.iloc[-1]) > float(hma.iloc[-2])
+            hma_flip = (
+                entry > float(hma.iloc[-1])
+                and float(hma.iloc[-1]) > float(hma.iloc[-2])
+            )
             rejection = (
                 float(current["close"]) > float(current["open"])
                 or lower_wick >= max(body, 0.30 * candle_range)
@@ -407,20 +537,29 @@ class Bot(v15.Bot):
             required = 3 if quality.q >= 85.0 else 2
             if sum(bool(x) for x in exhaustion) < required:
                 return None
-            raw_sl = min(level, float(d15["low"].iloc[-5:].min())) - 0.15 * atr15
+            raw_sl = (
+                min(level, float(d15["low"].iloc[-5:].min()))
+                - 0.15 * atr15
+            )
             risk = entry - raw_sl
             if risk <= 0.0 or risk > self.CTR_MAX_STOP_ATR15 * atr15:
                 return None
             risk = max(risk, 0.35 * atr15)
             sl = entry - risk
-            reward = min(risk, entry * self.CTR_MAX_TP_PCT)
+            reward = min(
+                risk,
+                entry * self.CTR_MAX_TP_PCT,
+                float(tpc_gap["available_reward"]),
+            )
             ema_reward = float(ema20.iloc[-1]) - entry
             if 0.80 * risk <= ema_reward <= reward:
                 reward = ema_reward
             rr = reward / max(risk, 1e-12)
-            if rr < self.CTR_MIN_RR:
+            if reward <= 0.0 or rr < self.CTR_MIN_RR:
                 return None
             tp = entry + reward
+            if tp >= float(tpc_gap["target_guard"]):
+                return None
             trigger = f"CTR_{level_name}_HMA16_REJECTION_LONG"
             compat_trend = S.Trend.BEAR
 
@@ -434,6 +573,9 @@ class Bot(v15.Bot):
             f"primary 1H {primary.side.value} Trend {primary.score:.0f} "
             f"Q {quality.q:.0f} | 15M {level_name} rejection | "
             f"HMA16 flip | exhaustion {sum(bool(x) for x in exhaustion)}/4 | "
+            f"TPC gap to {tpc_gap['name']} "
+            f"{tpc_gap['gap_pct'] * 100:.2f}%/"
+            f"{tpc_gap['gap_atr']:.2f}ATR | TP protected before TPC zone | "
             f"RR {rr:.2f} | margin {self.CTR_MARGIN_MULTIPLIER:.0%} of TPC"
         )
         return S.EntrySignal(
@@ -536,7 +678,10 @@ class Bot(v15.Bot):
             if not math.isfinite(atr5) or atr5 <= 0:
                 return ""
             level = float(level_price)
-            half = max(self.strat.sr_touch_zone_atr5 * atr5, abs(level) * 1e-6)
+            half = max(
+                self.strat.sr_touch_zone_atr5 * atr5,
+                abs(level) * 1e-6,
+            )
             low, high = level - half, level + half
             price = float(df5["close"].iloc[-1])
             if low <= price <= high:
@@ -563,12 +708,13 @@ class Bot(v15.Bot):
             zone = self._entry_zone_status(df5, df15, df1h, df4h)
             q = self._quality_status(df1h)
             status = self.strat.entry_status(df4h, df1h, df15, df5)
+            gap = self._ctr_gap_status(df4h, df1h, df15)
             ctr = self._ctr_generate_entry(df4h, df1h, df15, df5)
             ctr_part = "CTR=READY" if ctr is not None else "CTR=WAIT"
             zone_part = f" | {zone}" if zone else ""
             self._view[symbol] = (
                 f"5M px={px:.6g} | {self._asset_profile_status()}"
-                f"{zone_part} | {q} | {status} | {ctr_part}"
+                f"{zone_part} | {q} | {status} | {gap} | {ctr_part}"
             )
         except Exception as exc:
             self._view[symbol] = f"view error: {str(exc)[:140]}"
@@ -587,7 +733,8 @@ class Bot(v15.Bot):
                 )
                 if preview is not None and str(preview.trigger).startswith("CTR_"):
                     self.cfg.margin_per_position_usd = max(
-                        5.0, original_margin * self.CTR_MARGIN_MULTIPLIER
+                        5.0,
+                        original_margin * self.CTR_MARGIN_MULTIPLIER,
                     )
             except Exception as exc:
                 _LOG.debug("[%s] CTR sizing preflight unavailable: %s", symbol, exc)
@@ -629,7 +776,9 @@ class Bot(v15.Bot):
                 "`Q 45–59` only S2/R2, or reclaim at S1/R1\n"
                 "`Q <45` no trade\n"
                 "CTR fallback: opposing S/R + 15M HMA16 flip + rejection + exhaustion `2/4`\n"
-                "CTR uses `40%` margin, stop ≤`1.0 ATR15`, TP ≤`0.7%`, RR ≥`0.8`\n"
+                "CTR gap: distance to pending TPC zone must be `≥0.9%` or `≥1.2 ATR15`\n"
+                "CTR TP is capped at `0.7%` and must finish before the TPC zone\n"
+                "CTR uses `40%` margin, stop ≤`1.0 ATR15`, RR ≥`0.8`\n"
                 "CTR never opens when TPC has a valid signal or the symbol already has a position\n"
                 "Asset profiles: execution-zone width + ATR stop only\n"
                 "Prepared: `BTC ETH SOL HYPE XRP TRX XAU XAG CL`\n"
@@ -639,7 +788,7 @@ class Bot(v15.Bot):
 
         _LOG.info(
             "TPC Sentinel v1.0 startup complete: TPC primary unchanged; "
-            "CTR isolated fallback active; multi-asset risk profiles active"
+            "CTR TPC-zone-gap fallback active; multi-asset risk profiles active"
         )
 
 
@@ -649,7 +798,9 @@ async def _main():
     for sig_name in ("SIGINT", "SIGTERM"):
         try:
             signal_module = v15.v14.v13.v12.v11.v10.v9.v8.v7.v5.v4.v3.base._signal
-            loop.add_signal_handler(getattr(signal_module, sig_name), bot.request_shutdown)
+            loop.add_signal_handler(
+                getattr(signal_module, sig_name), bot.request_shutdown
+            )
         except (NotImplementedError, AttributeError):
             pass
     await bot.start()
