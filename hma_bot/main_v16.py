@@ -7,6 +7,9 @@ Quality policy:
     Q >= 60   normal S1/S2 or R1/R2 hold/reclaim
     Q 45..59  S2/R2 hold/reclaim, or reclaim at S1/R1
     Q < 45    no trade
+
+The TPC trading logic is identical for every symbol. Asset profiles adjust
+only execution-zone width and the structure-stop ATR floor/cap.
 """
 from __future__ import annotations
 
@@ -25,12 +28,26 @@ _LOG = v15._LOG
 
 
 class Bot(v15.Bot):
+    ASSET_PROFILES = {
+        "DEFAULT": {"zone_atr5": 0.25, "sl_min_atr15": 1.00, "sl_max_atr15": 1.80},
+        "BTC": {"zone_atr5": 0.22, "sl_min_atr15": 1.00, "sl_max_atr15": 1.60},
+        "ETH": {"zone_atr5": 0.25, "sl_min_atr15": 1.00, "sl_max_atr15": 1.60},
+        "SOL": {"zone_atr5": 0.30, "sl_min_atr15": 1.10, "sl_max_atr15": 1.70},
+        "HYPE": {"zone_atr5": 0.35, "sl_min_atr15": 1.20, "sl_max_atr15": 1.80},
+        "XRP": {"zone_atr5": 0.30, "sl_min_atr15": 1.10, "sl_max_atr15": 1.70},
+        "TRX": {"zone_atr5": 0.25, "sl_min_atr15": 1.00, "sl_max_atr15": 1.60},
+        "XAU": {"zone_atr5": 0.25, "sl_min_atr15": 1.20, "sl_max_atr15": 1.80},
+        "CL": {"zone_atr5": 0.30, "sl_min_atr15": 1.30, "sl_max_atr15": 2.00},
+    }
+
     def __init__(self):
         super().__init__()
         self.strat = S.PrecisionTrendStructureV12(self.cfg.strategy_config())
         self._shutdown_requested = False
         self._client_closed = False
         self._risk_symbol = ""
+        self._active_profile_name = "DEFAULT"
+        self._active_profile = dict(self.ASSET_PROFILES["DEFAULT"])
 
         self._quality_base = self.strat.quality_state_1h
         self.strat.quality_conditional_min = 45.0
@@ -106,11 +123,14 @@ class Bot(v15.Bot):
             if plan is None:
                 return None
             entry, sl, tp, atr15, structure_level, rr = plan
-            if str(self._risk_symbol).upper().startswith("XAU") and atr15 > 0:
+            if atr15 > 0:
+                profile = self._active_profile
+                min_atr = float(profile["sl_min_atr15"])
+                max_atr = float(profile["sl_max_atr15"])
                 raw_distance = abs(float(entry) - float(sl))
                 stop_distance = max(
-                    1.20 * atr15,
-                    min(raw_distance, 1.80 * atr15),
+                    min_atr * atr15,
+                    min(raw_distance, max_atr * atr15),
                 )
                 sl = (
                     float(entry) - stop_distance
@@ -121,6 +141,31 @@ class Bot(v15.Bot):
             return entry, sl, tp, atr15, structure_level, rr
 
         self.strat._risk_plan = adaptive_risk_plan
+
+    @staticmethod
+    def _base_symbol(symbol: str) -> str:
+        text = str(symbol or "").upper().strip()
+        for separator in ("/", "-", ":"):
+            if separator in text:
+                text = text.split(separator, 1)[0]
+        return text
+
+    def _apply_asset_profile(self, symbol: str):
+        name = self._base_symbol(symbol)
+        profile = self.ASSET_PROFILES.get(name, self.ASSET_PROFILES["DEFAULT"])
+        self._risk_symbol = symbol
+        self._active_profile_name = name if name in self.ASSET_PROFILES else "DEFAULT"
+        self._active_profile = dict(profile)
+        self.strat.sr_touch_zone_atr5 = float(profile["zone_atr5"])
+        return profile
+
+    def _asset_profile_status(self) -> str:
+        p = self._active_profile
+        return (
+            f"Profile={self._active_profile_name} "
+            f"Zone={p['zone_atr5']:.2f}ATR5 "
+            f"SL={p['sl_min_atr15']:.2f}-{p['sl_max_atr15']:.2f}ATR15"
+        )
 
     @staticmethod
     def _clean_quality_frame(df1h):
@@ -289,7 +334,7 @@ class Bot(v15.Bot):
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
-            self._risk_symbol = symbol
+            self._apply_asset_profile(symbol)
             if self.open_position_count() >= self.cfg.max_positions:
                 self._view[symbol] = f"POSITION LIMIT | MAX {self.cfg.max_positions}"
                 return
@@ -298,12 +343,15 @@ class Bot(v15.Bot):
             q = self._quality_status(df1h)
             status = self.strat.entry_status(df4h, df1h, df15, df5)
             zone_part = f" | {zone}" if zone else ""
-            self._view[symbol] = f"5M px={px:.6g}{zone_part} | {q} | {status}"
+            self._view[symbol] = (
+                f"5M px={px:.6g} | {self._asset_profile_status()}"
+                f"{zone_part} | {q} | {status}"
+            )
         except Exception as exc:
             self._view[symbol] = f"view error: {str(exc)[:140]}"
 
     async def _look_for_entry(self, symbol: str, st: dict):
-        self._risk_symbol = symbol
+        self._apply_asset_profile(symbol)
         return await super()._look_for_entry(symbol, st)
 
     async def start(self):
@@ -341,14 +389,15 @@ class Bot(v15.Bot):
                 "LONG uses adaptive 15M `S1/S2`; SHORT uses `R1/R2`\n"
                 "Hold: touch without closing through, then next closed 5M candle confirms\n"
                 "Reclaim: close through, then first closed 5M candle reclaims the level\n"
-                "XAU stop: 15M structure with `1.20–1.80 ATR` distance\n"
+                "Asset profiles: execution-zone width + ATR stop only; entry logic is unchanged\n"
+                "Prepared: `BTC ETH SOL HYPE XRP TRX XAU CL`\n"
                 "Stage 1 `+0.7%→lock +0.4%` | Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
                 "4H and Confidence are diagnostic only."
             )
 
         _LOG.info(
             "TPC Sentinel v1.0 startup complete: continuous Q 45/35/20; "
-            "Q>=60 full, Q45-59 conditional, Q<45 blocked"
+            "multi-asset execution/risk profiles active"
         )
 
 
