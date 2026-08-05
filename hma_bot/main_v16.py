@@ -1,4 +1,4 @@
-"""HMA S/R Sentinel production runtime.
+"""Trend Pullback Continuation (TPC Sentinel) production runtime.
 
 Continuous 1H quality:
     ADX 45 + CHOP 35 + directional DMI 20.
@@ -32,8 +32,6 @@ class Bot(v15.Bot):
         self._client_closed = False
         self._risk_symbol = ""
 
-        # Continuous Q replaces the old threshold-cliff formula while retaining
-        # the proven ADX/CHOP/DMI calculations from the strategy base.
         self._quality_base = self.strat.quality_state_1h
         self.strat.quality_conditional_min = 45.0
         self.strat.quality_full_min = 60.0
@@ -69,8 +67,6 @@ class Bot(v15.Bot):
 
         self.strat.quality_state_1h = continuous_quality
 
-        # Add the tier policy to the same evaluate() used by both status and
-        # live order generation. This prevents hidden disagreement.
         original_evaluate = self.strat.evaluate
 
         def tiered_evaluate(df4h, df1h, df15, df5):
@@ -103,7 +99,6 @@ class Bot(v15.Bot):
 
         self.strat.evaluate = tiered_evaluate
 
-        # XAU structure stop: enforce 1.20..1.80 ATR distance.
         original_risk_plan = self.strat._risk_plan
 
         def adaptive_risk_plan(decision, df15, df5):
@@ -209,7 +204,7 @@ class Bot(v15.Bot):
             text = str(exc).lower()
             if "closed by the user" not in text and "already closed" not in text:
                 _LOG.warning("OKX close during shutdown failed: %s", exc)
-        _LOG.info("HMA S/R Sentinel shutdown complete")
+        _LOG.info("TPC Sentinel shutdown complete")
 
     async def run_forever(self):
         while self._running:
@@ -320,7 +315,7 @@ class Bot(v15.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== HMA S/R SENTINEL [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
+            "=== TPC SENTINEL V1.0 [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE",
             self.cfg.symbols,
             self.cfg.margin_per_position_usd,
@@ -335,7 +330,7 @@ class Bot(v15.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"🎯 *HMA S/R Sentinel — {mode}*\n"
+                f"🎯 *TPC Sentinel v1.0 — Trend Pullback Continuation — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
@@ -352,7 +347,7 @@ class Bot(v15.Bot):
             )
 
         _LOG.info(
-            "HMA S/R Sentinel startup complete: continuous Q 45/35/20; "
+            "TPC Sentinel v1.0 startup complete: continuous Q 45/35/20; "
             "Q>=60 full, Q45-59 conditional, Q<45 blocked"
         )
 
