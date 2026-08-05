@@ -10,6 +10,8 @@ import asyncio
 import math
 import time
 
+import numpy as np
+
 import main_v15 as v15
 import strategy_v12 as S
 from sentinel_context import build_context
@@ -24,6 +26,28 @@ class Bot(v15.Bot):
         self._shutdown_requested = False
         self._client_closed = False
         self._risk_symbol = ""
+
+        # Keep the original calculator for diagnostics, but route all strategy
+        # decisions through a safe wrapper.  NaN/inf quality values previously
+        # made comparisons such as ``q < minimum`` evaluate False, which could
+        # allow invalid market data to bypass the quality gate.
+        self._quality_original = self.strat.quality_state_1h
+
+        def safe_quality_state(df1h):
+            clean = self._clean_quality_frame(df1h)
+            quality = self._quality_original(clean)
+            values = (
+                quality.q,
+                quality.adx,
+                quality.chop,
+                quality.plus_di,
+                quality.minus_di,
+            )
+            if len(clean) < 60 or not all(math.isfinite(float(v)) for v in values):
+                return type(quality)(0.0, 0.0, 100.0, 0.0, 0.0)
+            return quality
+
+        self.strat.quality_state_1h = safe_quality_state
 
         # XAU needs more breathing room than crypto on 5M execution. Keep the
         # structure-selected direction, but enforce a 15M ATR floor/cap for the
@@ -57,6 +81,61 @@ class Bot(v15.Bot):
             return entry, sl, tp, atr15, structure_level, rr
 
         self.strat._risk_plan = adaptive_risk_plan
+
+    @staticmethod
+    def _clean_quality_frame(df1h):
+        """Return sorted, unique, finite closed-1H OHLC rows for Q."""
+        if df1h is None or len(df1h) == 0:
+            return df1h
+        clean = df1h.copy()
+        clean = clean[~clean.index.duplicated(keep="last")].sort_index()
+        required = [column for column in ("open", "high", "low", "close") if column in clean]
+        if required:
+            clean[required] = clean[required].replace([np.inf, -np.inf], np.nan)
+            clean = clean.dropna(subset=required)
+        return clean
+
+    def _quality_status(self, df1h) -> str:
+        """Expose the exact inputs behind Q and distinguish Q=0 from bad data."""
+        try:
+            clean = self._clean_quality_frame(df1h)
+            if clean is None or len(clean) < 60:
+                count = 0 if clean is None else len(clean)
+                return f"QData=WARMUP({count})"
+
+            quality = self._quality_original(clean)
+            values = (
+                quality.q,
+                quality.adx,
+                quality.chop,
+                quality.plus_di,
+                quality.minus_di,
+            )
+            if not all(math.isfinite(float(v)) for v in values):
+                return "QData=INVALID_BLOCKED"
+
+            adx_points = self.strat._adx_score(float(quality.adx))
+            chop_points = self.strat._chop_score(float(quality.chop))
+            if quality.q <= 0.05:
+                if quality.adx <= 10.0 and quality.chop >= 62.0:
+                    state = "Q0_VALID_LOW_ADX_HIGH_CHOP"
+                else:
+                    state = "Q0_CHECK"
+            elif quality.q < self.strat.quality_min:
+                state = "Q_BELOW_MIN"
+            else:
+                state = "Q_PASS"
+
+            return (
+                f"QRaw={quality.q:.1f} "
+                f"ADX={quality.adx:.1f}({adx_points:.1f}) "
+                f"CHOP={quality.chop:.1f}({chop_points:.1f}) "
+                f"DI+={quality.plus_di:.1f} DI-={quality.minus_di:.1f} "
+                f"QState={state}"
+            )
+        except Exception as exc:
+            _LOG.debug("Quality diagnostics unavailable: %s", exc)
+            return "QData=ERROR_BLOCKED"
 
     def request_shutdown(self) -> None:
         """Ask the loops to finish without closing OKX underneath active work."""
@@ -195,10 +274,12 @@ class Bot(v15.Bot):
 
             px = float(df5["close"].iloc[-1]) if len(df5) else 0.0
             zone_status = self._entry_zone_status(df5, df15, df1h, df4h)
+            quality_status = self._quality_status(df1h)
             strategy_status = self.strat.entry_status(df4h, df1h, df15, df5)
             zone_part = f" | {zone_status}" if zone_status else ""
             self._view[symbol] = (
-                f"5M px={px:.6g}{zone_part} | {strategy_status}"
+                f"5M px={px:.6g}{zone_part} | {quality_status} | "
+                f"{strategy_status}"
             )
         except Exception as exc:
             self._view[symbol] = f"view error: {str(exc)[:140]}"
@@ -246,6 +327,7 @@ class Bot(v15.Bot):
                 "`Hold Entry` touch a level without closing through it, then enter after the next closed 5M candle still holds the level\n"
                 "`Reclaim Entry` close through a level, then enter immediately on the first closed 5M candle reclaiming back through it\n"
                 "`Log Zone` shows the active S/R entry price band and distance from current price\n"
+                "`Q Diagnostics` shows raw ADX/CHOP/DI values; invalid data is blocked\n"
                 f"`Risk Check` Room `≥{self.strat.min_room_atr:.2f} ATR` and actual R:R `≥{self.strat.min_actual_rr:.2f}`\n"
                 "`XAU Stop` 15M structure with `1.20–1.80 ATR` distance\n"
                 "TP/SL and position management remain unchanged.\n"
@@ -257,9 +339,9 @@ class Bot(v15.Bot):
 
         _LOG.info(
             "HMA S/R Sentinel startup complete: 1H direction plus S1/S2 or "
-            "R1/R2 hold/reclaim entries; logs show the active entry zone; "
-            "XAU structure stop uses 1.20-1.80 ATR; status and order creation "
-            "use the same decision"
+            "R1/R2 hold/reclaim entries; logs show Q inputs and active entry "
+            "zone; invalid Q data is blocked; XAU structure stop uses "
+            "1.20-1.80 ATR; status and order creation use the same decision"
         )
 
 
