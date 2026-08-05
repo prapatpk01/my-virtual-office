@@ -10,16 +10,98 @@ WaveTrend entry extremes used in production:
 - Long cross from oversold <= -42
 - Short cross from overbought >= +45
 
-WT is an entry trigger inside Trend Confirm, not a second strategy. The existing
-filename and Railway start command are retained.
+WT is an entry trigger inside Trend Confirm, not a second strategy. Telegram
+order alerts receive the exact entry-trigger owner from signal metadata and
+show either WT Cross or EMA8/13 Cross.
 """
 from __future__ import annotations
 
 import asyncio
 import os
+from contextvars import ContextVar
 
 import run_dual_bot  # keeps exchange, sleep, risk and lifecycle patches
 import run_bot
+from trading.bot import TradingBot
+from trading.telegram_notifier import TelegramNotifier
+
+
+_TG_ENTRY_TRIGGER: ContextVar[str | None] = ContextVar(
+    "trend_confirm_tg_entry_trigger",
+    default=None,
+)
+
+
+def _entry_trigger_label(signal) -> str | None:
+    """Resolve the exact Layer-3 trigger from signal metadata."""
+    metadata = getattr(signal, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    owner = str(
+        metadata.get("entry_trigger_owner")
+        or metadata.get("entry_trigger")
+        or ""
+    ).upper()
+    if "WT" in owner:
+        return "WT Cross"
+    if "EMA" in owner:
+        return "EMA8/13 Cross"
+    return None
+
+
+def _append_entry_trigger(text: str, label: str | None) -> str:
+    """Insert the trigger line beside the entry details without duplication."""
+    if not label or "Entry Trigger" in text:
+        return text
+
+    trigger_line = f"⚡ Entry Trigger : `{label}`"
+    lines = str(text).splitlines()
+    insert_at = 1
+    for index, line in enumerate(lines):
+        if "Entry :" in line or "Entry:" in line or "Fill:" in line:
+            insert_at = index + 1
+            break
+    lines.insert(insert_at, trigger_line)
+    return "\n".join(lines)
+
+
+def _install_telegram_entry_trigger_patch() -> None:
+    """Bridge Signal metadata to the existing Telegram notifier safely.
+
+    ContextVar keeps the trigger attached to the correct async order task even
+    if multiple symbols are evaluated close together. The notifier's public API
+    remains backward compatible for all other strategies and callers.
+    """
+    if getattr(TradingBot, "_tg_entry_trigger_patch_installed", False):
+        return
+
+    original_execute_signal = TradingBot._execute_signal
+    original_build_caption = TelegramNotifier.build_order_caption
+    original_notify = TelegramNotifier.notify
+
+    async def _execute_signal_with_trigger(self, signal, *args, **kwargs):
+        token = _TG_ENTRY_TRIGGER.set(_entry_trigger_label(signal))
+        try:
+            return await original_execute_signal(self, signal, *args, **kwargs)
+        finally:
+            _TG_ENTRY_TRIGGER.reset(token)
+
+    def _build_caption_with_trigger(self, *args, **kwargs):
+        caption = original_build_caption(self, *args, **kwargs)
+        return _append_entry_trigger(caption, _TG_ENTRY_TRIGGER.get())
+
+    def _notify_with_trigger(self, text: str):
+        # Also covers bot.py's minimal fallback alert if chart/caption delivery
+        # fails after the live order has already opened.
+        label = _TG_ENTRY_TRIGGER.get()
+        if label and ("Order Executed" in str(text) or "OPEN LONG" in str(text)
+                      or "OPEN SHORT" in str(text)):
+            text = _append_entry_trigger(str(text), label)
+        return original_notify(self, text)
+
+    TradingBot._execute_signal = _execute_signal_with_trigger
+    TelegramNotifier.build_order_caption = _build_caption_with_trigger
+    TelegramNotifier.notify = _notify_with_trigger
+    TradingBot._tg_entry_trigger_patch_installed = True
 
 
 def _make_merged_trend_confirm(symbols: list, config: dict):
@@ -64,6 +146,7 @@ def _build_merged_config() -> dict:
     return config
 
 
+_install_telegram_entry_trigger_patch()
 run_bot._make_strategies = _make_merged_trend_confirm
 run_bot.build_config = _build_merged_config
 
