@@ -1,114 +1,219 @@
-"""Adaptive v13.2 indicators: trend, structure, EMA, MACD and price-action triggers."""
+"""Adaptive SMC v14 indicator engine.
+
+Computes only the evidence required by the v14 state machine:
+4H EMA trend, 1H liquidity/structure, and 15M OB/FVG/price-action entry data.
+"""
 from __future__ import annotations
+
 from typing import Any, Dict, List, Tuple
 import math
 import numpy as np
 
-ENGINE_SCHEMA = "adaptive-v13.2-price-action-macd-v1"
+ENGINE_SCHEMA = "adaptive-smc-v14-structure-v1"
 
-def _v(c: Any, name: str, idx: int) -> float:
-    value = getattr(c, name, None)
-    if value is None and isinstance(c, dict): value = c.get(name)
-    if value is None and isinstance(c, (list, tuple)) and len(c) > idx: value = c[idx]
+
+def _v(candle: Any, name: str, index: int) -> float:
+    value = getattr(candle, name, None)
+    if value is None and isinstance(candle, dict):
+        value = candle.get(name)
+    if value is None and isinstance(candle, (list, tuple)) and len(candle) > index:
+        value = candle[index]
     return float(value or 0.0)
 
-def _s(candles: List[Any], name: str, idx: int) -> List[float]:
-    return [_v(c, name, idx) for c in candles]
+
+def _series(candles: List[Any], name: str, index: int) -> List[float]:
+    return [_v(c, name, index) for c in candles]
+
 
 def ema(values: List[float], length: int) -> List[float]:
-    if not values: return []
-    alpha = 2.0 / (length + 1.0); out = [float(values[0])]
-    for value in values[1:]: out.append(alpha * float(value) + (1.0 - alpha) * out[-1])
-    return out
+    if not values:
+        return []
+    alpha = 2.0 / (length + 1.0)
+    output = [float(values[0])]
+    for value in values[1:]:
+        output.append(alpha * float(value) + (1.0 - alpha) * output[-1])
+    return output
+
 
 def atr(candles: List[Any], length: int = 14) -> float:
-    if len(candles) < 2: return 0.0
-    h, l, c = _s(candles, "high", 2), _s(candles, "low", 3), _s(candles, "close", 4)
-    tr = [h[0] - l[0]]
-    for i in range(1, len(c)): tr.append(max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])))
+    if len(candles) < 2:
+        return 0.0
+    highs = _series(candles, "high", 2)
+    lows = _series(candles, "low", 3)
+    closes = _series(candles, "close", 4)
+    tr = [highs[0] - lows[0]]
+    for index in range(1, len(candles)):
+        tr.append(max(
+            highs[index] - lows[index],
+            abs(highs[index] - closes[index - 1]),
+            abs(lows[index] - closes[index - 1]),
+        ))
     return float(np.mean(tr[-length:]))
 
-def adx(candles: List[Any], length: int = 14) -> float:
-    if len(candles) < length + 2: return 0.0
-    h, l, c = _s(candles, "high", 2), _s(candles, "low", 3), _s(candles, "close", 4)
-    pdm, mdm, tr = [], [], []
-    for i in range(1, len(c)):
-        up, down = h[i]-h[i-1], l[i-1]-l[i]
-        pdm.append(up if up > down and up > 0 else 0.0); mdm.append(down if down > up and down > 0 else 0.0)
-        tr.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
-    total = max(sum(tr[-length:]), 1e-12); pdi = 100*sum(pdm[-length:])/total; mdi = 100*sum(mdm[-length:])/total
-    return float(100*abs(pdi-mdi)/max(pdi+mdi, 1e-12))
 
-def choppiness(candles: List[Any], length: int = 14) -> float:
-    if len(candles) < length + 1: return 100.0
-    window = candles[-length:]; highs, lows = _s(window, "high", 2), _s(window, "low", 3)
-    previous = _v(candles[-length-1], "close", 4); total = 0.0
-    for candle in window:
-        high, low = _v(candle, "high", 2), _v(candle, "low", 3)
-        total += max(high-low, abs(high-previous), abs(low-previous)); previous = _v(candle, "close", 4)
-    span = max(max(highs)-min(lows), 1e-12)
-    return float(100*math.log10(max(total/span, 1e-12))/math.log10(length))
+def _pivots(values: List[float], high: bool, left: int = 2, right: int = 2) -> List[Tuple[int, float]]:
+    points: List[Tuple[int, float]] = []
+    for index in range(left, len(values) - right):
+        window = values[index - left:index + right + 1]
+        value = values[index]
+        if high and value == max(window) and window.count(value) == 1:
+            points.append((index, value))
+        if not high and value == min(window) and window.count(value) == 1:
+            points.append((index, value))
+    return points
 
-def _pivots(values: List[float], high: bool, left: int = 2, right: int = 2) -> List[Tuple[int,float]]:
-    out=[]
-    for i in range(left, len(values)-right):
-        window=values[i-left:i+right+1]; value=values[i]
-        if high and value==max(window) and window.count(value)==1: out.append((i,value))
-        if not high and value==min(window) and window.count(value)==1: out.append((i,value))
-    return out
 
-def _age(flags: List[bool], maximum: int = 9) -> int:
-    for age, flag in enumerate(reversed(flags[-maximum:])):
-        if flag: return age
-    return 999
+def _last_two(points: List[Tuple[int, float]], fallback_a: float, fallback_b: float) -> Tuple[Tuple[int, float], Tuple[int, float]]:
+    if len(points) >= 2:
+        return points[-2], points[-1]
+    if len(points) == 1:
+        return (-1, fallback_a), points[-1]
+    return (-2, fallback_a), (-1, fallback_b)
+
+
+def _detect_fvg(highs: List[float], lows: List[float]) -> Dict[str, Any]:
+    bullish = False
+    bearish = False
+    low = high = 0.0
+    age = 999
+    for i in range(max(2, len(highs) - 12), len(highs)):
+        if lows[i] > highs[i - 2]:
+            bullish, bearish = True, False
+            low, high = highs[i - 2], lows[i]
+            age = len(highs) - 1 - i
+        if highs[i] < lows[i - 2]:
+            bearish, bullish = True, False
+            low, high = highs[i], lows[i - 2]
+            age = len(highs) - 1 - i
+    return {"bullish": bullish, "bearish": bearish, "low": low, "high": high, "age": age}
+
+
+def _detect_order_block(opens: List[float], highs: List[float], lows: List[float], closes: List[float], atr_value: float) -> Dict[str, Any]:
+    bullish = bearish = False
+    low = high = 0.0
+    age = 999
+    start = max(2, len(closes) - 16)
+    for i in range(start, len(closes)):
+        displacement_up = closes[i] > highs[i - 1] and (closes[i] - opens[i]) >= 0.45 * atr_value
+        displacement_down = closes[i] < lows[i - 1] and (opens[i] - closes[i]) >= 0.45 * atr_value
+        if displacement_up:
+            for j in range(i - 1, max(-1, i - 5), -1):
+                if closes[j] < opens[j]:
+                    bullish, bearish = True, False
+                    low, high = lows[j], highs[j]
+                    age = len(closes) - 1 - j
+                    break
+        if displacement_down:
+            for j in range(i - 1, max(-1, i - 5), -1):
+                if closes[j] > opens[j]:
+                    bearish, bullish = True, False
+                    low, high = lows[j], highs[j]
+                    age = len(closes) - 1 - j
+                    break
+    return {"bullish": bullish, "bearish": bearish, "low": low, "high": high, "age": age}
+
 
 def compute(candles: List[Any]) -> Dict[str, Any]:
-    if len(candles) < 80: return {}
-    o,h,l,c,vol = _s(candles,"open",1),_s(candles,"high",2),_s(candles,"low",3),_s(candles,"close",4),_s(candles,"volume",5)
-    e8,e13,e20,e50 = (ema(c,n) for n in (8,13,20,50)); a=max(atr(candles),c[-1]*0.0005)
-    macd_fast, macd_slow = ema(c,12), ema(c,26)
-    macd_series = [fast-slow for fast,slow in zip(macd_fast,macd_slow)]
-    macd_signal_series = ema(macd_series,9)
-    macd_value = macd_series[-1]; macd_signal = macd_signal_series[-1]; macd_hist = macd_value-macd_signal
-    ph,pl=_pivots(h[-60:],True),_pivots(l[-60:],False); hs=[v for _,v in ph[-2:]]; ls=[v for _,v in pl[-2:]]
-    last_high=hs[-1] if hs else max(h[-12:-1]); prev_high=hs[-2] if len(hs)>1 else max(h[-24:-12])
-    last_low=ls[-1] if ls else min(l[-12:-1]); prev_low=ls[-2] if len(ls)>1 else min(l[-24:-12])
-    hh,hl,lh,ll=last_high>prev_high,last_low>prev_low,last_high<prev_high,last_low<prev_low
-    structure="BULL" if hh and hl else "BEAR" if lh and ll else "MIXED"
-    up_flags=[]; down_flags=[]
-    for i in range(max(1,len(c)-10),len(c)):
-        up_flags.append(e8[i-1]<=e13[i-1] and e8[i]>e13[i]); down_flags.append(e8[i-1]>=e13[i-1] and e8[i]<e13[i])
-    bull_engulf=c[-1]>o[-1] and c[-2]<o[-2] and c[-1]>=o[-2] and o[-1]<=c[-2]
-    bear_engulf=c[-1]<o[-1] and c[-2]>o[-2] and c[-1]<=o[-2] and o[-1]>=c[-2]
-    body=abs(c[-1]-o[-1]); lower=min(o[-1],c[-1])-l[-1]; upper=h[-1]-max(o[-1],c[-1])
-    hammer=c[-1]>o[-1] and lower>=max(body*1.5,a*0.15); shooting=c[-1]<o[-1] and upper>=max(body*1.5,a*0.15)
-    strong_bull=c[-1]>o[-1] and body>=0.45*a and h[-1]-c[-1]<=0.20*a
-    strong_bear=c[-1]<o[-1] and body>=0.45*a and c[-1]-l[-1]<=0.20*a
-    inside=h[-2]<h[-3] and l[-2]>l[-3]; inside_up=inside and c[-1]>h[-2]; inside_down=inside and c[-1]<l[-2]
-    break_up=c[-1]>h[-2] and c[-2]>o[-2]; break_down=c[-1]<l[-2] and c[-2]<o[-2]
-    long_trigger=bull_engulf or hammer or strong_bull or inside_up or break_up
-    short_trigger=bear_engulf or shooting or strong_bear or inside_down or break_down
-    long_name="bull_engulf" if bull_engulf else "hammer" if hammer else "inside_break" if inside_up else "break_high" if break_up else "strong_bull" if strong_bull else "none"
-    short_name="bear_engulf" if bear_engulf else "shooting_star" if shooting else "inside_break" if inside_down else "break_low" if break_down else "strong_bear" if strong_bear else "none"
-    lp=[]; sp=[]
-    for i in range(len(c)-6,len(c)):
-        lp.append(l[i]<=e20[i]+0.35*a and c[i]>=e13[i]); sp.append(h[i]>=e20[i]-0.35*a and c[i]<=e13[i])
+    if len(candles) < 80:
+        return {}
+
+    opens = _series(candles, "open", 1)
+    highs = _series(candles, "high", 2)
+    lows = _series(candles, "low", 3)
+    closes = _series(candles, "close", 4)
+    volumes = _series(candles, "volume", 5)
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    atr_value = max(atr(candles), closes[-1] * 0.0005)
+
+    high_points = _pivots(highs[-80:], True)
+    low_points = _pivots(lows[-80:], False)
+    (ph_i, previous_high), (lh_i, last_high) = _last_two(high_points, max(highs[-40:-20]), max(highs[-20:-1]))
+    (pl_i, previous_low), (ll_i, last_low) = _last_two(low_points, min(lows[-40:-20]), min(lows[-20:-1]))
+
+    higher_high = last_high > previous_high
+    higher_low = last_low > previous_low
+    lower_high = last_high < previous_high
+    lower_low = last_low < previous_low
+    structure = "BULL" if higher_high and higher_low else "BEAR" if lower_high and lower_low else "MIXED"
+
+    sell_side_sweep = lows[-1] < last_low and closes[-1] > last_low
+    buy_side_sweep = highs[-1] > last_high and closes[-1] < last_high
+    recent_sell_sweep = any(lows[i] < last_low and closes[i] > last_low for i in range(max(0, len(closes) - 5), len(closes)))
+    recent_buy_sweep = any(highs[i] > last_high and closes[i] < last_high for i in range(max(0, len(closes) - 5), len(closes)))
+
+    bullish_choch = closes[-1] > last_high and (structure in {"BEAR", "MIXED"} or recent_sell_sweep)
+    bearish_choch = closes[-1] < last_low and (structure in {"BULL", "MIXED"} or recent_buy_sweep)
+    bullish_bos = closes[-1] > last_high and closes[-2] <= last_high
+    bearish_bos = closes[-1] < last_low and closes[-2] >= last_low
+
+    fvg = _detect_fvg(highs, lows)
+    order_block = _detect_order_block(opens, highs, lows, closes, atr_value)
+
+    body = abs(closes[-1] - opens[-1])
+    lower_wick = min(opens[-1], closes[-1]) - lows[-1]
+    upper_wick = highs[-1] - max(opens[-1], closes[-1])
+    bull_engulf = closes[-1] > opens[-1] and closes[-2] < opens[-2] and closes[-1] >= opens[-2] and opens[-1] <= closes[-2]
+    bear_engulf = closes[-1] < opens[-1] and closes[-2] > opens[-2] and closes[-1] <= opens[-2] and opens[-1] >= closes[-2]
+    bull_pin = closes[-1] > opens[-1] and lower_wick >= max(body * 1.8, atr_value * 0.15)
+    bear_pin = closes[-1] < opens[-1] and upper_wick >= max(body * 1.8, atr_value * 0.15)
+    break_high = closes[-1] > highs[-2]
+    break_low = closes[-1] < lows[-2]
+    volume_ratio = volumes[-1] / max(float(np.mean(volumes[-20:])), 1e-12)
+    bull_volume = closes[-1] > opens[-1] and volume_ratio >= 1.2
+    bear_volume = closes[-1] < opens[-1] and volume_ratio >= 1.2
+
+    zone_low = max(order_block["low"] if order_block["bullish"] else 0.0, fvg["low"] if fvg["bullish"] else 0.0)
+    zone_high_candidates = [value for value in (
+        order_block["high"] if order_block["bullish"] else 0.0,
+        fvg["high"] if fvg["bullish"] else 0.0,
+    ) if value > 0]
+    bull_overlap_high = min(zone_high_candidates) if zone_high_candidates else 0.0
+    bull_overlap = zone_low > 0 and bull_overlap_high > zone_low
+
+    bear_zone_low_candidates = [value for value in (
+        order_block["low"] if order_block["bearish"] else 0.0,
+        fvg["low"] if fvg["bearish"] else 0.0,
+    ) if value > 0]
+    bear_overlap_low = max(bear_zone_low_candidates) if bear_zone_low_candidates else 0.0
+    bear_zone_high_candidates = [value for value in (
+        order_block["high"] if order_block["bearish"] else 0.0,
+        fvg["high"] if fvg["bearish"] else 0.0,
+    ) if value > 0]
+    bear_overlap_high = min(bear_zone_high_candidates) if bear_zone_high_candidates else 0.0
+    bear_overlap = bear_overlap_low > 0 and bear_overlap_high > bear_overlap_low
+
     return {
-        "schema":ENGINE_SCHEMA,"open":o[-1],"high":h[-1],"low":l[-1],"close":c[-1],"prev_open":o[-2],"prev_high":h[-2],"prev_low":l[-2],"prev_close":c[-2],
-        "ema8":e8[-1],"ema13":e13[-1],"ema20":e20[-1],"ema50":e50[-1],"ema8_series":e8[-80:],"ema13_series":e13[-80:],"ema20_series":e20[-80:],
-        "ema20_slope_atr":(e20[-1]-e20[-4])/a,"macd":macd_value,"macd_signal":macd_signal,"macd_hist":macd_hist,
-        "macd_bull":macd_value>macd_signal and macd_hist>0,"macd_bear":macd_value<macd_signal and macd_hist<0,
-        "cross_up":up_flags[-1],"cross_down":down_flags[-1],"cross_up_age":_age(up_flags),"cross_down_age":_age(down_flags),
-        "atr":a,"adx":adx(candles),"chop":choppiness(candles),"body_atr":body/a,"extension_atr":abs(c[-1]-e20[-1])/a,"volume":vol[-1],"vol_avg":float(np.mean(vol[-20:])),
-        "last_swing_high":last_high,"previous_swing_high":prev_high,"last_swing_low":last_low,"previous_swing_low":prev_low,"higher_high":hh,"higher_low":hl,"lower_high":lh,"lower_low":ll,"structure":structure,
-        "long_pullback_age":_age(lp),"short_pullback_age":_age(sp),"long_trigger":long_trigger,"short_trigger":short_trigger,"long_trigger_name":long_name,"short_trigger_name":short_name,
-        "ema_bull":e8[-1]>e13[-1]>e20[-1],"ema_bear":e8[-1]<e13[-1]<e20[-1],"close_below_ema13_2":c[-1]<e13[-1] and c[-2]<e13[-2],"close_above_ema13_2":c[-1]>e13[-1] and c[-2]>e13[-2]
+        "schema": ENGINE_SCHEMA,
+        "open": opens[-1], "high": highs[-1], "low": lows[-1], "close": closes[-1],
+        "prev_open": opens[-2], "prev_high": highs[-2], "prev_low": lows[-2], "prev_close": closes[-2],
+        "ema20": e20[-1], "ema50": e50[-1], "ema20_series": e20[-80:], "ema50_series": e50[-80:],
+        "ema20_slope_atr": (e20[-1] - e20[-4]) / atr_value,
+        "atr": atr_value, "volume": volumes[-1], "volume_ratio": volume_ratio,
+        "last_swing_high": last_high, "previous_swing_high": previous_high,
+        "last_swing_low": last_low, "previous_swing_low": previous_low,
+        "higher_high": higher_high, "higher_low": higher_low, "lower_high": lower_high, "lower_low": lower_low,
+        "structure": structure,
+        "sell_side_sweep": sell_side_sweep, "buy_side_sweep": buy_side_sweep,
+        "recent_sell_sweep": recent_sell_sweep, "recent_buy_sweep": recent_buy_sweep,
+        "bullish_choch": bullish_choch, "bearish_choch": bearish_choch,
+        "bullish_bos": bullish_bos, "bearish_bos": bearish_bos,
+        "ob_bull": order_block["bullish"], "ob_bear": order_block["bearish"],
+        "ob_low": order_block["low"], "ob_high": order_block["high"], "ob_age": order_block["age"],
+        "fvg_bull": fvg["bullish"], "fvg_bear": fvg["bearish"],
+        "fvg_low": fvg["low"], "fvg_high": fvg["high"], "fvg_age": fvg["age"],
+        "bull_zone_low": zone_low if bull_overlap else (order_block["low"] if order_block["bullish"] else fvg["low"]),
+        "bull_zone_high": bull_overlap_high if bull_overlap else (order_block["high"] if order_block["bullish"] else fvg["high"]),
+        "bear_zone_low": bear_overlap_low if bear_overlap else (order_block["low"] if order_block["bearish"] else fvg["low"]),
+        "bear_zone_high": bear_overlap_high if bear_overlap else (order_block["high"] if order_block["bearish"] else fvg["high"]),
+        "bull_zone_overlap": bull_overlap, "bear_zone_overlap": bear_overlap,
+        "bull_engulf": bull_engulf, "bear_engulf": bear_engulf,
+        "bull_pin": bull_pin, "bear_pin": bear_pin,
+        "break_high": break_high, "break_low": break_low,
+        "bull_volume": bull_volume, "bear_volume": bear_volume,
     }
 
+
 class IndicatorEngine:
-    @staticmethod
-    def _candle(candles: List[Any]) -> Dict[str, Any]:
-        if not candles: return {}
-        c=candles[-1]; return {"open":_v(c,"open",1),"high":_v(c,"high",2),"low":_v(c,"low",3),"close":_v(c,"close",4),"volume":_v(c,"volume",5)}
-    def compute(self,c15m,c1h,c4h):
-        return self._candle(c15m),self._candle(c1h),self._candle(c4h),compute(c15m),compute(c1h),compute(c4h)
+    def compute(self, c15m: List[Any], c1h: List[Any], c4h: List[Any]):
+        return compute(c15m), compute(c1h), compute(c4h)
