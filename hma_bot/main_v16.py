@@ -7,10 +7,12 @@ OKX client once the active symbol operation has returned.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 
 import main_v15 as v15
 import strategy_v12 as S
+from sentinel_context import build_context
 
 _LOG = v15._LOG
 
@@ -120,16 +122,83 @@ class Bot(v15.Bot):
                 self.request_shutdown()
                 raise
 
+    @staticmethod
+    def _fmt_zone_price(value: float) -> str:
+        """Compact price formatting that still preserves crypto precision."""
+        return f"{float(value):.6g}"
+
+    def _entry_zone_status(self, df5, df15, df1h, df4h) -> str:
+        """Return the exact active S1/S2 or R1/R2 price band for logs.
+
+        The displayed band is the same 5M ATR touch zone used by the entry
+        engine, so Railway shows where price must trade before hold/reclaim
+        confirmation can create an order.
+        """
+        try:
+            if len(df5) < 20 or len(df1h) < 60 or len(df15) < 90:
+                return ""
+
+            direction, quality = self.strat._simple_direction(df1h)
+            if direction.side is None or quality.q < self.strat.quality_min:
+                return ""
+
+            context = build_context(
+                df15=df15,
+                df1h=df1h,
+                df4h=df4h,
+                side="long" if direction.side == S.Side.LONG else "short",
+            )
+            _, level_name, level_price, _, _ = self.strat._sr_entry_state(
+                df5, context.location, direction.side
+            )
+            if level_price is None or not math.isfinite(float(level_price)):
+                return ""
+
+            d5 = df5.copy()
+            d5["atr"] = self.strat._atr(d5, self.strat.cfg.atr_len)
+            atr5 = float(d5["atr"].iloc[-1])
+            if not math.isfinite(atr5) or atr5 <= 0.0:
+                return ""
+
+            level = float(level_price)
+            half_width = max(
+                self.strat.sr_touch_zone_atr5 * atr5,
+                abs(level) * 1e-6,
+            )
+            zone_low = level - half_width
+            zone_high = level + half_width
+            price = float(df5["close"].iloc[-1])
+
+            if zone_low <= price <= zone_high:
+                distance_text = "IN_ZONE"
+            elif price > zone_high:
+                distance_text = f"{(price - zone_high) / atr5:.2f}ATR_ABOVE"
+            else:
+                distance_text = f"{(zone_low - price) / atr5:.2f}ATR_BELOW"
+
+            return (
+                f"EntryZone={level_name} "
+                f"{self._fmt_zone_price(zone_low)}-"
+                f"{self._fmt_zone_price(zone_high)} | "
+                f"ZoneDist={distance_text}"
+            )
+        except Exception as exc:
+            _LOG.debug("Entry-zone display unavailable: %s", exc)
+            return ""
+
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
             self._risk_symbol = symbol
             if self.open_position_count() >= self.cfg.max_positions:
                 self._view[symbol] = f"POSITION LIMIT | MAX {self.cfg.max_positions}"
                 return
+
             px = float(df5["close"].iloc[-1]) if len(df5) else 0.0
+            zone_status = self._entry_zone_status(df5, df15, df1h, df4h)
+            strategy_status = self.strat.entry_status(df4h, df1h, df15, df5)
+            zone_part = f" | {zone_status}" if zone_status else ""
             self._view[symbol] = (
-                f"5M px={px:.6g} | "
-                f"{self.strat.entry_status(df4h, df1h, df15, df5)}"
+                f"5M px={px:.6g}{zone_part} | {strategy_status}"
             )
         except Exception as exc:
             self._view[symbol] = f"view error: {str(exc)[:140]}"
@@ -176,6 +245,7 @@ class Bot(v15.Bot):
                 "`SHORT Levels` adaptive 15M `R1/R2`\n"
                 "`Hold Entry` touch a level without closing through it, then enter after the next closed 5M candle still holds the level\n"
                 "`Reclaim Entry` close through a level, then enter immediately on the first closed 5M candle reclaiming back through it\n"
+                "`Log Zone` shows the active S/R entry price band and distance from current price\n"
                 f"`Risk Check` Room `≥{self.strat.min_room_atr:.2f} ATR` and actual R:R `≥{self.strat.min_actual_rr:.2f}`\n"
                 "`XAU Stop` 15M structure with `1.20–1.80 ATR` distance\n"
                 "TP/SL and position management remain unchanged.\n"
@@ -187,8 +257,9 @@ class Bot(v15.Bot):
 
         _LOG.info(
             "HMA S/R Sentinel startup complete: 1H direction plus S1/S2 or "
-            "R1/R2 hold/reclaim entries; XAU structure stop uses 1.20-1.80 "
-            "ATR; status and order creation use the same decision"
+            "R1/R2 hold/reclaim entries; logs show the active entry zone; "
+            "XAU structure stop uses 1.20-1.80 ATR; status and order creation "
+            "use the same decision"
         )
 
 
