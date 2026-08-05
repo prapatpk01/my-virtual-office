@@ -12,7 +12,7 @@ WaveTrend entry extremes used in production:
 
 WT is an entry trigger inside Trend Confirm, not a second strategy. Telegram
 order alerts receive the exact entry-trigger owner from signal metadata and
-show either WT Cross or EMA8/13 Cross.
+show the matching entry trigger and signal-exit rule.
 """
 from __future__ import annotations
 
@@ -49,18 +49,30 @@ def _entry_trigger_label(signal) -> str | None:
 
 
 def _append_entry_trigger(text: str, label: str | None) -> str:
-    """Insert the trigger line beside the entry details without duplication."""
-    if not label or "Entry Trigger" in text:
+    """Show the entry trigger and its matching signal exit in an order alert."""
+    if not label:
         return text
 
-    trigger_line = f"⚡ Entry Trigger : `{label}`"
     lines = str(text).splitlines()
-    insert_at = 1
+    if not any("Entry Trigger" in line for line in lines):
+        trigger_line = f"⚡ Entry Trigger : `{label}`"
+        insert_at = 1
+        for index, line in enumerate(lines):
+            if "Entry :" in line or "Entry:" in line or "Fill:" in line:
+                insert_at = index + 1
+                break
+        lines.insert(insert_at, trigger_line)
+
+    exit_text = (
+        "🏁 Signal Exit : `WT opposite cross`"
+        if label == "WT Cross"
+        else "🏁 Signal Exit : `EMA8/13 reverse cross`"
+    )
     for index, line in enumerate(lines):
-        if "Entry :" in line or "Entry:" in line or "Fill:" in line:
-            insert_at = index + 1
+        if line.startswith("🏁 Exit") or line.startswith("🏁 Signal Exit"):
+            lines[index] = exit_text
             break
-    lines.insert(insert_at, trigger_line)
+
     return "\n".join(lines)
 
 
