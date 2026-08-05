@@ -1,4 +1,4 @@
-"""HMA Simple Sentinel production runtime.
+"""HMA S/R Sentinel production runtime.
 
 Startup is standalone so Telegram receives one authoritative message only.
 Railway shutdown is graceful: stop the processing loop first, then close the
@@ -39,13 +39,18 @@ class Bot(v15.Bot):
                 min_atr = 1.20
                 max_atr = 1.80
                 raw_distance = abs(float(entry) - float(sl))
-                stop_distance = max(min_atr * atr15, min(raw_distance, max_atr * atr15))
+                stop_distance = max(
+                    min_atr * atr15,
+                    min(raw_distance, max_atr * atr15),
+                )
                 sl = (
                     float(entry) - stop_distance
                     if decision.side == S.Side.LONG
                     else float(entry) + stop_distance
                 )
-                rr = abs(float(tp) - float(entry)) / max(stop_distance, 1e-12)
+                rr = abs(float(tp) - float(entry)) / max(
+                    stop_distance, 1e-12
+                )
 
             return entry, sl, tp, atr15, structure_level, rr
 
@@ -70,7 +75,7 @@ class Bot(v15.Bot):
             text = str(exc).lower()
             if "closed by the user" not in text and "already closed" not in text:
                 _LOG.warning("OKX close during shutdown failed: %s", exc)
-        _LOG.info("HMA Simple Sentinel shutdown complete")
+        _LOG.info("HMA S/R Sentinel shutdown complete")
 
     async def run_forever(self):
         """Process symbols without reporting expected redeploy shutdown as errors."""
@@ -144,7 +149,7 @@ class Bot(v15.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== HMA SIMPLE SENTINEL [%s] symbols=%s margin=$%.2f "
+            "=== HMA S/R SENTINEL [%s] symbols=%s margin=$%.2f "
             "leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE",
             self.cfg.symbols,
@@ -161,16 +166,19 @@ class Bot(v15.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"⚡ *HMA Simple Sentinel — {mode}*\n"
+                f"🎯 *HMA S/R Sentinel — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
-                "Simplified entry logic:\n"
+                "Entry logic:\n"
                 f"`Layer 1 · 1H Direction` Trend `≥{self.strat.one_h_early_min:.0f}` · edge `≥{self.strat.one_h_direction_edge_min:.0f}` · Q `≥{self.strat.quality_min:.0f}`\n"
-                f"`Layer 2 · 15M Setup` S/R within `{self.strat.setup_proximity_atr:.2f} ATR` or aligned EMA20 pullback\n"
-                f"`Layer 3 · 5M Trigger` EMA8/13, BOS/CHOCH or continuation within `{self.strat.exec_trigger_lookback}` closed bars\n"
+                "`LONG Levels` adaptive 15M `S1/S2`\n"
+                "`SHORT Levels` adaptive 15M `R1/R2`\n"
+                "`Hold Entry` touch a level without closing through it, then enter after the next closed 5M candle still holds the level\n"
+                "`Reclaim Entry` close through a level, then enter immediately on the first closed 5M candle reclaiming back through it\n"
                 f"`Risk Check` Room `≥{self.strat.min_room_atr:.2f} ATR` and actual R:R `≥{self.strat.min_actual_rr:.2f}`\n"
                 "`XAU Stop` 15M structure with `1.20–1.80 ATR` distance\n"
+                "TP/SL and position management remain unchanged.\n"
                 "4H and Confidence are diagnostic only; neither can block an entry.\n"
                 "Risk management: Stage 1 `+0.7%→lock +0.4%` | Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
                 "Schedule: `FX 24/5 new entries` | Existing positions managed `24/7`\n"
@@ -178,9 +186,9 @@ class Bot(v15.Bot):
             )
 
         _LOG.info(
-            "HMA Simple Sentinel startup complete: 3 layers + 1 risk check; "
-            "XAU structure stop uses 1.20-1.80 ATR; status and order creation "
-            "use the same decision"
+            "HMA S/R Sentinel startup complete: 1H direction plus S1/S2 or "
+            "R1/R2 hold/reclaim entries; XAU structure stop uses 1.20-1.80 "
+            "ATR; status and order creation use the same decision"
         )
 
 
