@@ -51,7 +51,7 @@ class Bot(v15.Bot):
     CTR_MIN_TREND = 60.0
     CTR_MAX_STOP_ATR15 = 1.00
     CTR_MIN_RR = 0.80
-    CTR_MAX_TP_PCT = 0.007
+    CTR_MAX_TP_PCT = 0.005
     CTR_MIN_TPC_GAP_PCT = 0.009
     CTR_MIN_TPC_GAP_ATR15 = 1.20
     CTR_TPC_ZONE_BUFFER_ATR15 = 0.10
@@ -777,7 +777,7 @@ class Bot(v15.Bot):
                 "`Q <45` no trade\n"
                 "CTR fallback: opposing S/R + 15M HMA16 flip + rejection + exhaustion `2/4`\n"
                 "CTR gap: distance to pending TPC zone must be `≥0.9%` or `≥1.2 ATR15`\n"
-                "CTR TP is capped at `0.7%` and must finish before the TPC zone\n"
+                "CTR TP is capped at `0.5%` and must finish before the TPC zone\n"
                 "CTR uses `40%` margin, stop ≤`1.0 ATR15`, RR ≥`0.8`\n"
                 "CTR never opens when TPC has a valid signal or the symbol already has a position\n"
                 "Asset profiles: execution-zone width + ATR stop only\n"
