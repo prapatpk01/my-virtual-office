@@ -10,9 +10,9 @@ WaveTrend entry extremes used in production:
 - Long cross from oversold <= -42
 - Short cross from overbought >= +45
 
-WT is an entry trigger inside Trend Confirm, not a second strategy. Telegram
-order alerts receive the exact entry-trigger owner from signal metadata and
-show the matching trigger, T1 plan, signal-exit rule and strategy name.
+Telegram order alerts and charts receive the exact trigger owner:
+- EMA entry -> MACD lower panel and EMA reverse-cross exit text.
+- WT entry  -> WaveTrend lower panel and WT opposite-cross exit text.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from contextvars import ContextVar
 
 import run_dual_bot  # keeps exchange, sleep, risk and lifecycle patches
 import run_bot
+import trading.chart_renderer as chart_renderer
 from trading.bot import TradingBot
 from trading.telegram_notifier import TelegramNotifier
 
@@ -55,7 +56,6 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
 
     lines = str(text).splitlines()
 
-    # Show the exact Layer-3 trigger next to the fill/entry.
     if not any("Entry Trigger" in line for line in lines):
         trigger_line = f"⚡ Entry Trigger : `{label}`"
         insert_at = 1
@@ -65,7 +65,6 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
                 break
         lines.insert(insert_at, trigger_line)
 
-    # The live manager uses percentages, not R: T1 +0.6%, trim 40%, lock +0.3%.
     target_index = None
     for index, line in enumerate(lines):
         if line.startswith("🎯 Target") or line.startswith("🎯 T1"):
@@ -77,7 +76,6 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
         if not any(line.startswith("🔒 Runner") for line in lines):
             lines.insert(target_index + 1, runner_line)
 
-    # Enter with X, exit with the matching X.
     exit_text = (
         "🏁 Signal Exit : `WT opposite cross`"
         if label == "WT Cross"
@@ -88,7 +86,6 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
             lines[index] = exit_text
             break
 
-    # EMA and WT are entry triggers inside one Trend Confirm strategy family.
     for index, line in enumerate(lines):
         if line.startswith("📊 Strategy:"):
             regime_suffix = ""
@@ -97,7 +94,6 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
             lines[index] = f"📊 Strategy: `Trend Confirm`{regime_suffix}"
             break
 
-    # A missing macro score was previously rendered as a misleading 0/100.
     for index, line in enumerate(lines):
         if line.startswith("🧭 4H Macro:") and " (0/100)" in line:
             lines[index] = line.replace(" (0/100)", "")
@@ -105,19 +101,15 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
     return "\n".join(lines)
 
 
-def _install_telegram_entry_trigger_patch() -> None:
-    """Bridge Signal metadata to the existing Telegram notifier safely.
-
-    ContextVar keeps the trigger attached to the correct async order task even
-    if multiple symbols are evaluated close together. The notifier's public API
-    remains backward compatible for all other strategies and callers.
-    """
+def _install_trigger_aware_telegram_patch() -> None:
+    """Attach trigger metadata to both the Telegram caption and PNG chart."""
     if getattr(TradingBot, "_tg_entry_trigger_patch_installed", False):
         return
 
     original_execute_signal = TradingBot._execute_signal
     original_build_caption = TelegramNotifier.build_order_caption
     original_notify = TelegramNotifier.notify
+    original_render_entry_chart = chart_renderer.render_entry_chart
 
     async def _execute_signal_with_trigger(self, signal, *args, **kwargs):
         token = _TG_ENTRY_TRIGGER.set(_entry_trigger_label(signal))
@@ -131,8 +123,6 @@ def _install_telegram_entry_trigger_patch() -> None:
         return _append_entry_trigger(caption, _TG_ENTRY_TRIGGER.get())
 
     def _notify_with_trigger(self, text: str):
-        # Also covers bot.py's minimal fallback alert if chart/caption delivery
-        # fails after the live order has already opened.
         label = _TG_ENTRY_TRIGGER.get()
         if label and (
             "Order Executed" in str(text)
@@ -142,9 +132,32 @@ def _install_telegram_entry_trigger_patch() -> None:
             text = _append_entry_trigger(str(text), label)
         return original_notify(self, text)
 
+    def _render_entry_chart_with_trigger(*args, **kwargs):
+        """Select the lower indicator panel from the real entry owner."""
+        label = _TG_ENTRY_TRIGGER.get()
+        if label:
+            kwargs["entry_trigger"] = label
+            kwargs["strategy"] = "Trend Confirm"
+            kwargs["t1_pct"] = 0.006
+            kwargs["t1_trim_pct"] = 0.40
+            kwargs["t1_lock_pct"] = 0.003
+
+            if label == "WT Cross":
+                kwargs["lower_panel"] = "wt"
+                kwargs["wt_channel_length"] = 10
+                kwargs["wt_average_length"] = 21
+                kwargs["wt_signal_length"] = 4
+                kwargs["wt_oversold"] = -42.0
+                kwargs["wt_overbought"] = 45.0
+            else:
+                kwargs["lower_panel"] = "macd"
+
+        return original_render_entry_chart(*args, **kwargs)
+
     TradingBot._execute_signal = _execute_signal_with_trigger
     TelegramNotifier.build_order_caption = _build_caption_with_trigger
     TelegramNotifier.notify = _notify_with_trigger
+    chart_renderer.render_entry_chart = _render_entry_chart_with_trigger
     TradingBot._tg_entry_trigger_patch_installed = True
 
 
@@ -169,7 +182,6 @@ def _make_merged_trend_confirm(symbols: list, config: dict):
 
 
 def _build_merged_config() -> dict:
-    # Bypass the old dual quota sum. There is now only one strategy family.
     config = run_dual_bot._ORIGINAL_BUILD_CONFIG()
     if not run_dual_bot._env_bool("ENABLE_TREND_CONFIRM", True):
         raise RuntimeError(
@@ -190,7 +202,7 @@ def _build_merged_config() -> dict:
     return config
 
 
-_install_telegram_entry_trigger_patch()
+_install_trigger_aware_telegram_patch()
 run_bot._make_strategies = _make_merged_trend_confirm
 run_bot.build_config = _build_merged_config
 
