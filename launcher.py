@@ -1,6 +1,6 @@
 """Unified launcher — pick the trading system with the MODE env var.
 
-MODE=hma launches the HMA Simple Sentinel production entrypoint.
+MODE=hma launches the HMA S/R Sentinel production entrypoint.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def main() -> None:
     elif mode in ("hma", "hma16", "trendfollow"):
         target_dir = os.path.join(HERE, "hma_bot")
         argv = [sys.executable, "main_v16.py"]
-        name = "HMA Simple Sentinel"
+        name = "HMA S/R Sentinel"
     else:
         print(f"FATAL: unknown MODE={mode!r}", flush=True)
         sys.exit(1)
