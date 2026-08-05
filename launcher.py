@@ -1,6 +1,6 @@
 """Unified launcher — pick the trading system with the MODE env var.
 
-MODE=hma launches the HMA S/R Sentinel production entrypoint.
+MODE=tpc launches Trend Pullback Continuation (TPC Sentinel).
 """
 from __future__ import annotations
 
@@ -25,10 +25,17 @@ def main() -> None:
         target_dir = os.path.join(HERE, "htf_bot")
         argv = [sys.executable, "main.py"]
         name = "HTF Pullback"
-    elif mode in ("hma", "hma16", "trendfollow"):
+    elif mode in ("tpc", "trend_pullback_continuation"):
+        # Keep the current internal directory during the production-safe
+        # rebrand. MODE and all user-facing names are now TPC.
         target_dir = os.path.join(HERE, "hma_bot")
         argv = [sys.executable, "main_v16.py"]
-        name = "HMA S/R Sentinel"
+        name = "Trend Pullback Continuation (TPC Sentinel)"
+    elif mode in ("hma", "hma16", "trendfollow"):
+        # Temporary backward compatibility for old Railway variables.
+        target_dir = os.path.join(HERE, "hma_bot")
+        argv = [sys.executable, "main_v16.py"]
+        name = "Trend Pullback Continuation (legacy HMA alias)"
     else:
         print(f"FATAL: unknown MODE={mode!r}", flush=True)
         sys.exit(1)
