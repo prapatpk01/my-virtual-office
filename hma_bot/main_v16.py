@@ -37,6 +37,7 @@ class Bot(v15.Bot):
         "XRP": {"zone_atr5": 0.30, "sl_min_atr15": 1.10, "sl_max_atr15": 1.70},
         "TRX": {"zone_atr5": 0.25, "sl_min_atr15": 1.00, "sl_max_atr15": 1.60},
         "XAU": {"zone_atr5": 0.25, "sl_min_atr15": 1.20, "sl_max_atr15": 1.80},
+        "XAG": {"zone_atr5": 0.30, "sl_min_atr15": 1.20, "sl_max_atr15": 1.90},
         "CL": {"zone_atr5": 0.30, "sl_min_atr15": 1.30, "sl_max_atr15": 2.00},
     }
 
@@ -390,7 +391,7 @@ class Bot(v15.Bot):
                 "Hold: touch without closing through, then next closed 5M candle confirms\n"
                 "Reclaim: close through, then first closed 5M candle reclaims the level\n"
                 "Asset profiles: execution-zone width + ATR stop only; entry logic is unchanged\n"
-                "Prepared: `BTC ETH SOL HYPE XRP TRX XAU CL`\n"
+                "Prepared: `BTC ETH SOL HYPE XRP TRX XAU XAG CL`\n"
                 "Stage 1 `+0.7%→lock +0.4%` | Stage 2 `+1.1%→lock +0.75%` | Final TP `+1.5%`\n"
                 "4H and Confidence are diagnostic only."
             )
