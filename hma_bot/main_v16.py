@@ -24,6 +24,41 @@ class Bot(v15.Bot):
         self.post_close_cooldown_sec = 45 * 60
         self.risk_per_trade_pct = float(os.environ.get("FAST_RISK_PER_TRADE_PCT", "0.02"))
         self.min_dynamic_margin = float(os.environ.get("FAST_MIN_MARGIN_USD", "5.0"))
+        self._shutdown_requested = False
+        self._client_closed = False
+
+    def request_shutdown(self) -> None:
+        """Stop scheduling work; keep the OKX client alive for in-flight work."""
+        self._shutdown_requested = True
+        self._running = False
+        _LOG.info("FAST-V6 graceful shutdown requested")
+
+    async def run_forever(self):
+        """Finish the current symbol safely before closing exchange access."""
+        while self._running and not self._shutdown_requested:
+            for symbol in self.cfg.symbols:
+                if self._shutdown_requested:
+                    break
+                try:
+                    await self._process(symbol)
+                except Exception as exc:
+                    if self._shutdown_requested and "closed by the user" in str(exc).lower():
+                        break
+                    _LOG.error("[%s] unhandled: %s", symbol, exc, exc_info=True)
+            if self._shutdown_requested:
+                break
+            self._maybe_status_log()
+            await asyncio.sleep(self.cfg.poll_interval_sec)
+
+    async def stop(self):
+        """Close the shared OKX client exactly once."""
+        self._running = False
+        self._shutdown_requested = True
+        if self._client_closed:
+            return
+        self._client_closed = True
+        await self.client.close()
+        _LOG.info("FAST-V6 shutdown complete")
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
@@ -224,7 +259,9 @@ async def _main():
     for sig_name in ("SIGINT", "SIGTERM"):
         try:
             signal_module = v15.v14.v13.v12.v11.v10.v9.v8.v7.v5.v4.v3.base._signal
-            loop.add_signal_handler(getattr(signal_module, sig_name), lambda: asyncio.ensure_future(bot.stop()))
+            loop.add_signal_handler(
+                getattr(signal_module, sig_name), bot.request_shutdown
+            )
         except (NotImplementedError, AttributeError):
             pass
     await bot.start()
