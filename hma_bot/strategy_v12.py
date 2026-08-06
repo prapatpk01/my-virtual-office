@@ -82,6 +82,11 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
         tier = "TREND" if score < 68.0 else "STRONG"
         return AdaptiveDirection(side, score, opposite, edge, tier), quality
 
+    # Compatibility for a rolling Railway deployment where the previous
+    # runtime may briefly import the new strategy before main_v16 is replaced.
+    def _simple_direction(self, df1h):
+        return self._direction_1h(df1h)
+
     def _prepared_15m(self, df15):
         d = df15.copy()
         close = d["close"].astype(float)
