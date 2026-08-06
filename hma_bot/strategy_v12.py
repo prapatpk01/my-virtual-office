@@ -57,7 +57,8 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
         self.flip_lookback = max(1, _env_int("FAST_HMA_FLIP_LOOKBACK", 2))
         self.max_chase_atr = _env_float("FAST_MAX_CHASE_ATR", 1.10)
         self.min_body_atr = _env_float("FAST_MIN_BODY_ATR", 0.08)
-        self.sl_atr = _env_float("FAST_SL_ATR", 1.05)
+        self.sl_atr = _env_float("FAST_SL_ATR", 1.35)
+        self.sl_min_pct = _env_float("FAST_SL_MIN_PCT", 0.006)
         self.sl_max_pct = _env_float("FAST_SL_MAX_PCT", 0.010)
         self.tp_pct = _env_float("FAST_TP_PCT", 0.012)
         self.min_rr = _env_float("FAST_MIN_RR", 1.05)
@@ -186,7 +187,8 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
         else:
             swing = min([v for _, v in ctx["mic_h"][-3:] if v > entry] or [entry + atr])
             raw_dist = max(swing - entry + 0.10 * atr, self.sl_atr * atr)
-        stop_dist = min(raw_dist, entry * self.sl_max_pct)
+        stop_dist = max(raw_dist, entry * self.sl_min_pct)
+        stop_dist = min(stop_dist, entry * self.sl_max_pct)
         sl = entry - stop_dist if decision.side == Side.LONG else entry + stop_dist
         tp = entry * (1 + self.tp_pct) if decision.side == Side.LONG else entry * (1 - self.tp_pct)
         rr = abs(tp - entry) / max(stop_dist, 1e-12)
