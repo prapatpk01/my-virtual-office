@@ -1,12 +1,13 @@
 """TPC Dynamic Zone V6.1 — early, non-repainting trend-pullback entries.
 
 One authoritative path:
-    1H direction -> relaxed quality -> 15M dynamic zone -> 5M execution
+    1H direction/Q -> 15M dynamic location -> 15M execution
 
 Supply/demand zones use confirmed 15M pivots plus displacement.  They are
 invalidated only by closed candles and never move after confirmation.  A
 lightweight EMA13 pullback fallback keeps the strategy active when no clean
-structural zone exists.  Counter-trend entries are never generated.
+structural zone exists. Counter-trend entries are never generated. HMA16 flips
+are the early trigger; EMA13 reclaims additionally require 4H alignment.
 """
 from __future__ import annotations
 
@@ -73,13 +74,13 @@ class DynamicContext:
 
 
 class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
-    """1H trend with confirmed 15M location and immediate 5M execution."""
+    """1H trend with confirmed location and closed-15M execution."""
 
     def __init__(self, config=None) -> None:
         super().__init__(config)
         self.direction_min = _env_float("TPC_DIRECTION_MIN", 52.0)
         self.direction_edge_min = _env_float("TPC_DIRECTION_EDGE_MIN", 3.0)
-        self.quality_min = _env_float("TPC_QUALITY_MIN", 42.0)
+        self.quality_min = _env_float("TPC_QUALITY_MIN", 55.0)
         self.hard_chop = _env_float("TPC_HARD_CHOP", 68.0)
         self.hard_adx = _env_float("TPC_HARD_ADX", 11.0)
         self.dmi_opposition = _env_float("TPC_DMI_OPPOSITION", 8.0)
@@ -104,9 +105,39 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
         self.sl_atr = _env_float("TPC_SL_ATR", 1.35)
         self.sl_min_pct = _env_float("TPC_SL_MIN_PCT", 0.006)
         self.sl_max_pct = _env_float("TPC_SL_MAX_PCT", 0.010)
-        self.tp_pct = _env_float("TPC_TP_PCT", 0.012)
         self.target_buffer_atr = _env_float("TPC_TARGET_BUFFER_ATR", 0.10)
-        self.min_rr = _env_float("TPC_MIN_RR", 1.20)
+        self.macro_min = _env_float("TPC_4H_MIN", 52.0)
+        self.macro_edge_min = _env_float("TPC_4H_EDGE_MIN", 3.0)
+        self.stage_locks_enabled = os.environ.get(
+            "TPC_STAGE_LOCKS_ENABLED", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        # The previous +0.7%/+1.1% locks converted too many valid runners into
+        # small wins while full initial stops remained. V6.2 keeps native SL/TP
+        # authoritative unless stage locks are explicitly re-enabled.
+        self.tp_pct = _env_float("TPC_TP_PCT", 0.020)
+        self.min_rr = _env_float("TPC_MIN_RR", 1.80)
+
+    def locked_stop(self, side: Side, entry: float, best_price: float):
+        if self.stage_locks_enabled:
+            return super().locked_stop(side, entry, best_price)
+        default_stop = (
+            entry * (1.0 - self.cfg.stop_loss_pct)
+            if side == Side.LONG else entry * (1.0 + self.cfg.stop_loss_pct)
+        )
+        return default_stop, 0
+
+    def _macro_aligned(self, df4h: pd.DataFrame, side: Side) -> tuple[bool, float, float]:
+        long_score = float(trend_score_4h(df4h, "long"))
+        short_score = float(trend_score_4h(df4h, "short"))
+        chosen = long_score if side == Side.LONG else short_score
+        opposing = short_score if side == Side.LONG else long_score
+        return (
+            chosen >= self.macro_min
+            and chosen - opposing >= self.macro_edge_min,
+            chosen,
+            opposing,
+        )
 
     @staticmethod
     def _ema(series: pd.Series, length: int) -> pd.Series:
@@ -366,21 +397,32 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
         if context.location.room_atr < self.min_room_atr:
             return DecisionState(False, "ROOM", f"opposing zone {context.location.room_atr:.2f}<{self.min_room_atr:.2f} ATR", direction, quality, context, setup, None, direction.score)
 
-        trigger = self._execution_trigger(d5, direction.side, context.active_zone)
-        if trigger is None:
-            return DecisionState(False, "5M_TRIGGER", f"{context.reaction}; waiting reclaim/cross/flip", direction, quality, context, setup, None, direction.score)
-        atr5 = float(d5["atr"].iloc[-1])
-        chase = abs(float(d5["close"].iloc[-1]) - float(d5["ema13"].iloc[-1])) / max(atr5, 1e-12)
-        if chase > self.max_chase_atr:
-            return DecisionState(False, "CHASE", f"distance {chase:.2f}>{self.max_chase_atr:.2f} ATR5", direction, quality, context, setup, (trigger, atr5), direction.score)
+        raw_trigger = self._execution_trigger(d15, direction.side, context.active_zone)
+        allowed = {"5M_HMA16_FLIP", "5M_EMA13_RECLAIM"}
+        if raw_trigger not in allowed:
+            return DecisionState(False, "15M_TRIGGER", f"{context.reaction}; waiting HMA16 flip or EMA13 reclaim", direction, quality, context, setup, None, direction.score)
 
-        provisional = DecisionState(True, "READY", context.reaction, direction, quality, context, setup, (trigger, atr5), direction.score)
+        macro_ok, macro_score, macro_opposing = self._macro_aligned(df4h, direction.side)
+        if raw_trigger == "5M_EMA13_RECLAIM" and not macro_ok:
+            return DecisionState(
+                False, "4H_ALIGNMENT",
+                f"EMA13 reclaim needs 4H {direction.side.value} {macro_score:.0f} edge {macro_score - macro_opposing:+.0f}",
+                direction, quality, context, setup, None, direction.score,
+            )
+
+        trigger = raw_trigger.replace("5M_", "15M_", 1)
+        atr_exec = float(d15["atr"].iloc[-1])
+        chase = abs(float(d15["close"].iloc[-1]) - float(d15["ema13"].iloc[-1])) / max(atr_exec, 1e-12)
+        if chase > self.max_chase_atr:
+            return DecisionState(False, "CHASE", f"distance {chase:.2f}>{self.max_chase_atr:.2f} ATR15", direction, quality, context, setup, (trigger, atr_exec), direction.score)
+
+        provisional = DecisionState(True, "READY", context.reaction, direction, quality, context, setup, (trigger, atr_exec), direction.score)
         risk = self._risk_plan(provisional, df15, df5)
         if risk is None:
-            return DecisionState(False, "RISK", "zone stop exceeds 1.00% or target has no room", direction, quality, context, setup, (trigger, atr5), direction.score)
+            return DecisionState(False, "RISK", "zone stop exceeds 1.00% or target has no room", direction, quality, context, setup, (trigger, atr_exec), direction.score)
         if risk[-1] < self.min_rr:
-            return DecisionState(False, "RISK", f"actual RR {risk[-1]:.2f}<{self.min_rr:.2f}", direction, quality, context, setup, (trigger, atr5), direction.score)
-        return DecisionState(True, "READY", f"{context.reaction} RR {risk[-1]:.2f}", direction, quality, context, setup, (trigger, atr5), direction.score)
+            return DecisionState(False, "RISK", f"actual RR {risk[-1]:.2f}<{self.min_rr:.2f}", direction, quality, context, setup, (trigger, atr_exec), direction.score)
+        return DecisionState(True, "READY", f"{context.reaction} RR {risk[-1]:.2f}", direction, quality, context, setup, (trigger, atr_exec), direction.score)
 
     def generate_entry(self, df4h, df1h, df15, df5, has_open_position: bool = False) -> Optional[EntrySignal]:
         if has_open_position:
@@ -399,7 +441,7 @@ class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
         reason = (
             f"TPC Zone {decision.side.value} | 1H {decision.direction.score:.0f} "
             f"edge {decision.direction.edge:+.0f} Q {decision.quality.q:.0f} | "
-            f"15M {context.location.zone} {context.reaction} | 5M {trigger} | "
+            f"15M {context.location.zone} {context.reaction} → {trigger} | "
             f"Room {context.location.room_atr:.2f}ATR | 4H soft {macro:+.0f} | RR {rr:.2f}"
         )
         room_pct = abs(tp - entry) / max(entry, 1e-12)
