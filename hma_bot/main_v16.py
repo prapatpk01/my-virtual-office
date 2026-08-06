@@ -21,6 +21,139 @@ class Bot(v15.Bot):
         self.strat = S.PrecisionTrendStructureV12(self.cfg.strategy_config())
         self._closed_seen = {symbol: not bool((self.state.get(symbol) or {}).get("pos")) for symbol in self.cfg.symbols}
         self.post_close_cooldown_sec = 45 * 60
+        # Every protection update (entry repair, restart recovery and stage
+        # lock) must replace the old algo rather than append another one.
+        self.client.move_sl_to_breakeven = self._replace_native_protection
+
+    @staticmethod
+    def _valid_trigger(value) -> bool:
+        return value not in (None, "", "0", "0.0")
+
+    async def _pending_protections(self, symbol: str, pos_side: str):
+        """Return every active OKX TP/SL algo for one position leg."""
+        market = self.client._exchange.market(symbol)
+        inst_id = market["id"]
+        found = {}
+        for ord_type in ("oco", "conditional", "trigger", "move_order_stop"):
+            try:
+                response = await self.client._exchange.privateGetTradeAlgosPending({
+                    "instId": inst_id,
+                    "ordType": ord_type,
+                })
+                for order in (response or {}).get("data", []):
+                    if str(order.get("posSide") or "") != pos_side:
+                        continue
+                    if not (
+                        self._valid_trigger(order.get("slTriggerPx"))
+                        or self._valid_trigger(order.get("tpTriggerPx"))
+                    ):
+                        continue
+                    algo_id = str(order.get("algoId") or "")
+                    if algo_id:
+                        found[algo_id] = order
+            except Exception as exc:
+                _LOG.warning(
+                    "[%s] pending protection query %s failed: %s",
+                    symbol, ord_type, exc,
+                )
+        return inst_id, list(found.values())
+
+    async def _cancel_protections(self, inst_id: str, orders) -> bool:
+        """Cancel all supplied algos; never add a replacement after failure."""
+        ok = True
+        for order in orders:
+            algo_id = str(order.get("algoId") or "")
+            if not algo_id:
+                continue
+            try:
+                await self.client._exchange.privatePostTradeCancelAlgos(
+                    [{"algoId": algo_id, "instId": inst_id}]
+                )
+            except Exception as exc:
+                ok = False
+                _LOG.error("cancel protection %s failed: %s", algo_id, exc)
+        return ok
+
+    async def _replace_native_protection(
+        self, symbol: str, pos_side: str, sl_price: float,
+        remaining_amount: float, tp_price=None,
+    ) -> bool:
+        """Atomically converge one position leg to exactly one OCO order."""
+        if self.cfg.paper:
+            return True
+        if (
+            pos_side not in ("long", "short")
+            or float(sl_price or 0) <= 0
+            or float(tp_price or 0) <= 0
+            or float(remaining_amount or 0) <= 0
+        ):
+            return False
+        try:
+            inst_id, old_orders = await self._pending_protections(symbol, pos_side)
+            if old_orders and not await self._cancel_protections(inst_id, old_orders):
+                _LOG.error(
+                    "[%s] protection replace aborted: stale algo cancellation failed",
+                    symbol,
+                )
+                return False
+
+            contract_size = await self.client.contract_size(symbol)
+            if not contract_size or contract_size <= 0:
+                return False
+            contracts = max(1, round(float(remaining_amount) / contract_size))
+            request = {
+                "instId": inst_id,
+                "tdMode": self.client._margin_mode,
+                "side": "sell" if pos_side == "long" else "buy",
+                "posSide": pos_side,
+                "sz": str(contracts),
+                "ordType": "oco",
+                "slTriggerPx": str(round(float(sl_price), 6)),
+                "slOrdPx": "-1",
+                "slTriggerPxType": "last",
+                "tpTriggerPx": str(round(float(tp_price), 6)),
+                "tpOrdPx": "-1",
+                "tpTriggerPxType": "last",
+            }
+            await self.client._exchange.privatePostTradeOrderAlgo(request)
+
+            active = []
+            for _ in range(3):
+                _, active = await self._pending_protections(symbol, pos_side)
+                if active:
+                    break
+                await asyncio.sleep(0.5)
+            if len(active) > 1:
+                # Keep only the newest order if OKX exposed an older attached
+                # algo after the initial queries.
+                newest = max(
+                    active,
+                    key=lambda order: int(order.get("cTime") or 0),
+                )
+                extras = [order for order in active if order is not newest]
+                if not await self._cancel_protections(inst_id, extras):
+                    return False
+                _, active = await self._pending_protections(symbol, pos_side)
+
+            valid = (
+                len(active) == 1
+                and self._valid_trigger(active[0].get("slTriggerPx"))
+                and self._valid_trigger(active[0].get("tpTriggerPx"))
+            )
+            if valid:
+                _LOG.info(
+                    "[%s] native protection converged to one OCO: SL %.8g TP %.8g",
+                    symbol, sl_price, tp_price,
+                )
+            else:
+                _LOG.error(
+                    "[%s] protection verification expected 1 OCO, found %d",
+                    symbol, len(active),
+                )
+            return valid
+        except Exception as exc:
+            _LOG.exception("[%s] native protection replace failed: %s", symbol, exc)
+            return False
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
@@ -58,13 +191,16 @@ class Bot(v15.Bot):
                 continue
 
             native_sl, native_tp = await self.client.fetch_attached_stops(symbol, side)
-            if native_sl and native_tp:
-                pos.pop("recovery_quarantine", None)
-                continue
+            sl = float(pos.get("sl") or native_sl or 0.0)
+            tp = float(pos.get("tp") or native_tp or 0.0)
+            if sl <= 0:
+                sl = entry * (0.990 if side == "long" else 1.010)
+            if tp <= 0:
+                tp = entry * (1.012 if side == "long" else 0.988)
 
-            sl = entry * (0.990 if side == "long" else 1.010)
-            tp = entry * (1.012 if side == "long" else 0.988)
-            repaired = await self.client.move_sl_to_breakeven(
+            # Always converge on startup, even when both prices were found;
+            # fetch_attached_stops returns prices, not the number of algos.
+            repaired = await self._replace_native_protection(
                 symbol, side, sl, amount, tp_price=tp
             )
             if repaired:
@@ -109,14 +245,13 @@ class Bot(v15.Bot):
             await self._close_market(symbol, st, "PROTECTION_PLAN_INVALID")
             return
 
-        native_sl, native_tp = await self.client.fetch_attached_stops(symbol, side)
-        if native_sl and native_tp:
-            return
-        repaired = await self.client.move_sl_to_breakeven(
+        # Converge unconditionally. Price lookup alone cannot tell whether
+        # OKX currently has one protection or several duplicates.
+        repaired = await self._replace_native_protection(
             symbol, side, sl, amount, tp_price=tp
         )
         if repaired:
-            _LOG.warning("[%s] missing attached SL/TP repaired immediately", symbol)
+            _LOG.info("[%s] post-entry protection verified as one OCO", symbol)
             return
 
         _LOG.error("[%s] native SL/TP verification failed; closing position", symbol)
