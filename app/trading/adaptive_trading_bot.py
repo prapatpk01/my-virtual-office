@@ -1,4 +1,4 @@
-"""Adaptive Momentum v3.1: aligned 15M momentum with alternative triggers."""
+"""Adaptive Momentum v3.2 fast-entry trading bot."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -19,7 +19,10 @@ ADX_MIN = float(os.getenv("MOM_ADX_MIN", "15"))
 CHOP_MAX = float(os.getenv("MOM_CHOP_MAX", "55"))
 LOCATION_MAX_ATR = float(os.getenv("MOM_LOCATION_MAX_ATR", "1.0"))
 COOLDOWN_BARS = int(os.getenv("MOM_COOLDOWN_BARS", "3"))
-SUPPORTED_SCHEMAS = {"adaptive-momentum-v3-15m", "adaptive-momentum-v3.1-15m"}
+SUPPORTED_SCHEMAS = {
+    "adaptive-momentum-v3.1-15m",
+    "adaptive-momentum-v3.2-15m",
+}
 
 
 @dataclass
@@ -56,7 +59,7 @@ class TradingBot:
         self.cooldown_remaining = 0
         self.last_signal = "WARMUP"
         self.counts = {key: 0 for key in (
-            "scans", "entries", "cooldown", "trend", "alignment", "macd",
+            "scans", "entries", "cooldown", "trend", "alignment",
             "hist", "adx", "chop", "location", "trigger"
         )}
         self._apply_runtime_identity()
@@ -67,9 +70,9 @@ class TradingBot:
         try:
             runner = sys.modules.get("run_bot") or sys.modules.get("__main__")
             if runner is not None and hasattr(runner, "logger"):
-                runner.logger = logging.getLogger("adaptive_momentum_v3_1")
+                runner.logger = logging.getLogger("adaptive_momentum_v3_2")
             if runner is not None and hasattr(runner, "BUILD_ID"):
-                runner.BUILD_ID = "adaptive-momentum-v3.1-2026-08-06"
+                runner.BUILD_ID = "adaptive-momentum-v3.2-2026-08-06"
         except Exception:
             pass
 
@@ -129,7 +132,6 @@ class TradingBot:
         passed = {
             "trend": f"✅ Trend EMA20 {'>' if is_long else '<'} EMA50",
             "alignment": f"✅ EMA8 {'>' if is_long else '<'} EMA13",
-            "macd": f"✅ MACD {'>' if is_long else '<'} Signal",
             "hist": "✅ Histogram improving",
             "adx": f"✅ ADX {adx:.1f} rising",
             "chop": f"✅ CHOP {chop:.1f}",
@@ -139,7 +141,6 @@ class TradingBot:
         failed = {
             "trend": "❌ No EMA20/50 trend",
             "alignment": f"❌ EMA8 not {'above' if is_long else 'below'} EMA13",
-            "macd": f"❌ MACD not {'above' if is_long else 'below'} Signal",
             "hist": "❌ Histogram not improving",
             "adx": f"❌ ADX {adx:.1f}/{ADX_MIN:g} rising={'YES' if i15.get('adx_rising') else 'NO'}",
             "chop": f"❌ CHOP {chop:.1f}>{CHOP_MAX:g}",
@@ -147,20 +148,23 @@ class TradingBot:
             "trigger": "❌ Wait Cross / EMA13 reclaim / previous-bar break",
         }
         reason_gate = {
-            "EMA20_50_TREND": "trend", "EMA8_13_ALIGNMENT": "alignment",
-            "MACD_SIGNAL": "macd", "MACD_HIST_IMPROVING": "hist",
-            "ADX_NOT_STRONG_RISING": "adx", "CHOP_TOO_HIGH": "chop",
-            "LOCATION": "location", "ENTRY_TRIGGER": "trigger",
+            "EMA20_50_TREND": "trend",
+            "EMA8_13_ALIGNMENT": "alignment",
+            "MACD_HIST_IMPROVING": "hist",
+            "ADX_NOT_STRONG_RISING": "adx",
+            "CHOP_TOO_HIGH": "chop",
+            "LOCATION": "location",
+            "ENTRY_TRIGGER": "trigger",
         }
-        order = ["trend", "alignment", "macd", "hist", "adx", "chop", "location", "trigger"]
+        order = ["trend", "alignment", "hist", "adx", "chop", "location", "trigger"]
         if reason == "COOLDOWN":
-            return f"MOMENTUM V3.1 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bars · RESULT: WAIT"
+            return f"MOMENTUM V3.2 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bars · RESULT: WAIT"
         if reason == "RISK_BUILD":
-            return f"MOMENTUM V3.1 · {symbol} · 15M · {direction} · ❌ Invalid SL/size · RESULT: WAIT RISK"
+            return f"MOMENTUM V3.2 · {symbol} · 15M · {direction} · ❌ Invalid SL/size · RESULT: WAIT RISK"
 
         gate = reason_gate.get(reason)
         index = order.index(gate) if gate in order else len(order)
-        parts = [f"MOMENTUM V3.1 · {symbol} · 15M · {direction}"]
+        parts = [f"MOMENTUM V3.2 · {symbol} · 15M · {direction}"]
         if result == "ENTRY":
             parts.extend(passed[item] for item in order)
         else:
@@ -168,11 +172,15 @@ class TradingBot:
             if gate:
                 parts.append(failed[gate])
         labels = {
-            "EMA20_50_TREND": "WAIT TREND", "EMA8_13_ALIGNMENT": "WAIT ALIGNMENT",
-            "MACD_SIGNAL": "WAIT MACD", "MACD_HIST_IMPROVING": "WAIT HISTOGRAM",
-            "ADX_NOT_STRONG_RISING": "WAIT ADX", "CHOP_TOO_HIGH": "WAIT CHOP",
-            "LOCATION": "WAIT LOCATION", "ENTRY_TRIGGER": "WAIT TRIGGER",
-            "LONG": "ENTRY LONG", "SHORT": "ENTRY SHORT",
+            "EMA20_50_TREND": "WAIT TREND",
+            "EMA8_13_ALIGNMENT": "WAIT ALIGNMENT",
+            "MACD_HIST_IMPROVING": "WAIT HISTOGRAM",
+            "ADX_NOT_STRONG_RISING": "WAIT ADX",
+            "CHOP_TOO_HIGH": "WAIT CHOP",
+            "LOCATION": "WAIT LOCATION",
+            "ENTRY_TRIGGER": "WAIT TRIGGER",
+            "LONG": "ENTRY LONG",
+            "SHORT": "ENTRY SHORT",
         }
         parts.append(f"RESULT: {labels.get(reason, f'{result} {reason}')}")
         return " · ".join(parts)
@@ -196,14 +204,25 @@ class TradingBot:
             return None
         trigger = self._trigger_name(i15, direction)
         return {
-            "direction": direction, "strategy": "momentum_v3_1_aligned",
-            "trigger": trigger, "entry": entry, "sl": sl, "tp": tp2,
-            "tp1": tp1, "tp2": tp2, "size": size,
-            "risk_usdt": size * risk, "sl_pct": 100 * risk / max(entry, 1e-12),
-            "ema8": float(i15["ema8"]), "ema13": float(i15["ema13"]),
-            "ema20": float(i15["ema20"]), "ema50": float(i15["ema50"]),
-            "macd": float(i15["macd"]), "macd_signal": float(i15["macd_signal"]),
-            "macd_hist": float(i15["macd_hist"]), "adx": float(i15["adx"]),
+            "direction": direction,
+            "strategy": "momentum_v3_2_fast_entry",
+            "trigger": trigger,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp2,
+            "tp1": tp1,
+            "tp2": tp2,
+            "size": size,
+            "risk_usdt": size * risk,
+            "sl_pct": 100 * risk / max(entry, 1e-12),
+            "ema8": float(i15["ema8"]),
+            "ema13": float(i15["ema13"]),
+            "ema20": float(i15["ema20"]),
+            "ema50": float(i15["ema50"]),
+            "macd": float(i15.get("macd", 0.0)),
+            "macd_signal": float(i15.get("macd_signal", 0.0)),
+            "macd_hist": float(i15["macd_hist"]),
+            "adx": float(i15["adx"]),
             "chop": float(i15["chop"]),
             "distance_ema13_atr": float(i15["distance_ema13_atr"]),
         }
@@ -216,16 +235,25 @@ class TradingBot:
         initial_risk = abs(position.entry - position.initial_sl) * max(position.initial_size, 1e-12)
         r_multiple = pnl / initial_risk if initial_risk else 0.0
         payload = {
-            "symbol": self.symbol, "direction": position.direction, "price": price,
-            "entry": position.entry, "sl": position.sl, "tp": position.tp2,
-            "tp1": position.tp1, "tp2": position.tp2, "size": position.size,
-            "strategy": position.strategy, "trigger": position.trigger,
-            "reason": reason, "pnl": pnl, "r_multiple": r_multiple,
+            "symbol": self.symbol,
+            "direction": position.direction,
+            "price": price,
+            "entry": position.entry,
+            "sl": position.sl,
+            "tp": position.tp2,
+            "tp1": position.tp1,
+            "tp2": position.tp2,
+            "size": position.size,
+            "strategy": position.strategy,
+            "trigger": position.trigger,
+            "reason": reason,
+            "pnl": pnl,
+            "r_multiple": r_multiple,
         }
         if self.execution_callback:
             self.execution_callback("CLOSE_" + position.direction, payload)
         self.position = None
-        if reason == "MOMENTUM_FLIP":
+        if reason in {"EMA_CROSS_BACK", "HISTOGRAM_WEAK_3"}:
             self.cooldown_remaining = COOLDOWN_BARS
         self.save_state()
         self.last_signal = f"CLOSE {reason} pnl=${pnl:+.2f} r={r_multiple:+.2f}R cooldown={self.cooldown_remaining}"
@@ -245,9 +273,16 @@ class TradingBot:
             close_size = position.size * 0.5
             pnl = ((price - position.entry) * close_size if position.direction == "LONG"
                    else (position.entry - price) * close_size)
-            payload = {"symbol": self.symbol, "direction": position.direction,
-                       "price": price, "entry": position.entry, "size": close_size,
-                       "reason": "TP1", "pnl": pnl, "r_multiple": TP1_R}
+            payload = {
+                "symbol": self.symbol,
+                "direction": position.direction,
+                "price": price,
+                "entry": position.entry,
+                "size": close_size,
+                "reason": "TP1",
+                "pnl": pnl,
+                "r_multiple": TP1_R,
+            }
             if self.execution_callback:
                 self.execution_callback("CLOSE_PARTIAL", payload)
             position.size -= close_size
@@ -270,7 +305,7 @@ class TradingBot:
             return None
         schema = i15.get("schema")
         if schema not in SUPPORTED_SCHEMAS:
-            raise RuntimeError(f"MOMENTUM_V31_SCHEMA_MISMATCH: {schema}")
+            raise RuntimeError(f"MOMENTUM_V32_SCHEMA_MISMATCH: {schema}")
 
         if self.position:
             event = self.check_price(price or float(i15["close"]))
@@ -279,14 +314,19 @@ class TradingBot:
             position = self.position
             close_price = price or float(i15["close"])
             if position.direction == "LONG":
-                ema_flip = bool(i15.get("ema_cross_down"))
-                macd_weak = bool(i15.get("macd_hist_weaken_long_2") and float(i15["macd"]) <= float(i15["macd_signal"]))
+                if bool(i15.get("ema_cross_down")):
+                    return self._close(close_price, "EMA_CROSS_BACK")
+                if bool(i15.get("macd_hist_weaken_long_3")):
+                    return self._close(close_price, "HISTOGRAM_WEAK_3")
             else:
-                ema_flip = bool(i15.get("ema_cross_up"))
-                macd_weak = bool(i15.get("macd_hist_weaken_short_2") and float(i15["macd"]) >= float(i15["macd_signal"]))
-            if ema_flip or macd_weak:
-                return self._close(close_price, "MOMENTUM_FLIP")
-            self.last_signal = f"MANAGE {position.direction} | SL={position.sl:.6f} | TP1={position.tp1:.6f} | TP2={position.tp2:.6f}"
+                if bool(i15.get("ema_cross_up")):
+                    return self._close(close_price, "EMA_CROSS_BACK")
+                if bool(i15.get("macd_hist_weaken_short_3")):
+                    return self._close(close_price, "HISTOGRAM_WEAK_3")
+            self.last_signal = (
+                f"MANAGE {position.direction} | SL={position.sl:.6f} | "
+                f"TP1={position.tp1:.6f} | TP2={position.tp2:.6f}"
+            )
             return None
 
         self.counts["scans"] += 1
@@ -309,12 +349,6 @@ class TradingBot:
         if not alignment_ok:
             self.counts["alignment"] += 1
             self.last_signal = self._debug(i15, "WAIT", "EMA8_13_ALIGNMENT")
-            return None
-
-        macd_ok = bool(i15.get("macd_bull")) if direction == "LONG" else bool(i15.get("macd_bear"))
-        if not macd_ok:
-            self.counts["macd"] += 1
-            self.last_signal = self._debug(i15, "WAIT", "MACD_SIGNAL")
             return None
 
         hist_ok = bool(i15.get("macd_hist_improving_long")) if direction == "LONG" else bool(i15.get("macd_hist_improving_short"))
@@ -353,10 +387,18 @@ class TradingBot:
         if self.execution_callback:
             self.execution_callback("OPEN_" + direction, payload)
         self.position = Position(
-            direction=direction, entry=payload["entry"], sl=payload["sl"],
-            initial_sl=payload["sl"], tp=payload["tp2"], tp1=payload["tp1"],
-            tp2=payload["tp2"], size=payload["size"], initial_size=payload["size"],
-            strategy=payload["strategy"], trigger=payload["trigger"], opened_at=time.time(),
+            direction=direction,
+            entry=payload["entry"],
+            sl=payload["sl"],
+            initial_sl=payload["sl"],
+            tp=payload["tp2"],
+            tp1=payload["tp1"],
+            tp2=payload["tp2"],
+            size=payload["size"],
+            initial_size=payload["size"],
+            strategy=payload["strategy"],
+            trigger=payload["trigger"],
+            opened_at=time.time(),
         )
         self.counts["entries"] += 1
         self.save_state()
