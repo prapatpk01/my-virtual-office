@@ -98,6 +98,19 @@ def duration(seconds: float) -> str:
     return f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
+def display_payload(value):
+    """Round floats for logs only; trading calculations keep full precision."""
+    if isinstance(value, float):
+        return round(value, 4)
+    if isinstance(value, dict):
+        return {key: display_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [display_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(display_payload(item) for item in value)
+    return value
+
+
 def trade_text(order_type: str, payload: dict, paper: bool) -> str:
     mode = "PAPER" if paper else "LIVE"
     direction = str(payload.get("direction", ""))
@@ -109,19 +122,19 @@ def trade_text(order_type: str, payload: dict, paper: bool) -> str:
             f"Trend: EMA20 {'>' if direction == 'LONG' else '<'} EMA50 ✅\n"
             f"Entry: EMA8 {'>' if direction == 'LONG' else '<'} EMA13 ✅\n"
             f"Trigger: {payload.get('trigger', 'MACD histogram flip')} ✅\n"
-            f"MACD: {float(payload.get('macd', 0)):+.6f} / Signal {float(payload.get('macd_signal', 0)):+.6f}\n"
+            f"MACD: {float(payload.get('macd', 0)):+.4f} / Signal {float(payload.get('macd_signal', 0)):+.4f}\n"
             f"ADX: {float(payload.get('adx', 0)):.1f} Rising ✅ | CHOP: {float(payload.get('chop', 0)):.1f}\n"
             f"Location: {float(payload.get('distance_ema13_atr', 0)):.2f} ATR from EMA13\n\n"
-            f"Entry: {float(payload.get('entry', 0)):,.6f}\n"
-            f"SL: {float(payload.get('sl', 0)):,.6f} ({float(payload.get('sl_pct', 0)):.2f}%)\n"
-            f"TP1: {float(payload.get('tp1', 0)):,.6f} ({TP1_R:g}R · close 50% · SL→BE)\n"
-            f"TP2: {float(payload.get('tp2', payload.get('tp', 0))):,.6f} ({TP_R:g}R)\n"
-            f"Size: {float(payload.get('size', 0)):,.6f} | Risk: ${float(payload.get('risk_usdt', 0)):.2f}"
+            f"Entry: {float(payload.get('entry', 0)):,.4f}\n"
+            f"SL: {float(payload.get('sl', 0)):,.4f} ({float(payload.get('sl_pct', 0)):.2f}%)\n"
+            f"TP1: {float(payload.get('tp1', 0)):,.4f} ({TP1_R:g}R · close 50% · SL→BE)\n"
+            f"TP2: {float(payload.get('tp2', payload.get('tp', 0))):,.4f} ({TP_R:g}R)\n"
+            f"Size: {float(payload.get('size', 0)):,.4f} | Risk: ${float(payload.get('risk_usdt', 0)):.2f}"
         )
     pnl = float(payload.get("pnl", 0))
     return (
         f"{'✅' if pnl >= 0 else '❌'} [{mode}] {payload.get('reason', 'CLOSE')} {direction} {symbol}\n"
-        f"Price: {float(payload.get('price', 0)):,.6f}\n"
+        f"Price: {float(payload.get('price', 0)):,.4f}\n"
         f"PnL: ${pnl:+.2f} ({float(payload.get('r_multiple', 0)):+.2f}R)"
     )
 
@@ -151,11 +164,11 @@ def stats_text(trades, bots, prices, paper: bool, margin: float) -> str:
         floating += pnl
         lines += [
             f"{'🟢' if position.direction == 'LONG' else '🔴'} {symbol.split('/')[0]} {position.direction}",
-            f"Entry : {position.entry:,.6f}", f"Now   : {current:,.6f}",
+            f"Entry : {position.entry:,.4f}", f"Now   : {current:,.4f}",
             f"PnL   : ${pnl:+.2f}",
-            f"SL    : {position.sl:,.6f}{' (BE)' if position.be_moved else ''}",
-            f"TP1   : {position.tp1:,.6f} {'✅' if position.tp1_hit else ''}",
-            f"TP2   : {position.tp2:,.6f}", f"Trigger: {position.trigger}",
+            f"SL    : {position.sl:,.4f}{' (BE)' if position.be_moved else ''}",
+            f"TP1   : {position.tp1:,.4f} {'✅' if position.tp1_hit else ''}",
+            f"TP2   : {position.tp2:,.4f}", f"Trigger: {position.trigger}",
             f"Held  : {duration(time.time() - position.opened_at)}", "",
         ]
     if not count:
@@ -304,7 +317,7 @@ async def main() -> None:
         elif telegram_enabled:
             queue.put_nowait({"kind": "text", "text": trade_text(order_type, payload, paper)})
         if paper:
-            logger.info("[PAPER] %s %s", order_type, payload)
+            logger.info("[PAPER] %s %s", order_type, display_payload(payload))
             return {"paper": True}
         if live is None:
             raise RuntimeError("Live adapter unavailable")
@@ -387,7 +400,7 @@ async def main() -> None:
                     if event:
                         trades.append({**event, "timestamp": time.time(), "version": "momentum-v2"})
                         save_json(ledger_path, trades[-2000:])
-                    logger.info("[%s] %s", symbol, event if event else bot.last_signal)
+                    logger.info("[%s] %s", symbol, display_payload(event) if event else bot.last_signal)
                 except ccxt.BadSymbol as error:
                     disabled.add(symbol)
                     logger.error("[%s] unsupported: %s", symbol, error)
