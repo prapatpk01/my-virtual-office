@@ -1,30 +1,21 @@
-"""HMA Simple Sentinel — S1/S2 and R1/R2 entry strategy.
+"""HMA Fast Structure V6 — one-path, early 15M continuation strategy.
 
-Authoritative decisions:
+The old S/R pipeline waited for a 15M Sentinel level and another closed 5M
+confirmation.  That produced late entries, while the counter-trend fallback
+could take the opposite side.  V6 has one authoritative path:
 
-    Layer 1: 1H direction
-    Layer 2: 15M adaptive S1/S2 or R1/R2
-    Layer 3: closed-5M hold confirmation or reclaim
-    Risk:    existing structure SL, room and actual R:R
+    1H direction -> relaxed quality guard -> closed-15M trigger -> risk plan
 
-LONG:
-- Touch S1/S2 and close without losing the level -> enter after the next
-  closed 5M candle still holds above it.
-- Close below S1/S2 -> wait for the first closed 5M candle to reclaim above
-  the level, then enter immediately.
-
-SHORT mirrors the same rules at R1/R2.
-
-4H and confidence remain diagnostic only. Status and live order creation use
-this same evaluation result; no legacy entry gate is re-applied.
+4H is context only.  There is no weighted score, counter-trend engine, or
+mandatory S1/S2/R1/R2 touch.  All signals use closed candles.
 """
 from __future__ import annotations
 
 import os
-from dataclasses import replace
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 
 import strategy_v11 as v11
 from sentinel_context import build_context, trend_score_4h
@@ -34,6 +25,7 @@ DecisionState = v11.DecisionState
 EntrySignal = v11.EntrySignal
 AdaptiveDirection = v11.v10.v9.v8.v7.AdaptiveDirection
 Trend = v11.v10.v9.v8.v7.Trend
+SetupType = v11.v10.v9.v8.SetupType
 
 
 def _env_float(name: str, default: float) -> float:
@@ -51,597 +43,181 @@ def _env_int(name: str, default: int) -> int:
 
 
 class PrecisionTrendStructureV12(v11.PrecisionTrendStructureV11):
-    """1H direction -> S/R reaction -> one risk check."""
+    """Fast 1H bias with three interchangeable 15M entry triggers."""
 
     def __init__(self, config=None) -> None:
         super().__init__(config)
+        self.direction_min = _env_float("FAST_DIRECTION_MIN", 52.0)
+        self.direction_edge_min = _env_float("FAST_DIRECTION_EDGE_MIN", 3.0)
+        self.quality_min = _env_float("FAST_QUALITY_MIN", 42.0)
+        self.hard_chop = _env_float("FAST_HARD_CHOP", 68.0)
+        self.hard_adx = _env_float("FAST_HARD_ADX", 11.0)
+        self.dmi_opposition = _env_float("FAST_DMI_OPPOSITION", 8.0)
+        self.cross_lookback = max(1, _env_int("FAST_CROSS_LOOKBACK", 3))
+        self.flip_lookback = max(1, _env_int("FAST_HMA_FLIP_LOOKBACK", 2))
+        self.max_chase_atr = _env_float("FAST_MAX_CHASE_ATR", 1.10)
+        self.min_body_atr = _env_float("FAST_MIN_BODY_ATR", 0.08)
+        self.sl_atr = _env_float("FAST_SL_ATR", 1.05)
+        self.sl_max_pct = _env_float("FAST_SL_MAX_PCT", 0.010)
+        self.tp_pct = _env_float("FAST_TP_PCT", 0.012)
+        self.min_rr = _env_float("FAST_MIN_RR", 1.05)
 
-        # Layer 1: choose one side from 1H. Q is checked once and DMI only
-        # blocks when it is materially opposed.
-        self.one_h_early_min = _env_float("ONE_H_EARLY_TREND_MIN", 55.0)
-        self.one_h_strong_min = _env_float("ONE_H_STRONG_TREND_MIN", 68.0)
-        self.one_h_direction_edge_min = _env_float(
-            "ONE_H_DIRECTION_EDGE_MIN", 4.0
-        )
-        self.quality_min = _env_float("MIN_TREND_QUALITY", 52.0)
-        self.dmi_hard_opposition = _env_float("DMI_HARD_OPPOSITION", 10.0)
+    @staticmethod
+    def _ema(series: pd.Series, length: int) -> pd.Series:
+        return series.ewm(span=length, adjust=False).mean()
 
-        # S/R execution uses closed 5M candles around adaptive 15M levels.
-        self.sr_touch_zone_atr5 = _env_float("SR_TOUCH_ZONE_ATR5", 0.25)
-        self.sr_break_buffer_atr5 = _env_float("SR_BREAK_BUFFER_ATR5", 0.04)
-        self.sr_reclaim_buffer_atr5 = _env_float(
-            "SR_RECLAIM_BUFFER_ATR5", 0.03
-        )
-        self.sr_reclaim_lookback = max(
-            2, _env_int("SR_RECLAIM_LOOKBACK_BARS", 8)
-        )
+    def _hma16(self, series: pd.Series) -> pd.Series:
+        return self._hma(series.astype(float), 16)
 
-        # One combined risk check after a valid S/R trigger.
-        self.min_room_atr = _env_float("MIN_ENTRY_ROOM_ATR", 0.30)
-        self.min_actual_rr = _env_float("MIN_ACTUAL_RR", 0.90)
-
-    def _simple_direction(self, df1h):
-        """Select the stronger 1H side without using 4H as a gate."""
+    def _direction_1h(self, df1h):
         quality = self.quality_state_1h(df1h)
         long_score = float(trend_score_4h(df1h, "long"))
         short_score = float(trend_score_4h(df1h, "short"))
-
-        if long_score >= short_score:
-            side = Side.LONG
-            score, opposite = long_score, short_score
-        else:
-            side = Side.SHORT
-            score, opposite = short_score, long_score
-
+        side = Side.LONG if long_score >= short_score else Side.SHORT
+        score = max(long_score, short_score)
+        opposite = min(long_score, short_score)
         edge = score - opposite
-        if score < self.one_h_early_min or edge < self.one_h_direction_edge_min:
-            return (
-                AdaptiveDirection(None, score, opposite, edge, "NEUTRAL"),
-                quality,
-            )
-
-        tier = "STRONG" if score >= self.one_h_strong_min else "TREND"
+        if score < self.direction_min or edge < self.direction_edge_min:
+            side = None
+        tier = "TREND" if score < 68.0 else "STRONG"
         return AdaptiveDirection(side, score, opposite, edge, tier), quality
 
-    def _risk_plan(self, decision, df15, df5):
-        """Return entry, SL, TP, ATR, structure level and actual R:R."""
-        if decision.context is None or decision.side is None:
-            return None
-
-        d15 = df15.copy()
-        d15["atr"] = self._atr(d15, self.cfg.atr_len)
-        atr15 = float(d15["atr"].iloc[-1])
-        if not np.isfinite(atr15) or atr15 <= 0.0:
-            return None
-
-        entry = float(df5["close"].iloc[-1])
-        side = decision.side
-        structure_level = self._structure_level(decision.context, side, entry)
-        ctx15 = self._structure(d15)
-        sl = self._structure_stop(
-            entry, side, atr15, ctx15, structure_level
-        )
-        tp = (
-            entry * (1.0 + self.cfg.final_take_profit_pct)
-            if side == Side.LONG
-            else entry * (1.0 - self.cfg.final_take_profit_pct)
-        )
-        risk = abs(entry - sl)
-        rr = abs(tp - entry) / max(risk, 1e-12)
-        return entry, sl, tp, atr15, structure_level, rr
+    def _prepared_15m(self, df15):
+        d = df15.copy()
+        close = d["close"].astype(float)
+        d["ema8"] = self._ema(close, 8)
+        d["ema13"] = self._ema(close, 13)
+        d["ema20"] = self._ema(close, 20)
+        d["hma16"] = self._hma16(close)
+        d["atr"] = self._atr(d, self.cfg.atr_len)
+        return d
 
     @staticmethod
-    def _side_levels(loc, side: Side):
-        raw = (
-            (("S1", loc.s1), ("S2", loc.s2))
-            if side == Side.LONG
-            else (("R1", loc.r1), ("R2", loc.r2))
+    def _recent_cross(fast, slow, side: Side, lookback: int) -> bool:
+        start = max(1, len(fast) - lookback)
+        for i in range(start, len(fast)):
+            if side == Side.LONG and fast.iloc[i] > slow.iloc[i] and fast.iloc[i - 1] <= slow.iloc[i - 1]:
+                return True
+            if side == Side.SHORT and fast.iloc[i] < slow.iloc[i] and fast.iloc[i - 1] >= slow.iloc[i - 1]:
+                return True
+        return False
+
+    @staticmethod
+    def _recent_hma_flip(hma, side: Side, lookback: int) -> bool:
+        slope = hma.diff()
+        start = max(2, len(hma) - lookback)
+        for i in range(start, len(hma)):
+            if side == Side.LONG and slope.iloc[i] > 0 and slope.iloc[i - 1] <= 0:
+                return True
+            if side == Side.SHORT and slope.iloc[i] < 0 and slope.iloc[i - 1] >= 0:
+                return True
+        return False
+
+    def _trigger_15m(self, d, side: Side):
+        r, p = d.iloc[-1], d.iloc[-2]
+        atr = float(r["atr"])
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+        close, open_ = float(r["close"]), float(r["open"])
+        body = abs(close - open_) / atr
+        aligned = close > float(r["ema13"]) if side == Side.LONG else close < float(r["ema13"])
+        momentum = close > open_ if side == Side.LONG else close < open_
+        if not aligned or not momentum or body < self.min_body_atr:
+            return None
+
+        cross = self._recent_cross(d["ema8"], d["ema13"], side, self.cross_lookback)
+        flip = self._recent_hma_flip(d["hma16"], side, self.flip_lookback)
+        reclaim = (
+            float(p["low"]) <= float(p["ema13"]) and close > float(r["ema13"]) and float(r["ema13"]) >= float(p["ema13"])
+            if side == Side.LONG else
+            float(p["high"]) >= float(p["ema13"]) and close < float(r["ema13"]) and float(r["ema13"]) <= float(p["ema13"])
         )
-        return [
-            (name, float(value))
-            for name, value in raw
-            if value is not None and np.isfinite(float(value))
-        ]
-
-    def _level_reaction(self, df5, side: Side, name: str, level: float):
-        """Evaluate one S/R level using only closed 5M candles.
-
-        Returns ``(trigger, atr5, armed, reason, distance)``.
-        """
-        if len(df5) < max(20, self.sr_reclaim_lookback + 2):
-            return None, 0.0, False, "5M candles unavailable", float("inf")
-
-        d5 = df5.copy()
-        d5["atr"] = self._atr(d5, self.cfg.atr_len)
-        current = d5.iloc[-1]
-        previous = d5.iloc[-2]
-        atr5 = float(current["atr"])
-        if not np.isfinite(atr5) or atr5 <= 0.0:
-            return None, 0.0, False, "5M ATR unavailable", float("inf")
-
-        zone = max(self.sr_touch_zone_atr5 * atr5, abs(level) * 1e-6)
-        break_buffer = self.sr_break_buffer_atr5 * atr5
-        reclaim_buffer = self.sr_reclaim_buffer_atr5 * atr5
-        distance = abs(float(current["close"]) - level)
-
-        history = d5.iloc[-(self.sr_reclaim_lookback + 1) : -1]
-        if side == Side.LONG:
-            previous_touch_hold = (
-                float(previous["low"]) <= level + zone
-                and float(previous["close"]) >= level - break_buffer
-            )
-            next_candle_holds = (
-                float(current["close"]) > level + reclaim_buffer
-                and float(current["low"]) >= level - zone
-            )
-            hold_trigger = previous_touch_hold and next_candle_holds
-
-            was_below = bool(
-                (history["close"].astype(float) < level - break_buffer).any()
-            )
-            reclaim_trigger = (
-                was_below
-                and float(previous["close"]) <= level + break_buffer
-                and float(current["close"]) > level + reclaim_buffer
-            )
-
-            near_now = (
-                float(current["low"]) <= level + zone
-                or float(previous["low"]) <= level + zone
-                or distance <= zone
-            )
-            below_now = float(current["close"]) < level - break_buffer
-
-            if reclaim_trigger:
-                return (
-                    f"{name}_RECLAIM_LONG",
-                    atr5,
-                    True,
-                    f"{name} reclaimed above {level:.6g}",
-                    distance,
-                )
-            if hold_trigger:
-                return (
-                    f"{name}_HOLD_CONFIRM_LONG",
-                    atr5,
-                    True,
-                    f"{name} held; next 5M candle confirmed above {level:.6g}",
-                    distance,
-                )
-            if below_now or was_below:
-                return (
-                    None,
-                    atr5,
-                    True,
-                    f"{name} broken; waiting closed-5M reclaim above {level:.6g}",
-                    distance,
-                )
-            if near_now:
-                return (
-                    None,
-                    atr5,
-                    True,
-                    f"{name} touched/near; waiting next closed 5M candle to hold",
-                    distance,
-                )
-            return (
-                None,
-                atr5,
-                False,
-                f"waiting price to reach {name} {level:.6g}",
-                distance,
-            )
-
-        previous_touch_hold = (
-            float(previous["high"]) >= level - zone
-            and float(previous["close"]) <= level + break_buffer
-        )
-        next_candle_holds = (
-            float(current["close"]) < level - reclaim_buffer
-            and float(current["high"]) <= level + zone
-        )
-        hold_trigger = previous_touch_hold and next_candle_holds
-
-        was_above = bool(
-            (history["close"].astype(float) > level + break_buffer).any()
-        )
-        reclaim_trigger = (
-            was_above
-            and float(previous["close"]) >= level - break_buffer
-            and float(current["close"]) < level - reclaim_buffer
-        )
-
-        near_now = (
-            float(current["high"]) >= level - zone
-            or float(previous["high"]) >= level - zone
-            or distance <= zone
-        )
-        above_now = float(current["close"]) > level + break_buffer
-
-        if reclaim_trigger:
-            return (
-                f"{name}_RECLAIM_SHORT",
-                atr5,
-                True,
-                f"{name} reclaimed below {level:.6g}",
-                distance,
-            )
-        if hold_trigger:
-            return (
-                f"{name}_HOLD_CONFIRM_SHORT",
-                atr5,
-                True,
-                f"{name} held; next 5M candle confirmed below {level:.6g}",
-                distance,
-            )
-        if above_now or was_above:
-            return (
-                None,
-                atr5,
-                True,
-                f"{name} broken; waiting closed-5M reclaim below {level:.6g}",
-                distance,
-            )
-        if near_now:
-            return (
-                None,
-                atr5,
-                True,
-                f"{name} touched/near; waiting next closed 5M candle to hold",
-                distance,
-            )
-        return (
-            None,
-            atr5,
-            False,
-            f"waiting price to reach {name} {level:.6g}",
-            distance,
-        )
-
-    def _sr_entry_state(self, df5, loc, side: Side):
-        """Return the best active S/R state.
-
-        Result: ``execution, level_name, level_price, armed, reason``.
-        """
-        levels = self._side_levels(loc, side)
-        if not levels:
-            expected = "S1/S2" if side == Side.LONG else "R1/R2"
-            return None, expected, None, False, f"{expected} unavailable"
-
-        states = []
-        for name, level in levels:
-            trigger, atr5, armed, reason, distance = self._level_reaction(
-                df5, side, name, level
-            )
-            states.append(
-                {
-                    "execution": (trigger, atr5) if trigger else None,
-                    "name": name,
-                    "level": level,
-                    "armed": armed,
-                    "reason": reason,
-                    "distance": distance,
-                }
-            )
-
-        triggered = [state for state in states if state["execution"] is not None]
-        if triggered:
-            best = min(triggered, key=lambda state: state["distance"])
-        else:
-            armed_states = [state for state in states if state["armed"]]
-            pool = armed_states or states
-            best = min(pool, key=lambda state: state["distance"])
-
-        return (
-            best["execution"],
-            best["name"],
-            best["level"],
-            best["armed"],
-            best["reason"],
-        )
+        if cross:
+            return "EMA8_13_CROSS"
+        if flip:
+            return "HMA16_FLIP"
+        if reclaim:
+            return "EMA13_PULLBACK_RECLAIM"
+        return None
 
     def evaluate(self, df4h, df1h, df15, df5) -> DecisionState:
-        if len(df4h) < 60 or len(df1h) < 60 or len(df15) < 90 or len(df5) < 70:
-            direction = AdaptiveDirection(None, 0.0, 0.0, 0.0, "WARMUP")
-            quality = (
-                self.quality_state_1h(df1h) if len(df1h) >= 60 else None
-            )
-            return DecisionState(
-                False,
-                "L0_WARMUP",
-                "insufficient candles",
-                direction,
-                quality,
-                None,
-                None,
-                None,
-                0.0,
-            )
+        if len(df1h) < 60 or len(df15) < 60 or len(df4h) < 40:
+            direction = AdaptiveDirection(None, 0, 0, 0, "NEUTRAL")
+            return DecisionState(False, "WARMUP", "insufficient candles", direction, None, None, None, None, 0.0)
 
-        direction, quality = self._simple_direction(df1h)
+        direction, quality = self._direction_1h(df1h)
         if direction.side is None:
-            why = (
-                f"1H trend {direction.score:.0f}<{self.one_h_early_min:.0f}"
-                if direction.score < self.one_h_early_min
-                else (
-                    f"1H edge {direction.edge:.0f}"
-                    f"<{self.one_h_direction_edge_min:.0f}"
-                )
-            )
-            return DecisionState(
-                False,
-                "L1_DIRECTION",
-                why,
-                direction,
-                quality,
-                None,
-                None,
-                None,
-                0.0,
-            )
+            return DecisionState(False, "1H_DIRECTION", f"score {direction.score:.0f} edge {direction.edge:+.0f}", direction, quality, None, None, None, direction.score)
 
-        if quality.q < self.quality_min:
-            return DecisionState(
-                False,
-                "L1_DIRECTION",
-                f"Q {quality.q:.1f}<{self.quality_min:.0f}",
-                direction,
-                quality,
-                None,
-                None,
-                None,
-                0.0,
-            )
+        dmi_edge = (quality.plus_di - quality.minus_di) if direction.side == Side.LONG else (quality.minus_di - quality.plus_di)
+        hard_bad_market = quality.chop >= self.hard_chop and quality.adx < self.hard_adx
+        if quality.q < self.quality_min or hard_bad_market or dmi_edge < -self.dmi_opposition:
+            why = f"Q {quality.q:.0f} ADX {quality.adx:.1f} CHOP {quality.chop:.1f} DMI {dmi_edge:+.1f}"
+            return DecisionState(False, "1H_QUALITY", why, direction, quality, None, None, None, direction.score)
 
-        dmi_edge = self._dmi_edge(quality, direction.side)
-        if dmi_edge < -self.dmi_hard_opposition:
-            return DecisionState(
-                False,
-                "L1_DIRECTION",
-                f"DMI strongly opposed {dmi_edge:+.1f}",
-                direction,
-                quality,
-                None,
-                None,
-                None,
-                0.0,
-            )
+        d15 = self._prepared_15m(df15)
+        trigger = self._trigger_15m(d15, direction.side)
+        context = build_context(df15=df15, df1h=df1h, df4h=df4h, side="long" if direction.side == Side.LONG else "short")
+        setup = SetupType.PULLBACK if trigger == "EMA13_PULLBACK_RECLAIM" else SetupType.BREAKOUT_RETEST
+        if trigger is None:
+            return DecisionState(False, "15M_TRIGGER", "waiting EMA cross, HMA flip or EMA13 reclaim", direction, quality, context, setup, None, direction.score)
 
-        context = build_context(
-            df15=df15,
-            df1h=df1h,
-            df4h=df4h,
-            side="long" if direction.side == Side.LONG else "short",
-        )
-        loc = context.location
-        execution, level_name, level_price, armed, reaction_reason = (
-            self._sr_entry_state(df5, loc, direction.side)
-        )
+        r = d15.iloc[-1]
+        atr = float(r["atr"])
+        chase = abs(float(r["close"]) - float(r["ema13"])) / max(atr, 1e-12)
+        if chase > self.max_chase_atr:
+            return DecisionState(False, "CHASE", f"distance {chase:.2f}>{self.max_chase_atr:.2f} ATR", direction, quality, context, setup, (trigger, atr), direction.score)
 
-        level_label = (
-            f"{level_name}@{level_price:.6g}"
-            if level_price is not None
-            else level_name
-        )
-        updated_loc = replace(
-            loc,
-            zone=level_name,
-            score=max(float(loc.score), 60.0) if armed else float(loc.score),
-            reason=reaction_reason,
-        )
-        context = replace(context, location=updated_loc)
-        setup_type = self._setup_from_context(context)
+        return DecisionState(True, "READY", "fast closed-15M trigger", direction, quality, context, setup, (trigger, atr), direction.score)
 
-        macro_score, macro_label, macro_edge = self._macro_bias(
-            df4h, direction.side
-        )
-        confidence = self._v51_trade_score(
-            direction.score,
-            updated_loc.score,
-            execution is not None,
-            macro_score,
-        )
+    def _risk_plan(self, decision, df15):
+        d = self._prepared_15m(df15)
+        entry = float(d["close"].iloc[-1])
+        atr = float(d["atr"].iloc[-1])
+        ctx = self._structure(d)
+        if decision.side == Side.LONG:
+            swing = max([v for _, v in ctx["mic_l"][-3:] if v < entry] or [entry - atr])
+            raw_dist = max(entry - swing + 0.10 * atr, self.sl_atr * atr)
+        else:
+            swing = min([v for _, v in ctx["mic_h"][-3:] if v > entry] or [entry + atr])
+            raw_dist = max(swing - entry + 0.10 * atr, self.sl_atr * atr)
+        stop_dist = min(raw_dist, entry * self.sl_max_pct)
+        sl = entry - stop_dist if decision.side == Side.LONG else entry + stop_dist
+        tp = entry * (1 + self.tp_pct) if decision.side == Side.LONG else entry * (1 - self.tp_pct)
+        rr = abs(tp - entry) / max(stop_dist, 1e-12)
+        return entry, sl, tp, atr, swing, rr
 
-        if not armed:
-            return DecisionState(
-                False,
-                "L2_SETUP",
-                f"{reaction_reason} | 4H {macro_label} {macro_edge:+.0f}",
-                direction,
-                quality,
-                context,
-                setup_type,
-                None,
-                confidence,
-            )
-
-        if execution is None:
-            return DecisionState(
-                False,
-                "L3_TRIGGER",
-                f"{level_label} armed; {reaction_reason}",
-                direction,
-                quality,
-                context,
-                setup_type,
-                None,
-                confidence,
-            )
-
-        provisional = DecisionState(
-            True,
-            "READY",
-            "",
-            direction,
-            quality,
-            context,
-            setup_type,
-            execution,
-            confidence,
-        )
-        risk_plan = self._risk_plan(provisional, df15, df5)
-        if risk_plan is None:
-            return DecisionState(
-                False,
-                "RISK",
-                "15M structure risk plan unavailable",
-                direction,
-                quality,
-                context,
-                setup_type,
-                execution,
-                confidence,
-            )
-
-        rr = risk_plan[-1]
-        if updated_loc.room_atr < self.min_room_atr:
-            return DecisionState(
-                False,
-                "RISK",
-                (
-                    f"room {updated_loc.room_atr:.2f}"
-                    f"<{self.min_room_atr:.2f} ATR"
-                ),
-                direction,
-                quality,
-                context,
-                setup_type,
-                execution,
-                confidence,
-            )
-        if rr < self.min_actual_rr:
-            return DecisionState(
-                False,
-                "RISK",
-                f"actual RR {rr:.2f}<{self.min_actual_rr:.2f}",
-                direction,
-                quality,
-                context,
-                setup_type,
-                execution,
-                confidence,
-            )
-
-        return DecisionState(
-            True,
-            "READY",
-            (
-                f"{execution[0]} | RR {rr:.2f} | "
-                f"4H {macro_label} {macro_edge:+.0f}"
-            ),
-            direction,
-            quality,
-            context,
-            setup_type,
-            execution,
-            confidence,
-        )
-
-    def generate_entry(
-        self,
-        df4h,
-        df1h,
-        df15,
-        df5,
-        has_open_position: bool = False,
-    ) -> Optional[EntrySignal]:
-        """Create an order only from the same S/R decision shown in status."""
+    def generate_entry(self, df4h, df1h, df15, df5, has_open_position: bool = False) -> Optional[EntrySignal]:
         if has_open_position:
             return None
-
         decision = self.evaluate(df4h, df1h, df15, df5)
-        if (
-            not decision.ready
-            or decision.context is None
-            or decision.setup_type is None
-            or decision.execution is None
-            or decision.side is None
-        ):
+        if not decision.ready or decision.side is None or decision.execution is None:
             return None
-
-        risk_plan = self._risk_plan(decision, df15, df5)
-        if risk_plan is None:
+        entry, sl, tp, atr, structure, rr = self._risk_plan(decision, df15)
+        if rr < self.min_rr:
             return None
-        entry, sl, tp, atr15, structure_level, rr = risk_plan
-
-        loc = decision.context.location
-        if loc.room_atr < self.min_room_atr or rr < self.min_actual_rr:
-            return None
-
-        trigger_name, _ = decision.execution
-        side = decision.side
-        _, macro_label, macro_edge = self._macro_bias(df4h, side)
-        compat_trend = Trend.BULL if side == Side.LONG else Trend.BEAR
-        room_pct = max(
-            0.0, loc.room_atr * atr15 / max(entry, 1e-12)
-        )
-        reason = (
-            f"Sentinel S/R {side.value} | 1H Trend "
-            f"{decision.direction.score:.0f} edge "
-            f"{decision.direction.edge:+.0f} Q "
-            f"{decision.quality.q:.0f} | 15M {loc.zone} | "
-            f"5M {trigger_name} ({loc.reason}) | "
-            f"Room {loc.room_atr:.2f}ATR | RR {rr:.2f} | "
-            f"4H soft {macro_label} {macro_edge:+.0f}"
-        )
-
-        return EntrySignal(
-            side=side,
-            entry_price=entry,
-            stop_loss=sl,
-            take_profit=tp,
-            trend_4h=compat_trend,
-            q_1h=decision.quality.q,
-            adx_1h=decision.quality.adx,
-            chop_1h=decision.quality.chop,
-            setup=decision.setup_type,
-            trigger=trigger_name,
-            room_pct=room_pct,
-            atr15=atr15,
-            structure_level=structure_level,
-            reason=reason,
-        )
-
-    @staticmethod
-    def _stage_label(stage: str) -> str:
-        return {
-            "L0_WARMUP": "WARMUP",
-            "L1_DIRECTION": "DIRECTION",
-            "L2_SETUP": "S/R",
-            "L3_TRIGGER": "REACTION",
-            "RISK": "RISK",
-            "READY": "READY",
-        }.get(stage, stage)
+        macro_long = float(trend_score_4h(df4h, "long"))
+        macro_short = float(trend_score_4h(df4h, "short"))
+        macro = macro_long - macro_short
+        trigger = decision.execution[0]
+        trend = Trend.BULL if decision.side == Side.LONG else Trend.BEAR
+        reason = (f"Fast V6 {decision.side.value} | 1H {decision.direction.score:.0f} edge {decision.direction.edge:+.0f} "
+                  f"Q {decision.quality.q:.0f} | 15M {trigger} | 4H soft {macro:+.0f} | RR {rr:.2f}")
+        return EntrySignal(decision.side, entry, sl, tp, trend, decision.quality.q,
+                           decision.quality.adx, decision.quality.chop,
+                           decision.setup_type, trigger, self.tp_pct, atr,
+                           structure, reason)
 
     def entry_status(self, df4h, df1h, df15, df5) -> str:
-        """Compact production status showing the active S/R rule."""
         d = self.evaluate(df4h, df1h, df15, df5)
         side = d.side.value if d.side else "NONE"
-        stage = self._stage_label(d.stage)
-        status = "READY" if d.ready else "WAIT"
-
-        parts = [
-            f"SR {status}",
-            side,
-            f"Trend={d.direction.score:.0f}/{d.direction.tier}",
-            f"Edge={d.direction.edge:+.0f}",
-        ]
+        parts = [f"FAST-V6 {'READY' if d.ready else 'WAIT'}", side,
+                 f"Stage={d.stage}", f"Trend={d.direction.score:.0f}", f"Edge={d.direction.edge:+.0f}"]
         if d.quality is not None:
-            parts.append(f"Q={d.quality.q:.1f}")
-        if d.context is not None:
-            loc = d.context.location
-            trigger = d.execution[0] if d.execution else "WAIT"
-            parts.extend(
-                [
-                    f"Level={loc.zone}",
-                    f"Room={loc.room_atr:.2f}ATR",
-                    f"Trigger={trigger}",
-                    f"Conf={d.trade_score:.0f}",
-                ]
-            )
-
-        reason = d.blocker or "S/R reaction passed"
-        parts.extend([f"Stage={stage}", f"Reason={reason}"])
+            parts += [f"Q={d.quality.q:.0f}", f"ADX={d.quality.adx:.1f}", f"CHOP={d.quality.chop:.1f}"]
+        parts.append(f"Trigger={d.execution[0] if d.execution else 'WAIT'}")
+        if d.blocker:
+            parts.append(f"Reason={d.blocker}")
         return " | ".join(parts)
 
 
