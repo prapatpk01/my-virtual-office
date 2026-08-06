@@ -1,18 +1,12 @@
-"""Production entry point for merged Trend Confirm + corrected WaveTrend entry.
+"""Production entry point for unified Trend Confirm.
 
-One strategy family only:
-- Layer 1: 4H trend direction
-- Layer 2: 1H context + ADX/CHOP quality gate
-- Layer 3: 15M EMA8/13 cross OR WaveTrend extreme cross
-- 15M price must be on the correct side of EMA20
+Only closed 15M triggers may open a position:
+- EMA8/13 cross,
+- WaveTrend extreme cross (-42 / +45), or
+- confirmed Structure BOS + retest.
 
-WaveTrend entry extremes used in production:
-- Long cross from oversold <= -42
-- Short cross from overbought >= +45
-
-Telegram order alerts and charts receive the exact trigger owner:
-- EMA entry -> MACD lower panel and EMA reverse-cross exit text.
-- WT entry  -> WaveTrend lower panel and WT opposite-cross exit text.
+4H and 1H remain direction/quality gates only. Telegram text and PNG charts use
+entry-trigger metadata so every position shows the correct owner and exit rule.
 """
 from __future__ import annotations
 
@@ -20,21 +14,35 @@ import asyncio
 import os
 from contextvars import ContextVar
 
-import run_dual_bot  # keeps exchange, sleep, risk and lifecycle patches
+import run_dual_bot
 import run_bot
 import trading.chart_renderer as chart_renderer
 from trading.bot import TradingBot
 from trading.telegram_notifier import TelegramNotifier
 
 
-_TG_ENTRY_TRIGGER: ContextVar[str | None] = ContextVar(
-    "trend_confirm_tg_entry_trigger",
+_TG_ENTRY_CONTEXT: ContextVar[dict | None] = ContextVar(
+    "trend_confirm_tg_entry_context",
     default=None,
 )
 
 
-def _entry_trigger_label(signal) -> str | None:
-    """Resolve the exact Layer-3 trigger from signal metadata."""
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _entry_trigger_context(signal) -> dict:
+    """Resolve the exact Layer-3 owner and chart metadata from a Signal."""
     metadata = getattr(signal, "metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
     owner = str(
@@ -42,20 +50,36 @@ def _entry_trigger_label(signal) -> str | None:
         or metadata.get("entry_trigger")
         or ""
     ).upper()
-    if "WT" in owner:
-        return "WT Cross"
-    if "EMA" in owner:
-        return "EMA8/13 Cross"
-    return None
+
+    if "STRUCTURE" in owner or "BOS_RETEST" in owner:
+        label = "Structure BOS + Retest"
+    elif "WT" in owner:
+        label = "WT Cross"
+    elif "EMA" in owner:
+        label = "EMA8/13 Cross"
+    else:
+        label = None
+
+    return {
+        "label": label,
+        "metadata": dict(metadata),
+    }
+
+
+def _signal_exit_text(label: str) -> str:
+    if label == "WT Cross":
+        return "🏁 Signal Exit : `WT opposite cross`"
+    if label == "Structure BOS + Retest":
+        return "🏁 Signal Exit : `Structure invalidation / opposite CHOCH`"
+    return "🏁 Signal Exit : `EMA8/13 reverse cross`"
 
 
 def _append_entry_trigger(text: str, label: str | None) -> str:
-    """Rewrite a Trend Confirm order alert so every displayed rule is exact."""
+    """Rewrite the order caption to match the actual entry owner."""
     if not label:
         return text
 
     lines = str(text).splitlines()
-
     if not any("Entry Trigger" in line for line in lines):
         trigger_line = f"⚡ Entry Trigger : `{label}`"
         insert_at = 1
@@ -76,15 +100,15 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
         if not any(line.startswith("🔒 Runner") for line in lines):
             lines.insert(target_index + 1, runner_line)
 
-    exit_text = (
-        "🏁 Signal Exit : `WT opposite cross`"
-        if label == "WT Cross"
-        else "🏁 Signal Exit : `EMA8/13 reverse cross`"
-    )
+    exit_text = _signal_exit_text(label)
+    exit_replaced = False
     for index, line in enumerate(lines):
         if line.startswith("🏁 Exit") or line.startswith("🏁 Signal Exit"):
             lines[index] = exit_text
+            exit_replaced = True
             break
+    if not exit_replaced:
+        lines.append(exit_text)
 
     for index, line in enumerate(lines):
         if line.startswith("📊 Strategy:"):
@@ -101,8 +125,33 @@ def _append_entry_trigger(text: str, label: str | None) -> str:
     return "\n".join(lines)
 
 
+def _normalize_notification_metadata(signal) -> None:
+    """Expose Trend Confirm's native 4H metadata to the generic notifier."""
+    metadata = getattr(signal, "metadata", None)
+    if not isinstance(metadata, dict):
+        return
+
+    metadata["selected_strategy"] = "Trend Confirm"
+    macro = metadata.get("macro_4h")
+    if isinstance(macro, dict):
+        state = str(macro.get("state") or "").upper()
+        direction = str(macro.get("direction") or "").upper()
+        bias = state or direction
+        macro_trend = metadata.get("macro_trend")
+        if not isinstance(macro_trend, dict):
+            macro_trend = {}
+        if bias:
+            macro_trend["bias"] = bias
+        score = macro.get("score")
+        if isinstance(score, (int, float)):
+            macro_trend["score"] = float(score)
+        metadata["macro_trend"] = macro_trend
+        if state:
+            metadata["regime"] = {"state": state}
+
+
 def _install_trigger_aware_telegram_patch() -> None:
-    """Attach trigger metadata to both the Telegram caption and PNG chart."""
+    """Attach trigger metadata to caption, fallback text and PNG chart."""
     if getattr(TradingBot, "_tg_entry_trigger_patch_installed", False):
         return
 
@@ -112,18 +161,21 @@ def _install_trigger_aware_telegram_patch() -> None:
     original_render_entry_chart = chart_renderer.render_entry_chart
 
     async def _execute_signal_with_trigger(self, signal, *args, **kwargs):
-        token = _TG_ENTRY_TRIGGER.set(_entry_trigger_label(signal))
+        _normalize_notification_metadata(signal)
+        token = _TG_ENTRY_CONTEXT.set(_entry_trigger_context(signal))
         try:
             return await original_execute_signal(self, signal, *args, **kwargs)
         finally:
-            _TG_ENTRY_TRIGGER.reset(token)
+            _TG_ENTRY_CONTEXT.reset(token)
 
     def _build_caption_with_trigger(self, *args, **kwargs):
         caption = original_build_caption(self, *args, **kwargs)
-        return _append_entry_trigger(caption, _TG_ENTRY_TRIGGER.get())
+        context = _TG_ENTRY_CONTEXT.get() or {}
+        return _append_entry_trigger(caption, context.get("label"))
 
     def _notify_with_trigger(self, text: str):
-        label = _TG_ENTRY_TRIGGER.get()
+        context = _TG_ENTRY_CONTEXT.get() or {}
+        label = context.get("label")
         if label and (
             "Order Executed" in str(text)
             or "OPEN LONG" in str(text)
@@ -133,8 +185,9 @@ def _install_trigger_aware_telegram_patch() -> None:
         return original_notify(self, text)
 
     def _render_entry_chart_with_trigger(*args, **kwargs):
-        """Select the lower indicator panel from the real entry owner."""
-        label = _TG_ENTRY_TRIGGER.get()
+        context = _TG_ENTRY_CONTEXT.get() or {}
+        label = context.get("label")
+        metadata = context.get("metadata") or {}
         if label:
             kwargs["entry_trigger"] = label
             kwargs["strategy"] = "Trend Confirm"
@@ -149,6 +202,22 @@ def _install_trigger_aware_telegram_patch() -> None:
                 kwargs["wt_signal_length"] = 4
                 kwargs["wt_oversold"] = -42.0
                 kwargs["wt_overbought"] = 45.0
+            elif label == "Structure BOS + Retest":
+                structure = metadata.get("structure_15m")
+                structure = structure if isinstance(structure, dict) else {}
+                kwargs["lower_panel"] = "structure"
+                kwargs["structure_level"] = (
+                    metadata.get("structure_level")
+                    or structure.get("level")
+                )
+                kwargs["structure_breakout_ts"] = (
+                    metadata.get("structure_breakout_ts")
+                    or structure.get("breakout_ts")
+                )
+                kwargs["structure_retest_ts"] = (
+                    metadata.get("structure_retest_ts")
+                    or structure.get("retest_ts")
+                )
             else:
                 kwargs["lower_panel"] = "macd"
 
@@ -164,7 +233,7 @@ def _install_trigger_aware_telegram_patch() -> None:
 def _make_merged_trend_confirm(symbols: list, config: dict):
     if not run_dual_bot._env_bool("ENABLE_TREND_CONFIRM", True):
         raise RuntimeError(
-            "Merged Trend Confirm is disabled. Set ENABLE_TREND_CONFIRM=true"
+            "Unified Trend Confirm is disabled. Set ENABLE_TREND_CONFIRM=true"
         )
 
     from trading.strategies.trend_confirm_wt_fixed_strategy import (
@@ -176,6 +245,22 @@ def _make_merged_trend_confirm(symbols: list, config: dict):
             symbol,
             wt_oversold=-42.0,
             wt_overbought=45.0,
+            structure_swing_span=_env_int("STRUCTURE_SWING_SPAN", 3),
+            structure_retest_min_bars=_env_int("STRUCTURE_RETEST_MIN_BARS", 1),
+            structure_retest_max_bars=_env_int("STRUCTURE_RETEST_MAX_BARS", 3),
+            structure_bos_buffer_atr=_env_float("STRUCTURE_BOS_BUFFER_ATR", 0.05),
+            structure_touch_tolerance_atr=_env_float(
+                "STRUCTURE_TOUCH_TOLERANCE_ATR", 0.15
+            ),
+            structure_invalidation_tolerance_atr=_env_float(
+                "STRUCTURE_INVALIDATION_TOLERANCE_ATR", 0.25
+            ),
+            structure_max_close_distance_atr=_env_float(
+                "STRUCTURE_MAX_CLOSE_DISTANCE_ATR", 0.50
+            ),
+            structure_max_fill_slippage_atr=_env_float(
+                "STRUCTURE_MAX_FILL_SLIPPAGE_ATR", 0.35
+            ),
         )
         for symbol in symbols
     ]
@@ -185,18 +270,19 @@ def _build_merged_config() -> dict:
     config = run_dual_bot._ORIGINAL_BUILD_CONFIG()
     if not run_dual_bot._env_bool("ENABLE_TREND_CONFIRM", True):
         raise RuntimeError(
-            "Merged Trend Confirm is disabled. Set ENABLE_TREND_CONFIRM=true"
+            "Unified Trend Confirm is disabled. Set ENABLE_TREND_CONFIRM=true"
         )
 
     strategy_limit = max(1, int(os.getenv("TREND_CONFIRM_MAX_POSITIONS", "2")))
     requested_global = max(1, int(os.getenv("MAX_POSITIONS", str(strategy_limit))))
     config["max_positions"] = min(requested_global, strategy_limit)
-    config["strategy_mode"] = "trend_confirm_ema_or_wt"
+    config["strategy_mode"] = "trend_confirm_ema_wt_structure"
     config["enable_trend_confirm"] = True
     config["enable_wt_trend"] = False
     config["enable_ai_expert"] = False
     config["wt_oversold"] = -42.0
     config["wt_overbought"] = 45.0
+    config["structure_entry_enabled"] = True
     os.environ["CANDLE_TF"] = "15m"
     config["candle_tf"] = "15m"
     return config
