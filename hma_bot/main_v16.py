@@ -45,6 +45,53 @@ class Bot(v15.Bot):
             self._closed_seen[symbol] = True
             _LOG.info("[%s] FAST-V6 post-close cooldown 45 minutes", symbol)
 
+    async def _reconcile_startup(self):
+        """Recover positions and repair missing exchange-native protection."""
+        await super()._reconcile_startup()
+        for symbol in self.cfg.symbols:
+            st = self.state.get(symbol) or {}
+            pos = st.get("pos") or {}
+            side = str(pos.get("side") or "")
+            entry = float(pos.get("entry") or 0.0)
+            amount = float(pos.get("amount") or 0.0)
+            if side not in ("long", "short") or entry <= 0 or amount <= 0:
+                continue
+
+            native_sl, native_tp = await self.client.fetch_attached_stops(symbol, side)
+            if native_sl and native_tp:
+                pos.pop("recovery_quarantine", None)
+                continue
+
+            sl = entry * (0.990 if side == "long" else 1.010)
+            tp = entry * (1.012 if side == "long" else 0.988)
+            repaired = await self.client.move_sl_to_breakeven(
+                symbol, side, sl, amount, tp_price=tp
+            )
+            if repaired:
+                pos.update({
+                    "sl": sl,
+                    "initial_sl": sl,
+                    "tp": tp,
+                    "risk": abs(entry - sl),
+                    "recovery_quarantine": False,
+                })
+                _LOG.warning(
+                    "[%s] recovered position protection repaired: SL %.8g TP %.8g",
+                    symbol, sl, tp,
+                )
+                await self.tg.send_text(
+                    f"🛡️ `{symbol}` recovered {side.upper()} protection repaired\n"
+                    f"SL `{sl:.6g}` | TP `{tp:.6g}`"
+                )
+            else:
+                _LOG.error("[%s] recovered position remains unprotected", symbol)
+                await self.tg.send_text(
+                    f"🚨 `{symbol}` recovered position has no native SL/TP and repair failed. "
+                    "FAST-V6 is closing it for safety."
+                )
+                await self._close_market(symbol, st, "RECOVERY_PROTECTION_FAILED")
+        self._save_state()
+
     async def _look_for_entry(self, symbol: str, st: dict):
         """Use the inherited entry flow, then verify native protection."""
         had_position = bool(st.get("pos"))
