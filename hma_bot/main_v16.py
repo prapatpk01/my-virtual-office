@@ -1,4 +1,4 @@
-"""HMA Fast Structure V6 production runtime.
+"""TPC Dynamic Zone V6.1 production runtime.
 
 Keeps the proven OKX execution, restart reconciliation, native SL/TP and
 Telegram/statistics infrastructure.  Only the active strategy and runtime
@@ -31,7 +31,7 @@ class Bot(v15.Bot):
         """Stop scheduling work; keep the OKX client alive for in-flight work."""
         self._shutdown_requested = True
         self._running = False
-        _LOG.info("FAST-V6 graceful shutdown requested")
+        _LOG.info("TPC-ZONE-V6.1 graceful shutdown requested")
 
     async def run_forever(self):
         """Finish the current symbol safely before closing exchange access."""
@@ -58,21 +58,21 @@ class Bot(v15.Bot):
             return
         self._client_closed = True
         await self.client.close()
-        _LOG.info("FAST-V6 shutdown complete")
+        _LOG.info("TPC-ZONE-V6.1 shutdown complete")
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
             if self.open_position_count() >= self.cfg.max_positions:
-                self._view[symbol] = f"FAST-V6 POSITION LIMIT | MAX {self.cfg.max_positions}"
+                self._view[symbol] = f"TPC-ZONE-V6.1 POSITION LIMIT | MAX {self.cfg.max_positions}"
                 return
             remaining = max(0, self._cooldown_until.get(symbol, 0) - time.time())
             if remaining > 0:
-                self._view[symbol] = f"FAST-V6 COOLDOWN | {remaining / 60:.0f}m"
+                self._view[symbol] = f"TPC-ZONE-V6.1 COOLDOWN | {remaining / 60:.0f}m"
                 return
             px = float(df15["close"].iloc[-1]) if len(df15) else 0.0
             self._view[symbol] = f"15M px={px:.6g} | {self.strat.entry_status(df4h, df1h, df15, df5)}"
         except Exception as exc:
-            self._view[symbol] = f"FAST-V6 view error: {str(exc)[:140]}"
+            self._view[symbol] = f"TPC-ZONE-V6.1 view error: {str(exc)[:140]}"
 
     async def _manage(self, symbol: str, st: dict):
         had_position = bool(st.get("pos"))
@@ -97,7 +97,7 @@ class Bot(v15.Bot):
         if had_position and not has_position:
             self._cooldown_until[symbol] = time.time() + self.post_close_cooldown_sec
             self._closed_seen[symbol] = True
-            _LOG.info("[%s] FAST-V6 post-close cooldown 45 minutes", symbol)
+            _LOG.info("[%s] TPC-ZONE-V6.1 post-close cooldown 45 minutes", symbol)
 
     async def _reconcile_startup(self):
         """Recover positions without cancelling or replacing existing TP/SL."""
@@ -225,7 +225,7 @@ class Bot(v15.Bot):
             raise RuntimeError("Could not confirm OKX hedge mode.")
 
         balance = await self.client.fetch_balance_usdt()
-        _LOG.info("=== HMA FAST STRUCTURE V6 [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
+        _LOG.info("=== TPC DYNAMIC ZONE V6.1 [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
                   "PAPER" if self.cfg.paper else "LIVE", self.cfg.symbols,
                   self.cfg.margin_per_position_usd, self.cfg.leverage,
                   self.cfg.max_positions, balance)
@@ -236,21 +236,23 @@ class Bot(v15.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"⚡ *HMA Fast Structure V6 — {mode}*\n"
+                f"🎯 *TPC Dynamic Zone V6.1 — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin cap `${self.cfg.margin_per_position_usd:.2f}` "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}`\n\n"
-                "Pipeline: `1H direction → relaxed Q guard → direct closed-15M entry`\n"
-                "Entry: `EMA8/13 cross OR HMA16 flip OR EMA13 pullback reclaim`\n"
-                "4H: `soft context only` | No mandatory Sentinel S/R | No counter-trend fallback\n"
+                "Pipeline: `1H direction → confirmed 15M supply/demand → 5M execution`\n"
+                "Zone entry: `hold/sweep-reclaim`; fallback: `EMA13 trend pullback`\n"
+                "5M trigger: `zone reclaim OR EMA8/13 cross OR HMA16 flip OR EMA13 reclaim`\n"
+                "4H: `soft context only` | Confirmed closed-candle zones | No counter-trend entry\n"
                 "Quality defaults: `Q≥42`; only severe ADX/CHOP or opposing DMI blocks\n"
                 "Anti-chase: `≤1.10 ATR from EMA13`\n"
-                "Risk: structure SL `0.60–1.00%` and `≥1.35 ATR15`; TP `1.2%`\n"
+                "Risk: SL outside zone/structure `0.60–1.00%` and `≥1.35 ATR15`\n"
+                "Target: `1.2%` or before opposing zone; actual RR must be `≥1.2`\n"
                 "Sizing: dynamic margin targets `2% balance risk`; `$20` is the cap\n"
                 "Re-entry: `45-minute cooldown after every close`\n"
                 "Recovery: existing positions and native SL/TP reconciled after restart"
             )
-        _LOG.info("HMA Fast Structure V6 startup complete")
+        _LOG.info("TPC Dynamic Zone V6.1 startup complete")
 
 
 async def _main():
