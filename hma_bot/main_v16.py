@@ -17,6 +17,10 @@ _LOG = v15._LOG
 
 
 class Bot(v15.Bot):
+    XAG_MIN_Q = 60.0
+    XAG_ENTRY_START_UTC = 0
+    XAG_ENTRY_END_UTC = 7
+
     def __init__(self):
         super().__init__()
         self.strat = S.PrecisionTrendStructureV12(self.cfg.strategy_config())
@@ -30,10 +34,73 @@ class Bot(v15.Bot):
         self.min_dynamic_margin = float(os.environ.get("FAST_MIN_MARGIN_USD", "5.0"))
         self._shutdown_requested = False
         self._client_closed = False
+        self._entry_symbol = ""
+        self._xag_filter_reason = "NOT_EVALUATED"
+
+        # Keep one production generator. The wrapper only removes XAG cohorts
+        # that failed validation; every other symbol is returned unchanged.
+        self._raw_generate_entry = self.strat.generate_entry
+
+        def symbol_filtered_generate_entry(
+            df4h, df1h, df15, df5, has_open_position: bool = False
+        ):
+            signal = self._raw_generate_entry(
+                df4h, df1h, df15, df5,
+                has_open_position=has_open_position,
+            )
+            return self._apply_symbol_entry_filter(
+                self._entry_symbol, signal, df15
+            )
+
+        self.strat.generate_entry = symbol_filtered_generate_entry
 
     @staticmethod
     def _base_symbol(symbol: str) -> str:
         return str(symbol or "").upper().split("/", 1)[0].split(":", 1)[0]
+
+    @staticmethod
+    def _closed_candle_utc_hour(frame) -> int:
+        if frame is None or len(frame) == 0:
+            return -1
+        timestamp = frame.index[-1]
+        try:
+            if getattr(timestamp, "tzinfo", None) is None:
+                timestamp = timestamp.tz_localize("UTC")
+            else:
+                timestamp = timestamp.tz_convert("UTC")
+            return int(timestamp.hour)
+        except (AttributeError, TypeError, ValueError):
+            return -1
+
+    def _apply_symbol_entry_filter(self, symbol: str, signal, df15):
+        """Apply the validated XAG-only entry filter."""
+        if self._base_symbol(symbol) != "XAG":
+            return signal
+        if signal is None:
+            self._xag_filter_reason = "WAIT_SIGNAL"
+            return None
+        if float(signal.q_1h) < self.XAG_MIN_Q:
+            self._xag_filter_reason = (
+                f"Q_{float(signal.q_1h):.1f}_LT_{self.XAG_MIN_Q:.0f}"
+            )
+            return None
+
+        # This is the stable strategy label emitted by V6.2 when location is
+        # the EMA13 fallback instead of an unvalidated structural-zone entry.
+        if "EMA13_TREND_PULLBACK" not in str(signal.reason or "").upper():
+            self._xag_filter_reason = "NEED_EMA13_PULLBACK_LOCATION"
+            return None
+
+        hour = self._closed_candle_utc_hour(df15)
+        session_open = self.XAG_ENTRY_START_UTC <= hour < self.XAG_ENTRY_END_UTC
+        if not session_open:
+            self._xag_filter_reason = f"SESSION_CLOSED_{hour:02d}UTC"
+            return None
+
+        self._xag_filter_reason = (
+            f"PASS_EMA13_PULLBACK_Q{float(signal.q_1h):.0f}_{hour:02d}UTC"
+        )
+        return signal
 
     def request_shutdown(self) -> None:
         """Stop scheduling work; keep the OKX client alive for in-flight work."""
@@ -70,6 +137,7 @@ class Bot(v15.Bot):
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
+            self._entry_symbol = symbol
             if self.open_position_count() >= self.cfg.max_positions:
                 self._view[symbol] = f"TPC-ZONE-V6.2 POSITION LIMIT | MAX {self.cfg.max_positions}"
                 return
@@ -78,7 +146,14 @@ class Bot(v15.Bot):
                 self._view[symbol] = f"TPC-ZONE-V6.2 COOLDOWN | {remaining / 60:.0f}m"
                 return
             px = float(df15["close"].iloc[-1]) if len(df15) else 0.0
-            self._view[symbol] = f"15M px={px:.6g} | {self.strat.entry_status(df4h, df1h, df15, df5)}"
+            status = self.strat.entry_status(df4h, df1h, df15, df5)
+            xag_status = ""
+            if self._base_symbol(symbol) == "XAG":
+                self.strat.generate_entry(
+                    df4h, df1h, df15, df5, has_open_position=False
+                )
+                xag_status = f" | XAGFilter={self._xag_filter_reason}"
+            self._view[symbol] = f"15M px={px:.6g} | {status}{xag_status}"
         except Exception as exc:
             self._view[symbol] = f"TPC-ZONE-V6.2 view error: {str(exc)[:140]}"
 
@@ -155,6 +230,7 @@ class Bot(v15.Bot):
 
     async def _look_for_entry(self, symbol: str, st: dict):
         """Risk-size the inherited entry, then verify protection read-only."""
+        self._entry_symbol = symbol
         had_position = bool(st.get("pos"))
         base_symbol = self._base_symbol(symbol)
         if not had_position and base_symbol in self.disabled_entry_symbols:
@@ -264,6 +340,7 @@ class Bot(v15.Bot):
                 "Target: `2.0%` or before opposing zone; actual RR must be `≥1.8`\n"
                 "Management: `native SL/TP`; early Stage Lock disabled by default\n"
                 "Sizing: dynamic margin targets `2% balance risk`; `$20` is the cap\n"
+                "XAG filter: `EMA13 pullback location | Q≥60 | 00:00–07:00 UTC`\n"
                 f"Entry disabled after validation: `{', '.join(sorted(self.disabled_entry_symbols)) or 'none'}`\n"
                 "Re-entry: `45-minute cooldown after every close`\n"
                 "Recovery: existing positions and native SL/TP reconciled after restart"
