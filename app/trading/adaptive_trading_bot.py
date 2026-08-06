@@ -19,6 +19,7 @@ ADX_MIN = float(os.getenv("MOM_ADX_MIN", "15"))
 CHOP_MAX = float(os.getenv("MOM_CHOP_MAX", "55"))
 LOCATION_MAX_ATR = float(os.getenv("MOM_LOCATION_MAX_ATR", "1.0"))
 COOLDOWN_BARS = int(os.getenv("MOM_COOLDOWN_BARS", "3"))
+SUPPORTED_SCHEMAS = {"adaptive-momentum-v3-15m", "adaptive-momentum-v3.1-15m"}
 
 
 @dataclass
@@ -66,7 +67,7 @@ class TradingBot:
         try:
             runner = sys.modules.get("run_bot") or sys.modules.get("__main__")
             if runner is not None and hasattr(runner, "logger"):
-                runner.logger = logging.getLogger("adaptive_momentum_v3")
+                runner.logger = logging.getLogger("adaptive_momentum_v3_1")
             if runner is not None and hasattr(runner, "BUILD_ID"):
                 runner.BUILD_ID = "adaptive-momentum-v3.1-2026-08-06"
         except Exception:
@@ -267,8 +268,9 @@ class TradingBot:
         if not i15:
             self.last_signal = "WAIT INDICATOR_WARMUP"
             return None
-        if i15.get("schema") != "adaptive-momentum-v3.1-15m":
-            raise RuntimeError(f"MOMENTUM_V31_SCHEMA_MISMATCH: {i15.get('schema')}")
+        schema = i15.get("schema")
+        if schema not in SUPPORTED_SCHEMAS:
+            raise RuntimeError(f"MOMENTUM_V31_SCHEMA_MISMATCH: {schema}")
 
         if self.position:
             event = self.check_price(price or float(i15["close"]))
