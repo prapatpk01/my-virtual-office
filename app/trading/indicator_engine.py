@@ -1,10 +1,10 @@
-"""Adaptive Momentum v3.1 indicator engine for closed 15-minute candles."""
+"""Adaptive Momentum v3.2 fast-entry indicator engine for closed 15-minute candles."""
 from __future__ import annotations
 
 from typing import Any, Dict, List
 import math
 
-ENGINE_SCHEMA = "adaptive-momentum-v3.1-15m"
+ENGINE_SCHEMA = "adaptive-momentum-v3.2-15m"
 
 
 def _v(candle: Any, name: str, index: int) -> float:
@@ -84,14 +84,12 @@ def _chop(highs: List[float], lows: List[float], closes: List[float], length: in
 
 def _cross_up_recent(fast: List[float], slow: List[float], bars: int = 3) -> bool:
     start = max(1, len(fast) - bars)
-    return any(fast[index] > slow[index] and fast[index - 1] <= slow[index - 1]
-               for index in range(start, len(fast)))
+    return any(fast[i] > slow[i] and fast[i - 1] <= slow[i - 1] for i in range(start, len(fast)))
 
 
 def _cross_down_recent(fast: List[float], slow: List[float], bars: int = 3) -> bool:
     start = max(1, len(fast) - bars)
-    return any(fast[index] < slow[index] and fast[index - 1] >= slow[index - 1]
-               for index in range(start, len(fast)))
+    return any(fast[i] < slow[i] and fast[i - 1] >= slow[i - 1] for i in range(start, len(fast)))
 
 
 def compute(candles: List[Any]) -> Dict[str, Any]:
@@ -136,22 +134,17 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
         "entry_bull": e8[-1] > e13[-1], "entry_bear": e8[-1] < e13[-1],
         "ema_cross_up": e8[-1] > e13[-1] and e8[-2] <= e13[-2],
         "ema_cross_down": e8[-1] < e13[-1] and e8[-2] >= e13[-2],
-        "ema_cross_up_recent": fresh_up,
-        "ema_cross_down_recent": fresh_down,
-        "ema13_reclaim_long": reclaim_long,
-        "ema13_reclaim_short": reclaim_short,
-        "prev_bar_break_long": prev_break_long,
-        "prev_bar_break_short": prev_break_short,
+        "ema_cross_up_recent": fresh_up, "ema_cross_down_recent": fresh_down,
+        "ema13_reclaim_long": reclaim_long, "ema13_reclaim_short": reclaim_short,
+        "prev_bar_break_long": prev_break_long, "prev_bar_break_short": prev_break_short,
         "trigger_long": fresh_up or reclaim_long or prev_break_long,
         "trigger_short": fresh_down or reclaim_short or prev_break_short,
         "macd": macd_line[-1], "macd_signal": macd_signal[-1],
         "macd_hist": macd_hist[-1], "macd_hist_prev": macd_hist[-2],
-        "macd_bull": macd_line[-1] > macd_signal[-1],
-        "macd_bear": macd_line[-1] < macd_signal[-1],
         "macd_hist_improving_long": macd_hist[-1] > macd_hist[-2],
         "macd_hist_improving_short": macd_hist[-1] < macd_hist[-2],
-        "macd_hist_weaken_long_2": macd_hist[-1] < macd_hist[-2] < macd_hist[-3],
-        "macd_hist_weaken_short_2": macd_hist[-1] > macd_hist[-2] > macd_hist[-3],
+        "macd_hist_weaken_long_3": macd_hist[-1] < macd_hist[-2] < macd_hist[-3] < macd_hist[-4],
+        "macd_hist_weaken_short_3": macd_hist[-1] > macd_hist[-2] > macd_hist[-3] > macd_hist[-4],
         "adx": adx_series[-1], "adx_prev": adx_series[-2],
         "adx_rising": adx_series[-1] > adx_series[-2],
         "chop": chop_value, "atr": atr_value,
@@ -159,8 +152,6 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
         "location_long": closes[-1] >= e13[-1] and distance_atr <= 1.0,
         "location_short": closes[-1] <= e13[-1] and distance_atr <= 1.0,
         "recent_low": recent_low, "recent_high": recent_high,
-        "structure_long": closes[-1] > recent_high,
-        "structure_short": closes[-1] < recent_low,
         "volume": volumes[-1],
     }
 
