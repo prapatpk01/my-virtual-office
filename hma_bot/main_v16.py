@@ -1,4 +1,4 @@
-"""TPC Dynamic Zone V6.2 production runtime.
+"""TPC Dynamic Zone V6.3 production runtime.
 
 Keeps the proven OKX execution, restart reconciliation, native SL/TP and
 Telegram/statistics infrastructure.  Only the active strategy and runtime
@@ -16,14 +16,99 @@ import strategy_v12 as S
 _LOG = v15._LOG
 
 
+class FastPrecisionStrategy(S.PrecisionTrendStructureV12):
+    """Promote only exceptionally strong EMA13 continuations.
+
+    The normal V6.2 path remains authoritative for every symbol.  BTC and
+    DOGE get one early path after a closed 15M pullback candle, but only when
+    1H quality is strong and 4H confirms the same direction.
+    """
+
+    FAST_SYMBOLS = {
+        item.strip().upper()
+        for item in os.environ.get("TPC_FAST_SYMBOLS", "BTC,DOGE").split(",")
+        if item.strip()
+    }
+    FAST_TREND_MIN = float(os.environ.get("TPC_FAST_TREND_MIN", "75"))
+    FAST_EDGE_MIN = float(os.environ.get("TPC_FAST_EDGE_MIN", "60"))
+    FAST_Q_MIN = float(os.environ.get("TPC_FAST_Q_MIN", "65"))
+    FAST_ADX_MIN = float(os.environ.get("TPC_FAST_ADX_MIN", "18"))
+    FAST_CHOP_MAX = float(os.environ.get("TPC_FAST_CHOP_MAX", "55"))
+    FAST_MAX_CHASE_ATR = float(os.environ.get("TPC_FAST_MAX_CHASE_ATR", "0.65"))
+
+    def __init__(self, config=None) -> None:
+        super().__init__(config)
+        self.current_symbol = ""
+        if "TPC_MIN_ROOM_ATR" not in os.environ:
+            self.min_room_atr = 0.55
+
+    def evaluate(self, df4h, df1h, df15, df5):
+        decision = super().evaluate(df4h, df1h, df15, df5)
+        symbol = str(self.current_symbol or "").upper()
+        if (
+            decision.ready
+            or decision.stage != "15M_TRIGGER"
+            or symbol not in self.FAST_SYMBOLS
+            or decision.direction.side is None
+            or decision.quality is None
+            or not isinstance(decision.context, S.DynamicContext)
+            or decision.context.mode != "EMA13_FALLBACK"
+            or decision.direction.score < self.FAST_TREND_MIN
+            or decision.direction.edge < self.FAST_EDGE_MIN
+            or decision.quality.q < self.FAST_Q_MIN
+            or decision.quality.adx < self.FAST_ADX_MIN
+            or decision.quality.chop > self.FAST_CHOP_MAX
+        ):
+            return decision
+
+        side = decision.direction.side
+        macro_ok, _, _ = self._macro_aligned(df4h, side)
+        if not macro_ok:
+            return decision
+
+        d15 = self._prepared(df15)
+        row = d15.iloc[-1]
+        atr = float(row["atr"])
+        if atr <= 0:
+            return decision
+        close = float(row["close"])
+        open_ = float(row["open"])
+        aligned = close > float(row["ema13"]) if side == S.Side.LONG else close < float(row["ema13"])
+        momentum = close > open_ if side == S.Side.LONG else close < open_
+        body_atr = abs(close - open_) / atr
+        chase = abs(close - float(row["ema13"])) / atr
+        if (
+            not aligned
+            or not momentum
+            or body_atr < self.min_body_atr
+            or chase > self.FAST_MAX_CHASE_ATR
+        ):
+            return decision
+
+        trigger = "15M_FAST_EMA13_CONTINUATION"
+        provisional = S.DecisionState(
+            True, "READY", "FAST_EMA13_CONTINUATION",
+            decision.direction, decision.quality, decision.context,
+            decision.setup_type, (trigger, atr), decision.direction.score,
+        )
+        risk = self._risk_plan(provisional, df15, df5)
+        if risk is None or risk[-1] < self.min_rr:
+            return decision
+        return S.DecisionState(
+            True, "READY", f"FAST_EMA13_CONTINUATION RR {risk[-1]:.2f}",
+            decision.direction, decision.quality, decision.context,
+            decision.setup_type, (trigger, atr), decision.direction.score,
+        )
+
+
 class Bot(v15.Bot):
     XAG_MIN_Q = 60.0
     XAG_ENTRY_START_UTC = 0
-    XAG_ENTRY_END_UTC = 7
+    XAG_ENTRY_END_UTC = 12
 
     def __init__(self):
         super().__init__()
-        self.strat = S.PrecisionTrendStructureV12(self.cfg.strategy_config())
+        self.strat = FastPrecisionStrategy(self.cfg.strategy_config())
         disabled = os.environ.get("TPC_DISABLED_SYMBOLS", "ETH,HYPE")
         self.disabled_entry_symbols = {
             item.strip().upper() for item in disabled.split(",") if item.strip()
@@ -44,6 +129,7 @@ class Bot(v15.Bot):
         def symbol_filtered_generate_entry(
             df4h, df1h, df15, df5, has_open_position: bool = False
         ):
+            self.strat.current_symbol = self._base_symbol(self._entry_symbol)
             signal = self._raw_generate_entry(
                 df4h, df1h, df15, df5,
                 has_open_position=has_open_position,
@@ -106,7 +192,7 @@ class Bot(v15.Bot):
         """Stop scheduling work; keep the OKX client alive for in-flight work."""
         self._shutdown_requested = True
         self._running = False
-        _LOG.info("TPC-ZONE-V6.2 graceful shutdown requested")
+        _LOG.info("TPC-ZONE-V6.3 graceful shutdown requested")
 
     async def run_forever(self):
         """Finish the current symbol safely before closing exchange access."""
@@ -133,19 +219,20 @@ class Bot(v15.Bot):
             return
         self._client_closed = True
         await self.client.close()
-        _LOG.info("TPC-ZONE-V6.2 shutdown complete")
+        _LOG.info("TPC-ZONE-V6.3 shutdown complete")
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
             self._entry_symbol = symbol
             if self.open_position_count() >= self.cfg.max_positions:
-                self._view[symbol] = f"TPC-ZONE-V6.2 POSITION LIMIT | MAX {self.cfg.max_positions}"
+                self._view[symbol] = f"TPC-ZONE-V6.3 POSITION LIMIT | MAX {self.cfg.max_positions}"
                 return
             remaining = max(0, self._cooldown_until.get(symbol, 0) - time.time())
             if remaining > 0:
-                self._view[symbol] = f"TPC-ZONE-V6.2 COOLDOWN | {remaining / 60:.0f}m"
+                self._view[symbol] = f"TPC-ZONE-V6.3 COOLDOWN | {remaining / 60:.0f}m"
                 return
             px = float(df15["close"].iloc[-1]) if len(df15) else 0.0
+            self.strat.current_symbol = self._base_symbol(symbol)
             status = self.strat.entry_status(df4h, df1h, df15, df5)
             xag_status = ""
             if self._base_symbol(symbol) == "XAG":
@@ -155,7 +242,7 @@ class Bot(v15.Bot):
                 xag_status = f" | XAGFilter={self._xag_filter_reason}"
             self._view[symbol] = f"15M px={px:.6g} | {status}{xag_status}"
         except Exception as exc:
-            self._view[symbol] = f"TPC-ZONE-V6.2 view error: {str(exc)[:140]}"
+            self._view[symbol] = f"TPC-ZONE-V6.3 view error: {str(exc)[:140]}"
 
     async def _manage(self, symbol: str, st: dict):
         had_position = bool(st.get("pos"))
@@ -180,7 +267,7 @@ class Bot(v15.Bot):
         if had_position and not has_position:
             self._cooldown_until[symbol] = time.time() + self.post_close_cooldown_sec
             self._closed_seen[symbol] = True
-            _LOG.info("[%s] TPC-ZONE-V6.2 post-close cooldown 45 minutes", symbol)
+            _LOG.info("[%s] TPC-ZONE-V6.3 post-close cooldown 45 minutes", symbol)
 
     async def _reconcile_startup(self):
         """Recover positions without cancelling or replacing existing TP/SL."""
@@ -235,7 +322,7 @@ class Bot(v15.Bot):
         base_symbol = self._base_symbol(symbol)
         if not had_position and base_symbol in self.disabled_entry_symbols:
             self._view[symbol] = (
-                f"TPC-ZONE-V6.2 ENTRY DISABLED | {base_symbol} failed validation"
+                f"TPC-ZONE-V6.3 ENTRY DISABLED | {base_symbol} failed validation"
             )
             return
         configured_margin = float(self.cfg.margin_per_position_usd)
@@ -315,7 +402,7 @@ class Bot(v15.Bot):
             raise RuntimeError("Could not confirm OKX hedge mode.")
 
         balance = await self.client.fetch_balance_usdt()
-        _LOG.info("=== TPC DYNAMIC ZONE V6.2 [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
+        _LOG.info("=== TPC DYNAMIC ZONE V6.3 [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
                   "PAPER" if self.cfg.paper else "LIVE", self.cfg.symbols,
                   self.cfg.margin_per_position_usd, self.cfg.leverage,
                   self.cfg.max_positions, balance)
@@ -326,13 +413,14 @@ class Bot(v15.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"🎯 *TPC Dynamic Zone V6.2 — {mode}*\n"
+                f"🎯 *TPC Dynamic Zone V6.3 — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin cap `${self.cfg.margin_per_position_usd:.2f}` "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}`\n\n"
                 "Pipeline: `1H direction/Q → 15M location → closed-15M execution`\n"
                 "Zone entry: `hold/sweep-reclaim`; fallback: `EMA13 trend pullback`\n"
                 "15M trigger: `HMA16 flip OR EMA13 reclaim`\n"
+                "Fast trigger: `BTC/DOGE only; strong 1H + aligned 4H EMA13 continuation`\n"
                 "4H: `required for EMA13 reclaim`; HMA16 flip uses 1H trend/Q\n"
                 "Quality defaults: `Q≥55`; severe ADX/CHOP or opposing DMI blocks\n"
                 "Anti-chase: `≤1.10 ATR15 from EMA13`\n"
@@ -340,12 +428,13 @@ class Bot(v15.Bot):
                 "Target: `2.0%` or before opposing zone; actual RR must be `≥1.8`\n"
                 "Management: `native SL/TP`; early Stage Lock disabled by default\n"
                 "Sizing: dynamic margin targets `2% balance risk`; `$20` is the cap\n"
-                "XAG filter: `EMA13 pullback location | Q≥60 | 00:00–07:00 UTC`\n"
+                "Location room: `≥0.55 ATR`; final RR must still be `≥1.8`\n"
+                "XAG filter: `EMA13 pullback location | Q≥60 | 00:00–12:00 UTC`\n"
                 f"Entry disabled after validation: `{', '.join(sorted(self.disabled_entry_symbols)) or 'none'}`\n"
                 "Re-entry: `45-minute cooldown after every close`\n"
                 "Recovery: existing positions and native SL/TP reconciled after restart"
             )
-        _LOG.info("TPC Dynamic Zone V6.2 startup complete")
+        _LOG.info("TPC Dynamic Zone V6.3 startup complete")
 
 
 async def _main():
