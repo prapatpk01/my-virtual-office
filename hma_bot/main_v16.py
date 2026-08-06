@@ -7,6 +7,7 @@ guards are replaced.  One path only; the counter-trend fallback is removed.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 
 import main_v15 as v15
@@ -21,6 +22,8 @@ class Bot(v15.Bot):
         self.strat = S.PrecisionTrendStructureV12(self.cfg.strategy_config())
         self._closed_seen = {symbol: not bool((self.state.get(symbol) or {}).get("pos")) for symbol in self.cfg.symbols}
         self.post_close_cooldown_sec = 45 * 60
+        self.risk_per_trade_pct = float(os.environ.get("FAST_RISK_PER_TRADE_PCT", "0.02"))
+        self.min_dynamic_margin = float(os.environ.get("FAST_MIN_MARGIN_USD", "5.0"))
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
@@ -108,9 +111,39 @@ class Bot(v15.Bot):
         self._save_state()
 
     async def _look_for_entry(self, symbol: str, st: dict):
-        """Use the inherited entry flow, then verify native protection."""
+        """Risk-size the inherited entry, then verify protection read-only."""
         had_position = bool(st.get("pos"))
-        await super()._look_for_entry(symbol, st)
+        configured_margin = float(self.cfg.margin_per_position_usd)
+        try:
+            try:
+                df5, df15, df1h, df4h = await self._entry_frames(symbol)
+                preview = self.strat.generate_entry(
+                    df4h, df1h, df15, df5, has_open_position=False
+                )
+                if preview is not None and preview.entry_price > 0:
+                    stop_pct = abs(
+                        float(preview.entry_price) - float(preview.stop_loss)
+                    ) / float(preview.entry_price)
+                    balance = await self.client.fetch_balance_usdt()
+                    risk_budget = max(0.0, balance * self.risk_per_trade_pct)
+                    margin = risk_budget / max(
+                        stop_pct * float(self.cfg.leverage), 1e-12
+                    )
+                    self.cfg.margin_per_position_usd = min(
+                        configured_margin,
+                        max(self.min_dynamic_margin, margin),
+                    )
+                    _LOG.info(
+                        "[%s] dynamic risk size: balance=%.2f risk=$%.2f "
+                        "SL=%.2f%% margin=$%.2f cap=$%.2f",
+                        symbol, balance, risk_budget, stop_pct * 100,
+                        self.cfg.margin_per_position_usd, configured_margin,
+                    )
+            except Exception as exc:
+                _LOG.warning("[%s] dynamic sizing preflight failed: %s", symbol, exc)
+            await super()._look_for_entry(symbol, st)
+        finally:
+            self.cfg.margin_per_position_usd = configured_margin
         pos = st.get("pos") or {}
         if had_position or not pos:
             return
@@ -170,14 +203,15 @@ class Bot(v15.Bot):
             await self.tg.send_text(
                 f"⚡ *HMA Fast Structure V6 — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
-                f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}` "
+                f"Balance: `{balance:.2f}` USDT | Margin cap `${self.cfg.margin_per_position_usd:.2f}` "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}`\n\n"
                 "Pipeline: `1H direction → relaxed Q guard → direct closed-15M entry`\n"
                 "Entry: `EMA8/13 cross OR HMA16 flip OR EMA13 pullback reclaim`\n"
                 "4H: `soft context only` | No mandatory Sentinel S/R | No counter-trend fallback\n"
                 "Quality defaults: `Q≥42`; only severe ADX/CHOP or opposing DMI blocks\n"
                 "Anti-chase: `≤1.10 ATR from EMA13`\n"
-                "Risk: native OKX `SL≤1.0%` and `TP 1.2%`; minimum `1.05R`\n"
+                "Risk: structure SL `0.60–1.00%` and `≥1.35 ATR15`; TP `1.2%`\n"
+                "Sizing: dynamic margin targets `2% balance risk`; `$20` is the cap\n"
                 "Re-entry: `45-minute cooldown after every close`\n"
                 "Recovery: existing positions and native SL/TP reconciled after restart"
             )
