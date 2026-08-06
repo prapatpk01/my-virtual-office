@@ -20,12 +20,20 @@ class Bot(v15.Bot):
     def __init__(self):
         super().__init__()
         self.strat = S.PrecisionTrendStructureV12(self.cfg.strategy_config())
+        disabled = os.environ.get("TPC_DISABLED_SYMBOLS", "ETH,HYPE")
+        self.disabled_entry_symbols = {
+            item.strip().upper() for item in disabled.split(",") if item.strip()
+        }
         self._closed_seen = {symbol: not bool((self.state.get(symbol) or {}).get("pos")) for symbol in self.cfg.symbols}
         self.post_close_cooldown_sec = 45 * 60
         self.risk_per_trade_pct = float(os.environ.get("FAST_RISK_PER_TRADE_PCT", "0.02"))
         self.min_dynamic_margin = float(os.environ.get("FAST_MIN_MARGIN_USD", "5.0"))
         self._shutdown_requested = False
         self._client_closed = False
+
+    @staticmethod
+    def _base_symbol(symbol: str) -> str:
+        return str(symbol or "").upper().split("/", 1)[0].split(":", 1)[0]
 
     def request_shutdown(self) -> None:
         """Stop scheduling work; keep the OKX client alive for in-flight work."""
@@ -148,6 +156,12 @@ class Bot(v15.Bot):
     async def _look_for_entry(self, symbol: str, st: dict):
         """Risk-size the inherited entry, then verify protection read-only."""
         had_position = bool(st.get("pos"))
+        base_symbol = self._base_symbol(symbol)
+        if not had_position and base_symbol in self.disabled_entry_symbols:
+            self._view[symbol] = (
+                f"TPC-ZONE-V6.2 ENTRY DISABLED | {base_symbol} failed validation"
+            )
+            return
         configured_margin = float(self.cfg.margin_per_position_usd)
         try:
             try:
@@ -250,6 +264,7 @@ class Bot(v15.Bot):
                 "Target: `2.0%` or before opposing zone; actual RR must be `≥1.8`\n"
                 "Management: `native SL/TP`; early Stage Lock disabled by default\n"
                 "Sizing: dynamic margin targets `2% balance risk`; `$20` is the cap\n"
+                f"Entry disabled after validation: `{', '.join(sorted(self.disabled_entry_symbols)) or 'none'}`\n"
                 "Re-entry: `45-minute cooldown after every close`\n"
                 "Recovery: existing positions and native SL/TP reconciled after restart"
             )
