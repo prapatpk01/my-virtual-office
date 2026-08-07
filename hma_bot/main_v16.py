@@ -131,6 +131,20 @@ class Bot(v15.Bot):
     XAG_ENTRY_START_UTC = 0
     XAG_ENTRY_END_UTC = 12
 
+    # CTR master switch — DISABLED by default.
+    # Backtest (BTC, Mar-May 2026, fee 0.05%) rejected every CTR variant:
+    #   production flip -1.5R | momentum-decel -16.2R | 5M flip -17.1R |
+    #   no-flip -61.3R  — a flat ~-1.1R per trade, so the loss scales linearly
+    #   with trade count. Root cause: the CTR stop is only ~0.268% wide, so the
+    #   0.10% round-trip fee eats 0.37R of every trade; at RR 1.86 it needs a
+    #   ~48% win rate but counter-trend entries only won ~20%.
+    # The engine is intentionally KEPT (not deleted) pending a redesign with a
+    # wider stop/target so fee drag stops dominating. Set CTR_ENABLED=1 to
+    # re-enable once a variant actually backtests positive.
+    CTR_ENABLED = os.environ.get("CTR_ENABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
     CTR_MARGIN_MULTIPLIER = 0.40
     CTR_MIN_TREND = 55.0
     CTR_MIN_Q = 50.0
@@ -183,7 +197,7 @@ class Bot(v15.Bot):
                 df5,
                 has_open_position=has_open_position,
             )
-            if signal is None and not has_open_position:
+            if signal is None and not has_open_position and self.CTR_ENABLED:
                 signal = self._ctr_generate_entry(df4h, df1h, df15, df5)
             return self._apply_symbol_entry_filter(
                 self._entry_symbol,
@@ -524,7 +538,9 @@ class Bot(v15.Bot):
                 df5,
                 has_open_position=False,
             )
-            if tpc_preview is not None:
+            if not self.CTR_ENABLED:
+                ctr_status = "CTR=OFF"
+            elif tpc_preview is not None:
                 ctr_status = "CTR=SKIP_TPC_READY"
             else:
                 ctr_preview = self._ctr_generate_entry(df4h, df1h, df15, df5)
@@ -781,9 +797,13 @@ class Bot(v15.Bot):
                 "TPC trigger: `HMA16 flip, EMA13 reclaim, or strong fast EMA13 continuation`\n"
                 "Fast symbols: `BTC ETH SOL HYPE XRP TRX XAU XAG CL DOGE`\n"
                 "TPC defaults: `room≥0.40ATR`, `RR≥1.30`, `SL≤1.20%`\n"
-                "CTR fallback: only when TPC has no signal; recent supply/demand touch + HMA16 cross/turn + rejection\n"
-                "CTR gap: `≥0.7% or ≥1.0ATR` toward the pending TPC zone\n"
-                "CTR risk: `40% sizing`, `TP≤0.7%`, `SL≤1.2ATR`, `RR≥0.7`\n"
+                + (
+                    "CTR fallback: only when TPC has no signal; recent supply/demand touch + HMA16 cross/turn + rejection\n"
+                    "CTR gap: `≥0.7% or ≥1.0ATR` toward the pending TPC zone\n"
+                    "CTR risk: `40% sizing`, `TP≤0.7%`, `SL≤1.2ATR`, `RR≥0.7`\n"
+                    if self.CTR_ENABLED else
+                    "CTR fallback: `DISABLED` (backtest-negative; set `CTR_ENABLED=1` to re-enable)\n"
+                ) +
                 "Entries disabled by default: `none`\n"
                 f"Explicit disabled symbols: `{', '.join(sorted(self.disabled_entry_symbols)) or 'none'}`\n"
                 f"Re-entry cooldown: `{self.post_close_cooldown_sec / 60:.0f} minutes`\n"
