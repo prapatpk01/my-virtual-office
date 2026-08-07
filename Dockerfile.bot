@@ -16,8 +16,12 @@ COPY app/trading/ ./trading/
 COPY app/run_bot.py .
 COPY app/run_dual_bot.py .
 COPY app/run_enhanced_dual_bot.py .
+COPY app/run_trendconfirm_utbot.py .
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \
   CMD python -c "import os, sys; sys.exit(0)"
 
-CMD ["python", "run_enhanced_dual_bot.py"]
+# Production entry point supports Railway toggles:
+# ENABLE_TREND_CONFIRM=true|false
+# ENABLE_UTBOT_XAU=true|false
+CMD ["python", "run_trendconfirm_utbot.py"]
