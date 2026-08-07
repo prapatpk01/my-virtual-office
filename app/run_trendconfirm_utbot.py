@@ -167,7 +167,6 @@ def _install_combined_risk_policy() -> None:
         if candidate_family == "trend_confirm":
             family_limit = max(0, _env_int("TREND_CONFIRM_MAX_POSITIONS", 2))
         elif candidate_family == "utbot_xau":
-            # UT strategy has exactly one symbol and exactly one owned position.
             family_limit = 1
 
         if candidate_family in {"trend_confirm", "utbot_xau"} and family_count >= family_limit:
@@ -176,9 +175,9 @@ def _install_combined_risk_policy() -> None:
                 f"({family_count}/{family_limit})"
             )
 
-        # Two strategy-owned XAU positions are allowed only as a true hedge.
-        # Same-side positions are aggregated by OKX; keeping them separate only
-        # in bot state would break exchange-side SL/TP ownership/reconciliation.
+        # XAU may be owned by both strategies at once ONLY as opposite sides.
+        # Same-side OKX hedge positions aggregate into one exchange position,
+        # which would destroy deterministic per-strategy SL/TP ownership.
         if symbol == UT_SYMBOL and positions_for_symbol:
             for tracked_strategy, position in positions_for_symbol:
                 tracked_family = _family(tracked_strategy)
@@ -192,12 +191,11 @@ def _install_combined_risk_policy() -> None:
                 if existing_side == candidate_side:
                     return False, (
                         f"XAU {candidate_side.upper()} already owned by {tracked_family}; "
-                        "same-side TC+UT stacking is blocked to preserve separate ownership"
+                        "same-side TC+UT stacking blocked to preserve separate ownership"
                     )
 
-        # Outside XAU, keep one position per symbol/family and obey global cap.
         per_symbol_limit = 2 if symbol == UT_SYMBOL else max(
-            1, _env_int("MAX_POSITIONS_PER_SYMBOL", 1)
+            1, _env_int("MAX_POSITIONS_PER_SYMBOL", 2)
         )
         if len(positions_for_symbol) >= per_symbol_limit:
             return False, (
@@ -224,9 +222,10 @@ def _make_combined_strategies(symbols: list, config: dict):
 
     strategies = []
     if tc_enabled:
-        # Reuse the exact existing Trend Confirm factory, including
-        # USE_LAYER1_4H and EMA/WT/Structure parameters.
-        strategies.extend(_TREND_MAKE_STRATEGIES(symbols, config))
+        # Crucial: UT may append XAU to config symbols for its own data, but TC
+        # must still trade exactly the user's original SYMBOLS universe.
+        tc_symbols = list(config.get("trend_confirm_symbols") or symbols)
+        strategies.extend(_TREND_MAKE_STRATEGIES(tc_symbols, config))
 
     if ut_enabled:
         from trading.strategies.utbot_xau_strategy import UTBotXAUStrategy
@@ -237,8 +236,6 @@ def _make_combined_strategies(symbols: list, config: dict):
                 multiplier=_env_float("UTBOT_MULTIPLIER", 1.0),
                 atr_period=_env_int("UTBOT_ATR_PERIOD", 10),
                 timeframe="15m",
-                # Pine date filter is a backtest control. Live trading defaults
-                # to enabled with the supplied 2020-2030 range.
                 use_date_filter=_env_bool("UTBOT_USE_DATE_FILTER", True),
             )
         )
@@ -256,17 +253,20 @@ def _build_combined_config() -> dict:
 
     if tc_enabled:
         config = _TREND_BUILD_CONFIG()
+        tc_symbols = list(config.get("symbols") or [])
     else:
-        # The enhanced TC config intentionally errors when TC is disabled.
-        # UT-only mode therefore starts from the original baseline config kept
-        # by run_dual_bot inside the enhanced runner.
+        # Enhanced TC intentionally refuses TC=false. UT-only starts from the
+        # original baseline config but instantiates no baseline strategies.
         config = trend_runner.run_dual_bot._ORIGINAL_BUILD_CONFIG()
+        tc_symbols = []
 
-    symbols = list(config.get("symbols") or [])
+    config["trend_confirm_symbols"] = tc_symbols
+
+    if tc_enabled:
+        symbols = list(tc_symbols)
+    else:
+        symbols = []
     if ut_enabled and UT_SYMBOL not in symbols:
-        # Include XAU market data only when UT is enabled. This does NOT make TC
-        # trade XAU unless XAU is also present in the user's SYMBOLS env, because
-        # TC strategies are created from the pre-append symbol list above.
         symbols.append(UT_SYMBOL)
 
     config["symbols"] = symbols
@@ -290,11 +290,11 @@ def _build_combined_config() -> dict:
     ut_limit = 1 if ut_enabled else 0
     required_slots = max(1, tc_limit + ut_limit)
     requested = max(1, _env_int("MAX_POSITIONS", required_slots))
-    # Never silently shrink below the enabled family quotas. Users can still
-    # lower TREND_CONFIRM_MAX_POSITIONS itself if they want fewer slots.
+    # Give every enabled family enough room to use its own quota. Set the TC
+    # quota lower if a smaller combined total is desired.
     config["max_positions"] = max(requested, required_slots)
 
-    # Hedge mode is mandatory to permit TC LONG + UT SHORT (or vice versa).
+    # True hedge mode is mandatory for TC LONG + UT SHORT (or vice versa).
     config["hedge_mode"] = True
     config["futures"] = True
     return config
@@ -360,7 +360,7 @@ def _ut_caption(
 
 
 def _install_ut_telegram_and_chart_patch() -> None:
-    """Layer UT-specific UI on top of the already-installed Trend Confirm UI."""
+    """Layer UT-specific UI on top of the installed Trend Confirm UI."""
     if getattr(TradingBot, "_combined_utbot_ui_installed", False):
         return
 
