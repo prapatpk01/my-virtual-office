@@ -1,10 +1,5 @@
 """Production runner: Trend Confirm + optional XAU-only UT Bot v2.
 
-This wrapper preserves the existing enhanced Trend Confirm production runner and
-adds one independent strategy family:
-
-    UTBotXAU(XAU/USDT:USDT)
-
 Railway toggles:
     ENABLE_TREND_CONFIRM=true|false
     ENABLE_UTBOT_XAU=true|false
@@ -15,15 +10,17 @@ Supported modes:
     false / true  -> UT Bot XAU only
     false / false -> startup error (no strategy enabled)
 
-XAU coexistence policy:
-- Trend Confirm and UT Bot may hold XAU simultaneously when their sides are
-  opposite (true OKX hedge: one LONG + one SHORT).
-- They may NOT stack two independently-owned positions on the same XAU side.
-  OKX aggregates same-side hedge positions, which would make Trend Confirm's
-  exchange-side SL/TP ownership ambiguous. Blocking same-side stacking keeps
-  close/reconcile/accounting deterministic.
+Hard XAU ownership rule in this runner:
+- Trend Confirm NEVER creates a strategy for XAU/USDT:USDT, even if XAU is
+  present in the Railway SYMBOLS variable.
+- UT Bot is the only strategy allowed to create NEW XAU positions.
+- UT Bot may trade LONG or SHORT and reverse on its own confirmed UT cross.
+- A legacy Trend Confirm XAU position that was already open before this rule is
+  not force-closed. Same-side stacking against such a legacy position remains
+  blocked until that old position is gone, because OKX aggregates same-side
+  hedge positions and ownership would become ambiguous.
 
-UT Bot itself is a faithful port of the supplied Pine strategy:
+UT Bot is a faithful live port of the supplied Pine strategy:
 - source=close, ATR(10), multiplier=1 by default
 - confirmed 15m crossover with recursive ATR trailing stop
 - no trend/EMA/WT/structure filter
@@ -37,8 +34,8 @@ import logging
 import os
 from contextvars import ContextVar
 
-# Importing this module installs all existing Trend Confirm production patches,
-# including USE_LAYER1_4H, trigger-owner exits, Telegram and trigger-aware charts.
+# Importing this module installs the existing Trend Confirm production patches:
+# USE_LAYER1_4H, EMA/WT/Structure owner exits, Telegram and trigger-aware charts.
 import run_enhanced_dual_bot as trend_runner
 import run_bot
 import trading.chart_renderer as chart_renderer
@@ -57,7 +54,8 @@ _UT_ENTRY_CONTEXT: ContextVar[dict | None] = ContextVar(
     default=None,
 )
 
-# Capture the enhanced Trend Confirm hooks before this wrapper replaces them.
+# Capture the already-installed Trend Confirm hooks before this combined wrapper
+# replaces the public run_bot hooks.
 _TREND_BUILD_CONFIG = run_bot.build_config
 _TREND_MAKE_STRATEGIES = run_bot._make_strategies
 
@@ -117,9 +115,11 @@ def _position_side(strategy_key: str, position=None) -> str:
 
 
 def _install_combined_risk_policy() -> None:
-    """Give TC and UT independent quotas while permitting true XAU hedging."""
+    """Independent family quotas; UT owns all NEW XAU exposure."""
     if getattr(RiskManager, "_tc_utbot_risk_policy_installed", False):
         return
+
+    original_open_position = RiskManager.open_position
 
     def _can_open(self: RiskManager, symbol: str, strategy: str = ""):
         if self._halted:
@@ -141,6 +141,10 @@ def _install_combined_risk_policy() -> None:
             return False, "Trend Confirm disabled by ENABLE_TREND_CONFIRM=false"
         if candidate_family == "utbot_xau" and not ut_enabled:
             return False, "UT Bot XAU disabled by ENABLE_UTBOT_XAU=false"
+
+        # Hard ownership boundary: Trend Confirm must never open XAU here.
+        if candidate_family == "trend_confirm" and symbol == UT_SYMBOL:
+            return False, "XAU is reserved exclusively for UT Bot in this runner"
         if candidate_family == "utbot_xau" and symbol != UT_SYMBOL:
             return False, f"UT Bot is hard-locked to {UT_SYMBOL}"
 
@@ -163,41 +167,52 @@ def _install_combined_risk_policy() -> None:
             if tracked_symbol == symbol:
                 positions_for_symbol.append((tracked_strategy, position))
 
-        family_limit = 1
         if candidate_family == "trend_confirm":
             family_limit = max(0, _env_int("TREND_CONFIRM_MAX_POSITIONS", 2))
         elif candidate_family == "utbot_xau":
             family_limit = 1
+        else:
+            family_limit = max(1, self.max_open_positions)
 
-        if candidate_family in {"trend_confirm", "utbot_xau"} and family_count >= family_limit:
+        if (
+            candidate_family in {"trend_confirm", "utbot_xau"}
+            and family_count >= family_limit
+        ):
             return False, (
                 f"{candidate_family} position quota reached "
                 f"({family_count}/{family_limit})"
             )
 
-        # XAU may be owned by both strategies at once ONLY as opposite sides.
-        # Same-side OKX hedge positions aggregate into one exchange position,
-        # which would destroy deterministic per-strategy SL/TP ownership.
-        if symbol == UT_SYMBOL and positions_for_symbol:
+        # Normally UT is now the only XAU owner. Keep this guard only for a
+        # legacy TC-XAU position reconciled from before the hard exclusion.
+        if symbol == UT_SYMBOL and candidate_family == "utbot_xau":
             for tracked_strategy, position in positions_for_symbol:
                 tracked_family = _family(tracked_strategy)
-                if tracked_family not in {"trend_confirm", "utbot_xau"}:
+                if tracked_family == "utbot_xau":
+                    return False, "UT Bot already owns an XAU position"
+                if tracked_family != "trend_confirm":
                     continue
-                if tracked_family == candidate_family:
-                    return False, f"{candidate_family} already owns XAU exposure"
                 existing_side = _position_side(tracked_strategy, position)
-                if candidate_side not in {"long", "short"}:
-                    return False, f"Cannot determine hedge side for {strategy}"
-                if existing_side == candidate_side:
+                if candidate_side == existing_side:
                     return False, (
-                        f"XAU {candidate_side.upper()} already owned by {tracked_family}; "
-                        "same-side TC+UT stacking blocked to preserve separate ownership"
+                        f"Legacy Trend Confirm XAU {existing_side.upper()} is still open; "
+                        "same-side UT entry is blocked until it closes to avoid OKX aggregation"
                     )
 
-        per_symbol_limit = 2 if symbol == UT_SYMBOL else max(
+        per_symbol_limit = 1 if symbol == UT_SYMBOL else max(
             1, _env_int("MAX_POSITIONS_PER_SYMBOL", 2)
         )
-        if len(positions_for_symbol) >= per_symbol_limit:
+        # A legacy opposite-side TC XAU may temporarily coexist with UT, so do
+        # not count it against UT's normal one-position ownership limit.
+        if symbol == UT_SYMBOL:
+            ut_count = sum(
+                1
+                for tracked_strategy, _position in positions_for_symbol
+                if _family(tracked_strategy) == "utbot_xau"
+            )
+            if ut_count >= per_symbol_limit:
+                return False, "UT Bot XAU position limit reached (1/1)"
+        elif len(positions_for_symbol) >= per_symbol_limit:
             return False, (
                 f"{symbol} per-symbol position limit reached "
                 f"({len(positions_for_symbol)}/{per_symbol_limit})"
@@ -207,7 +222,35 @@ def _install_combined_risk_policy() -> None:
             return False, f"Max open positions ({self.max_open_positions}) reached"
         return True, "ok"
 
+    def _open_position(
+        self: RiskManager,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        amount: float,
+        strategy: str = "",
+        stop_loss: float = None,
+        take_profit: float = None,
+    ):
+        position = original_open_position(
+            self,
+            symbol,
+            side,
+            entry_price,
+            amount,
+            strategy=strategy,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+        if _family(strategy) == "utbot_xau":
+            # RiskManager normally replaces None/0 with generic percentage
+            # stops. Pine UT Bot has none, so erase those fallbacks only for UT.
+            position.stop_loss = None
+            position.take_profit = None
+        return position
+
     RiskManager.can_open = _can_open
+    RiskManager.open_position = _open_position
     RiskManager._tc_utbot_risk_policy_installed = True
 
 
@@ -221,11 +264,19 @@ def _make_combined_strategies(symbols: list, config: dict):
         )
 
     strategies = []
-    if tc_enabled:
-        # Crucial: UT may append XAU to config symbols for its own data, but TC
-        # must still trade exactly the user's original SYMBOLS universe.
-        tc_symbols = list(config.get("trend_confirm_symbols") or symbols)
+    tc_symbols = [
+        symbol
+        for symbol in list(config.get("trend_confirm_symbols") or [])
+        if symbol != UT_SYMBOL
+    ]
+
+    if tc_enabled and tc_symbols:
         strategies.extend(_TREND_MAKE_STRATEGIES(tc_symbols, config))
+    elif tc_enabled and not ut_enabled:
+        raise RuntimeError(
+            "Trend Confirm has no tradable symbols after XAU exclusion. "
+            "Add a non-XAU symbol to SYMBOLS or enable ENABLE_UTBOT_XAU=true."
+        )
 
     if ut_enabled:
         from trading.strategies.utbot_xau_strategy import UTBotXAUStrategy
@@ -239,6 +290,7 @@ def _make_combined_strategies(symbols: list, config: dict):
                 use_date_filter=_env_bool("UTBOT_USE_DATE_FILTER", True),
             )
         )
+
     return strategies
 
 
@@ -253,23 +305,31 @@ def _build_combined_config() -> dict:
 
     if tc_enabled:
         config = _TREND_BUILD_CONFIG()
-        tc_symbols = list(config.get("symbols") or [])
+        raw_tc_symbols = list(config.get("symbols") or [])
     else:
         # Enhanced TC intentionally refuses TC=false. UT-only starts from the
-        # original baseline config but instantiates no baseline strategies.
+        # baseline config but instantiates no baseline strategies.
         config = trend_runner.run_dual_bot._ORIGINAL_BUILD_CONFIG()
-        tc_symbols = []
+        raw_tc_symbols = []
 
+    # Hard exclusion is applied regardless of what Railway SYMBOLS contains.
+    tc_symbols = [symbol for symbol in raw_tc_symbols if symbol != UT_SYMBOL]
     config["trend_confirm_symbols"] = tc_symbols
+    config["trend_confirm_xau_disabled"] = True
+    config["trend_confirm_excluded_symbols"] = [UT_SYMBOL]
 
-    if tc_enabled:
-        symbols = list(tc_symbols)
-    else:
-        symbols = []
-    if ut_enabled and UT_SYMBOL not in symbols:
+    if tc_enabled and not tc_symbols and not ut_enabled:
+        raise RuntimeError(
+            "Trend Confirm cannot run XAU in the combined runner. "
+            "Add a non-XAU SYMBOLS market or enable UT Bot XAU."
+        )
+
+    # Overall market-data universe = TC's non-XAU symbols + UT's XAU market.
+    symbols = list(tc_symbols) if tc_enabled else []
+    if ut_enabled:
         symbols.append(UT_SYMBOL)
 
-    config["symbols"] = symbols
+    config["symbols"] = list(dict.fromkeys(symbols))
     config["candle_tf"] = "15m"
     os.environ["CANDLE_TF"] = "15m"
     config["enable_trend_confirm"] = tc_enabled
@@ -284,17 +344,16 @@ def _build_combined_config() -> dict:
 
     tc_limit = (
         max(0, _env_int("TREND_CONFIRM_MAX_POSITIONS", 2))
-        if tc_enabled
+        if tc_enabled and tc_symbols
         else 0
     )
     ut_limit = 1 if ut_enabled else 0
     required_slots = max(1, tc_limit + ut_limit)
     requested = max(1, _env_int("MAX_POSITIONS", required_slots))
-    # Give every enabled family enough room to use its own quota. Set the TC
-    # quota lower if a smaller combined total is desired.
     config["max_positions"] = max(requested, required_slots)
 
-    # True hedge mode is mandatory for TC LONG + UT SHORT (or vice versa).
+    # UT needs hedge mode so SELL means an owned SHORT rather than merely a
+    # one-way-mode instruction to close a LONG. TC remains fully independent.
     config["hedge_mode"] = True
     config["futures"] = True
     return config
