@@ -1,6 +1,7 @@
 """Unified launcher — pick the trading system with the MODE env var.
 
 MODE=tpc launches Trend Pullback Continuation (TPC Sentinel).
+MODE=ema_hybrid launches EMA Hybrid Pro.
 """
 from __future__ import annotations
 
@@ -26,13 +27,14 @@ def main() -> None:
         argv = [sys.executable, "main.py"]
         name = "HTF Pullback"
     elif mode in ("tpc", "trend_pullback_continuation"):
-        # Keep the current internal directory during the production-safe
-        # rebrand. MODE and all user-facing names are now TPC.
         target_dir = os.path.join(HERE, "hma_bot")
         argv = [sys.executable, "main_v16.py"]
         name = "Trend Pullback Continuation (TPC Sentinel)"
+    elif mode in ("ema_hybrid", "ema_hybrid_pro", "hybrid"):
+        target_dir = os.path.join(HERE, "ema_hybrid_bot")
+        argv = [sys.executable, "main.py"]
+        name = "EMA Hybrid Pro"
     elif mode in ("hma", "hma16", "trendfollow"):
-        # Temporary backward compatibility for old Railway variables.
         target_dir = os.path.join(HERE, "hma_bot")
         argv = [sys.executable, "main_v16.py"]
         name = "Trend Pullback Continuation (legacy HMA alias)"
