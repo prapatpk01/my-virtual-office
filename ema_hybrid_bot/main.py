@@ -24,6 +24,53 @@ class Bot(base.Bot):
     def __init__(self):
         super().__init__()
         self.strat = EMAHybridProStrategy(self.cfg.strategy_config())
+        self._okx_reconnect_lock = asyncio.Lock()
+
+    async def _recover_okx_session(self, reason: str = "") -> None:
+        """Re-open CCXT's async HTTP session after an unexpected close.
+
+        Railway/container networking can occasionally leave aiohttp's session
+        closed while the process itself is still healthy.  CCXT then raises
+        `okx instance was closed by the user` on every subsequent request.
+        Re-opening the existing exchange object is safe and preserves its
+        markets, credentials and rate limiter.
+        """
+        async with self._okx_reconnect_lock:
+            exchange = getattr(self.client, "_exchange", None)
+            if exchange is None:
+                return
+            session = getattr(exchange, "session", None)
+            if session is not None and not getattr(session, "closed", False):
+                return
+            _LOG.warning("[OKX] async session closed; reopening%s", f" ({reason})" if reason else "")
+            await exchange.open()
+            _LOG.info("[OKX] async session reopened")
+
+    @staticmethod
+    def _is_closed_session_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "instance was closed by the user" in text
+            or "session is closed" in text
+            or "client session is closed" in text
+        )
+
+    async def _frame(self, symbol, tf, minutes, limit=300):
+        """Fetch candles with one automatic OKX session recovery retry."""
+        now_ms = int(__import__("time").time() * 1000)
+        try:
+            raw = await self.client.fetch_ohlcv(symbol, tf, limit=limit)
+        except Exception as exc:
+            if not self._is_closed_session_error(exc):
+                raise
+            await self._recover_okx_session(f"{symbol} {tf}")
+            raw = await self.client.fetch_ohlcv(symbol, tf, limit=limit)
+
+        df = base._ohlcv_to_df(raw)
+        if df.empty:
+            return df
+        close_ms = (df.index.as_unit("ns").asi8 // 1_000_000) + minutes * 60_000
+        return df[close_ms <= now_ms]
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
         try:
