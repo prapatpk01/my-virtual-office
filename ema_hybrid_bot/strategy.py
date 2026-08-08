@@ -2,7 +2,7 @@
 
 Primary timeframe: M15
 Trend confirmation: H1
-4H is not an entry gate.
+4H is diagnostic only, not an entry gate.
 
 Entry checklist:
 1) EMA20/50/200 aligned on H1 and M15.
@@ -70,7 +70,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
     def __init__(self, config=None) -> None:
         super().__init__(config)
-        # Disable percentage-stage management inherited from TPC. Hybrid uses R milestones.
         self.stage_locks_enabled = False
         self.live_schedule_timezone = os.getenv("LIVE_SCHEDULE_TIMEZONE", "Asia/Seoul").strip() or "Asia/Seoul"
         try:
@@ -82,13 +81,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             ) from exc
 
     def _entry_schedule_open(self) -> bool:
-        """Return whether NEW entries are currently permitted.
-
-        Paper mode intentionally runs 24/7 so forward tests do not lose
-        weekend samples. Live mode is 24/5 and uses the configured IANA
-        timezone. This gate applies only to NEW entries; the parent runtime
-        continues managing existing positions 24/7.
-        """
         if bool(getattr(self.cfg, "paper", False)):
             return True
         return datetime.now(timezone.utc).astimezone(self._live_tz).weekday() < 5
@@ -108,12 +100,35 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
     @staticmethod
     def _ema_side(d: pd.DataFrame) -> Optional[Side]:
+        if d.empty or len(d) < 200:
+            return None
         r = d.iloc[-1]
         if float(r.ema20) > float(r.ema50) > float(r.ema200):
             return Side.LONG
         if float(r.ema20) < float(r.ema50) < float(r.ema200):
             return Side.SHORT
         return None
+
+    @staticmethod
+    def _trend_label(d: pd.DataFrame) -> str:
+        if d.empty:
+            return "DATA_ERROR"
+        if len(d) < 200:
+            return f"WARMUP({len(d)}/200)"
+        side = EMAHybridProStrategy._ema_side(d)
+        if side == Side.LONG:
+            return "BULL"
+        if side == Side.SHORT:
+            return "BEAR"
+        return "NEUTRAL"
+
+    def _trend_diagnostics(self, df4h, df1h, df15):
+        """Return explicit HTF/MID/entry trend state; never use '?' placeholders."""
+        return {
+            "4H": self._trend_label(self._prep(df4h)) if len(df4h) else "DATA_ERROR",
+            "1H": self._trend_label(self._prep(df1h)) if len(df1h) else "DATA_ERROR",
+            "15M": self._trend_label(self._prep(df15)) if len(df15) else "DATA_ERROR",
+        }
 
     def _pivot_pairs(self, d: pd.DataFrame):
         span = self.PIVOT_SPAN
@@ -148,10 +163,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
                 return None
             fib50 = low + 0.500 * (high - low)
             fib618 = low + 0.618 * (high - low)
-        return {
-            "low": low, "high": high,
-            "fib_low": min(fib50, fib618), "fib_high": max(fib50, fib618),
-        }
+        return {"low": low, "high": high, "fib_low": min(fib50, fib618), "fib_high": max(fib50, fib618)}
 
     def _ema_touch(self, d: pd.DataFrame, side: Side) -> str:
         r = d.iloc[-1]
@@ -180,7 +192,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         rng = max(rh - rl, 1e-12)
         upper = rh - max(ro, rc)
         lower = min(ro, rc) - rl
-
         if side == Side.LONG:
             if rc > ro and pc < po and rc >= po and ro <= pc:
                 return "BULL_ENGULF"
@@ -235,7 +246,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         if side_m15 != side_h1:
             return HybridView(side_h1, "M15_TREND", "M15 triple EMA not aligned with H1")
         side = side_h1
-
         impulse = self._impulse(m15, side)
         if not impulse:
             return HybridView(side, "FIB", "no confirmed impulse swing")
@@ -243,24 +253,18 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         atr = max(float(r.atr), 1e-12)
         fib_lo = impulse["fib_low"] - self.FIB_TOL_ATR * atr
         fib_hi = impulse["fib_high"] + self.FIB_TOL_ATR * atr
-        in_fib = fib_lo <= float(r.close) <= fib_hi or not (
-            float(r.high) < fib_lo or float(r.low) > fib_hi
-        )
+        in_fib = fib_lo <= float(r.close) <= fib_hi or not (float(r.high) < fib_lo or float(r.low) > fib_hi)
         if not in_fib:
             return HybridView(side, "FIB", "waiting 50%-61.8% retracement", impulse["fib_low"], impulse["fib_high"])
-
         touch = self._ema_touch(m15, side)
         if touch == "NONE":
             return HybridView(side, "EMA_PULLBACK", "Fibo reached; waiting EMA20/50 touch", impulse["fib_low"], impulse["fib_high"])
-
         sweep = self._liquidity_sweep(m15, side)
         if sweep == "NONE":
             return HybridView(side, "LIQUIDITY", "waiting liquidity sweep", impulse["fib_low"], impulse["fib_high"], touch)
-
         pa = self._price_action(m15, side)
         if pa == "NONE":
             return HybridView(side, "PRICE_ACTION", "waiting closed-M15 confirmation", impulse["fib_low"], impulse["fib_high"], touch, "NONE", sweep)
-
         entry = float(r.close)
         if side == Side.LONG:
             sl = min(float(impulse["low"]), float(m15.low.iloc[-8:].min())) - self.SL_BUFFER_ATR * atr
@@ -270,7 +274,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             risk = sl - entry
         if risk <= 0 or not math.isfinite(risk):
             return HybridView(side, "RISK", "invalid swing stop", impulse["fib_low"], impulse["fib_high"], touch, pa, sweep)
-
         rr = self.FINAL_RR
         vr = self._volume_ratio(m15)
         return HybridView(side, "READY", "all mandatory gates passed", impulse["fib_low"], impulse["fib_high"], touch, pa, sweep, vr, rr)
@@ -300,7 +303,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             trend = Trend.BEAR
         if risk <= 0:
             return None
-
         q = self.quality_state_1h(df1h)
         reason = (
             f"EMA Hybrid Pro {v.side.value} | H1+M15 EMA20/50/200 aligned | "
@@ -311,10 +313,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         trigger = f"EMA_HYBRID_{v.pa}_{v.sweep}"
         room_pct = abs(tp - entry) / max(entry, 1e-12)
         structure = float(impulse["low"] if v.side == Side.LONG else impulse["high"])
-        return EntrySignal(
-            v.side, entry, sl, tp, trend, q.q, q.adx, q.chop,
-            SetupType.PULLBACK, trigger, room_pct, atr, structure, reason,
-        )
+        return EntrySignal(v.side, entry, sl, tp, trend, q.q, q.adx, q.chop, SetupType.PULLBACK, trigger, room_pct, atr, structure, reason)
 
     def locked_stop(self, side: Side, entry: float, best_price: float):
         r = max(entry * float(self.cfg.stop_loss_pct), entry * 0.003)
@@ -327,6 +326,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
     def entry_status(self, df4h, df1h, df15, df5) -> str:
         v = self._view(df1h, df15)
+        diag = self._trend_diagnostics(df4h, df1h, df15)
         paper = bool(getattr(self.cfg, "paper", False))
         schedule = "24/7 PAPER" if paper else "24/5 LIVE"
         if paper:
@@ -334,9 +334,11 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         else:
             local_now = datetime.now(timezone.utc).astimezone(self._live_tz)
             schedule_state = "OPEN" if local_now.weekday() < 5 else "WEEKEND_CLOSED"
+        aligned = "YES" if diag["1H"] != "NEUTRAL" and diag["1H"] == diag["15M"] else "NO"
         return (
-            f"EMA-HYBRID {'READY' if v.stage == 'READY' and schedule_state == 'OPEN' else 'WAIT'} | {side if (side := (v.side.value if v.side else 'NONE')) else 'NONE'} | "
-            f"Schedule={schedule}({schedule_state}) | Stage={v.stage} | Fib={v.fib_low:.6g}-{v.fib_high:.6g} | "
-            f"EMA={v.ema_touch} | Sweep={v.sweep} | PA={v.pa} | "
-            f"Vol={v.volume_ratio:.2f}x | Reason={v.reason}"
+            f"EMA-HYBRID {'READY' if v.stage == 'READY' and schedule_state == 'OPEN' else 'WAIT'} | "
+            f"4H={diag['4H']} | 1H={diag['1H']} | 15M={diag['15M']} | MTF={aligned} | "
+            f"Side={(v.side.value if v.side else 'NONE')} | Schedule={schedule}({schedule_state}) | "
+            f"Stage={v.stage} | Fib={v.fib_low:.6g}-{v.fib_high:.6g} | EMA={v.ema_touch} | "
+            f"Sweep={v.sweep} | PA={v.pa} | Vol={v.volume_ratio:.2f}x | Reason={v.reason}"
         )
