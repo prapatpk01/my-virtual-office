@@ -1,33 +1,29 @@
-"""Sentinel V1.3 — 1H S/R map + fast 15M execution.
+"""Sentinel V1.4 — 1H S/R map + fast 15M execution + open-sky runner.
 
-Architecture
-- 1H ONLY: build confirmed S1/S2/R1/R2 and ATR14 map.
-- 1H ATR: measure S1<->R1 profit room, proximity band and SL buffer.
-- 15M ONLY: execute proximity rejection / reclaim / displacement.
-- No EMA/HMA cross is required for entry.
-- Sentinel X + MCDX remain directional/context validators.
+Core rules
+- 1H ONLY builds S1/S2/R1/R2 and ATR14.
+- 15M ONLY executes proximity rejection / reclaim / displacement.
+- LONG requires 1H S1+S2. If R1 exists, S1->R1 room and actual RR must pass.
+  If NO 1H R1 exists (price is above all confirmed 1H resistance), LONG is allowed
+  as OPEN_SKY: SL stays below S2 and there is no fixed TP.
+- SHORT is the inverse: requires R1+R2; if no S1 exists, OPEN_FLOOR short is allowed
+  with no fixed TP.
+- Open-ended positions are closed once the opposite 1H target level appears and
+  15M confirms reversal at that level OR 15M structure flips against the position.
 
-LONG
-- 1H S1/S2/R1/R2 must exist.
-- S1->R1 room >= configured minimum in ATR(1H).
-- Price approaches 1H S1 inside the proximity band.
-- A completed 15M candle rejects/reclaims S1 OR a bullish displacement candle
-  moves away from S1 after proximity.
-- SL below 1H S2 by ATR(1H) buffer; TP at 1H R1.
-
-SHORT is the exact inverse around 1H R1/R2 with TP at 1H S1.
+Sentinel X + MCDX remain context validators; they never replace the 1H location map.
 """
 from __future__ import annotations
 
 from typing import Optional
-import math
 import numpy as np
 
 from .base import BaseStrategy, Signal, SignalType
 
 
 class SentinelStrategy(BaseStrategy):
-    VERSION = "1.3"
+    VERSION = "1.4"
+    entry_tf = "15m"
 
     def __init__(
         self,
@@ -39,7 +35,6 @@ class SentinelStrategy(BaseStrategy):
         entry_zone_atr: float = 0.30,
         reversal_proximity_atr: float = 0.20,
         sl_buffer_atr: float = 0.15,
-        sr_merge_atr: float = 0.65,
         pivot_span: int = 3,
     ):
         super().__init__(symbol, params)
@@ -49,9 +44,20 @@ class SentinelStrategy(BaseStrategy):
         self.entry_zone_atr = float(entry_zone_atr)
         self.reversal_proximity_atr = max(0.05, float(reversal_proximity_atr))
         self.sl_buffer_atr = float(sl_buffer_atr)
-        self.sr_merge_atr = float(sr_merge_atr)
         self.pivot_span = max(2, int(pivot_span))
         self.name = f"Sentinel({symbol})"
+
+        # Runtime position/cache state. The TradingBot refreshes _latest_15m for
+        # 15m strategies before tick_open_position(); 1H/SR is refreshed by analyze.
+        self._open_position: Optional[str] = None
+        self._entry_price: Optional[float] = None
+        self._entry_sl: Optional[float] = None
+        self._open_ended: bool = False
+        self._latest_15m: list = []
+        self._latest_mtf: dict = {}
+        self._latest_sr: dict = {}
+        self._latest_sx: dict = {}
+        self._latest_mc: dict = {}
 
     @staticmethod
     def _clamp(x: float, lo: float, hi: float) -> float:
@@ -72,45 +78,6 @@ class SentinelStrategy(BaseStrategy):
                 lows.append(lo)
         return highs, lows
 
-    def _sr_map_1h(self, mtf: dict, price: float) -> dict:
-        """Build S1/S2/R1/R2 exclusively from confirmed 1H pivots."""
-        h1 = list((mtf or {}).get("1h") or [])
-        if len(h1) < 60:
-            return {"ready": False, "reason": "1H S/R warmup", "bars_1h": len(h1)}
-
-        atr_arr = self.atr(h1, 14)
-        atr_1h = float(atr_arr[-1]) if len(atr_arr) and np.isfinite(atr_arr[-1]) else 0.0
-        if atr_1h <= 0:
-            return {"ready": False, "reason": "1H ATR unavailable", "bars_1h": len(h1)}
-
-        h1_h, h1_l = self._confirmed_pivots(h1[-160:], self.pivot_span)
-        resistance_pool = sorted({float(x) for x in h1_h if float(x) > price})
-        support_pool = sorted({float(x) for x in h1_l if float(x) < price}, reverse=True)
-
-        r1 = resistance_pool[0] if resistance_pool else None
-        r2 = resistance_pool[1] if len(resistance_pool) > 1 else None
-        s1 = support_pool[0] if support_pool else None
-        s2 = support_pool[1] if len(support_pool) > 1 else None
-        if any(v is None for v in (s1, s2, r1, r2)):
-            return {
-                "ready": False, "reason": "Need complete 1H S1/S2/R1/R2",
-                "s1": s1, "s2": s2, "r1": r1, "r2": r2,
-                "atr_1h": atr_1h, "bars_1h": len(h1),
-            }
-
-        s1_raw, s2_raw, r1_raw, r2_raw = s1, s2, r1, r2
-        if abs(r2-r1) <= atr_1h*self.sr_merge_atr:
-            r1 = (r1+r2)/2.0
-        if abs(s1-s2) <= atr_1h*self.sr_merge_atr:
-            s1 = (s1+s2)/2.0
-
-        return {
-            "ready": True,
-            "s1": s1, "s2": s2_raw, "r1": r1, "r2": r2_raw,
-            "s1_raw": s1_raw, "r1_raw": r1_raw,
-            "atr_1h": atr_1h, "bars_1h": len(h1), "source_tf": "1H",
-        }
-
     def _structure(self, candles: list) -> str:
         hs, ls = self._confirmed_pivots(candles[-80:], 3)
         if len(hs) >= 2 and len(ls) >= 2:
@@ -120,22 +87,59 @@ class SentinelStrategy(BaseStrategy):
                 return "BEAR"
         return "MIXED"
 
+    def _sr_map_1h(self, mtf: dict, price: float) -> dict:
+        """Build directional S/R map from confirmed 1H pivots only.
+
+        We deliberately allow a partial map:
+        - LONG needs S1/S2; R1/R2 may be absent (OPEN_SKY).
+        - SHORT needs R1/R2; S1/S2 may be absent (OPEN_FLOOR).
+        """
+        h1 = list((mtf or {}).get("1h") or [])
+        if len(h1) < 60:
+            return {"ready": False, "reason": "1H S/R warmup", "bars_1h": len(h1)}
+
+        atr_arr = self.atr(h1, 14)
+        atr_1h = float(atr_arr[-1]) if len(atr_arr) and np.isfinite(atr_arr[-1]) else 0.0
+        if atr_1h <= 0:
+            return {"ready": False, "reason": "1H ATR unavailable", "bars_1h": len(h1)}
+
+        h1_h, h1_l = self._confirmed_pivots(h1[-180:], self.pivot_span)
+        resistance_pool = sorted({float(x) for x in h1_h if float(x) > price})
+        support_pool = sorted({float(x) for x in h1_l if float(x) < price}, reverse=True)
+
+        r1 = resistance_pool[0] if resistance_pool else None
+        r2 = resistance_pool[1] if len(resistance_pool) > 1 else None
+        s1 = support_pool[0] if support_pool else None
+        s2 = support_pool[1] if len(support_pool) > 1 else None
+
+        return {
+            "ready": True,
+            "s1": s1, "s2": s2, "r1": r1, "r2": r2,
+            "atr_1h": atr_1h,
+            "bars_1h": len(h1),
+            "source_tf": "1H",
+            "long_map_ready": s1 is not None and s2 is not None,
+            "short_map_ready": r1 is not None and r2 is not None,
+            "open_sky_long": s1 is not None and s2 is not None and r1 is None,
+            "open_floor_short": r1 is not None and r2 is not None and s1 is None,
+        }
+
     @staticmethod
     def _norm(v: float, lo: float, hi: float) -> float:
-        if not math.isfinite(v) or not math.isfinite(lo) or not math.isfinite(hi) or hi == lo:
+        if not np.isfinite(v) or not np.isfinite(lo) or not np.isfinite(hi) or hi == lo:
             return 50.0
         return max(0.0, min(100.0, (v-lo)/(hi-lo)*100.0))
 
     def _mcdx_context(self, candles: list, mtf: dict) -> dict:
-        """Compact MCDX context; 15M flow with 1H trend confirmation."""
+        """Compact 15M MCDX/flow context with 1H trend alignment."""
         n = len(candles)
         if n < 120:
             return {"long_score": 0.0, "short_score": 0.0, "smart_flow": 50.0, "ready": False}
 
-        closes = np.asarray([float(c.close) for c in candles], dtype=float)
-        highs = np.asarray([float(c.high) for c in candles], dtype=float)
-        lows = np.asarray([float(c.low) for c in candles], dtype=float)
-        vols = np.asarray([max(0.0, float(c.volume)) for c in candles], dtype=float)
+        closes=np.asarray([float(c.close) for c in candles],dtype=float)
+        highs=np.asarray([float(c.high) for c in candles],dtype=float)
+        lows=np.asarray([float(c.low) for c in candles],dtype=float)
+        vols=np.asarray([max(0.0,float(c.volume)) for c in candles],dtype=float)
 
         lo50=float(np.min(lows[-50:])); hi50=float(np.max(highs[-50:])); rng=max(hi50-lo50,1e-12)
         smart=self._clamp(((closes[-1]*0.96)-lo50)/rng*100.0,0,100)
@@ -194,106 +198,173 @@ class SentinelStrategy(BaseStrategy):
         rsiv=float(r[-1]) if np.isfinite(r[-1]) else 50.0
         return {"bias":"BULL" if bull else "BEAR" if bear else "BALANCED","structure":structure,"sme_bull":fast>0 and histv>=0 and rsiv>=45,"sme_bear":fast<0 and histv<=0 and rsiv<=55,"ready":True}
 
+    def _entry_triggers_15m(self, candles: list, s1, r1, atr_1h: float) -> dict:
+        bar=candles[-1]; prev=candles[-2]
+        close=float(bar.close); op=float(bar.open); high=float(bar.high); low=float(bar.low)
+        prev_close=float(prev.close); prev_high=float(prev.high); prev_low=float(prev.low)
+        proximity=self.reversal_proximity_atr*atr_1h
+        zone=self.entry_zone_atr*atr_1h
+
+        long_trigger=False; long_name=""
+        if s1 is not None:
+            near_now=low>=s1 and low<=s1+proximity
+            rejection=near_now and close>s1+0.05*atr_1h and close>op
+            reclaim=(low<=s1+zone and close>=s1 and close>op)
+            prev_near=prev_low>=s1 and prev_low<=s1+proximity
+            displacement=prev_near and close>s1+proximity and close>prev_close and close>op and (close-op)>=0.20*atr_1h
+            if rejection: long_trigger=True; long_name="1H_S1__15M_REJECTION"
+            elif displacement: long_trigger=True; long_name="1H_S1__15M_DISPLACEMENT"
+            elif reclaim: long_trigger=True; long_name="1H_S1__15M_RECLAIM"
+
+        short_trigger=False; short_name=""
+        if r1 is not None:
+            near_now=high<=r1 and high>=r1-proximity
+            rejection=near_now and close<r1-0.05*atr_1h and close<op
+            reclaim=(high>=r1-zone and close<=r1 and close<op)
+            prev_near=prev_high<=r1 and prev_high>=r1-proximity
+            displacement=prev_near and close<r1-proximity and close<prev_close and close<op and (op-close)>=0.20*atr_1h
+            if rejection: short_trigger=True; short_name="1H_R1__15M_REJECTION"
+            elif displacement: short_trigger=True; short_name="1H_R1__15M_DISPLACEMENT"
+            elif reclaim: short_trigger=True; short_name="1H_R1__15M_RECLAIM"
+
+        return {"long":long_trigger,"long_name":long_name,"short":short_trigger,"short_name":short_name}
+
     async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
         if len(candles) < 120:
             return Signal(SignalType.HOLD,self.symbol,current_price,0.0,"15M Sentinel warmup",metadata={"strategy":"SENTINEL","version":self.VERSION})
 
         mtf=mtf_candles or {}
-        bar=candles[-1]; prev=candles[-2]
-        close=float(bar.close); op=float(bar.open); low=float(bar.low); high=float(bar.high)
-        prev_close=float(prev.close); prev_open=float(prev.open); prev_low=float(prev.low); prev_high=float(prev.high)
+        self._latest_15m=list(candles)
+        self._latest_mtf=mtf
+        close=float(candles[-1].close)
 
         sr=self._sr_map_1h(mtf,close)
-        meta={"strategy":"SENTINEL","version":self.VERSION,"sr_tf":"1H","entry_tf":"15M","entry_engine":"PROXIMITY_REJECTION_DISPLACEMENT"}
-        meta.update({k:v for k,v in sr.items() if k not in {"ready"}})
+        meta={"strategy":"SENTINEL","version":self.VERSION,"sr_tf":"1H","entry_tf":"15M"}
+        meta.update({k:v for k,v in sr.items() if k!="ready"})
         if not sr.get("ready"):
             return Signal(SignalType.HOLD,self.symbol,current_price,0.0,sr.get("reason","1H map unavailable"),metadata=meta)
 
-        s1,s2,r1,r2=sr["s1"],sr["s2"],sr["r1"],sr["r2"]
+        self._latest_sr=sr
         atr_1h=float(sr["atr_1h"])
-        atr15_arr=self.atr(candles,14)
-        atr_15m=float(atr15_arr[-1]) if len(atr15_arr) and np.isfinite(atr15_arr[-1]) else 0.0
+        s1,s2,r1,r2=sr.get("s1"),sr.get("s2"),sr.get("r1"),sr.get("r2")
         sx=self._sentinel_context(candles,mtf)
         mc=self._mcdx_context(candles,mtf)
-        meta.update({"s1":s1,"s2":s2,"r1":r1,"r2":r2,"atr_1h":round(atr_1h,8),"atr_15m":round(atr_15m,8),"sentinel_x":sx,"mcdx":mc})
+        self._latest_sx=sx; self._latest_mc=mc
+        meta.update({"sentinel_x":sx,"mcdx":mc,"atr_1h":round(atr_1h,8)})
 
-        # HARD location gate: if S1 and R1 are too close, no 15M signal may trade.
-        location_atr=(r1-s1)/atr_1h
-        meta.update({"location_atr":round(location_atr,2),"min_location_atr":self.min_location_atr})
-        if location_atr < self.min_location_atr:
-            meta["room_gate"]="BLOCK"
-            return Signal(SignalType.HOLD,self.symbol,current_price,0.0,f"1H S1-R1 room BLOCK ({location_atr:.2f} ATR1H < {self.min_location_atr:.2f})",metadata=meta)
-        meta["room_gate"]="PASS"
+        # While a Sentinel position is open, analyze only refreshes map/context;
+        # tick_open_position owns exits so a reversal cannot create a duplicate.
+        if self._open_position is not None:
+            return Signal(SignalType.HOLD,self.symbol,current_price,0.0,f"Managing {self._open_position.upper()} | open_ended={self._open_ended}",metadata=meta)
 
-        zone=self.entry_zone_atr*atr_1h
-        proximity=self.reversal_proximity_atr*atr_1h
-
-        # FAST 15M entry engine. No EMA/HMA cross is required.
-        # 1) Same-bar proximity rejection: price only needs to reach the 0.20 ATR1H
-        #    band (not literally touch S1/R1) and then close back away from it.
-        bar_range=max(high-low,1e-12)
-        body=abs(close-op)
-        lower_wick=min(op,close)-low
-        upper_wick=high-max(op,close)
-        long_near_now=(low >= s1 and low <= s1+proximity)
-        short_near_now=(high <= r1 and high >= r1-proximity)
-        long_rejection=bool(long_near_now and close>op and close>=low+0.55*bar_range and (lower_wick>=0.25*bar_range or body>=0.45*bar_range))
-        short_rejection=bool(short_near_now and close<op and close<=high-0.55*bar_range and (upper_wick>=0.25*bar_range or body>=0.45*bar_range))
-
-        # 2) Direct reclaim/rejection for a candle that actually probes the wider
-        #    entry zone but closes back on the correct side of the 1H level.
-        long_reclaim=bool(low <= s1+zone and close >= s1 and close>op)
-        short_reclaim=bool(high >= r1-zone and close <= r1 and close<op)
-
-        # 3) Two-candle proximity -> displacement. Previous 15M bar approaches the
-        #    1H level; the next bar can fire as soon as it shows real displacement.
-        long_near_prev=(prev_low >= s1 and prev_low <= s1+proximity)
-        short_near_prev=(prev_high <= r1 and prev_high >= r1-proximity)
-        long_displacement=bool(long_near_prev and close>prev_close and close>op and atr_15m>0 and body>=0.60*atr_15m and close>s1+0.10*atr_1h)
-        short_displacement=bool(short_near_prev and close<prev_close and close<op and atr_15m>0 and body>=0.60*atr_15m and close<r1-0.10*atr_1h)
-
-        long_trigger=long_rejection or long_reclaim or long_displacement
-        short_trigger=short_rejection or short_reclaim or short_displacement
-
-        long_sl=s2-self.sl_buffer_atr*atr_1h; long_tp=r1
-        short_sl=r2+self.sl_buffer_atr*atr_1h; short_tp=s1
-        long_risk=close-long_sl; long_reward=long_tp-close
-        short_risk=short_sl-close; short_reward=close-short_tp
-        long_rr=long_reward/long_risk if long_risk>0 else 0.0
-        short_rr=short_reward/short_risk if short_risk>0 else 0.0
-
-        meta.update({
-            "long_rr":round(long_rr,2),"short_rr":round(short_rr,2),
-            "long_sl":long_sl,"long_tp":long_tp,"short_sl":short_sl,"short_tp":short_tp,
-            "reversal_proximity_atr_1h":self.reversal_proximity_atr,
-            "long_near_now":long_near_now,"short_near_now":short_near_now,
-            "long_rejection":long_rejection,"short_rejection":short_rejection,
-            "long_reclaim":long_reclaim,"short_reclaim":short_reclaim,
-            "long_near_prev":long_near_prev,"short_near_prev":short_near_prev,
-            "long_displacement":long_displacement,"short_displacement":short_displacement,
-            "ema_hma_cross_required":False,
-        })
-
-        # Context validates direction; location is still the actual entry authority.
+        trg=self._entry_triggers_15m(candles,s1,r1,atr_1h)
         long_context=(sx.get("bias")!="BEAR" and sx.get("structure")!="BEAR" and (sx.get("sme_bull") or sx.get("bias")=="BULL") and mc.get("long_score",0)>=self.min_context_score and mc.get("smart_flow",50)>=52)
         short_context=(sx.get("bias")!="BULL" and sx.get("structure")!="BULL" and (sx.get("sme_bear") or sx.get("bias")=="BEAR") and mc.get("short_score",0)>=self.min_context_score and mc.get("smart_flow",50)<=48)
 
-        if long_trigger and long_context and long_rr>=self.min_rr and long_reward>0:
-            trigger="1H_S1__15M_REJECTION" if long_rejection else "1H_S1__15M_RECLAIM" if long_reclaim else "1H_S1__15M_DISPLACEMENT"
-            meta.update({"entry_location":"1H_S1","stop_basis":"BELOW_1H_S2","tp_basis":"1H_R1","stop_loss":long_sl,"take_profit":long_tp,"rr_ratio":round(long_rr,2),"entry_trigger":trigger})
-            return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trigger} | room {location_atr:.2f}ATR1H | RR {long_rr:.2f}",confidence=min(1.0,0.50+mc.get("long_score",0)/200.0),metadata=meta)
+        # LONG: S1/S2 mandatory. R1 is optional. If R1 exists, enforce room+RR.
+        if sr.get("long_map_ready") and trg["long"] and long_context:
+            long_sl=float(s2)-self.sl_buffer_atr*atr_1h
+            long_risk=close-long_sl
+            if long_risk>0:
+                if r1 is None:
+                    self._open_position="long"; self._entry_price=close; self._entry_sl=long_sl; self._open_ended=True
+                    meta.update({"entry_location":"1H_S1","entry_trigger":trg["long_name"],"stop_loss":long_sl,"take_profit":None,"open_ended_tp":True,"tp_basis":"DYNAMIC_R1_OR_STRUCTURE_EXIT","stop_basis":"BELOW_1H_S2","room_mode":"OPEN_SKY"})
+                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | OPEN_SKY no 1H R1 | SL below S2 | dynamic exit when R forms + reversal/structure",confidence=min(1.0,0.50+mc.get("long_score",0)/200.0),metadata=meta)
+                location_atr=(float(r1)-float(s1))/atr_1h
+                long_reward=float(r1)-close
+                long_rr=long_reward/long_risk if long_risk>0 else 0.0
+                meta.update({"location_atr":round(location_atr,2),"long_rr":round(long_rr,2)})
+                if location_atr>=self.min_location_atr and long_reward>0 and long_rr>=self.min_rr:
+                    self._open_position="long"; self._entry_price=close; self._entry_sl=long_sl; self._open_ended=False
+                    meta.update({"entry_location":"1H_S1","entry_trigger":trg["long_name"],"stop_loss":long_sl,"take_profit":float(r1),"open_ended_tp":False,"tp_basis":"1H_R1","stop_basis":"BELOW_1H_S2","rr_ratio":round(long_rr,2),"room_mode":"FIXED_R1"})
+                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | room {location_atr:.2f}ATR1H | RR {long_rr:.2f}",confidence=min(1.0,0.50+mc.get("long_score",0)/200.0),metadata=meta)
 
-        if short_trigger and short_context and short_rr>=self.min_rr and short_reward>0:
-            trigger="1H_R1__15M_REJECTION" if short_rejection else "1H_R1__15M_RECLAIM" if short_reclaim else "1H_R1__15M_DISPLACEMENT"
-            meta.update({"entry_location":"1H_R1","stop_basis":"ABOVE_1H_R2","tp_basis":"1H_S1","stop_loss":short_sl,"take_profit":short_tp,"rr_ratio":round(short_rr,2),"entry_trigger":trigger})
-            return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trigger} | room {location_atr:.2f}ATR1H | RR {short_rr:.2f}",confidence=min(1.0,0.50+mc.get("short_score",0)/200.0),metadata=meta)
+        # SHORT inverse: R1/R2 mandatory; S1 optional OPEN_FLOOR.
+        if sr.get("short_map_ready") and trg["short"] and short_context:
+            short_sl=float(r2)+self.sl_buffer_atr*atr_1h
+            short_risk=short_sl-close
+            if short_risk>0:
+                if s1 is None:
+                    self._open_position="short"; self._entry_price=close; self._entry_sl=short_sl; self._open_ended=True
+                    meta.update({"entry_location":"1H_R1","entry_trigger":trg["short_name"],"stop_loss":short_sl,"take_profit":None,"open_ended_tp":True,"tp_basis":"DYNAMIC_S1_OR_STRUCTURE_EXIT","stop_basis":"ABOVE_1H_R2","room_mode":"OPEN_FLOOR"})
+                    return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trg['short_name']} | OPEN_FLOOR no 1H S1 | SL above R2 | dynamic exit when S forms + reversal/structure",confidence=min(1.0,0.50+mc.get("short_score",0)/200.0),metadata=meta)
+                location_atr=(float(r1)-float(s1))/atr_1h
+                short_reward=close-float(s1)
+                short_rr=short_reward/short_risk if short_risk>0 else 0.0
+                meta.update({"location_atr":round(location_atr,2),"short_rr":round(short_rr,2)})
+                if location_atr>=self.min_location_atr and short_reward>0 and short_rr>=self.min_rr:
+                    self._open_position="short"; self._entry_price=close; self._entry_sl=short_sl; self._open_ended=False
+                    meta.update({"entry_location":"1H_R1","entry_trigger":trg["short_name"],"stop_loss":short_sl,"take_profit":float(s1),"open_ended_tp":False,"tp_basis":"1H_S1","stop_basis":"ABOVE_1H_R2","rr_ratio":round(short_rr,2),"room_mode":"FIXED_S1"})
+                    return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trg['short_name']} | room {location_atr:.2f}ATR1H | RR {short_rr:.2f}",confidence=min(1.0,0.50+mc.get("short_score",0)/200.0),metadata=meta)
 
         reasons=[]
-        if long_trigger and not long_context: reasons.append("15M LONG rejection/displacement ready at 1H S1; context not confirmed")
-        elif short_trigger and not short_context: reasons.append("15M SHORT rejection/displacement ready at 1H R1; context not confirmed")
-        elif long_trigger and long_rr<self.min_rr: reasons.append(f"LONG trigger but RR {long_rr:.2f} < {self.min_rr:.2f}")
-        elif short_trigger and short_rr<self.min_rr: reasons.append(f"SHORT trigger but RR {short_rr:.2f} < {self.min_rr:.2f}")
-        elif long_near_now or long_near_prev: reasons.append(f"ARMED LONG: 15M near 1H S1 within {self.reversal_proximity_atr:.2f} ATR1H; waiting rejection/displacement")
-        elif short_near_now or short_near_prev: reasons.append(f"ARMED SHORT: 15M near 1H R1 within {self.reversal_proximity_atr:.2f} ATR1H; waiting rejection/displacement")
-        else: reasons.append("WAIT 15M proximity at 1H S1/R1")
+        if not sr.get("long_map_ready"): reasons.append("LONG needs 1H S1+S2")
+        if not sr.get("short_map_ready"): reasons.append("SHORT needs 1H R1+R2")
+        if sr.get("open_sky_long"): reasons.append("LONG OPEN_SKY available when 15M S1 trigger+context fire")
+        if sr.get("open_floor_short"): reasons.append("SHORT OPEN_FLOOR available when 15M R1 trigger+context fire")
+        if not reasons: reasons.append("WAIT 15M trigger/context at 1H S1/R1")
         return Signal(SignalType.HOLD,self.symbol,current_price,0.0,"; ".join(reasons),metadata=meta)
+
+    def tick_open_position(self,current_price:float,position_key:Optional[str]=None):
+        """Dynamic exit for open-ended Sentinel positions.
+
+        LONG OPEN_SKY: once a new 1H R1 exists, close on a 15M bearish reversal
+        around R1 OR if 15M structure has flipped BEAR. SHORT is inverse.
+        Fixed-target positions remain managed by hard SL/TP.
+        """
+        if self._open_position is None:
+            return None
+        from ..engines.position_manager import PositionUpdate
+
+        if not self._open_ended:
+            return PositionUpdate(action="hold",reason=f"Sentinel {self._open_position.upper()} fixed 1H target active")
+
+        sr=self._latest_sr or {}
+        atr_1h=float(sr.get("atr_1h") or 0.0)
+        candles=self._latest_15m or []
+        if atr_1h<=0 or len(candles)<3:
+            return PositionUpdate(action="hold",reason="Sentinel open-ended runner: waiting refreshed 1H/15M map")
+
+        structure=self._structure(candles)
+        bar=candles[-1]; prev=candles[-2]
+        close=float(bar.close); op=float(bar.open); high=float(bar.high); low=float(bar.low)
+        prev_close=float(prev.close)
+        proximity=self.reversal_proximity_atr*atr_1h
+
+        if self._open_position=="long":
+            r1=sr.get("r1")
+            if r1 is None:
+                return PositionUpdate(action="hold",reason="LONG OPEN_SKY: no 1H R1 yet — keep runner")
+            near_r=high>=float(r1)-proximity
+            bearish_reversal=near_r and close<float(r1)-0.05*atr_1h and close<op and close<prev_close
+            if bearish_reversal or structure=="BEAR":
+                reason=(f"OPEN_SKY exit: 1H R1 formed at {float(r1):.6f} + 15M bearish reversal" if bearish_reversal else f"OPEN_SKY exit: 1H R1 formed at {float(r1):.6f} + 15M structure BEAR")
+                self._reset_position_state()
+                return PositionUpdate(action="close",close_pct=1.0,reason=reason)
+            return PositionUpdate(action="hold",reason=f"LONG OPEN_SKY: 1H R1={float(r1):.6f} formed; waiting 15M reversal/BEAR structure")
+
+        s1=sr.get("s1")
+        if s1 is None:
+            return PositionUpdate(action="hold",reason="SHORT OPEN_FLOOR: no 1H S1 yet — keep runner")
+        near_s=low<=float(s1)+proximity
+        bullish_reversal=near_s and close>float(s1)+0.05*atr_1h and close>op and close>prev_close
+        if bullish_reversal or structure=="BULL":
+            reason=(f"OPEN_FLOOR exit: 1H S1 formed at {float(s1):.6f} + 15M bullish reversal" if bullish_reversal else f"OPEN_FLOOR exit: 1H S1 formed at {float(s1):.6f} + 15M structure BULL")
+            self._reset_position_state()
+            return PositionUpdate(action="close",close_pct=1.0,reason=reason)
+        return PositionUpdate(action="hold",reason=f"SHORT OPEN_FLOOR: 1H S1={float(s1):.6f} formed; waiting 15M reversal/BULL structure")
+
+    def attach_existing_position(self,direction:str,entry_price:float,stop_loss:Optional[float]=None,take_profit:Optional[float]=None)->None:
+        self._open_position=str(direction).lower()
+        self._entry_price=float(entry_price)
+        self._entry_sl=float(stop_loss) if stop_loss is not None else None
+        self._open_ended=take_profit is None
+
+    def cancel_pending_entry(self,reason:str="")->None:
+        self._reset_position_state()
+
+    def _reset_position_state(self)->None:
+        self._open_position=None
+        self._entry_price=None
+        self._entry_sl=None
+        self._open_ended=False
