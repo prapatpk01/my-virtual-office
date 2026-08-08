@@ -95,7 +95,10 @@ def _make_strategies(symbols: list, config: dict):
         for symbol in config.get("sentinel_symbols", []):
             strategies.append(SentinelStrategy(
                 symbol=symbol,
-                min_context_score=_env_float("SENTINEL_MIN_CONTEXT_SCORE", 65.0),
+                min_context_score=_env_float("SENTINEL_MCDX_MIN_SCORE", 45.0),
+                mcdx_dominance_gap=_env_float("SENTINEL_MCDX_DOMINANCE_GAP", 10.0),
+                long_flow_min=_env_float("SENTINEL_MCDX_LONG_FLOW_MIN", 52.0),
+                short_flow_max=_env_float("SENTINEL_MCDX_SHORT_FLOW_MAX", 48.0),
                 min_location_atr=_env_float("SENTINEL_MIN_LOCATION_ATR", 1.20),
                 min_rr=_env_float("SENTINEL_MIN_RR", 1.50),
                 entry_zone_atr=_env_float("SENTINEL_ENTRY_ZONE_ATR", 0.30),
@@ -149,6 +152,7 @@ def _router_log_scan(self, symbol, strategy_name, price, signal):
 
     if str(strategy_name).startswith("Sentinel("):
         mc = meta.get("mcdx") if isinstance(meta.get("mcdx"), dict) else {}
+        gate = meta.get("mcdx_gate") if isinstance(meta.get("mcdx_gate"), dict) else {}
         sx = meta.get("sentinel_x") if isinstance(meta.get("sentinel_x"), dict) else {}
         s1, r1, atr = meta.get("s1"), meta.get("r1"), meta.get("atr_1h")
         gap = None
@@ -164,14 +168,21 @@ def _router_log_scan(self, symbol, strategy_name, price, signal):
         room_status = "OPEN" if room_atr is None else ("PASS" if room_atr >= min_room else "BLOCK")
         gap_text = "?" if gap is None else f"{gap:.6f}"
         room_text = "?" if room_atr is None else f"{room_atr:.2f}"
+        l_score = mc.get("long_score", "?")
+        s_score = mc.get("short_score", "?")
+        flow = mc.get("smart_flow", "?")
+        l_gap = gate.get("long_gap", "?")
+        s_gap = gate.get("short_gap", "?")
+        l_pass = "PASS" if gate.get("long_pass") else "BLOCK"
+        s_pass = "PASS" if gate.get("short_pass") else "BLOCK"
         scan_logger.info(
-            "[SCAN SENTINEL] %s %s px=%.4f sig=%s | S2=%s S1=%s R1=%s R2=%s | GAP=%s = %sATR1H [%s min=%.2f] | SX=%s/%s | MCDX L=%s S=%s flow=%s | RR L=%s S=%s | %s",
+            "[SCAN SENTINEL] %s %s px=%.4f sig=%s | S2=%s S1=%s R1=%s R2=%s | GAP=%s = %sATR1H [%s min=%.2f] | SX=%s/%s | MCDX L=%s S=%s flow=%s [LONG %s Δ=%s | SHORT %s Δ=%s] | RR L=%s S=%s | %s",
             strategy_name, symbol, price,
             getattr(getattr(signal, "type", None), "value", "hold").upper(),
             meta.get("s2", "?"), s1 if s1 is not None else "?", r1 if r1 is not None else "?", meta.get("r2", "?"),
             gap_text, room_text, room_status, min_room,
             sx.get("bias", "?"), sx.get("structure", "?"),
-            mc.get("long_score", "?"), mc.get("short_score", "?"), mc.get("smart_flow", "?"),
+            l_score, s_score, flow, l_pass, l_gap, s_pass, s_gap,
             meta.get("long_rr", "?"), meta.get("short_rr", "?"), getattr(signal, "reason", ""),
         )
         return
