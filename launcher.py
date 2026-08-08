@@ -12,7 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def main() -> None:
-    mode = os.environ.get("MODE", "dual").strip().lower()
+    # EMA Hybrid is the production default for this trading-bot image.
+    # Other runtimes remain selectable explicitly through MODE.
+    mode = os.environ.get("MODE", "ema_hybrid").strip().lower()
     banner = "=" * 62
     if mode in ("dual", "dual_entry", "v14", "v1.4"):
         target_dir = HERE
