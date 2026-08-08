@@ -13,6 +13,10 @@ Entry checklist:
 6) Volume is supportive when available (soft confirmation, not a hard gate).
 7) Initial R:R must be >= 1:2.
 
+Schedule:
+- PAPER: entries allowed 24/7 for uninterrupted strategy testing.
+- LIVE: new entries allowed Monday-Friday (24/5); existing positions remain managed 24/7.
+
 Risk:
 - SL beyond the confirmed swing that anchors the Fibonacci impulse plus ATR buffer.
 - 2R is TP1 milestone: lock +1R.
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -64,6 +69,17 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         super().__init__(config)
         # Disable percentage-stage management inherited from TPC. Hybrid uses R milestones.
         self.stage_locks_enabled = False
+
+    def _entry_schedule_open(self) -> bool:
+        """Return whether NEW entries are currently permitted.
+
+        Paper mode intentionally runs 24/7 so backtests/forward tests do not
+        lose weekend samples. Live mode is 24/5: Monday-Friday UTC. Position
+        management is not gated here and continues through the parent runtime.
+        """
+        if bool(getattr(self.cfg, "paper", False)):
+            return True
+        return datetime.now(timezone.utc).weekday() < 5
 
     @staticmethod
     def _ema(series: pd.Series, n: int) -> pd.Series:
@@ -243,13 +259,14 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         if risk <= 0 or not math.isfinite(risk):
             return HybridView(side, "RISK", "invalid swing stop", impulse["fib_low"], impulse["fib_high"], touch, pa, sweep)
 
-        # Final target is 3R; therefore initial plan always has >=2R if valid.
         rr = self.FINAL_RR
         vr = self._volume_ratio(m15)
         return HybridView(side, "READY", "all mandatory gates passed", impulse["fib_low"], impulse["fib_high"], touch, pa, sweep, vr, rr)
 
     def generate_entry(self, df4h, df1h, df15, df5, has_open_position: bool = False) -> Optional[EntrySignal]:
         if has_open_position:
+            return None
+        if not self._entry_schedule_open():
             return None
         v = self._view(df1h, df15)
         if v.stage != "READY" or v.side is None:
@@ -272,7 +289,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         if risk <= 0:
             return None
 
-        # Parent runtime expects these diagnostic fields; they do not gate Hybrid entries.
         q = self.quality_state_1h(df1h)
         reason = (
             f"EMA Hybrid Pro {v.side.value} | H1+M15 EMA20/50/200 aligned | "
@@ -289,11 +305,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         )
 
     def locked_stop(self, side: Side, entry: float, best_price: float):
-        """At +2R lock +1R; final native TP remains +3R.
-
-        Runtime API does not carry initial R here, so infer a conservative R from
-        configured stop-loss percentage. The exchange-native initial SL remains authoritative.
-        """
         r = max(entry * float(self.cfg.stop_loss_pct), entry * 0.003)
         move = (best_price - entry) if side == Side.LONG else (entry - best_price)
         if move >= 2.0 * r:
@@ -305,9 +316,10 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
     def entry_status(self, df4h, df1h, df15, df5) -> str:
         v = self._view(df1h, df15)
         side = v.side.value if v.side else "NONE"
+        schedule = "24/7 PAPER" if bool(getattr(self.cfg, "paper", False)) else "24/5 LIVE"
         return (
             f"EMA-HYBRID {'READY' if v.stage == 'READY' else 'WAIT'} | {side} | "
-            f"Stage={v.stage} | Fib={v.fib_low:.6g}-{v.fib_high:.6g} | "
+            f"Schedule={schedule} | Stage={v.stage} | Fib={v.fib_low:.6g}-{v.fib_high:.6g} | "
             f"EMA={v.ema_touch} | Sweep={v.sweep} | PA={v.pa} | "
             f"Vol={v.volume_ratio:.2f}x | Reason={v.reason}"
         )
