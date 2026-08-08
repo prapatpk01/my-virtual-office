@@ -16,6 +16,7 @@ Entry checklist:
 Schedule:
 - PAPER: entries allowed 24/7 for uninterrupted strategy testing.
 - LIVE: new entries allowed Monday-Friday (24/5); existing positions remain managed 24/7.
+- LIVE weekday is evaluated in LIVE_SCHEDULE_TIMEZONE (default Asia/Seoul).
 
 Risk:
 - SL beyond the confirmed swing that anchors the Fibonacci impulse plus ATR buffer.
@@ -25,9 +26,11 @@ Risk:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -69,17 +72,26 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         super().__init__(config)
         # Disable percentage-stage management inherited from TPC. Hybrid uses R milestones.
         self.stage_locks_enabled = False
+        self.live_schedule_timezone = os.getenv("LIVE_SCHEDULE_TIMEZONE", "Asia/Seoul").strip() or "Asia/Seoul"
+        try:
+            self._live_tz = ZoneInfo(self.live_schedule_timezone)
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid LIVE_SCHEDULE_TIMEZONE={self.live_schedule_timezone!r}; "
+                "use an IANA timezone such as Asia/Seoul or UTC"
+            ) from exc
 
     def _entry_schedule_open(self) -> bool:
         """Return whether NEW entries are currently permitted.
 
-        Paper mode intentionally runs 24/7 so backtests/forward tests do not
-        lose weekend samples. Live mode is 24/5: Monday-Friday UTC. Position
-        management is not gated here and continues through the parent runtime.
+        Paper mode intentionally runs 24/7 so forward tests do not lose
+        weekend samples. Live mode is 24/5 and uses the configured IANA
+        timezone. This gate applies only to NEW entries; the parent runtime
+        continues managing existing positions 24/7.
         """
         if bool(getattr(self.cfg, "paper", False)):
             return True
-        return datetime.now(timezone.utc).weekday() < 5
+        return datetime.now(timezone.utc).astimezone(self._live_tz).weekday() < 5
 
     @staticmethod
     def _ema(series: pd.Series, n: int) -> pd.Series:
@@ -315,11 +327,16 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
     def entry_status(self, df4h, df1h, df15, df5) -> str:
         v = self._view(df1h, df15)
-        side = v.side.value if v.side else "NONE"
-        schedule = "24/7 PAPER" if bool(getattr(self.cfg, "paper", False)) else "24/5 LIVE"
+        paper = bool(getattr(self.cfg, "paper", False))
+        schedule = "24/7 PAPER" if paper else "24/5 LIVE"
+        if paper:
+            schedule_state = "OPEN"
+        else:
+            local_now = datetime.now(timezone.utc).astimezone(self._live_tz)
+            schedule_state = "OPEN" if local_now.weekday() < 5 else "WEEKEND_CLOSED"
         return (
-            f"EMA-HYBRID {'READY' if v.stage == 'READY' else 'WAIT'} | {side} | "
-            f"Schedule={schedule} | Stage={v.stage} | Fib={v.fib_low:.6g}-{v.fib_high:.6g} | "
+            f"EMA-HYBRID {'READY' if v.stage == 'READY' and schedule_state == 'OPEN' else 'WAIT'} | {side if (side := (v.side.value if v.side else 'NONE')) else 'NONE'} | "
+            f"Schedule={schedule}({schedule_state}) | Stage={v.stage} | Fib={v.fib_low:.6g}-{v.fib_high:.6g} | "
             f"EMA={v.ema_touch} | Sweep={v.sweep} | PA={v.pa} | "
             f"Vol={v.volume_ratio:.2f}x | Reason={v.reason}"
         )
