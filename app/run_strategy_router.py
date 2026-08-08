@@ -99,8 +99,8 @@ def _make_strategies(symbols: list, config: dict):
                 min_location_atr=_env_float("SENTINEL_MIN_LOCATION_ATR", 1.20),
                 min_rr=_env_float("SENTINEL_MIN_RR", 1.50),
                 entry_zone_atr=_env_float("SENTINEL_ENTRY_ZONE_ATR", 0.30),
-                reversal_proximity_atr=_env_float("SENTINEL_REVERSAL_PROXIMITY_ATR", 0.20),
-                open_ended_proximity_atr=_env_float("SENTINEL_OPEN_ENDED_PROXIMITY_ATR", 0.50),
+                reversal_proximity_atr=_env_float("SENTINEL_REVERSAL_PROXIMITY_ATR", 0.30),
+                open_ended_proximity_atr=_env_float("SENTINEL_OPEN_ENDED_PROXIMITY_ATR", 0.60),
                 sl_buffer_atr=_env_float("SENTINEL_SL_BUFFER_ATR", 0.15),
                 pivot_span=_env_int("SENTINEL_PIVOT_SPAN", 4),
             ))
