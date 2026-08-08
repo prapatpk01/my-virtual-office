@@ -2,28 +2,22 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Build tools needed for yfinance (lxml) and numpy
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libxml2-dev libxslt-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
 COPY requirements-trading.txt .
 RUN pip install --no-cache-dir -r requirements-trading.txt
 
-# Copy trading bot source
 COPY app/trading/ ./trading/
 COPY app/run_bot.py .
 COPY app/run_dual_bot.py .
 COPY app/run_enhanced_dual_bot.py .
 COPY app/run_trendconfirm_utbot.py .
 COPY app/run_strategy_router.py .
-COPY app/trend_confirm_v5_patch.py .
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \
   CMD python -c "import os, sys; sys.exit(0)"
 
-# Production entry point. BOT_STRATEGY_MODE selects the non-XAU strategy:
-# trend_confirm | adaptive | both
-# ENABLE_UTBOT_XAU=true|false controls the dedicated XAU UT Bot independently.
+# Canonical production: Trend Confirm V5.1 + Sentinel. UTBot is disabled by router/env.
 CMD ["python", "run_strategy_router.py"]
