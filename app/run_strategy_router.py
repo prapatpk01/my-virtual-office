@@ -14,7 +14,6 @@ import asyncio
 import logging
 import os
 
-# Keep the production Trend Confirm execution/Telegram/chart hooks.
 import run_enhanced_dual_bot  # noqa: F401
 import run_bot
 from trading.bot import TradingBot
@@ -118,7 +117,6 @@ def _make_strategies(symbols: list, config: dict):
     return strategies
 
 
-# Detailed ViewLog: V5 component scores + Sentinel S/R/MCDX detail.
 _ORIGINAL_LOG = TradingBot._log_scan
 scan_logger = logging.getLogger("trading_bot")
 
@@ -152,12 +150,27 @@ def _router_log_scan(self, symbol, strategy_name, price, signal):
     if str(strategy_name).startswith("Sentinel("):
         mc = meta.get("mcdx") if isinstance(meta.get("mcdx"), dict) else {}
         sx = meta.get("sentinel_x") if isinstance(meta.get("sentinel_x"), dict) else {}
+        s1, r1, atr = meta.get("s1"), meta.get("r1"), meta.get("atr_1h")
+        gap = None
+        room_atr = None
+        try:
+            if s1 is not None and r1 is not None:
+                gap = float(r1) - float(s1)
+                if atr is not None and float(atr) > 0:
+                    room_atr = gap / float(atr)
+        except (TypeError, ValueError):
+            gap = room_atr = None
+        min_room = _env_float("SENTINEL_MIN_LOCATION_ATR", 1.20)
+        room_status = "OPEN" if room_atr is None else ("PASS" if room_atr >= min_room else "BLOCK")
+        gap_text = "?" if gap is None else f"{gap:.6f}"
+        room_text = "?" if room_atr is None else f"{room_atr:.2f}"
         scan_logger.info(
-            "[SCAN SENTINEL] %s %s px=%.4f sig=%s | S2=%s S1=%s R1=%s R2=%s | room=%sATR | SX=%s/%s | MCDX L=%s S=%s flow=%s | RR L=%s S=%s | %s",
+            "[SCAN SENTINEL] %s %s px=%.4f sig=%s | S2=%s S1=%s R1=%s R2=%s | GAP=%s = %sATR1H [%s min=%.2f] | SX=%s/%s | MCDX L=%s S=%s flow=%s | RR L=%s S=%s | %s",
             strategy_name, symbol, price,
             getattr(getattr(signal, "type", None), "value", "hold").upper(),
-            meta.get("s2", "?"), meta.get("s1", "?"), meta.get("r1", "?"), meta.get("r2", "?"),
-            meta.get("location_atr", "?"), sx.get("bias", "?"), sx.get("structure", "?"),
+            meta.get("s2", "?"), s1 if s1 is not None else "?", r1 if r1 is not None else "?", meta.get("r2", "?"),
+            gap_text, room_text, room_status, min_room,
+            sx.get("bias", "?"), sx.get("structure", "?"),
             mc.get("long_score", "?"), mc.get("short_score", "?"), mc.get("smart_flow", "?"),
             meta.get("long_rr", "?"), meta.get("short_rr", "?"), getattr(signal, "reason", ""),
         )
