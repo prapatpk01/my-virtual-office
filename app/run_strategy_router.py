@@ -66,9 +66,9 @@ def _apply_strategy_mode() -> str:
 _mode = _apply_strategy_mode()
 
 # Install V5 before the combined runner captures Trend Confirm's factory.
-# The patch is harmless in adaptive-only mode and preserves the established
-# 1H-only implementation when USE_LAYER1_4H=false.
+# The ADX patch changes only Layer2 ADX contribution + detailed component log.
 import trend_confirm_v5_patch  # noqa: E402,F401
+import trading.strategies.trend_confirm_v5_adx_patch  # noqa: E402,F401
 import run_trendconfirm_utbot  # noqa: E402,F401
 import run_bot  # noqa: E402
 
