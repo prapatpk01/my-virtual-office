@@ -1,17 +1,18 @@
-"""Sentinel V1.2 — 1H S/R map + 15M execution.
+"""Sentinel V1.3 — 1H S/R map + fast 15M execution.
 
 Architecture
 - 1H ONLY: build confirmed S1/S2/R1/R2 and ATR14 map.
 - 1H ATR: measure S1<->R1 profit room, proximity band and SL buffer.
-- 15M ONLY: execute reclaim/rejection or two-candle proximity reversal.
+- 15M ONLY: execute proximity rejection / reclaim / displacement.
+- No EMA/HMA cross is required for entry.
 - Sentinel X + MCDX remain directional/context validators.
 
 LONG
 - 1H S1/S2/R1/R2 must exist.
 - S1->R1 room >= configured minimum in ATR(1H).
-- 15M may enter on a direct S1 reclaim, or when the previous 15M candle comes
-  within 0.20 ATR(1H) of S1 without breaking it and the next completed 15M candle
-  closes away from S1 bullishly.
+- Price approaches 1H S1 inside the proximity band.
+- A completed 15M candle rejects/reclaims S1 OR a bullish displacement candle
+  moves away from S1 after proximity.
 - SL below 1H S2 by ATR(1H) buffer; TP at 1H R1.
 
 SHORT is the exact inverse around 1H R1/R2 with TP at 1H S1.
@@ -26,7 +27,7 @@ from .base import BaseStrategy, Signal, SignalType
 
 
 class SentinelStrategy(BaseStrategy):
-    VERSION = "1.2"
+    VERSION = "1.3"
 
     def __init__(
         self,
@@ -97,8 +98,6 @@ class SentinelStrategy(BaseStrategy):
                 "atr_1h": atr_1h, "bars_1h": len(h1),
             }
 
-        # Merge only the primary 1H entry/target zone when adjacent confirmed
-        # levels are extremely close. Keep raw S2/R2 for stop construction.
         s1_raw, s2_raw, r1_raw, r2_raw = s1, s2, r1, r2
         if abs(r2-r1) <= atr_1h*self.sr_merge_atr:
             r1 = (r1+r2)/2.0
@@ -202,21 +201,23 @@ class SentinelStrategy(BaseStrategy):
         mtf=mtf_candles or {}
         bar=candles[-1]; prev=candles[-2]
         close=float(bar.close); op=float(bar.open); low=float(bar.low); high=float(bar.high)
-        prev_close=float(prev.close); prev_low=float(prev.low); prev_high=float(prev.high)
+        prev_close=float(prev.close); prev_open=float(prev.open); prev_low=float(prev.low); prev_high=float(prev.high)
 
         sr=self._sr_map_1h(mtf,close)
-        meta={"strategy":"SENTINEL","version":self.VERSION,"sr_tf":"1H","entry_tf":"15M"}
+        meta={"strategy":"SENTINEL","version":self.VERSION,"sr_tf":"1H","entry_tf":"15M","entry_engine":"PROXIMITY_REJECTION_DISPLACEMENT"}
         meta.update({k:v for k,v in sr.items() if k not in {"ready"}})
         if not sr.get("ready"):
             return Signal(SignalType.HOLD,self.symbol,current_price,0.0,sr.get("reason","1H map unavailable"),metadata=meta)
 
         s1,s2,r1,r2=sr["s1"],sr["s2"],sr["r1"],sr["r2"]
         atr_1h=float(sr["atr_1h"])
+        atr15_arr=self.atr(candles,14)
+        atr_15m=float(atr15_arr[-1]) if len(atr15_arr) and np.isfinite(atr15_arr[-1]) else 0.0
         sx=self._sentinel_context(candles,mtf)
         mc=self._mcdx_context(candles,mtf)
-        meta.update({"s1":s1,"s2":s2,"r1":r1,"r2":r2,"atr_1h":round(atr_1h,8),"sentinel_x":sx,"mcdx":mc})
+        meta.update({"s1":s1,"s2":s2,"r1":r1,"r2":r2,"atr_1h":round(atr_1h,8),"atr_15m":round(atr_15m,8),"sentinel_x":sx,"mcdx":mc})
 
-        # 1H location gate. If S1 and R1 are too close, no 15M trigger is allowed.
+        # HARD location gate: if S1 and R1 are too close, no 15M signal may trade.
         location_atr=(r1-s1)/atr_1h
         meta.update({"location_atr":round(location_atr,2),"min_location_atr":self.min_location_atr})
         if location_atr < self.min_location_atr:
@@ -227,15 +228,32 @@ class SentinelStrategy(BaseStrategy):
         zone=self.entry_zone_atr*atr_1h
         proximity=self.reversal_proximity_atr*atr_1h
 
-        # 15M execution against fixed 1H levels.
-        long_at_s1=(low <= s1+zone and close >= s1 and close>op)
-        short_at_r1=(high >= r1-zone and close <= r1 and close<op)
-        long_near_s1=(prev_low >= s1 and prev_low <= s1+proximity)
-        long_departed=(close > s1+proximity and close > prev_close and close > op)
-        short_near_r1=(prev_high <= r1 and prev_high >= r1-proximity)
-        short_departed=(close < r1-proximity and close < prev_close and close < op)
-        long_proximity_reversal=bool(long_near_s1 and long_departed)
-        short_proximity_reversal=bool(short_near_r1 and short_departed)
+        # FAST 15M entry engine. No EMA/HMA cross is required.
+        # 1) Same-bar proximity rejection: price only needs to reach the 0.20 ATR1H
+        #    band (not literally touch S1/R1) and then close back away from it.
+        bar_range=max(high-low,1e-12)
+        body=abs(close-op)
+        lower_wick=min(op,close)-low
+        upper_wick=high-max(op,close)
+        long_near_now=(low >= s1 and low <= s1+proximity)
+        short_near_now=(high <= r1 and high >= r1-proximity)
+        long_rejection=bool(long_near_now and close>op and close>=low+0.55*bar_range and (lower_wick>=0.25*bar_range or body>=0.45*bar_range))
+        short_rejection=bool(short_near_now and close<op and close<=high-0.55*bar_range and (upper_wick>=0.25*bar_range or body>=0.45*bar_range))
+
+        # 2) Direct reclaim/rejection for a candle that actually probes the wider
+        #    entry zone but closes back on the correct side of the 1H level.
+        long_reclaim=bool(low <= s1+zone and close >= s1 and close>op)
+        short_reclaim=bool(high >= r1-zone and close <= r1 and close<op)
+
+        # 3) Two-candle proximity -> displacement. Previous 15M bar approaches the
+        #    1H level; the next bar can fire as soon as it shows real displacement.
+        long_near_prev=(prev_low >= s1 and prev_low <= s1+proximity)
+        short_near_prev=(prev_high <= r1 and prev_high >= r1-proximity)
+        long_displacement=bool(long_near_prev and close>prev_close and close>op and atr_15m>0 and body>=0.60*atr_15m and close>s1+0.10*atr_1h)
+        short_displacement=bool(short_near_prev and close<prev_close and close<op and atr_15m>0 and body>=0.60*atr_15m and close<r1-0.10*atr_1h)
+
+        long_trigger=long_rejection or long_reclaim or long_displacement
+        short_trigger=short_rejection or short_reclaim or short_displacement
 
         long_sl=s2-self.sl_buffer_atr*atr_1h; long_tp=r1
         short_sl=r2+self.sl_buffer_atr*atr_1h; short_tp=s1
@@ -243,29 +261,39 @@ class SentinelStrategy(BaseStrategy):
         short_risk=short_sl-close; short_reward=close-short_tp
         long_rr=long_reward/long_risk if long_risk>0 else 0.0
         short_rr=short_reward/short_risk if short_risk>0 else 0.0
-        meta.update({"long_rr":round(long_rr,2),"short_rr":round(short_rr,2),"long_sl":long_sl,"long_tp":long_tp,"short_sl":short_sl,"short_tp":short_tp,"reversal_proximity_atr_1h":self.reversal_proximity_atr,"long_near_s1":long_near_s1,"long_departed":long_departed,"short_near_r1":short_near_r1,"short_departed":short_departed})
 
+        meta.update({
+            "long_rr":round(long_rr,2),"short_rr":round(short_rr,2),
+            "long_sl":long_sl,"long_tp":long_tp,"short_sl":short_sl,"short_tp":short_tp,
+            "reversal_proximity_atr_1h":self.reversal_proximity_atr,
+            "long_near_now":long_near_now,"short_near_now":short_near_now,
+            "long_rejection":long_rejection,"short_rejection":short_rejection,
+            "long_reclaim":long_reclaim,"short_reclaim":short_reclaim,
+            "long_near_prev":long_near_prev,"short_near_prev":short_near_prev,
+            "long_displacement":long_displacement,"short_displacement":short_displacement,
+            "ema_hma_cross_required":False,
+        })
+
+        # Context validates direction; location is still the actual entry authority.
         long_context=(sx.get("bias")!="BEAR" and sx.get("structure")!="BEAR" and (sx.get("sme_bull") or sx.get("bias")=="BULL") and mc.get("long_score",0)>=self.min_context_score and mc.get("smart_flow",50)>=52)
         short_context=(sx.get("bias")!="BULL" and sx.get("structure")!="BULL" and (sx.get("sme_bear") or sx.get("bias")=="BEAR") and mc.get("short_score",0)>=self.min_context_score and mc.get("smart_flow",50)<=48)
-        long_trigger=long_at_s1 or long_proximity_reversal
-        short_trigger=short_at_r1 or short_proximity_reversal
 
         if long_trigger and long_context and long_rr>=self.min_rr and long_reward>0:
-            trigger="1H_S1_NEAR_0.20ATR__15M_REVERSAL" if long_proximity_reversal else "1H_S1__15M_RECLAIM"
+            trigger="1H_S1__15M_REJECTION" if long_rejection else "1H_S1__15M_RECLAIM" if long_reclaim else "1H_S1__15M_DISPLACEMENT"
             meta.update({"entry_location":"1H_S1","stop_basis":"BELOW_1H_S2","tp_basis":"1H_R1","stop_loss":long_sl,"take_profit":long_tp,"rr_ratio":round(long_rr,2),"entry_trigger":trigger})
             return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trigger} | room {location_atr:.2f}ATR1H | RR {long_rr:.2f}",confidence=min(1.0,0.50+mc.get("long_score",0)/200.0),metadata=meta)
 
         if short_trigger and short_context and short_rr>=self.min_rr and short_reward>0:
-            trigger="1H_R1_NEAR_0.20ATR__15M_REVERSAL" if short_proximity_reversal else "1H_R1__15M_REJECTION"
+            trigger="1H_R1__15M_REJECTION" if short_rejection else "1H_R1__15M_RECLAIM" if short_reclaim else "1H_R1__15M_DISPLACEMENT"
             meta.update({"entry_location":"1H_R1","stop_basis":"ABOVE_1H_R2","tp_basis":"1H_S1","stop_loss":short_sl,"take_profit":short_tp,"rr_ratio":round(short_rr,2),"entry_trigger":trigger})
             return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trigger} | room {location_atr:.2f}ATR1H | RR {short_rr:.2f}",confidence=min(1.0,0.50+mc.get("short_score",0)/200.0),metadata=meta)
 
         reasons=[]
-        if long_trigger and not long_context: reasons.append("15M LONG trigger ready at 1H S1; context not confirmed")
-        elif short_trigger and not short_context: reasons.append("15M SHORT trigger ready at 1H R1; context not confirmed")
-        elif long_trigger and long_rr<self.min_rr: reasons.append(f"LONG RR {long_rr:.2f} < {self.min_rr:.2f}")
-        elif short_trigger and short_rr<self.min_rr: reasons.append(f"SHORT RR {short_rr:.2f} < {self.min_rr:.2f}")
-        elif long_near_s1 and not long_departed: reasons.append(f"ARMED LONG: 15M near 1H S1 within {self.reversal_proximity_atr:.2f} ATR1H; waiting 15M bullish departure")
-        elif short_near_r1 and not short_departed: reasons.append(f"ARMED SHORT: 15M near 1H R1 within {self.reversal_proximity_atr:.2f} ATR1H; waiting 15M bearish departure")
-        else: reasons.append("WAIT 15M location trigger at 1H S1/R1")
+        if long_trigger and not long_context: reasons.append("15M LONG rejection/displacement ready at 1H S1; context not confirmed")
+        elif short_trigger and not short_context: reasons.append("15M SHORT rejection/displacement ready at 1H R1; context not confirmed")
+        elif long_trigger and long_rr<self.min_rr: reasons.append(f"LONG trigger but RR {long_rr:.2f} < {self.min_rr:.2f}")
+        elif short_trigger and short_rr<self.min_rr: reasons.append(f"SHORT trigger but RR {short_rr:.2f} < {self.min_rr:.2f}")
+        elif long_near_now or long_near_prev: reasons.append(f"ARMED LONG: 15M near 1H S1 within {self.reversal_proximity_atr:.2f} ATR1H; waiting rejection/displacement")
+        elif short_near_now or short_near_prev: reasons.append(f"ARMED SHORT: 15M near 1H R1 within {self.reversal_proximity_atr:.2f} ATR1H; waiting rejection/displacement")
+        else: reasons.append("WAIT 15M proximity at 1H S1/R1")
         return Signal(SignalType.HOLD,self.symbol,current_price,0.0,"; ".join(reasons),metadata=meta)
