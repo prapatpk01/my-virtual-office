@@ -6,6 +6,9 @@ import importlib.util
 import os
 import signal
 import sys
+import time
+
+import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -15,10 +18,8 @@ if HMA not in sys.path:
 
 import main_v15 as base
 
-# IMPORTANT: hma_bot also contains a module named `strategy.py`.  Do not use
-# `from strategy import ...` here because HMA is intentionally on sys.path for
-# main_v15 and Python can resolve the wrong module. Load this bot's strategy
-# explicitly by absolute file path under a unique module name.
+# hma_bot also contains strategy.py. Load EMA Hybrid's strategy explicitly so
+# Python cannot resolve the HMA strategy module by accident.
 _strategy_path = os.path.join(HERE, "strategy.py")
 _strategy_spec = importlib.util.spec_from_file_location("ema_hybrid_bot_strategy", _strategy_path)
 if _strategy_spec is None or _strategy_spec.loader is None:
@@ -29,6 +30,28 @@ _strategy_spec.loader.exec_module(_strategy_module)
 EMAHybridProStrategy = _strategy_module.EMAHybridProStrategy
 
 _LOG = base._LOG
+
+
+def _ohlcv_to_df(raw):
+    """Convert CCXT OHLCV rows to the DataFrame expected by EMA Hybrid.
+
+    Do not depend on a private/helper symbol from main_v15: that module does
+    not expose _ohlcv_to_df on all runtime versions. Keeping this converter
+    local makes the EMA Hybrid runtime independent of the HMA version chain.
+    """
+    if not raw:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    rows = [list(r[:6]) for r in raw if len(r) >= 6]
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+    df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+    df.index = pd.to_datetime(df.pop("timestamp"), unit="ms", utc=True)
+    return df
 
 
 class Bot(base.Bot):
@@ -59,7 +82,7 @@ class Bot(base.Bot):
         )
 
     async def _frame(self, symbol, tf, minutes, limit=300):
-        now_ms = int(__import__("time").time() * 1000)
+        now_ms = int(time.time() * 1000)
         try:
             raw = await self.client.fetch_ohlcv(symbol, tf, limit=limit)
         except Exception as exc:
@@ -68,10 +91,10 @@ class Bot(base.Bot):
             await self._recover_okx_session(f"{symbol} {tf}")
             raw = await self.client.fetch_ohlcv(symbol, tf, limit=limit)
 
-        df = base._ohlcv_to_df(raw)
+        df = _ohlcv_to_df(raw)
         if df.empty:
             return df
-        close_ms = (df.index.as_unit("ns").asi8 // 1_000_000) + minutes * 60_000
+        close_ms = (df.index.astype("int64") // 1_000_000) + minutes * 60_000
         return df[close_ms <= now_ms]
 
     def _set_view_v3(self, symbol: str, df5, df15, df1h, df4h):
