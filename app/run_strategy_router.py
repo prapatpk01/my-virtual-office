@@ -6,11 +6,6 @@ BOT_STRATEGY_MODE controls the non-XAU strategy family explicitly:
   both           -> Trend Confirm + Adaptive Multi-Trigger
 
 XAU/UTBot remains controlled independently by ENABLE_UTBOT_XAU.
-
-Why this exists:
-Railway can retain old ENABLE_* variables. When switching back to Trend Confirm,
-a stale ENABLE_ADAPTIVE_MULTI_TRIGGER=true previously caused Adaptive to keep
-running. This router makes the intended primary mode authoritative.
 """
 from __future__ import annotations
 
@@ -40,9 +35,6 @@ def _normalize_mode(raw: str) -> str:
 
 
 def _apply_strategy_mode() -> str:
-    # BOT_STRATEGY_MODE is the authoritative selector. If it is absent, default
-    # to Trend Confirm so stale Railway ENABLE_ADAPTIVE_MULTI_TRIGGER values do
-    # not unexpectedly reactivate Adaptive after a strategy switch.
     raw = os.getenv("BOT_STRATEGY_MODE", "trend_confirm")
     mode = _normalize_mode(raw)
 
@@ -71,10 +63,12 @@ def _apply_strategy_mode() -> str:
     return mode
 
 
-_apply_strategy_mode()
+_mode = _apply_strategy_mode()
 
-# Import only AFTER applying the mode because this module installs the combined
-# runner hooks and reads ENABLE_* flags at runtime.
+# Install V5 before the combined runner captures Trend Confirm's factory.
+# The patch is harmless in adaptive-only mode and preserves the established
+# 1H-only implementation when USE_LAYER1_4H=false.
+import trend_confirm_v5_patch  # noqa: E402,F401
 import run_trendconfirm_utbot  # noqa: E402,F401
 import run_bot  # noqa: E402
 
