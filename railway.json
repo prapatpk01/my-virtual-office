@@ -4,7 +4,7 @@
     "dockerfilePath": "Dockerfile.bot"
   },
   "deploy": {
-    "startCommand": "python run_trendconfirm_utbot.py",
+    "startCommand": "python run_strategy_router.py",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
