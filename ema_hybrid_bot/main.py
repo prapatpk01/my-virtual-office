@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import signal
 import sys
@@ -11,11 +12,21 @@ ROOT = os.path.dirname(HERE)
 HMA = os.path.join(ROOT, "hma_bot")
 if HMA not in sys.path:
     sys.path.insert(0, HMA)
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
 
 import main_v15 as base
-from strategy import EMAHybridProStrategy
+
+# IMPORTANT: hma_bot also contains a module named `strategy.py`.  Do not use
+# `from strategy import ...` here because HMA is intentionally on sys.path for
+# main_v15 and Python can resolve the wrong module. Load this bot's strategy
+# explicitly by absolute file path under a unique module name.
+_strategy_path = os.path.join(HERE, "strategy.py")
+_strategy_spec = importlib.util.spec_from_file_location("ema_hybrid_bot_strategy", _strategy_path)
+if _strategy_spec is None or _strategy_spec.loader is None:
+    raise ImportError(f"Cannot load EMA Hybrid strategy: {_strategy_path}")
+_strategy_module = importlib.util.module_from_spec(_strategy_spec)
+sys.modules[_strategy_spec.name] = _strategy_module
+_strategy_spec.loader.exec_module(_strategy_module)
+EMAHybridProStrategy = _strategy_module.EMAHybridProStrategy
 
 _LOG = base._LOG
 
@@ -27,14 +38,6 @@ class Bot(base.Bot):
         self._okx_reconnect_lock = asyncio.Lock()
 
     async def _recover_okx_session(self, reason: str = "") -> None:
-        """Re-open CCXT's async HTTP session after an unexpected close.
-
-        Railway/container networking can occasionally leave aiohttp's session
-        closed while the process itself is still healthy.  CCXT then raises
-        `okx instance was closed by the user` on every subsequent request.
-        Re-opening the existing exchange object is safe and preserves its
-        markets, credentials and rate limiter.
-        """
         async with self._okx_reconnect_lock:
             exchange = getattr(self.client, "_exchange", None)
             if exchange is None:
@@ -56,7 +59,6 @@ class Bot(base.Bot):
         )
 
     async def _frame(self, symbol, tf, minutes, limit=300):
-        """Fetch candles with one automatic OKX session recovery retry."""
         now_ms = int(__import__("time").time() * 1000)
         try:
             raw = await self.client.fetch_ohlcv(symbol, tf, limit=limit)
