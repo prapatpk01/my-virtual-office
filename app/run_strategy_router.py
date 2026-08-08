@@ -43,17 +43,23 @@ def _apply_strategy_mode() -> str:
 
 _mode = _apply_strategy_mode()
 
-# Install strategy/risk/UI patches first.
-import trend_confirm_v5_patch  # noqa: E402,F401
+# Import every runtime patch first.
+import trend_confirm_v5_patch  # noqa: E402
 import trading.strategies.trend_confirm_v5_adx_patch  # noqa: E402,F401
-import run_trendconfirm_utbot  # noqa: E402,F401
+import run_trendconfirm_utbot  # noqa: E402
 import run_bot  # noqa: E402
-
-# IMPORTANT: install the detailed Trend Confirm logger LAST. Some combined-runner
-# patches wrap TradingBot._log_scan during import. Doing this last guarantees the
-# production viewlog cannot silently fall back to the legacy compact formatter.
 from trading.bot import TradingBot  # noqa: E402
 
+# HARD-WIRE V5 INTO THE COMBINED RUNNER.
+# The combined runner captures its Trend Confirm factory at import time. If that
+# capture ever points at an older factory, production can silently instantiate
+# legacy TrendConfirm and the viewlog shows 4/4 + compact Q. Reassign the global
+# used by _make_combined_strategies so every future bot build uses V5 directly.
+run_trendconfirm_utbot._TREND_MAKE_STRATEGIES = trend_confirm_v5_patch._factory
+run_bot._make_strategies = run_trendconfirm_utbot._make_combined_strategies
+logger.warning("[TREND CONFIRM V5.1] HARD-WIRED combined factory -> V5")
+
+# Install the detailed logger LAST, after all wrappers.
 _FINAL_FALLBACK_LOG = TradingBot._log_scan
 _final_logger = logging.getLogger("trading_bot")
 
@@ -64,35 +70,36 @@ def _final_component_log(self, symbol, strategy_name, price, signal):
         macro = meta.get("macro_4h") if isinstance(meta.get("macro_4h"), dict) else {}
         ctx = meta.get("context_1h") if isinstance(meta.get("context_1h"), dict) else {}
         comp = ctx.get("components") if isinstance(ctx.get("components"), dict) else {}
+        version = str(meta.get("trend_confirm_version", "?"))
+        sig_type = getattr(getattr(signal, "type", None), "value", "hold").upper()
 
-        # V5 should always provide components. If a HOLD was produced before the
-        # full context dict exists, still print explicit placeholders so it is
-        # obvious which component is unavailable rather than reverting to old log.
-        if str(meta.get("trend_confirm_version", "")).startswith("5") or macro.get("layer_role") == "DIRECTION_ONLY" or comp:
-            sig_type = getattr(getattr(signal, "type", None), "value", "hold").upper()
-            mom_label = "ALIGNED" if ctx.get("momentum_aligned") else "OPPOSED"
-            trigger = meta.get("entry_trigger_owner") or meta.get("entry_trigger") or meta.get("direction_15m", "WAIT")
-            _final_logger.info(
-                "[SCAN] %s %s px=%.4f sig=%s | L1 4H=%s score=%s/100 (B=%s S=%s) | "
-                "L2 1H=%s Q=%s/100 [ADX %s=%s/25 | CHOP %s=%s/20 | STRUCT %s=%s/20 | "
-                "MOM %s=%s/15 | ROOM %sR=%s/20] hard=%s | 15M=%s | %s",
-                strategy_name, symbol, price, sig_type,
-                macro.get("state", "?"), macro.get("score", "?"), macro.get("bull_score", "?"), macro.get("bear_score", "?"),
-                ctx.get("label", "?"), ctx.get("score", "?"),
-                ctx.get("adx", "?"), comp.get("adx", "?"),
-                ctx.get("chop", "?"), comp.get("chop", "?"),
-                str(ctx.get("structure", "?")).upper(), comp.get("structure", "?"),
-                mom_label, comp.get("momentum", "?"),
-                ctx.get("room_r", "?"), comp.get("room", "?"),
-                ctx.get("hard_block", "?"), trigger, getattr(signal, "reason", ""),
-            )
-            return
+        # Never fall back to the legacy compact formatter for Trend Confirm.
+        # Even warm-up/partial metadata is printed in the V5 schema with '?' so
+        # production immediately reveals whether V5 metadata is present.
+        mom_label = "ALIGNED" if ctx.get("momentum_aligned") is True else "OPPOSED" if ctx.get("momentum_aligned") is False else "?"
+        trigger = meta.get("entry_trigger_owner") or meta.get("entry_trigger") or meta.get("direction_15m", "WAIT")
+        _final_logger.info(
+            "[SCAN V5.%s] %s %s px=%.4f sig=%s | L1 4H=%s score=%s/100 (B=%s S=%s) | "
+            "L2 1H=%s Q=%s/100 [ADX %s=%s/25 | CHOP %s=%s/20 | STRUCT %s=%s/20 | "
+            "MOM %s=%s/15 | ROOM %sR=%s/20] hard=%s | 15M=%s | %s",
+            version,
+            strategy_name, symbol, price, sig_type,
+            macro.get("state", "?"), macro.get("score", "?"), macro.get("bull_score", "?"), macro.get("bear_score", "?"),
+            ctx.get("label", "?"), ctx.get("score", "?"),
+            ctx.get("adx", "?"), comp.get("adx", "?"),
+            ctx.get("chop", "?"), comp.get("chop", "?"),
+            str(ctx.get("structure", "?")).upper(), comp.get("structure", "?"),
+            mom_label, comp.get("momentum", "?"),
+            ctx.get("room_r", "?"), comp.get("room", "?"),
+            ctx.get("hard_block", "?"), trigger, getattr(signal, "reason", ""),
+        )
+        return
     return _FINAL_FALLBACK_LOG(self, symbol, strategy_name, price, signal)
 
 
 TradingBot._log_scan = _final_component_log
 TradingBot._trend_confirm_final_component_log_installed = True
-logger.warning("[VIEWLOG] Final Trend Confirm component logger installed AFTER all runtime patches")
+logger.warning("[VIEWLOG V5.1] FINAL component logger installed; legacy TrendConfirm formatter disabled")
 
 
 if __name__ == "__main__":
