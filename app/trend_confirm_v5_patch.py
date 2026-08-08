@@ -7,10 +7,12 @@ import os
 import run_bot
 import run_enhanced_dual_bot as enhanced
 from trading.bot import TradingBot
+from trading.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("trend_confirm_v5_patch")
 _ORIGINAL_FACTORY = enhanced._make_merged_trend_confirm
 _ORIGINAL_LOG_SCAN = TradingBot._log_scan
+_ORIGINAL_BUILD_CAPTION = TelegramNotifier.build_order_caption
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -88,12 +90,39 @@ def _log_scan(self, symbol, strategy_name, price, signal):
     return _ORIGINAL_LOG_SCAN(self, symbol, strategy_name, price, signal)
 
 
+def _caption_v5(self, *args, **kwargs):
+    text = _ORIGINAL_BUILD_CAPTION(self, *args, **kwargs)
+    if "Trend Confirm" not in str(text):
+        return text
+    lines = str(text).splitlines()
+    out = []
+    t1_done = False
+    runner_done = False
+    for line in lines:
+        if line.startswith("🎯 T1") or (line.startswith("🎯 Target") and not t1_done):
+            out.append("🎯 T1 : `+1.0R` → take profit `40%` → runner SL `BE`")
+            t1_done = True
+            continue
+        if line.startswith("🔒 Runner"):
+            out.append("🔒 Runner `60%` : TP2 `+2.0R` | or entry-owner signal exit")
+            runner_done = True
+            continue
+        out.append(line)
+    if t1_done and not runner_done:
+        idx = next((i for i, x in enumerate(out) if x.startswith("🎯 T1")), len(out)-1)
+        out.insert(idx + 1, "🔒 Runner `60%` : TP2 `+2.0R` | or entry-owner signal exit")
+    return "\n".join(out)
+
+
 def install() -> None:
     enhanced._make_merged_trend_confirm = _factory
     run_bot._make_strategies = _factory
     if not getattr(TradingBot, "_trend_confirm_v5_log_installed", False):
         TradingBot._log_scan = _log_scan
         TradingBot._trend_confirm_v5_log_installed = True
+    if not getattr(TelegramNotifier, "_trend_confirm_v5_caption_installed", False):
+        TelegramNotifier.build_order_caption = _caption_v5
+        TelegramNotifier._trend_confirm_v5_caption_installed = True
     logger.warning("[TREND CONFIRM V5] installed: simplified 4H direction + 1H quality + RR 1:2")
 
 
