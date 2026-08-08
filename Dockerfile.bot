@@ -1,9 +1,9 @@
 # Unified trading-bot image — ALL systems baked in, chosen by env MODE:
-#   MODE=dual       -> DUAL ENTRY PRECISION V1.4 (default)
+#   MODE=ema_hybrid -> EMA Hybrid Pro (production default)
+#   MODE=dual       -> DUAL ENTRY PRECISION V1.4
 #   MODE=regime     -> Signal Regime Bias bot (legacy)
 #   MODE=htf        -> HTF pullback bot
 #   MODE=tpc        -> Trend Pullback Continuation / HMA bot
-#   MODE=ema_hybrid -> EMA Hybrid Pro
 # /app/main.py is the launcher; MODE selects the runtime.
 FROM python:3.11-slim
 
@@ -23,6 +23,10 @@ COPY htf_bot/ htf_bot/
 COPY hma_bot/ hma_bot/
 COPY ema_hybrid_bot/ ema_hybrid_bot/
 COPY launcher.py main.py
+
+# Railway can override MODE explicitly for another runtime. If it is omitted,
+# this image must run the EMA Hybrid bot rather than silently starting DUAL.
+ENV MODE=ema_hybrid
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \
   CMD python -c "import os, sys; sys.exit(0)"
