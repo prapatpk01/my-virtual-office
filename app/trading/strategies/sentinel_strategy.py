@@ -1,4 +1,4 @@
-"""Sentinel V1.5 — 1H S/R map + fast 15M execution + adaptive open-sky proximity.
+"""Sentinel V1.6 — 1H S/R map + fast 15M execution + relative MCDX dominance.
 
 Core rules
 - 1H ONLY builds S1/S2/R1/R2 and ATR14.
@@ -6,13 +6,15 @@ Core rules
 - LONG requires 1H S1+S2. If R1 exists, S1->R1 room and actual RR must pass.
   If NO 1H R1 exists (price is above all confirmed 1H resistance), LONG is allowed
   as OPEN_SKY: SL stays below S2 and there is no fixed TP.
-- In normal mapped trades the S1/R1 execution proximity is 0.20 ATR(1H).
+- In normal mapped trades the S1/R1 execution proximity is 0.30 ATR(1H).
 - In OPEN_SKY/OPEN_FLOOR only, execution proximity expands to as much as
-  0.50 ATR(1H) because there is no opposing confirmed 1H target nearby.
+  0.60 ATR(1H) because there is no opposing confirmed 1H target nearby.
 - SHORT is the inverse: requires R1+R2; if no S1 exists, OPEN_FLOOR short is allowed
   with no fixed TP.
 - Open-ended positions are closed once the opposite 1H target level appears and
   15M confirms reversal at that level OR 15M structure flips against the position.
+- MCDX confirms relative directional dominance rather than requiring an absolute
+  65 score: LONG needs L>45, L-S>10 and flow>52; SHORT is the inverse.
 
 Sentinel X + MCDX remain context validators; they never replace the 1H location map.
 """
@@ -25,31 +27,37 @@ from .base import BaseStrategy, Signal, SignalType
 
 
 class SentinelStrategy(BaseStrategy):
-    VERSION = "1.5"
+    VERSION = "1.6"
     entry_tf = "15m"
 
     def __init__(
         self,
         symbol: str,
         params: Optional[dict] = None,
-        min_context_score: float = 65.0,
+        min_context_score: float = 45.0,
+        mcdx_dominance_gap: float = 10.0,
+        long_flow_min: float = 52.0,
+        short_flow_max: float = 48.0,
         min_location_atr: float = 1.20,
         min_rr: float = 1.50,
         entry_zone_atr: float = 0.30,
-        reversal_proximity_atr: float = 0.20,
-        open_ended_proximity_atr: float = 0.50,
+        reversal_proximity_atr: float = 0.30,
+        open_ended_proximity_atr: float = 0.60,
         sl_buffer_atr: float = 0.15,
         pivot_span: int = 3,
     ):
         super().__init__(symbol, params)
         self.min_context_score = float(min_context_score)
+        self.mcdx_dominance_gap = max(0.0, float(mcdx_dominance_gap))
+        self.long_flow_min = float(long_flow_min)
+        self.short_flow_max = float(short_flow_max)
         self.min_location_atr = float(min_location_atr)
         self.min_rr = float(min_rr)
         self.entry_zone_atr = float(entry_zone_atr)
         self.reversal_proximity_atr = max(0.05, float(reversal_proximity_atr))
         self.open_ended_proximity_atr = max(
             self.reversal_proximity_atr,
-            min(0.50, float(open_ended_proximity_atr)),
+            min(0.60, float(open_ended_proximity_atr)),
         )
         self.sl_buffer_atr = float(sl_buffer_atr)
         self.pivot_span = max(2, int(pivot_span))
@@ -270,8 +278,8 @@ class SentinelStrategy(BaseStrategy):
         if self._open_position is not None:
             return Signal(SignalType.HOLD,self.symbol,current_price,0.0,f"Managing {self._open_position.upper()} | open_ended={self._open_ended}",metadata=meta)
 
-        # Normal mapped entries use 0.20 ATR proximity. If the opposing 1H
-        # target does not exist, widen only that open-ended direction to 0.50 ATR.
+        # Normal mapped entries use 0.30 ATR proximity. If the opposing 1H
+        # target does not exist, widen only that open-ended direction to 0.60 ATR.
         long_prox = self.open_ended_proximity_atr if sr.get("open_sky_long") else self.reversal_proximity_atr
         short_prox = self.open_ended_proximity_atr if sr.get("open_floor_short") else self.reversal_proximity_atr
         trg=self._entry_triggers_15m(
@@ -284,8 +292,25 @@ class SentinelStrategy(BaseStrategy):
             "short_entry_proximity_atr":round(short_prox,2),
         })
 
-        long_context=(sx.get("bias")!="BEAR" and sx.get("structure")!="BEAR" and (sx.get("sme_bull") or sx.get("bias")=="BULL") and mc.get("long_score",0)>=self.min_context_score and mc.get("smart_flow",50)>=52)
-        short_context=(sx.get("bias")!="BULL" and sx.get("structure")!="BULL" and (sx.get("sme_bear") or sx.get("bias")=="BEAR") and mc.get("short_score",0)>=self.min_context_score and mc.get("smart_flow",50)<=48)
+        long_score=float(mc.get("long_score",0) or 0)
+        short_score=float(mc.get("short_score",0) or 0)
+        smart_flow=float(mc.get("smart_flow",50) or 50)
+        long_gap=long_score-short_score
+        short_gap=short_score-long_score
+        mcdx_long_pass=bool(long_score>self.min_context_score and long_gap>self.mcdx_dominance_gap and smart_flow>self.long_flow_min)
+        mcdx_short_pass=bool(short_score>self.min_context_score and short_gap>self.mcdx_dominance_gap and smart_flow<self.short_flow_max)
+        meta["mcdx_gate"]={
+            "long_pass":mcdx_long_pass,"short_pass":mcdx_short_pass,
+            "long_score":round(long_score,1),"short_score":round(short_score,1),
+            "long_gap":round(long_gap,1),"short_gap":round(short_gap,1),
+            "min_score_strict_gt":self.min_context_score,
+            "dominance_gap_strict_gt":self.mcdx_dominance_gap,
+            "long_flow_strict_gt":self.long_flow_min,
+            "short_flow_strict_lt":self.short_flow_max,
+        }
+
+        long_context=(sx.get("bias")!="BEAR" and sx.get("structure")!="BEAR" and (sx.get("sme_bull") or sx.get("bias")=="BULL") and mcdx_long_pass)
+        short_context=(sx.get("bias")!="BULL" and sx.get("structure")!="BULL" and (sx.get("sme_bear") or sx.get("bias")=="BEAR") and mcdx_short_pass)
 
         if sr.get("long_map_ready") and trg["long"] and long_context:
             long_sl=float(s2)-self.sl_buffer_atr*atr_1h
@@ -294,7 +319,7 @@ class SentinelStrategy(BaseStrategy):
                 if r1 is None:
                     self._open_position="long"; self._entry_price=close; self._entry_sl=long_sl; self._open_ended=True
                     meta.update({"entry_location":"1H_S1","entry_trigger":trg["long_name"],"stop_loss":long_sl,"take_profit":None,"open_ended_tp":True,"tp_basis":"DYNAMIC_R1_OR_STRUCTURE_EXIT","stop_basis":"BELOW_1H_S2","room_mode":"OPEN_SKY","entry_proximity_atr":round(long_prox,2)})
-                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | OPEN_SKY no 1H R1 | proximity {long_prox:.2f}ATR1H | SL below S2 | dynamic exit",confidence=min(1.0,0.50+mc.get("long_score",0)/200.0),metadata=meta)
+                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | OPEN_SKY no 1H R1 | proximity {long_prox:.2f}ATR1H | MCDX L={long_score:.1f} S={short_score:.1f} Δ={long_gap:.1f} flow={smart_flow:.1f} | SL below S2 | dynamic exit",confidence=min(1.0,0.50+long_score/200.0),metadata=meta)
                 location_atr=(float(r1)-float(s1))/atr_1h
                 long_reward=float(r1)-close
                 long_rr=long_reward/long_risk if long_risk>0 else 0.0
@@ -302,7 +327,7 @@ class SentinelStrategy(BaseStrategy):
                 if location_atr>=self.min_location_atr and long_reward>0 and long_rr>=self.min_rr:
                     self._open_position="long"; self._entry_price=close; self._entry_sl=long_sl; self._open_ended=False
                     meta.update({"entry_location":"1H_S1","entry_trigger":trg["long_name"],"stop_loss":long_sl,"take_profit":float(r1),"open_ended_tp":False,"tp_basis":"1H_R1","stop_basis":"BELOW_1H_S2","rr_ratio":round(long_rr,2),"room_mode":"FIXED_R1","entry_proximity_atr":round(long_prox,2)})
-                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | room {location_atr:.2f}ATR1H | RR {long_rr:.2f}",confidence=min(1.0,0.50+mc.get("long_score",0)/200.0),metadata=meta)
+                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | room {location_atr:.2f}ATR1H | RR {long_rr:.2f} | MCDX L={long_score:.1f} S={short_score:.1f} Δ={long_gap:.1f} flow={smart_flow:.1f}",confidence=min(1.0,0.50+long_score/200.0),metadata=meta)
 
         if sr.get("short_map_ready") and trg["short"] and short_context:
             short_sl=float(r2)+self.sl_buffer_atr*atr_1h
@@ -311,7 +336,7 @@ class SentinelStrategy(BaseStrategy):
                 if s1 is None:
                     self._open_position="short"; self._entry_price=close; self._entry_sl=short_sl; self._open_ended=True
                     meta.update({"entry_location":"1H_R1","entry_trigger":trg["short_name"],"stop_loss":short_sl,"take_profit":None,"open_ended_tp":True,"tp_basis":"DYNAMIC_S1_OR_STRUCTURE_EXIT","stop_basis":"ABOVE_1H_R2","room_mode":"OPEN_FLOOR","entry_proximity_atr":round(short_prox,2)})
-                    return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trg['short_name']} | OPEN_FLOOR no 1H S1 | proximity {short_prox:.2f}ATR1H | SL above R2 | dynamic exit",confidence=min(1.0,0.50+mc.get("short_score",0)/200.0),metadata=meta)
+                    return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trg['short_name']} | OPEN_FLOOR no 1H S1 | proximity {short_prox:.2f}ATR1H | MCDX S={short_score:.1f} L={long_score:.1f} Δ={short_gap:.1f} flow={smart_flow:.1f} | SL above R2 | dynamic exit",confidence=min(1.0,0.50+short_score/200.0),metadata=meta)
                 location_atr=(float(r1)-float(s1))/atr_1h
                 short_reward=close-float(s1)
                 short_rr=short_reward/short_risk if short_risk>0 else 0.0
@@ -319,13 +344,15 @@ class SentinelStrategy(BaseStrategy):
                 if location_atr>=self.min_location_atr and short_reward>0 and short_rr>=self.min_rr:
                     self._open_position="short"; self._entry_price=close; self._entry_sl=short_sl; self._open_ended=False
                     meta.update({"entry_location":"1H_R1","entry_trigger":trg["short_name"],"stop_loss":short_sl,"take_profit":float(s1),"open_ended_tp":False,"tp_basis":"1H_S1","stop_basis":"ABOVE_1H_R2","rr_ratio":round(short_rr,2),"room_mode":"FIXED_S1","entry_proximity_atr":round(short_prox,2)})
-                    return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trg['short_name']} | room {location_atr:.2f}ATR1H | RR {short_rr:.2f}",confidence=min(1.0,0.50+mc.get("short_score",0)/200.0),metadata=meta)
+                    return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trg['short_name']} | room {location_atr:.2f}ATR1H | RR {short_rr:.2f} | MCDX S={short_score:.1f} L={long_score:.1f} Δ={short_gap:.1f} flow={smart_flow:.1f}",confidence=min(1.0,0.50+short_score/200.0),metadata=meta)
 
         reasons=[]
         if not sr.get("long_map_ready"): reasons.append("LONG needs 1H S1+S2")
         if not sr.get("short_map_ready"): reasons.append("SHORT needs 1H R1+R2")
         if sr.get("open_sky_long"): reasons.append(f"LONG OPEN_SKY armed zone <= {long_prox:.2f} ATR1H from S1")
         if sr.get("open_floor_short"): reasons.append(f"SHORT OPEN_FLOOR armed zone <= {short_prox:.2f} ATR1H from R1")
+        if not mcdx_long_pass and not mcdx_short_pass:
+            reasons.append(f"MCDX wait L={long_score:.1f} S={short_score:.1f} ΔL={long_gap:.1f} ΔS={short_gap:.1f} flow={smart_flow:.1f}")
         if not reasons: reasons.append("WAIT 15M trigger/context at 1H S1/R1")
         return Signal(SignalType.HOLD,self.symbol,current_price,0.0,"; ".join(reasons),metadata=meta)
 
