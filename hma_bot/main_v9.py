@@ -1,11 +1,15 @@
 """HMA Expert MTF V3.7 — FX 24/5 new-entry schedule.
 
-New positions:
+Live mode new positions:
 - allowed Monday through Thursday,
 - allowed Friday until 17:00 New York,
 - paused after the FX weekly close,
 - enabled again Sunday at 13:00 New York, four hours before the conventional
   Sunday 17:00 New York FX open.
+
+Paper mode intentionally scans 24/7 by default so strategy validation is not
+blocked by the live FX calendar. Set PAPER_24_7_ENTRIES=false if paper mode
+should mimic the live FX session gate.
 
 Open positions continue to be monitored and managed 24/7.  This gate never
 pauses native OKX SL/TP, stage locks, close detection, or restart recovery.
@@ -51,7 +55,13 @@ def _v37_text(text: str) -> str:
 class Bot(v8.Bot):
     def __init__(self):
         super().__init__()
-        self.fx_24_5_enabled = _env_bool("FX_24_5_ENABLED", True)
+        # LIVE keeps the FX 24/5 gate. PAPER is 24/7 by default so weekend
+        # validation can actually produce simulated entries. An explicit
+        # FX_24_5_ENABLED value still overrides this default for either mode.
+        paper_24_7 = _env_bool("PAPER_24_7_ENTRIES", True)
+        default_fx_gate = not (self.cfg.paper and paper_24_7)
+        self.fx_24_5_enabled = _env_bool("FX_24_5_ENABLED", default_fx_gate)
+        self.paper_24_7_entries = self.cfg.paper and paper_24_7
         self.fx_preopen_hours = max(0, min(_env_int("FX_PREOPEN_HOURS", 4), 23))
         self._fx_session_status: str | None = None
 
@@ -96,8 +106,10 @@ class Bot(v8.Bot):
         )
 
     async def _look_for_entry(self, symbol: str, st: dict):
-        """Apply the FX calendar only to NEW entries, never position management."""
+        """Apply the FX calendar only to live NEW entries, never management."""
         if not self.fx_24_5_enabled:
+            if self.paper_24_7_entries:
+                self._view[symbol] = "PAPER 24/7 SCAN | FX session gate bypassed"
             return await super()._look_for_entry(symbol, st)
 
         state = fx_entry_session(preopen_hours=self.fx_preopen_hours)
@@ -114,6 +126,20 @@ class Bot(v8.Bot):
 
     async def start(self):
         await super().start()
+
+        if self.paper_24_7_entries and not _env_bool("FX_24_5_ENABLED", False):
+            _LOG.info(
+                "HMA V3.7 PAPER 24/7 entry scan active: FX weekend gate bypassed; "
+                "set PAPER_24_7_ENTRIES=false or FX_24_5_ENABLED=true to mimic live schedule"
+            )
+            await self.tg.send_text(
+                "🧪 *PAPER 24/7 Entry Scan — ACTIVE*\n"
+                "FX weekend sleep gate is bypassed in paper mode.\n"
+                "The bot will continue scanning and can create paper entries 24/7.\n"
+                "Existing positions remain managed 24/7."
+            )
+            return
+
         state = fx_entry_session(preopen_hours=self.fx_preopen_hours)
         await self._announce_session_transition(state)
         schedule = (
