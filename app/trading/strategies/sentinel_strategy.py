@@ -8,17 +8,23 @@ indicators. This strategy intentionally keeps responsibilities simple:
 3) Location is the actual entry engine.
 
 LONG
-- enter from S1 only after a confirmed reclaim/rejection at S1
+- normal trigger: reclaim/rejection at S1
+- early reversal trigger: previous completed candle approaches S1 within 0.20 ATR
+  without breaking below S1, then the next completed candle closes back above the
+  0.20 ATR proximity band and moves away from S1
 - SL below S2 by a small ATR buffer
 - TP at R1
 
 SHORT
-- enter from R1 only after a confirmed rejection/reclaim downward at R1
+- normal trigger: rejection/reclaim downward at R1
+- early reversal trigger: previous completed candle approaches R1 within 0.20 ATR
+  without breaking above R1, then the next completed candle closes back below the
+  0.20 ATR proximity band and moves away from R1
 - SL above R2 by a small ATR buffer
 - TP at S1
 
-A trade is rejected when S1<->R1 room is too small or the actual TP/SL R:R is below
-minimum. S2/R2 are mandatory because the requested stop is beyond those levels.
+No trade is allowed unless S1<->R1 has enough profit room AND the actual TP/SL R:R
+passes the configured minimum. S2/R2 are mandatory because stops are beyond them.
 """
 from __future__ import annotations
 
@@ -30,7 +36,7 @@ from .base import BaseStrategy, Signal, SignalType
 
 
 class SentinelStrategy(BaseStrategy):
-    VERSION = "1.0"
+    VERSION = "1.1"
 
     def __init__(
         self,
@@ -40,6 +46,7 @@ class SentinelStrategy(BaseStrategy):
         min_location_atr: float = 1.20,
         min_rr: float = 1.50,
         entry_zone_atr: float = 0.30,
+        reversal_proximity_atr: float = 0.20,
         sl_buffer_atr: float = 0.15,
         sr_merge_atr: float = 0.65,
         pivot_span: int = 4,
@@ -49,6 +56,7 @@ class SentinelStrategy(BaseStrategy):
         self.min_location_atr = float(min_location_atr)
         self.min_rr = float(min_rr)
         self.entry_zone_atr = float(entry_zone_atr)
+        self.reversal_proximity_atr = max(0.05, float(reversal_proximity_atr))
         self.sl_buffer_atr = float(sl_buffer_atr)
         self.sr_merge_atr = float(sr_merge_atr)
         self.pivot_span = max(2, int(pivot_span))
@@ -85,8 +93,6 @@ class SentinelStrategy(BaseStrategy):
         h1_h, h1_l = self._confirmed_pivots(h1[-100:], 3) if h1 else ([], [])
         h4_h, h4_l = self._confirmed_pivots(h4[-100:], 3) if h4 else ([], [])
 
-        # Keep the last two local pivots and the last HTF pivot from each timeframe,
-        # mirroring the four-candidate pool used by Sentinel X.
         resistance_pool = (local_h[-2:] + h1_h[-1:] + h4_h[-1:])
         support_pool = (local_l[-2:] + h1_l[-1:] + h4_l[-1:])
         resistance_pool = sorted({float(x) for x in resistance_pool if float(x) > price})
@@ -97,9 +103,6 @@ class SentinelStrategy(BaseStrategy):
         s1 = support_pool[0] if support_pool else None
         s2 = support_pool[1] if len(support_pool) > 1 else None
 
-        # Merge close levels the same way Sentinel X does. If merging would remove
-        # S2/R2 we keep the farther raw level for stop construction; entry/TP levels
-        # use the merged primary zone.
         r1_raw, r2_raw, s1_raw, s2_raw = r1, r2, s1, s2
         if r1 is not None and r2 is not None and abs(r2-r1) <= atr*self.sr_merge_atr:
             r1 = (r1+r2)/2.0
@@ -157,7 +160,6 @@ class SentinelStrategy(BaseStrategy):
         retail_falling = retail < retail_sma and retail < retail_hist[-2]
         retail_rising = retail > retail_sma and retail > retail_hist[-2]
 
-        # Volume flow: OBV + VWAP location + recent up/down volume agreement.
         signed = np.sign(np.diff(closes, prepend=closes[0])) * vols
         obv = np.cumsum(signed)
         obv20 = obv[-20:]
@@ -203,9 +205,6 @@ class SentinelStrategy(BaseStrategy):
         structure=self._structure(candles)
         struct_bias=1 if structure=="BULL" else -1 if structure=="BEAR" else 0
 
-        # Preserve MCDX v3 score architecture. Liquidity memory is deliberately
-        # neutral here (0) because this location strategy already uses S1/R1 as
-        # the execution location rather than double-counting a sweep condition.
         long_score=(30.0 if smart>=55 else 18.0 if smart>=50 else 0.0)+(25.0 if smart_flow>=60 else 15.0 if smart_flow>=52 else 0.0)+(20.0 if struct_bias==1 else 8.0 if struct_bias==0 else 0.0)+(10.0 if htf_bull else 0.0)
         short_score=(30.0 if smart<=45 else 18.0 if smart<=50 else 0.0)+(25.0 if smart_flow<=40 else 15.0 if smart_flow<=48 else 0.0)+(20.0 if struct_bias==-1 else 8.0 if struct_bias==0 else 0.0)+(10.0 if htf_bear else 0.0)
 
@@ -226,7 +225,6 @@ class SentinelStrategy(BaseStrategy):
         structure=self._structure(candles)
         bull=bool(e20[-1]>=e50[-1] and e20[-1]>e20[-4] and closes[-1]>=e20[-1])
         bear=bool(e20[-1]<=e50[-1] and e20[-1]<e20[-4] and closes[-1]<=e20[-1])
-        # SME-style fast/core directional proxy: HMA slope + MACD histogram + RSI.
         _,_,hist=self.macd(closes,12,26,9); r=self.rsi(closes,14)
         fast=(float(hma16[-1]-hma16[-3]) if np.isfinite(hma16[-1]) and np.isfinite(hma16[-3]) else 0.0)
         histv=float(hist[-1]) if np.isfinite(hist[-1]) else 0.0; rsiv=float(r[-1]) if np.isfinite(r[-1]) else 50.0
@@ -247,9 +245,12 @@ class SentinelStrategy(BaseStrategy):
         if atr<=0:
             return Signal(SignalType.HOLD,self.symbol,current_price,0.0,"ATR unavailable",metadata={"strategy":"SENTINEL","version":self.VERSION})
 
-        # Use the last completed bar for trigger confirmation.
+        # Both reversal legs use completed candles only. Signal generated after the
+        # departure candle closes, so the next scan/order is the earliest safe entry.
         bar=candles[-1]; prev=candles[-2]
         close=float(bar.close); op=float(bar.open); low=float(bar.low); high=float(bar.high)
+        prev_close=float(prev.close); prev_low=float(prev.low); prev_high=float(prev.high)
+
         sr=self._adaptive_sr(candles,mtf_candles or {},close,atr)
         s1,s2,r1,r2=sr["s1"],sr["s2"],sr["r1"],sr["r2"]
         sx=self._sentinel_context(candles,mtf_candles or {})
@@ -259,16 +260,46 @@ class SentinelStrategy(BaseStrategy):
         if any(v is None for v in (s1,s2,r1,r2)):
             return Signal(SignalType.HOLD,self.symbol,current_price,0.0,"Need complete S1/S2/R1/R2 structure",metadata=meta)
 
+        # Gate 1: absolute S1 -> R1 target room. This is evaluated before every
+        # entry trigger, including proximity reversals. Close S1/R1 means NO TRADE.
         location_atr=(r1-s1)/atr
         meta["location_atr"]=round(location_atr,2)
+        meta["min_location_atr"]=self.min_location_atr
         if location_atr < self.min_location_atr:
-            return Signal(SignalType.HOLD,self.symbol,current_price,0.0,f"S1-R1 room too small ({location_atr:.2f} ATR < {self.min_location_atr:.2f})",metadata=meta)
+            meta["room_gate"]="BLOCK"
+            return Signal(SignalType.HOLD,self.symbol,current_price,0.0,f"S1-R1 profit room BLOCK ({location_atr:.2f} ATR < {self.min_location_atr:.2f})",metadata=meta)
+        meta["room_gate"]="PASS"
 
         zone=self.entry_zone_atr*atr
+        proximity=self.reversal_proximity_atr*atr
+
+        # Existing same-bar reclaim/rejection trigger.
         long_at_s1=(low <= s1+zone and close >= s1 and close>op)
         short_at_r1=(high >= r1-zone and close <= r1 and close<op)
 
-        # Stops are explicitly beyond S2/R2 as requested.
+        # NEW two-candle proximity reversal trigger.
+        # LONG: previous candle approaches from ABOVE and never breaks S1. The next
+        # completed candle closes above the 0.20 ATR band and farther away than the
+        # previous close. No need to wait for a literal touch of S1.
+        long_near_s1=(prev_low >= s1 and prev_low <= s1+proximity)
+        long_departed=(close > s1+proximity and close > prev_close and close > op)
+        long_proximity_reversal=bool(long_near_s1 and long_departed)
+
+        # SHORT is the exact inverse around R1.
+        short_near_r1=(prev_high <= r1 and prev_high >= r1-proximity)
+        short_departed=(close < r1-proximity and close < prev_close and close < op)
+        short_proximity_reversal=bool(short_near_r1 and short_departed)
+
+        meta.update({
+            "reversal_proximity_atr":self.reversal_proximity_atr,
+            "long_near_s1":long_near_s1,
+            "long_departed":long_departed,
+            "long_proximity_reversal":long_proximity_reversal,
+            "short_near_r1":short_near_r1,
+            "short_departed":short_departed,
+            "short_proximity_reversal":short_proximity_reversal,
+        })
+
         long_sl=s2-self.sl_buffer_atr*atr
         long_tp=r1
         short_sl=r2+self.sl_buffer_atr*atr
@@ -279,21 +310,31 @@ class SentinelStrategy(BaseStrategy):
         short_rr=(short_reward/short_risk) if short_risk>0 else 0.0
         meta.update({"long_rr":round(long_rr,2),"short_rr":round(short_rr,2),"long_sl":long_sl,"long_tp":long_tp,"short_sl":short_sl,"short_tp":short_tp})
 
+        # Sentinel X + MCDX remain directional/context validators. They do not create
+        # the entry; location/reversal does. This keeps the two supplied indicators
+        # in the analysis while allowing the requested early ATR reversal trigger.
         long_context=(sx.get("bias")!="BEAR" and sx.get("structure")!="BEAR" and (sx.get("sme_bull") or sx.get("bias")=="BULL") and mc.get("long_score",0)>=self.min_context_score and mc.get("smart_flow",50)>=52)
         short_context=(sx.get("bias")!="BULL" and sx.get("structure")!="BULL" and (sx.get("sme_bear") or sx.get("bias")=="BEAR") and mc.get("short_score",0)>=self.min_context_score and mc.get("smart_flow",50)<=48)
 
-        if long_at_s1 and long_context and long_rr>=self.min_rr and long_reward>0:
-            meta.update({"entry_location":"S1","stop_basis":"BELOW_S2","tp_basis":"R1","stop_loss":long_sl,"take_profit":long_tp,"rr_ratio":round(long_rr,2),"entry_trigger":"S1_RECLAIM"})
-            return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG: S1 reclaim | TP R1 | SL below S2 | room {location_atr:.2f}ATR | RR {long_rr:.2f} | MCDX {mc.get('long_score')}",confidence=min(1.0,0.50+mc.get("long_score",0)/200.0),metadata=meta)
+        long_trigger=long_at_s1 or long_proximity_reversal
+        short_trigger=short_at_r1 or short_proximity_reversal
 
-        if short_at_r1 and short_context and short_rr>=self.min_rr and short_reward>0:
-            meta.update({"entry_location":"R1","stop_basis":"ABOVE_R2","tp_basis":"S1","stop_loss":short_sl,"take_profit":short_tp,"rr_ratio":round(short_rr,2),"entry_trigger":"R1_REJECTION"})
-            return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT: R1 rejection | TP S1 | SL above R2 | room {location_atr:.2f}ATR | RR {short_rr:.2f} | MCDX {mc.get('short_score')}",confidence=min(1.0,0.50+mc.get("short_score",0)/200.0),metadata=meta)
+        if long_trigger and long_context and long_rr>=self.min_rr and long_reward>0:
+            trigger="S1_NEAR_0.20ATR_REVERSAL" if long_proximity_reversal else "S1_RECLAIM"
+            meta.update({"entry_location":"S1","stop_basis":"BELOW_S2","tp_basis":"R1","stop_loss":long_sl,"take_profit":long_tp,"rr_ratio":round(long_rr,2),"entry_trigger":trigger})
+            return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG: {trigger} | TP R1 | SL below S2 | room {location_atr:.2f}ATR | RR {long_rr:.2f} | MCDX {mc.get('long_score')}",confidence=min(1.0,0.50+mc.get("long_score",0)/200.0),metadata=meta)
+
+        if short_trigger and short_context and short_rr>=self.min_rr and short_reward>0:
+            trigger="R1_NEAR_0.20ATR_REVERSAL" if short_proximity_reversal else "R1_REJECTION"
+            meta.update({"entry_location":"R1","stop_basis":"ABOVE_R2","tp_basis":"S1","stop_loss":short_sl,"take_profit":short_tp,"rr_ratio":round(short_rr,2),"entry_trigger":trigger})
+            return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT: {trigger} | TP S1 | SL above R2 | room {location_atr:.2f}ATR | RR {short_rr:.2f} | MCDX {mc.get('short_score')}",confidence=min(1.0,0.50+mc.get("short_score",0)/200.0),metadata=meta)
 
         reasons=[]
-        if long_at_s1 and not long_context: reasons.append("S1 touched but LONG context not confirmed")
-        elif short_at_r1 and not short_context: reasons.append("R1 touched but SHORT context not confirmed")
-        elif long_at_s1 and long_rr<self.min_rr: reasons.append(f"LONG RR {long_rr:.2f} < {self.min_rr:.2f}")
-        elif short_at_r1 and short_rr<self.min_rr: reasons.append(f"SHORT RR {short_rr:.2f} < {self.min_rr:.2f}")
+        if long_trigger and not long_context: reasons.append("S1 reversal ready but LONG context not confirmed")
+        elif short_trigger and not short_context: reasons.append("R1 reversal ready but SHORT context not confirmed")
+        elif long_trigger and long_rr<self.min_rr: reasons.append(f"LONG trigger but RR {long_rr:.2f} < {self.min_rr:.2f}")
+        elif short_trigger and short_rr<self.min_rr: reasons.append(f"SHORT trigger but RR {short_rr:.2f} < {self.min_rr:.2f}")
+        elif long_near_s1 and not long_departed: reasons.append(f"ARMED LONG: S1 within {self.reversal_proximity_atr:.2f}ATR; waiting bullish departure close")
+        elif short_near_r1 and not short_departed: reasons.append(f"ARMED SHORT: R1 within {self.reversal_proximity_atr:.2f}ATR; waiting bearish departure close")
         else: reasons.append("WAIT location: LONG@S1 / SHORT@R1")
         return Signal(SignalType.HOLD,self.symbol,current_price,0.0,"; ".join(reasons),metadata=meta)
