@@ -104,6 +104,7 @@ def _make_strategies(symbols: list, config: dict):
                 entry_zone_atr=_env_float("SENTINEL_ENTRY_ZONE_ATR", 0.30),
                 reversal_proximity_atr=_env_float("SENTINEL_REVERSAL_PROXIMITY_ATR", 0.30),
                 open_ended_proximity_atr=_env_float("SENTINEL_OPEN_ENDED_PROXIMITY_ATR", 0.60),
+                open_ended_max_proximity_atr=_env_float("SENTINEL_OPEN_ENDED_MAX_PROXIMITY_ATR", 1.50),
                 sl_buffer_atr=_env_float("SENTINEL_SL_BUFFER_ATR", 0.15),
                 pivot_span=_env_int("SENTINEL_PIVOT_SPAN", 4),
             ))
@@ -175,12 +176,19 @@ def _router_log_scan(self, symbol, strategy_name, price, signal):
         s_gap = gate.get("short_gap", "?")
         l_pass = "PASS" if gate.get("long_pass") else "BLOCK"
         s_pass = "PASS" if gate.get("short_pass") else "BLOCK"
+        l_prox = meta.get("long_entry_proximity_atr", "?")
+        s_prox = meta.get("short_entry_proximity_atr", "?")
         scan_logger.info(
-            "[SCAN SENTINEL] %s %s px=%.4f sig=%s | S2=%s S1=%s R1=%s R2=%s | GAP=%s = %sATR1H [%s min=%.2f] | SX=%s/%s | MCDX L=%s S=%s flow=%s [LONG %s Δ=%s | SHORT %s Δ=%s] | RR L=%s S=%s | %s",
+            "[SCAN SENTINEL] %s %s px=%.4f sig=%s | S2=%s(%s) S1=%s(%s) R1=%s(%s) R2=%s(%s) | GAP=%s = %sATR1H [%s min=%.2f] | PROX L=%sATR(%s) S=%sATR(%s) | SX=%s/%s | MCDX L=%s S=%s flow=%s [LONG %s Δ=%s | SHORT %s Δ=%s] | RR L=%s S=%s | %s",
             strategy_name, symbol, price,
             getattr(getattr(signal, "type", None), "value", "hold").upper(),
-            meta.get("s2", "?"), s1 if s1 is not None else "?", r1 if r1 is not None else "?", meta.get("r2", "?"),
+            meta.get("s2", "?"), meta.get("s2_source", "?"),
+            s1 if s1 is not None else "?", meta.get("s1_source", "?"),
+            r1 if r1 is not None else "?", meta.get("r1_source", "?"),
+            meta.get("r2", "?"), meta.get("r2_source", "?"),
             gap_text, room_text, room_status, min_room,
+            l_prox, meta.get("long_proximity_mode", "?"),
+            s_prox, meta.get("short_proximity_mode", "?"),
             sx.get("bias", "?"), sx.get("structure", "?"),
             l_score, s_score, flow, l_pass, l_gap, s_pass, s_gap,
             meta.get("long_rr", "?"), meta.get("short_rr", "?"), getattr(signal, "reason", ""),
