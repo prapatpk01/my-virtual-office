@@ -1,4 +1,4 @@
-"""Sentinel V1.9 — 1H S/R map + fast 15M execution + dynamic proximity.
+"""Sentinel V1.10 — 1H S/R map + fast 15M execution + dynamic proximity.
 
 Core rules
 - 1H ONLY builds S1/S2/R1/R2 and ATR14.
@@ -14,7 +14,7 @@ Core rules
 - Normal mapped proximity is 0.30 ATR while S1-R1 room is <= 3.0 ATR.
 - If mapped room is > 3.0 ATR, proximity expands to room/5, capped at 1.00 ATR.
 - OPEN_SKY/OPEN_FLOOR keep the dedicated 0.60 ATR proximity.
-- MCDX relative dominance: LONG L>45, L-S>10, flow>52; SHORT inverse.
+- MCDX relative dominance: LONG L>=45, L-S>10, flow>52; SHORT S>=45, S-L>10, flow<48.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from .base import BaseStrategy, Signal, SignalType
 
 
 class SentinelStrategy(BaseStrategy):
-    VERSION = "1.9"
+    VERSION = "1.10"
     entry_tf = "15m"
 
     def __init__(
@@ -169,8 +169,8 @@ class SentinelStrategy(BaseStrategy):
         trg=self._entry_triggers_15m(candles,s1,r1,atr_1h,long_proximity_atr=long_prox,short_proximity_atr=short_prox)
         meta.update({"long_entry_proximity_atr":round(long_prox,2),"short_entry_proximity_atr":round(short_prox,2),"proximity_mode":proximity_mode,"proximity_room_atr":round(room_for_prox,2) if room_for_prox is not None else None})
 
-        long_score=float(mc.get("long_score",0) or 0); short_score=float(mc.get("short_score",0) or 0); smart_flow=float(mc.get("smart_flow",50) or 50); long_gap=long_score-short_score; short_gap=short_score-long_score; mcdx_long_pass=bool(long_score>self.min_context_score and long_gap>self.mcdx_dominance_gap and smart_flow>self.long_flow_min); mcdx_short_pass=bool(short_score>self.min_context_score and short_gap>self.mcdx_dominance_gap and smart_flow<self.short_flow_max)
-        meta["mcdx_gate"]={"long_pass":mcdx_long_pass,"short_pass":mcdx_short_pass,"long_score":round(long_score,1),"short_score":round(short_score,1),"long_gap":round(long_gap,1),"short_gap":round(short_gap,1),"min_score_strict_gt":self.min_context_score,"dominance_gap_strict_gt":self.mcdx_dominance_gap,"long_flow_strict_gt":self.long_flow_min,"short_flow_strict_lt":self.short_flow_max}
+        long_score=float(mc.get("long_score",0) or 0); short_score=float(mc.get("short_score",0) or 0); smart_flow=float(mc.get("smart_flow",50) or 50); long_gap=long_score-short_score; short_gap=short_score-long_score; mcdx_long_pass=bool(long_score>=self.min_context_score and long_gap>self.mcdx_dominance_gap and smart_flow>self.long_flow_min); mcdx_short_pass=bool(short_score>=self.min_context_score and short_gap>self.mcdx_dominance_gap and smart_flow<self.short_flow_max)
+        meta["mcdx_gate"]={"long_pass":mcdx_long_pass,"short_pass":mcdx_short_pass,"long_score":round(long_score,1),"short_score":round(short_score,1),"long_gap":round(long_gap,1),"short_gap":round(short_gap,1),"min_score_gte":self.min_context_score,"dominance_gap_strict_gt":self.mcdx_dominance_gap,"long_flow_strict_gt":self.long_flow_min,"short_flow_strict_lt":self.short_flow_max}
         long_context=(sx.get("bias")!="BEAR" and sx.get("structure")!="BEAR" and (sx.get("sme_bull") or sx.get("bias")=="BULL") and mcdx_long_pass); short_context=(sx.get("bias")!="BULL" and sx.get("structure")!="BULL" and (sx.get("sme_bear") or sx.get("bias")=="BEAR") and mcdx_short_pass)
 
         if sr.get("long_map_ready") and trg["long"] and long_context:
