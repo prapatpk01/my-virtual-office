@@ -1,10 +1,12 @@
-"""Sentinel V1.7 — 1H S/R map + fast 15M execution + relative MCDX dominance.
+"""Sentinel V1.8 — 1H S/R map + fast 15M execution + relative MCDX dominance.
 
 Core rules
 - 1H ONLY builds S1/S2/R1/R2 and ATR14.
 - 15M ONLY executes proximity rejection / reclaim / displacement.
-- LONG requires 1H S1+S2. If R1 exists, S1->R1 room and actual RR must pass.
-  If NO 1H R1 exists, LONG is allowed as OPEN_SKY with no fixed TP.
+- LONG requires only 1H S1. S2 is preferred but is NOT required.
+  If S2 exists, SL sits below S2 + buffer. If S2 is missing, SL falls back to
+  S1 - configurable ATR distance. If R1 exists it remains the TP and actual RR
+  must pass; if R1 does not exist, LONG is OPEN_SKY with dynamic exit.
 - SHORT requires only 1H R1. R2 is preferred but is NOT required.
   If R2 exists, SL sits above R2 + buffer. If R2 is missing, SL falls back to
   R1 + configurable ATR distance. If S1 exists it remains the TP and actual RR
@@ -22,7 +24,7 @@ from .base import BaseStrategy, Signal, SignalType
 
 
 class SentinelStrategy(BaseStrategy):
-    VERSION = "1.7"
+    VERSION = "1.8"
     entry_tf = "15m"
 
     def __init__(
@@ -120,10 +122,11 @@ class SentinelStrategy(BaseStrategy):
             "atr_1h": atr_1h,
             "bars_1h": len(h1),
             "source_tf": "1H",
-            "long_map_ready": s1 is not None and s2 is not None,
+            "long_map_ready": s1 is not None,
+            "long_has_s2": s2 is not None,
             "short_map_ready": r1 is not None,
             "short_has_r2": r2 is not None,
-            "open_sky_long": s1 is not None and s2 is not None and r1 is None,
+            "open_sky_long": s1 is not None and r1 is None,
             "open_floor_short": r1 is not None and s1 is None,
         }
 
@@ -262,19 +265,26 @@ class SentinelStrategy(BaseStrategy):
         long_context=(sx.get("bias")!="BEAR" and sx.get("structure")!="BEAR" and (sx.get("sme_bull") or sx.get("bias")=="BULL") and mcdx_long_pass)
         short_context=(sx.get("bias")!="BULL" and sx.get("structure")!="BULL" and (sx.get("sme_bear") or sx.get("bias")=="BEAR") and mcdx_short_pass)
 
+        # LONG no longer requires S2. Prefer structural S2 stop when available;
+        # otherwise use an ATR stop below S1. If R1 exists, R1 is TP and RR must pass.
         if sr.get("long_map_ready") and trg["long"] and long_context:
-            long_sl=float(s2)-self.sl_buffer_atr*atr_1h; long_risk=close-long_sl
+            if s2 is not None:
+                long_sl=float(s2)-self.sl_buffer_atr*atr_1h; long_stop_basis="BELOW_1H_S2"
+            else:
+                long_sl=float(s1)-self.missing_outer_sl_atr*atr_1h; long_stop_basis=f"S1_MINUS_{self.missing_outer_sl_atr:.2f}ATR1H"
+            long_risk=close-long_sl
+            meta.update({"planned_long_sl":round(long_sl,8),"long_stop_basis":long_stop_basis})
             if long_risk>0:
                 if r1 is None:
                     self._open_position="long"; self._entry_price=close; self._entry_sl=long_sl; self._open_ended=True
-                    meta.update({"entry_location":"1H_S1","entry_trigger":trg["long_name"],"stop_loss":long_sl,"take_profit":None,"open_ended_tp":True,"tp_basis":"DYNAMIC_R1_OR_STRUCTURE_EXIT","stop_basis":"BELOW_1H_S2","room_mode":"OPEN_SKY","entry_proximity_atr":round(long_prox,2)})
-                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | OPEN_SKY no 1H R1 | proximity {long_prox:.2f}ATR1H | MCDX L={long_score:.1f} S={short_score:.1f} Δ={long_gap:.1f} flow={smart_flow:.1f} | SL below S2 | dynamic exit",confidence=min(1.0,0.50+long_score/200.0),metadata=meta)
+                    meta.update({"entry_location":"1H_S1","entry_trigger":trg["long_name"],"stop_loss":long_sl,"take_profit":None,"open_ended_tp":True,"tp_basis":"DYNAMIC_R1_OR_STRUCTURE_EXIT","stop_basis":long_stop_basis,"room_mode":"OPEN_SKY","entry_proximity_atr":round(long_prox,2)})
+                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | OPEN_SKY | SL {long_stop_basis} | MCDX L={long_score:.1f} S={short_score:.1f} Δ={long_gap:.1f} flow={smart_flow:.1f}",confidence=min(1.0,0.50+long_score/200.0),metadata=meta)
                 location_atr=(float(r1)-float(s1))/atr_1h; long_reward=float(r1)-close; long_rr=long_reward/long_risk if long_risk>0 else 0.0
-                meta.update({"location_atr":round(location_atr,2),"long_rr":round(long_rr,2)})
+                meta.update({"location_atr":round(location_atr,2),"long_rr":round(long_rr,2),"planned_long_tp":float(r1)})
                 if location_atr>=self.min_location_atr and long_reward>0 and long_rr>=self.min_rr:
                     self._open_position="long"; self._entry_price=close; self._entry_sl=long_sl; self._open_ended=False
-                    meta.update({"entry_location":"1H_S1","entry_trigger":trg["long_name"],"stop_loss":long_sl,"take_profit":float(r1),"open_ended_tp":False,"tp_basis":"1H_R1","stop_basis":"BELOW_1H_S2","rr_ratio":round(long_rr,2),"room_mode":"FIXED_R1","entry_proximity_atr":round(long_prox,2)})
-                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | room {location_atr:.2f}ATR1H | RR {long_rr:.2f} | MCDX L={long_score:.1f} S={short_score:.1f} Δ={long_gap:.1f} flow={smart_flow:.1f}",confidence=min(1.0,0.50+long_score/200.0),metadata=meta)
+                    meta.update({"entry_location":"1H_S1","entry_trigger":trg["long_name"],"stop_loss":long_sl,"take_profit":float(r1),"open_ended_tp":False,"tp_basis":"1H_R1","stop_basis":long_stop_basis,"rr_ratio":round(long_rr,2),"room_mode":"FIXED_R1","entry_proximity_atr":round(long_prox,2)})
+                    return Signal(SignalType.BUY,self.symbol,current_price,0.0,f"SENTINEL LONG {trg['long_name']} | room {location_atr:.2f}ATR1H | RR {long_rr:.2f} | SL {long_stop_basis} | MCDX L={long_score:.1f} S={short_score:.1f} Δ={long_gap:.1f} flow={smart_flow:.1f}",confidence=min(1.0,0.50+long_score/200.0),metadata=meta)
 
         # SHORT no longer requires R2. Prefer structural R2 stop when available;
         # otherwise use an ATR stop above R1. If S1 exists, S1 is TP and RR must pass.
@@ -298,7 +308,8 @@ class SentinelStrategy(BaseStrategy):
                     return Signal(SignalType.SELL,self.symbol,current_price,0.0,f"SENTINEL SHORT {trg['short_name']} | room {location_atr:.2f}ATR1H | RR {short_rr:.2f} | SL {short_stop_basis} | MCDX S={short_score:.1f} L={long_score:.1f} Δ={short_gap:.1f} flow={smart_flow:.1f}",confidence=min(1.0,0.50+short_score/200.0),metadata=meta)
 
         reasons=[]
-        if not sr.get("long_map_ready"): reasons.append("LONG needs 1H S1+S2")
+        if not sr.get("long_map_ready"): reasons.append("LONG needs 1H S1")
+        elif s2 is None: reasons.append(f"LONG S1-only ready; fallback SL=S1-{self.missing_outer_sl_atr:.2f}ATR1H")
         if not sr.get("short_map_ready"): reasons.append("SHORT needs 1H R1")
         elif r2 is None: reasons.append(f"SHORT R1-only ready; fallback SL=R1+{self.missing_outer_sl_atr:.2f}ATR1H")
         if sr.get("open_sky_long"): reasons.append(f"LONG OPEN_SKY armed zone <= {long_prox:.2f} ATR1H from S1")
