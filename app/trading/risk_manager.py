@@ -1,13 +1,14 @@
 """Risk management: position sizing, stop-loss, and max drawdown guard."""
 from dataclasses import dataclass, field
 from typing import Optional
+import os
 import time
 
 
 @dataclass
 class Position:
     symbol: str
-    side: str          # 'long' | 'short'
+    side: str
     entry_price: float
     amount: float
     stop_loss: Optional[float] = None
@@ -30,11 +31,13 @@ class RiskManager:
                  cooldown_hours: float = 3.0,
                  post_cooldown_strict_trades: int = 5,
                  post_cooldown_threshold_bonus: float = 6.0,
+                 max_positions_per_symbol: Optional[int] = None,
                  ):
         self.max_risk_per_trade_pct = max_risk_per_trade_pct
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.max_open_positions = max_open_positions
+        self.max_positions_per_symbol = max(1, int(max_positions_per_symbol if max_positions_per_symbol is not None else os.getenv("MAX_POSITIONS_PER_SYMBOL", "2")))
         self.max_drawdown_pct = max_drawdown_pct
         self.max_consecutive_sl = max_consecutive_sl
         self.cooldown_seconds = cooldown_hours * 3600
@@ -81,9 +84,7 @@ class RiskManager:
         return False, 0.0
 
     def entry_threshold_bonus(self, symbol: str = "") -> float:
-        if self._strict_left.get(symbol, 0) > 0:
-            return self.post_cooldown_threshold_bonus
-        return 0.0
+        return self.post_cooldown_threshold_bonus if self._strict_left.get(symbol, 0) > 0 else 0.0
 
     def consume_strict_entry(self, symbol: str = "") -> None:
         if self._strict_left.get(symbol, 0) > 0:
@@ -97,11 +98,9 @@ class RiskManager:
 
     def compute_stops(self, side: str, entry_price: float) -> tuple[float, float]:
         if side in ("buy", "long"):
-            sl = entry_price * (1 - self.stop_loss_pct)
-            tp = entry_price * (1 + self.take_profit_pct)
+            sl, tp = entry_price * (1 - self.stop_loss_pct), entry_price * (1 + self.take_profit_pct)
         else:
-            sl = entry_price * (1 + self.stop_loss_pct)
-            tp = entry_price * (1 - self.take_profit_pct)
+            sl, tp = entry_price * (1 + self.stop_loss_pct), entry_price * (1 - self.take_profit_pct)
         return round(sl, 6), round(tp, 6)
 
     def can_open(self, symbol: str, strategy: str = "") -> tuple[bool, str]:
@@ -109,29 +108,19 @@ class RiskManager:
             return False, "Trading halted: max drawdown reached"
         in_cd, remaining = self.in_cooldown(symbol)
         if in_cd:
-            return False, (
-                f"{symbol} cooldown after {self.max_consecutive_sl} consecutive losing closes "
-                f"— resumes in {remaining/60:.0f} min"
-            )
+            return False, f"{symbol} cooldown after {self.max_consecutive_sl} consecutive losing closes — resumes in {remaining/60:.0f} min"
         key = f"{symbol}||{strategy}"
         if key in self._positions:
             return False, f"{strategy} already has open position for {symbol}"
         sym_count = sum(1 for k in self._positions if k.startswith(f"{symbol}||"))
-        if sym_count >= 2:
-            return False, f"Max 2 positions per symbol for {symbol}"
+        if sym_count >= self.max_positions_per_symbol:
+            return False, f"Max {self.max_positions_per_symbol} positions per symbol for {symbol}"
         if len(self._positions) >= self.max_open_positions:
             return False, f"Max open positions ({self.max_open_positions}) reached"
         return True, "ok"
 
     def open_position(self, symbol: str, side: str, entry_price: float, amount: float,
                       strategy: str = "", stop_loss: float = None, take_profit: float = None) -> Position:
-        """Register a position.
-
-        Sentinel open-sky/open-floor trades intentionally have no fixed TP. For
-        those strategies a None TP is preserved so the strategy's dynamic
-        R/S+structure exit can manage the runner. Other strategies retain the
-        legacy percentage fallback when they omit SL/TP.
-        """
         is_sentinel = str(strategy).startswith("Sentinel(")
         sl_default, tp_default = self.compute_stops(side, entry_price)
         if stop_loss is None:
@@ -157,15 +146,11 @@ class RiskManager:
         if not pos:
             return None
         if pos.side == "long":
-            if pos.stop_loss and price <= pos.stop_loss:
-                return "stop_loss"
-            if pos.take_profit and price >= pos.take_profit:
-                return "take_profit"
+            if pos.stop_loss and price <= pos.stop_loss: return "stop_loss"
+            if pos.take_profit and price >= pos.take_profit: return "take_profit"
         else:
-            if pos.stop_loss and price >= pos.stop_loss:
-                return "stop_loss"
-            if pos.take_profit and price <= pos.take_profit:
-                return "take_profit"
+            if pos.stop_loss and price >= pos.stop_loss: return "stop_loss"
+            if pos.take_profit and price <= pos.take_profit: return "take_profit"
         return None
 
     def update_stop_loss(self, symbol: str, new_sl: float, strategy: str = "") -> bool:
@@ -184,15 +169,8 @@ class RiskManager:
         result = []
         for key, p in self._positions.items():
             strategy = key.split("||")[1] if "||" in key else ""
-            result.append({
-                "symbol": p.symbol,
-                "strategy": strategy,
-                "side": p.side,
-                "entry": p.entry_price,
-                "amount": p.amount,
-                "stop_loss": p.stop_loss,
-                "take_profit": p.take_profit,
-            })
+            result.append({"symbol": p.symbol, "strategy": strategy, "side": p.side, "entry": p.entry_price,
+                           "amount": p.amount, "stop_loss": p.stop_loss, "take_profit": p.take_profit})
         return result
 
     @property
