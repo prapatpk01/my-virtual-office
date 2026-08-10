@@ -1,26 +1,22 @@
 """EMA Hybrid Pro Advanced — Direction -> Location -> Liquidity -> Structure -> Execution.
 
-Progressive scoring is evaluated at every stage so diagnostics reflect how close
-an instrument is to a trade. Two entry paths preserve quality without making a
-liquidity sweep mandatory on every setup:
+Progressive scoring with two entry paths:
+A) Liquidity path: value-zone + sweep + score >= 7.
+B) Strong-confirmation path: value-zone + structure + M5 trigger + PA + score >= 8.
 
-A) Liquidity path: valid value-zone location + sweep + score >= MIN_SCORE.
-B) Strong-confirmation path: valid value-zone location + structure + M5 trigger
-   + price action + score >= STRONG_CONFIRM_SCORE.
-
-Paper entries run 24/7. Live new entries run 24/5; existing positions continue
-being managed by the parent runtime 24/7.
+Risk/exit model:
+- SL = structure beyond swing + 0.25 ATR (configurable).
+- TP1 = +1R, runtime trims 60% and moves remaining SL to BE + 0.15R.
+- TP2 = next eligible M15 liquidity/swing target with at least 1.5R room.
 """
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 
 import strategy_v12 as base
@@ -53,10 +49,9 @@ class HybridView:
 
 
 class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
-    MIN_RR = float(os.getenv("EMA_ADV_MIN_RR", "2.0"))
-    FINAL_RR = float(os.getenv("EMA_ADV_FINAL_RR", "3.0"))
     MIN_SCORE = int(os.getenv("EMA_ADV_MIN_SCORE", "7"))
     STRONG_CONFIRM_SCORE = int(os.getenv("EMA_ADV_STRONG_CONFIRM_SCORE", "8"))
+    TP2_MIN_RR = float(os.getenv("EMA_ADV_TP2_MIN_RR", "1.5"))
     SWING_LOOKBACK = 90
     PIVOT_SPAN = 2
     EMA_TOUCH_ATR = float(os.getenv("EMA_ADV_EMA_TOUCH_ATR", "0.22"))
@@ -106,8 +101,8 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             return "DATA_ERROR"
         if len(d) < 200:
             return f"WARMUP({len(d)}/200)"
-        s = EMAHybridProStrategy._ema_side(d)
-        return "BULL" if s == Side.LONG else "BEAR" if s == Side.SHORT else "NEUTRAL"
+        side = EMAHybridProStrategy._ema_side(d)
+        return "BULL" if side == Side.LONG else "BEAR" if side == Side.SHORT else "NEUTRAL"
 
     def _trend_diagnostics(self, df4h, df1h, df15):
         return {
@@ -143,17 +138,17 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             if not pairs:
                 return None
             _, low, _, high = max(pairs, key=lambda x: x[2])
-            if high <= low:
-                return None
-            fib50 = high - 0.500 * (high-low)
-            fib618 = high - 0.618 * (high-low)
         else:
             pairs = [(hi, hv, li, lv) for hi, hv in highs for li, lv in lows if hi < li]
             if not pairs:
                 return None
             _, high, _, low = max(pairs, key=lambda x: x[2])
-            if high <= low:
-                return None
+        if high <= low:
+            return None
+        if side == Side.LONG:
+            fib50 = high - 0.500 * (high-low)
+            fib618 = high - 0.618 * (high-low)
+        else:
             fib50 = low + 0.500 * (high-low)
             fib618 = low + 0.618 * (high-low)
         return {"low": low, "high": high, "fib_low": min(fib50, fib618), "fib_high": max(fib50, fib618)}
@@ -197,23 +192,15 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         upper = rh-max(ro, rc)
         lower = min(ro, rc)-rl
         if side == Side.LONG:
-            if rc > ro and pc < po and rc >= po and ro <= pc:
-                return "BULL_ENGULF"
-            if lower >= max(body*1.8, rng*0.45) and rc > rl+0.55*rng:
-                return "BULL_PIN"
-            if ph < float(p2.high) and pl > float(p2.low) and rc > ph:
-                return "INSIDE_BREAK_UP"
-            if rc > ro and body/rng >= 0.60:
-                return "STRONG_BULL_CLOSE"
+            if rc > ro and pc < po and rc >= po and ro <= pc: return "BULL_ENGULF"
+            if lower >= max(body*1.8, rng*0.45) and rc > rl+0.55*rng: return "BULL_PIN"
+            if ph < float(p2.high) and pl > float(p2.low) and rc > ph: return "INSIDE_BREAK_UP"
+            if rc > ro and body/rng >= 0.60: return "STRONG_BULL_CLOSE"
         else:
-            if rc < ro and pc > po and rc <= po and ro >= pc:
-                return "BEAR_ENGULF"
-            if upper >= max(body*1.8, rng*0.45) and rc < rh-0.55*rng:
-                return "BEAR_PIN"
-            if ph < float(p2.high) and pl > float(p2.low) and rc < pl:
-                return "INSIDE_BREAK_DOWN"
-            if rc < ro and body/rng >= 0.60:
-                return "STRONG_BEAR_CLOSE"
+            if rc < ro and pc > po and rc <= po and ro >= pc: return "BEAR_ENGULF"
+            if upper >= max(body*1.8, rng*0.45) and rc < rh-0.55*rng: return "BEAR_PIN"
+            if ph < float(p2.high) and pl > float(p2.low) and rc < pl: return "INSIDE_BREAK_DOWN"
+            if rc < ro and body/rng >= 0.60: return "STRONG_BEAR_CLOSE"
         return "NONE"
 
     def _structure_confirm(self, d, side):
@@ -222,15 +209,11 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         recent = d.iloc[-8:-1]
         r = d.iloc[-1]
         if side == Side.LONG:
-            if float(r.close) > float(recent.high.max()):
-                return "BOS_UP"
-            if float(r.close) > float(d.high.iloc[-3]):
-                return "CHOCH_UP"
+            if float(r.close) > float(recent.high.max()): return "BOS_UP"
+            if float(r.close) > float(d.high.iloc[-3]): return "CHOCH_UP"
         else:
-            if float(r.close) < float(recent.low.min()):
-                return "BOS_DOWN"
-            if float(r.close) < float(d.low.iloc[-3]):
-                return "CHOCH_DOWN"
+            if float(r.close) < float(recent.low.min()): return "BOS_DOWN"
+            if float(r.close) < float(d.low.iloc[-3]): return "CHOCH_DOWN"
         return "NONE"
 
     def _ob_fvg(self, d, side):
@@ -238,15 +221,11 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             return "NONE"
         a, b, c = d.iloc[-3], d.iloc[-2], d.iloc[-1]
         if side == Side.LONG:
-            if float(a.high) < float(c.low):
-                return "BULL_FVG"
-            if float(b.close) < float(b.open) and float(c.close) > float(b.high):
-                return "BULL_OB"
+            if float(a.high) < float(c.low): return "BULL_FVG"
+            if float(b.close) < float(b.open) and float(c.close) > float(b.high): return "BULL_OB"
         else:
-            if float(a.low) > float(c.high):
-                return "BEAR_FVG"
-            if float(b.close) > float(b.open) and float(c.close) < float(b.low):
-                return "BEAR_OB"
+            if float(a.low) > float(c.high): return "BEAR_FVG"
+            if float(b.close) > float(b.open) and float(c.close) < float(b.low): return "BEAR_OB"
         return "NONE"
 
     def _m5_trigger(self, df5, side):
@@ -258,19 +237,13 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         d["ema13"] = self._ema(c, 13)
         r, p = d.iloc[-1], d.iloc[-2]
         if side == Side.LONG:
-            if float(p.ema8) <= float(p.ema13) and float(r.ema8) > float(r.ema13):
-                return "EMA8_13_CROSS_UP"
-            if float(r.close) > float(d.high.iloc[-6:-1].max()):
-                return "M5_BOS_UP"
-            if float(r.close) > float(r.ema13) and float(r.close) > float(r.open):
-                return "M5_RECLAIM_UP"
+            if float(p.ema8) <= float(p.ema13) and float(r.ema8) > float(r.ema13): return "EMA8_13_CROSS_UP"
+            if float(r.close) > float(d.high.iloc[-6:-1].max()): return "M5_BOS_UP"
+            if float(r.close) > float(r.ema13) and float(r.close) > float(r.open): return "M5_RECLAIM_UP"
         else:
-            if float(p.ema8) >= float(p.ema13) and float(r.ema8) < float(r.ema13):
-                return "EMA8_13_CROSS_DOWN"
-            if float(r.close) < float(d.low.iloc[-6:-1].min()):
-                return "M5_BOS_DOWN"
-            if float(r.close) < float(r.ema13) and float(r.close) < float(r.open):
-                return "M5_RECLAIM_DOWN"
+            if float(p.ema8) >= float(p.ema13) and float(r.ema8) < float(r.ema13): return "EMA8_13_CROSS_DOWN"
+            if float(r.close) < float(d.low.iloc[-6:-1].min()): return "M5_BOS_DOWN"
+            if float(r.close) < float(r.ema13) and float(r.close) < float(r.open): return "M5_RECLAIM_DOWN"
         return "NONE"
 
     @staticmethod
@@ -300,81 +273,79 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
     def _score(self, h1, m15, df5, side, location_ok, touch, sweep, pa):
         score = 0
-        if self._ema_side(h1) == side:
-            score += 2
-        if self._ema_side(m15) == side:
-            score += 1
-        if location_ok:
-            score += 1
-        if touch != "NONE":
-            score += 1
-        if sweep != "NONE":
-            score += 2
+        if self._ema_side(h1) == side: score += 2
+        if self._ema_side(m15) == side: score += 1
+        if location_ok: score += 1
+        if touch != "NONE": score += 1
+        if sweep != "NONE": score += 2
         structure = self._structure_confirm(m15, side)
-        if structure != "NONE":
-            score += 2
+        if structure != "NONE": score += 2
         zone = self._ob_fvg(m15, side)
-        if zone != "NONE":
-            score += 1
-        if pa != "NONE":
-            score += 1
+        if zone != "NONE": score += 1
+        if pa != "NONE": score += 1
         m5 = self._m5_trigger(df5, side)
-        if m5 != "NONE":
-            score += 1
-        if self._ema_slope_ok(h1, side):
-            score += 1
+        if m5 != "NONE": score += 1
+        if self._ema_slope_ok(h1, side): score += 1
         vr = self._volume_ratio(m15)
-        if vr >= 1.10:
-            score += 1
+        if vr >= 1.10: score += 1
         return score, self._grade(score), structure, zone, m5, vr
 
     def _view(self, df1h, df15, df5):
         if len(df1h) < 220 or len(df15) < 220:
             return HybridView(None, "WARMUP", "need >=220 H1/M15 candles")
-
         h1, m15 = self._prep(df1h), self._prep(df15)
         side = self._ema_side(h1)
         if side is None:
             return HybridView(None, "H1_TREND", "H1 EMA20/50/200 not aligned")
-
-        m15_side = self._ema_side(m15)
-        if m15_side != side:
+        if self._ema_side(m15) != side:
             score = 2 + (1 if self._ema_slope_ok(h1, side) else 0)
             return HybridView(side, "M15_TREND", "M15 triple EMA not aligned with H1", score=score, grade=self._grade(score))
-
         impulse = self._impulse(m15, side)
         if not impulse:
             score = 3 + (1 if self._ema_slope_ok(h1, side) else 0)
             return HybridView(side, "FIB", "no confirmed impulse swing", score=score, grade=self._grade(score))
-
         touch = self._ema_touch(m15, side)
         location_ok, location = self._location_state(m15, impulse, touch)
         sweep = self._liquidity_sweep(m15, side)
         pa = self._price_action(m15, side)
         score, grade, structure, zone, m5, vr = self._score(h1, m15, df5, side, location_ok, touch, sweep, pa)
-
-        common = dict(
-            fib_low=impulse["fib_low"], fib_high=impulse["fib_high"], ema_touch=touch,
-            pa=pa, sweep=sweep, structure=structure, zone=zone, m5_trigger=m5,
-            volume_ratio=vr, rr=self.FINAL_RR, score=score, grade=grade, location=location,
-        )
-
+        common = dict(fib_low=impulse["fib_low"], fib_high=impulse["fib_high"], ema_touch=touch,
+                      pa=pa, sweep=sweep, structure=structure, zone=zone, m5_trigger=m5,
+                      volume_ratio=vr, score=score, grade=grade, location=location)
         if not location_ok:
             return HybridView(side, "LOCATION", f"waiting value zone: {location}", **common)
-
         if sweep != "NONE" and score >= self.MIN_SCORE:
             return HybridView(side, "READY", "liquidity path passed", entry_path="LIQUIDITY", **common)
-
         strong_confirm = structure != "NONE" and m5 != "NONE" and pa != "NONE"
         if strong_confirm and score >= self.STRONG_CONFIRM_SCORE:
             return HybridView(side, "READY", "strong confirmation path passed", entry_path="CONFIRM", **common)
-
         if sweep == "NONE":
-            return HybridView(
-                side, "CONFIRM", f"need sweep OR Structure+M5+PA; score {score}/{self.STRONG_CONFIRM_SCORE}",
-                **common,
-            )
+            return HybridView(side, "CONFIRM", f"need sweep OR Structure+M5+PA; score {score}/{self.STRONG_CONFIRM_SCORE}", **common)
         return HybridView(side, "SCORE", f"setup score {score} < {self.MIN_SCORE}", **common)
+
+    def _liquidity_target(self, m15, side: Side, entry: float, risk: float, impulse) -> tuple[Optional[float], float]:
+        """Nearest confirmed M15 swing/liquidity level that leaves >= TP2_MIN_RR room."""
+        if risk <= 0:
+            return None, 0.0
+        highs, lows = self._pivot_pairs(m15)
+        candidates = []
+        if side == Side.LONG:
+            candidates.extend(v for _, v in highs if v > entry)
+            candidates.append(float(impulse["high"]))
+            candidates = sorted(set(candidates))
+            for target in candidates:
+                rr = (target-entry)/risk
+                if rr >= self.TP2_MIN_RR:
+                    return target, rr
+        else:
+            candidates.extend(v for _, v in lows if v < entry)
+            candidates.append(float(impulse["low"]))
+            candidates = sorted(set(candidates), reverse=True)
+            for target in candidates:
+                rr = (entry-target)/risk
+                if rr >= self.TP2_MIN_RR:
+                    return target, rr
+        return None, 0.0
 
     def generate_entry(self, df4h, df1h, df15, df5, has_open_position=False):
         if has_open_position or not self._entry_schedule_open():
@@ -382,7 +353,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         v = self._view(df1h, df15, df5)
         if v.stage != "READY" or v.side is None:
             return None
-
         m15 = self._prep(df15)
         impulse = self._impulse(m15, v.side)
         if not impulse:
@@ -393,40 +363,29 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         if v.side == Side.LONG:
             sl = min(float(impulse["low"]), float(m15.low.iloc[-8:].min())) - self.SL_BUFFER_ATR*atr
             risk = entry-sl
-            tp = entry+self.FINAL_RR*risk
             trend = Trend.BULL
         else:
             sl = max(float(impulse["high"]), float(m15.high.iloc[-8:].max())) + self.SL_BUFFER_ATR*atr
             risk = sl-entry
-            tp = entry-self.FINAL_RR*risk
             trend = Trend.BEAR
-        if risk <= 0 or self.FINAL_RR < self.MIN_RR:
+        if risk <= 0:
             return None
-
+        tp2, target_rr = self._liquidity_target(m15, v.side, entry, risk, impulse)
+        if tp2 is None:
+            return None
         q = self.quality_state_1h(df1h)
         reason = (
             f"EMA Hybrid Advanced {v.side.value} | Path={v.entry_path} | Score {v.score}/14 {v.grade} | "
-            f"Location={v.location} | Fib {v.fib_low:.6g}-{v.fib_high:.6g} | {v.ema_touch} | {v.sweep} | "
-            f"Structure={v.structure} | Zone={v.zone} | M5={v.m5_trigger} | PA={v.pa} | "
-            f"Vol={v.volume_ratio:.2f}x | SL=structure+{self.SL_BUFFER_ATR:.2f}ATR | Final={self.FINAL_RR:.1f}R"
+            f"Location={v.location} | {v.ema_touch} | {v.sweep} | Structure={v.structure} | Zone={v.zone} | "
+            f"M5={v.m5_trigger} | PA={v.pa} | Vol={v.volume_ratio:.2f}x | "
+            f"SL=structure+{self.SL_BUFFER_ATR:.2f}ATR | TP1=1R trim60% + SL BE+0.15R | "
+            f"TP2=liquidity/swing {target_rr:.2f}R"
         )
         trigger = f"EMA_ADV_{v.entry_path}_{v.grade}_{v.m5_trigger}_{v.structure}_{v.pa}"
-        room_pct = abs(tp-entry)/max(entry, 1e-12)
+        room_pct = abs(tp2-entry)/max(entry, 1e-12)
         structure_px = float(impulse["low"] if v.side == Side.LONG else impulse["high"])
-        return EntrySignal(
-            v.side, entry, sl, tp, trend, q.q, q.adx, q.chop,
-            SetupType.PULLBACK, trigger, room_pct, atr, structure_px, reason,
-        )
-
-    def locked_stop(self, side, entry, best_price):
-        r = max(entry*float(self.cfg.stop_loss_pct), entry*0.003)
-        move = (best_price-entry) if side == Side.LONG else (entry-best_price)
-        if move >= 2.0*r:
-            return (entry+r if side == Side.LONG else entry-r), 1
-        return (
-            entry*(1.0-self.cfg.stop_loss_pct) if side == Side.LONG else entry*(1.0+self.cfg.stop_loss_pct),
-            0,
-        )
+        return EntrySignal(v.side, entry, sl, tp2, trend, q.q, q.adx, q.chop,
+                           SetupType.PULLBACK, trigger, room_pct, atr, structure_px, reason)
 
     def entry_status(self, df4h, df1h, df15, df5):
         v = self._view(df1h, df15, df5)
@@ -440,9 +399,8 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         needed = max(0, (self.MIN_SCORE if v.sweep != "NONE" else self.STRONG_CONFIRM_SCORE) - v.score)
         return (
             f"EMA-HYBRID-ADV {'READY' if ready else 'WAIT'} | {side} | 4H={d['4H']} | 1H={d['1H']} | "
-            f"15M={d['15M']} | MTF={mtf} | Schedule={sched} | Stage={v.stage} | "
-            f"Score={v.score}/14({v.grade}) Need={needed} | Location={v.location} | Path={v.entry_path} | "
-            f"Fib={v.fib_low:.6g}-{v.fib_high:.6g} | EMA={v.ema_touch} | Sweep={v.sweep} | "
-            f"Structure={v.structure} | Zone={v.zone} | M5={v.m5_trigger} | PA={v.pa} | "
-            f"Vol={v.volume_ratio:.2f}x | SLBuf={self.SL_BUFFER_ATR:.2f}ATR | Reason={v.reason}"
+            f"15M={d['15M']} | MTF={mtf} | Schedule={sched} | Stage={v.stage} | Score={v.score}/14({v.grade}) "
+            f"Need={needed} | Location={v.location} | Path={v.entry_path} | Fib={v.fib_low:.6g}-{v.fib_high:.6g} | "
+            f"EMA={v.ema_touch} | Sweep={v.sweep} | Structure={v.structure} | Zone={v.zone} | M5={v.m5_trigger} | "
+            f"PA={v.pa} | Vol={v.volume_ratio:.2f}x | SLBuf={self.SL_BUFFER_ATR:.2f}ATR | TP2Min={self.TP2_MIN_RR:.1f}R | Reason={v.reason}"
         )
