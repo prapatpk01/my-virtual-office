@@ -1,4 +1,8 @@
-"""Adaptive Momentum v3.2 fast-entry indicator engine for closed 15-minute candles."""
+"""Adaptive Momentum v3.2 fast-entry indicator engine.
+
+Direction comes from closed 1H EMA20/50 built from closed 15M candles.
+All alignment, momentum, quality, location and entry triggers remain on 15M.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -13,6 +17,15 @@ def _v(candle: Any, name: str, index: int) -> float:
         value = candle.get(name)
     if value is None and isinstance(candle, (list, tuple)) and len(candle) > index:
         value = candle[index]
+    return float(value or 0.0)
+
+
+def _timestamp(candle: Any) -> float:
+    value = getattr(candle, "timestamp", None)
+    if value is None and isinstance(candle, dict):
+        value = candle.get("timestamp")
+    if value is None and isinstance(candle, (list, tuple)) and candle:
+        value = candle[0]
     return float(value or 0.0)
 
 
@@ -92,8 +105,38 @@ def _cross_down_recent(fast: List[float], slow: List[float], bars: int = 3) -> b
     return any(fast[i] < slow[i] and fast[i - 1] >= slow[i - 1] for i in range(start, len(fast)))
 
 
+def _closed_1h_from_15m(candles: List[Any]) -> List[List[float]]:
+    """Aggregate only complete four-candle 1H bars from closed 15M candles."""
+    groups: Dict[int, List[Any]] = {}
+    for candle in candles:
+        ts = int(_timestamp(candle))
+        if ts <= 0:
+            continue
+        # CCXT timestamps are milliseconds. Keep support for seconds for tests/local data.
+        hour_ms = 3_600_000
+        if ts < 10_000_000_000:
+            ts *= 1000
+        bucket = ts // hour_ms
+        groups.setdefault(bucket, []).append(candle)
+
+    output: List[List[float]] = []
+    for bucket in sorted(groups):
+        rows = sorted(groups[bucket], key=_timestamp)
+        if len(rows) != 4:
+            continue
+        output.append([
+            bucket * 3_600_000,
+            _v(rows[0], "open", 1),
+            max(_v(row, "high", 2) for row in rows),
+            min(_v(row, "low", 3) for row in rows),
+            _v(rows[-1], "close", 4),
+            sum(_v(row, "volume", 5) for row in rows),
+        ])
+    return output
+
+
 def compute(candles: List[Any]) -> Dict[str, Any]:
-    if len(candles) < 80:
+    if len(candles) < 240:
         return {}
 
     opens = _series(candles, "open", 1)
@@ -102,7 +145,8 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
     closes = _series(candles, "close", 4)
     volumes = _series(candles, "volume", 5)
 
-    e8, e13, e20, e50 = ema(closes, 8), ema(closes, 13), ema(closes, 20), ema(closes, 50)
+    # 15M execution indicators.
+    e8, e13, e20_15m, e50_15m = ema(closes, 8), ema(closes, 13), ema(closes, 20), ema(closes, 50)
     macd_line = [fast - slow for fast, slow in zip(ema(closes, 12), ema(closes, 26))]
     macd_signal = ema(macd_line, 9)
     macd_hist = [line - signal for line, signal in zip(macd_line, macd_signal)]
@@ -110,6 +154,16 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
     atr_value = max(atr_series[-1], closes[-1] * 0.0005)
     adx_series = _adx(highs, lows, closes, 14)
     chop_value = _chop(highs, lows, closes, 14)
+
+    # 1H direction filter. Never use an in-progress 1H candle.
+    candles_1h = _closed_1h_from_15m(candles)
+    if len(candles_1h) < 50:
+        return {}
+    closes_1h = [row[4] for row in candles_1h]
+    e20_1h = ema(closes_1h, 20)
+    e50_1h = ema(closes_1h, 50)
+    trend_bull = e20_1h[-1] > e50_1h[-1]
+    trend_bear = e20_1h[-1] < e50_1h[-1]
 
     recent_high = max(highs[-6:-1])
     recent_low = min(lows[-6:-1])
@@ -124,13 +178,17 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
 
     return {
         "schema": ENGINE_SCHEMA,
+        "trend_tf": "1H",
+        "trend_ema20": e20_1h[-1],
+        "trend_ema50": e50_1h[-1],
+        "trend_bull": trend_bull,
+        "trend_bear": trend_bear,
         "open": opens[-1], "high": highs[-1], "low": lows[-1], "close": closes[-1],
         "prev_open": opens[-2], "prev_high": highs[-2], "prev_low": lows[-2], "prev_close": closes[-2],
-        "ema8": e8[-1], "ema13": e13[-1], "ema20": e20[-1], "ema50": e50[-1],
+        "ema8": e8[-1], "ema13": e13[-1], "ema20": e20_15m[-1], "ema50": e50_15m[-1],
         "ema8_prev": e8[-2], "ema13_prev": e13[-2],
         "ema8_series": e8[-100:], "ema13_series": e13[-100:],
-        "ema20_series": e20[-100:], "ema50_series": e50[-100:],
-        "trend_bull": e20[-1] > e50[-1], "trend_bear": e20[-1] < e50[-1],
+        "ema20_series": e20_15m[-100:], "ema50_series": e50_15m[-100:],
         "entry_bull": e8[-1] > e13[-1], "entry_bear": e8[-1] < e13[-1],
         "ema_cross_up": e8[-1] > e13[-1] and e8[-2] <= e13[-2],
         "ema_cross_down": e8[-1] < e13[-1] and e8[-2] >= e13[-2],
