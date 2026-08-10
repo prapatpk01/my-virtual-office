@@ -62,7 +62,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
     EMA_TOUCH_ATR = float(os.getenv("EMA_ADV_EMA_TOUCH_ATR", "0.22"))
     FIB_TOL_ATR = float(os.getenv("EMA_ADV_FIB_TOL_ATR", "0.15"))
     NEAR_FIB_ATR = float(os.getenv("EMA_ADV_NEAR_FIB_ATR", "0.35"))
-    SL_BUFFER_ATR = 0.15
+    SL_BUFFER_ATR = float(os.getenv("EMA_ADV_SL_BUFFER_ATR", "0.25"))
     SWEEP_LOOKBACK = 12
 
     def __init__(self, config=None) -> None:
@@ -142,7 +142,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             pairs = [(li, lv, hi, hv) for li, lv in lows for hi, hv in highs if li < hi]
             if not pairs:
                 return None
-            li, low, hi, high = max(pairs, key=lambda x: x[2])
+            _, low, _, high = max(pairs, key=lambda x: x[2])
             if high <= low:
                 return None
             fib50 = high - 0.500 * (high-low)
@@ -151,7 +151,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             pairs = [(hi, hv, li, lv) for hi, hv in highs for li, lv in lows if hi < li]
             if not pairs:
                 return None
-            hi, high, li, low = max(pairs, key=lambda x: x[2])
+            _, high, _, low = max(pairs, key=lambda x: x[2])
             if high <= low:
                 return None
             fib50 = low + 0.500 * (high-low)
@@ -339,7 +339,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
         m15_side = self._ema_side(m15)
         if m15_side != side:
-            # Progressive score still shows H1 strength rather than an artificial 0/14.
             score = 2 + (1 if self._ema_slope_ok(h1, side) else 0)
             return HybridView(side, "M15_TREND", "M15 triple EMA not aligned with H1", score=score, grade=self._grade(score))
 
@@ -363,11 +362,9 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         if not location_ok:
             return HybridView(side, "LOCATION", f"waiting value zone: {location}", **common)
 
-        # A: classic liquidity-trap path.
         if sweep != "NONE" and score >= self.MIN_SCORE:
             return HybridView(side, "READY", "liquidity path passed", entry_path="LIQUIDITY", **common)
 
-        # B: continuation path. No sweep required, but confirmation must be stronger.
         strong_confirm = structure != "NONE" and m5 != "NONE" and pa != "NONE"
         if strong_confirm and score >= self.STRONG_CONFIRM_SCORE:
             return HybridView(side, "READY", "strong confirmation path passed", entry_path="CONFIRM", **common)
@@ -411,7 +408,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             f"EMA Hybrid Advanced {v.side.value} | Path={v.entry_path} | Score {v.score}/14 {v.grade} | "
             f"Location={v.location} | Fib {v.fib_low:.6g}-{v.fib_high:.6g} | {v.ema_touch} | {v.sweep} | "
             f"Structure={v.structure} | Zone={v.zone} | M5={v.m5_trigger} | PA={v.pa} | "
-            f"Vol={v.volume_ratio:.2f}x | SL=structure+0.15ATR | Final={self.FINAL_RR:.1f}R"
+            f"Vol={v.volume_ratio:.2f}x | SL=structure+{self.SL_BUFFER_ATR:.2f}ATR | Final={self.FINAL_RR:.1f}R"
         )
         trigger = f"EMA_ADV_{v.entry_path}_{v.grade}_{v.m5_trigger}_{v.structure}_{v.pa}"
         room_pct = abs(tp-entry)/max(entry, 1e-12)
@@ -447,5 +444,5 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             f"Score={v.score}/14({v.grade}) Need={needed} | Location={v.location} | Path={v.entry_path} | "
             f"Fib={v.fib_low:.6g}-{v.fib_high:.6g} | EMA={v.ema_touch} | Sweep={v.sweep} | "
             f"Structure={v.structure} | Zone={v.zone} | M5={v.m5_trigger} | PA={v.pa} | "
-            f"Vol={v.volume_ratio:.2f}x | Reason={v.reason}"
+            f"Vol={v.volume_ratio:.2f}x | SLBuf={self.SL_BUFFER_ATR:.2f}ATR | Reason={v.reason}"
         )
