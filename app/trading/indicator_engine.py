@@ -1,219 +1,135 @@
-"""Adaptive Momentum v3.2 fast-entry indicator engine.
-
-Direction comes from closed 1H EMA20/50 built from closed 15M candles.
-All alignment, momentum, quality, location and entry triggers remain on 15M.
+"""Adaptive Momentum v3.3 indicator engine.
+1H EMA20/50 selects direction. 15M uses ADX+CHOP quality, MACD histogram+ROC9 momentum,
+EMA20 distance+market structure location, and EMA8/13 cross as the only entry trigger.
 """
 from __future__ import annotations
-
 from typing import Any, Dict, List
 import math
 
-ENGINE_SCHEMA = "adaptive-momentum-v3.2-15m"
+ENGINE_SCHEMA = "adaptive-momentum-v3.3-15m"
 
 
-def _v(candle: Any, name: str, index: int) -> float:
-    value = getattr(candle, name, None)
-    if value is None and isinstance(candle, dict):
-        value = candle.get(name)
-    if value is None and isinstance(candle, (list, tuple)) and len(candle) > index:
-        value = candle[index]
-    return float(value or 0.0)
+def _v(c: Any, name: str, idx: int) -> float:
+    v = getattr(c, name, None)
+    if v is None and isinstance(c, dict): v = c.get(name)
+    if v is None and isinstance(c, (list, tuple)) and len(c) > idx: v = c[idx]
+    return float(v or 0.0)
 
 
-def _timestamp(candle: Any) -> float:
-    value = getattr(candle, "timestamp", None)
-    if value is None and isinstance(candle, dict):
-        value = candle.get("timestamp")
-    if value is None and isinstance(candle, (list, tuple)) and candle:
-        value = candle[0]
-    return float(value or 0.0)
+def _ts(c: Any) -> float:
+    v = getattr(c, "timestamp", None)
+    if v is None and isinstance(c, dict): v = c.get("timestamp")
+    if v is None and isinstance(c, (list, tuple)) and c: v = c[0]
+    return float(v or 0.0)
 
 
-def _series(candles: List[Any], name: str, index: int) -> List[float]:
-    return [_v(candle, name, index) for candle in candles]
+def _series(cs, name, idx): return [_v(c, name, idx) for c in cs]
 
 
-def ema(values: List[float], length: int) -> List[float]:
-    if not values:
-        return []
-    alpha = 2.0 / (length + 1.0)
-    output = [float(values[0])]
-    for value in values[1:]:
-        output.append(alpha * float(value) + (1.0 - alpha) * output[-1])
-    return output
+def ema(xs: List[float], n: int) -> List[float]:
+    if not xs: return []
+    a = 2.0 / (n + 1.0); out = [float(xs[0])]
+    for x in xs[1:]: out.append(a * float(x) + (1-a) * out[-1])
+    return out
 
 
-def _rma(values: List[float], length: int) -> List[float]:
-    if not values:
-        return []
-    alpha = 1.0 / max(length, 1)
-    output = [float(values[0])]
-    for value in values[1:]:
-        output.append(alpha * float(value) + (1.0 - alpha) * output[-1])
-    return output
+def _rma(xs: List[float], n: int) -> List[float]:
+    if not xs: return []
+    a = 1.0 / max(n, 1); out = [float(xs[0])]
+    for x in xs[1:]: out.append(a * float(x) + (1-a) * out[-1])
+    return out
 
 
-def _true_ranges(highs: List[float], lows: List[float], closes: List[float]) -> List[float]:
-    output = [max(highs[0] - lows[0], 0.0)]
-    for index in range(1, len(closes)):
-        output.append(max(
-            highs[index] - lows[index],
-            abs(highs[index] - closes[index - 1]),
-            abs(lows[index] - closes[index - 1]),
-        ))
-    return output
+def _tr(h, l, c):
+    out = [max(h[0]-l[0], 0.0)]
+    for i in range(1, len(c)): out.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+    return out
 
 
-def _adx(highs: List[float], lows: List[float], closes: List[float], length: int = 14) -> List[float]:
-    tr = _true_ranges(highs, lows, closes)
-    plus_dm, minus_dm = [0.0], [0.0]
-    for index in range(1, len(closes)):
-        up = highs[index] - highs[index - 1]
-        down = lows[index - 1] - lows[index]
-        plus_dm.append(up if up > down and up > 0 else 0.0)
-        minus_dm.append(down if down > up and down > 0 else 0.0)
-    atr_rma = _rma(tr, length)
-    plus_rma = _rma(plus_dm, length)
-    minus_rma = _rma(minus_dm, length)
-    dx: List[float] = []
-    for atr_value, plus_value, minus_value in zip(atr_rma, plus_rma, minus_rma):
-        if atr_value <= 1e-12:
-            dx.append(0.0)
-            continue
-        plus_di = 100.0 * plus_value / atr_value
-        minus_di = 100.0 * minus_value / atr_value
-        total = plus_di + minus_di
-        dx.append(100.0 * abs(plus_di - minus_di) / total if total > 1e-12 else 0.0)
-    return _rma(dx, length)
+def _adx(h, l, c, n=14):
+    tr = _tr(h,l,c); pd=[0.0]; md=[0.0]
+    for i in range(1,len(c)):
+        up=h[i]-h[i-1]; dn=l[i-1]-l[i]
+        pd.append(up if up>dn and up>0 else 0.0); md.append(dn if dn>up and dn>0 else 0.0)
+    ar,pr,mr=_rma(tr,n),_rma(pd,n),_rma(md,n); dx=[]
+    for a,p,m in zip(ar,pr,mr):
+        if a<=1e-12: dx.append(0.0); continue
+        pdi=100*p/a; mdi=100*m/a; s=pdi+mdi
+        dx.append(100*abs(pdi-mdi)/s if s>1e-12 else 0.0)
+    return _rma(dx,n)
 
 
-def _chop(highs: List[float], lows: List[float], closes: List[float], length: int = 14) -> float:
-    tr_sum = sum(_true_ranges(highs, lows, closes)[-length:])
-    span = max(highs[-length:]) - min(lows[-length:])
-    if tr_sum <= 0 or span <= 1e-12:
-        return 100.0
-    return 100.0 * math.log10(tr_sum / span) / math.log10(length)
+def _chop(h,l,c,n=14):
+    s=sum(_tr(h,l,c)[-n:]); span=max(h[-n:])-min(l[-n:])
+    return 100.0 if s<=0 or span<=1e-12 else 100*math.log10(s/span)/math.log10(n)
 
 
-def _cross_up_recent(fast: List[float], slow: List[float], bars: int = 3) -> bool:
-    start = max(1, len(fast) - bars)
-    return any(fast[i] > slow[i] and fast[i - 1] <= slow[i - 1] for i in range(start, len(fast)))
-
-
-def _cross_down_recent(fast: List[float], slow: List[float], bars: int = 3) -> bool:
-    start = max(1, len(fast) - bars)
-    return any(fast[i] < slow[i] and fast[i - 1] >= slow[i - 1] for i in range(start, len(fast)))
-
-
-def _closed_1h_from_15m(candles: List[Any]) -> List[List[float]]:
-    """Aggregate only complete four-candle 1H bars from closed 15M candles."""
-    groups: Dict[int, List[Any]] = {}
-    for candle in candles:
-        ts = int(_timestamp(candle))
-        if ts <= 0:
-            continue
-        # CCXT timestamps are milliseconds. Keep support for seconds for tests/local data.
-        hour_ms = 3_600_000
-        if ts < 10_000_000_000:
-            ts *= 1000
-        bucket = ts // hour_ms
-        groups.setdefault(bucket, []).append(candle)
-
-    output: List[List[float]] = []
-    for bucket in sorted(groups):
-        rows = sorted(groups[bucket], key=_timestamp)
-        if len(rows) != 4:
-            continue
-        output.append([
-            bucket * 3_600_000,
-            _v(rows[0], "open", 1),
-            max(_v(row, "high", 2) for row in rows),
-            min(_v(row, "low", 3) for row in rows),
-            _v(rows[-1], "close", 4),
-            sum(_v(row, "volume", 5) for row in rows),
-        ])
-    return output
+def _closed_1h(cs):
+    groups={}
+    for c in cs:
+        t=int(_ts(c));
+        if t<=0: continue
+        if t<10_000_000_000: t*=1000
+        groups.setdefault(t//3_600_000,[]).append(c)
+    out=[]
+    for b in sorted(groups):
+        rows=sorted(groups[b],key=_ts)
+        if len(rows)!=4: continue
+        out.append([b*3_600_000,_v(rows[0],"open",1),max(_v(x,"high",2) for x in rows),min(_v(x,"low",3) for x in rows),_v(rows[-1],"close",4),sum(_v(x,"volume",5) for x in rows)])
+    return out
 
 
 def compute(candles: List[Any]) -> Dict[str, Any]:
-    if len(candles) < 240:
-        return {}
+    if len(candles)<240: return {}
+    o=_series(candles,"open",1); h=_series(candles,"high",2); l=_series(candles,"low",3); c=_series(candles,"close",4); v=_series(candles,"volume",5)
+    e8,e13,e20,e50=ema(c,8),ema(c,13),ema(c,20),ema(c,50)
+    ml=[a-b for a,b in zip(ema(c,12),ema(c,26))]; ms=ema(ml,9); mh=[a-b for a,b in zip(ml,ms)]
+    atrs=_rma(_tr(h,l,c),14); atr=max(atrs[-1],c[-1]*0.0005); adxs=_adx(h,l,c,14); chop=_chop(h,l,c,14)
+    h1=_closed_1h(candles)
+    if len(h1)<50: return {}
+    hc=[x[4] for x in h1]; te20=ema(hc,20); te50=ema(hc,50)
+    trend_bull=te20[-1]>te50[-1]; trend_bear=te20[-1]<te50[-1]
 
-    opens = _series(candles, "open", 1)
-    highs = _series(candles, "high", 2)
-    lows = _series(candles, "low", 3)
-    closes = _series(candles, "close", 4)
-    volumes = _series(candles, "volume", 5)
+    # Momentum: 1/2 is enough to pass; 2/2 is STRONG.
+    roc9=((c[-1]/c[-10])-1.0)*100.0 if c[-10] else 0.0
+    hist_long=mh[-1]>mh[-2]; hist_short=mh[-1]<mh[-2]
+    roc_long=roc9>0; roc_short=roc9<0
+    mom_long=int(hist_long)+int(roc_long); mom_short=int(hist_short)+int(roc_short)
 
-    # 15M execution indicators.
-    e8, e13, e20_15m, e50_15m = ema(closes, 8), ema(closes, 13), ema(closes, 20), ema(closes, 50)
-    macd_line = [fast - slow for fast, slow in zip(ema(closes, 12), ema(closes, 26))]
-    macd_signal = ema(macd_line, 9)
-    macd_hist = [line - signal for line, signal in zip(macd_line, macd_signal)]
-    atr_series = _rma(_true_ranges(highs, lows, closes), 14)
-    atr_value = max(atr_series[-1], closes[-1] * 0.0005)
-    adx_series = _adx(highs, lows, closes, 14)
-    chop_value = _chop(highs, lows, closes, 14)
+    # Location tool 1: distance from 15M EMA20, not EMA13.
+    dist20=abs(c[-1]-e20[-1])/atr
+    ema20_loc_long=c[-1]>=e20[-1] and dist20<=1.2
+    ema20_loc_short=c[-1]<=e20[-1] and dist20<=1.2
 
-    # 1H direction filter. Never use an in-progress 1H candle.
-    candles_1h = _closed_1h_from_15m(candles)
-    if len(candles_1h) < 50:
-        return {}
-    closes_1h = [row[4] for row in candles_1h]
-    e20_1h = ema(closes_1h, 20)
-    e50_1h = ema(closes_1h, 50)
-    trend_bull = e20_1h[-1] > e50_1h[-1]
-    trend_bear = e20_1h[-1] < e50_1h[-1]
+    # Location tool 2: simple confirmed swing structure. It is supportive, not a hard 2/2 gate.
+    prior_low=min(l[-7:-2]); prior_high=max(h[-7:-2])
+    recent_low=min(l[-3:]); recent_high=max(h[-3:])
+    hl=recent_low>prior_low; lh=recent_high<prior_high
+    location_score_long=int(ema20_loc_long)+int(hl)
+    location_score_short=int(ema20_loc_short)+int(lh)
 
-    recent_high = max(highs[-6:-1])
-    recent_low = min(lows[-6:-1])
-    distance_atr = abs(closes[-1] - e13[-1]) / atr_value
-
-    fresh_up = _cross_up_recent(e8, e13, 3)
-    fresh_down = _cross_down_recent(e8, e13, 3)
-    reclaim_long = lows[-1] <= e13[-1] and closes[-1] > e13[-1] and closes[-1] > opens[-1]
-    reclaim_short = highs[-1] >= e13[-1] and closes[-1] < e13[-1] and closes[-1] < opens[-1]
-    prev_break_long = closes[-1] > highs[-2]
-    prev_break_short = closes[-1] < lows[-2]
+    cross_up=e8[-1]>e13[-1] and e8[-2]<=e13[-2]
+    cross_down=e8[-1]<e13[-1] and e8[-2]>=e13[-2]
+    recent_low5=min(l[-6:-1]); recent_high5=max(h[-6:-1])
 
     return {
-        "schema": ENGINE_SCHEMA,
-        "trend_tf": "1H",
-        "trend_ema20": e20_1h[-1],
-        "trend_ema50": e50_1h[-1],
-        "trend_bull": trend_bull,
-        "trend_bear": trend_bear,
-        "open": opens[-1], "high": highs[-1], "low": lows[-1], "close": closes[-1],
-        "prev_open": opens[-2], "prev_high": highs[-2], "prev_low": lows[-2], "prev_close": closes[-2],
-        "ema8": e8[-1], "ema13": e13[-1], "ema20": e20_15m[-1], "ema50": e50_15m[-1],
-        "ema8_prev": e8[-2], "ema13_prev": e13[-2],
-        "ema8_series": e8[-100:], "ema13_series": e13[-100:],
-        "ema20_series": e20_15m[-100:], "ema50_series": e50_15m[-100:],
-        "entry_bull": e8[-1] > e13[-1], "entry_bear": e8[-1] < e13[-1],
-        "ema_cross_up": e8[-1] > e13[-1] and e8[-2] <= e13[-2],
-        "ema_cross_down": e8[-1] < e13[-1] and e8[-2] >= e13[-2],
-        "ema_cross_up_recent": fresh_up, "ema_cross_down_recent": fresh_down,
-        "ema13_reclaim_long": reclaim_long, "ema13_reclaim_short": reclaim_short,
-        "prev_bar_break_long": prev_break_long, "prev_bar_break_short": prev_break_short,
-        "trigger_long": fresh_up or reclaim_long or prev_break_long,
-        "trigger_short": fresh_down or reclaim_short or prev_break_short,
-        "macd": macd_line[-1], "macd_signal": macd_signal[-1],
-        "macd_hist": macd_hist[-1], "macd_hist_prev": macd_hist[-2],
-        "macd_hist_improving_long": macd_hist[-1] > macd_hist[-2],
-        "macd_hist_improving_short": macd_hist[-1] < macd_hist[-2],
-        "macd_hist_weaken_long_3": macd_hist[-1] < macd_hist[-2] < macd_hist[-3] < macd_hist[-4],
-        "macd_hist_weaken_short_3": macd_hist[-1] > macd_hist[-2] > macd_hist[-3] > macd_hist[-4],
-        "adx": adx_series[-1], "adx_prev": adx_series[-2],
-        "adx_rising": adx_series[-1] > adx_series[-2],
-        "chop": chop_value, "atr": atr_value,
-        "distance_ema13_atr": distance_atr,
-        "location_long": closes[-1] >= e13[-1] and distance_atr <= 1.0,
-        "location_short": closes[-1] <= e13[-1] and distance_atr <= 1.0,
-        "recent_low": recent_low, "recent_high": recent_high,
-        "volume": volumes[-1],
+        "schema":ENGINE_SCHEMA,"trend_tf":"1H","trend_ema20":te20[-1],"trend_ema50":te50[-1],"trend_bull":trend_bull,"trend_bear":trend_bear,
+        "open":o[-1],"high":h[-1],"low":l[-1],"close":c[-1],"prev_high":h[-2],"prev_low":l[-2],"prev_close":c[-2],
+        "ema8":e8[-1],"ema13":e13[-1],"ema20":e20[-1],"ema50":e50[-1],"ema8_prev":e8[-2],"ema13_prev":e13[-2],
+        "ema_cross_up":cross_up,"ema_cross_down":cross_down,"entry_bull":e8[-1]>e13[-1],"entry_bear":e8[-1]<e13[-1],
+        "macd":ml[-1],"macd_signal":ms[-1],"macd_hist":mh[-1],"macd_hist_prev":mh[-2],
+        "macd_hist_improving_long":hist_long,"macd_hist_improving_short":hist_short,
+        "macd_hist_weaken_long_3":mh[-1]<mh[-2]<mh[-3]<mh[-4],"macd_hist_weaken_short_3":mh[-1]>mh[-2]>mh[-3]>mh[-4],
+        "roc9":roc9,"roc_long":roc_long,"roc_short":roc_short,"momentum_score_long":mom_long,"momentum_score_short":mom_short,
+        "adx":adxs[-1],"adx_prev":adxs[-2],"adx_rising":adxs[-1]>adxs[-2],"chop":chop,"atr":atr,
+        "distance_ema20_atr":dist20,"ema20_location_long":ema20_loc_long,"ema20_location_short":ema20_loc_short,
+        "structure_hl":hl,"structure_lh":lh,"location_score_long":location_score_long,"location_score_short":location_score_short,
+        "location_long":location_score_long>=1,"location_short":location_score_short>=1,
+        "trigger_long":cross_up,"trigger_short":cross_down,
+        "recent_low":recent_low5,"recent_high":recent_high5,"volume":v[-1],
     }
 
 
 class IndicatorEngine:
-    def compute(self, c15m: List[Any], c1h: List[Any], c4h: List[Any]):
-        return compute(c15m), {}, {}
+    def compute(self,c15m:List[Any],c1h:List[Any],c4h:List[Any]):
+        return compute(c15m),{},{}
