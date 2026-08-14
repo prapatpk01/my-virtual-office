@@ -14,10 +14,15 @@ import os
 # V3 journal isolation MUST be set before trading.bot / signal_state are imported.
 # If Railway explicitly supplies SIGNAL_STATE_FILE, respect that override.
 os.environ.setdefault("SIGNAL_STATE_FILE", "/app/signal_state_sentinel_v3.json")
+os.environ.setdefault("SENTINEL_REENTRY_COOLDOWN_MIN", "120")
 
 import run_bot
+from trading.sentinel_runtime_guard import install_sentinel_runtime_guard
 
 logger = logging.getLogger("run_sentinel_bot")
+
+# Install before run_bot.main() constructs TelegramNotifier / TradingBot.
+install_sentinel_runtime_guard()
 
 
 def _sentinel_only_strategies(symbols: list[str], config: dict):
@@ -28,10 +33,11 @@ def _sentinel_only_strategies(symbols: list[str], config: dict):
     strategies = [SentinelStrategy(symbol) for symbol in symbols]
     logger.info(
         "SENTINEL V3 ONLY | %d strategy instances | symbols=%s | "
-        "TrendConfirm=DISABLED | journal=%s",
+        "TrendConfirm=DISABLED | journal=%s | reentry=%smin",
         len(strategies),
         symbols,
         os.environ.get("SIGNAL_STATE_FILE"),
+        os.environ.get("SENTINEL_REENTRY_COOLDOWN_MIN"),
     )
     return strategies
 
