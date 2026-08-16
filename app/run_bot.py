@@ -1,9 +1,10 @@
-"""Adaptive Momentum v2 runner: 15M execution, Telegram charts and stats."""
+"""Adaptive Momentum v4.1 runner — 15M cross-directed execution, Telegram charts and resettable stats."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -19,14 +20,14 @@ from trading.connectors.binance_conn import BinanceConnector
 from trading.adaptive_trading_bot import TradingBot, TP1_R, TP_R
 from trading.indicator_engine import compute, ema
 
-BUILD_ID = "adaptive-momentum-v2-2026-08-05"
+BUILD_ID = "adaptive-momentum-v4.1-cross-directed-2026-08-17"
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
     force=True,
 )
-logger = logging.getLogger("adaptive_momentum_v2")
+logger = logging.getLogger("adaptive_momentum_v4_1")
 
 
 def env_bool(key: str, default: bool = False) -> bool:
@@ -59,7 +60,8 @@ def fx_open(now: datetime) -> bool:
 
 def load_json(path: str, default):
     try:
-        return json.load(open(path, encoding="utf-8"))
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
     except Exception:
         return default
 
@@ -99,7 +101,6 @@ def duration(seconds: float) -> str:
 
 
 def display_payload(value):
-    """Round floats for logs only; trading calculations keep full precision."""
     if isinstance(value, float):
         return round(value, 4)
     if isinstance(value, dict):
@@ -111,20 +112,33 @@ def display_payload(value):
     return value
 
 
+def bbands(closes, length: int = 20, mult: float = 2.0):
+    mids, uppers, lowers = [], [], []
+    for index in range(len(closes)):
+        start = max(0, index - length + 1)
+        window = closes[start:index + 1]
+        mid = sum(window) / len(window)
+        variance = sum((x - mid) ** 2 for x in window) / len(window)
+        std = math.sqrt(variance)
+        mids.append(mid)
+        uppers.append(mid + mult * std)
+        lowers.append(mid - mult * std)
+    return mids, uppers, lowers
+
+
 def trade_text(order_type: str, payload: dict, paper: bool) -> str:
     mode = "PAPER" if paper else "LIVE"
     direction = str(payload.get("direction", ""))
     symbol = str(payload.get("symbol", ""))
     if order_type.startswith("OPEN_"):
         return (
-            f"{'🟢' if direction == 'LONG' else '🔴'} MOMENTUM V2 {direction} — {symbol}\n"
+            f"{'🟢' if direction == 'LONG' else '🔴'} ADAPTIVE MOMENTUM V4.1 {direction} — {symbol}\n"
             f"Mode: {mode} | TF: 15M\n"
-            f"Trend: EMA20 {'>' if direction == 'LONG' else '<'} EMA50 ✅\n"
-            f"Entry: EMA8 {'>' if direction == 'LONG' else '<'} EMA13 ✅\n"
-            f"Trigger: {payload.get('trigger', 'MACD histogram flip')} ✅\n"
+            f"Direction: EMA8/13 Cross {'UP' if direction == 'LONG' else 'DOWN'} ✅\n"
             f"MACD: {float(payload.get('macd', 0)):+.4f} / Signal {float(payload.get('macd_signal', 0)):+.4f}\n"
-            f"ADX: {float(payload.get('adx', 0)):.1f} Rising ✅ | CHOP: {float(payload.get('chop', 0)):.1f}\n"
-            f"Location: {float(payload.get('distance_ema13_atr', 0)):.2f} ATR from EMA13\n\n"
+            f"Histogram: {float(payload.get('macd_hist', 0)):+.4f} | ROC9: {float(payload.get('roc9', 0)):+.2f}%\n"
+            f"ADX: {float(payload.get('adx', 0)):.1f} | CHOP: {float(payload.get('chop', 0)):.1f}\n"
+            f"ATR14: {float(payload.get('atr', 0)):,.4f}\n\n"
             f"Entry: {float(payload.get('entry', 0)):,.4f}\n"
             f"SL: {float(payload.get('sl', 0)):,.4f} ({float(payload.get('sl_pct', 0)):.2f}%)\n"
             f"TP1: {float(payload.get('tp1', 0)):,.4f} ({TP1_R:g}R · close 50% · SL→BE)\n"
@@ -139,15 +153,19 @@ def trade_text(order_type: str, payload: dict, paper: bool) -> str:
     )
 
 
-def stats_text(trades, bots, prices, paper: bool, margin: float) -> str:
+def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_at: float) -> str:
     closed = [trade for trade in trades if trade.get("event") == "CLOSE"]
     partials = [trade for trade in trades if trade.get("event") == "PARTIAL"]
     wins = [trade for trade in closed if float(trade.get("pnl", 0)) > 0]
     net = sum(float(trade.get("pnl", 0)) for trade in closed + partials)
+    started = datetime.fromtimestamp(stats_started_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        "📊 Adaptive Momentum v2 Stats", "",
+        "📊 Adaptive Momentum V4.1 Stats", "",
         f"Mode: {'PAPER' if paper else 'LIVE'}",
-        "Logic: EMA20/50 → EMA8/13 → MACD Hist Flip → ADX/CHOP → Location", "",
+        "TF: 15M only",
+        "Direction: EMA8/13 Cross UP=LONG · DOWN=SHORT",
+        "Filters: ADX+CHOP · MACD+ROC9 · BB+Structure · ATR14 Risk",
+        f"Stats since: {started}", "",
         f"OPEN POSITIONS ({sum(int(bot.position_open) for bot in bots.values())})",
         "――――――――――――――――",
     ]
@@ -179,18 +197,23 @@ def stats_text(trades, bots, prices, paper: bool, margin: float) -> str:
         f"Margin Used  : ${count * margin:.2f}", f"Floating PnL : ${floating:+.2f}", "",
         "OVERALL", "――――――――――――――――",
         f"Trades   : {len(closed)} ({len(wins)}W / {len(closed) - len(wins)}L)",
-        f"Win rate : {win_rate:.0f}%", f"TP1 hit  : {len(partials)}",
+        f"Win rate : {win_rate:.0f}%",
+        f"TP1 hit  : {len(partials)}",
         f"TP2 hit  : {sum(t.get('reason') == 'TP2' for t in closed)}",
         f"SL hit   : {sum(t.get('reason') == 'SL' for t in closed)}",
         f"BE exit  : {sum(t.get('reason') == 'BE' for t in closed)}",
-        f"Momentum exit: {sum(t.get('reason') == 'MOMENTUM_FLIP' for t in closed)}",
+        f"Cross exit: {sum(t.get('reason') == 'EMA_CROSS_BACK' for t in closed)}",
+        f"Momentum exit: {sum(t.get('reason') == 'MOMENTUM_LOST' for t in closed)}",
         f"Net PnL  : ${net:+.2f}",
     ]
     if closed:
         lines += ["", "LAST 5 TRADES", "――――――――――――――――"]
         for index, trade in enumerate(reversed(closed[-5:]), 1):
             pnl = float(trade.get("pnl", 0))
-            lines.append(f"{index}. {'✅' if pnl > 0 else '❌'} {str(trade.get('symbol', '')).split('/')[0]} {trade.get('direction', '')} ${pnl:+.2f} — {trade.get('reason', '')}")
+            lines.append(
+                f"{index}. {'✅' if pnl > 0 else '❌'} {str(trade.get('symbol', '')).split('/')[0]} "
+                f"{trade.get('direction', '')} ${pnl:+.2f} — {trade.get('reason', '')}"
+            )
     return "\n".join(lines)
 
 
@@ -211,27 +234,33 @@ def chart(candles, payload: dict, path: str) -> bool:
     lows = [field(row, "low", 3) for row in rows]
     closes = [field(row, "close", 4) for row in rows]
     volumes = [field(row, "volume", 5) for row in rows]
-    e8, e13, e20, e50 = ema(closes, 8), ema(closes, 13), ema(closes, 20), ema(closes, 50)
+    e8, e13 = ema(closes, 8), ema(closes, 13)
+    bb_mid, bb_upper, bb_lower = bbands(closes, 20, 2.0)
+
     fig, (axis, volume_axis) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [4, 1]})
     for index, (open_price, high, low, close, volume) in enumerate(zip(opens, highs, lows, closes, volumes)):
         candle_color = "#26a69a" if close >= open_price else "#ef5350"
         axis.vlines(index, low, high, color=candle_color, linewidth=1)
-        axis.add_patch(Rectangle((index - 0.3, min(open_price, close)), 0.6, max(abs(close - open_price), max(close, 1) * 1e-6), facecolor=candle_color, edgecolor=candle_color))
+        axis.add_patch(Rectangle((index - 0.3, min(open_price, close)), 0.6,
+                                 max(abs(close - open_price), max(close, 1) * 1e-6),
+                                 facecolor=candle_color, edgecolor=candle_color))
         volume_axis.bar(index, volume, width=0.7, color=candle_color)
-    axis.plot(e8, label="EMA8", linewidth=1.0)
-    axis.plot(e13, label="EMA13", linewidth=1.0)
-    axis.plot(e20, label="EMA20", linewidth=1.2)
-    axis.plot(e50, label="EMA50", linewidth=1.2)
+    axis.plot(e8, label="EMA8", linewidth=1.1)
+    axis.plot(e13, label="EMA13", linewidth=1.1)
+    axis.plot(bb_mid, label="BB Mid 20", linewidth=0.9)
+    axis.plot(bb_upper, label="BB Upper", linewidth=0.8)
+    axis.plot(bb_lower, label="BB Lower", linewidth=0.8)
     for key, label in (("entry", "ENTRY"), ("sl", "SL"), ("tp1", "TP1"), ("tp2", "TP2")):
         value = float(payload.get(key, 0))
         if value:
             axis.axhline(value, linestyle="--", linewidth=1.1, label=f"{label} {value:,.4f}")
     entry = float(payload.get("entry", 0))
-    axis.scatter(len(rows) - 1, entry, marker="^" if payload.get("direction") == "LONG" else "v", s=120, zorder=6, label="ENTRY POINT")
+    axis.scatter(len(rows) - 1, entry, marker="^" if payload.get("direction") == "LONG" else "v",
+                 s=120, zorder=6, label="ENTRY POINT")
     axis.legend(loc="best", fontsize=7, ncol=2)
     axis.grid(alpha=0.2)
     volume_axis.grid(alpha=0.15)
-    axis.set_title(f"{payload.get('symbol')} {payload.get('direction')} | Momentum v2 | 15M | {payload.get('trigger')}")
+    axis.set_title(f"{payload.get('symbol')} {payload.get('direction')} | Adaptive Momentum V4.1 | 15M | EMA8/13 Cross")
     axis.set_ylabel("Price")
     volume_axis.set_ylabel("Volume")
     fig.tight_layout()
@@ -242,7 +271,9 @@ def chart(candles, payload: dict, path: str) -> bool:
 
 async def main() -> None:
     paper = env_bool("PAPER_TRADING", True) or os.getenv("TRADING_MODE", "").lower() == "paper"
-    symbols = [symbol.strip() for symbol in os.getenv("SYMBOLS", "XAU/USDT:USDT,SOL/USDT:USDT,XAG/USDT:USDT,XRP/USDT:USDT,HYPE/USDT:USDT").split(",") if symbol.strip()]
+    symbols = [symbol.strip() for symbol in os.getenv(
+        "SYMBOLS", "XAU/USDT:USDT,SOL/USDT:USDT,XAG/USDT:USDT,XRP/USDT:USDT,HYPE/USDT:USDT"
+    ).split(",") if symbol.strip()]
     leverage = int(os.getenv("LEVERAGE", "20"))
     margin = float(os.getenv("ADAPTIVE_MARGIN_USDT", "20"))
     interval = int(os.getenv("INTERVAL_SECONDS", "60"))
@@ -253,9 +284,12 @@ async def main() -> None:
     telegram_enabled = bool(token and chat_id)
     queue: asyncio.Queue = asyncio.Queue()
     update_offset = 0
-    state_dir = os.getenv("BOT_STATE_DIR", "/tmp/adaptive_momentum_v2")
-    ledger_path = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger_momentum_v2.json"))
+    state_dir = os.getenv("BOT_STATE_DIR", "/tmp/adaptive_momentum_v4_1")
+    ledger_path = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger_v4_1.json"))
+    stats_meta_path = os.path.join(state_dir, "stats_meta_v4_1.json")
     trades = load_json(ledger_path, [])
+    stats_meta = load_json(stats_meta_path, {"started_at": time.time()})
+    stats_started_at = float(stats_meta.get("started_at", time.time()))
     latest_candles, prices = {}, {}
 
     def telegram_api(method: str, fields: dict, photo: str = ""):
@@ -263,13 +297,17 @@ async def main() -> None:
         if not photo:
             request = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), method="POST")
         else:
-            boundary = "----MomentumV2" + uuid.uuid4().hex
+            boundary = "----MomentumV41" + uuid.uuid4().hex
             parts = []
             for key, value in fields.items():
                 parts += [f"--{boundary}\r\n".encode(), f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(), str(value).encode(), b"\r\n"]
-            image = open(photo, "rb").read()
-            parts += [f"--{boundary}\r\n".encode(), b'Content-Disposition: form-data; name="photo"; filename="momentum_v2.png"\r\n', b"Content-Type: image/png\r\n\r\n", image, b"\r\n", f"--{boundary}--\r\n".encode()]
-            request = urllib.request.Request(url, data=b"".join(parts), method="POST", headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            with open(photo, "rb") as handle:
+                image = handle.read()
+            parts += [f"--{boundary}\r\n".encode(),
+                      b'Content-Disposition: form-data; name="photo"; filename="momentum_v4_1.png"\r\n',
+                      b"Content-Type: image/png\r\n\r\n", image, b"\r\n", f"--{boundary}--\r\n".encode()]
+            request = urllib.request.Request(url, data=b"".join(parts), method="POST",
+                                             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(request, timeout=20) as response:
             result = json.loads(response.read().decode())
         if not result.get("ok"):
@@ -304,15 +342,17 @@ async def main() -> None:
     live = None
     if not paper:
         from trading.connectors.okx_adapter import OKXAdapter
-        live = OKXAdapter(api_key=os.getenv("EXCHANGE_API_KEY", ""), api_secret=os.getenv("EXCHANGE_API_SECRET", ""), api_passphrase=os.getenv("EXCHANGE_PASSPHRASE", ""), paper=False, leverage=leverage)
+        live = OKXAdapter(api_key=os.getenv("EXCHANGE_API_KEY", ""),
+                          api_secret=os.getenv("EXCHANGE_API_SECRET", ""),
+                          api_passphrase=os.getenv("EXCHANGE_PASSPHRASE", ""), paper=False, leverage=leverage)
 
     def execute(order_type: str, payload: dict):
         if order_type.startswith("OPEN_"):
             payload["tp2"] = payload.get("tp2", payload.get("tp"))
             if telegram_enabled:
-                image_path = f"/tmp/momentum_v2_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+                image_path = f"/tmp/momentum_v4_1_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
                 if not chart(latest_candles.get(str(payload.get("symbol")), []), payload, image_path):
-                    raise RuntimeError("Mandatory Momentum v2 chart failed")
+                    raise RuntimeError("Mandatory Momentum v4.1 chart failed")
                 queue.put_nowait({"kind": "photo", "path": image_path, "caption": trade_text(order_type, payload, paper)})
         elif telegram_enabled:
             queue.put_nowait({"kind": "text", "text": trade_text(order_type, payload, paper)})
@@ -328,12 +368,14 @@ async def main() -> None:
         return result
 
     bots = {
-        symbol: TradingBot(symbol, margin, leverage, paper, os.path.join(state_dir, symbol.replace("/", "_").replace(":", "_") + ".json"), execute, risk_usdt)
+        symbol: TradingBot(symbol, margin, leverage, paper,
+                           os.path.join(state_dir, symbol.replace("/", "_").replace(":", "_") + ".json"),
+                           execute, risk_usdt)
         for symbol in symbols
     }
 
     async def poll_commands():
-        nonlocal update_offset
+        nonlocal update_offset, stats_started_at
         if not telegram_enabled:
             return
         try:
@@ -343,8 +385,19 @@ async def main() -> None:
                 message = update.get("message") or {}
                 if str((message.get("chat") or {}).get("id", "")) != str(chat_id):
                     continue
-                if str(message.get("text", "")).lower().startswith(("/stats", "/restats")):
-                    queue.put_nowait({"kind": "text", "text": stats_text(trades, bots, prices, paper, margin)})
+                command = str(message.get("text", "")).strip().lower().split()[0] if message.get("text") else ""
+                if command == "/stats":
+                    queue.put_nowait({"kind": "text", "text": stats_text(trades, bots, prices, paper, margin, stats_started_at)})
+                elif command == "/restats":
+                    # Reset statistics only. Open positions and trading state are intentionally preserved.
+                    trades.clear()
+                    save_json(ledger_path, [])
+                    stats_started_at = time.time()
+                    save_json(stats_meta_path, {"started_at": stats_started_at})
+                    for bot in bots.values():
+                        for key in bot.counts:
+                            bot.counts[key] = 0
+                    queue.put_nowait({"kind": "text", "text": "♻️ Adaptive Momentum V4.1 stats reset\nTrades: 0\nWin rate: 0%\nNet PnL: $0.00\nOpen positions were NOT closed.\nNew counting starts now."})
         except Exception as error:
             logger.warning("Telegram polling: %s", error)
 
@@ -357,9 +410,18 @@ async def main() -> None:
             pass
     telegram_task = asyncio.create_task(telegram_worker()) if telegram_enabled else None
     last_bar, disabled = {}, set()
-    logger.info("Adaptive Momentum v2 | build=%s | mode=%s | tf=15m | telegram=%s", BUILD_ID, "PAPER" if paper else "LIVE", "CONNECTED" if telegram_enabled else "DISABLED")
+    logger.info("Adaptive Momentum V4.1 | build=%s | mode=%s | tf=15m | telegram=%s",
+                BUILD_ID, "PAPER" if paper else "LIVE", "CONNECTED" if telegram_enabled else "DISABLED")
     if telegram_enabled:
-        queue.put_nowait({"kind": "text", "text": f"🤖 Adaptive Momentum v2 started\nMode: {'PAPER' if paper else 'LIVE'}\nTF: 15M\nLogic: EMA20/50 → EMA8/13 → MACD Histogram Flip → ADX Rising + CHOP → Location\nCooldown: {os.getenv('MOM_COOLDOWN_BARS', '3')} bars after momentum exit\nTP1: {TP1_R:g}R close 50% + BE | TP2: {TP_R:g}R\nMargin: ${margin:.2f} | Risk: ${risk_usdt:.2f}/trade\nCommand: /stats"})
+        queue.put_nowait({"kind": "text", "text": (
+            f"🤖 Adaptive Momentum V4.1 started\n"
+            f"Mode: {'PAPER' if paper else 'LIVE'}\nTF: 15M only\n"
+            "Direction: EMA8/13 Cross UP=LONG · DOWN=SHORT\n"
+            "Filters: ADX+CHOP · MACD+ROC9 · Bollinger+Structure · ATR14 risk\n"
+            f"TP1: {TP1_R:g}R close 50% + BE | TP2: {TP_R:g}R\n"
+            f"Margin: ${margin:.2f} | Risk: ${risk_usdt:.2f}/trade\n"
+            "Commands: /stats · /restats"
+        )})
 
     try:
         while not stop.is_set():
@@ -378,10 +440,11 @@ async def main() -> None:
                     bot = bots[symbol]
                     live_price = field(raw_15m[-1], "close", 4) or float(prices.get(symbol, 0))
                     prices[symbol] = live_price
+
                     if bot.position_open and live_price:
                         event = bot.check_price(live_price)
                         if event:
-                            trades.append({**event, "timestamp": time.time(), "version": "momentum-v2"})
+                            trades.append({**event, "timestamp": time.time(), "version": "momentum-v4.1"})
                             save_json(ledger_path, trades[-2000:])
                     if bar_timestamp == last_bar.get(symbol):
                         continue
@@ -398,7 +461,7 @@ async def main() -> None:
                             continue
                     event = bot.on_bar(indicators, price=live_price)
                     if event:
-                        trades.append({**event, "timestamp": time.time(), "version": "momentum-v2"})
+                        trades.append({**event, "timestamp": time.time(), "version": "momentum-v4.1"})
                         save_json(ledger_path, trades[-2000:])
                     logger.info("[%s] %s", symbol, display_payload(event) if event else bot.last_signal)
                 except ccxt.BadSymbol as error:
@@ -409,14 +472,14 @@ async def main() -> None:
                 except Exception as error:
                     logger.exception("[%s] tick failed", symbol)
                     if telegram_enabled:
-                        queue.put_nowait({"kind": "text", "text": f"❌ Adaptive Momentum v2 error\nSymbol: {symbol}\n{type(error).__name__}: {error}"})
+                        queue.put_nowait({"kind": "text", "text": f"❌ Adaptive Momentum V4.1 error\nSymbol: {symbol}\n{type(error).__name__}: {error}"})
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
     finally:
         if telegram_enabled:
-            queue.put_nowait({"kind": "text", "text": "⏹ Adaptive Momentum v2 stopped"})
+            queue.put_nowait({"kind": "text", "text": "⏹ Adaptive Momentum V4.1 stopped"})
             try:
                 await asyncio.wait_for(queue.join(), timeout=5)
             except asyncio.TimeoutError:
