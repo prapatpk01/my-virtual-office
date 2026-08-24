@@ -1,16 +1,17 @@
-"""EMA Hybrid 15M Cross-Filter System.
+"""EMA Hybrid balanced MTF execution.
 
-Signal model (closed 15-minute candles only):
-- Trigger: fresh EMA8/EMA13 cross.
-- Filters: RSI14, SMA14, ADX and Choppiness.
-- LONG: EMA8 crosses above EMA13, close > SMA14, RSI in bullish zone,
-  ADX >= minimum and CHOP <= maximum.
-- SHORT: inverse rules.
+15M = light directional bias only:
+- LONG bias: close > SMA14 and RSI14 >= 50
+- SHORT bias: close < SMA14 and RSI14 <= 50
+
+5M = actual execution trigger:
+- LONG: fresh EMA8/13 cross up + ADX >= 12 + CHOP <= 65
+- SHORT: fresh EMA8/13 cross down + ADX >= 12 + CHOP <= 65
 
 Risk model:
-- SL = recent 15M structure +/- 0.25 ATR buffer.
-- TP1 = +1R; runtime trims 60% and moves remaining SL to BE+0.15R.
-- TP2 = nearest 15M liquidity/swing target; fallback 2R.
+- SL = recent 5M structure +/- 0.25 ATR
+- TP1 = +1R; runtime trims 60% and moves remaining SL to BE+0.15R
+- TP2 = nearest 5M liquidity/swing target; fallback 2R
 """
 from __future__ import annotations
 
@@ -30,37 +31,41 @@ SetupType = base.SetupType
 
 
 @dataclass(frozen=True)
-class SignalView:
+class BiasView:
+    side: Optional[Side]
+    rsi: float
+    sma14: float
+    close: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class TriggerView:
     side: Optional[Side]
     ready: bool
+    adx: float
+    chop: float
     reason: str
-    rsi: float = 50.0
-    sma14: float = 0.0
-    adx: float = 0.0
-    chop: float = 100.0
 
 
 class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
-    """15M EMA8/13 cross trigger with RSI14/SMA14/ADX/CHOP filters."""
+    """15M bias + 5M EMA8/13 cross execution."""
 
     SL_BUFFER_ATR = float(os.getenv("EMA_ADV_SL_BUFFER_ATR", "0.25"))
     TP2_MIN_RR = float(os.getenv("EMA_ADV_TP2_MIN_RR", "1.30"))
     TP2_FALLBACK_R = float(os.getenv("EMA_ADV_TP2_FALLBACK_R", "2.0"))
 
-    EMA_FAST = int(os.getenv("EMA_15M_FAST", os.getenv("EMA_5M_FAST", "8")))
-    EMA_SLOW = int(os.getenv("EMA_15M_SLOW", os.getenv("EMA_5M_SLOW", "13")))
-    RSI_LEN = int(os.getenv("EMA_15M_RSI_LEN", os.getenv("EMA_5M_RSI_LEN", "14")))
-    SMA_LEN = int(os.getenv("EMA_15M_SMA_LEN", os.getenv("EMA_5M_SMA_LEN", "14")))
+    EMA_FAST = int(os.getenv("EMA_5M_FAST", "8"))
+    EMA_SLOW = int(os.getenv("EMA_5M_SLOW", "13"))
+    RSI_LEN = int(os.getenv("EMA_15M_RSI_LEN", "14"))
+    SMA_LEN = int(os.getenv("EMA_15M_SMA_LEN", "14"))
+    BIAS_RSI_MID = float(os.getenv("EMA_15M_RSI_MID", "50"))
 
-    RSI_LONG_MIN = float(os.getenv("EMA_15M_RSI_LONG_MIN", os.getenv("EMA_5M_RSI_LONG_MIN", "52")))
-    RSI_LONG_MAX = float(os.getenv("EMA_15M_RSI_LONG_MAX", os.getenv("EMA_5M_RSI_LONG_MAX", "70")))
-    RSI_SHORT_MIN = float(os.getenv("EMA_15M_RSI_SHORT_MIN", os.getenv("EMA_5M_RSI_SHORT_MIN", "30")))
-    RSI_SHORT_MAX = float(os.getenv("EMA_15M_RSI_SHORT_MAX", os.getenv("EMA_5M_RSI_SHORT_MAX", "48")))
-    ADX_MIN = float(os.getenv("EMA_15M_ADX_MIN", os.getenv("EMA_5M_ADX_MIN", "12")))
-    CHOP_MAX = float(os.getenv("EMA_15M_CHOP_MAX", os.getenv("EMA_5M_CHOP_MAX", "65")))
+    ADX_MIN = float(os.getenv("EMA_5M_ADX_MIN", "12"))
+    CHOP_MAX = float(os.getenv("EMA_5M_CHOP_MAX", "65"))
 
-    SWING_LOOKBACK = max(20, int(os.getenv("EMA_15M_SWING_LOOKBACK", os.getenv("EMA_5M_SWING_LOOKBACK", "48"))))
-    STRUCTURE_LOOKBACK = max(6, int(os.getenv("EMA_15M_STRUCTURE_LOOKBACK", os.getenv("EMA_5M_STRUCTURE_LOOKBACK", "12"))))
+    SWING_LOOKBACK = max(20, int(os.getenv("EMA_5M_SWING_LOOKBACK", "48")))
+    STRUCTURE_LOOKBACK = max(6, int(os.getenv("EMA_5M_STRUCTURE_LOOKBACK", "12")))
 
     def __init__(self, config=None) -> None:
         super().__init__(config)
@@ -88,81 +93,76 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         rs = avg_gain / avg_loss.replace(0.0, 1e-12)
         return 100.0 - (100.0 / (1.0 + rs))
 
-    def _prep(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def _prep5(self, frame: pd.DataFrame) -> pd.DataFrame:
         d = frame.copy()
         c = d["close"].astype(float)
         d["ema_fast"] = self._ema(c, self.EMA_FAST)
         d["ema_slow"] = self._ema(c, self.EMA_SLOW)
-        d["sma14"] = c.rolling(self.SMA_LEN, min_periods=self.SMA_LEN).mean()
-        d["rsi14"] = self._rsi(c, self.RSI_LEN)
         d["atr"] = self._atr(d, self.cfg.atr_len)
         return d
 
-    def _quality_values(self, d: pd.DataFrame) -> tuple[float, float]:
+    def _prep15(self, frame: pd.DataFrame) -> pd.DataFrame:
+        d = frame.copy()
+        c = d["close"].astype(float)
+        d["sma14"] = c.rolling(self.SMA_LEN, min_periods=self.SMA_LEN).mean()
+        d["rsi14"] = self._rsi(c, self.RSI_LEN)
+        return d
+
+    def _quality_values_5m(self, d: pd.DataFrame) -> tuple[float, float]:
         try:
             q = self.quality_state_1h(d)
             return float(q.adx), float(q.chop)
         except Exception:
             return 0.0, 100.0
 
-    def _cross_signal(self, df15: pd.DataFrame) -> tuple[Optional[SignalView], dict]:
-        if len(df15) < 80:
-            return None, {"state": "WARMUP", "rsi": 0.0, "sma": 0.0, "adx": 0.0, "chop": 0.0}
-
-        d = self._prep(df15)
-        r, p = d.iloc[-1], d.iloc[-2]
+    def _bias15(self, df15: pd.DataFrame) -> BiasView:
+        if len(df15) < 30:
+            return BiasView(None, 0.0, 0.0, 0.0, "15M WARMUP")
+        d = self._prep15(df15)
+        r = d.iloc[-1]
         if pd.isna(r.sma14) or pd.isna(r.rsi14):
-            return None, {"state": "WARMUP", "rsi": 0.0, "sma": 0.0, "adx": 0.0, "chop": 0.0}
+            return BiasView(None, 0.0, 0.0, float(r.close), "15M WARMUP")
 
-        adx, chop = self._quality_values(d)
-        rsi = float(r.rsi14)
-        sma = float(r.sma14)
         close = float(r.close)
+        sma = float(r.sma14)
+        rsi = float(r.rsi14)
+        if close > sma and rsi >= self.BIAS_RSI_MID:
+            return BiasView(Side.LONG, rsi, sma, close, "15M BULL: Close>SMA14 & RSI>=50")
+        if close < sma and rsi <= self.BIAS_RSI_MID:
+            return BiasView(Side.SHORT, rsi, sma, close, "15M BEAR: Close<SMA14 & RSI<=50")
+        return BiasView(None, rsi, sma, close, "15M NEUTRAL/MIXED")
+
+    def _trigger5(self, df5: pd.DataFrame, bias_side: Optional[Side]) -> TriggerView:
+        if len(df5) < 80 or bias_side is None:
+            return TriggerView(None, False, 0.0, 100.0, "5M WAIT: no valid 15M bias")
+
+        d = self._prep5(df5)
+        r, p = d.iloc[-1], d.iloc[-2]
+        adx, chop = self._quality_values_5m(d)
+        quality_ok = adx >= self.ADX_MIN and chop <= self.CHOP_MAX
 
         cross_up = float(p.ema_fast) <= float(p.ema_slow) and float(r.ema_fast) > float(r.ema_slow)
         cross_down = float(p.ema_fast) >= float(p.ema_slow) and float(r.ema_fast) < float(r.ema_slow)
-        quality_ok = adx >= self.ADX_MIN and chop <= self.CHOP_MAX
 
-        long_filters = close > sma and self.RSI_LONG_MIN <= rsi <= self.RSI_LONG_MAX and quality_ok
-        short_filters = close < sma and self.RSI_SHORT_MIN <= rsi <= self.RSI_SHORT_MAX and quality_ok
+        if bias_side == Side.LONG:
+            ready = cross_up and quality_ok
+            state = "READY LONG" if ready else ("CROSS_UP_FILTERED" if cross_up else "WAIT CROSS_UP")
+            return TriggerView(Side.LONG, ready, adx, chop, f"5M {state}")
 
-        meta = {
-            "state": "WAIT", "rsi": rsi, "sma": sma, "adx": adx, "chop": chop,
-            "cross_up": cross_up, "cross_down": cross_down, "close": close,
-        }
-
-        if cross_up and long_filters:
-            reason = (
-                f"EMA{self.EMA_FAST}/{self.EMA_SLOW} CROSS_UP | RSI14={rsi:.1f} | "
-                f"Close>SMA14 | ADX={adx:.1f} | CHOP={chop:.1f}"
-            )
-            meta["state"] = "LONG_READY"
-            return SignalView(Side.LONG, True, reason, rsi, sma, adx, chop), meta
-
-        if cross_down and short_filters:
-            reason = (
-                f"EMA{self.EMA_FAST}/{self.EMA_SLOW} CROSS_DOWN | RSI14={rsi:.1f} | "
-                f"Close<SMA14 | ADX={adx:.1f} | CHOP={chop:.1f}"
-            )
-            meta["state"] = "SHORT_READY"
-            return SignalView(Side.SHORT, True, reason, rsi, sma, adx, chop), meta
-
-        if cross_up:
-            meta["state"] = "CROSS_UP_FILTERED"
-        elif cross_down:
-            meta["state"] = "CROSS_DOWN_FILTERED"
-        return None, meta
+        ready = cross_down and quality_ok
+        state = "READY SHORT" if ready else ("CROSS_DOWN_FILTERED" if cross_down else "WAIT CROSS_DOWN")
+        return TriggerView(Side.SHORT, ready, adx, chop, f"5M {state}")
 
     def _structure_stop(self, d: pd.DataFrame, side: Side, entry: float) -> tuple[float, float]:
         atr = max(float(d.atr.iloc[-1]), 1e-12)
         recent = d.iloc[-self.STRUCTURE_LOOKBACK:]
         if side == Side.LONG:
-            base_sl = float(recent.low.min())
-            sl = base_sl - self.SL_BUFFER_ATR * atr
+            structure = float(recent.low.min())
+            sl = structure - self.SL_BUFFER_ATR * atr
             risk = entry - sl
         else:
-            base_sl = float(recent.high.max())
-            sl = base_sl + self.SL_BUFFER_ATR * atr
+            structure = float(recent.high.max())
+            sl = structure + self.SL_BUFFER_ATR * atr
             risk = sl - entry
         return sl, risk
 
@@ -184,65 +184,61 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             for target in sorted(set(x for x in highs if x > entry)):
                 rr = (target - entry) / risk
                 if rr >= self.TP2_MIN_RR:
-                    return target, rr, "SWING_HIGH"
-            target = entry + self.TP2_FALLBACK_R * risk
-        else:
-            for target in sorted(set((x for x in lows if x < entry)), reverse=True):
-                rr = (entry - target) / risk
-                if rr >= self.TP2_MIN_RR:
-                    return target, rr, "SWING_LOW"
-            target = entry - self.TP2_FALLBACK_R * risk
-        return target, self.TP2_FALLBACK_R, "FALLBACK_R"
+                    return target, rr, "5M_SWING_HIGH"
+            return entry + self.TP2_FALLBACK_R * risk, self.TP2_FALLBACK_R, "FALLBACK_R"
+
+        for target in sorted(set((x for x in lows if x < entry)), reverse=True):
+            rr = (entry - target) / risk
+            if rr >= self.TP2_MIN_RR:
+                return target, rr, "5M_SWING_LOW"
+        return entry - self.TP2_FALLBACK_R * risk, self.TP2_FALLBACK_R, "FALLBACK_R"
 
     def generate_entry(self, df4h, df1h, df15, df5, has_open_position=False):
         if has_open_position or not self._entry_schedule_open():
             return None
 
-        sig, _ = self._cross_signal(df15)
-        if sig is None or sig.side is None:
+        bias = self._bias15(df15)
+        trigger = self._trigger5(df5, bias.side)
+        if not trigger.ready or trigger.side is None:
             return None
 
-        d = self._prep(df15)
-        entry = float(d.close.iloc[-1])
-        sl, risk = self._structure_stop(d, sig.side, entry)
+        d5 = self._prep5(df5)
+        entry = float(d5.close.iloc[-1])
+        sl, risk = self._structure_stop(d5, trigger.side, entry)
         if risk <= 0:
             return None
 
-        tp2, rr, target_type = self._tp2(d, sig.side, entry, risk)
-        atr = max(float(d.atr.iloc[-1]), 1e-12)
-        trend = Trend.BULL if sig.side == Side.LONG else Trend.BEAR
-        trigger = f"EMA15M_CROSS_{'UP' if sig.side == Side.LONG else 'DOWN'}"
+        tp2, rr, target_type = self._tp2(d5, trigger.side, entry, risk)
+        atr = max(float(d5.atr.iloc[-1]), 1e-12)
+        trend = Trend.BULL if trigger.side == Side.LONG else Trend.BEAR
+        trigger_name = f"EMA5M_CROSS_{'UP' if trigger.side == Side.LONG else 'DOWN'}"
         room_pct = abs(tp2 - entry) / max(entry, 1e-12)
-        structure_px = sl + self.SL_BUFFER_ATR * atr if sig.side == Side.LONG else sl - self.SL_BUFFER_ATR * atr
+        structure_px = sl + self.SL_BUFFER_ATR * atr if trigger.side == Side.LONG else sl - self.SL_BUFFER_ATR * atr
 
         reason = (
-            f"EMA Hybrid 15M CROSS | {sig.reason} | "
-            f"SL=15M structure+{self.SL_BUFFER_ATR:.2f}ATR | "
+            f"EMA Hybrid BALANCED | {bias.reason} | EMA{self.EMA_FAST}/{self.EMA_SLOW} 5M CROSS | "
+            f"ADX5M={trigger.adx:.1f} CHOP5M={trigger.chop:.1f} | "
+            f"SL=5M structure+{self.SL_BUFFER_ATR:.2f}ATR | "
             f"TP1=1R trim60% + SL BE+0.15R | TP2={target_type} {rr:.2f}R"
         )
 
         return EntrySignal(
-            sig.side, entry, sl, tp2, trend,
-            sig.rsi, sig.adx, sig.chop,
-            SetupType.PULLBACK, trigger, room_pct, atr, structure_px, reason,
+            trigger.side, entry, sl, tp2, trend,
+            bias.rsi, trigger.adx, trigger.chop,
+            SetupType.PULLBACK, trigger_name, room_pct, atr, structure_px, reason,
         )
 
     def entry_status(self, df4h, df1h, df15, df5):
-        sig, meta = self._cross_signal(df15)
+        bias = self._bias15(df15)
+        trigger = self._trigger5(df5, bias.side)
         paper = bool(getattr(self.cfg, "paper", False))
         open_ = self._entry_schedule_open()
         sched = "24/7 PAPER(OPEN)" if paper else f"24/5 LIVE({'OPEN' if open_ else 'WEEKEND_CLOSED'})"
-
-        if sig is not None:
-            return (
-                f"15M EMA-CROSS READY | {sig.side.value} | RSI14={sig.rsi:.1f} | SMA14={sig.sma14:.6g} | "
-                f"ADX={sig.adx:.1f} CHOP={sig.chop:.1f} | Schedule={sched} | SLBuf={self.SL_BUFFER_ATR:.2f}ATR"
-            )
+        side = bias.side.value if bias.side is not None else "NEUTRAL"
 
         return (
-            f"15M EMA-CROSS WAIT | State={meta.get('state','?')} | RSI14={meta.get('rsi',0):.1f} | "
-            f"SMA14={meta.get('sma',0):.6g} | ADX={meta.get('adx',0):.1f} CHOP={meta.get('chop',0):.1f} | "
-            f"Rules: LONG RSI {self.RSI_LONG_MIN:.0f}-{self.RSI_LONG_MAX:.0f}, "
-            f"SHORT RSI {self.RSI_SHORT_MIN:.0f}-{self.RSI_SHORT_MAX:.0f}, "
+            f"BALANCED MTF | 15M Bias={side} Close={bias.close:.6g} SMA14={bias.sma14:.6g} RSI14={bias.rsi:.1f} | "
+            f"5M={trigger.reason} ADX={trigger.adx:.1f} CHOP={trigger.chop:.1f} | "
+            f"Rules: 15M Close/SMA14 + RSI side-of-50; 5M EMA{self.EMA_FAST}/{self.EMA_SLOW} cross, "
             f"ADX>={self.ADX_MIN:.0f}, CHOP<={self.CHOP_MAX:.0f} | Schedule={sched}"
         )
