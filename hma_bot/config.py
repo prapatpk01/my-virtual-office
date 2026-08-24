@@ -64,10 +64,9 @@ class Config:
         default_factory=lambda: _env_float("MARGIN_PER_POSITION_USD", 20.0))
     max_positions: int = field(default_factory=lambda: _env_int("MAX_POSITIONS", 2))
 
-    fee_rate: float = 0.0005      # verified 0.05% OKX taker per fill
+    fee_rate: float = 0.0005
     margin_mode: str = "isolated"
 
-    # ── MTF strategy tunables ─────────────────────────────────────────────
     trend_tf: str = "4h"
     quality_tf: str = "1h"
     entry_tf: str = "15m"
@@ -89,7 +88,9 @@ class Config:
     reentry_cooldown_bars: int = field(default_factory=lambda: _env_int("REENTRY_COOLDOWN_BARS", 0))
 
     poll_interval_sec: int = 30
-    status_log_interval_sec: int = field(default_factory=lambda: _env_int("STATUS_LOG_INTERVAL_SEC", 300))
+    # Railway status/view log every 15 minutes by default. Execution scans
+    # continue on each closed 5M bar; this only controls diagnostic logging.
+    status_log_interval_sec: int = field(default_factory=lambda: _env_int("STATUS_LOG_INTERVAL_SEC", 900))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "state"))
     stats_since_date: str = field(default_factory=lambda: os.environ.get("STATS_SINCE_DATE", "2026-07-30"))
 
