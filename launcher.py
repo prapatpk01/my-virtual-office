@@ -51,8 +51,8 @@ def main() -> None:
         name = "Trend Pullback Continuation (TPC Sentinel)"
     elif mode in ("ema_hybrid", "ema_hybrid_pro", "hybrid"):
         target_dir = os.path.join(HERE, "ema_hybrid_bot")
-        argv = [sys.executable, "main.py"]
-        name = "EMA Hybrid Pro"
+        argv = [sys.executable, "main_guarded.py"]
+        name = "EMA Hybrid Pro — One-Position Guarded"
     elif mode in ("hma", "hma16", "trendfollow"):
         target_dir = os.path.join(HERE, "hma_bot")
         argv = [sys.executable, "main_v16.py"]
