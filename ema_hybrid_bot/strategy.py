@@ -1,17 +1,16 @@
-"""EMA Hybrid 5M Five-Engine System.
+"""EMA Hybrid 5M Cross-Filter System.
 
-All signal generation is executed on closed 5-minute candles.
-Five independent entry engines:
-1) EMA pullback reclaim
-2) EMA8/13 momentum cross
-3) Liquidity sweep reversal
-4) BOS breakout with volume
-5) Trend continuation
+Signal model (closed 5-minute candles only):
+- Trigger: fresh EMA8/EMA13 cross.
+- Filters: RSI14, SMA14, ADX and Choppiness.
+- LONG: EMA8 crosses above EMA13, close > SMA14, RSI in bullish zone,
+  ADX >= minimum and CHOP <= maximum.
+- SHORT: inverse rules.
 
 Risk model remains compatible with the EMA Hybrid runtime:
-- SL = recent 5M structure + 0.25 ATR buffer
-- TP1 = +1R, runtime trims 60% and moves remaining SL to BE+0.15R
-- TP2 = nearest 5M liquidity/swing target; fallback 2R if no clean target exists
+- SL = recent 5M structure +/- 0.25 ATR buffer.
+- TP1 = +1R; runtime trims 60% and moves remaining SL to BE+0.15R.
+- TP2 = nearest 5M liquidity/swing target; fallback 2R.
 """
 from __future__ import annotations
 
@@ -33,30 +32,35 @@ SetupType = base.SetupType
 @dataclass(frozen=True)
 class SignalView:
     side: Optional[Side]
-    engine: str
     ready: bool
-    score: int
     reason: str
-    regime: str = "NEUTRAL"
-    pa: str = "NONE"
-    volume_ratio: float = 1.0
-    structure: str = "NONE"
+    rsi: float = 50.0
+    sma14: float = 0.0
+    adx: float = 0.0
+    chop: float = 100.0
 
 
 class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
-    """Fast 5M-only strategy with five independent signal engines."""
+    """5M EMA8/13 cross trigger with RSI14/SMA14/ADX/CHOP filters."""
 
     SL_BUFFER_ATR = float(os.getenv("EMA_ADV_SL_BUFFER_ATR", "0.25"))
     TP2_MIN_RR = float(os.getenv("EMA_ADV_TP2_MIN_RR", "1.30"))
     TP2_FALLBACK_R = float(os.getenv("EMA_ADV_TP2_FALLBACK_R", "2.0"))
-    MIN_SIGNAL_SCORE = int(os.getenv("EMA_5M_MIN_SIGNAL_SCORE", "5"))
+
+    EMA_FAST = int(os.getenv("EMA_5M_FAST", "8"))
+    EMA_SLOW = int(os.getenv("EMA_5M_SLOW", "13"))
+    RSI_LEN = int(os.getenv("EMA_5M_RSI_LEN", "14"))
+    SMA_LEN = int(os.getenv("EMA_5M_SMA_LEN", "14"))
+
+    RSI_LONG_MIN = float(os.getenv("EMA_5M_RSI_LONG_MIN", "52"))
+    RSI_LONG_MAX = float(os.getenv("EMA_5M_RSI_LONG_MAX", "70"))
+    RSI_SHORT_MIN = float(os.getenv("EMA_5M_RSI_SHORT_MIN", "30"))
+    RSI_SHORT_MAX = float(os.getenv("EMA_5M_RSI_SHORT_MAX", "48"))
     ADX_MIN = float(os.getenv("EMA_5M_ADX_MIN", "12"))
     CHOP_MAX = float(os.getenv("EMA_5M_CHOP_MAX", "65"))
+
     SWING_LOOKBACK = max(20, int(os.getenv("EMA_5M_SWING_LOOKBACK", "48")))
     STRUCTURE_LOOKBACK = max(6, int(os.getenv("EMA_5M_STRUCTURE_LOOKBACK", "12")))
-    SWEEP_LOOKBACK = max(5, int(os.getenv("EMA_5M_SWEEP_LOOKBACK", "10")))
-    EMA_TOUCH_ATR = float(os.getenv("EMA_5M_EMA_TOUCH_ATR", "0.35"))
-    VOLUME_EXPANSION = float(os.getenv("EMA_5M_VOLUME_EXPANSION", "1.10"))
 
     def __init__(self, config=None) -> None:
         super().__init__(config)
@@ -73,186 +77,96 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
     def _ema(series: pd.Series, n: int) -> pd.Series:
         return series.astype(float).ewm(span=n, adjust=False).mean()
 
+    @staticmethod
+    def _rsi(series: pd.Series, n: int) -> pd.Series:
+        s = series.astype(float)
+        delta = s.diff()
+        gain = delta.clip(lower=0.0)
+        loss = -delta.clip(upper=0.0)
+        avg_gain = gain.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+        avg_loss = loss.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+        rs = avg_gain / avg_loss.replace(0.0, 1e-12)
+        return 100.0 - (100.0 / (1.0 + rs))
+
     def _prep(self, frame: pd.DataFrame) -> pd.DataFrame:
         d = frame.copy()
         c = d["close"].astype(float)
-        d["ema8"] = self._ema(c, 8)
-        d["ema13"] = self._ema(c, 13)
-        d["ema20"] = self._ema(c, 20)
-        d["ema50"] = self._ema(c, 50)
-        d["ema200"] = self._ema(c, 200)
+        d["ema_fast"] = self._ema(c, self.EMA_FAST)
+        d["ema_slow"] = self._ema(c, self.EMA_SLOW)
+        d["sma14"] = c.rolling(self.SMA_LEN, min_periods=self.SMA_LEN).mean()
+        d["rsi14"] = self._rsi(c, self.RSI_LEN)
         d["atr"] = self._atr(d, self.cfg.atr_len)
         return d
 
-    def _regime(self, d: pd.DataFrame) -> tuple[Optional[Side], str]:
-        if len(d) < 60:
-            return None, "WARMUP"
-        r = d.iloc[-1]
-        slope50 = float(d.ema50.iloc[-1] - d.ema50.iloc[-6])
-        if float(r.close) > float(r.ema50) and float(r.ema8) > float(r.ema13) and slope50 >= 0:
-            return Side.LONG, "BULL"
-        if float(r.close) < float(r.ema50) and float(r.ema8) < float(r.ema13) and slope50 <= 0:
-            return Side.SHORT, "BEAR"
-        return None, "NEUTRAL"
-
-    @staticmethod
-    def _volume_ratio(d: pd.DataFrame) -> float:
-        if "volume" not in d.columns or len(d) < 20:
-            return 1.0
-        avg = float(d.volume.astype(float).iloc[-20:].mean())
-        return float(d.volume.iloc[-1]) / max(avg, 1e-12)
-
-    @staticmethod
-    def _pa(d: pd.DataFrame, side: Side) -> str:
-        if len(d) < 3:
-            return "NONE"
-        r, p = d.iloc[-1], d.iloc[-2]
-        ro, rh, rl, rc = map(float, (r.open, r.high, r.low, r.close))
-        po, ph, pl, pc = map(float, (p.open, p.high, p.low, p.close))
-        rng = max(rh-rl, 1e-12)
-        body = abs(rc-ro)
-        upper = rh-max(ro, rc)
-        lower = min(ro, rc)-rl
-        if side == Side.LONG:
-            if rc > ro and pc < po and rc >= po and ro <= pc:
-                return "BULL_ENGULF"
-            if lower >= max(body*1.7, rng*0.40) and rc > rl + 0.55*rng:
-                return "BULL_PIN"
-            if rc > ro and body/rng >= 0.55:
-                return "STRONG_BULL"
-        else:
-            if rc < ro and pc > po and rc <= po and ro >= pc:
-                return "BEAR_ENGULF"
-            if upper >= max(body*1.7, rng*0.40) and rc < rh - 0.55*rng:
-                return "BEAR_PIN"
-            if rc < ro and body/rng >= 0.55:
-                return "STRONG_BEAR"
-        return "NONE"
-
-    def _structure(self, d: pd.DataFrame, side: Side) -> str:
-        if len(d) < self.STRUCTURE_LOOKBACK + 2:
-            return "NONE"
-        r = d.iloc[-1]
-        prior = d.iloc[-self.STRUCTURE_LOOKBACK-1:-1]
-        if side == Side.LONG and float(r.close) > float(prior.high.max()):
-            return "BOS_UP"
-        if side == Side.SHORT and float(r.close) < float(prior.low.min()):
-            return "BOS_DOWN"
-        return "NONE"
-
-    def _sweep(self, d: pd.DataFrame, side: Side) -> bool:
-        if len(d) < self.SWEEP_LOOKBACK + 2:
-            return False
-        r = d.iloc[-1]
-        prior = d.iloc[-self.SWEEP_LOOKBACK-1:-1]
-        if side == Side.LONG:
-            low = float(prior.low.min())
-            return float(r.low) < low and float(r.close) > low
-        high = float(prior.high.max())
-        return float(r.high) > high and float(r.close) < high
-
-    def _quality(self, d: pd.DataFrame):
+    def _quality_values(self, d: pd.DataFrame) -> tuple[float, float]:
+        """Reuse the production ADX/CHOP implementation on the 5M frame."""
         try:
-            return self.quality_state_1h(d)
+            q = self.quality_state_1h(d)
+            return float(q.adx), float(q.chop)
         except Exception:
-            return None
+            return 0.0, 100.0
 
-    def _quality_ok(self, d: pd.DataFrame) -> tuple[bool, float, float, float]:
-        q = self._quality(d)
-        if q is None:
-            return True, 50.0, 15.0, 50.0
-        qv, adx, chop = float(q.q), float(q.adx), float(q.chop)
-        return adx >= self.ADX_MIN and chop <= self.CHOP_MAX, qv, adx, chop
-
-    def _engine_pullback_reclaim(self, d: pd.DataFrame, side: Side) -> SignalView:
-        r, p = d.iloc[-1], d.iloc[-2]
-        atr = max(float(r.atr), 1e-12)
-        tol = self.EMA_TOUCH_ATR * atr
-        touched = False
-        reclaimed = False
-        if side == Side.LONG:
-            touched = float(p.low) <= float(p.ema13) + tol or float(p.low) <= float(p.ema20) + tol
-            reclaimed = float(r.close) > float(r.ema13) and float(r.close) > float(r.open)
-        else:
-            touched = float(p.high) >= float(p.ema13) - tol or float(p.high) >= float(p.ema20) - tol
-            reclaimed = float(r.close) < float(r.ema13) and float(r.close) < float(r.open)
-        pa = self._pa(d, side)
-        score = 2 + (2 if touched else 0) + (2 if reclaimed else 0) + (1 if pa != "NONE" else 0)
-        return SignalView(side, "EMA_PULLBACK", touched and reclaimed and score >= self.MIN_SIGNAL_SCORE,
-                          score, f"touch={touched} reclaim={reclaimed}", pa=pa, volume_ratio=self._volume_ratio(d))
-
-    def _engine_cross(self, d: pd.DataFrame, side: Side) -> SignalView:
-        r, p = d.iloc[-1], d.iloc[-2]
-        if side == Side.LONG:
-            cross = float(p.ema8) <= float(p.ema13) and float(r.ema8) > float(r.ema13)
-            momentum = float(r.close) > float(r.open) and float(r.close) > float(r.ema20)
-        else:
-            cross = float(p.ema8) >= float(p.ema13) and float(r.ema8) < float(r.ema13)
-            momentum = float(r.close) < float(r.open) and float(r.close) < float(r.ema20)
-        vr = self._volume_ratio(d)
-        score = 2 + (3 if cross else 0) + (1 if momentum else 0) + (1 if vr >= 1.0 else 0)
-        return SignalView(side, "EMA_CROSS", cross and momentum and score >= self.MIN_SIGNAL_SCORE,
-                          score, f"cross={cross} momentum={momentum}", volume_ratio=vr)
-
-    def _engine_sweep(self, d: pd.DataFrame, side: Side) -> SignalView:
-        sweep = self._sweep(d, side)
-        pa = self._pa(d, side)
-        vr = self._volume_ratio(d)
-        score = 2 + (3 if sweep else 0) + (2 if pa != "NONE" else 0) + (1 if vr >= 1.0 else 0)
-        return SignalView(side, "LIQUIDITY_SWEEP", sweep and pa != "NONE" and score >= self.MIN_SIGNAL_SCORE,
-                          score, f"sweep={sweep} pa={pa}", pa=pa, volume_ratio=vr)
-
-    def _engine_bos(self, d: pd.DataFrame, side: Side) -> SignalView:
-        structure = self._structure(d, side)
-        vr = self._volume_ratio(d)
-        r = d.iloc[-1]
-        if side == Side.LONG:
-            body_ok = float(r.close) > float(r.open) and float(r.close) > float(r.ema13)
-        else:
-            body_ok = float(r.close) < float(r.open) and float(r.close) < float(r.ema13)
-        score = 2 + (3 if structure != "NONE" else 0) + (2 if vr >= self.VOLUME_EXPANSION else 0) + (1 if body_ok else 0)
-        ready = structure != "NONE" and body_ok and vr >= self.VOLUME_EXPANSION and score >= self.MIN_SIGNAL_SCORE
-        return SignalView(side, "BOS_BREAKOUT", ready, score,
-                          f"structure={structure} vol={vr:.2f}x", volume_ratio=vr, structure=structure)
-
-    def _engine_continuation(self, d: pd.DataFrame, side: Side) -> SignalView:
-        r, p = d.iloc[-1], d.iloc[-2]
-        if side == Side.LONG:
-            stack = float(r.ema8) > float(r.ema13) > float(r.ema50)
-            shallow = float(p.low) <= float(p.ema13) and float(p.close) >= float(p.ema50)
-            continue_bar = float(r.close) > float(p.high) and float(r.close) > float(r.open)
-        else:
-            stack = float(r.ema8) < float(r.ema13) < float(r.ema50)
-            shallow = float(p.high) >= float(p.ema13) and float(p.close) <= float(p.ema50)
-            continue_bar = float(r.close) < float(p.low) and float(r.close) < float(r.open)
-        vr = self._volume_ratio(d)
-        score = 2 + (2 if stack else 0) + (2 if shallow else 0) + (2 if continue_bar else 0) + (1 if vr >= 1.0 else 0)
-        return SignalView(side, "TREND_CONTINUATION", stack and shallow and continue_bar and score >= self.MIN_SIGNAL_SCORE,
-                          score, f"stack={stack} shallow={shallow} continuation={continue_bar}", volume_ratio=vr)
-
-    def _best_signal(self, df5: pd.DataFrame) -> tuple[Optional[SignalView], dict]:
+    def _cross_signal(self, df5: pd.DataFrame) -> tuple[Optional[SignalView], dict]:
         if len(df5) < 80:
-            return None, {"regime": "WARMUP", "q": 0.0, "adx": 0.0, "chop": 0.0}
+            return None, {"state": "WARMUP", "rsi": 0.0, "sma": 0.0, "adx": 0.0, "chop": 0.0}
+
         d = self._prep(df5)
-        side, regime = self._regime(d)
-        quality_ok, qv, adx, chop = self._quality_ok(d)
-        meta = {"regime": regime, "q": qv, "adx": adx, "chop": chop}
-        if side is None or not quality_ok:
-            return None, meta
-        engines = [
-            self._engine_pullback_reclaim(d, side),
-            self._engine_cross(d, side),
-            self._engine_sweep(d, side),
-            self._engine_bos(d, side),
-            self._engine_continuation(d, side),
-        ]
-        ready = [x for x in engines if x.ready]
-        if not ready:
-            meta["engines"] = engines
-            return None, meta
-        best = max(ready, key=lambda x: x.score)
-        meta["engines"] = engines
-        return best, meta
+        r, p = d.iloc[-1], d.iloc[-2]
+        if pd.isna(r.sma14) or pd.isna(r.rsi14):
+            return None, {"state": "WARMUP", "rsi": 0.0, "sma": 0.0, "adx": 0.0, "chop": 0.0}
+
+        adx, chop = self._quality_values(d)
+        rsi = float(r.rsi14)
+        sma = float(r.sma14)
+        close = float(r.close)
+
+        cross_up = float(p.ema_fast) <= float(p.ema_slow) and float(r.ema_fast) > float(r.ema_slow)
+        cross_down = float(p.ema_fast) >= float(p.ema_slow) and float(r.ema_fast) < float(r.ema_slow)
+
+        quality_ok = adx >= self.ADX_MIN and chop <= self.CHOP_MAX
+        long_filters = (
+            close > sma
+            and self.RSI_LONG_MIN <= rsi <= self.RSI_LONG_MAX
+            and quality_ok
+        )
+        short_filters = (
+            close < sma
+            and self.RSI_SHORT_MIN <= rsi <= self.RSI_SHORT_MAX
+            and quality_ok
+        )
+
+        meta = {
+            "state": "WAIT",
+            "rsi": rsi,
+            "sma": sma,
+            "adx": adx,
+            "chop": chop,
+            "cross_up": cross_up,
+            "cross_down": cross_down,
+            "close": close,
+        }
+
+        if cross_up and long_filters:
+            reason = (
+                f"EMA{self.EMA_FAST}/{self.EMA_SLOW} CROSS_UP | "
+                f"RSI14={rsi:.1f} | Close>SMA14 | ADX={adx:.1f} | CHOP={chop:.1f}"
+            )
+            meta["state"] = "LONG_READY"
+            return SignalView(Side.LONG, True, reason, rsi, sma, adx, chop), meta
+
+        if cross_down and short_filters:
+            reason = (
+                f"EMA{self.EMA_FAST}/{self.EMA_SLOW} CROSS_DOWN | "
+                f"RSI14={rsi:.1f} | Close<SMA14 | ADX={adx:.1f} | CHOP={chop:.1f}"
+            )
+            meta["state"] = "SHORT_READY"
+            return SignalView(Side.SHORT, True, reason, rsi, sma, adx, chop), meta
+
+        if cross_up:
+            meta["state"] = "CROSS_UP_FILTERED"
+        elif cross_down:
+            meta["state"] = "CROSS_DOWN_FILTERED"
+        return None, meta
 
     def _structure_stop(self, d: pd.DataFrame, side: Side, entry: float) -> tuple[float, float]:
         atr = max(float(d.atr.iloc[-1]), 1e-12)
@@ -269,9 +183,9 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
     def _pivot_levels(self, d: pd.DataFrame):
         span = 2
-        start = max(span, len(d)-self.SWING_LOOKBACK)
+        start = max(span, len(d) - self.SWING_LOOKBACK)
         highs, lows = [], []
-        for i in range(start, len(d)-span):
+        for i in range(start, len(d) - span):
             w = d.iloc[i-span:i+span+1]
             if float(d.high.iloc[i]) >= float(w.high.max()):
                 highs.append(float(d.high.iloc[i]))
@@ -283,55 +197,71 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         highs, lows = self._pivot_levels(d)
         if side == Side.LONG:
             for target in sorted(set(x for x in highs if x > entry)):
-                rr = (target-entry)/risk
+                rr = (target - entry) / risk
                 if rr >= self.TP2_MIN_RR:
                     return target, rr, "SWING_HIGH"
-            target = entry + self.TP2_FALLBACK_R*risk
+            target = entry + self.TP2_FALLBACK_R * risk
         else:
             for target in sorted(set((x for x in lows if x < entry)), reverse=True):
-                rr = (entry-target)/risk
+                rr = (entry - target) / risk
                 if rr >= self.TP2_MIN_RR:
                     return target, rr, "SWING_LOW"
-            target = entry - self.TP2_FALLBACK_R*risk
+            target = entry - self.TP2_FALLBACK_R * risk
         return target, self.TP2_FALLBACK_R, "FALLBACK_R"
 
     def generate_entry(self, df4h, df1h, df15, df5, has_open_position=False):
         if has_open_position or not self._entry_schedule_open():
             return None
-        best, meta = self._best_signal(df5)
-        if best is None or best.side is None:
+
+        sig, meta = self._cross_signal(df5)
+        if sig is None or sig.side is None:
             return None
+
         d = self._prep(df5)
         entry = float(d.close.iloc[-1])
-        sl, risk = self._structure_stop(d, best.side, entry)
+        sl, risk = self._structure_stop(d, sig.side, entry)
         if risk <= 0:
             return None
-        tp2, rr, target_type = self._tp2(d, best.side, entry, risk)
+
+        tp2, rr, target_type = self._tp2(d, sig.side, entry, risk)
         atr = max(float(d.atr.iloc[-1]), 1e-12)
-        trend = Trend.BULL if best.side == Side.LONG else Trend.BEAR
+        trend = Trend.BULL if sig.side == Side.LONG else Trend.BEAR
+        trigger = f"EMA5M_CROSS_{'UP' if sig.side == Side.LONG else 'DOWN'}"
+        room_pct = abs(tp2 - entry) / max(entry, 1e-12)
+        structure_px = sl + self.SL_BUFFER_ATR * atr if sig.side == Side.LONG else sl - self.SL_BUFFER_ATR * atr
+
         reason = (
-            f"EMA Hybrid 5M | Engine={best.engine} | Score={best.score} | Regime={meta['regime']} | "
-            f"Q={meta['q']:.0f} ADX={meta['adx']:.1f} CHOP={meta['chop']:.1f} | {best.reason} | "
-            f"SL=5M structure+{self.SL_BUFFER_ATR:.2f}ATR | TP1=1R trim60% + SL BE+0.15R | "
-            f"TP2={target_type} {rr:.2f}R"
+            f"EMA Hybrid 5M CROSS | {sig.reason} | "
+            f"SL=5M structure+{self.SL_BUFFER_ATR:.2f}ATR | "
+            f"TP1=1R trim60% + SL BE+0.15R | TP2={target_type} {rr:.2f}R"
         )
-        trigger = f"EMA5M_{best.engine}_{best.score}"
-        room_pct = abs(tp2-entry)/max(entry, 1e-12)
-        structure_px = sl + self.SL_BUFFER_ATR*atr if best.side == Side.LONG else sl - self.SL_BUFFER_ATR*atr
-        return EntrySignal(best.side, entry, sl, tp2, trend, meta['q'], meta['adx'], meta['chop'],
-                           SetupType.PULLBACK, trigger, room_pct, atr, structure_px, reason)
+
+        # q_1h field is retained for runtime compatibility; RSI is surfaced there
+        # until the legacy alert formatter is fully renamed.
+        return EntrySignal(
+            sig.side, entry, sl, tp2, trend,
+            sig.rsi, sig.adx, sig.chop,
+            SetupType.PULLBACK, trigger, room_pct, atr, structure_px, reason,
+        )
 
     def entry_status(self, df4h, df1h, df15, df5):
-        best, meta = self._best_signal(df5)
+        sig, meta = self._cross_signal(df5)
         paper = bool(getattr(self.cfg, "paper", False))
         open_ = self._entry_schedule_open()
         sched = "24/7 PAPER(OPEN)" if paper else f"24/5 LIVE({'OPEN' if open_ else 'WEEKEND_CLOSED'})"
-        if best is not None:
-            return (f"EMA-5M READY | {best.side.value} | Engine={best.engine} | Score={best.score} | "
-                    f"Regime={meta['regime']} | Q={meta['q']:.0f} ADX={meta['adx']:.1f} CHOP={meta['chop']:.1f} | "
-                    f"Schedule={sched} | SLBuf={self.SL_BUFFER_ATR:.2f}ATR | TP2Min={self.TP2_MIN_RR:.2f}R")
-        engines = meta.get("engines") or []
-        eng = ", ".join(f"{x.engine}:{x.score}" for x in engines) if engines else "NONE"
-        return (f"EMA-5M WAIT | Regime={meta.get('regime','?')} | Q={meta.get('q',0):.0f} "
-                f"ADX={meta.get('adx',0):.1f} CHOP={meta.get('chop',0):.1f} | Engines={eng} | "
-                f"Schedule={sched} | MinScore={self.MIN_SIGNAL_SCORE} | SLBuf={self.SL_BUFFER_ATR:.2f}ATR")
+
+        if sig is not None:
+            return (
+                f"EMA-CROSS READY | {sig.side.value} | RSI14={sig.rsi:.1f} | SMA14={sig.sma14:.6g} | "
+                f"ADX={sig.adx:.1f} CHOP={sig.chop:.1f} | Schedule={sched} | "
+                f"SLBuf={self.SL_BUFFER_ATR:.2f}ATR"
+            )
+
+        return (
+            f"EMA-CROSS WAIT | State={meta.get('state','?')} | RSI14={meta.get('rsi',0):.1f} | "
+            f"SMA14={meta.get('sma',0):.6g} | ADX={meta.get('adx',0):.1f} "
+            f"CHOP={meta.get('chop',0):.1f} | "
+            f"Rules: LONG RSI {self.RSI_LONG_MIN:.0f}-{self.RSI_LONG_MAX:.0f}, "
+            f"SHORT RSI {self.RSI_SHORT_MIN:.0f}-{self.RSI_SHORT_MAX:.0f}, "
+            f"ADX>={self.ADX_MIN:.0f}, CHOP<={self.CHOP_MAX:.0f} | Schedule={sched}"
+        )
