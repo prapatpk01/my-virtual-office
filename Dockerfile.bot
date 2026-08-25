@@ -19,5 +19,5 @@ COPY app/run_strategy_router.py .
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \
   CMD python -c "import os, sys; sys.exit(0)"
 
-# Canonical production: one Simple Precision strategy (4H -> 1H -> 15M).
+# Canonical production: Sentinel V2 (4H direction -> 1H quality -> 15M structure/location execution).
 CMD ["python", "run_strategy_router.py"]
