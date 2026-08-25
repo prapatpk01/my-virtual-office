@@ -1,4 +1,4 @@
-"""Canonical production router for Sentinel V2.
+"""Canonical production router for Sentinel V3 — 15M Unified.
 
 Railway starts this file. Legacy strategies remain in the repository for
 comparison/backtests but are not instantiated in production.
@@ -11,7 +11,7 @@ import os
 
 import run_bot
 from trading.bot import TradingBot
-from trading.strategies.sentinel_v2_strategy import SentinelV2Strategy
+from trading.strategies.sentinel_v3_strategy import SentinelV3Strategy
 
 logger = logging.getLogger("run_strategy_router")
 
@@ -42,24 +42,22 @@ _BASE_BUILD_CONFIG = run_bot.build_config
 
 def _build_config() -> dict:
     config = _BASE_BUILD_CONFIG()
-    # Keep the existing env name for Railway backward compatibility.
+    # Keep existing Railway env names for backward compatibility.
     config["symbols"] = _env_symbols("SIMPLE_PRECISION_SYMBOLS", config.get("symbols") or [])
-    # Keep strategy_mode stable so surrounding execution code sees no mode migration.
     config["strategy_mode"] = "simple_precision"
     config["candle_tf"] = "15m"
     os.environ["CANDLE_TF"] = "15m"
     logger.warning(
-        "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | "
-        "4H direction -> 1H quality -> 15M structure/location + 3 triggers",
-        SentinelV2Strategy.VERSION,
+        "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | 15M only: quality + Sentinel X + trigger direction",
+        SentinelV3Strategy.VERSION,
         config["symbols"],
     )
     return config
 
 
-def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV2Strategy]:
+def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV3Strategy]:
     strategies = [
-        SentinelV2Strategy(
+        SentinelV3Strategy(
             symbol,
             quality_threshold=_env_float("SP_QUALITY_THRESHOLD", 55.0),
             adx_min=_env_float("SP_ADX_MIN", 15.0),
@@ -85,34 +83,31 @@ _ORIGINAL_LOG_SCAN = TradingBot._log_scan
 
 def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     meta = getattr(signal, "metadata", None) or {}
-    if meta.get("strategy") != "SENTINEL_V2":
+    if meta.get("strategy") != "SENTINEL_V3":
         return _ORIGINAL_LOG_SCAN(self, symbol, strategy_name, price, signal)
 
-    macro = meta.get("macro_4h") or {}
-    quality = meta.get("quality_1h") or {}
+    market = meta.get("market_quality_15m") or {}
     entry = meta.get("entry_15m") or {}
-    structure = entry.get("structure") or {}
-    location = entry.get("location") or {}
+    structure = entry.get("structure") or meta.get("structure_15m") or {}
     logging.getLogger("trading_bot").info(
-        "[SCAN SENTINEL] %s px=%.4f sig=%s | 4H=%s score=%s | "
-        "1H Q=%s/%s ADX=%s CHOP=%s blocks=%s | "
-        "15M trigger=%s struct=%s dist=%sATR room=%sR fast=%s tp2=%s | %s",
+        "[SCAN SENTINEL] %s px=%.4f sig=%s | "
+        "15M Q=%s/%s ADX=%s CHOP=%s | "
+        "trigger=%s dir=%s struct=%s room=%sR dist=%sATR fast=%s tp2=%s blocks=%s | %s",
         symbol,
         price,
         getattr(getattr(signal, "type", None), "value", "hold").upper(),
-        macro.get("direction", "WAIT"),
-        macro.get("score", "?"),
-        quality.get("score", "?"),
-        quality.get("threshold", "?"),
-        quality.get("adx", "?"),
-        quality.get("chop", "?"),
-        ",".join(quality.get("hard_blocks", [])) or "none",
-        entry.get("trigger", "WAIT"),
+        entry.get("quality_score", market.get("score", "?")),
+        entry.get("quality_threshold", "?"),
+        market.get("adx", "?"),
+        market.get("chop", "?"),
+        entry.get("candidate_trigger", entry.get("trigger", "WAIT")),
+        entry.get("direction", "WAIT"),
         structure.get("label", "?"),
+        entry.get("room_r", "?"),
         entry.get("distance_atr", "?"),
-        entry.get("room_r", location.get("room_r", "?")),
         entry.get("fast_impulse", "?"),
         entry.get("target_source", "?"),
+        ",".join(entry.get("hard_blocks", [])) or ",".join(market.get("hard_blocks", [])) or "none",
         getattr(signal, "reason", ""),
     )
 
@@ -122,8 +117,8 @@ run_bot._make_strategies = _make_strategies
 TradingBot._log_scan = _sentinel_log_scan
 
 logger.warning(
-    "[PRODUCTION] Sentinel V%s installed; Simple Precision risk/exits retained; legacy strategies disabled",
-    SentinelV2Strategy.VERSION,
+    "[PRODUCTION] Sentinel V%s 15M Unified installed; 4H/1H decision gates removed",
+    SentinelV3Strategy.VERSION,
 )
 
 
