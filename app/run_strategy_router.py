@@ -79,6 +79,7 @@ def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV3Strateg
 
 
 _ORIGINAL_LOG_SCAN = TradingBot._log_scan
+_LAST_SENTINEL_SCAN: dict[str, dict] = {}
 
 
 def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
@@ -86,29 +87,48 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     if meta.get("strategy") != "SENTINEL_V3":
         return _ORIGINAL_LOG_SCAN(self, symbol, strategy_name, price, signal)
 
-    market = meta.get("market_quality_15m") or {}
-    entry = meta.get("entry_15m") or {}
-    structure = entry.get("structure") or meta.get("structure_15m") or {}
+    reason = str(getattr(signal, "reason", "") or "")
+    has_metrics = bool(meta.get("market_quality_15m") or meta.get("entry_15m") or meta.get("structure_15m"))
+    if has_metrics:
+        _LAST_SENTINEL_SCAN[symbol] = meta
+
+    # Repeated scans inside the same closed 15M candle intentionally skip a
+    # second strategy evaluation. Reuse the previous metrics for display only
+    # so Railway logs do not degrade into Q=? ADX=? CHOP=? etc.
+    repeated_bar = reason == "15M bar already evaluated"
+    view = _LAST_SENTINEL_SCAN.get(symbol, meta) if repeated_bar else meta
+
+    market = view.get("market_quality_15m") or {}
+    entry = view.get("entry_15m") or {}
+    structure = entry.get("structure") or view.get("structure_15m") or {}
+
+    q_value = entry.get("quality_score", market.get("score", "-"))
+    q_threshold = entry.get("quality_threshold", "-")
+    trigger_value = entry.get("candidate_trigger", entry.get("trigger", "WAIT"))
+    direction_value = entry.get("direction", "WAIT")
+    repeat_tag = " | cached=same-15M-bar" if repeated_bar and view is not meta else ""
+
     logging.getLogger("trading_bot").info(
         "[SCAN SENTINEL] %s px=%.4f sig=%s | "
         "15M Q=%s/%s ADX=%s CHOP=%s | "
-        "trigger=%s dir=%s struct=%s room=%sR dist=%sATR fast=%s tp2=%s blocks=%s | %s",
+        "trigger=%s dir=%s struct=%s room=%sR dist=%sATR fast=%s tp2=%s blocks=%s | %s%s",
         symbol,
         price,
         getattr(getattr(signal, "type", None), "value", "hold").upper(),
-        entry.get("quality_score", market.get("score", "?")),
-        entry.get("quality_threshold", "?"),
-        market.get("adx", "?"),
-        market.get("chop", "?"),
-        entry.get("candidate_trigger", entry.get("trigger", "WAIT")),
-        entry.get("direction", "WAIT"),
-        structure.get("label", "?"),
-        entry.get("room_r", "?"),
-        entry.get("distance_atr", "?"),
-        entry.get("fast_impulse", "?"),
-        entry.get("target_source", "?"),
+        q_value,
+        q_threshold,
+        market.get("adx", "-"),
+        market.get("chop", "-"),
+        trigger_value,
+        direction_value,
+        structure.get("label", "-"),
+        entry.get("room_r", "-"),
+        entry.get("distance_atr", "-"),
+        entry.get("fast_impulse", "-"),
+        entry.get("target_source", "-"),
         ",".join(entry.get("hard_blocks", [])) or ",".join(market.get("hard_blocks", [])) or "none",
-        getattr(signal, "reason", ""),
+        reason,
+        repeat_tag,
     )
 
 
