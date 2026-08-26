@@ -1,16 +1,16 @@
-"""Adaptive Momentum v4.2 — 15M-only, EMA8/13 cross-directed trading bot.
+"""Adaptive Momentum v4.3 — 15M-only dual-entry trading bot.
 
-A fresh EMA8/13 cross is the ONLY event that chooses trade direction:
-- cross up   -> LONG candidate
-- cross down -> SHORT candidate
-There is no separate trend filter. Entry quality is validated by ADX+CHOP and a
-3/4 confirmation score across MACD, ROC9, Bollinger location and market structure.
-Momentum weakness alone never closes a position; early exit requires momentum loss
-plus structure invalidation.
+Entry engines:
+- Momentum: BOS/CHOCH + EMA8/13 alignment.
+- Pullback: EMA13 reclaim/reject + EMA8/13 alignment.
+
+ADX+CHOP is the quality gate. MACD, ROC9, Bollinger location and structure form
+a 4-point confirmation score. Momentum weakness alone never closes a position;
+early exit requires momentum loss plus structure invalidation.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 import json, logging, os, sys, time
 
 TP1_R = float(os.getenv("MOM_TP1_R", "1.0"))
@@ -24,8 +24,8 @@ CHOP_MAX = float(os.getenv("MOM_CHOP_MAX", "55"))
 CONFIRM_MIN = int(os.getenv("MOM_CONFIRM_MIN", "3"))
 COOLDOWN_BARS = int(os.getenv("MOM_COOLDOWN_BARS", "3"))
 SUPPORTED_SCHEMAS = {
-    "adaptive-momentum-v4.0-15m",
     "adaptive-momentum-v4.2-15m",
+    "adaptive-momentum-v4.3-dual-entry-15m",
 }
 
 
@@ -62,7 +62,7 @@ class TradingBot:
         self.position: Optional[Position] = None
         self.cooldown_remaining = 0
         self.last_signal = "WARMUP"
-        self.counts = {k: 0 for k in ("scans", "entries", "cooldown", "cross", "quality", "confirmation")}
+        self.counts = {k: 0 for k in ("scans", "entries", "cooldown", "trigger", "quality", "confirmation")}
         self._identity()
         self.load_state()
 
@@ -71,9 +71,9 @@ class TradingBot:
         try:
             runner = sys.modules.get("run_bot") or sys.modules.get("__main__")
             if runner is not None and hasattr(runner, "logger"):
-                runner.logger = logging.getLogger("adaptive_momentum_v4_2")
+                runner.logger = logging.getLogger("adaptive_momentum_v4_3")
             if runner is not None and hasattr(runner, "BUILD_ID"):
-                runner.BUILD_ID = "adaptive-momentum-v4.2-adaptive-confirmation-2026-08-26"
+                runner.BUILD_ID = "adaptive-momentum-v4.3-dual-entry-2026-08-26"
         except Exception:
             pass
 
@@ -107,56 +107,58 @@ class TradingBot:
         os.replace(tmp, self.state_file)
 
     @staticmethod
-    def _cross_direction(i: Dict) -> str:
-        if bool(i.get("ema_cross_up")):
-            return "LONG"
-        if bool(i.get("ema_cross_down")):
-            return "SHORT"
-        return "NONE"
-
-    @staticmethod
     def _score(i: Dict, direction: str) -> int:
         return int(i.get("confirmation_score_long" if direction == "LONG" else "confirmation_score_short", 0))
 
-    def _debug(self, i: Dict, result: str, reason: str, direction: str = "NONE") -> str:
+    @staticmethod
+    def _entry_candidate(i: Dict) -> Tuple[str, str]:
+        """Return direction and trigger. Momentum trigger gets priority if both fire."""
+        if i.get("momentum_trigger_long"):
+            trigger = "CHOCH bullish break" if i.get("structure_choch_long") else "Bullish BOS"
+            return "LONG", trigger
+        if i.get("momentum_trigger_short"):
+            trigger = "CHOCH bearish break" if i.get("structure_choch_short") else "Bearish BOS"
+            return "SHORT", trigger
+        if i.get("pullback_trigger_long"):
+            return "LONG", "EMA13 bullish reclaim"
+        if i.get("pullback_trigger_short"):
+            return "SHORT", "EMA13 bearish reject"
+        return "NONE", ""
+
+    def _debug(self, i: Dict, result: str, reason: str, direction: str = "NONE", trigger: str = "") -> str:
         symbol = self.symbol.split("/")[0]
         adx = float(i.get("adx", 0))
         chop = float(i.get("chop", 100))
-        roc = float(i.get("roc9", 0))
-        hist = float(i.get("macd_hist", 0))
         score = self._score(i, direction) if direction in {"LONG", "SHORT"} else 0
-        macd_ok = bool(i.get("macd_bull" if direction == "LONG" else "macd_bear")) if direction in {"LONG", "SHORT"} else False
-        roc_ok = bool(i.get("roc_long" if direction == "LONG" else "roc_short")) if direction in {"LONG", "SHORT"} else False
-        bb_ok = bool(i.get("bb_long" if direction == "LONG" else "bb_short")) if direction in {"LONG", "SHORT"} else False
-        structure_ok = bool(i.get("structure_long" if direction == "LONG" else "structure_short")) if direction in {"LONG", "SHORT"} else False
-
         if reason == "COOLDOWN":
-            return f"MOMENTUM V4.2 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bars · RESULT: WAIT"
-        if reason == "CROSS":
-            return f"MOMENTUM V4.2 · {symbol} · 15M · ❌ No fresh EMA8/13 cross · RESULT: WAIT CROSS"
+            return f"MOMENTUM V4.3 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bars · RESULT: WAIT"
+        if reason == "TRIGGER":
+            return f"MOMENTUM V4.3 · {symbol} · 15M · ❌ No BOS/CHOCH or EMA13 reclaim/reject · RESULT: WAIT TRIGGER"
 
+        macd_ok = bool(i.get("macd_bull" if direction == "LONG" else "macd_bear"))
+        roc_ok = bool(i.get("roc_long" if direction == "LONG" else "roc_short"))
+        bb_ok = bool(i.get("bb_long" if direction == "LONG" else "bb_short"))
+        structure_ok = bool(i.get("structure_long" if direction == "LONG" else "structure_short"))
+        alignment = "EMA8>EMA13" if direction == "LONG" else "EMA8<EMA13"
         parts = [
-            f"MOMENTUM V4.2 · {symbol} · 15M · {direction}",
-            f"✅ EMA8/13 CROSS {'UP' if direction == 'LONG' else 'DOWN'} → {direction}",
+            f"MOMENTUM V4.3 · {symbol} · 15M · {direction}",
+            f"✅ Trigger {trigger}",
+            f"✅ Alignment {alignment}",
         ]
-        quality_ok = adx >= ADX_MIN and chop <= CHOP_MAX
         if reason == "QUALITY":
             parts.append(f"❌ Quality ADX {adx:.1f}/{ADX_MIN:g} · CHOP {chop:.1f}/{CHOP_MAX:g}")
-        elif quality_ok:
-            rising = "↑" if i.get("adx_rising") else "→"
-            parts.append(f"✅ Quality ADX {adx:.1f}{rising} · CHOP {chop:.1f}")
+        else:
+            parts.append(f"✅ Quality ADX {adx:.1f}{'↑' if i.get('adx_rising') else '→'} · CHOP {chop:.1f}")
 
         if reason == "CONFIRMATION":
             parts.append(
-                f"❌ Confirm {score}/4 (need {CONFIRM_MIN}) · "
-                f"MACD {'✅' if macd_ok else '❌'} · ROC9 {'✅' if roc_ok else '❌'} · "
-                f"BB {'✅' if bb_ok else '❌'} · Structure {'✅' if structure_ok else '❌'}"
+                f"❌ Confirm {score}/4 need {CONFIRM_MIN} · MACD {'✅' if macd_ok else '❌'} · "
+                f"ROC9 {'✅' if roc_ok else '❌'} · BB {'✅' if bb_ok else '❌'} · Structure {'✅' if structure_ok else '❌'}"
             )
-            parts.append(f"Hist {hist:.4f} · ROC9 {roc:.2f}%")
-        elif reason not in {"QUALITY", "CROSS", "COOLDOWN"}:
+        elif reason not in {"QUALITY", "TRIGGER", "COOLDOWN"}:
             parts.append(
-                f"✅ Confirm {score}/4 · MACD {'✅' if macd_ok else '❌'} · ROC9 {'✅' if roc_ok else '❌'} · "
-                f"BB {'✅' if bb_ok else '❌'} · Structure {'✅' if structure_ok else '❌'}"
+                f"✅ Confirm {score}/4 · MACD {'✅' if macd_ok else '❌'} · "
+                f"ROC9 {'✅' if roc_ok else '❌'} · BB {'✅' if bb_ok else '❌'} · Structure {'✅' if structure_ok else '❌'}"
             )
             if result == "ENTRY":
                 parts.append("✅ ENTRY CONFIRMED")
@@ -171,20 +173,18 @@ class TradingBot:
         parts.append(f"RESULT: {labels.get(reason, reason)}")
         return " · ".join(parts)
 
-    def _build(self, i: Dict, direction: str):
+    def _build(self, i: Dict, direction: str, trigger: str):
         entry = float(i["close"])
         atr = max(float(i["atr"]), entry * 0.0005)
         minimum = entry * MIN_SL_PCT
         if direction == "LONG":
             sl = min(float(i.get("recent_low", entry - atr)), entry - SL_ATR * atr, entry - minimum)
             risk = entry - sl
-            tp1 = entry + TP1_R * risk
-            tp2 = entry + TP2_R * risk
+            tp1, tp2 = entry + TP1_R * risk, entry + TP2_R * risk
         else:
             sl = max(float(i.get("recent_high", entry + atr)), entry + SL_ATR * atr, entry + minimum)
             risk = sl - entry
-            tp1 = entry - TP1_R * risk
-            tp2 = entry - TP2_R * risk
+            tp1, tp2 = entry - TP1_R * risk, entry - TP2_R * risk
         if risk <= 0:
             return None
         size = min(self.risk_usdt / risk, (self.margin_usdt * self.leverage) / max(entry, 1e-12))
@@ -192,30 +192,17 @@ class TradingBot:
             return None
         return {
             "direction": direction,
-            "strategy": "adaptive_momentum_v4_2_cross_directed",
-            "trigger": f"EMA8/13 cross {'up' if direction == 'LONG' else 'down'}",
+            "strategy": "adaptive_momentum_v4_3_dual_entry",
+            "trigger": trigger,
             "confirmation_score": self._score(i, direction),
-            "entry": entry,
-            "sl": sl,
-            "tp": tp2,
-            "tp1": tp1,
-            "tp2": tp2,
-            "size": size,
-            "risk_usdt": size * risk,
-            "sl_pct": 100 * risk / max(entry, 1e-12),
-            "ema8": float(i["ema8"]),
-            "ema13": float(i["ema13"]),
-            "macd": float(i["macd"]),
-            "macd_signal": float(i["macd_signal"]),
+            "entry": entry, "sl": sl, "tp": tp2, "tp1": tp1, "tp2": tp2,
+            "size": size, "risk_usdt": size * risk, "sl_pct": 100 * risk / max(entry, 1e-12),
+            "ema8": float(i["ema8"]), "ema13": float(i["ema13"]),
+            "macd": float(i["macd"]), "macd_signal": float(i["macd_signal"]),
             "macd_hist": float(i["macd_hist"]),
-            "bb_mid": float(i["bb_mid"]),
-            "bb_upper": float(i["bb_upper"]),
-            "bb_lower": float(i["bb_lower"]),
-            "atr": atr,
-            "adx": float(i["adx"]),
-            "adx_rising": bool(i.get("adx_rising")),
-            "chop": float(i["chop"]),
-            "roc9": float(i["roc9"]),
+            "bb_mid": float(i["bb_mid"]), "bb_upper": float(i["bb_upper"]), "bb_lower": float(i["bb_lower"]),
+            "atr": atr, "adx": float(i["adx"]), "adx_rising": bool(i.get("adx_rising")),
+            "chop": float(i["chop"]), "roc9": float(i["roc9"]),
         }
 
     def _close(self, price: float, reason: str):
@@ -233,7 +220,7 @@ class TradingBot:
         if self.execution_callback:
             self.execution_callback("CLOSE_" + p.direction, payload)
         self.position = None
-        if reason in {"EMA_CROSS_BACK", "MOMENTUM_STRUCTURE_EXIT"}:
+        if reason in {"EMA_ALIGNMENT_FLIP", "MOMENTUM_STRUCTURE_EXIT"}:
             self.cooldown_remaining = COOLDOWN_BARS
         self.save_state()
         self.last_signal = f"CLOSE {reason} pnl=${pnl:+.2f} r={r:+.2f}R"
@@ -273,7 +260,7 @@ class TradingBot:
             self.last_signal = "WAIT INDICATOR_WARMUP"
             return None
         if i.get("schema") not in SUPPORTED_SCHEMAS:
-            raise RuntimeError(f"MOMENTUM_V42_SCHEMA_MISMATCH: {i.get('schema')}")
+            raise RuntimeError(f"MOMENTUM_V43_SCHEMA_MISMATCH: {i.get('schema')}")
 
         if self.position:
             event = self.check_price(price or float(i["close"]))
@@ -282,13 +269,12 @@ class TradingBot:
             p = self.position
             px = price or float(i["close"])
 
-            # Hard thesis invalidation: opposite EMA8/13 cross.
-            if p.direction == "LONG" and i.get("ema_cross_down"):
-                return self._close(px, "EMA_CROSS_BACK")
-            if p.direction == "SHORT" and i.get("ema_cross_up"):
-                return self._close(px, "EMA_CROSS_BACK")
+            # EMA8/13 is now alignment; a confirmed flip against the position is a thesis exit.
+            if p.direction == "LONG" and i.get("ema_bear"):
+                return self._close(px, "EMA_ALIGNMENT_FLIP")
+            if p.direction == "SHORT" and i.get("ema_bull"):
+                return self._close(px, "EMA_ALIGNMENT_FLIP")
 
-            # Momentum weakness is only a warning. Early exit requires structure to break too.
             momentum = int(i.get("momentum_score_long" if p.direction == "LONG" else "momentum_score_short", 0))
             structure_invalid = bool(i.get("structure_invalid_long" if p.direction == "LONG" else "structure_invalid_short"))
             if momentum == 0 and structure_invalid:
@@ -309,29 +295,29 @@ class TradingBot:
             self.last_signal = self._debug(i, "WAIT", "COOLDOWN")
             return None
 
-        # FIRST: current closed 15M EMA8/13 cross chooses the side.
-        direction = self._cross_direction(i)
+        # FIRST: one of the two price-action triggers must fire on the current closed 15M candle.
+        direction, trigger = self._entry_candidate(i)
         if direction == "NONE":
-            self.counts["cross"] += 1
-            self.last_signal = self._debug(i, "WAIT", "CROSS")
+            self.counts["trigger"] += 1
+            self.last_signal = self._debug(i, "WAIT", "TRIGGER")
             return None
 
-        # SECOND: quality hard gate. ADX rising is informative, not mandatory.
+        # SECOND: market quality. ADX rising is informative, not mandatory.
         if float(i["adx"]) < ADX_MIN or float(i["chop"]) > CHOP_MAX:
             self.counts["quality"] += 1
-            self.last_signal = self._debug(i, "WAIT", "QUALITY", direction)
+            self.last_signal = self._debug(i, "WAIT", "QUALITY", direction, trigger)
             return None
 
-        # THIRD: adaptive confirmation. Require 3/4 from MACD, ROC9, BB, Structure.
+        # THIRD: adaptive confirmation. Need at least 3/4 from MACD, ROC9, BB and Structure.
         score = self._score(i, direction)
         if score < CONFIRM_MIN:
             self.counts["confirmation"] += 1
-            self.last_signal = self._debug(i, "WAIT", "CONFIRMATION", direction)
+            self.last_signal = self._debug(i, "WAIT", "CONFIRMATION", direction, trigger)
             return None
 
-        payload = self._build(i, direction)
+        payload = self._build(i, direction, trigger)
         if not payload:
-            self.last_signal = self._debug(i, "WAIT", "RISK", direction)
+            self.last_signal = self._debug(i, "WAIT", "RISK", direction, trigger)
             return None
         payload["symbol"] = self.symbol
         if self.execution_callback:
@@ -344,5 +330,5 @@ class TradingBot:
         )
         self.counts["entries"] += 1
         self.save_state()
-        self.last_signal = self._debug(i, "ENTRY", direction, direction)
+        self.last_signal = self._debug(i, "ENTRY", direction, direction, trigger)
         return {"event": "OPEN", **payload}
