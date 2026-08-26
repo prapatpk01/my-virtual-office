@@ -1,4 +1,4 @@
-"""Canonical production router for Sentinel V3 — 15M Unified.
+"""Canonical production router for Sentinel V3.1 — 15M Unified.
 
 Railway starts this file. Legacy strategies remain in the repository for
 comparison/backtests but are not instantiated in production.
@@ -11,7 +11,7 @@ import os
 
 import run_bot
 from trading.bot import TradingBot
-from trading.strategies.sentinel_v3_strategy import SentinelV3Strategy
+from trading.strategies.sentinel_v31_strategy import SentinelV31Strategy
 
 logger = logging.getLogger("run_strategy_router")
 
@@ -49,15 +49,15 @@ def _build_config() -> dict:
     os.environ["CANDLE_TF"] = "15m"
     logger.warning(
         "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | 15M only: quality + Sentinel X + trigger direction",
-        SentinelV3Strategy.VERSION,
+        SentinelV31Strategy.VERSION,
         config["symbols"],
     )
     return config
 
 
-def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV3Strategy]:
+def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV31Strategy]:
     strategies = [
-        SentinelV3Strategy(
+        SentinelV31Strategy(
             symbol,
             quality_threshold=_env_float("SP_QUALITY_THRESHOLD", 55.0),
             adx_min=_env_float("SP_ADX_MIN", 15.0),
@@ -92,9 +92,6 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     if has_metrics:
         _LAST_SENTINEL_SCAN[symbol] = meta
 
-    # Repeated scans inside the same closed 15M candle intentionally skip a
-    # second strategy evaluation. Reuse the previous metrics for display only
-    # so Railway logs do not degrade into Q=? ADX=? CHOP=? etc.
     repeated_bar = reason == "15M bar already evaluated"
     view = _LAST_SENTINEL_SCAN.get(symbol, meta) if repeated_bar else meta
 
@@ -137,8 +134,8 @@ run_bot._make_strategies = _make_strategies
 TradingBot._log_scan = _sentinel_log_scan
 
 logger.warning(
-    "[PRODUCTION] Sentinel V%s 15M Unified installed; 4H/1H decision gates removed",
-    SentinelV3Strategy.VERSION,
+    "[PRODUCTION] Sentinel V%s installed; 15M unified + structure-aware hold + same-side rearm",
+    SentinelV31Strategy.VERSION,
 )
 
 
