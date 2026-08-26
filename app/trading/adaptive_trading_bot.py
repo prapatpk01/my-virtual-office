@@ -1,9 +1,12 @@
-"""Adaptive Momentum v4.1 — 15M-only, EMA8/13 cross-directed trading bot.
+"""Adaptive Momentum v4.2 — 15M-only, EMA8/13 cross-directed trading bot.
 
 A fresh EMA8/13 cross is the ONLY event that chooses trade direction:
 - cross up   -> LONG candidate
 - cross down -> SHORT candidate
-There is no separate trend filter or EMA alignment bias.
+There is no separate trend filter. Entry quality is validated by ADX+CHOP and a
+3/4 confirmation score across MACD, ROC9, Bollinger location and market structure.
+Momentum weakness alone never closes a position; early exit requires momentum loss
+plus structure invalidation.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass
@@ -18,8 +21,12 @@ MIN_SL_PCT = float(os.getenv("MOM_MIN_SL_PCT", "0.004"))
 RISK_USDT = float(os.getenv("MOM_RISK_USDT", "5.0"))
 ADX_MIN = float(os.getenv("MOM_ADX_MIN", "15"))
 CHOP_MAX = float(os.getenv("MOM_CHOP_MAX", "55"))
+CONFIRM_MIN = int(os.getenv("MOM_CONFIRM_MIN", "3"))
 COOLDOWN_BARS = int(os.getenv("MOM_COOLDOWN_BARS", "3"))
-SUPPORTED_SCHEMAS = {"adaptive-momentum-v4.0-15m"}
+SUPPORTED_SCHEMAS = {
+    "adaptive-momentum-v4.0-15m",
+    "adaptive-momentum-v4.2-15m",
+}
 
 
 @dataclass
@@ -55,7 +62,7 @@ class TradingBot:
         self.position: Optional[Position] = None
         self.cooldown_remaining = 0
         self.last_signal = "WARMUP"
-        self.counts = {k: 0 for k in ("scans", "entries", "cooldown", "cross", "quality", "momentum", "location")}
+        self.counts = {k: 0 for k in ("scans", "entries", "cooldown", "cross", "quality", "confirmation")}
         self._identity()
         self.load_state()
 
@@ -64,9 +71,9 @@ class TradingBot:
         try:
             runner = sys.modules.get("run_bot") or sys.modules.get("__main__")
             if runner is not None and hasattr(runner, "logger"):
-                runner.logger = logging.getLogger("adaptive_momentum_v4_1")
+                runner.logger = logging.getLogger("adaptive_momentum_v4_2")
             if runner is not None and hasattr(runner, "BUILD_ID"):
-                runner.BUILD_ID = "adaptive-momentum-v4.1-cross-directed-2026-08-17"
+                runner.BUILD_ID = "adaptive-momentum-v4.2-adaptive-confirmation-2026-08-26"
         except Exception:
             pass
 
@@ -107,46 +114,56 @@ class TradingBot:
             return "SHORT"
         return "NONE"
 
+    @staticmethod
+    def _score(i: Dict, direction: str) -> int:
+        return int(i.get("confirmation_score_long" if direction == "LONG" else "confirmation_score_short", 0))
+
     def _debug(self, i: Dict, result: str, reason: str, direction: str = "NONE") -> str:
         symbol = self.symbol.split("/")[0]
         adx = float(i.get("adx", 0))
         chop = float(i.get("chop", 100))
         roc = float(i.get("roc9", 0))
         hist = float(i.get("macd_hist", 0))
-        mom = int(i.get("momentum_score_long" if direction == "LONG" else "momentum_score_short", 0)) if direction in {"LONG", "SHORT"} else 0
-        loc = int(i.get("location_score_long" if direction == "LONG" else "location_score_short", 0)) if direction in {"LONG", "SHORT"} else 0
-        structure = (
-            "HL/BOS" if direction == "LONG" and i.get("structure_long")
-            else "LH/BOS" if direction == "SHORT" and i.get("structure_short")
-            else "-"
-        )
+        score = self._score(i, direction) if direction in {"LONG", "SHORT"} else 0
+        macd_ok = bool(i.get("macd_bull" if direction == "LONG" else "macd_bear")) if direction in {"LONG", "SHORT"} else False
+        roc_ok = bool(i.get("roc_long" if direction == "LONG" else "roc_short")) if direction in {"LONG", "SHORT"} else False
+        bb_ok = bool(i.get("bb_long" if direction == "LONG" else "bb_short")) if direction in {"LONG", "SHORT"} else False
+        structure_ok = bool(i.get("structure_long" if direction == "LONG" else "structure_short")) if direction in {"LONG", "SHORT"} else False
+
         if reason == "COOLDOWN":
-            return f"MOMENTUM V4.1 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bars · RESULT: WAIT"
+            return f"MOMENTUM V4.2 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bars · RESULT: WAIT"
         if reason == "CROSS":
-            return f"MOMENTUM V4.1 · {symbol} · 15M · ❌ No fresh EMA8/13 cross · RESULT: WAIT CROSS"
+            return f"MOMENTUM V4.2 · {symbol} · 15M · ❌ No fresh EMA8/13 cross · RESULT: WAIT CROSS"
 
         parts = [
-            f"MOMENTUM V4.1 · {symbol} · 15M · {direction}",
+            f"MOMENTUM V4.2 · {symbol} · 15M · {direction}",
             f"✅ EMA8/13 CROSS {'UP' if direction == 'LONG' else 'DOWN'} → {direction}",
         ]
+        quality_ok = adx >= ADX_MIN and chop <= CHOP_MAX
         if reason == "QUALITY":
-            parts.append(f"❌ Quality ADX {adx:.1f} rising={'YES' if i.get('adx_rising') else 'NO'} · CHOP {chop:.1f}")
-        else:
-            parts.append(f"✅ Quality ADX {adx:.1f}↑ · CHOP {chop:.1f}")
-            if reason == "MOMENTUM":
-                parts.append(f"❌ Momentum 0/2 · MACD Hist {hist:.4f} · ROC9 {roc:.2f}%")
-            else:
-                parts.append(f"✅ Momentum {mom}/2{' STRONG' if mom == 2 else ''} · MACD Hist {hist:.4f} · ROC9 {roc:.2f}%")
-                if reason == "LOCATION":
-                    parts.append(f"❌ Location 0/2 · BB + Structure {structure}")
-                else:
-                    parts.append(f"✅ Location {loc}/2 · BB + Structure {structure}")
-                    if result == "ENTRY":
-                        parts.append("✅ ENTRY CONFIRMED")
+            parts.append(f"❌ Quality ADX {adx:.1f}/{ADX_MIN:g} · CHOP {chop:.1f}/{CHOP_MAX:g}")
+        elif quality_ok:
+            rising = "↑" if i.get("adx_rising") else "→"
+            parts.append(f"✅ Quality ADX {adx:.1f}{rising} · CHOP {chop:.1f}")
+
+        if reason == "CONFIRMATION":
+            parts.append(
+                f"❌ Confirm {score}/4 (need {CONFIRM_MIN}) · "
+                f"MACD {'✅' if macd_ok else '❌'} · ROC9 {'✅' if roc_ok else '❌'} · "
+                f"BB {'✅' if bb_ok else '❌'} · Structure {'✅' if structure_ok else '❌'}"
+            )
+            parts.append(f"Hist {hist:.4f} · ROC9 {roc:.2f}%")
+        elif reason not in {"QUALITY", "CROSS", "COOLDOWN"}:
+            parts.append(
+                f"✅ Confirm {score}/4 · MACD {'✅' if macd_ok else '❌'} · ROC9 {'✅' if roc_ok else '❌'} · "
+                f"BB {'✅' if bb_ok else '❌'} · Structure {'✅' if structure_ok else '❌'}"
+            )
+            if result == "ENTRY":
+                parts.append("✅ ENTRY CONFIRMED")
+
         labels = {
             "QUALITY": "WAIT QUALITY",
-            "MOMENTUM": "WAIT MOMENTUM",
-            "LOCATION": "WAIT LOCATION",
+            "CONFIRMATION": "WAIT CONFIRMATION",
             "LONG": "ENTRY LONG",
             "SHORT": "ENTRY SHORT",
             "RISK": "WAIT RISK",
@@ -175,8 +192,9 @@ class TradingBot:
             return None
         return {
             "direction": direction,
-            "strategy": "adaptive_momentum_v4_1_cross_directed",
+            "strategy": "adaptive_momentum_v4_2_cross_directed",
             "trigger": f"EMA8/13 cross {'up' if direction == 'LONG' else 'down'}",
+            "confirmation_score": self._score(i, direction),
             "entry": entry,
             "sl": sl,
             "tp": tp2,
@@ -195,6 +213,7 @@ class TradingBot:
             "bb_lower": float(i["bb_lower"]),
             "atr": atr,
             "adx": float(i["adx"]),
+            "adx_rising": bool(i.get("adx_rising")),
             "chop": float(i["chop"]),
             "roc9": float(i["roc9"]),
         }
@@ -214,7 +233,7 @@ class TradingBot:
         if self.execution_callback:
             self.execution_callback("CLOSE_" + p.direction, payload)
         self.position = None
-        if reason in {"EMA_CROSS_BACK", "MOMENTUM_LOST"}:
+        if reason in {"EMA_CROSS_BACK", "MOMENTUM_STRUCTURE_EXIT"}:
             self.cooldown_remaining = COOLDOWN_BARS
         self.save_state()
         self.last_signal = f"CLOSE {reason} pnl=${pnl:+.2f} r={r:+.2f}R"
@@ -254,7 +273,7 @@ class TradingBot:
             self.last_signal = "WAIT INDICATOR_WARMUP"
             return None
         if i.get("schema") not in SUPPORTED_SCHEMAS:
-            raise RuntimeError(f"MOMENTUM_V41_SCHEMA_MISMATCH: {i.get('schema')}")
+            raise RuntimeError(f"MOMENTUM_V42_SCHEMA_MISMATCH: {i.get('schema')}")
 
         if self.position:
             event = self.check_price(price or float(i["close"]))
@@ -262,15 +281,24 @@ class TradingBot:
                 return event
             p = self.position
             px = price or float(i["close"])
+
+            # Hard thesis invalidation: opposite EMA8/13 cross.
             if p.direction == "LONG" and i.get("ema_cross_down"):
                 return self._close(px, "EMA_CROSS_BACK")
             if p.direction == "SHORT" and i.get("ema_cross_up"):
                 return self._close(px, "EMA_CROSS_BACK")
-            if p.direction == "LONG" and int(i.get("momentum_score_long", 0)) == 0:
-                return self._close(px, "MOMENTUM_LOST")
-            if p.direction == "SHORT" and int(i.get("momentum_score_short", 0)) == 0:
-                return self._close(px, "MOMENTUM_LOST")
-            self.last_signal = f"MANAGE {p.direction} | SL={p.sl:.4f} | TP1={p.tp1:.4f} | TP2={p.tp2:.4f}"
+
+            # Momentum weakness is only a warning. Early exit requires structure to break too.
+            momentum = int(i.get("momentum_score_long" if p.direction == "LONG" else "momentum_score_short", 0))
+            structure_invalid = bool(i.get("structure_invalid_long" if p.direction == "LONG" else "structure_invalid_short"))
+            if momentum == 0 and structure_invalid:
+                return self._close(px, "MOMENTUM_STRUCTURE_EXIT")
+
+            warning = " | ⚠ MOMENTUM WEAK" if momentum == 0 else ""
+            self.last_signal = (
+                f"MANAGE {p.direction} | SL={p.sl:.4f} | TP1={p.tp1:.4f} | TP2={p.tp2:.4f} | "
+                f"Momentum={momentum}/2 | StructureInvalid={int(structure_invalid)}{warning}"
+            )
             return None
 
         self.counts["scans"] += 1
@@ -281,31 +309,24 @@ class TradingBot:
             self.last_signal = self._debug(i, "WAIT", "COOLDOWN")
             return None
 
-        # FIRST: the current closed 15M EMA8/13 cross decides the side.
+        # FIRST: current closed 15M EMA8/13 cross chooses the side.
         direction = self._cross_direction(i)
         if direction == "NONE":
             self.counts["cross"] += 1
             self.last_signal = self._debug(i, "WAIT", "CROSS")
             return None
 
-        # SECOND: quality validates whether the cross occurs in a tradable environment.
-        if float(i["adx"]) < ADX_MIN or not bool(i.get("adx_rising")) or float(i["chop"]) > CHOP_MAX:
+        # SECOND: quality hard gate. ADX rising is informative, not mandatory.
+        if float(i["adx"]) < ADX_MIN or float(i["chop"]) > CHOP_MAX:
             self.counts["quality"] += 1
             self.last_signal = self._debug(i, "WAIT", "QUALITY", direction)
             return None
 
-        # THIRD: MACD 12/26/9 or ROC9 agreeing with the cross is enough (1/2).
-        momentum = int(i.get("momentum_score_long" if direction == "LONG" else "momentum_score_short", 0))
-        if momentum < 1:
-            self.counts["momentum"] += 1
-            self.last_signal = self._debug(i, "WAIT", "MOMENTUM", direction)
-            return None
-
-        # FOURTH: Bollinger location or market structure support is enough (1/2).
-        location = int(i.get("location_score_long" if direction == "LONG" else "location_score_short", 0))
-        if location < 1:
-            self.counts["location"] += 1
-            self.last_signal = self._debug(i, "WAIT", "LOCATION", direction)
+        # THIRD: adaptive confirmation. Require 3/4 from MACD, ROC9, BB, Structure.
+        score = self._score(i, direction)
+        if score < CONFIRM_MIN:
+            self.counts["confirmation"] += 1
+            self.last_signal = self._debug(i, "WAIT", "CONFIRMATION", direction)
             return None
 
         payload = self._build(i, direction)
