@@ -1,4 +1,4 @@
-"""Canonical production router for Sentinel V4 — 15M Price-Action Core.
+"""Canonical production router for Sentinel V4.1 — 15M Price-Action Core.
 
 Railway starts this file. Legacy strategies remain in the repository for
 comparison/backtests but are not instantiated in production.
@@ -11,7 +11,7 @@ import os
 
 import run_bot
 from trading.bot import TradingBot
-from trading.strategies.sentinel_v4_strategy import SentinelV4Strategy
+from trading.strategies.sentinel_v41_strategy import SentinelV41Strategy
 
 logger = logging.getLogger("run_strategy_router")
 
@@ -49,22 +49,23 @@ def _build_config() -> dict:
     config["candle_tf"] = "15m"
     os.environ["CANDLE_TF"] = "15m"
     logger.warning(
-        "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | 15M price-action core",
-        SentinelV4Strategy.VERSION,
+        "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | 15M price-action core | RSI14/SMA14 | min target 1.5R",
+        SentinelV41Strategy.VERSION,
         config["symbols"],
     )
     return config
 
 
-def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV4Strategy]:
+def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV41Strategy]:
     strategies = [
-        SentinelV4Strategy(
+        SentinelV41Strategy(
             symbol,
             quality_threshold=_env_float("SP_QUALITY_THRESHOLD", 55.0),
             adx_min=_env_float("SENTINEL_ADX_MIN", _env_float("SP_ADX_MIN", 15.0)),
             chop_max=_env_float("SENTINEL_CHOP_MAX", _env_float("SP_CHOP_MAX", 62.0)),
             max_entry_distance_atr=_env_float("SP_MAX_ENTRY_DISTANCE_ATR", 1.50),
-            min_room_r=_env_float("SENTINEL_MIN_ROOM_R", 1.60),
+            # Production policy: 1.5R is the minimum acceptable room/target.
+            min_room_r=1.50,
             stop_atr_min=_env_float("SP_STOP_ATR_MIN", 0.80),
             stop_atr_max=_env_float("SP_STOP_ATR_MAX", 1.60),
             target_r=2.0,
@@ -136,8 +137,8 @@ run_bot._make_strategies = _make_strategies
 TradingBot._log_scan = _sentinel_log_scan
 
 logger.warning(
-    "[PRODUCTION] Sentinel V%s installed; EMA cross entry/exit removed; fresh price-action setups only",
-    SentinelV4Strategy.VERSION,
+    "[PRODUCTION] Sentinel V%s installed; RSI14/SMA14; 1.5R minimum target/room; fresh price-action setups only",
+    SentinelV41Strategy.VERSION,
 )
 
 
