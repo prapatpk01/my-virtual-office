@@ -1,4 +1,4 @@
-"""Canonical production router for Sentinel V4.2 — Responsive 15M Price Action.
+"""Canonical production router for Sentinel V4.3 — Responsive 15M Price Action + 1H Major S/R.
 
 Railway starts this file. Legacy strategies remain in the repository for
 comparison/backtests but are not instantiated in production.
@@ -11,7 +11,7 @@ import os
 
 import run_bot
 from trading.bot import TradingBot
-from trading.strategies.sentinel_v42_strategy import SentinelV42Strategy
+from trading.strategies.sentinel_v43_strategy import SentinelV43Strategy
 
 logger = logging.getLogger("run_strategy_router")
 
@@ -48,16 +48,16 @@ def _build_config() -> dict:
     config["candle_tf"] = "15m"
     os.environ["CANDLE_TF"] = "15m"
     logger.warning(
-        "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | 15M responsive PA | ADX>=12 CHOP<65 | RSI14/SMA14 | min target 1.5R",
-        SentinelV42Strategy.VERSION,
+        "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | 15M responsive PA | 1H major S/R obstacle only | ADX>=12 CHOP<65 | RSI14/SMA14 | min target 1.5R",
+        SentinelV43Strategy.VERSION,
         config["symbols"],
     )
     return config
 
 
-def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV42Strategy]:
+def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV43Strategy]:
     strategies = [
-        SentinelV42Strategy(
+        SentinelV43Strategy(
             symbol,
             quality_threshold=_env_float("SP_QUALITY_THRESHOLD", 55.0),
             adx_min=12.0,
@@ -97,6 +97,7 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     market = view.get("market_15m") or {}
     entry = view.get("entry_15m") or {}
     structure = entry.get("structure") or view.get("structure_15m") or {}
+    major1h = entry.get("major_sr_1h") or view.get("major_sr_1h") or {}
 
     setup = entry.get("candidate_trigger", entry.get("trigger", "WAIT"))
     direction = entry.get("direction", "WAIT")
@@ -104,10 +105,15 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     blocks = entry.get("blocks", []) or market.get("blocks", []) or []
     repeat_tag = " | cached=same-15M-bar" if repeated_bar and view is not meta else ""
 
+    room15 = entry.get("room_15m_r", entry.get("room_r", "-"))
+    room1h = entry.get("room_1h_r", major1h.get("room_r", "-"))
+    effective_room = entry.get("room_r", "-")
+    sr_source = entry.get("target_source", major1h.get("target_source", "-"))
+
     logging.getLogger("trading_bot").info(
         "[SCAN SENTINEL] %s px=%.4f sig=%s | "
         "15M gate=%s ADX=%s CHOP=%s ATRx=%s | "
-        "setup=%s dir=%s struct=%s room=%sR rr=%sR dist=%sATR "
+        "setup=%s dir=%s struct=%s room15=%sR room1H=%sR eff=%sR rr=%sR SR=%s dist=%sATR "
         "RSI=%s/%s blocks=%s | %s%s",
         symbol,
         price,
@@ -119,8 +125,11 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
         setup,
         direction,
         structure.get("label", "-"),
-        entry.get("room_r", "-"),
+        room15,
+        room1h if room1h is not None else "-",
+        effective_room,
         entry.get("target_rr", "-"),
+        sr_source,
         entry.get("distance_atr", "-"),
         entry.get("rsi", market.get("rsi", "-")),
         entry.get("rsi_sma", market.get("rsi_sma", "-")),
@@ -135,8 +144,8 @@ run_bot._make_strategies = _make_strategies
 TradingBot._log_scan = _sentinel_log_scan
 
 logger.warning(
-    "[PRODUCTION] Sentinel V%s installed; responsive PA entry; ADX12/CHOP65; SL<=1.8ATR; RSI14/SMA14; target>=1.5R",
-    SentinelV42Strategy.VERSION,
+    "[PRODUCTION] Sentinel V%s installed; 15M owns entry/direction; 1H S/R is major obstacle only; no 1H/4H trend gate",
+    SentinelV43Strategy.VERSION,
 )
 
 
