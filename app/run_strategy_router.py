@@ -10,8 +10,9 @@ import logging
 import os
 
 import run_bot
-from trading.bot import TradingBot
+from trading.bot import TradingBot, TradeRecord
 from trading.telegram_notifier import TelegramNotifier
+from trading import signal_state as signal_state_module
 from trading.strategies.sentinel_v44_strategy import SentinelV44Strategy
 
 logger = logging.getLogger("run_strategy_router")
@@ -165,13 +166,109 @@ def _sentinel_build_order_caption(self, *args, **kwargs):
     return text
 
 
+# V4.4-specific reason labels. Keep every legacy mapping intact for all other
+# strategies, but stop reporting Sentinel structure/HMA exits as EMA8/13 exits.
+_ORIGINAL_CLASSIFY_EXIT_REASON = signal_state_module.classify_exit_reason
+
+
+def _sentinel_classify_exit_reason(reason: str, won: bool):
+    r = (reason or "").lower()
+    if "structure invalidation" in r:
+        return ("Structure Exit", "🧱")
+    if "2 closes beyond ema20" in r and "hma16" in r:
+        return ("EMA20/HMA16 Trend Failure", "↩️")
+    return _ORIGINAL_CLASSIFY_EXIT_REASON(reason, won)
+
+
+# PAPER Sentinel only: enforce the hard risk boundary before the strategy gets
+# a chance to issue a softer technical exit. LIVE already has exchange-side
+# SL/TP algo orders, so its lifecycle is intentionally left untouched.
+_ORIGINAL_TICK = TradingBot._tick
+
+
+async def _sentinel_tick_hard_stop_first(self):
+    if getattr(self.connector, "paper", False):
+        for pos_info in list(self.risk.get_positions()):
+            strategy_name = pos_info.get("strategy", "")
+            if not str(strategy_name).startswith("SentinelV4.4"):
+                continue
+
+            sym = pos_info["symbol"]
+            try:
+                ticker = await self.connector.fetch_ticker(sym)
+                price = ticker["last"]
+                trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
+                if not trigger:
+                    continue
+
+                side = "sell" if pos_info["side"] == "long" else "buy"
+                pos_side = pos_info["side"] if self._hedge_mode else None
+                close_order = await self.connector.create_order(
+                    sym, side, pos_info["amount"], pos_side=pos_side
+                )
+                fill = self._close_fill_info(
+                    f"{sym}||{strategy_name}", close_order, price,
+                    pos_info["amount"], 1.0, final=True,
+                )
+                exit_px = fill["exit_avg_px"]
+                pnl = (
+                    fill["net_pnl"] if fill["net_pnl"] is not None else
+                    ((exit_px - pos_info["entry"]) * pos_info["amount"]
+                     if pos_info["side"] == "long"
+                     else (pos_info["entry"] - exit_px) * pos_info["amount"])
+                )
+
+                self._record_trade(TradeRecord(
+                    timestamp=int(__import__("time").time() * 1000),
+                    symbol=sym,
+                    side=side,
+                    price=exit_px,
+                    amount=fill["exit_sz"],
+                    pnl=round(pnl, 4),
+                    strategy=strategy_name,
+                    reason=trigger,
+                    paper=True,
+                ))
+                outcome = self._sig.record_outcome(
+                    symbol=sym,
+                    side=pos_info["side"],
+                    entry=pos_info["entry"],
+                    exit_price=exit_px,
+                    sl=pos_info.get("stop_loss"),
+                    tp=pos_info.get("take_profit"),
+                    reason=trigger,
+                    strategy=strategy_name,
+                    fill=fill,
+                )
+                self._sig.unlock_strategy(sym, strategy_name)
+                self.risk.close_position(sym, strategy=strategy_name)
+                strategy_inst = self._resolve_strategy_inst(strategy_name)
+                self._on_position_closed(sym, strategy_name, exit_px, trigger, strategy_inst)
+                logging.getLogger("trading_bot").info(
+                    "[SENTINEL PAPER RISK-FIRST] Position closed by %s before technical exit: %s [%s]",
+                    trigger, sym, strategy_name,
+                )
+                if self.telegram:
+                    self.telegram.notify_trade_closed(sym, outcome, self._sig.summary())
+                self._check_cooldown_trigger(pnl, sym)
+            except Exception as e:
+                logging.getLogger("trading_bot").error(
+                    "[SENTINEL PAPER RISK-FIRST] hard-stop precheck failed [%s %s]: %s",
+                    strategy_name, sym, e,
+                )
+
+    return await _ORIGINAL_TICK(self)
+
+
 run_bot.build_config = _build_config
 run_bot._make_strategies = _make_strategies
 TradingBot._log_scan = _sentinel_log_scan
+TradingBot._tick = _sentinel_tick_hard_stop_first
 TelegramNotifier.build_order_caption = _sentinel_build_order_caption
+signal_state_module.classify_exit_reason = _sentinel_classify_exit_reason
 
 logger.warning(
-    "[PRODUCTION] Sentinel V%s installed; SL>=1.0ATR; wider structure buffer; hard-SL same-side rearm=3 bars + fresh reset; technical exit unchanged",
+    "[PRODUCTION] Sentinel V%s installed; SL>=1.0ATR; hard-SL same-side rearm=3 bars + fresh reset; PAPER hard SL/TP runs before technical exit; V4.4 exit labels corrected",
     SentinelV44Strategy.VERSION,
 )
 
