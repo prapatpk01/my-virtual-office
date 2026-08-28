@@ -1,13 +1,17 @@
-"""Simple Structure Trading Bot V6 — one 15M strategy, no router.
+"""Simple Structure Trading Bot V6.1 — confirmed HL/LH continuation on 15M.
 
 ENTRY
 - Direction: price vs EMA20 + EMA20 slope
-- Trigger: 5-bar BOS OR one-candle EMA20 pullback continuation
+- Setup: completed Higher Low for LONG / Lower High for SHORT
+- Trigger: closed-bar break of the completed setup extreme
 - Momentum: RSI14 on the correct side of 50
-- Anti-chase: entry within 1.5 ATR of EMA20
+- Anti-chase: entry within 0.70 ATR of EMA20
+
+The old raw 5-bar BOS entry is removed. EMA20 is bias only; price must first form
+structure, then prove continuation. Risk remains simple and deterministic.
 
 RISK
-- ATR/structure stop
+- Setup-structure / ATR stop
 - TP1 1R close 50%, move stop to BE+0.10R
 - TP2 2R close 25%
 - Runner 25%, exit on a closed-bar EMA20 failure
@@ -85,9 +89,9 @@ class TradingBot:
         try:
             runner = sys.modules.get("run_bot") or sys.modules.get("__main__")
             if runner is not None and hasattr(runner, "logger"):
-                runner.logger = logging.getLogger("simple_structure_v6")
+                runner.logger = logging.getLogger("simple_structure_v6_1")
             if runner is not None and hasattr(runner, "BUILD_ID"):
-                runner.BUILD_ID = "simple-structure-v6-2026-08-28"
+                runner.BUILD_ID = "simple-structure-v6.1-2026-08-29"
         except Exception:
             pass
 
@@ -126,10 +130,11 @@ class TradingBot:
     def _debug(self, i: Dict, reason: str) -> str:
         symbol = self.symbol.split("/")[0]
         if reason == "COOLDOWN":
-            return f"V6 · {symbol} · COOLDOWN {self.cooldown_remaining} bar · WAIT"
+            return f"V6.1 · {symbol} · COOLDOWN {self.cooldown_remaining} bar · WAIT"
         bias = "LONG" if i.get("bias_long") else "SHORT" if i.get("bias_short") else "FLAT"
+        structure = "HL" if i.get("higher_low") else "LH" if i.get("lower_high") else "NONE"
         return (
-            f"V6 · {symbol} · bias={bias} · RSI {float(i.get('rsi14', 50)):.1f} · "
+            f"V6.1 · {symbol} · bias={bias} · setup={structure} · RSI {float(i.get('rsi14', 50)):.1f} · "
             f"dist={float(i.get('distance_atr', 0)):.2f}ATR · WAIT"
         )
 
@@ -162,8 +167,8 @@ class TradingBot:
 
         return {
             "direction": direction,
-            "style": "STRUCTURE",
-            "strategy": "simple_structure_v6",
+            "style": "STRUCTURE_V61",
+            "strategy": "simple_structure_v6_1",
             "trigger": trigger,
             "entry": entry,
             "sl": sl,
@@ -177,6 +182,8 @@ class TradingBot:
             "rsi14": float(i["rsi14"]),
             "atr": atr,
             "distance_atr": float(i.get("distance_atr", 0.0)),
+            "setup_high": float(i.get("setup_high", 0.0)),
+            "setup_low": float(i.get("setup_low", 0.0)),
         }
 
     def _close(self, price: float, reason: str):
@@ -239,7 +246,6 @@ class TradingBot:
         if (p.direction == "LONG" and price <= p.sl) or (p.direction == "SHORT" and price >= p.sl):
             return self._close(price, "LOCKED_SL" if p.be_moved else "SL")
 
-        # Preserve a legacy mean target if one survived from an older deployment.
         if p.style == "MEAN":
             if (p.direction == "LONG" and price >= p.tp) or (p.direction == "SHORT" and price <= p.tp):
                 return self._close(price, "MEAN_TARGET")
@@ -287,7 +293,7 @@ class TradingBot:
             self.last_signal = "WAIT INDICATOR_WARMUP"
             return None
         if i.get("schema") not in SUPPORTED_SCHEMAS:
-            raise RuntimeError(f"SIMPLE_V6_SCHEMA_MISMATCH: {i.get('schema')}")
+            raise RuntimeError(f"SIMPLE_V6_1_SCHEMA_MISMATCH: {i.get('schema')}")
 
         if self.position:
             event = self.check_price(price or float(i["close"]))
@@ -296,8 +302,6 @@ class TradingBot:
 
             p = self.position
             if p.runner_active:
-                # Closed-bar EMA20 failure ends the runner. This applies to both
-                # V6 and preserved older positions for simple, deterministic management.
                 if p.direction == "LONG" and float(i["close"]) < float(i["ema20"]):
                     return self._close(float(i["close"]), "RUNNER_EMA20_EXIT")
                 if p.direction == "SHORT" and float(i["close"]) > float(i["ema20"]):
@@ -323,10 +327,10 @@ class TradingBot:
             self.last_signal = self._debug(i, "WAIT")
             return None
 
-        trigger = str(i.get("trigger") or "Structure continuation")
+        trigger = str(i.get("trigger") or "Confirmed structure continuation")
         payload = self._build(i, direction, trigger)
         if not payload:
-            self.last_signal = f"V6 · {self.symbol.split('/')[0]} · WAIT RISK BUILD"
+            self.last_signal = f"V6.1 · {self.symbol.split('/')[0]} · WAIT RISK BUILD"
             return None
 
         payload["symbol"] = self.symbol
@@ -346,7 +350,7 @@ class TradingBot:
             strategy=payload["strategy"],
             trigger=payload["trigger"],
             opened_at=time.time(),
-            style="STRUCTURE",
+            style="STRUCTURE_V61",
         )
         self.counts["entries"] += 1
         self.save_state()
