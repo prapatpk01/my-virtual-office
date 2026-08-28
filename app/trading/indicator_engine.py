@@ -1,8 +1,5 @@
 """Adaptive Trading Bot V5 indicator engine — 15M only.
 
-The engine does one job: classify the current 15M market into a lightweight regime
-and expose the trigger for that regime.
-
 REGIME ROUTER
 - TREND:    ADX >= 20 and CHOP < 50
 - MEAN:     ADX < 20 and CHOP > 55
@@ -10,17 +7,23 @@ REGIME ROUTER
 - WAIT:     anything ambiguous
 
 STYLE ENGINES
-- TREND: EMA8/13 + MACD12/26/9 + RSI14 + EMA13 reclaim/reject
+- TREND: directional bias -> controlled EMA13 pullback -> micro re-acceleration
 - MEAN: Bollinger Bands 20,2 + RSI14 + re-entry into the band
 - BREAKOUT: swing break + Bollinger expansion + ATR14 expansion + ROC9
 
-No 1H/4H dependency and no multi-indicator score.
+Trend V5.1 deliberately removes the old same-candle EMA13 reclaim entry. A wick
+into EMA13 is only a pullback setup; entry requires the next move to prove that
+momentum has restarted by breaking the prior candle extreme, reclaiming EMA8,
+and showing RSI/MACD re-acceleration. This is designed to avoid entering while
+the pullback is still developing without adding higher-timeframe dependency.
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List
 import math
 
+# Keep the V5 schema stable so the deployed TradingBot can consume this upgrade
+# without a transient engine/bot schema mismatch during Railway rolling deploys.
 ENGINE_SCHEMA = "adaptive-v5-three-style-15m"
 
 
@@ -169,7 +172,7 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
     bb_width_prev = (bb_upper[-2] - bb_lower[-2]) / max(abs(bb_mid[-2]), 1e-12)
     bb_expanding = bb_width > bb_width_prev
 
-    # Regime router. BREAKOUT gets first priority because it is a transition state.
+    # Regime router. BREAKOUT keeps first priority because it is a transition state.
     if adx_rising and 45.0 <= chop <= 55.0 and bb_expanding and atr_rising:
         regime = "BREAKOUT"
     elif adx >= 20.0 and chop < 50.0:
@@ -184,25 +187,68 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
     ema_cross_up = ema_bull and e8[-2] <= e13[-2]
     ema_cross_down = ema_bear and e8[-2] >= e13[-2]
 
-    # TREND style: pullback into EMA13 then reclaim/reject.
-    touch_tolerance = 0.10 * atr
+    # ------------------------------------------------------------------
+    # TREND V5.1: Bias -> Pullback -> Re-acceleration
+    # ------------------------------------------------------------------
+    # 1) Bias must have slope. This rejects flat EMA alignment that can still
+    #    pass ADX/CHOP briefly after a noisy move.
+    ema13_slope_up = e13[-1] > e13[-4]
+    ema13_slope_down = e13[-1] < e13[-4]
+
+    # 2) Pullback must have occurred in one of the two bars BEFORE the trigger
+    #    candle. A small ATR tolerance accepts a near-touch, while the depth
+    #    guard rejects a genuine EMA13 breakdown masquerading as a reclaim.
+    pullback_tol = 0.15 * atr
+    deep_break = 0.35 * atr
+    prior_lows = lows[-3:-1]
+    prior_highs = highs[-3:-1]
+    prior_closes = closes[-3:-1]
+    prior_e13 = e13[-3:-1]
+
+    trend_pullback_long = (
+        min(prior_lows) <= max(prior_e13) + pullback_tol
+        and min(c - e for c, e in zip(prior_closes, prior_e13)) >= -deep_break
+    )
+    trend_pullback_short = (
+        max(prior_highs) >= min(prior_e13) - pullback_tol
+        and max(c - e for c, e in zip(prior_closes, prior_e13)) <= deep_break
+    )
+
+    # 3) Re-acceleration trigger. Instead of buying/selling the same candle
+    #    that touched EMA13, require the current close to break the previous
+    #    candle extreme and reclaim EMA8. RSI must turn with the trade and
+    #    MACD must either agree outright or visibly improve.
+    rsi_long_ok = rsi14[-1] >= 45.0 and rsi14[-1] > rsi14[-2]
+    rsi_short_ok = rsi14[-1] <= 55.0 and rsi14[-1] < rsi14[-2]
+    macd_long_ok = macd_line[-1] > macd_signal[-1] or macd_hist[-1] > macd_hist[-2]
+    macd_short_ok = macd_line[-1] < macd_signal[-1] or macd_hist[-1] < macd_hist[-2]
+    trigger_long = closes[-1] > highs[-2] and closes[-1] > e8[-1] and closes[-1] > opens[-1]
+    trigger_short = closes[-1] < lows[-2] and closes[-1] < e8[-1] and closes[-1] < opens[-1]
+
+    # Anti-chase: if confirmation candle is already >1 ATR away from EMA13,
+    # the reward/risk has usually deteriorated. Wait for the next pullback.
+    trend_distance_atr = abs(closes[-1] - e13[-1]) / max(atr, 1e-12)
+    not_chasing = trend_distance_atr <= 1.0
+
     trend_long = (
         regime == "TREND"
         and ema_bull
-        and macd_line[-1] > macd_signal[-1]
-        and rsi14[-1] >= 45.0
-        and lows[-1] <= e13[-1] + touch_tolerance
-        and closes[-1] > e13[-1]
-        and closes[-1] > opens[-1]
+        and ema13_slope_up
+        and trend_pullback_long
+        and trigger_long
+        and rsi_long_ok
+        and macd_long_ok
+        and not_chasing
     )
     trend_short = (
         regime == "TREND"
         and ema_bear
-        and macd_line[-1] < macd_signal[-1]
-        and rsi14[-1] <= 55.0
-        and highs[-1] >= e13[-1] - touch_tolerance
-        and closes[-1] < e13[-1]
-        and closes[-1] < opens[-1]
+        and ema13_slope_down
+        and trend_pullback_short
+        and trigger_short
+        and rsi_short_ok
+        and macd_short_ok
+        and not_chasing
     )
 
     # MEAN style: pierce/touch an outer band and close back inside it.
@@ -252,8 +298,10 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
         "ema8_prev": e8[-2], "ema13_prev": e13[-2],
         "ema_bull": ema_bull, "ema_bear": ema_bear,
         "ema_cross_up": ema_cross_up, "ema_cross_down": ema_cross_down,
+        "ema13_slope_up": ema13_slope_up, "ema13_slope_down": ema13_slope_down,
         "macd": macd_line[-1], "macd_signal": macd_signal[-1], "macd_hist": macd_hist[-1],
-        "rsi14": rsi14[-1], "roc9": roc9,
+        "macd_hist_prev": macd_hist[-2],
+        "rsi14": rsi14[-1], "rsi14_prev": rsi14[-2], "roc9": roc9,
         "bb_mid": bb_mid[-1], "bb_upper": bb_upper[-1], "bb_lower": bb_lower[-1],
         "bb_width": bb_width, "bb_expanding": bb_expanding,
         "atr": atr, "atr_prev": atrs[-2], "atr_rising": atr_rising,
@@ -261,6 +309,15 @@ def compute(candles: List[Any]) -> Dict[str, Any]:
         "chop": chop,
         "swing_high": swing_high, "swing_low": swing_low,
         "recent_low": recent_low, "recent_high": recent_high,
+        "trend_pullback_long": trend_pullback_long,
+        "trend_pullback_short": trend_pullback_short,
+        "trend_trigger_long": trigger_long,
+        "trend_trigger_short": trigger_short,
+        "trend_macd_long_ok": macd_long_ok,
+        "trend_macd_short_ok": macd_short_ok,
+        "trend_rsi_long_ok": rsi_long_ok,
+        "trend_rsi_short_ok": rsi_short_ok,
+        "trend_distance_atr": trend_distance_atr,
         "trend_long": trend_long, "trend_short": trend_short,
         "mean_long": mean_long, "mean_short": mean_short,
         "breakout_long": breakout_long, "breakout_short": breakout_short,
