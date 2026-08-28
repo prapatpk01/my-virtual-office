@@ -216,7 +216,7 @@ class SentinelV7Strategy(SentinelV61Strategy):
             })
             return out
 
-        risk = max(raw_risk, min_risk, entry * 0.001)
+        risk = max(raw_risk, min_risk)
         stop = entry - risk if side == "long" else entry + risk
         tp1 = entry + self.TP1_R * risk if side == "long" else entry - self.TP1_R * risk
         tp2 = entry + self.TP2_R * risk if side == "long" else entry - self.TP2_R * risk
