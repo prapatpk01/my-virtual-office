@@ -1,7 +1,7 @@
-"""Canonical production router for Sentinel V6 — Trend-Filtered RSI + 2TP.
+"""Canonical production router for Sentinel V6.1 — RSI Momentum Quality + 2TP.
 
 Railway starts this file. Older Sentinel versions remain in the repository for
-rollback, but production instantiates only V6.
+rollback, but production instantiates only V6.1.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import run_bot
 from trading.bot import TradingBot, TradeRecord
 from trading.telegram_notifier import TelegramNotifier
 from trading import signal_state as signal_state_module
-from trading.strategies.sentinel_v6_strategy import SentinelV6Strategy
+from trading.strategies.sentinel_v61_strategy import SentinelV61Strategy
 
 logger = logging.getLogger("run_strategy_router")
 
@@ -45,17 +45,17 @@ def _build_config() -> dict:
     os.environ["CANDLE_TF"] = "15m"
     logger.warning(
         "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | 1H EMA20/50+slope direction | "
-        "15M ADX>=12 CHOP<65 ATRx>=0.65 | RSI14/SMA14 trigger | "
-        "SL=1.25ATR | TP1=1.0R close50%% lock+0.10R | TP2=2.0R",
-        SentinelV6Strategy.VERSION,
+        "15M ADX>=12 CHOP<65 ATRx>=0.65 | RSI14/SMA14 cross + slope/spread expansion | "
+        "divergence=soft bonus | SL=1.25ATR | TP1=1.0R close50%% lock+0.10R | TP2=2.0R",
+        SentinelV61Strategy.VERSION,
         config["symbols"],
     )
     return config
 
 
-def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV6Strategy]:
+def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV61Strategy]:
     strategies = [
-        SentinelV6Strategy(
+        SentinelV61Strategy(
             symbol,
             exit_cooldown_bars=_env_int("SENTINEL_EXIT_COOLDOWN_BARS", 2),
         )
@@ -67,7 +67,7 @@ def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV6Strateg
 
 
 # ---------------------------------------------------------------------------
-# Compact V6 scan log
+# Compact V6.1 scan log
 # ---------------------------------------------------------------------------
 _ORIGINAL_LOG_SCAN = TradingBot._log_scan
 _LAST_SENTINEL_SCAN: dict[str, dict] = {}
@@ -75,7 +75,7 @@ _LAST_SENTINEL_SCAN: dict[str, dict] = {}
 
 def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     meta = getattr(signal, "metadata", None) or {}
-    if meta.get("strategy") != "SENTINEL_V6":
+    if meta.get("strategy") != "SENTINEL_V6_1":
         return _ORIGINAL_LOG_SCAN(self, symbol, strategy_name, price, signal)
 
     reason = str(getattr(signal, "reason", "") or "")
@@ -87,15 +87,17 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     trend = view.get("trend_1h") or {}
     market = view.get("market_15m") or {}
     entry = view.get("entry_15m") or {}
+    divergence = market.get("divergence") or {}
 
     gate = "PASS" if market.get("market_ready") else "BLOCK" if market else "-"
     blocks = entry.get("blocks", []) or market.get("blocks", []) or []
     repeat_tag = " | cached=same-15M-bar" if repeated_bar and view is not meta else ""
 
     logging.getLogger("trading_bot").info(
-        "[SCAN SENTINEL V6] %s px=%.4f sig=%s | 1H=%s EMA20=%s EMA50=%s slope=%s | "
-        "15M gate=%s ADX=%s CHOP=%s ATRx=%s | RSI=%s SMA14=%s prev=%s/%s cross=%s "
-        "zoneL<55=%s zoneS>=65=%s | SL=1.25ATR TP1=1R/50%% TP2=2R | blocks=%s | %s%s",
+        "[SCAN SENTINEL V6.1] %s px=%.4f sig=%s | 1H=%s EMA20=%s EMA50=%s slope=%s | "
+        "15M gate=%s ADX=%s CHOP=%s ATRx=%s | RSI=%s SMA14=%s cross=%s zoneL=%s zoneS=%s | "
+        "rSlope=%s sSlope=%s spread=%s dSpread=%s div=%s | "
+        "SL=1.25ATR TP1=1R/50%% TP2=2R | blocks=%s | %s%s",
         symbol,
         price,
         getattr(getattr(signal, "type", None), "value", "hold").upper(),
@@ -109,11 +111,14 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
         market.get("atr_ratio", "-"),
         market.get("rsi", "-"),
         market.get("rsi_sma", "-"),
-        market.get("prev_rsi", "-"),
-        market.get("prev_rsi_sma", "-"),
         market.get("cross", "-"),
         "Y" if market.get("long_zone") else "N",
         "Y" if market.get("short_zone") else "N",
+        market.get("rsi_slope", "-"),
+        market.get("rsi_sma_slope", "-"),
+        market.get("spread", "-"),
+        market.get("spread_delta", "-"),
+        divergence.get("label", "NONE"),
         ",".join(blocks) or "none",
         reason,
         repeat_tag,
@@ -131,7 +136,7 @@ def _sentinel_build_order_caption(self, *args, **kwargs):
     strategy = kwargs.get("strategy")
     if strategy is None and len(args) >= 5:
         strategy = args[4]
-    if "SentinelV6" in str(strategy or "") or "SentinelV6" in text:
+    if "SentinelV6.1" in str(strategy or "") or "SentinelV6.1" in text:
         text = text.replace(
             "🏁 Exit : trend flip (EMA cross-back / close past EMA)",
             "🎯 TP1 : +1.0R close 50% → runner SL +0.10R\n"
@@ -167,7 +172,7 @@ async def _sentinel_tick_hard_stop_first(self):
     if getattr(self.connector, "paper", False):
         for pos_info in list(self.risk.get_positions()):
             strategy_name = pos_info.get("strategy", "")
-            if not str(strategy_name).startswith("SentinelV6"):
+            if not str(strategy_name).startswith("SentinelV6.1"):
                 continue
 
             sym = pos_info["symbol"]
@@ -222,7 +227,7 @@ async def _sentinel_tick_hard_stop_first(self):
                 strategy_inst = self._resolve_strategy_inst(strategy_name)
                 self._on_position_closed(sym, strategy_name, exit_px, trigger, strategy_inst)
                 logging.getLogger("trading_bot").info(
-                    "[SENTINEL V6 PAPER RISK-FIRST] Position closed by %s before RSI exit: %s [%s]",
+                    "[SENTINEL V6.1 PAPER RISK-FIRST] Position closed by %s before RSI exit: %s [%s]",
                     trigger, sym, strategy_name,
                 )
                 if self.telegram:
@@ -230,7 +235,7 @@ async def _sentinel_tick_hard_stop_first(self):
                 self._check_cooldown_trigger(pnl, sym)
             except Exception as e:
                 logging.getLogger("trading_bot").error(
-                    "[SENTINEL V6 PAPER RISK-FIRST] hard-stop precheck failed [%s %s]: %s",
+                    "[SENTINEL V6.1 PAPER RISK-FIRST] hard-stop precheck failed [%s %s]: %s",
                     strategy_name, sym, e,
                 )
 
@@ -245,9 +250,9 @@ TelegramNotifier.build_order_caption = _sentinel_build_order_caption
 signal_state_module.classify_exit_reason = _sentinel_classify_exit_reason
 
 logger.warning(
-    "[PRODUCTION] Sentinel V%s installed; 1H direction only; 15M RSI trigger; "
-    "SL=1.25ATR; TP1=1R close50%%+lock0.10R; TP2=2R; confirmed RSI reversal exit",
-    SentinelV6Strategy.VERSION,
+    "[PRODUCTION] Sentinel V%s installed; 1H direction; 15M RSI cross+slope+spread; "
+    "divergence soft bonus; SL=1.25ATR; TP1=1R close50%%+lock0.10R; TP2=2R",
+    SentinelV61Strategy.VERSION,
 )
 
 
