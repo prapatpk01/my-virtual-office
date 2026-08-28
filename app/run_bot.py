@@ -1,4 +1,4 @@
-"""Simple Structure Trading Bot V6 runner — CLOSED 15M signals only."""
+"""Simple Structure Trading Bot V6.1 runner — CLOSED 15M signals only."""
 from __future__ import annotations
 
 import asyncio
@@ -19,14 +19,14 @@ from trading.connectors.binance_conn import BinanceConnector
 from trading.adaptive_trading_bot import BE_LOCK_R, TP1_R, TP2_R, TradingBot
 from trading.indicator_engine import compute, ema
 
-BUILD_ID = "simple-structure-v6-2026-08-28"
+BUILD_ID = "simple-structure-v6.1-2026-08-29"
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
     force=True,
 )
-logger = logging.getLogger("simple_structure_v6")
+logger = logging.getLogger("simple_structure_v6_1")
 
 
 def env_bool(key: str, default: bool = False) -> bool:
@@ -117,12 +117,13 @@ def trade_text(order_type: str, payload: dict, paper: bool) -> str:
 
     if order_type.startswith("OPEN_"):
         return "\n".join([
-            f"{'🟢' if direction == 'LONG' else '🔴'} SIMPLE V6 {direction} — {symbol}",
+            f"{'🟢' if direction == 'LONG' else '🔴'} SIMPLE V6.1 {direction} — {symbol}",
             f"Mode: {mode} | TF: 15M CLOSED",
             f"Trigger: {payload.get('trigger', '-')}",
             f"EMA20: {float(payload.get('ema20',0)):,.4f}",
             f"RSI14: {float(payload.get('rsi14',0)):.1f}",
             f"Distance: {float(payload.get('distance_atr',0)):.2f} ATR",
+            f"Setup H/L: {float(payload.get('setup_high',0)):,.4f} / {float(payload.get('setup_low',0)):,.4f}",
             "",
             f"Entry: {float(payload.get('entry',0)):,.4f}",
             f"SL: {float(payload.get('sl',0)):,.4f} ({float(payload.get('sl_pct',0)):.2f}%)",
@@ -148,14 +149,15 @@ def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_a
     started = datetime.fromtimestamp(stats_started_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
-        "📊 Simple Structure Trading Bot V6 Stats", "",
+        "📊 Simple Structure Trading Bot V6.1 Stats", "",
         f"Mode: {'PAPER' if paper else 'LIVE'}",
         "TF: 15M only · CLOSED bars for signals",
-        "ONE STRATEGY: EMA20 + Market Structure + RSI14 + ATR14",
+        "ONE STRATEGY: EMA20 + HL/LH Structure + RSI14 + ATR14",
         "Bias: price side of EMA20 + EMA20 slope",
-        "Entry: 5-bar BOS OR EMA20 pullback continuation",
+        "Setup: Higher Low LONG / Lower High SHORT",
+        "Trigger: break completed setup extreme",
         "Momentum: RSI >50 LONG / <50 SHORT",
-        "Anti-chase: ≤1.5 ATR from EMA20",
+        "Anti-chase: ≤0.70 ATR from EMA20",
         f"Risk: TP1 {TP1_R:g}R→BE+{BE_LOCK_R:g}R · TP2 {TP2_R:g}R→Runner 25%",
         "Runner exit: closed-bar EMA20 failure",
         f"Stats since: {started}", "",
@@ -206,16 +208,16 @@ def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_a
         "BY STRATEGY", "――――――――――――――――",
     ]
 
-    current_closed = [t for t in closed if t.get("style") == "STRUCTURE"]
-    current_partials = [t for t in partials if t.get("style") == "STRUCTURE"]
+    current_closed = [t for t in closed if t.get("style") == "STRUCTURE_V61"]
+    current_partials = [t for t in partials if t.get("style") == "STRUCTURE_V61"]
     current_wins = sum(float(t.get("pnl", 0)) > 0 for t in current_closed)
     current_wr = 100 * current_wins / len(current_closed) if current_closed else 0.0
     current_pnl = sum(float(t.get("pnl", 0)) for t in current_closed + current_partials)
-    lines.append(f"STRUCTURE {len(current_closed):>2} trades · {current_wr:.0f}%WR · ${current_pnl:+.2f}")
+    lines.append(f"STRUCTURE_V61 {len(current_closed):>2} trades · {current_wr:.0f}%WR · ${current_pnl:+.2f}")
 
-    old = [t for t in closed + partials if t.get("style") != "STRUCTURE"]
+    old = [t for t in closed + partials if t.get("style") != "STRUCTURE_V61"]
     if old:
-        old_closed = [t for t in closed if t.get("style") != "STRUCTURE"]
+        old_closed = [t for t in closed if t.get("style") != "STRUCTURE_V61"]
         old_pnl = sum(float(t.get("pnl", 0)) for t in old)
         lines += ["", f"PRESERVED OLD: {len(old_closed)} closed · ${old_pnl:+.2f}"]
 
@@ -258,7 +260,7 @@ def chart(candles, payload: dict, path: str) -> bool:
         volume_axis.bar(i, v, width=0.7, color=color)
 
     axis.plot(e20, label="EMA20", linewidth=1.2)
-    for key, label in (("entry", "ENTRY"), ("sl", "SL"), ("tp1", "TP1"), ("tp2", "TP2")):
+    for key, label in (("entry", "ENTRY"), ("sl", "SL"), ("tp1", "TP1"), ("tp2", "TP2"), ("setup_high", "SETUP H"), ("setup_low", "SETUP L")):
         value = float(payload.get(key, 0))
         if value:
             axis.axhline(value, linestyle="--", linewidth=1.0, label=f"{label} {value:,.4f}")
@@ -267,7 +269,7 @@ def chart(candles, payload: dict, path: str) -> bool:
     axis.legend(loc="best", fontsize=8)
     axis.grid(alpha=0.2)
     volume_axis.grid(alpha=0.15)
-    axis.set_title(f"{payload.get('symbol')} {payload.get('direction')} | Simple V6 | {payload.get('trigger')}")
+    axis.set_title(f"{payload.get('symbol')} {payload.get('direction')} | Simple V6.1 | {payload.get('trigger')}")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -291,8 +293,8 @@ async def main() -> None:
     update_offset = 0
 
     state_dir = os.getenv("BOT_STATE_DIR", "/tmp/adaptive_momentum_v4_1")
-    ledger_path = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger_v6.json"))
-    stats_meta_path = os.path.join(state_dir, "stats_meta_v6.json")
+    ledger_path = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger_v6_1.json"))
+    stats_meta_path = os.path.join(state_dir, "stats_meta_v6_1.json")
     trades = load_json(ledger_path, [])
     stats_meta = load_json(stats_meta_path, {"started_at": time.time()})
     stats_started_at = float(stats_meta.get("started_at", time.time()))
@@ -303,14 +305,14 @@ async def main() -> None:
         if not photo:
             request = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), method="POST")
         else:
-            boundary = "----SimpleV6" + uuid.uuid4().hex
+            boundary = "----SimpleV61" + uuid.uuid4().hex
             parts = []
             for key, value in fields.items():
                 parts += [f"--{boundary}\r\n".encode(), f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(), str(value).encode(), b"\r\n"]
             with open(photo, "rb") as handle:
                 image = handle.read()
             parts += [
-                f"--{boundary}\r\n".encode(), b'Content-Disposition: form-data; name="photo"; filename="simple_v6.png"\r\n',
+                f"--{boundary}\r\n".encode(), b'Content-Disposition: form-data; name="photo"; filename="simple_v6_1.png"\r\n',
                 b"Content-Type: image/png\r\n\r\n", image, b"\r\n", f"--{boundary}--\r\n".encode(),
             ]
             request = urllib.request.Request(url, data=b"".join(parts), method="POST", headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
@@ -356,9 +358,9 @@ async def main() -> None:
 
     def execute(order_type: str, payload: dict):
         if order_type.startswith("OPEN_") and telegram_enabled:
-            image_path = f"/tmp/simple_v6_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+            image_path = f"/tmp/simple_v6_1_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
             if not chart(latest_candles.get(str(payload.get("symbol")), []), payload, image_path):
-                raise RuntimeError("Mandatory Simple V6 chart failed")
+                raise RuntimeError("Mandatory Simple V6.1 chart failed")
             queue.put_nowait({"kind": "photo", "path": image_path, "caption": trade_text(order_type, payload, paper)})
         elif telegram_enabled:
             queue.put_nowait({"kind": "text", "text": trade_text(order_type, payload, paper)})
@@ -398,7 +400,7 @@ async def main() -> None:
                     save_json(ledger_path, [])
                     stats_started_at = time.time()
                     save_json(stats_meta_path, {"started_at": stats_started_at})
-                    queue.put_nowait({"kind": "text", "text": "♻️ Simple V6 stats reset\nTrades: 0\nWin rate: 0%\nNet PnL: $0.00\nOpen positions were NOT closed."})
+                    queue.put_nowait({"kind": "text", "text": "♻️ Simple V6.1 stats reset\nTrades: 0\nWin rate: 0%\nNet PnL: $0.00\nOpen positions were NOT closed."})
         except Exception as error:
             logger.warning("Telegram polling: %s", error)
 
@@ -412,13 +414,14 @@ async def main() -> None:
 
     telegram_task = asyncio.create_task(telegram_worker()) if telegram_enabled else None
     last_bar, disabled = {}, set()
-    logger.info("Simple Structure V6 | build=%s | mode=%s | tf=15m | telegram=%s", BUILD_ID, "PAPER" if paper else "LIVE", "CONNECTED" if telegram_enabled else "DISABLED")
+    logger.info("Simple Structure V6.1 | build=%s | mode=%s | tf=15m | telegram=%s", BUILD_ID, "PAPER" if paper else "LIVE", "CONNECTED" if telegram_enabled else "DISABLED")
 
     if telegram_enabled:
         queue.put_nowait({"kind": "text", "text": (
-            f"🤖 Simple Structure Trading Bot V6 started\nMode: {'PAPER' if paper else 'LIVE'}\nTF: 15M CLOSED\n"
-            "Logic: EMA20 bias + BOS / EMA20 pullback + RSI14 + ATR14\n"
-            "No router · No ADX/CHOP · No MACD · No BB · No ROC\n"
+            f"🤖 Simple Structure Trading Bot V6.1 started\nMode: {'PAPER' if paper else 'LIVE'}\nTF: 15M CLOSED\n"
+            "Logic: EMA20 bias → HL/LH setup → structure break → RSI14\n"
+            "Anti-chase: entry must be ≤0.70 ATR from EMA20\n"
+            "No raw 5-bar BOS · No router · No ADX/CHOP · No MACD · No BB · No ROC\n"
             f"TP1 {TP1_R:g}R close 50% → BE+{BE_LOCK_R:g}R | TP2 {TP2_R:g}R close 25% → Runner 25%\n"
             f"Margin: ${margin:.2f} | Risk: ${risk_usdt:.2f}/trade\nCommands: /stats · /restats"
         )})
@@ -444,7 +447,7 @@ async def main() -> None:
                     if bot.position_open and live_price:
                         event = bot.check_price(live_price)
                         if event:
-                            trades.append({**event, "timestamp": time.time(), "version": "simple-v6"})
+                            trades.append({**event, "timestamp": time.time(), "version": "simple-v6.1"})
                             save_json(ledger_path, trades[-2000:])
 
                     if bar_timestamp == last_bar.get(symbol):
@@ -465,7 +468,7 @@ async def main() -> None:
 
                     event = bot.on_bar(indicators, price=live_price)
                     if event:
-                        trades.append({**event, "timestamp": time.time(), "version": "simple-v6"})
+                        trades.append({**event, "timestamp": time.time(), "version": "simple-v6.1"})
                         save_json(ledger_path, trades[-2000:])
                     logger.info("[%s] %s", symbol, display_payload(event) if event else bot.last_signal)
 
@@ -477,7 +480,7 @@ async def main() -> None:
                 except Exception as error:
                     logger.exception("[%s] tick failed", symbol)
                     if telegram_enabled:
-                        queue.put_nowait({"kind": "text", "text": f"❌ Simple V6 error\nSymbol: {symbol}\n{type(error).__name__}: {error}"})
+                        queue.put_nowait({"kind": "text", "text": f"❌ Simple V6.1 error\nSymbol: {symbol}\n{type(error).__name__}: {error}"})
 
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -485,7 +488,7 @@ async def main() -> None:
                 pass
     finally:
         if telegram_enabled:
-            queue.put_nowait({"kind": "text", "text": "⏹ Simple Structure Trading Bot V6 stopped"})
+            queue.put_nowait({"kind": "text", "text": "⏹ Simple Structure Trading Bot V6.1 stopped"})
             try:
                 await asyncio.wait_for(queue.join(), timeout=5)
             except asyncio.TimeoutError:
