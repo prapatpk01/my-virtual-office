@@ -1,14 +1,16 @@
-"""Adaptive Trading Bot V5 — simple 15M regime router with three independent styles.
+"""Adaptive Trading Bot V5.2 — 15M Dual Engine.
 
-The bot does not stack every indicator into one gate. It first selects one market
-style, then evaluates only that style's lightweight setup:
+ACTIVE ENTRIES
+- LEGACY_MOMENTUM: EMA8/13 directional bias + BOS/CHOCH + ADX/CHOP quality
+  + 2-of-3 MACD/ROC9/structure confirmation.
+- BREAKOUT: volatility expansion + local swing break + ROC9. Breakout has priority.
 
-TREND    -> EMA8/13 + MACD + RSI14 + EMA13 reclaim/reject
-MEAN     -> Bollinger Bands + RSI14 + band re-entry
-BREAKOUT -> swing break + Bollinger expansion + ATR14 expansion + ROC9
+TREND and MEAN no longer open new positions. Existing positions from older versions
+are preserved and continue to be managed safely after deployment.
 
-Risk management is style-specific. TREND/BREAKOUT use TP1 1R, lock SL at
-BE+0.15R, TP2 2R partial, then a runner. MEAN exits fully at the BB middle line.
+Both active engines use TP1 1R (close 50%, lock BE+0.15R), TP2 2R (close 25%),
+then a 25% runner. Legacy Momentum runners exit on EMA8/13 flip; Breakout runners
+use a one-ATR trailing stop on closed 15M bars.
 """
 from __future__ import annotations
 
@@ -74,7 +76,7 @@ class TradingBot:
         self.cooldown_remaining = 0
         self.last_signal = "WARMUP"
         self.counts = {key: 0 for key in (
-            "scans", "entries", "cooldown", "wait_regime", "trend", "mean", "breakout"
+            "scans", "entries", "cooldown", "wait_regime", "legacy_momentum", "breakout"
         )}
         self._identity()
         self.load_state()
@@ -84,9 +86,9 @@ class TradingBot:
         try:
             runner = sys.modules.get("run_bot") or sys.modules.get("__main__")
             if runner is not None and hasattr(runner, "logger"):
-                runner.logger = logging.getLogger("adaptive_trading_v5")
+                runner.logger = logging.getLogger("adaptive_trading_v5_2")
             if runner is not None and hasattr(runner, "BUILD_ID"):
-                runner.BUILD_ID = "adaptive-v5-three-style-2026-08-27"
+                runner.BUILD_ID = "adaptive-v5.2-dual-engine-2026-08-28"
         except Exception:
             pass
 
@@ -125,21 +127,22 @@ class TradingBot:
     @staticmethod
     def _entry_candidate(i: Dict) -> Tuple[str, str, str]:
         regime = str(i.get("regime", "WAIT"))
-        if regime == "TREND":
-            if i.get("trend_long"):
-                return "LONG", "TREND", "EMA13 bullish reclaim"
-            if i.get("trend_short"):
-                return "SHORT", "TREND", "EMA13 bearish reject"
-        elif regime == "MEAN":
-            if i.get("mean_long"):
-                return "LONG", "MEAN", "Lower BB re-entry"
-            if i.get("mean_short"):
-                return "SHORT", "MEAN", "Upper BB re-entry"
-        elif regime == "BREAKOUT":
+
+        # Breakout receives first priority from the indicator router.
+        if regime == "BREAKOUT":
             if i.get("breakout_long"):
-                return "LONG", "BREAKOUT", "Swing + Upper BB breakout"
+                return "LONG", "BREAKOUT", "Swing breakout + volatility expansion"
             if i.get("breakout_short"):
-                return "SHORT", "BREAKOUT", "Swing + Lower BB breakout"
+                return "SHORT", "BREAKOUT", "Swing breakdown + volatility expansion"
+
+        if regime == "LEGACY_MOMENTUM":
+            if i.get("legacy_long"):
+                trigger = "Bullish BOS" if i.get("bullish_bos") else "Bullish CHOCH"
+                return "LONG", "LEGACY_MOMENTUM", trigger
+            if i.get("legacy_short"):
+                trigger = "Bearish BOS" if i.get("bearish_bos") else "Bearish CHOCH"
+                return "SHORT", "LEGACY_MOMENTUM", trigger
+
         return "NONE", regime, ""
 
     def _debug(self, i: Dict, reason: str) -> str:
@@ -147,48 +150,27 @@ class TradingBot:
         regime = str(i.get("regime", "WAIT"))
         adx = float(i.get("adx", 0.0))
         chop = float(i.get("chop", 100.0))
-        rsi = float(i.get("rsi14", 50.0))
         if reason == "COOLDOWN":
-            return f"ADAPTIVE V5 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bar · RESULT: WAIT"
-        if regime == "WAIT":
-            return f"ADAPTIVE V5 · {symbol} · 15M · REGIME WAIT · ADX {adx:.1f} · CHOP {chop:.1f} · RESULT: NO TRADE"
-        if regime == "TREND":
+            return f"ADAPTIVE V5.2 · {symbol} · 15M · ⏳ COOLDOWN {self.cooldown_remaining} bar · WAIT"
+        if regime == "BREAKOUT":
             return (
-                f"ADAPTIVE V5 · {symbol} · TREND · EMA8/13 + MACD + RSI {rsi:.1f} · "
-                f"❌ WAIT EMA13 RECLAIM/REJECT"
+                f"ADAPTIVE V5.2 · {symbol} · BREAKOUT · ROC9 {float(i.get('roc9',0)):+.2f}% · "
+                f"BBexpand={int(bool(i.get('bb_expanding')))} ATRrise={int(bool(i.get('atr_rising')))} · WAIT BREAK"
             )
-        if regime == "MEAN":
+        if regime == "LEGACY_MOMENTUM":
+            score = max(int(i.get("legacy_long_score", 0)), int(i.get("legacy_short_score", 0)))
             return (
-                f"ADAPTIVE V5 · {symbol} · MEAN · RSI {rsi:.1f} · "
-                f"❌ WAIT OUTER BB RE-ENTRY"
+                f"ADAPTIVE V5.2 · {symbol} · LEGACY MOMENTUM · ADX {adx:.1f} · CHOP {chop:.1f} · "
+                f"confirm={score}/3 · WAIT STRUCTURE"
             )
-        return (
-            f"ADAPTIVE V5 · {symbol} · BREAKOUT · ROC9 {float(i.get('roc9', 0)):+.2f}% · "
-            f"BBexpand={int(bool(i.get('bb_expanding')))} ATRrise={int(bool(i.get('atr_rising')))} · "
-            f"❌ WAIT SWING BREAK"
-        )
+        return f"ADAPTIVE V5.2 · {symbol} · WAIT · ADX {adx:.1f} · CHOP {chop:.1f} · NO TRADE"
 
     def _build(self, i: Dict, direction: str, style: str, trigger: str):
         entry = float(i["close"])
         atr = max(float(i["atr"]), entry * 0.0005)
         min_risk = entry * MIN_SL_PCT
 
-        if style == "MEAN":
-            if direction == "LONG":
-                sl = float(i["low"]) - atr
-                target = float(i["bb_mid"])
-                if target <= entry:
-                    return None
-                risk = entry - sl
-            else:
-                sl = float(i["high"]) + atr
-                target = float(i["bb_mid"])
-                if target >= entry:
-                    return None
-                risk = sl - entry
-            tp1 = target
-            tp2 = target
-        elif style == "BREAKOUT":
+        if style == "BREAKOUT":
             if direction == "LONG":
                 candidate = float(i["swing_high"]) - 0.30 * atr
                 sl = max(candidate, entry - 1.20 * atr)
@@ -201,7 +183,7 @@ class TradingBot:
                 sl = max(sl, entry + max(0.50 * atr, min_risk))
                 risk = sl - entry
                 tp1, tp2 = entry - TP1_R * risk, entry - TP2_R * risk
-        else:  # TREND
+        else:  # LEGACY_MOMENTUM
             if direction == "LONG":
                 structure_stop = float(i["recent_low"]) - 0.10 * atr
                 sl = max(structure_stop, entry - 1.20 * atr)
@@ -224,10 +206,11 @@ class TradingBot:
         if size <= 0:
             return None
 
+        score = int(i.get("legacy_long_score", 0) if direction == "LONG" else i.get("legacy_short_score", 0))
         return {
             "direction": direction,
             "style": style,
-            "strategy": "adaptive_v5_three_style",
+            "strategy": "adaptive_v5_2_dual_engine",
             "trigger": trigger,
             "entry": entry,
             "sl": sl,
@@ -249,6 +232,7 @@ class TradingBot:
             "atr": atr,
             "adx": float(i["adx"]),
             "chop": float(i["chop"]),
+            "confirmation_score": score,
         }
 
     def _close(self, price: float, reason: str):
@@ -312,13 +296,12 @@ class TradingBot:
             reason = "LOCKED_SL" if p.be_moved else "SL"
             return self._close(price, reason)
 
-        # MEAN has one thesis target: the BB middle line.
+        # Preserve management for an old MEAN position if one survived deployment.
         if p.style == "MEAN":
             if (p.direction == "LONG" and price >= p.tp) or (p.direction == "SHORT" and price <= p.tp):
                 return self._close(price, "MEAN_TARGET")
             return None
 
-        # TREND/BREAKOUT: TP1 closes 50% and locks the remainder at BE + 0.15R.
         if not p.tp1_hit and (
             (p.direction == "LONG" and price >= p.tp1)
             or (p.direction == "SHORT" and price <= p.tp1)
@@ -334,7 +317,6 @@ class TradingBot:
             self.save_state()
             return event
 
-        # TP2 closes another 25% of initial size, leaving a 25% runner.
         if p.tp1_hit and not p.tp2_hit and (
             (p.direction == "LONG" and price >= p.tp2)
             or (p.direction == "SHORT" and price <= p.tp2)
@@ -362,7 +344,7 @@ class TradingBot:
             self.last_signal = "WAIT INDICATOR_WARMUP"
             return None
         if i.get("schema") not in SUPPORTED_SCHEMAS:
-            raise RuntimeError(f"ADAPTIVE_V5_SCHEMA_MISMATCH: {i.get('schema')}")
+            raise RuntimeError(f"ADAPTIVE_V5_2_SCHEMA_MISMATCH: {i.get('schema')}")
 
         if self.position:
             event = self.check_price(price or float(i["close"]))
@@ -371,11 +353,14 @@ class TradingBot:
 
             p = self.position
             if p.runner_active:
-                if p.style == "TREND":
+                # New Legacy Momentum and old LEGACY/TREND positions use the same
+                # clean EMA8/13 runner exit. This also fixes old LEGACY runners
+                # that previously had no closed-bar trend exit in V5.
+                if p.style in {"LEGACY_MOMENTUM", "LEGACY", "TREND"}:
                     if p.direction == "LONG" and i.get("ema_bear"):
-                        return self._close(float(i["close"]), "TREND_RUNNER_EMA_EXIT")
+                        return self._close(float(i["close"]), "MOMENTUM_RUNNER_EMA_EXIT")
                     if p.direction == "SHORT" and i.get("ema_bull"):
-                        return self._close(float(i["close"]), "TREND_RUNNER_EMA_EXIT")
+                        return self._close(float(i["close"]), "MOMENTUM_RUNNER_EMA_EXIT")
                 elif p.style == "BREAKOUT":
                     atr = float(i["atr"])
                     if p.direction == "LONG":
@@ -409,7 +394,7 @@ class TradingBot:
 
         payload = self._build(i, direction, style, trigger)
         if not payload:
-            self.last_signal = f"ADAPTIVE V5 · {self.symbol.split('/')[0]} · {style} · WAIT RISK BUILD"
+            self.last_signal = f"ADAPTIVE V5.2 · {self.symbol.split('/')[0]} · {style} · WAIT RISK BUILD"
             return None
 
         payload["symbol"] = self.symbol
