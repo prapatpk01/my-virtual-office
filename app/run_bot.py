@@ -1,10 +1,9 @@
-"""Adaptive Trading Bot V5.2 runner — 15M Legacy Momentum + Breakout Dual Engine."""
+"""Simple Structure Trading Bot V6 runner — CLOSED 15M signals only."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import math
 import os
 import signal
 import sys
@@ -20,14 +19,14 @@ from trading.connectors.binance_conn import BinanceConnector
 from trading.adaptive_trading_bot import BE_LOCK_R, TP1_R, TP2_R, TradingBot
 from trading.indicator_engine import compute, ema
 
-BUILD_ID = "adaptive-v5.2-dual-engine-2026-08-28"
+BUILD_ID = "simple-structure-v6-2026-08-28"
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
     force=True,
 )
-logger = logging.getLogger("adaptive_trading_v5_2")
+logger = logging.getLogger("simple_structure_v6")
 
 
 def env_bool(key: str, default: bool = False) -> bool:
@@ -107,22 +106,7 @@ def display_payload(value):
         return {key: display_payload(item) for key, item in value.items()}
     if isinstance(value, list):
         return [display_payload(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(display_payload(item) for item in value)
     return value
-
-
-def bbands(closes, length: int = 20, mult: float = 2.0):
-    mids, uppers, lowers = [], [], []
-    for index in range(len(closes)):
-        window = closes[max(0, index - length + 1):index + 1]
-        mid = sum(window) / len(window)
-        variance = sum((value - mid) ** 2 for value in window) / len(window)
-        std = math.sqrt(variance)
-        mids.append(mid)
-        uppers.append(mid + mult * std)
-        lowers.append(mid - mult * std)
-    return mids, uppers, lowers
 
 
 def trade_text(order_type: str, payload: dict, paper: bool) -> str:
@@ -132,34 +116,21 @@ def trade_text(order_type: str, payload: dict, paper: bool) -> str:
     style = str(payload.get("style", "LEGACY"))
 
     if order_type.startswith("OPEN_"):
-        lines = [
-            f"{'🟢' if direction == 'LONG' else '🔴'} ADAPTIVE V5.2 {style} {direction} — {symbol}",
-            f"Mode: {mode} | TF: 15M",
+        return "\n".join([
+            f"{'🟢' if direction == 'LONG' else '🔴'} SIMPLE V6 {direction} — {symbol}",
+            f"Mode: {mode} | TF: 15M CLOSED",
             f"Trigger: {payload.get('trigger', '-')}",
-        ]
-        if style == "LEGACY_MOMENTUM":
-            lines += [
-                f"EMA8/13: {float(payload.get('ema8',0)):.4f} / {float(payload.get('ema13',0)):.4f}",
-                f"MACD: {float(payload.get('macd',0)):+.4f} / Signal {float(payload.get('macd_signal',0)):+.4f}",
-                f"ROC9: {float(payload.get('roc9',0)):+.2f}% | Confirm: {int(payload.get('confirmation_score',0))}/3",
-            ]
-        elif style == "BREAKOUT":
-            lines += [
-                f"ROC9: {float(payload.get('roc9',0)):+.2f}%",
-                f"ATR14: {float(payload.get('atr',0)):,.4f}",
-                "Breakout: swing break + BB width expand + ATR rise",
-            ]
-        lines += [
-            f"ADX: {float(payload.get('adx',0)):.1f} | CHOP: {float(payload.get('chop',0)):.1f}",
+            f"EMA20: {float(payload.get('ema20',0)):,.4f}",
+            f"RSI14: {float(payload.get('rsi14',0)):.1f}",
+            f"Distance: {float(payload.get('distance_atr',0)):.2f} ATR",
             "",
             f"Entry: {float(payload.get('entry',0)):,.4f}",
             f"SL: {float(payload.get('sl',0)):,.4f} ({float(payload.get('sl_pct',0)):.2f}%)",
             f"TP1: {float(payload.get('tp1',0)):,.4f} ({TP1_R:g}R · close 50% · SL→BE+{BE_LOCK_R:g}R)",
             f"TP2: {float(payload.get('tp2',0)):,.4f} ({TP2_R:g}R · close 25%)",
-            "Runner: 25%",
+            "Runner: 25% · exit on EMA20 failure",
             f"Size: {float(payload.get('size',0)):,.4f} | Risk: ${float(payload.get('risk_usdt',0)):.2f}",
-        ]
-        return "\n".join(lines)
+        ])
 
     pnl = float(payload.get("pnl", 0.0))
     return (
@@ -170,22 +141,23 @@ def trade_text(order_type: str, payload: dict, paper: bool) -> str:
 
 
 def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_at: float) -> str:
-    closed = [trade for trade in trades if trade.get("event") == "CLOSE"]
-    partials = [trade for trade in trades if trade.get("event") == "PARTIAL"]
-    wins = [trade for trade in closed if float(trade.get("pnl", 0)) > 0]
-    net = sum(float(trade.get("pnl", 0)) for trade in closed + partials)
+    closed = [t for t in trades if t.get("event") == "CLOSE"]
+    partials = [t for t in trades if t.get("event") == "PARTIAL"]
+    wins = [t for t in closed if float(t.get("pnl", 0)) > 0]
+    net = sum(float(t.get("pnl", 0)) for t in closed + partials)
     started = datetime.fromtimestamp(stats_started_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
-        "📊 Adaptive Trading Bot V5.2 Stats", "",
+        "📊 Simple Structure Trading Bot V6 Stats", "",
         f"Mode: {'PAPER' if paper else 'LIVE'}",
         "TF: 15M only · CLOSED bars for signals",
-        "ACTIVE: LEGACY MOMENTUM + BREAKOUT",
-        "LEGACY MOMENTUM: EMA8/13 + BOS/CHOCH + ADX≥15 + CHOP≤55 + 2/3 MACD/ROC9/Structure",
-        "BREAKOUT: Swing break + BB width expansion + ATR rising + ROC9",
-        "Priority: BREAKOUT → LEGACY MOMENTUM → WAIT",
+        "ONE STRATEGY: EMA20 + Market Structure + RSI14 + ATR14",
+        "Bias: price side of EMA20 + EMA20 slope",
+        "Entry: 5-bar BOS OR EMA20 pullback continuation",
+        "Momentum: RSI >50 LONG / <50 SHORT",
+        "Anti-chase: ≤1.5 ATR from EMA20",
         f"Risk: TP1 {TP1_R:g}R→BE+{BE_LOCK_R:g}R · TP2 {TP2_R:g}R→Runner 25%",
-        "DISABLED entries: TREND · MEAN",
+        "Runner exit: closed-bar EMA20 failure",
         f"Stats since: {started}", "",
         f"OPEN POSITIONS ({sum(int(bot.position_open) for bot in bots.values())})",
         "――――――――――――――――",
@@ -194,75 +166,65 @@ def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_a
     count = 0
     floating = 0.0
     for symbol, bot in bots.items():
-        position = bot.position
-        if not position:
+        p = bot.position
+        if not p:
             continue
         count += 1
-        current = float(prices.get(symbol, position.entry))
-        pnl = ((current - position.entry) * position.size
-               if position.direction == "LONG"
-               else (position.entry - current) * position.size)
+        current = float(prices.get(symbol, p.entry))
+        pnl = (current - p.entry) * p.size if p.direction == "LONG" else (p.entry - current) * p.size
         floating += pnl
         lines += [
-            f"{'🟢' if position.direction == 'LONG' else '🔴'} {symbol.split('/')[0]} {position.style} {position.direction}",
-            f"Entry : {position.entry:,.4f}",
+            f"{'🟢' if p.direction == 'LONG' else '🔴'} {symbol.split('/')[0]} {p.style} {p.direction}",
+            f"Entry : {p.entry:,.4f}",
             f"Now   : {current:,.4f}",
             f"PnL   : ${pnl:+.2f}",
-            f"SL    : {position.sl:,.4f}{' (LOCK)' if position.be_moved else ''}",
+            f"SL    : {p.sl:,.4f}{' (LOCK)' if p.be_moved else ''}",
+            f"TP1   : {p.tp1:,.4f} {'✅' if p.tp1_hit else ''}",
+            f"TP2   : {p.tp2:,.4f} {'✅' if p.tp2_hit else ''}",
+            f"Runner: {'ACTIVE' if p.runner_active else 'WAIT'}",
+            f"Trigger: {p.trigger}",
+            f"Held  : {duration(time.time() - p.opened_at)}", "",
         ]
-        if position.style == "MEAN":
-            lines.append(f"Target: {position.tp:,.4f} (BB Mid · legacy management)")
-        else:
-            lines += [
-                f"TP1   : {position.tp1:,.4f} {'✅' if position.tp1_hit else ''}",
-                f"TP2   : {position.tp2:,.4f} {'✅' if position.tp2_hit else ''}",
-                f"Runner: {'ACTIVE' if position.runner_active else 'WAIT'}",
-            ]
-        lines += [f"Trigger: {position.trigger}", f"Held  : {duration(time.time() - position.opened_at)}", ""]
 
     if not count:
         lines += ["No open positions", ""]
 
-    win_rate = 100 * len(wins) / len(closed) if closed else 0.0
+    wr = 100 * len(wins) / len(closed) if closed else 0.0
     lines += [
         "EXPOSURE", "――――――――――――――――",
         f"Margin Used  : ${count * margin:.2f}",
         f"Floating PnL : ${floating:+.2f}", "",
         "OVERALL", "――――――――――――――――",
         f"Trades   : {len(closed)} ({len(wins)}W / {len(closed)-len(wins)}L)",
-        f"Win rate : {win_rate:.0f}%",
+        f"Win rate : {wr:.0f}%",
         f"TP1 hit  : {sum(t.get('reason') == 'TP1' for t in partials)}",
         f"TP2 partial: {sum(t.get('reason') == 'TP2_PARTIAL' for t in partials)}",
         f"SL hit   : {sum(t.get('reason') == 'SL' for t in closed)}",
         f"Locked SL: {sum(t.get('reason') == 'LOCKED_SL' for t in closed)}",
-        f"Momentum runner exit: {sum(t.get('reason') == 'MOMENTUM_RUNNER_EMA_EXIT' for t in closed)}",
+        f"Runner exit: {sum(t.get('reason') == 'RUNNER_EMA20_EXIT' for t in closed)}",
         f"Net PnL  : ${net:+.2f}", "",
-        "BY ENGINE", "――――――――――――――――",
+        "BY STRATEGY", "――――――――――――――――",
     ]
 
-    for style in ("LEGACY_MOMENTUM", "BREAKOUT"):
-        style_closed = [trade for trade in closed if trade.get("style") == style]
-        style_partials = [trade for trade in partials if trade.get("style") == style]
-        style_wins = sum(float(trade.get("pnl", 0)) > 0 for trade in style_closed)
-        style_pnl = sum(float(trade.get("pnl", 0)) for trade in style_closed + style_partials)
-        style_wr = 100 * style_wins / len(style_closed) if style_closed else 0.0
-        lines.append(f"{style:<16} {len(style_closed):>2} trades · {style_wr:.0f}%WR · ${style_pnl:+.2f}")
+    current_closed = [t for t in closed if t.get("style") == "STRUCTURE"]
+    current_partials = [t for t in partials if t.get("style") == "STRUCTURE"]
+    current_wins = sum(float(t.get("pnl", 0)) > 0 for t in current_closed)
+    current_wr = 100 * current_wins / len(current_closed) if current_closed else 0.0
+    current_pnl = sum(float(t.get("pnl", 0)) for t in current_closed + current_partials)
+    lines.append(f"STRUCTURE {len(current_closed):>2} trades · {current_wr:.0f}%WR · ${current_pnl:+.2f}")
 
-    old_styles = [style for style in ("LEGACY", "TREND", "MEAN") if any(t.get("style") == style for t in closed + partials)]
-    if old_styles:
-        lines += ["", "PRESERVED OLD POSITIONS / HISTORY"]
-        for style in old_styles:
-            style_closed = [trade for trade in closed if trade.get("style") == style]
-            style_partials = [trade for trade in partials if trade.get("style") == style]
-            style_pnl = sum(float(trade.get("pnl", 0)) for trade in style_closed + style_partials)
-            lines.append(f"{style:<16} {len(style_closed):>2} closed · ${style_pnl:+.2f}")
+    old = [t for t in closed + partials if t.get("style") != "STRUCTURE"]
+    if old:
+        old_closed = [t for t in closed if t.get("style") != "STRUCTURE"]
+        old_pnl = sum(float(t.get("pnl", 0)) for t in old)
+        lines += ["", f"PRESERVED OLD: {len(old_closed)} closed · ${old_pnl:+.2f}"]
 
     if closed:
         lines += ["", "LAST 5 TRADES", "――――――――――――――――"]
-        for index, trade in enumerate(reversed(closed[-5:]), 1):
+        for idx, trade in enumerate(reversed(closed[-5:]), 1):
             pnl = float(trade.get("pnl", 0))
             lines.append(
-                f"{index}. {'✅' if pnl > 0 else '❌'} {str(trade.get('symbol','')).split('/')[0]} "
+                f"{idx}. {'✅' if pnl > 0 else '❌'} {str(trade.get('symbol','')).split('/')[0]} "
                 f"{trade.get('style','')} {trade.get('direction','')} ${pnl:+.2f} — {trade.get('reason','')}"
             )
     return "\n".join(lines)
@@ -281,52 +243,31 @@ def chart(candles, payload: dict, path: str) -> bool:
     rows = list(candles[-100:])
     if len(rows) < 40:
         return False
-    opens = [field(row, "open", 1) for row in rows]
-    highs = [field(row, "high", 2) for row in rows]
-    lows = [field(row, "low", 3) for row in rows]
-    closes = [field(row, "close", 4) for row in rows]
-    volumes = [field(row, "volume", 5) for row in rows]
-    e8, e13 = ema(closes, 8), ema(closes, 13)
-    bb_mid, bb_upper, bb_lower = bbands(closes)
+    opens = [field(r, "open", 1) for r in rows]
+    highs = [field(r, "high", 2) for r in rows]
+    lows = [field(r, "low", 3) for r in rows]
+    closes = [field(r, "close", 4) for r in rows]
+    volumes = [field(r, "volume", 5) for r in rows]
+    e20 = ema(closes, 20)
 
-    fig, (axis, volume_axis) = plt.subplots(
-        2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [4, 1]}
-    )
-    for index, (open_price, high, low, close, volume) in enumerate(zip(opens, highs, lows, closes, volumes)):
-        candle_color = "#26a69a" if close >= open_price else "#ef5350"
-        axis.vlines(index, low, high, color=candle_color, linewidth=1)
-        axis.add_patch(Rectangle(
-            (index - 0.3, min(open_price, close)), 0.6,
-            max(abs(close - open_price), max(close, 1) * 1e-6),
-            facecolor=candle_color, edgecolor=candle_color,
-        ))
-        volume_axis.bar(index, volume, width=0.7, color=candle_color)
+    fig, (axis, volume_axis) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [4, 1]})
+    for i, (o, h, l, c, v) in enumerate(zip(opens, highs, lows, closes, volumes)):
+        color = "#26a69a" if c >= o else "#ef5350"
+        axis.vlines(i, l, h, color=color, linewidth=1)
+        axis.add_patch(Rectangle((i - 0.3, min(o, c)), 0.6, max(abs(c - o), max(c, 1) * 1e-6), facecolor=color, edgecolor=color))
+        volume_axis.bar(i, v, width=0.7, color=color)
 
-    axis.plot(e8, label="EMA8", linewidth=1.1)
-    axis.plot(e13, label="EMA13", linewidth=1.1)
-    axis.plot(bb_mid, label="BB Mid", linewidth=0.9)
-    axis.plot(bb_upper, label="BB Upper", linewidth=0.8)
-    axis.plot(bb_lower, label="BB Lower", linewidth=0.8)
-
+    axis.plot(e20, label="EMA20", linewidth=1.2)
     for key, label in (("entry", "ENTRY"), ("sl", "SL"), ("tp1", "TP1"), ("tp2", "TP2")):
         value = float(payload.get(key, 0))
         if value:
-            axis.axhline(value, linestyle="--", linewidth=1.1, label=f"{label} {value:,.4f}")
-
+            axis.axhline(value, linestyle="--", linewidth=1.0, label=f"{label} {value:,.4f}")
     entry = float(payload.get("entry", 0))
-    axis.scatter(
-        len(rows) - 1, entry,
-        marker="^" if payload.get("direction") == "LONG" else "v",
-        s=120, zorder=6, label="ENTRY",
-    )
-    axis.legend(loc="best", fontsize=7, ncol=2)
+    axis.scatter(len(rows) - 1, entry, marker="^" if payload.get("direction") == "LONG" else "v", s=120, zorder=6, label="ENTRY")
+    axis.legend(loc="best", fontsize=8)
     axis.grid(alpha=0.2)
     volume_axis.grid(alpha=0.15)
-    axis.set_title(
-        f"{payload.get('symbol')} {payload.get('direction')} | Adaptive V5.2 {payload.get('style')} | {payload.get('trigger')}"
-    )
-    axis.set_ylabel("Price")
-    volume_axis.set_ylabel("Volume")
+    axis.set_title(f"{payload.get('symbol')} {payload.get('direction')} | Simple V6 | {payload.get('trigger')}")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -335,9 +276,9 @@ def chart(candles, payload: dict, path: str) -> bool:
 
 async def main() -> None:
     paper = env_bool("PAPER_TRADING", True) or os.getenv("TRADING_MODE", "").lower() == "paper"
-    symbols = [symbol.strip() for symbol in os.getenv(
-        "SYMBOLS", "XAU/USDT:USDT,SOL/USDT:USDT,XAG/USDT:USDT,XRP/USDT:USDT,HYPE/USDT:USDT"
-    ).split(",") if symbol.strip()]
+    symbols = [s.strip() for s in os.getenv(
+        "SYMBOLS", "XAU/USDT:USDT,SOL/USDT:USDT,XAG/USDT:USDT,XRP/USDT:USDT,HYPE/USDT:USDT,BTC/USDT:USDT"
+    ).split(",") if s.strip()]
     leverage = int(os.getenv("LEVERAGE", "20"))
     margin = float(os.getenv("ADAPTIVE_MARGIN_USDT", "20"))
     interval = int(os.getenv("INTERVAL_SECONDS", "60"))
@@ -349,11 +290,9 @@ async def main() -> None:
     queue: asyncio.Queue = asyncio.Queue()
     update_offset = 0
 
-    # Preserve existing symbol states/open positions across deployment. V5.2 gets
-    # a fresh default ledger so the Dual Engine can be evaluated independently.
     state_dir = os.getenv("BOT_STATE_DIR", "/tmp/adaptive_momentum_v4_1")
-    ledger_path = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger_v5_2.json"))
-    stats_meta_path = os.path.join(state_dir, "stats_meta_v5_2.json")
+    ledger_path = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger_v6.json"))
+    stats_meta_path = os.path.join(state_dir, "stats_meta_v6.json")
     trades = load_json(ledger_path, [])
     stats_meta = load_json(stats_meta_path, {"started_at": time.time()})
     stats_started_at = float(stats_meta.get("started_at", time.time()))
@@ -364,26 +303,17 @@ async def main() -> None:
         if not photo:
             request = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), method="POST")
         else:
-            boundary = "----AdaptiveV52" + uuid.uuid4().hex
+            boundary = "----SimpleV6" + uuid.uuid4().hex
             parts = []
             for key, value in fields.items():
-                parts += [
-                    f"--{boundary}\r\n".encode(),
-                    f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(),
-                    str(value).encode(), b"\r\n",
-                ]
+                parts += [f"--{boundary}\r\n".encode(), f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(), str(value).encode(), b"\r\n"]
             with open(photo, "rb") as handle:
                 image = handle.read()
             parts += [
-                f"--{boundary}\r\n".encode(),
-                b'Content-Disposition: form-data; name="photo"; filename="adaptive_v5_2.png"\r\n',
-                b"Content-Type: image/png\r\n\r\n", image, b"\r\n",
-                f"--{boundary}--\r\n".encode(),
+                f"--{boundary}\r\n".encode(), b'Content-Disposition: form-data; name="photo"; filename="simple_v6.png"\r\n',
+                b"Content-Type: image/png\r\n\r\n", image, b"\r\n", f"--{boundary}--\r\n".encode(),
             ]
-            request = urllib.request.Request(
-                url, data=b"".join(parts), method="POST",
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            )
+            request = urllib.request.Request(url, data=b"".join(parts), method="POST", headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(request, timeout=20) as response:
             result = json.loads(response.read().decode())
         if not result.get("ok"):
@@ -395,17 +325,11 @@ async def main() -> None:
             item = await queue.get()
             try:
                 if item["kind"] == "photo":
-                    await asyncio.to_thread(
-                        telegram_api, "sendPhoto",
-                        {"chat_id": chat_id, "caption": item["caption"]}, item["path"],
-                    )
+                    await asyncio.to_thread(telegram_api, "sendPhoto", {"chat_id": chat_id, "caption": item["caption"]}, item["path"])
                     if os.path.exists(item["path"]):
                         os.remove(item["path"])
                 else:
-                    await asyncio.to_thread(
-                        telegram_api, "sendMessage",
-                        {"chat_id": chat_id, "text": item["text"], "disable_web_page_preview": "true"},
-                    )
+                    await asyncio.to_thread(telegram_api, "sendMessage", {"chat_id": chat_id, "text": item["text"], "disable_web_page_preview": "true"})
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -426,22 +350,16 @@ async def main() -> None:
     if not paper:
         from trading.connectors.okx_adapter import OKXAdapter
         live = OKXAdapter(
-            api_key=os.getenv("EXCHANGE_API_KEY", ""),
-            api_secret=os.getenv("EXCHANGE_API_SECRET", ""),
-            api_passphrase=os.getenv("EXCHANGE_PASSPHRASE", ""),
-            paper=False, leverage=leverage,
+            api_key=os.getenv("EXCHANGE_API_KEY", ""), api_secret=os.getenv("EXCHANGE_API_SECRET", ""),
+            api_passphrase=os.getenv("EXCHANGE_PASSPHRASE", ""), paper=False, leverage=leverage,
         )
 
     def execute(order_type: str, payload: dict):
-        if order_type.startswith("OPEN_"):
-            if telegram_enabled:
-                image_path = f"/tmp/adaptive_v5_2_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
-                if not chart(latest_candles.get(str(payload.get("symbol")), []), payload, image_path):
-                    raise RuntimeError("Mandatory Adaptive V5.2 chart failed")
-                queue.put_nowait({
-                    "kind": "photo", "path": image_path,
-                    "caption": trade_text(order_type, payload, paper),
-                })
+        if order_type.startswith("OPEN_") and telegram_enabled:
+            image_path = f"/tmp/simple_v6_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+            if not chart(latest_candles.get(str(payload.get("symbol")), []), payload, image_path):
+                raise RuntimeError("Mandatory Simple V6 chart failed")
+            queue.put_nowait({"kind": "photo", "path": image_path, "caption": trade_text(order_type, payload, paper)})
         elif telegram_enabled:
             queue.put_nowait({"kind": "text", "text": trade_text(order_type, payload, paper)})
 
@@ -457,11 +375,7 @@ async def main() -> None:
         return result
 
     bots = {
-        symbol: TradingBot(
-            symbol, margin, leverage, paper,
-            os.path.join(state_dir, symbol.replace("/", "_").replace(":", "_") + ".json"),
-            execute, risk_usdt,
-        )
+        symbol: TradingBot(symbol, margin, leverage, paper, os.path.join(state_dir, symbol.replace("/", "_").replace(":", "_") + ".json"), execute, risk_usdt)
         for symbol in symbols
     }
 
@@ -470,9 +384,7 @@ async def main() -> None:
         if not telegram_enabled:
             return
         try:
-            result = await asyncio.to_thread(
-                telegram_api, "getUpdates", {"timeout": 0, "offset": update_offset}
-            )
+            result = await asyncio.to_thread(telegram_api, "getUpdates", {"timeout": 0, "offset": update_offset})
             for update in result.get("result", []):
                 update_offset = max(update_offset, int(update.get("update_id", 0)) + 1)
                 message = update.get("message") or {}
@@ -480,26 +392,13 @@ async def main() -> None:
                     continue
                 command = str(message.get("text", "")).strip().lower().split()[0] if message.get("text") else ""
                 if command == "/stats":
-                    queue.put_nowait({
-                        "kind": "text",
-                        "text": stats_text(trades, bots, prices, paper, margin, stats_started_at),
-                    })
+                    queue.put_nowait({"kind": "text", "text": stats_text(trades, bots, prices, paper, margin, stats_started_at)})
                 elif command == "/restats":
                     trades.clear()
                     save_json(ledger_path, [])
                     stats_started_at = time.time()
                     save_json(stats_meta_path, {"started_at": stats_started_at})
-                    for bot in bots.values():
-                        for key in bot.counts:
-                            bot.counts[key] = 0
-                    queue.put_nowait({
-                        "kind": "text",
-                        "text": (
-                            "♻️ Adaptive Trading Bot V5.2 stats reset\n"
-                            "Trades: 0\nWin rate: 0%\nNet PnL: $0.00\n"
-                            "Open positions were NOT closed.\nNew counting starts now."
-                        ),
-                    })
+                    queue.put_nowait({"kind": "text", "text": "♻️ Simple V6 stats reset\nTrades: 0\nWin rate: 0%\nNet PnL: $0.00\nOpen positions were NOT closed."})
         except Exception as error:
             logger.warning("Telegram polling: %s", error)
 
@@ -513,39 +412,28 @@ async def main() -> None:
 
     telegram_task = asyncio.create_task(telegram_worker()) if telegram_enabled else None
     last_bar, disabled = {}, set()
-    logger.info(
-        "Adaptive Trading Bot V5.2 | build=%s | mode=%s | tf=15m | engines=LEGACY_MOMENTUM,BREAKOUT | telegram=%s",
-        BUILD_ID, "PAPER" if paper else "LIVE", "CONNECTED" if telegram_enabled else "DISABLED",
-    )
+    logger.info("Simple Structure V6 | build=%s | mode=%s | tf=15m | telegram=%s", BUILD_ID, "PAPER" if paper else "LIVE", "CONNECTED" if telegram_enabled else "DISABLED")
 
     if telegram_enabled:
-        queue.put_nowait({
-            "kind": "text",
-            "text": (
-                f"🤖 Adaptive Trading Bot V5.2 started\nMode: {'PAPER' if paper else 'LIVE'}\nTF: 15M only\n"
-                "ACTIVE ENGINES: LEGACY MOMENTUM + BREAKOUT\n"
-                "LEGACY: EMA8/13 + BOS/CHOCH + ADX≥15 + CHOP≤55 + 2/3 MACD/ROC9/Structure\n"
-                "BREAKOUT: Swing break + BB width expand + ATR rise + ROC9\n"
-                "Priority: BREAKOUT → LEGACY MOMENTUM → WAIT\n"
-                f"TP1 {TP1_R:g}R close 50% → SL BE+{BE_LOCK_R:g}R | TP2 {TP2_R:g}R close 25% → Runner 25%\n"
-                "TREND/MEAN entries: DISABLED\n"
-                f"Margin: ${margin:.2f} | Risk: ${risk_usdt:.2f}/trade\nCommands: /stats · /restats"
-            ),
-        })
+        queue.put_nowait({"kind": "text", "text": (
+            f"🤖 Simple Structure Trading Bot V6 started\nMode: {'PAPER' if paper else 'LIVE'}\nTF: 15M CLOSED\n"
+            "Logic: EMA20 bias + BOS / EMA20 pullback + RSI14 + ATR14\n"
+            "No router · No ADX/CHOP · No MACD · No BB · No ROC\n"
+            f"TP1 {TP1_R:g}R close 50% → BE+{BE_LOCK_R:g}R | TP2 {TP2_R:g}R close 25% → Runner 25%\n"
+            f"Margin: ${margin:.2f} | Risk: ${risk_usdt:.2f}/trade\nCommands: /stats · /restats"
+        )})
 
     try:
         while not stop.is_set():
             await poll_commands()
             now_utc = datetime.now(timezone.utc)
-
             for symbol in symbols:
                 if symbol in disabled:
                     continue
                 try:
                     raw_15m = await connector.fetch_ohlcv(symbol, "15m", 320)
-                    if len(raw_15m) < 100:
+                    if len(raw_15m) < 61:
                         continue
-                    # Critical: signal calculations use only fully closed 15m bars.
                     closed_15m = list(raw_15m[:-1])
                     latest_candles[symbol] = closed_15m
                     bar_timestamp = timestamp(closed_15m[-1])
@@ -553,11 +441,10 @@ async def main() -> None:
                     live_price = field(raw_15m[-1], "close", 4) or float(prices.get(symbol, 0))
                     prices[symbol] = live_price
 
-                    # Live intra-bar price is used only for protective SL/TP handling.
                     if bot.position_open and live_price:
                         event = bot.check_price(live_price)
                         if event:
-                            trades.append({**event, "timestamp": time.time(), "version": "adaptive-v5.2"})
+                            trades.append({**event, "timestamp": time.time(), "version": "simple-v6"})
                             save_json(ledger_path, trades[-2000:])
 
                     if bar_timestamp == last_bar.get(symbol):
@@ -578,7 +465,7 @@ async def main() -> None:
 
                     event = bot.on_bar(indicators, price=live_price)
                     if event:
-                        trades.append({**event, "timestamp": time.time(), "version": "adaptive-v5.2"})
+                        trades.append({**event, "timestamp": time.time(), "version": "simple-v6"})
                         save_json(ledger_path, trades[-2000:])
                     logger.info("[%s] %s", symbol, display_payload(event) if event else bot.last_signal)
 
@@ -590,10 +477,7 @@ async def main() -> None:
                 except Exception as error:
                     logger.exception("[%s] tick failed", symbol)
                     if telegram_enabled:
-                        queue.put_nowait({
-                            "kind": "text",
-                            "text": f"❌ Adaptive V5.2 error\nSymbol: {symbol}\n{type(error).__name__}: {error}",
-                        })
+                        queue.put_nowait({"kind": "text", "text": f"❌ Simple V6 error\nSymbol: {symbol}\n{type(error).__name__}: {error}"})
 
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -601,7 +485,7 @@ async def main() -> None:
                 pass
     finally:
         if telegram_enabled:
-            queue.put_nowait({"kind": "text", "text": "⏹ Adaptive Trading Bot V5.2 stopped"})
+            queue.put_nowait({"kind": "text", "text": "⏹ Simple Structure Trading Bot V6 stopped"})
             try:
                 await asyncio.wait_for(queue.join(), timeout=5)
             except asyncio.TimeoutError:
