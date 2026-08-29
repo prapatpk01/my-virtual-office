@@ -1,4 +1,15 @@
-"""Simple Structure Trading Bot V6.1 runner — CLOSED 15M signals only."""
+"""Adaptive SMC MTF V7.0 runner.
+
+Closed-candle decision pipeline:
+  4H  TSS-style direction filter
+  15M Market Structure
+  5M  AMD (Accumulation -> Manipulation -> Distribution)
+  1M  IFVG precision execution
+
+The loop polls every INTERVAL_SECONDS, but a new entry decision is evaluated only
+once per newly closed 1M candle. Higher-timeframe candle sets are cached and only
+refreshed when their own time bucket advances.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -19,14 +30,14 @@ from trading.connectors.binance_conn import BinanceConnector
 from trading.adaptive_trading_bot import BE_LOCK_R, TP1_R, TP2_R, TradingBot
 from trading.indicator_engine import compute, ema
 
-BUILD_ID = "simple-structure-v6.1-2026-08-29"
+BUILD_ID = "adaptive-smc-v7.0-2026-08-29"
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
     force=True,
 )
-logger = logging.getLogger("simple_structure_v6_1")
+logger = logging.getLogger("adaptive_smc_v7")
 
 
 def env_bool(key: str, default: bool = False) -> bool:
@@ -101,7 +112,7 @@ def duration(seconds: float) -> str:
 
 def display_payload(value):
     if isinstance(value, float):
-        return round(value, 4)
+        return round(value, 5)
     if isinstance(value, dict):
         return {key: display_payload(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -117,20 +128,20 @@ def trade_text(order_type: str, payload: dict, paper: bool) -> str:
 
     if order_type.startswith("OPEN_"):
         return "\n".join([
-            f"{'🟢' if direction == 'LONG' else '🔴'} SIMPLE V6.1 {direction} — {symbol}",
-            f"Mode: {mode} | TF: 15M CLOSED",
+            f"{'🟢' if direction == 'LONG' else '🔴'} ADAPTIVE SMC V7 {direction} — {symbol}",
+            f"Mode: {mode} | Execution: M1 CLOSED",
+            f"4H TSS: {payload.get('tss_bias','-')} ({float(payload.get('tss_score',0)):.0f})",
+            f"M15 Structure: {payload.get('structure','-')}",
+            f"M5 AMD: {payload.get('amd_phase','-')}",
+            f"M1 IFVG: {float(payload.get('ifvg_low',0)):,.4f} – {float(payload.get('ifvg_high',0)):,.4f}",
             f"Trigger: {payload.get('trigger', '-')}",
-            f"EMA20: {float(payload.get('ema20',0)):,.4f}",
-            f"RSI14: {float(payload.get('rsi14',0)):.1f}",
-            f"Distance: {float(payload.get('distance_atr',0)):.2f} ATR",
-            f"Setup H/L: {float(payload.get('setup_high',0)):,.4f} / {float(payload.get('setup_low',0)):,.4f}",
             "",
             f"Entry: {float(payload.get('entry',0)):,.4f}",
             f"SL: {float(payload.get('sl',0)):,.4f} ({float(payload.get('sl_pct',0)):.2f}%)",
             f"TP1: {float(payload.get('tp1',0)):,.4f} ({TP1_R:g}R · close 50% · SL→BE+{BE_LOCK_R:g}R)",
-            f"TP2: {float(payload.get('tp2',0)):,.4f} ({TP2_R:g}R · close 25%)",
-            "Runner: 25% · exit on EMA20 failure",
-            f"Size: {float(payload.get('size',0)):,.4f} | Risk: ${float(payload.get('risk_usdt',0)):.2f}",
+            f"TP2: {float(payload.get('tp2',0)):,.4f} ({TP2_R:g}R · close remaining)",
+            "Runner after TP1: M15/M5 invalidation can exit early",
+            f"Size: {float(payload.get('size',0)):,.6g} | Risk: ${float(payload.get('risk_usdt',0)):.2f}",
         ])
 
     pnl = float(payload.get("pnl", 0.0))
@@ -149,17 +160,16 @@ def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_a
     started = datetime.fromtimestamp(stats_started_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
-        "📊 Simple Structure Trading Bot V6.1 Stats", "",
+        "📊 Adaptive SMC MTF V7 Stats", "",
         f"Mode: {'PAPER' if paper else 'LIVE'}",
-        "TF: 15M only · CLOSED bars for signals",
-        "ONE STRATEGY: EMA20 + HL/LH Structure + RSI14 + ATR14",
-        "Bias: price side of EMA20 + EMA20 slope",
-        "Setup: Higher Low LONG / Lower High SHORT",
-        "Trigger: break completed setup extreme",
-        "Momentum: RSI >50 LONG / <50 SHORT",
-        "Anti-chase: ≤0.70 ATR from EMA20",
-        f"Risk: TP1 {TP1_R:g}R→BE+{BE_LOCK_R:g}R · TP2 {TP2_R:g}R→Runner 25%",
-        "Runner exit: closed-bar EMA20 failure",
+        "Pipeline: 4H TSS → M15 Structure → M5 AMD → M1 IFVG",
+        "Signals: CLOSED candles only · M1 execution cadence",
+        "4H: EMA20/50 + HMA16 trend-tunnel approximation",
+        "M15: HH/HL · LH/LL · BOS/CHOCH",
+        "M5: Accumulation → liquidity sweep → Distribution",
+        "M1: inverted FVG + fresh retest/rejection",
+        f"Risk: TP1 {TP1_R:g}R 50% → BE+{BE_LOCK_R:g}R · TP2 {TP2_R:g}R closes remaining",
+        "Early runner exit: M15 CHOCH or opposite M5 distribution after TP1",
         f"Stats since: {started}", "",
         f"OPEN POSITIONS ({sum(int(bot.position_open) for bot in bots.values())})",
         "――――――――――――――――",
@@ -183,8 +193,8 @@ def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_a
             f"SL    : {p.sl:,.4f}{' (LOCK)' if p.be_moved else ''}",
             f"TP1   : {p.tp1:,.4f} {'✅' if p.tp1_hit else ''}",
             f"TP2   : {p.tp2:,.4f} {'✅' if p.tp2_hit else ''}",
-            f"Runner: {'ACTIVE' if p.runner_active else 'WAIT'}",
-            f"Trigger: {p.trigger}",
+            f"4H/M15/M5: {p.tss_bias or '-'} / {p.structure or '-'} / {p.amd_phase or '-'}",
+            f"IFVG  : {p.ifvg_low:,.4f} – {p.ifvg_high:,.4f}",
             f"Held  : {duration(time.time() - p.opened_at)}", "",
         ]
 
@@ -194,35 +204,36 @@ def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_a
     wr = 100 * len(wins) / len(closed) if closed else 0.0
     lines += [
         "EXPOSURE", "――――――――――――――――",
-        f"Margin Used  : ${count * margin:.2f}",
-        f"Floating PnL : ${floating:+.2f}", "",
+        f"Margin Target : ${count * margin:.2f}",
+        f"Floating PnL  : ${floating:+.2f}", "",
         "OVERALL", "――――――――――――――――",
         f"Trades   : {len(closed)} ({len(wins)}W / {len(closed)-len(wins)}L)",
         f"Win rate : {wr:.0f}%",
         f"TP1 hit  : {sum(t.get('reason') == 'TP1' for t in partials)}",
-        f"TP2 partial: {sum(t.get('reason') == 'TP2_PARTIAL' for t in partials)}",
+        f"TP2 hit  : {sum(t.get('reason') == 'TP2' for t in closed)}",
         f"SL hit   : {sum(t.get('reason') == 'SL' for t in closed)}",
         f"Locked SL: {sum(t.get('reason') == 'LOCKED_SL' for t in closed)}",
-        f"Runner exit: {sum(t.get('reason') == 'RUNNER_EMA20_EXIT' for t in closed)}",
+        f"SMC runner exits: {sum(t.get('reason') == 'RUNNER_STRUCTURE_EXIT' for t in closed)}",
+        f"Exchange reconciles: {sum(str(t.get('reason','')).startswith('EXCHANGE_') for t in closed)}",
         f"Net PnL  : ${net:+.2f}", "",
         "BY STRATEGY", "――――――――――――――――",
     ]
 
-    current_closed = [t for t in closed if t.get("style") == "STRUCTURE_V61"]
-    current_partials = [t for t in partials if t.get("style") == "STRUCTURE_V61"]
+    current_closed = [t for t in closed if t.get("style") == "SMC_MTF_V1"]
+    current_partials = [t for t in partials if t.get("style") == "SMC_MTF_V1"]
     current_wins = sum(float(t.get("pnl", 0)) > 0 for t in current_closed)
     current_wr = 100 * current_wins / len(current_closed) if current_closed else 0.0
     current_pnl = sum(float(t.get("pnl", 0)) for t in current_closed + current_partials)
-    lines.append(f"STRUCTURE_V61 {len(current_closed):>2} trades · {current_wr:.0f}%WR · ${current_pnl:+.2f}")
+    lines.append(f"SMC_MTF_V1 {len(current_closed):>2} closes · {current_wr:.0f}%WR · ${current_pnl:+.2f}")
 
-    old = [t for t in closed + partials if t.get("style") != "STRUCTURE_V61"]
+    old = [t for t in closed + partials if t.get("style") != "SMC_MTF_V1"]
     if old:
-        old_closed = [t for t in closed if t.get("style") != "STRUCTURE_V61"]
+        old_closed = [t for t in closed if t.get("style") != "SMC_MTF_V1"]
         old_pnl = sum(float(t.get("pnl", 0)) for t in old)
-        lines += ["", f"PRESERVED OLD: {len(old_closed)} closed · ${old_pnl:+.2f}"]
+        lines += ["", f"PRESERVED/RECOVERED: {len(old_closed)} closes · ${old_pnl:+.2f}"]
 
     if closed:
-        lines += ["", "LAST 5 TRADES", "――――――――――――――――"]
+        lines += ["", "LAST 5 CLOSES", "――――――――――――――――"]
         for idx, trade in enumerate(reversed(closed[-5:]), 1):
             pnl = float(trade.get("pnl", 0))
             lines.append(
@@ -233,6 +244,7 @@ def stats_text(trades, bots, prices, paper: bool, margin: float, stats_started_a
 
 
 def chart(candles, payload: dict, path: str) -> bool:
+    """M1 execution chart for Telegram. EMA20 is visual context only."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -242,8 +254,8 @@ def chart(candles, payload: dict, path: str) -> bool:
         logger.error("Chart unavailable: %s", error)
         return False
 
-    rows = list(candles[-100:])
-    if len(rows) < 40:
+    rows = list(candles[-120:])
+    if len(rows) < 50:
         return False
     opens = [field(r, "open", 1) for r in rows]
     highs = [field(r, "high", 2) for r in rows]
@@ -252,24 +264,42 @@ def chart(candles, payload: dict, path: str) -> bool:
     volumes = [field(r, "volume", 5) for r in rows]
     e20 = ema(closes, 20)
 
-    fig, (axis, volume_axis) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [4, 1]})
-    for i, (o, h, l, c, v) in enumerate(zip(opens, highs, lows, closes, volumes)):
+    fig, (axis, volume_axis) = plt.subplots(
+        2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [4, 1]}
+    )
+    for idx, (o, h, l, c, v) in enumerate(zip(opens, highs, lows, closes, volumes)):
         color = "#26a69a" if c >= o else "#ef5350"
-        axis.vlines(i, l, h, color=color, linewidth=1)
-        axis.add_patch(Rectangle((i - 0.3, min(o, c)), 0.6, max(abs(c - o), max(c, 1) * 1e-6), facecolor=color, edgecolor=color))
-        volume_axis.bar(i, v, width=0.7, color=color)
+        axis.vlines(idx, l, h, color=color, linewidth=1)
+        axis.add_patch(Rectangle(
+            (idx - 0.3, min(o, c)), 0.6,
+            max(abs(c - o), max(c, 1) * 1e-6),
+            facecolor=color, edgecolor=color,
+        ))
+        volume_axis.bar(idx, v, width=0.7, color=color)
 
-    axis.plot(e20, label="EMA20", linewidth=1.2)
-    for key, label in (("entry", "ENTRY"), ("sl", "SL"), ("tp1", "TP1"), ("tp2", "TP2"), ("setup_high", "SETUP H"), ("setup_low", "SETUP L")):
-        value = float(payload.get(key, 0))
+    axis.plot(e20, label="M1 EMA20 (visual)", linewidth=1.2)
+    levels = (
+        ("entry", "ENTRY"), ("sl", "SL"), ("tp1", "TP1"), ("tp2", "TP2"),
+        ("ifvg_low", "IFVG LOW"), ("ifvg_high", "IFVG HIGH"),
+        ("manipulation_low", "M5 MANIP LOW"), ("manipulation_high", "M5 MANIP HIGH"),
+    )
+    for key, label in levels:
+        value = float(payload.get(key, 0) or 0)
         if value:
             axis.axhline(value, linestyle="--", linewidth=1.0, label=f"{label} {value:,.4f}")
     entry = float(payload.get("entry", 0))
-    axis.scatter(len(rows) - 1, entry, marker="^" if payload.get("direction") == "LONG" else "v", s=120, zorder=6, label="ENTRY")
-    axis.legend(loc="best", fontsize=8)
+    axis.scatter(
+        len(rows) - 1, entry,
+        marker="^" if payload.get("direction") == "LONG" else "v",
+        s=120, zorder=6, label="ENTRY",
+    )
+    axis.legend(loc="best", fontsize=7)
     axis.grid(alpha=0.2)
     volume_axis.grid(alpha=0.15)
-    axis.set_title(f"{payload.get('symbol')} {payload.get('direction')} | Simple V6.1 | {payload.get('trigger')}")
+    axis.set_title(
+        f"{payload.get('symbol')} {payload.get('direction')} | Adaptive SMC V7 | "
+        f"4H {payload.get('tss_bias')} · M15 {payload.get('structure')} · M5 {payload.get('amd_phase')}"
+    )
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -283,7 +313,7 @@ async def main() -> None:
     ).split(",") if s.strip()]
     leverage = int(os.getenv("LEVERAGE", "20"))
     margin = float(os.getenv("ADAPTIVE_MARGIN_USDT", "20"))
-    interval = int(os.getenv("INTERVAL_SECONDS", "60"))
+    interval = max(10, int(os.getenv("INTERVAL_SECONDS", "30")))
     max_positions = int(os.getenv("MAX_POSITIONS", "2"))
     risk_usdt = float(os.getenv("MOM_RISK_USDT", "5.0"))
     token = first_env("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TG_BOT_TOKEN")
@@ -292,9 +322,11 @@ async def main() -> None:
     queue: asyncio.Queue = asyncio.Queue()
     update_offset = 0
 
+    # Keep the same default state directory as V6.1 so a persistent mounted
+    # volume can preserve any position state through the strategy upgrade.
     state_dir = os.getenv("BOT_STATE_DIR", "/tmp/adaptive_momentum_v4_1")
-    ledger_path = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger_v6_1.json"))
-    stats_meta_path = os.path.join(state_dir, "stats_meta_v6_1.json")
+    ledger_path = os.getenv("TRADE_LEDGER_FILE", os.path.join(state_dir, "trade_ledger_smc_v7.json"))
+    stats_meta_path = os.path.join(state_dir, "stats_meta_smc_v7.json")
     trades = load_json(ledger_path, [])
     stats_meta = load_json(stats_meta_path, {"started_at": time.time()})
     stats_started_at = float(stats_meta.get("started_at", time.time()))
@@ -303,19 +335,30 @@ async def main() -> None:
     def telegram_api(method: str, fields: dict, photo: str = ""):
         url = f"https://api.telegram.org/bot{token}/{method}"
         if not photo:
-            request = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), method="POST")
+            request = urllib.request.Request(
+                url, data=urllib.parse.urlencode(fields).encode(), method="POST"
+            )
         else:
-            boundary = "----SimpleV61" + uuid.uuid4().hex
+            boundary = "----AdaptiveSMCV7" + uuid.uuid4().hex
             parts = []
             for key, value in fields.items():
-                parts += [f"--{boundary}\r\n".encode(), f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(), str(value).encode(), b"\r\n"]
+                parts += [
+                    f"--{boundary}\r\n".encode(),
+                    f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(),
+                    str(value).encode(), b"\r\n",
+                ]
             with open(photo, "rb") as handle:
                 image = handle.read()
             parts += [
-                f"--{boundary}\r\n".encode(), b'Content-Disposition: form-data; name="photo"; filename="simple_v6_1.png"\r\n',
-                b"Content-Type: image/png\r\n\r\n", image, b"\r\n", f"--{boundary}--\r\n".encode(),
+                f"--{boundary}\r\n".encode(),
+                b'Content-Disposition: form-data; name="photo"; filename="adaptive_smc_v7.png"\r\n',
+                b"Content-Type: image/png\r\n\r\n", image, b"\r\n",
+                f"--{boundary}--\r\n".encode(),
             ]
-            request = urllib.request.Request(url, data=b"".join(parts), method="POST", headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            request = urllib.request.Request(
+                url, data=b"".join(parts), method="POST",
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
         with urllib.request.urlopen(request, timeout=20) as response:
             result = json.loads(response.read().decode())
         if not result.get("ok"):
@@ -327,11 +370,17 @@ async def main() -> None:
             item = await queue.get()
             try:
                 if item["kind"] == "photo":
-                    await asyncio.to_thread(telegram_api, "sendPhoto", {"chat_id": chat_id, "caption": item["caption"]}, item["path"])
+                    await asyncio.to_thread(
+                        telegram_api, "sendPhoto",
+                        {"chat_id": chat_id, "caption": item["caption"]}, item["path"],
+                    )
                     if os.path.exists(item["path"]):
                         os.remove(item["path"])
                 else:
-                    await asyncio.to_thread(telegram_api, "sendMessage", {"chat_id": chat_id, "text": item["text"], "disable_web_page_preview": "true"})
+                    await asyncio.to_thread(
+                        telegram_api, "sendMessage",
+                        {"chat_id": chat_id, "text": item["text"], "disable_web_page_preview": "true"},
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -339,54 +388,86 @@ async def main() -> None:
             finally:
                 queue.task_done()
 
+    # Public market-data connector. paper=True keeps this path read-only even in
+    # live mode; authenticated orders go exclusively through OKXAdapter below.
     connector = BinanceConnector(
-        api_key="" if paper else os.getenv("EXCHANGE_API_KEY", ""),
-        api_secret="" if paper else os.getenv("EXCHANGE_API_SECRET", ""),
-        paper=True,
-        exchange_id=os.getenv("EXCHANGE", "okx"),
-        passphrase="" if paper else os.getenv("EXCHANGE_PASSPHRASE", ""),
-        leverage=leverage,
+        api_key="", api_secret="", paper=True,
+        exchange_id=os.getenv("EXCHANGE", "okx"), passphrase="", leverage=leverage,
     )
 
     live = None
     if not paper:
         from trading.connectors.okx_adapter import OKXAdapter
         live = OKXAdapter(
-            api_key=os.getenv("EXCHANGE_API_KEY", ""), api_secret=os.getenv("EXCHANGE_API_SECRET", ""),
-            api_passphrase=os.getenv("EXCHANGE_PASSPHRASE", ""), paper=False, leverage=leverage,
+            api_key=os.getenv("EXCHANGE_API_KEY", ""),
+            api_secret=os.getenv("EXCHANGE_API_SECRET", ""),
+            api_passphrase=os.getenv("EXCHANGE_PASSPHRASE", ""),
+            paper=False, leverage=leverage,
         )
 
     def execute(order_type: str, payload: dict):
-        if order_type.startswith("OPEN_") and telegram_enabled:
-            image_path = f"/tmp/simple_v6_1_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
-            if not chart(latest_candles.get(str(payload.get("symbol")), []), payload, image_path):
-                raise RuntimeError("Mandatory Simple V6.1 chart failed")
-            queue.put_nowait({"kind": "photo", "path": image_path, "caption": trade_text(order_type, payload, paper)})
-        elif telegram_enabled:
-            queue.put_nowait({"kind": "text", "text": trade_text(order_type, payload, paper)})
+        # SL amendments are operational updates, not user-facing trade events.
+        if order_type == "AMEND_SL":
+            if paper:
+                logger.info("[PAPER] AMEND_SL %s", display_payload(payload))
+                return {"paper": True, "_amended": True}
+            if live is None:
+                raise RuntimeError("Live adapter unavailable")
+            return live.execute("AMEND_SL", payload)
 
         if paper:
+            result = {"paper": True}
             logger.info("[PAPER] %s %s", order_type, display_payload(payload))
-            return {"paper": True}
-        if live is None:
-            raise RuntimeError("Live adapter unavailable")
-        adapter_type = "CLOSE_FULL" if order_type.startswith("CLOSE_") and order_type != "CLOSE_PARTIAL" else order_type
-        result = live.execute(adapter_type, payload)
-        if adapter_type in {"CLOSE_FULL", "CLOSE_PARTIAL"} and result is None:
-            raise RuntimeError(f"Exchange close failed for {payload.get('symbol')}")
+        else:
+            if live is None:
+                raise RuntimeError("Live adapter unavailable")
+            adapter_type = (
+                "CLOSE_FULL"
+                if order_type.startswith("CLOSE_") and order_type != "CLOSE_PARTIAL"
+                else order_type
+            )
+            result = live.execute(adapter_type, payload)
+            if adapter_type in {"CLOSE_FULL", "CLOSE_PARTIAL"} and result is None:
+                raise RuntimeError(f"Exchange close failed for {payload.get('symbol')}")
+
+        # Notify only after paper acceptance / live exchange execution succeeds.
+        if telegram_enabled:
+            if order_type.startswith("OPEN_"):
+                image_path = f"/tmp/adaptive_smc_v7_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+                if chart(latest_candles.get(str(payload.get("symbol")), []), payload, image_path):
+                    queue.put_nowait({
+                        "kind": "photo", "path": image_path,
+                        "caption": trade_text(order_type, payload, paper),
+                    })
+                else:
+                    queue.put_nowait({"kind": "text", "text": trade_text(order_type, payload, paper)})
+            else:
+                queue.put_nowait({"kind": "text", "text": trade_text(order_type, payload, paper)})
         return result
 
     bots = {
-        symbol: TradingBot(symbol, margin, leverage, paper, os.path.join(state_dir, symbol.replace("/", "_").replace(":", "_") + ".json"), execute, risk_usdt)
+        symbol: TradingBot(
+            symbol, margin, leverage, paper,
+            os.path.join(state_dir, symbol.replace("/", "_").replace(":", "_") + ".json"),
+            execute, risk_usdt,
+        )
         for symbol in symbols
     }
+
+    def record_event(event: dict | None) -> None:
+        if not event:
+            return
+        trades.append({**event, "timestamp": time.time(), "version": "adaptive-smc-v7"})
+        save_json(ledger_path, trades[-2000:])
 
     async def poll_commands():
         nonlocal update_offset, stats_started_at
         if not telegram_enabled:
             return
         try:
-            result = await asyncio.to_thread(telegram_api, "getUpdates", {"timeout": 0, "offset": update_offset})
+            result = await asyncio.to_thread(
+                telegram_api, "getUpdates", {"timeout": 0, "offset": update_offset}
+            )
             for update in result.get("result", []):
                 update_offset = max(update_offset, int(update.get("update_id", 0)) + 1)
                 message = update.get("message") or {}
@@ -394,15 +475,92 @@ async def main() -> None:
                     continue
                 command = str(message.get("text", "")).strip().lower().split()[0] if message.get("text") else ""
                 if command == "/stats":
-                    queue.put_nowait({"kind": "text", "text": stats_text(trades, bots, prices, paper, margin, stats_started_at)})
+                    queue.put_nowait({
+                        "kind": "text",
+                        "text": stats_text(trades, bots, prices, paper, margin, stats_started_at),
+                    })
                 elif command == "/restats":
                     trades.clear()
                     save_json(ledger_path, [])
                     stats_started_at = time.time()
                     save_json(stats_meta_path, {"started_at": stats_started_at})
-                    queue.put_nowait({"kind": "text", "text": "♻️ Simple V6.1 stats reset\nTrades: 0\nWin rate: 0%\nNet PnL: $0.00\nOpen positions were NOT closed."})
+                    queue.put_nowait({
+                        "kind": "text",
+                        "text": "♻️ Adaptive SMC V7 stats reset\nTrades: 0\nWin rate: 0%\nNet PnL: $0.00\nOpen positions were NOT closed.",
+                    })
         except Exception as error:
             logger.warning("Telegram polling: %s", error)
+
+    blocked_external: set[str] = set()
+
+    async def reconcile_live_position(symbol: str, bot: TradingBot, live_price: float = 0.0) -> bool:
+        """Reconcile local state against OKX; returns True if this cycle should stop."""
+        if paper or live is None:
+            return False
+        try:
+            pos = await asyncio.to_thread(live.fetch_open_position, symbol)
+        except Exception as error:
+            logger.warning("[%s] live reconcile failed: %s", symbol, error)
+            return False
+
+        if bot.position_open:
+            if pos is None:
+                event = bot.reconcile_exchange_closed(live_price, "EXCHANGE_CLOSED")
+                record_event(event)
+                blocked_external.discard(symbol)
+                logger.warning("[%s] local position reconciled flat from OKX", symbol)
+                return True
+            # Recover SL algo id after restart when state had the position but
+            # not the exchange order id.
+            if not bot.position.sl_algo_id:
+                try:
+                    side = bot.position.direction.lower()
+                    attached = await asyncio.to_thread(live.fetch_attached_sl_tp, symbol, side)
+                    if attached and attached.get("algo_id"):
+                        bot.position.sl_algo_id = str(attached["algo_id"])
+                        bot.save_state()
+                except Exception:
+                    pass
+            return False
+
+        if pos is None:
+            blocked_external.discard(symbol)
+            return False
+
+        # Exchange has a position but local state is absent (common after a
+        # Railway restart with ephemeral /tmp). Adopt only when a real exchange
+        # stop can be recovered; never fabricate risk on a live position.
+        side = str(pos.get("side") or "").lower()
+        if side not in {"long", "short"}:
+            blocked_external.add(symbol)
+            return True
+        try:
+            attached = await asyncio.to_thread(live.fetch_attached_sl_tp, symbol, side)
+        except Exception:
+            attached = None
+        if not attached or not attached.get("sl"):
+            if symbol not in blocked_external:
+                logger.error(
+                    "[%s] live %s exists but attached SL cannot be recovered — blocking new entries for this symbol",
+                    symbol, side,
+                )
+            blocked_external.add(symbol)
+            return True
+
+        contracts = abs(float(pos.get("contracts") or 0.0))
+        contract_size = abs(float(pos.get("contractSize") or 1.0))
+        size = contracts * contract_size
+        entry = float(pos.get("entryPrice") or pos.get("entry_price") or 0.0)
+        if entry <= 0 or size <= 0:
+            blocked_external.add(symbol)
+            return True
+        bot.adopt_exchange_position(
+            side.upper(), entry, size, float(attached["sl"]),
+            float(attached.get("tp") or 0.0), str(attached.get("algo_id") or ""),
+        )
+        blocked_external.discard(symbol)
+        logger.warning("[%s] adopted live OKX %s after restart: entry=%.4f size=%.6g", symbol, side, entry, size)
+        return False
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -413,48 +571,100 @@ async def main() -> None:
             pass
 
     telegram_task = asyncio.create_task(telegram_worker()) if telegram_enabled else None
-    last_bar, disabled = {}, set()
-    logger.info("Simple Structure V6.1 | build=%s | mode=%s | tf=15m | telegram=%s", BUILD_ID, "PAPER" if paper else "LIVE", "CONNECTED" if telegram_enabled else "DISABLED")
+    logger.info(
+        "Adaptive SMC V7 | build=%s | mode=%s | pipeline=4H>T15>T5>T1 | poll=%ss | telegram=%s",
+        BUILD_ID, "PAPER" if paper else "LIVE", interval,
+        "CONNECTED" if telegram_enabled else "DISABLED",
+    )
 
     if telegram_enabled:
         queue.put_nowait({"kind": "text", "text": (
-            f"🤖 Simple Structure Trading Bot V6.1 started\nMode: {'PAPER' if paper else 'LIVE'}\nTF: 15M CLOSED\n"
-            "Logic: EMA20 bias → HL/LH setup → structure break → RSI14\n"
-            "Anti-chase: entry must be ≤0.70 ATR from EMA20\n"
-            "No raw 5-bar BOS · No router · No ADX/CHOP · No MACD · No BB · No ROC\n"
-            f"TP1 {TP1_R:g}R close 50% → BE+{BE_LOCK_R:g}R | TP2 {TP2_R:g}R close 25% → Runner 25%\n"
-            f"Margin: ${margin:.2f} | Risk: ${risk_usdt:.2f}/trade\nCommands: /stats · /restats"
+            f"🤖 Adaptive SMC MTF V7 started\nMode: {'PAPER' if paper else 'LIVE'}\n"
+            "Pipeline: 4H TSS-style → M15 Market Structure → M5 AMD → M1 IFVG\n"
+            "Signals use CLOSED candles only; execution is evaluated once per closed M1 candle.\n"
+            "No 1H hard gate. 4H chooses direction; M15 validates structure; M5 finds liquidity manipulation; M1 times entry.\n"
+            f"TP1 {TP1_R:g}R close 50% → BE+{BE_LOCK_R:g}R | TP2 {TP2_R:g}R closes remaining\n"
+            "After TP1, M15 CHOCH / opposite M5 distribution can exit the remainder early.\n"
+            f"Margin cap: ${margin:.2f} | Risk target: ${risk_usdt:.2f}/trade | Max positions: {max_positions}\n"
+            "Commands: /stats · /restats"
         )})
+
+    # First live reconciliation before any scanner is allowed to open a trade.
+    if not paper:
+        for symbol, bot in bots.items():
+            await reconcile_live_position(symbol, bot, 0.0)
+
+    last_1m_bar: dict[str, object] = {}
+    disabled: set[str] = set()
+    tf_cache: dict[tuple[str, str], list] = {}
+    tf_bucket: dict[tuple[str, str], int] = {}
+
+    async def get_closed_cached(symbol: str, tf: str, limit: int, bucket_seconds: int):
+        key = (symbol, tf)
+        bucket = int(time.time() // bucket_seconds)
+        cached = tf_cache.get(key)
+        if cached is not None and tf_bucket.get(key) == bucket:
+            return cached
+        raw = await connector.fetch_ohlcv(symbol, tf, limit)
+        if len(raw) < 3:
+            return cached or []
+        closed = list(raw[:-1])
+        if not closed:
+            return cached or []
+        old_last = timestamp(cached[-1]) if cached else None
+        new_last = timestamp(closed[-1])
+        tf_cache[key] = closed
+        # If the exchange has not published the just-closed candle yet, leave
+        # the old bucket marker so the next poll retries instead of staying stale.
+        if cached is None or new_last != old_last:
+            tf_bucket[key] = bucket
+        return closed
 
     try:
         while not stop.is_set():
             await poll_commands()
             now_utc = datetime.now(timezone.utc)
+
             for symbol in symbols:
                 if symbol in disabled:
                     continue
                 try:
-                    raw_15m = await connector.fetch_ohlcv(symbol, "15m", 320)
-                    if len(raw_15m) < 61:
+                    raw_1m = await connector.fetch_ohlcv(symbol, "1m", 220)
+                    if len(raw_1m) < 80:
+                        logger.debug("[%s] M1 warmup %d/80", symbol, len(raw_1m))
                         continue
-                    closed_15m = list(raw_15m[:-1])
-                    latest_candles[symbol] = closed_15m
-                    bar_timestamp = timestamp(closed_15m[-1])
-                    bot = bots[symbol]
-                    live_price = field(raw_15m[-1], "close", 4) or float(prices.get(symbol, 0))
+                    closed_1m = list(raw_1m[:-1])
+                    latest_candles[symbol] = closed_1m
+                    bar_ts = timestamp(closed_1m[-1])
+                    live_price = field(raw_1m[-1], "close", 4) or field(closed_1m[-1], "close", 4)
                     prices[symbol] = live_price
+                    bot = bots[symbol]
+
+                    # Exchange reconciliation precedes local price management so
+                    # an OKX-side SL/TP cannot leave a ghost local position.
+                    reconciled = await reconcile_live_position(symbol, bot, live_price)
+                    if reconciled and not bot.position_open:
+                        continue
 
                     if bot.position_open and live_price:
                         event = bot.check_price(live_price)
                         if event:
-                            trades.append({**event, "timestamp": time.time(), "version": "simple-v6.1"})
-                            save_json(ledger_path, trades[-2000:])
+                            record_event(event)
 
-                    if bar_timestamp == last_bar.get(symbol):
+                    # No duplicate decision on the same closed M1 candle.
+                    if bar_ts == last_1m_bar.get(symbol):
                         continue
-                    last_bar[symbol] = bar_timestamp
-                    indicators = compute(closed_15m)
+                    last_1m_bar[symbol] = bar_ts
+
+                    closed_5m = await get_closed_cached(symbol, "5m", 140, 5 * 60)
+                    closed_15m = await get_closed_cached(symbol, "15m", 140, 15 * 60)
+                    closed_4h = await get_closed_cached(symbol, "4h", 90, 4 * 60 * 60)
+                    indicators = compute(closed_1m, closed_5m, closed_15m, closed_4h)
                     if not indicators:
+                        logger.info(
+                            "[%s] WAIT MTF warmup | M1=%d M5=%d M15=%d H4=%d",
+                            symbol, len(closed_1m), len(closed_5m), len(closed_15m), len(closed_4h),
+                        )
                         continue
 
                     if not bot.position_open:
@@ -462,14 +672,16 @@ async def main() -> None:
                         if base in {"XAU", "XAG"} and not fx_open(now_utc):
                             logger.info("[%s] SLEEP_MODE FX closed", symbol)
                             continue
+                        if symbol in blocked_external:
+                            logger.warning("[%s] WAIT external live position not safely adopted", symbol)
+                            continue
                         if sum(int(item.position_open) for item in bots.values()) >= max_positions:
                             logger.info("[%s] WAIT max positions", symbol)
                             continue
 
                     event = bot.on_bar(indicators, price=live_price)
                     if event:
-                        trades.append({**event, "timestamp": time.time(), "version": "simple-v6.1"})
-                        save_json(ledger_path, trades[-2000:])
+                        record_event(event)
                     logger.info("[%s] %s", symbol, display_payload(event) if event else bot.last_signal)
 
                 except ccxt.BadSymbol as error:
@@ -480,7 +692,10 @@ async def main() -> None:
                 except Exception as error:
                     logger.exception("[%s] tick failed", symbol)
                     if telegram_enabled:
-                        queue.put_nowait({"kind": "text", "text": f"❌ Simple V6.1 error\nSymbol: {symbol}\n{type(error).__name__}: {error}"})
+                        queue.put_nowait({
+                            "kind": "text",
+                            "text": f"❌ Adaptive SMC V7 error\nSymbol: {symbol}\n{type(error).__name__}: {error}",
+                        })
 
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -488,7 +703,7 @@ async def main() -> None:
                 pass
     finally:
         if telegram_enabled:
-            queue.put_nowait({"kind": "text", "text": "⏹ Simple Structure Trading Bot V6.1 stopped"})
+            queue.put_nowait({"kind": "text", "text": "⏹ Adaptive SMC MTF V7 stopped"})
             try:
                 await asyncio.wait_for(queue.join(), timeout=5)
             except asyncio.TimeoutError:
@@ -506,6 +721,11 @@ async def main() -> None:
                 logger.info("Closed market-data exchange session")
             except Exception as error:
                 logger.warning("Exchange close failed: %s", error)
+        if live is not None:
+            try:
+                await live.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
