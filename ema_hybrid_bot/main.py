@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import json
 import os
 import signal
@@ -62,6 +63,13 @@ def _ema_runtime_text(text: str) -> str:
     return text
 
 
+async def _await_if_needed(value):
+    """Compatibility guard for legacy notifier wrappers that may return None/bool."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
 class Bot(base.Bot):
     TP1_R = float(os.getenv("EMA_ADV_TP1_R", "1.0"))
     TP1_TRIM_PCT = float(os.getenv("EMA_ADV_TP1_TRIM_PCT", "0.60"))
@@ -78,10 +86,12 @@ class Bot(base.Bot):
         previous_send_photo = self.tg._send_photo
 
         async def ema_text(text: str) -> bool:
-            return await previous_send_text(_ema_runtime_text(text))
+            result = await _await_if_needed(previous_send_text(_ema_runtime_text(text)))
+            return bool(result)
 
         async def ema_photo(path: str, caption: str) -> bool:
-            return await previous_send_photo(path, _ema_runtime_text(caption))
+            result = await _await_if_needed(previous_send_photo(path, _ema_runtime_text(caption)))
+            return bool(result)
 
         self.tg.send_text = ema_text
         self.tg._send_photo = ema_photo
@@ -119,7 +129,6 @@ class Bot(base.Bot):
             initial_amount = float(pos.get("amount") or 0.0) + float(pos.get("tp1_trimmed") or 0.0)
         tp1_net = float(pos.get("tp1_net_pnl") or 0.0)
         final_net = float(getattr(final_order, "realized_pnl", 0.0) or 0.0) - float(getattr(final_order, "fee_cost", 0.0) or 0.0)
-        # Paper exchange charges opening fee immediately. Include it once at full lifecycle close.
         open_fee = initial_amount * entry * float(getattr(self.cfg, "fee_rate", 0.0) or 0.0)
         net = tp1_net + final_net - open_fee
         row = {
@@ -199,7 +208,6 @@ class Bot(base.Bot):
             self._save_state()
 
     async def _manage(self, symbol: str, st: dict):
-        """2TP management: 1R trim 60%, then native SL at BE+0.15R to TP2."""
         pos = st.get("pos") or {}
         side = str(pos.get("side") or "").lower()
         entry = float(pos.get("entry") or 0.0)
@@ -280,7 +288,6 @@ class Bot(base.Bot):
         return await super()._manage(symbol, st)
 
     async def _build_stats_report(self) -> str:
-        """EMA-native paper stats. A 2TP lifecycle counts as one completed trade."""
         if not self.cfg.paper:
             inherited = await super()._build_stats_report()
             lines = inherited.splitlines()
@@ -379,7 +386,7 @@ class Bot(base.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== EMA HYBRID PRO ADVANCED [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
+            "=== EMA HYBRID PRO REGIME MTF [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE", self.cfg.symbols,
             self.cfg.margin_per_position_usd, self.cfg.leverage, self.cfg.max_positions, balance,
         )
@@ -390,17 +397,20 @@ class Bot(base.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"📈 *EMA Hybrid Pro Advanced — {mode}*\n"
+                f"📈 *EMA Hybrid Pro Regime MTF — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
-                "H1 Direction → M15 Value/Structure → M5 Execution\n"
-                f"SL: `structure + {self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
+                "15M Regime Score → 5M EMA8/13 Execution\n"
+                f"15M Gate: Score `≥{self.strat.REGIME_MIN_SCORE}/6` | ADX `≥{self.strat.REGIME_ADX_MIN:.0f}` | "
+                f"CHOP `≤{self.strat.REGIME_CHOP_MAX:.0f}` | SMA14 slope + ADX rising\n"
+                f"5M Trigger: EMA{self.strat.EMA_FAST}/{self.strat.EMA_SLOW} cross | ADX `≥{self.strat.ADX_MIN:.0f}` | CHOP `≤{self.strat.CHOP_MAX:.0f}`\n"
+                f"SL: `5M structure + {self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
                 f"TP1: `+{self.TP1_R:.1f}R` → trim `{self.TP1_TRIM_PCT*100:.0f}%` → SL `BE+{self.TP1_LOCK_R:.2f}R`\n"
-                f"TP2: `next M15 liquidity/swing target` with room `≥{self.strat.TP2_MIN_RR:.1f}R`\n"
+                f"TP2: `next 5M liquidity/swing target` with room `≥{self.strat.TP2_MIN_RR:.1f}R`\n"
                 "PAPER entries: `24/7` | LIVE entries: `24/5` | Open positions managed: `24/7`"
             )
-        _LOG.info("EMA Hybrid Pro Advanced startup complete: 2TP liquidity-target model active; EMA-native stats active")
+        _LOG.info("EMA Hybrid Pro Regime MTF startup complete: 15M score gate + 5M EMA cross; EMA-native stats active")
 
 
 async def _main():
