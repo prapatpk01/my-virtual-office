@@ -1,4 +1,4 @@
-"""Adaptive SMC Execution Bot V7.0.
+"""Adaptive SMC Execution Bot V7.1.
 
 New execution architecture:
   4H  TSS-style trend tunnel -> direction only
@@ -97,7 +97,7 @@ class TradingBot:
             if runner is not None and hasattr(runner, "logger"):
                 runner.logger = logging.getLogger("adaptive_smc_v7")
             if runner is not None and hasattr(runner, "BUILD_ID"):
-                runner.BUILD_ID = "adaptive-smc-v7.0-2026-08-29"
+                runner.BUILD_ID = "adaptive-smc-v7.1-2026-08-31"
         except Exception:
             pass
 
@@ -251,22 +251,40 @@ class TradingBot:
         p = self.position
         assert p
         requested_qty = min(max(float(qty), 0.0), p.size)
+
+        # Calculate the expected partial-fill PnL BEFORE invoking the execution
+        # callback. The Telegram notification is generated inside that callback,
+        # so previously it saw no pnl/r_multiple fields and displayed $0.00 / 0R.
+        # In PAPER mode these values are the final realized values. In LIVE mode
+        # they are then replaced below by OKX's actual fill price/size/PnL when
+        # the adapter returns exchange fill data.
+        requested_price = float(price)
+        estimated_pnl = (
+            (requested_price - p.entry) * requested_qty
+            if p.direction == "LONG"
+            else (p.entry - requested_price) * requested_qty
+        )
+        initial_risk = abs(p.entry - p.initial_sl) * max(p.initial_size, 1e-12)
+        estimated_r = estimated_pnl / initial_risk if initial_risk else r_multiple
+
         payload = {
             "symbol": self.symbol,
             "direction": p.direction,
             "style": p.style,
-            "price": float(price),
+            "price": requested_price,
             "entry": p.entry,
             "size": requested_qty,
             "trigger": p.trigger,
             "reason": reason,
+            "pnl": estimated_pnl,
+            "r_multiple": estimated_r,
         }
         execution_result = None
         if self.execution_callback:
             execution_result = self.execution_callback("CLOSE_PARTIAL", payload)
 
         actual_qty = requested_qty
-        actual_price = float(price)
+        actual_price = requested_price
         actual_pnl = None
         already_flat = False
         if isinstance(execution_result, dict):
@@ -286,7 +304,6 @@ class TradingBot:
         if pnl is None:
             pnl = ((actual_price - p.entry) * actual_qty if p.direction == "LONG"
                    else (p.entry - actual_price) * actual_qty)
-        initial_risk = abs(p.entry - p.initial_sl) * max(p.initial_size, 1e-12)
         realized_r = pnl / initial_risk if initial_risk else r_multiple
         return {
             "event": "PARTIAL",
