@@ -1,7 +1,7 @@
-"""Canonical production router for Sentinel V8.1 — Quality Price Action Core.
+"""Canonical production router for Sentinel V9 — Scored Setup Execution.
 
-Railway starts this file. Older Sentinel versions remain available for rollback,
-but production instantiates only V8.1.
+Railway starts this file. Production instantiates only Sentinel V9 while older
+strategy files remain available for rollback.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import run_bot
 from trading.bot import TradingBot, TradeRecord
 from trading.telegram_notifier import TelegramNotifier
 from trading import signal_state as signal_state_module
-from trading.strategies.sentinel_v81_strategy import SentinelV81Strategy
+from trading.strategies.sentinel_v9_strategy import SentinelV9Strategy
 
 logger = logging.getLogger("run_strategy_router")
 
@@ -46,26 +46,27 @@ def _build_config() -> dict:
     os.environ["CANDLE_TF"] = "15m"
     logger.warning(
         "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | scan=%ss closed-bars-only | "
-        "15M slope-anchor bias + price/RSI confirm | 5M gate ADX>=12 CHOP<64 ATRx>=0.65 | "
-        "PA=PULLBACK/MICRO_BREAK/SWEEP + quality close/location | raw structure risk >=0.40%% fee-edge | "
-        "one fill/15M; hard-SL reentry wait=3x5M | anti-chase<=0.30ATR | "
-        "SL structure+0.18ATR min0.90 max1.80ATR | TP1=1R close50%% lock+0.15R | TP2=2R",
-        SentinelV81Strategy.VERSION,
+        "15M Pine-v6.2 scored analysis PB/LQ/BO/REV | "
+        "score mins PB6 LQ6 BOdirect7 BOretest6.5 REV7.5 | "
+        "5M V8.1 execution gate ADX>=12 CHOP<64 ATRx>=0.65 + quality/fee edge | "
+        "anti-chase<=0.30ATR | SL structure+0.18ATR min0.90 max1.80ATR risk>=0.40%% | "
+        "TP1=1R close50%% lock+0.15R | TP2 dynamic1.5-2.5R fallback2R",
+        SentinelV9Strategy.VERSION,
         config["symbols"],
         config["interval"],
     )
     return config
 
 
-def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV81Strategy]:
-    strategies = [SentinelV81Strategy(symbol) for symbol in symbols]
+def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV9Strategy]:
+    strategies = [SentinelV9Strategy(symbol) for symbol in symbols]
     if not strategies:
         raise RuntimeError("SENTINEL_SYMBOLS/SIMPLE_PRECISION_SYMBOLS/SYMBOLS is empty")
     return strategies
 
 
 # ---------------------------------------------------------------------------
-# V8.1 scan log — show the quality/fee decision, not only the raw trigger.
+# Compact V9 scan log: 15M thesis/score + 5M execution/edge.
 # ---------------------------------------------------------------------------
 _ORIGINAL_LOG_SCAN = TradingBot._log_scan
 _LAST_SENTINEL_SCAN: dict[str, dict] = {}
@@ -73,54 +74,73 @@ _LAST_SENTINEL_SCAN: dict[str, dict] = {}
 
 def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     meta = getattr(signal, "metadata", None) or {}
-    if meta.get("strategy") != "SENTINEL_V8_1":
+    if meta.get("strategy") != "SENTINEL_V9":
         return _ORIGINAL_LOG_SCAN(self, symbol, strategy_name, price, signal)
 
     reason = str(getattr(signal, "reason", "") or "")
-    if reason != "5M bar already evaluated" and (meta.get("bias_15m") or meta.get("setup_5m")):
+    if reason != "5M bar already evaluated" and (meta.get("analysis_15m") or meta.get("setup_5m")):
         _LAST_SENTINEL_SCAN[symbol] = meta
     view = _LAST_SENTINEL_SCAN.get(symbol, meta) if reason == "5M bar already evaluated" else meta
 
-    bias = view.get("bias_15m") or {}
-    setup = view.get("setup_5m") or {}
-    gate = "PASS" if setup.get("market_ready") else "BLOCK" if setup else "-"
-    blocks = setup.get("blocks", []) or setup.get("gate_blocks", []) or []
-    candidate = setup.get("trigger_candidate") or setup.get("trigger") or "-"
+    a = view.get("analysis_15m") or {}
+    s = view.get("setup_5m") or {}
+    gate = "PASS" if s.get("market_ready") else "BLOCK" if s else "-"
+    blocks = s.get("blocks", []) or s.get("gate_blocks", []) or []
+    candidate = s.get("trigger_candidate") or s.get("trigger") or "-"
+    comp = a.get("components") or {}
     repeat_tag = " | cached=same-5M-bar" if reason == "5M bar already evaluated" else ""
 
     logging.getLogger("trading_bot").info(
-        "[SCAN SENTINEL V8.1] %s px=%.4f sig=%s | "
-        "15M bias=%s strength=%s EMA20=%s slopeATR=%s RSI=%s | "
-        "5M gate=%s ADX=%s CHOP=%s ATRx=%s | "
-        "PB=%s BO=%s SWEEP=%s candidate=%s trigger=%s | "
-        "bodyATR=%s closePos=%s distEMA=%s volx=%s slope5=%s chaseATR=%s rawRisk=%s%% slATR=%s strict=%s | "
-        "TP1=1R/50%% lock+0.15R TP2=2R | blocks=%s | %s%s",
+        "[SCAN SENTINEL V9] %s px=%.4f sig=%s | "
+        "15M setup=%s side=%s score=%s/%s L=%s S=%s | "
+        "T=%s QL/QS=%s/%s Struct=%s Loc=%s roomL/S=%s/%s "
+        "ADX15=%s CHOP15=%s RSI=%s/%s HMA=%s | "
+        "pts[T/Q/S/L/M]=%s/%s/%s/%s/%s | "
+        "5M gate=%s ADX=%s CHOP=%s ATRx=%s candidate=%s trigger=%s "
+        "body=%s closePos=%s distEMA=%s volx=%s chase=%s rawRisk=%s%% slATR=%s strict=%s | "
+        "TP2R=%s source=%s | blocks=%s | %s%s",
         symbol,
         price,
         getattr(getattr(signal, "type", None), "value", "hold").upper(),
-        bias.get("direction", "NEUTRAL"),
-        bias.get("strength", "-"),
-        bias.get("ema20", "-"),
-        bias.get("ema20_slope_atr", "-"),
-        bias.get("rsi", "-"),
+        a.get("selected_setup", "-") or "-",
+        a.get("direction", "NEUTRAL") or "NEUTRAL",
+        a.get("selected_score", "-"),
+        a.get("score_threshold", "-"),
+        a.get("score_long", "-"),
+        a.get("score_short", "-"),
+        a.get("trend", "-"),
+        a.get("trend_quality_long", "-"),
+        a.get("trend_quality_short", "-"),
+        a.get("structure", "-"),
+        a.get("location", "-"),
+        a.get("room_long_atr", "-"),
+        a.get("room_short_atr", "-"),
+        a.get("adx", "-"),
+        a.get("chop", "-"),
+        a.get("rsi", "-"),
+        a.get("rsi_sma", "-"),
+        a.get("hma_slope_atr", "-"),
+        comp.get("trend", "-"),
+        comp.get("quality", "-"),
+        comp.get("structure", "-"),
+        comp.get("location", "-"),
+        comp.get("momentum", "-"),
         gate,
-        setup.get("adx", "-"),
-        setup.get("chop", "-"),
-        setup.get("atr_ratio", "-"),
-        "Y" if setup.get("pullback") else "N",
-        "Y" if setup.get("breakout") else "N",
-        "Y" if setup.get("sweep") else "N",
+        s.get("adx", "-"),
+        s.get("chop", "-"),
+        s.get("atr_ratio", "-"),
         candidate,
-        setup.get("trigger", "-") or "-",
-        setup.get("body_atr", "-"),
-        setup.get("close_pos", "-"),
-        setup.get("dist_ema_atr", "-"),
-        setup.get("volume_ratio", "-"),
-        setup.get("ema20_slope_atr", "-"),
-        setup.get("chase_atr", "-"),
-        setup.get("raw_risk_pct", "-"),
-        setup.get("sl_atr", setup.get("raw_sl_atr", "-")),
-        "Y" if setup.get("strict_mode") else "N",
+        s.get("trigger", "-") or "-",
+        s.get("body_atr", "-"),
+        s.get("close_pos", "-"),
+        s.get("dist_ema_atr", "-"),
+        s.get("volume_ratio", "-"),
+        s.get("chase_atr", "-"),
+        s.get("raw_risk_pct", "-"),
+        s.get("sl_atr", s.get("raw_sl_atr", "-")),
+        "Y" if s.get("strict_mode") else "N",
+        view.get("tp2_r_dynamic", "-"),
+        view.get("tp2_source", "-"),
         ",".join(blocks) or "none",
         reason,
         repeat_tag,
@@ -128,7 +148,7 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
 
 
 # ---------------------------------------------------------------------------
-# Preserve lifecycle management for older Sentinel positions across deploys.
+# Preserve lifecycle management for positions opened by older Sentinel versions.
 # ---------------------------------------------------------------------------
 _ORIGINAL_RESOLVE_STRATEGY = TradingBot._resolve_strategy_inst
 
@@ -139,27 +159,26 @@ def _sentinel_resolve_strategy(self, strategy_name: str):
         return inst
     raw = str(strategy_name or "")
     bare = raw[:-2] if raw.endswith((":L", ":S")) else raw
-    prefixes = ("SentinelV7(", "SentinelV7.1(", "SentinelV8(")
+    prefixes = ("SentinelV7(", "SentinelV7.1(", "SentinelV8(", "SentinelV8.1(")
     for prefix in prefixes:
         if bare.startswith(prefix) and bare.endswith(")"):
             symbol = bare[len(prefix):-1]
-            return self._strategy_map.get(f"SentinelV8.1({symbol})")
+            return self._strategy_map.get(f"SentinelV9({symbol})")
     return None
 
 
 # ---------------------------------------------------------------------------
-# Fill synchronization for V8.1.
-# Keep the structure SL absolute, but rebuild TP from the freshest pre-order
-# price and then sync the strategy to the ACTUAL post-fill entry afterwards.
-# This prevents a fill shift from turning a planned 2R target into 2.3R/1.7R.
+# Fill synchronization.
+# Keep the structure SL absolute. Rebuild TP1/TP2 from freshest pre-order price,
+# then from ACTUAL post-fill entry. V9's rr_ratio can be dynamic 1.5..2.5R.
 # ---------------------------------------------------------------------------
 _ORIGINAL_EXECUTE_SIGNAL = TradingBot._execute_signal
 
 
 async def _sentinel_execute_signal(self, signal, strategy_name: str,
                                    direction: str = "long", candles=None):
-    is_v81 = str(strategy_name).startswith("SentinelV8.1")
-    if is_v81:
+    is_v9 = str(strategy_name).startswith("SentinelV9")
+    if is_v9:
         meta = signal.metadata or {}
         sl = meta.get("stop_loss")
         if sl:
@@ -167,25 +186,26 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str,
                 px = float((await self.connector.fetch_ticker(signal.symbol))["last"])
                 risk = abs(px - float(sl))
                 if risk > 0:
-                    rr = float(meta.get("rr_ratio") or SentinelV81Strategy.TP2_R)
-                    tp1r = float(meta.get("tp1_r") or SentinelV81Strategy.TP1_R)
+                    rr = float(meta.get("rr_ratio") or SentinelV9Strategy.DYNAMIC_TP_FALLBACK_R)
+                    rr = max(SentinelV9Strategy.DYNAMIC_TP_MIN_R,
+                             min(SentinelV9Strategy.DYNAMIC_TP_MAX_R, rr))
+                    tp1r = float(meta.get("tp1_r") or SentinelV9Strategy.TP1_R)
+                    meta["rr_ratio"] = rr
                     meta["take_profit"] = px + rr * risk if direction == "long" else px - rr * risk
                     meta["tp1_price"] = px + tp1r * risk if direction == "long" else px - tp1r * risk
                     signal.metadata = meta
             except Exception as e:
                 logging.getLogger("trading_bot").warning(
-                    "[SENTINEL V8.1] pre-fill TP rebase skipped [%s]: %s", signal.symbol, e
+                    "[SENTINEL V9] pre-fill target rebase skipped [%s]: %s", signal.symbol, e
                 )
 
     result = await _ORIGINAL_EXECUTE_SIGNAL(
         self, signal, strategy_name, direction=direction, candles=candles
     )
 
-    if not is_v81:
+    if not is_v9:
         return result
 
-    # Exact post-fill synchronization. The order is already open, so use the
-    # RiskManager's recorded fill entry and keep the original structure SL.
     key = f"{signal.symbol}||{strategy_name}"
     pos_obj = getattr(self.risk, "_positions", {}).get(key)
     if pos_obj is None or pos_obj.stop_loss is None:
@@ -197,20 +217,23 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str,
         actual_risk = abs(entry - sl)
         if actual_risk <= 0:
             return result
-        exact_tp = (
-            entry + SentinelV81Strategy.TP2_R * actual_risk
-            if direction == "long"
-            else entry - SentinelV81Strategy.TP2_R * actual_risk
-        )
-        pos_obj.take_profit = exact_tp
 
         meta = signal.metadata or {}
-        meta["take_profit"] = exact_tp
-        meta["tp1_price"] = (
-            entry + SentinelV81Strategy.TP1_R * actual_risk
+        rr = float(meta.get("rr_ratio") or SentinelV9Strategy.DYNAMIC_TP_FALLBACK_R)
+        rr = max(SentinelV9Strategy.DYNAMIC_TP_MIN_R,
+                 min(SentinelV9Strategy.DYNAMIC_TP_MAX_R, rr))
+        exact_tp = entry + rr * actual_risk if direction == "long" else entry - rr * actual_risk
+        exact_tp1 = (
+            entry + SentinelV9Strategy.TP1_R * actual_risk
             if direction == "long"
-            else entry - SentinelV81Strategy.TP1_R * actual_risk
+            else entry - SentinelV9Strategy.TP1_R * actual_risk
         )
+
+        pos_obj.take_profit = exact_tp
+        meta["take_profit"] = exact_tp
+        meta["tp1_price"] = exact_tp1
+        meta["rr_ratio"] = rr
+        meta["tp2_r_dynamic"] = rr
         signal.metadata = meta
 
         strategy_inst = self._resolve_strategy_inst(strategy_name)
@@ -223,16 +246,17 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str,
             )
         except Exception as e:
             logging.getLogger("trading_bot").warning(
-                "[SENTINEL V8.1] exact post-fill TP replace failed [%s]: %s", signal.symbol, e
+                "[SENTINEL V9] exact post-fill TP replace failed [%s]: %s", signal.symbol, e
             )
 
         logging.getLogger("trading_bot").info(
-            "[SENTINEL V8.1 FILL-SYNC] %s %s entry=%.4f SL=%.4f TP=%.4f exact=2.00R",
-            signal.symbol, direction.upper(), entry, sl, exact_tp,
+            "[SENTINEL V9 FILL-SYNC] %s %s entry=%.4f SL=%.4f TP=%.4f exact=%.2fR source=%s",
+            signal.symbol, direction.upper(), entry, sl, exact_tp, rr,
+            meta.get("tp2_source", "FALLBACK_2R"),
         )
     except Exception as e:
         logging.getLogger("trading_bot").warning(
-            "[SENTINEL V8.1] post-fill synchronization failed [%s]: %s", signal.symbol, e
+            "[SENTINEL V9] post-fill synchronization failed [%s]: %s", signal.symbol, e
         )
     return result
 
@@ -248,13 +272,15 @@ def _sentinel_build_order_caption(self, *args, **kwargs):
     strategy = kwargs.get("strategy")
     if strategy is None and len(args) >= 5:
         strategy = args[4]
-    if "SentinelV8.1" in str(strategy or "") or "SentinelV8.1" in text:
+    if "SentinelV9" in str(strategy or "") or "SentinelV9" in text:
         text = text.replace(
             "🏁 Exit : trend flip (EMA cross-back / close past EMA)",
-            "🛑 SL : 5M structure + 0.18 ATR (0.90–1.80 ATR; structure risk must be ≥0.40%)\n"
+            "🧠 15M : scored PB/LQ/BO/REV analysis (Trend/Quality/Structure/Location/Momentum)\n"
+            "⚡ Entry : confirmed 5M price action\n"
+            "🛑 SL : 5M structure + 0.18 ATR (0.90–1.80 ATR; natural risk ≥0.40%)\n"
             "🎯 TP1 : +1.0R close 50% → runner SL +0.15R\n"
-            "🎯 TP2 : +2.0R close remaining 50%\n"
-            "🏁 Early exit : confirmed opposite 15M slope-anchor bias flip",
+            "🎯 TP2 : dynamic 1.5–2.5R from 15M structure/Fib; fallback 2R\n"
+            "🏁 Early exit : confirmed opposite qualified 15M scored setup",
         )
     return text
 
@@ -268,13 +294,13 @@ _ORIGINAL_CLASSIFY_EXIT_REASON = signal_state_module.classify_exit_reason
 def _sentinel_classify_exit_reason(reason: str, won: bool):
     r = (reason or "").lower()
     if "bias_flip_exit" in r:
-        return ("15M Bias Flip Exit", "↩️")
+        return ("15M Scored Setup Flip Exit", "↩️")
     return _ORIGINAL_CLASSIFY_EXIT_REASON(reason, won)
 
 
 # ---------------------------------------------------------------------------
-# PAPER Sentinel: simulate exchange-side hard SL/TP at the trigger level rather
-# than at the next 60-second poll price. LIVE already has OKX algo TP/SL orders.
+# PAPER Sentinel: hard SL/TP first, filled at configured trigger level.
+# LIVE already has exchange-side OKX algo TP/SL.
 # ---------------------------------------------------------------------------
 _ORIGINAL_TICK = TradingBot._tick
 
@@ -302,9 +328,6 @@ async def _sentinel_tick_hard_stop_first(self):
                 side = "sell" if pos_info["side"] == "long" else "buy"
                 pos_side = pos_info["side"] if self._hedge_mode else None
 
-                # Paper connector honors explicit price for a limit simulation.
-                # This models an exchange-side trigger fill at the configured
-                # level instead of waiting for the next polling price.
                 close_order = await self.connector.create_order(
                     sym, side, pos_info["amount"], order_type="limit",
                     price=trigger_px, pos_side=pos_side,
@@ -346,7 +369,7 @@ async def _sentinel_tick_hard_stop_first(self):
                 self._check_cooldown_trigger(pnl, sym)
             except Exception as e:
                 logging.getLogger("trading_bot").error(
-                    "[SENTINEL V8.1 PAPER] hard-stop precheck failed [%s %s]: %s",
+                    "[SENTINEL V9 PAPER] hard-stop precheck failed [%s %s]: %s",
                     strategy_name, sym, e,
                 )
 
@@ -363,10 +386,10 @@ TelegramNotifier.build_order_caption = _sentinel_build_order_caption
 signal_state_module.classify_exit_reason = _sentinel_classify_exit_reason
 
 logger.warning(
-    "[PRODUCTION] Sentinel V%s installed; fee-aware quality PA; scan=60s; "
-    "15M slope-anchor bias -> 5M PA; economic structure risk>=0.40%%; one fill/15M; "
-    "hard-SL wait=3x5M; TP1=1R/50%% lock+0.15R; TP2 exact 2R from actual fill",
-    SentinelV81Strategy.VERSION,
+    "[PRODUCTION] Sentinel V%s installed; 15M Pine-v6.2 scored analysis -> 5M V8.1 execution/risk; "
+    "PB/LQ/BO/REV setup-specific scores; fee-aware structure SL; one fill/15M; "
+    "hard-SL wait=3x5M; TP1=1R/50%% lock+0.15R; TP2 dynamic1.5-2.5R fallback2R",
+    SentinelV9Strategy.VERSION,
 )
 
 
