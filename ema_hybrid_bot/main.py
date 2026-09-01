@@ -386,7 +386,7 @@ class Bot(base.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== EMA HYBRID PRO REGIME MTF [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
+            "=== EMA HYBRID PRO BALANCED MTF [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE", self.cfg.symbols,
             self.cfg.margin_per_position_usd, self.cfg.leverage, self.cfg.max_positions, balance,
         )
@@ -397,20 +397,19 @@ class Bot(base.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"📈 *EMA Hybrid Pro Regime MTF — {mode}*\n"
+                f"📈 *EMA Hybrid Pro Balanced MTF — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
-                "15M Regime Score → 5M EMA8/13 Execution\n"
-                f"15M Gate: Score `≥{self.strat.REGIME_MIN_SCORE}/6` | ADX `≥{self.strat.REGIME_ADX_MIN:.0f}` | "
-                f"CHOP `≤{self.strat.REGIME_CHOP_MAX:.0f}` | SMA14 slope + ADX rising\n"
+                "15M Bias → 5M EMA8/13 Execution\n"
+                f"15M Bias: Close vs SMA{self.strat.SMA_LEN} + RSI{self.strat.RSI_LEN} side of `{self.strat.BIAS_RSI_MID:.0f}`\n"
                 f"5M Trigger: EMA{self.strat.EMA_FAST}/{self.strat.EMA_SLOW} cross | ADX `≥{self.strat.ADX_MIN:.0f}` | CHOP `≤{self.strat.CHOP_MAX:.0f}`\n"
                 f"SL: `5M structure + {self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
                 f"TP1: `+{self.TP1_R:.1f}R` → trim `{self.TP1_TRIM_PCT*100:.0f}%` → SL `BE+{self.TP1_LOCK_R:.2f}R`\n"
                 f"TP2: `next 5M liquidity/swing target` with room `≥{self.strat.TP2_MIN_RR:.1f}R`\n"
                 "PAPER entries: `24/7` | LIVE entries: `24/5` | Open positions managed: `24/7`"
             )
-        _LOG.info("EMA Hybrid Pro Regime MTF startup complete: 15M score gate + 5M EMA cross; EMA-native stats active")
+        _LOG.info("EMA Hybrid Pro Balanced MTF startup complete: 15M bias + 5M EMA cross; EMA-native stats active")
 
 
 async def _main():
