@@ -1,13 +1,14 @@
-"""Canonical production router for Sentinel V10 — Momentum + Location Forecast Core.
+"""Canonical production router for Sentinel V10.1 — Bias-Separated Momentum + Location Core.
 
-Railway starts this file. Production instantiates V10 only. V9 and all older
-strategy files remain untouched for rollback.
+Railway starts this file. Production instantiates V10.1 only. V10, V9 and all
+older strategy source files remain available for rollback.
 
-V10 attribution policy:
-- Setup Engine selects PULLBACK / BREAKOUT_RETEST / SWEEP_REVERSAL.
-- 5M Execution Engine confirms the actual entry trigger.
-- Forecast Engine is advisory: bias/confidence + TP2/runner context; it never
-  opens a trade by itself.
+V10.1 entry policy:
+- Exact Setup Engine keeps PULLBACK / BREAKOUT_RETEST / SWEEP_REVERSAL.
+- If no exact setup exists, a qualified Bias Engine can expose
+  MOMENTUM_CONTINUATION to the 5M Execution Engine.
+- Forecast Engine remains advisory for normal exact setups and is only a
+  strong-opposition veto for the fallback bias path.
 - Entry engine context is persisted in SignalState and follows the position to
   TP1, TP2, SL and technical/runner exits, including across restarts.
 """
@@ -23,7 +24,7 @@ import run_bot
 from trading.bot import TradingBot, TradeRecord
 from trading.telegram_notifier import TelegramNotifier
 from trading import signal_state as signal_state_module
-from trading.strategies.sentinel_v10_strategy import SentinelV10Strategy
+from trading.strategies.sentinel_v101_strategy import SentinelV101Strategy
 
 logger = logging.getLogger("run_strategy_router")
 
@@ -56,16 +57,17 @@ def _build_config() -> dict:
     logger.warning(
         "[PRODUCTION CONFIG] Sentinel V%s | symbols=%s | scan=%ss closed-bars-only | "
         "15M EMA20 + RSI/SMA14 + MACD + KDJ + S/R | regime ADX/CHOP/ATRx=2of3 | "
-        "setups=PB>=6 BO-RETEST>=6.5 SWEEP>=7 | Forecast advisory/runner target only | "
-        "5M PA execution | anti-chase<=0.30ATR | SL structure+0.20ATR min0.90 max1.80 risk>=0.40%% | "
-        "TP1=1R close50%% lock+0.15R | TP2 S/R 1.5-2.5R fallback2R | engine attribution persisted",
-        SentinelV10Strategy.VERSION, config["symbols"], config["interval"],
+        "exact=PB>=6 BO-RETEST>=6.5 SWEEP>=7 | bias fallback=score>=7 edge>=1.5 mom>=2/3 room>=0.75ATR | "
+        "Forecast advisory; opposing>=65%% veto only fallback | 5M PA execution | anti-chase<=0.30ATR | "
+        "SL structure+0.20ATR min0.90 max1.80 risk>=0.40%% | TP1=1R close50%% lock+0.15R | "
+        "TP2 S/R 1.5-2.5R fallback2R | engine attribution persisted",
+        SentinelV101Strategy.VERSION, config["symbols"], config["interval"],
     )
     return config
 
 
-def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV10Strategy]:
-    strategies = [SentinelV10Strategy(symbol) for symbol in symbols]
+def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV101Strategy]:
+    strategies = [SentinelV101Strategy(symbol) for symbol in symbols]
     if not strategies:
         raise RuntimeError("SENTINEL_SYMBOLS/SIMPLE_PRECISION_SYMBOLS/SYMBOLS is empty")
     return strategies
@@ -84,6 +86,7 @@ def _v10_context_from_meta(meta: dict) -> dict:
     setup = meta.get("setup_5m") or {}
     setup_engine = meta.get("setup_family") or analysis.get("selected_setup") or "UNKNOWN"
     execution_engine = meta.get("entry_trigger") or setup.get("trigger") or "UNKNOWN"
+    setup_mode = meta.get("setup_mode") or analysis.get("setup_mode") or "EXACT_SETUP"
     fc_side = meta.get("forecast_side") or fc.get("side") or "NEUTRAL"
     fc_conf = meta.get("forecast_confidence")
     if fc_conf is None:
@@ -93,7 +96,8 @@ def _v10_context_from_meta(meta: dict) -> dict:
     except (TypeError, ValueError):
         fc_conf = None
     return {
-        "entry_engine": "SETUP_ENGINE+5M_EXECUTION",
+        "entry_engine": "BIAS_ENGINE+5M_EXECUTION" if setup_mode == "BIAS_FALLBACK" else "SETUP_ENGINE+5M_EXECUTION",
+        "setup_mode": str(setup_mode),
         "setup_engine": str(setup_engine),
         "execution_engine": str(execution_engine),
         "forecast_engine": str(fc_side),
@@ -119,9 +123,10 @@ def _v10_context_lines(ctx: dict) -> list[str]:
         except (TypeError, ValueError):
             pass
     return [
-        f"🧩 Setup Engine : `{setup_txt}`",
+        f"🧭 Entry Path : `{ctx.get('setup_mode') or 'EXACT_SETUP'}`",
+        f"🧩 Setup/Bias Engine : `{setup_txt}`",
         f"⚡ Execution Engine : `{ctx.get('execution_engine') or 'UNKNOWN'}`",
-        f"🔭 Forecast Engine : `{fc_txt}` _(advisory, not entry trigger)_",
+        f"🔭 Forecast Engine : `{fc_txt}` _(advisory; fallback veto only if strongly opposite)_",
     ]
 
 
@@ -153,15 +158,13 @@ def _v10_persist_context(bot, key: str, ctx: dict, signal=None) -> None:
     if isinstance(pp, dict):
         pp["engine_context"] = dict(ctx)
 
-    # record_signal() happens before _execute_signal(). Enrich the matching
-    # fired record after a confirmed open so attribution survives /stats and
-    # learning history without changing global bot.py.
     if signal is not None:
         fired = getattr(sig, "_fired", [])
         for item in reversed(fired[-20:]):
             if item.get("symbol") == signal.symbol and item.get("strategy") == key.split("||", 1)[1]:
                 item.update({
                     "entry_engine": ctx.get("entry_engine"),
+                    "setup_mode": ctx.get("setup_mode"),
                     "setup_engine": ctx.get("setup_engine"),
                     "execution_engine": ctx.get("execution_engine"),
                     "forecast_engine": ctx.get("forecast_engine"),
@@ -197,15 +200,18 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     comp = a.get("components") or {}
     blocks = s.get("blocks", []) or []
     candidate = s.get("trigger_candidate") or s.get("candidate") or s.get("trigger") or "-"
+    bias_rejects = a.get("bias_rejects") or []
     repeat_tag = " | cached=same-5M-bar" if reason == "5M bar already evaluated" else ""
     logging.getLogger("trading_bot").info(
-        "[SCAN SENTINEL V10] %s px=%.4f sig=%s | 15M setup=%s side=%s score=%s/%s L/S=%s/%s | "
-        "EMA20=%s slope=%s RSI/SMA=%s/%s MACDhist=%s dHist=%s KDJ=%s/%s/%s | "
+        "[SCAN SENTINEL V10.1] %s px=%.4f sig=%s | 15M setup=%s mode=%s side=%s score=%s/%s L/S=%s/%s "
+        "edge=%s mom=%s/3 room=%s rejects=%s | EMA20=%s slope=%s RSI/SMA=%s/%s MACDhist=%s dHist=%s KDJ=%s/%s/%s | "
         "S/R=%s/%s loc=%s regime=%s/3 ADX=%s CHOP=%s ATRx=%s | pts[E/R/M/K/L/G]=%s/%s/%s/%s/%s/%s | "
         "FC=%s raw=%s conf=%s%% | 5M candidate=%s trigger=%s reg=%s/3 body=%s closePos=%s distEMA=%s volx=%s chase=%s rawRisk=%s%% slATR=%s | "
         "TP2R=%s source=%s | blocks=%s | %s%s",
         symbol, price, getattr(getattr(signal, "type", None), "value", "hold").upper(),
-        a.get("selected_setup", "-") or "-", a.get("direction", "NEUTRAL") or "NEUTRAL", a.get("selected_score", "-"), a.get("score_threshold", "-"), a.get("score_long", "-"), a.get("score_short", "-"),
+        a.get("selected_setup", "-") or "-", a.get("setup_mode", "NONE"), a.get("direction", "NEUTRAL") or "NEUTRAL",
+        a.get("selected_score", "-"), a.get("score_threshold", "-"), a.get("score_long", "-"), a.get("score_short", "-"),
+        a.get("bias_score_edge", "-"), a.get("bias_momentum_votes", "-"), a.get("bias_room_atr", "-"), ",".join(bias_rejects) or "none",
         a.get("ema20", "-"), a.get("ema20_slope_atr", "-"), a.get("rsi", "-"), a.get("rsi_sma", "-"), a.get("macd_hist", "-"), a.get("macd_hist_delta", "-"), a.get("kdj_k", "-"), a.get("kdj_d", "-"), a.get("kdj_j", "-"),
         a.get("support", "-"), a.get("resistance", "-"), a.get("location", "-"), reg.get("pass_count", "-"), reg.get("adx", "-"), reg.get("chop", "-"), reg.get("atr_ratio", "-"),
         comp.get("ema20", "-"), comp.get("rsi_sma", "-"), comp.get("macd", "-"), comp.get("kdj", "-"), comp.get("location", "-"), comp.get("regime", "-"),
@@ -235,7 +241,7 @@ def _sentinel_resolve_strategy(self, strategy_name: str):
 
 
 # ---------------------------------------------------------------------------
-# V10 entry execution + exact fill-sync + context persistence.
+# V10.1 entry execution + exact fill-sync + context persistence.
 # ---------------------------------------------------------------------------
 _ORIGINAL_EXECUTE_SIGNAL = TradingBot._execute_signal
 
@@ -247,8 +253,6 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: 
     if is_v10:
         meta = signal.metadata or {}
         ctx = _v10_context_from_meta(meta)
-        # Needed immediately because the rich order caption is built inside the
-        # original _execute_signal call.
         _V10_ENTRY_CONTEXT[key] = dict(ctx)
         sl = meta.get("stop_loss")
         if sl:
@@ -256,14 +260,14 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: 
                 px = float((await self.connector.fetch_ticker(signal.symbol))["last"])
                 risk = abs(px - float(sl))
                 if risk > 0:
-                    rr = float(meta.get("rr_ratio") or SentinelV10Strategy.DYNAMIC_TP_FALLBACK_R)
-                    rr = max(SentinelV10Strategy.DYNAMIC_TP_MIN_R, min(SentinelV10Strategy.DYNAMIC_TP_MAX_R, rr))
+                    rr = float(meta.get("rr_ratio") or SentinelV101Strategy.DYNAMIC_TP_FALLBACK_R)
+                    rr = max(SentinelV101Strategy.DYNAMIC_TP_MIN_R, min(SentinelV101Strategy.DYNAMIC_TP_MAX_R, rr))
                     meta["rr_ratio"] = rr
                     meta["take_profit"] = px + rr * risk if direction == "long" else px - rr * risk
-                    meta["tp1_price"] = px + SentinelV10Strategy.TP1_R * risk if direction == "long" else px - SentinelV10Strategy.TP1_R * risk
+                    meta["tp1_price"] = px + SentinelV101Strategy.TP1_R * risk if direction == "long" else px - SentinelV101Strategy.TP1_R * risk
                     signal.metadata = meta
             except Exception as e:
-                logging.getLogger("trading_bot").warning("[SENTINEL V10] pre-fill target rebase skipped [%s]: %s", signal.symbol, e)
+                logging.getLogger("trading_bot").warning("[SENTINEL V10.1] pre-fill target rebase skipped [%s]: %s", signal.symbol, e)
 
     result = await _ORIGINAL_EXECUTE_SIGNAL(self, signal, strategy_name, direction=direction, candles=candles)
     if not is_v10:
@@ -273,8 +277,6 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: 
     if pos_obj is None or pos_obj.stop_loss is None:
         return result
 
-    # Confirmed open: persist attribution in SignalState for restart-safe TP/SL
-    # and close notifications.
     _v10_persist_context(self, key, ctx, signal=signal)
 
     try:
@@ -284,10 +286,10 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: 
         if risk <= 0:
             return result
         meta = signal.metadata or {}
-        rr = float(meta.get("rr_ratio") or SentinelV10Strategy.DYNAMIC_TP_FALLBACK_R)
-        rr = max(SentinelV10Strategy.DYNAMIC_TP_MIN_R, min(SentinelV10Strategy.DYNAMIC_TP_MAX_R, rr))
+        rr = float(meta.get("rr_ratio") or SentinelV101Strategy.DYNAMIC_TP_FALLBACK_R)
+        rr = max(SentinelV101Strategy.DYNAMIC_TP_MIN_R, min(SentinelV101Strategy.DYNAMIC_TP_MAX_R, rr))
         exact_tp = entry + rr * risk if direction == "long" else entry - rr * risk
-        exact_tp1 = entry + SentinelV10Strategy.TP1_R * risk if direction == "long" else entry - SentinelV10Strategy.TP1_R * risk
+        exact_tp1 = entry + SentinelV101Strategy.TP1_R * risk if direction == "long" else entry - SentinelV101Strategy.TP1_R * risk
         pos_obj.take_profit = exact_tp
         meta["take_profit"] = exact_tp
         meta["tp1_price"] = exact_tp1
@@ -306,15 +308,15 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: 
         try:
             await self.connector.set_position_tpsl(signal.symbol, direction, float(pos_obj.amount), sl=sl, tp=exact_tp)
         except Exception as e:
-            logging.getLogger("trading_bot").warning("[SENTINEL V10] exact post-fill TP replace failed [%s]: %s", signal.symbol, e)
+            logging.getLogger("trading_bot").warning("[SENTINEL V10.1] exact post-fill TP replace failed [%s]: %s", signal.symbol, e)
         logging.getLogger("trading_bot").info(
-            "[SENTINEL V10 FILL-SYNC] %s %s entry=%.4f SL=%.4f TP=%.4f exact=%.2fR source=%s FC=%s/%s%% setup=%s trigger=%s",
+            "[SENTINEL V10.1 FILL-SYNC] %s %s entry=%.4f SL=%.4f TP=%.4f exact=%.2fR source=%s FC=%s/%s%% path=%s setup=%s trigger=%s",
             signal.symbol, direction.upper(), entry, sl, exact_tp, rr, meta.get("tp2_source", "FALLBACK_2R"),
-            ctx.get("forecast_engine", "-"), ctx.get("forecast_confidence", "-"),
+            ctx.get("forecast_engine", "-"), ctx.get("forecast_confidence", "-"), ctx.get("setup_mode", "-"),
             ctx.get("setup_engine", "-"), ctx.get("execution_engine", "-"),
         )
     except Exception as e:
-        logging.getLogger("trading_bot").warning("[SENTINEL V10] post-fill synchronization failed [%s]: %s", signal.symbol, e)
+        logging.getLogger("trading_bot").warning("[SENTINEL V10.1] post-fill synchronization failed [%s]: %s", signal.symbol, e)
     return result
 
 
@@ -333,6 +335,7 @@ def _sentinel_record_outcome(self, *args, **kwargs):
     if ctx:
         outcome["engine_context"] = dict(ctx)
         outcome["entry_engine"] = ctx.get("entry_engine")
+        outcome["setup_mode"] = ctx.get("setup_mode")
         outcome["setup_engine"] = ctx.get("setup_engine")
         outcome["execution_engine"] = ctx.get("execution_engine")
         outcome["forecast_engine"] = ctx.get("forecast_engine")
@@ -345,7 +348,6 @@ def _sentinel_record_outcome(self, *args, **kwargs):
     return outcome
 
 
-# Add setup-engine performance to SignalState.summary without changing other bots.
 _ORIGINAL_SUMMARY = signal_state_module.SignalState.summary
 
 
@@ -387,9 +389,10 @@ def _sentinel_build_order_caption(self, *args, **kwargs):
     if "SentinelV10" in str(strategy or "") or "SentinelV10" in text:
         text = text.replace(
             "🏁 Exit : trend flip (EMA cross-back / close past EMA)",
-            "🧠 15M : EMA20 + RSI/SMA14 + MACD + KDJ + S/R\n"
+            "🧠 15M : exact Setup Engine or qualified Bias Fallback\n"
+            "📈 Core : EMA20 + RSI/SMA14 + MACD + KDJ + S/R\n"
             "🌡 Regime : ADX / CHOP / ATR Activity, pass 2-of-3\n"
-            "🔭 Forecast : advisory bias/confidence + S/R runner target (not an entry gate)\n"
+            "🔭 Forecast : advisory; strong opposite veto only for Bias Fallback\n"
             "⚡ Entry : confirmed 5M price action\n"
             "🛑 SL : 5M structure + 0.20 ATR (0.90–1.80 ATR; natural risk ≥0.40%)\n"
             "🎯 TP1 : +1.0R close 50% → runner SL +0.15R\n"
@@ -407,9 +410,6 @@ _ORIGINAL_NOTIFY = TelegramNotifier.notify
 
 
 def _sentinel_notify(self, text: str):
-    # bot.py sends TP1/move-SL through the generic notify() path. Add the same
-    # stable entry attribution to those lifecycle messages instead of sending a
-    # second duplicate alert.
     if text and "SentinelV10" in text and ("Partial Take-Profit" in text or "SL moved to lock profit" in text):
         strat_m = re.search(r"\[(SentinelV10[^\]]+)\]", text)
         sym_m = re.search(r"`([^`]+)`", text)
@@ -467,7 +467,7 @@ def _sentinel_render_stats(self, s: dict) -> str:
     text = _ORIGINAL_RENDER_STATS(self, s)
     groups = s.get("v10_engine_stats") or {}
     if groups:
-        lines = [text, "", "—" * 16, "V10 · BY SETUP ENGINE", "—" * 16]
+        lines = [text, "", "—" * 16, "V10.1 · BY SETUP/BIAS ENGINE", "—" * 16]
         for name, d in sorted(groups.items(), key=lambda kv: -kv[1].get("total_r", 0.0)):
             sign = "+" if d.get("pnl_usd", 0.0) >= 0 else "-"
             lines.append(
@@ -487,9 +487,9 @@ _ORIGINAL_CLASSIFY_EXIT_REASON = signal_state_module.classify_exit_reason
 def _sentinel_classify_exit_reason(reason: str, won: bool):
     r = (reason or "").lower()
     if "v10_exit_2of3" in r:
-        return ("V10 Momentum Exit 2/3", "↩️")
+        return ("V10.1 Momentum Exit 2/3", "↩️")
     if "v10_runner_exit" in r:
-        return ("V10 Runner Forecast Exit", "🏁")
+        return ("V10.1 Runner Forecast Exit", "🏁")
     return _ORIGINAL_CLASSIFY_EXIT_REASON(reason, won)
 
 
@@ -507,7 +507,6 @@ async def _sentinel_tick_hard_stop_first(self):
                 continue
             sym = pos_info["symbol"]
             try:
-                # Restore context into the process cache after a service restart.
                 key = f"{sym}||{strategy_name}"
                 persisted = _v10_load_context(self._sig, key)
                 if persisted:
@@ -537,7 +536,7 @@ async def _sentinel_tick_hard_stop_first(self):
                 self._check_cooldown_trigger(pnl, sym)
                 _V10_ENTRY_CONTEXT.pop(key, None)
             except Exception as e:
-                logging.getLogger("trading_bot").error("[SENTINEL V10 PAPER] hard-stop precheck failed [%s %s]: %s", strategy_name, sym, e)
+                logging.getLogger("trading_bot").error("[SENTINEL V10.1 PAPER] hard-stop precheck failed [%s %s]: %s", strategy_name, sym, e)
     return await _ORIGINAL_TICK(self)
 
 
@@ -556,10 +555,10 @@ signal_state_module.SignalState.summary = _sentinel_summary
 signal_state_module.classify_exit_reason = _sentinel_classify_exit_reason
 
 logger.warning(
-    "[PRODUCTION] Sentinel V%s installed | V9 retained for rollback | 15M EMA20+RSI/SMA+MACD+KDJ+S/R, regime 2of3 -> 5M PA | "
-    "Forecast advisory only | engine attribution persisted | TG OPEN/TP1/TP2/SL/CLOSE enabled | "
+    "[PRODUCTION] Sentinel V%s installed | V10/V9 retained for rollback | exact setup OR qualified bias fallback -> 5M PA | "
+    "Forecast advisory except strong-opposition fallback veto | engine attribution persisted | TG OPEN/TP1/TP2/SL/CLOSE enabled | "
     "fee-aware structure SL | one fill/15M | hard-SL wait=3x5M+fresh event | TP1=1R/50%% lock+0.15R | TP2 S/R 1.5-2.5R fallback2R",
-    SentinelV10Strategy.VERSION,
+    SentinelV101Strategy.VERSION,
 )
 
 
