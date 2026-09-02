@@ -2,12 +2,21 @@
 
 Railway starts this file. Production instantiates V10 only. V9 and all older
 strategy files remain untouched for rollback.
+
+V10 attribution policy:
+- Setup Engine selects PULLBACK / BREAKOUT_RETEST / SWEEP_REVERSAL.
+- 5M Execution Engine confirms the actual entry trigger.
+- Forecast Engine is advisory: bias/confidence + TP2/runner context; it never
+  opens a trade by itself.
+- Entry engine context is persisted in SignalState and follows the position to
+  TP1, TP2, SL and technical/runner exits, including across restarts.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import re
 import time
 
 import run_bot
@@ -49,7 +58,7 @@ def _build_config() -> dict:
         "15M EMA20 + RSI/SMA14 + MACD + KDJ + S/R | regime ADX/CHOP/ATRx=2of3 | "
         "setups=PB>=6 BO-RETEST>=6.5 SWEEP>=7 | Forecast advisory/runner target only | "
         "5M PA execution | anti-chase<=0.30ATR | SL structure+0.20ATR min0.90 max1.80 risk>=0.40%% | "
-        "TP1=1R close50%% lock+0.15R | TP2 S/R 1.5-2.5R fallback2R",
+        "TP1=1R close50%% lock+0.15R | TP2 S/R 1.5-2.5R fallback2R | engine attribution persisted",
         SentinelV10Strategy.VERSION, config["symbols"], config["interval"],
     )
     return config
@@ -62,6 +71,113 @@ def _make_strategies(symbols: list[str], config: dict) -> list[SentinelV10Strate
     return strategies
 
 
+# ---------------------------------------------------------------------------
+# Stable per-position engine context.
+# ---------------------------------------------------------------------------
+_V10_ENTRY_CONTEXT: dict[str, dict] = {}
+
+
+def _v10_context_from_meta(meta: dict) -> dict:
+    meta = meta or {}
+    fc = meta.get("forecast") or {}
+    analysis = meta.get("analysis_15m") or {}
+    setup = meta.get("setup_5m") or {}
+    setup_engine = meta.get("setup_family") or analysis.get("selected_setup") or "UNKNOWN"
+    execution_engine = meta.get("entry_trigger") or setup.get("trigger") or "UNKNOWN"
+    fc_side = meta.get("forecast_side") or fc.get("side") or "NEUTRAL"
+    fc_conf = meta.get("forecast_confidence")
+    if fc_conf is None:
+        fc_conf = fc.get("confidence")
+    try:
+        fc_conf = round(float(fc_conf), 1) if fc_conf is not None else None
+    except (TypeError, ValueError):
+        fc_conf = None
+    return {
+        "entry_engine": "SETUP_ENGINE+5M_EXECUTION",
+        "setup_engine": str(setup_engine),
+        "execution_engine": str(execution_engine),
+        "forecast_engine": str(fc_side),
+        "forecast_confidence": fc_conf,
+        "setup_score": meta.get("setup_score") or analysis.get("selected_score"),
+        "tp2_r": meta.get("tp2_r_dynamic") or meta.get("rr_ratio"),
+        "tp2_source": meta.get("tp2_source") or "FALLBACK_2R",
+    }
+
+
+def _v10_context_lines(ctx: dict) -> list[str]:
+    if not ctx:
+        return []
+    fc_conf = ctx.get("forecast_confidence")
+    fc_txt = str(ctx.get("forecast_engine") or "NEUTRAL")
+    if fc_conf is not None:
+        fc_txt += f" {fc_conf:.1f}%"
+    score = ctx.get("setup_score")
+    setup_txt = str(ctx.get("setup_engine") or "UNKNOWN")
+    if score is not None:
+        try:
+            setup_txt += f" · score {float(score):.2f}"
+        except (TypeError, ValueError):
+            pass
+    return [
+        f"🧩 Setup Engine : `{setup_txt}`",
+        f"⚡ Execution Engine : `{ctx.get('execution_engine') or 'UNKNOWN'}`",
+        f"🔭 Forecast Engine : `{fc_txt}` _(advisory, not entry trigger)_",
+    ]
+
+
+def _v10_load_context(sig_state, key: str) -> dict:
+    active = getattr(sig_state, "_active", {}).get(key) or {}
+    ctx = active.get("engine_context")
+    if ctx:
+        return dict(ctx)
+    pp = getattr(sig_state, "_paper_positions", {}).get(key) or {}
+    ctx = pp.get("engine_context")
+    if ctx:
+        return dict(ctx)
+    return dict(_V10_ENTRY_CONTEXT.get(key) or {})
+
+
+def _v10_persist_context(bot, key: str, ctx: dict, signal=None) -> None:
+    if not ctx:
+        return
+    _V10_ENTRY_CONTEXT[key] = dict(ctx)
+    sig = getattr(bot, "_sig", None)
+    if sig is None:
+        return
+
+    active = getattr(sig, "_active", {}).get(key)
+    if isinstance(active, dict):
+        active["engine_context"] = dict(ctx)
+
+    pp = getattr(sig, "_paper_positions", {}).get(key)
+    if isinstance(pp, dict):
+        pp["engine_context"] = dict(ctx)
+
+    # record_signal() happens before _execute_signal(). Enrich the matching
+    # fired record after a confirmed open so attribution survives /stats and
+    # learning history without changing global bot.py.
+    if signal is not None:
+        fired = getattr(sig, "_fired", [])
+        for item in reversed(fired[-20:]):
+            if item.get("symbol") == signal.symbol and item.get("strategy") == key.split("||", 1)[1]:
+                item.update({
+                    "entry_engine": ctx.get("entry_engine"),
+                    "setup_engine": ctx.get("setup_engine"),
+                    "execution_engine": ctx.get("execution_engine"),
+                    "forecast_engine": ctx.get("forecast_engine"),
+                    "forecast_confidence": ctx.get("forecast_confidence"),
+                    "setup_score": ctx.get("setup_score"),
+                })
+                break
+    try:
+        sig._save()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Scan logging.
+# ---------------------------------------------------------------------------
 _ORIGINAL_LOG_SCAN = TradingBot._log_scan
 _LAST_SENTINEL_SCAN: dict[str, dict] = {}
 
@@ -98,6 +214,9 @@ def _sentinel_log_scan(self, symbol, strategy_name, price, signal):
     )
 
 
+# ---------------------------------------------------------------------------
+# Strategy compatibility across deploys.
+# ---------------------------------------------------------------------------
 _ORIGINAL_RESOLVE_STRATEGY = TradingBot._resolve_strategy_inst
 
 
@@ -115,13 +234,22 @@ def _sentinel_resolve_strategy(self, strategy_name: str):
     return None
 
 
+# ---------------------------------------------------------------------------
+# V10 entry execution + exact fill-sync + context persistence.
+# ---------------------------------------------------------------------------
 _ORIGINAL_EXECUTE_SIGNAL = TradingBot._execute_signal
 
 
 async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: str = "long", candles=None):
     is_v10 = str(strategy_name).startswith("SentinelV10")
+    ctx = {}
+    key = f"{signal.symbol}||{strategy_name}"
     if is_v10:
         meta = signal.metadata or {}
+        ctx = _v10_context_from_meta(meta)
+        # Needed immediately because the rich order caption is built inside the
+        # original _execute_signal call.
+        _V10_ENTRY_CONTEXT[key] = dict(ctx)
         sl = meta.get("stop_loss")
         if sl:
             try:
@@ -136,13 +264,19 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: 
                     signal.metadata = meta
             except Exception as e:
                 logging.getLogger("trading_bot").warning("[SENTINEL V10] pre-fill target rebase skipped [%s]: %s", signal.symbol, e)
+
     result = await _ORIGINAL_EXECUTE_SIGNAL(self, signal, strategy_name, direction=direction, candles=candles)
     if not is_v10:
         return result
-    key = f"{signal.symbol}||{strategy_name}"
+
     pos_obj = getattr(self.risk, "_positions", {}).get(key)
     if pos_obj is None or pos_obj.stop_loss is None:
         return result
+
+    # Confirmed open: persist attribution in SignalState for restart-safe TP/SL
+    # and close notifications.
+    _v10_persist_context(self, key, ctx, signal=signal)
+
     try:
         entry = float(pos_obj.entry_price)
         sl = float(pos_obj.stop_loss)
@@ -160,6 +294,10 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: 
         meta["rr_ratio"] = rr
         meta["tp2_r_dynamic"] = rr
         signal.metadata = meta
+        ctx["tp2_r"] = rr
+        ctx["tp2_source"] = meta.get("tp2_source") or ctx.get("tp2_source")
+        _v10_persist_context(self, key, ctx, signal=signal)
+
         strategy_inst = self._resolve_strategy_inst(strategy_name)
         if hasattr(strategy_inst, "attach_existing_position"):
             strategy_inst.attach_existing_position(direction, entry, sl, exact_tp)
@@ -170,22 +308,82 @@ async def _sentinel_execute_signal(self, signal, strategy_name: str, direction: 
         except Exception as e:
             logging.getLogger("trading_bot").warning("[SENTINEL V10] exact post-fill TP replace failed [%s]: %s", signal.symbol, e)
         logging.getLogger("trading_bot").info(
-            "[SENTINEL V10 FILL-SYNC] %s %s entry=%.4f SL=%.4f TP=%.4f exact=%.2fR source=%s FC=%s/%s%%",
-            signal.symbol, direction.upper(), entry, sl, exact_tp, rr, meta.get("tp2_source", "FALLBACK_2R"), meta.get("forecast_side", "-"), meta.get("forecast_confidence", "-"),
+            "[SENTINEL V10 FILL-SYNC] %s %s entry=%.4f SL=%.4f TP=%.4f exact=%.2fR source=%s FC=%s/%s%% setup=%s trigger=%s",
+            signal.symbol, direction.upper(), entry, sl, exact_tp, rr, meta.get("tp2_source", "FALLBACK_2R"),
+            ctx.get("forecast_engine", "-"), ctx.get("forecast_confidence", "-"),
+            ctx.get("setup_engine", "-"), ctx.get("execution_engine", "-"),
         )
     except Exception as e:
         logging.getLogger("trading_bot").warning("[SENTINEL V10] post-fill synchronization failed [%s]: %s", signal.symbol, e)
     return result
 
 
+# ---------------------------------------------------------------------------
+# Persist engine attribution into each final journal outcome.
+# ---------------------------------------------------------------------------
+_ORIGINAL_RECORD_OUTCOME = signal_state_module.SignalState.record_outcome
+
+
+def _sentinel_record_outcome(self, *args, **kwargs):
+    symbol = kwargs.get("symbol") if "symbol" in kwargs else (args[0] if len(args) > 0 else "")
+    strategy = kwargs.get("strategy") if "strategy" in kwargs else (args[7] if len(args) > 7 else "")
+    key = f"{symbol}||{strategy}"
+    ctx = _v10_load_context(self, key) if str(strategy).startswith("SentinelV10") else {}
+    outcome = _ORIGINAL_RECORD_OUTCOME(self, *args, **kwargs)
+    if ctx:
+        outcome["engine_context"] = dict(ctx)
+        outcome["entry_engine"] = ctx.get("entry_engine")
+        outcome["setup_engine"] = ctx.get("setup_engine")
+        outcome["execution_engine"] = ctx.get("execution_engine")
+        outcome["forecast_engine"] = ctx.get("forecast_engine")
+        outcome["forecast_confidence"] = ctx.get("forecast_confidence")
+        outcome["setup_score"] = ctx.get("setup_score")
+        try:
+            self._save()
+        except Exception:
+            pass
+    return outcome
+
+
+# Add setup-engine performance to SignalState.summary without changing other bots.
+_ORIGINAL_SUMMARY = signal_state_module.SignalState.summary
+
+
+def _sentinel_summary(self):
+    data = _ORIGINAL_SUMMARY(self)
+    groups: dict[str, dict] = {}
+    for o in getattr(self, "_outcomes", []):
+        if not str(o.get("strategy") or "").startswith("SentinelV10"):
+            continue
+        setup = o.get("setup_engine") or (o.get("engine_context") or {}).get("setup_engine") or "UNKNOWN"
+        d = groups.setdefault(setup, {"trades": 0, "wins": 0, "losses": 0, "total_r": 0.0, "pnl_usd": 0.0})
+        d["trades"] += 1
+        won = bool(o.get("won", o.get("pnl_r", 0) > 0))
+        d["wins" if won else "losses"] += 1
+        d["total_r"] += float(o.get("pnl_r") or 0.0)
+        d["pnl_usd"] += float(o.get("pnl_usd") or 0.0)
+    for d in groups.values():
+        d["win_rate"] = round(d["wins"] / d["trades"] * 100.0, 1) if d["trades"] else 0.0
+        d["total_r"] = round(d["total_r"], 2)
+        d["pnl_usd"] = round(d["pnl_usd"], 2)
+    data["v10_engine_stats"] = groups
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Telegram: rich attribution at OPEN, TP1, TP2/SL and technical closes.
+# ---------------------------------------------------------------------------
 _ORIGINAL_BUILD_ORDER_CAPTION = TelegramNotifier.build_order_caption
 
 
 def _sentinel_build_order_caption(self, *args, **kwargs):
     text = _ORIGINAL_BUILD_ORDER_CAPTION(self, *args, **kwargs)
     strategy = kwargs.get("strategy")
+    symbol = kwargs.get("symbol")
     if strategy is None and len(args) >= 5:
         strategy = args[4]
+    if symbol is None and len(args) >= 1:
+        symbol = args[0]
     if "SentinelV10" in str(strategy or "") or "SentinelV10" in text:
         text = text.replace(
             "🏁 Exit : trend flip (EMA cross-back / close past EMA)",
@@ -198,9 +396,91 @@ def _sentinel_build_order_caption(self, *args, **kwargs):
             "🎯 TP2 : S/R + Forecast 1.5–2.5R; fallback 2R\n"
             "🏁 Exit : 15M EMA/RSI/MACD 2-of-3; runner may exit on RSI+KDJ/forecast reversal",
         )
+        key = f"{symbol}||{strategy}"
+        ctx = _V10_ENTRY_CONTEXT.get(key) or {}
+        if ctx:
+            text += "\n" + "\n".join(_v10_context_lines(ctx))
     return text
 
 
+_ORIGINAL_NOTIFY = TelegramNotifier.notify
+
+
+def _sentinel_notify(self, text: str):
+    # bot.py sends TP1/move-SL through the generic notify() path. Add the same
+    # stable entry attribution to those lifecycle messages instead of sending a
+    # second duplicate alert.
+    if text and "SentinelV10" in text and ("Partial Take-Profit" in text or "SL moved to lock profit" in text):
+        strat_m = re.search(r"\[(SentinelV10[^\]]+)\]", text)
+        sym_m = re.search(r"`([^`]+)`", text)
+        if strat_m and sym_m:
+            key = f"{sym_m.group(1)}||{strat_m.group(1)}"
+            ctx = _V10_ENTRY_CONTEXT.get(key) or {}
+            if ctx:
+                text += "\n" + "\n".join(_v10_context_lines(ctx))
+    return _ORIGINAL_NOTIFY(self, text)
+
+
+_ORIGINAL_NOTIFY_TRADE_CLOSED = TelegramNotifier.notify_trade_closed
+
+
+def _sentinel_notify_trade_closed(self, symbol: str, outcome: dict, stats: dict):
+    strategy = str(outcome.get("strategy") or "")
+    if not strategy.startswith("SentinelV10"):
+        return _ORIGINAL_NOTIFY_TRADE_CLOSED(self, symbol, outcome, stats)
+
+    ctx = outcome.get("engine_context") or {}
+    won = outcome.get("won", outcome.get("pnl_usd", 0) > 0)
+    result_emoji = "✅" if won else "❌"
+    label = outcome.get("reason_label", "Position Closed")
+    reason_emoji = outcome.get("emoji", "☑️")
+    side = str(outcome.get("side") or "").upper()
+    entry = float(outcome.get("entry") or 0.0)
+    exit_px = float(outcome.get("exit") or 0.0)
+    sl = outcome.get("sl")
+    tp = outcome.get("tp")
+    pnl_r = float(outcome.get("pnl_r") or 0.0)
+    pnl_usd = float(outcome.get("pnl_usd") or 0.0)
+    fill = outcome.get("fill") or {}
+    if fill.get("net_pnl") is not None:
+        pnl_usd = float(fill.get("net_pnl") or 0.0)
+    sign = "+" if pnl_usd >= 0 else "-"
+    sl_txt = f"`{float(sl):,.4f}`" if sl else "—"
+    tp_txt = f"`{float(tp):,.4f}`" if tp else "—"
+    lines = [
+        f"{result_emoji} *{label}* {reason_emoji}",
+        f"`{symbol}` {side} · `{strategy}`",
+        f"Entry `{entry:,.4f}` → Exit `{exit_px:,.4f}`",
+        f"SL {sl_txt} | TP {tp_txt}",
+        f"💵 Net P&L `{sign}${abs(pnl_usd):,.4f}` | `{pnl_r:+.2f}R`",
+    ]
+    lines.extend(_v10_context_lines(ctx))
+    lines.append(f"📌 Reason : `{outcome.get('reason', 'closed')}`")
+    lines.append("_Engine attribution is stored with this trade for /stats._")
+    self.notify("\n".join(lines))
+
+
+_ORIGINAL_RENDER_STATS = TelegramNotifier._render_stats
+
+
+def _sentinel_render_stats(self, s: dict) -> str:
+    text = _ORIGINAL_RENDER_STATS(self, s)
+    groups = s.get("v10_engine_stats") or {}
+    if groups:
+        lines = [text, "", "—" * 16, "V10 · BY SETUP ENGINE", "—" * 16]
+        for name, d in sorted(groups.items(), key=lambda kv: -kv[1].get("total_r", 0.0)):
+            sign = "+" if d.get("pnl_usd", 0.0) >= 0 else "-"
+            lines.append(
+                f"`{name}` {d.get('trades', 0)} trades · {d.get('win_rate', 0):.1f}%WR · "
+                f"`{d.get('total_r', 0):+.2f}R` · `{sign}${abs(d.get('pnl_usd', 0.0)):.2f}`"
+            )
+        return "\n".join(lines)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Exit labels.
+# ---------------------------------------------------------------------------
 _ORIGINAL_CLASSIFY_EXIT_REASON = signal_state_module.classify_exit_reason
 
 
@@ -213,6 +493,9 @@ def _sentinel_classify_exit_reason(reason: str, won: bool):
     return _ORIGINAL_CLASSIFY_EXIT_REASON(reason, won)
 
 
+# ---------------------------------------------------------------------------
+# PAPER: hard SL/TP first and always notify the final lifecycle event.
+# ---------------------------------------------------------------------------
 _ORIGINAL_TICK = TradingBot._tick
 
 
@@ -224,6 +507,12 @@ async def _sentinel_tick_hard_stop_first(self):
                 continue
             sym = pos_info["symbol"]
             try:
+                # Restore context into the process cache after a service restart.
+                key = f"{sym}||{strategy_name}"
+                persisted = _v10_load_context(self._sig, key)
+                if persisted:
+                    _V10_ENTRY_CONTEXT[key] = persisted
+
                 price = float((await self.connector.fetch_ticker(sym))["last"])
                 trigger = self.risk.check_stops(sym, price, strategy=strategy_name)
                 if not trigger:
@@ -246,6 +535,7 @@ async def _sentinel_tick_hard_stop_first(self):
                 if self.telegram:
                     self.telegram.notify_trade_closed(sym, outcome, self._sig.summary())
                 self._check_cooldown_trigger(pnl, sym)
+                _V10_ENTRY_CONTEXT.pop(key, None)
             except Exception as e:
                 logging.getLogger("trading_bot").error("[SENTINEL V10 PAPER] hard-stop precheck failed [%s %s]: %s", strategy_name, sym, e)
     return await _ORIGINAL_TICK(self)
@@ -258,11 +548,17 @@ TradingBot._resolve_strategy_inst = _sentinel_resolve_strategy
 TradingBot._execute_signal = _sentinel_execute_signal
 TradingBot._tick = _sentinel_tick_hard_stop_first
 TelegramNotifier.build_order_caption = _sentinel_build_order_caption
+TelegramNotifier.notify = _sentinel_notify
+TelegramNotifier.notify_trade_closed = _sentinel_notify_trade_closed
+TelegramNotifier._render_stats = _sentinel_render_stats
+signal_state_module.SignalState.record_outcome = _sentinel_record_outcome
+signal_state_module.SignalState.summary = _sentinel_summary
 signal_state_module.classify_exit_reason = _sentinel_classify_exit_reason
 
 logger.warning(
     "[PRODUCTION] Sentinel V%s installed | V9 retained for rollback | 15M EMA20+RSI/SMA+MACD+KDJ+S/R, regime 2of3 -> 5M PA | "
-    "Forecast advisory/runner targeting | fee-aware structure SL | one fill/15M | hard-SL wait=3x5M+fresh event | TP1=1R/50%% lock+0.15R | TP2 S/R 1.5-2.5R fallback2R",
+    "Forecast advisory only | engine attribution persisted | TG OPEN/TP1/TP2/SL/CLOSE enabled | "
+    "fee-aware structure SL | one fill/15M | hard-SL wait=3x5M+fresh event | TP1=1R/50%% lock+0.15R | TP2 S/R 1.5-2.5R fallback2R",
     SentinelV10Strategy.VERSION,
 )
 
