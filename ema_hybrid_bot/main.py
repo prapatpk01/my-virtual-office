@@ -53,8 +53,6 @@ def _setup_key_from_trigger(trigger: str) -> str:
     t = str(trigger or "").upper()
     if "EMA5M_CROSS_" in t:
         return "A_EMA_CROSS"
-    if "RSI_SMA_" in t:
-        return "C_RSI_SMA_REVERSAL"
     if "PULLBACK_" in t:
         return "B_PULLBACK_RECLAIM"
     return "UNKNOWN"
@@ -65,7 +63,6 @@ def _setup_label_from_trigger(trigger: str) -> str:
     return {
         "A_EMA_CROSS": "A · EMA8/13 CROSS",
         "B_PULLBACK_RECLAIM": "B · PULLBACK RECLAIM/BOS",
-        "C_RSI_SMA_REVERSAL": "C · RSI/SMA OB-OS REVERSAL",
     }.get(key, "UNKNOWN")
 
 
@@ -73,8 +70,6 @@ def _setup_label_from_text(text: str) -> str | None:
     upper = str(text or "").upper()
     if "EMA5M_CROSS_" in upper:
         return "A · EMA8/13 CROSS"
-    if "RSI_SMA_" in upper:
-        return "C · RSI/SMA OB-OS REVERSAL"
     if "PULLBACK_RECLAIM_" in upper or "PULLBACK_MICRO_BOS_" in upper:
         return "B · PULLBACK RECLAIM/BOS"
     return None
@@ -159,7 +154,6 @@ class Bot(base.Bot):
             _LOG.error("[EMA STATS] journal write failed: %s", exc)
 
     def _paper_trade_finalize(self, symbol: str, pos: dict, final_order, exit_reason: str) -> dict | None:
-        """Write exactly one completed EMA Hybrid trade, including both 2TP legs."""
         if not self.cfg.paper or pos.get("ema_trade_journaled"):
             return None
         entry = float(pos.get("entry") or 0.0)
@@ -279,7 +273,6 @@ class Bot(base.Bot):
             self._save_state()
 
     async def _manage(self, symbol: str, st: dict):
-        """EMA 2TP manager with explicit Telegram lifecycle alerts."""
         pos = st.get("pos") or {}
         side = str(pos.get("side") or "").lower()
         entry = float(pos.get("entry") or 0.0)
@@ -367,7 +360,6 @@ class Bot(base.Bot):
         return await super()._manage(symbol, st)
 
     async def _build_stats_report(self) -> str:
-        """EMA-native stats with by-symbol and by-setup attribution."""
         if not self.cfg.paper:
             inherited = await super()._build_stats_report()
             lines = inherited.splitlines()
@@ -394,7 +386,7 @@ class Bot(base.Bot):
 
         def row_setup_key(r: dict) -> str:
             explicit = str(r.get("setup") or "")
-            if explicit in {"A_EMA_CROSS", "B_PULLBACK_RECLAIM", "C_RSI_SMA_REVERSAL"}:
+            if explicit in {"A_EMA_CROSS", "B_PULLBACK_RECLAIM"}:
                 return explicit
             return _setup_key_from_trigger(str(r.get("trigger") or ""))
 
@@ -428,7 +420,6 @@ class Bot(base.Bot):
         setup_names = (
             ("A_EMA_CROSS", "A EMA CROSS"),
             ("B_PULLBACK_RECLAIM", "B PULLBACK"),
-            ("C_RSI_SMA_REVERSAL", "C RSI/SMA REV"),
         )
         for key, label in setup_names:
             block = [r for r in month_rows if row_setup_key(r) == key]
@@ -461,7 +452,7 @@ class Bot(base.Bot):
             sep,
             f"BY SETUP — {month_label}",
             sep,
-            *(by_setup or ["(no completed A/B/C setup trades this month)"]),
+            *(by_setup or ["(no completed A/B setup trades this month)"]),
             "",
             sep,
             f"SINCE {since_label}",
@@ -491,7 +482,7 @@ class Bot(base.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== EMA HYBRID PRO MULTI-SETUP MTF [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
+            "=== EMA HYBRID PRO A+B MTF [%s] symbols=%s margin=$%.2f leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE", self.cfg.symbols,
             self.cfg.margin_per_position_usd, self.cfg.leverage, self.cfg.max_positions, balance,
         )
@@ -502,15 +493,14 @@ class Bot(base.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"📈 *EMA Hybrid Pro Multi-Setup — {mode}*\n"
+                f"📈 *EMA Hybrid Pro A+B — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
-                "15M Bias → 5M Multi-Setup Execution\n"
+                "15M Bias → 5M A/B Execution\n"
                 f"15M Bias: Close vs SMA{self.strat.SMA_LEN} + RSI{self.strat.RSI_LEN} side of `{self.strat.BIAS_RSI_MID:.0f}`\n"
                 f"A: EMA{self.strat.EMA_FAST}/{self.strat.EMA_SLOW} fresh cross\n"
                 "B: Pullback to EMA13 → reclaim / micro BOS\n"
-                f"C: RSI{self.strat.RSI5_LEN}/SMA{self.strat.RSI5_SMA_LEN} reversal from OS `≤{self.strat.RSI_OS:.0f}` / OB `≥{self.strat.RSI_OB:.0f}`\n"
                 f"5M Quality: ADX `≥{self.strat.ADX_MIN:.0f}` | CHOP `≤{self.strat.CHOP_MAX:.0f}`\n"
                 f"SL: `5M structure + {self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
                 f"TP1: `+{self.TP1_R:.1f}R` → trim `{self.TP1_TRIM_PCT*100:.0f}%` → SL `BE+{self.TP1_LOCK_R:.2f}R`\n"
@@ -518,7 +508,7 @@ class Bot(base.Bot):
                 "Telegram: Entry + Setup Engine + TP1 + TP2/SL/TP1_LOCK alerts\n"
                 "PAPER entries: `24/7` | LIVE entries: `24/5` | Open positions managed: `24/7`"
             )
-        _LOG.info("EMA Hybrid Multi-Setup startup complete: A/B/C attribution + lifecycle Telegram alerts active")
+        _LOG.info("EMA Hybrid A+B startup complete: setup attribution + lifecycle Telegram alerts active")
 
 
 async def _main():
