@@ -1,21 +1,25 @@
-"""Adaptive SMC MTF V7.1 indicator engine.
+"""Adaptive SMC MTF V7.2 indicator engine.
 
 Closed-candle pipeline:
   4H  TSS-style direction (EMA20/50 + HMA16 slope)
   15M Market Structure (HH/HL, LH/LL, BOS/CHOCH)
   5M  AMD liquidity setup
-  1M  IFVG location -> micro BOS/CHOCH confirmation -> execution
+  1M  IFVG -> micro BOS -> pullback/no-chase execution
 
-V7.1 fixes the main V7 weakness: an IFVG retest is a location, not proof that
-short-term order flow has actually turned.  Entry therefore requires a fresh
-M1 break of micro structure after the IFVG retest.  Stops are built from the
-M1 confirmation swing plus the M5 manipulation extreme and an ATR buffer.
+V7.2 keeps the V7.1 confirmation, but refuses to chase price after the micro
+BOS.  A setup stays armed briefly and entry is allowed only when price pulls
+back close to the IFVG while preserving the confirmed direction.  The engine
+also exports a stable AMD-cycle id for loss re-arm protection and an M5 swing
+trail for post-TP1 runner management.
 """
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 import math
 
 ENGINE_SCHEMA = "adaptive-smc-mtf-v1"
+NO_CHASE_ATR1 = 0.50
+BOS_ARM_BARS = 8
+RUNNER_ATR5_BUFFER = 0.12
 
 
 def _v(c: Any, name: str, idx: int) -> float:
@@ -23,6 +27,13 @@ def _v(c: Any, name: str, idx: int) -> float:
     if v is None and isinstance(c, dict): v = c.get(name)
     if v is None and isinstance(c, (list, tuple)) and len(c) > idx: v = c[idx]
     return float(v or 0.0)
+
+
+def _ts(c: Any):
+    v = getattr(c, "timestamp", None)
+    if v is None and isinstance(c, dict): v = c.get("timestamp")
+    if v is None and isinstance(c, (list, tuple)) and c: v = c[0]
+    return str(v or "0")
 
 
 def _series(c, name, idx): return [_v(x, name, idx) for x in c]
@@ -123,7 +134,9 @@ def _amd_5m(candles):
     if ok and si is not None and si<len(c)-1:
         sr=any(c[i]<l[si] or (c[i]<o[i] and o[i]-c[i]>=.55*atr and c[i]<(hi+lo)/2) for i in range(si+1,len(c)))
     phase="DISTRIBUTION_LONG" if lr and not sr else "DISTRIBUTION_SHORT" if sr and not lr else "MANIPULATION" if li is not None or si is not None else "ACCUMULATION" if ok else "WAIT"
-    return {"phase":phase,"long_ready":lr,"short_ready":sr,"accumulation_ok":ok,"range_high":hi,"range_low":lo,"manipulation_low":min(l[a1:]),"manipulation_high":max(h[a1:]),"atr":atr}
+    long_id=f"L:{_ts(candles[li])}:{hi:.8g}:{lo:.8g}" if li is not None else ""
+    short_id=f"S:{_ts(candles[si])}:{hi:.8g}:{lo:.8g}" if si is not None else ""
+    return {"phase":phase,"long_ready":lr,"short_ready":sr,"accumulation_ok":ok,"range_high":hi,"range_low":lo,"manipulation_low":min(l[a1:]),"manipulation_high":max(h[a1:]),"atr":atr,"long_cycle_id":long_id,"short_cycle_id":short_id}
 
 
 def _ifvg_1m(candles,direction):
@@ -135,42 +148,51 @@ def _ifvg_1m(candles,direction):
             if h[i]>=l[i-2]:continue
             zl,zh=h[i],l[i-2]; inv=next((j for j in range(i+1,len(c)) if c[j]>zh),None)
             if inv is None or inv>=len(c)-1:continue
-            rs=[j for j in range(max(inv+1,len(c)-5),len(c)) if l[j]<=zh+tol and c[j]>=zh]
+            rs=[j for j in range(max(inv+1,len(c)-8),len(c)) if l[j]<=zh+tol and c[j]>=zl]
             if not rs:continue
             j=rs[-1]
-            if not (c[j]>o[j] or c[-1]>zh):continue
         else:
             if l[i]<=h[i-2]:continue
             zl,zh=h[i-2],l[i]; inv=next((j for j in range(i+1,len(c)) if c[j]<zl),None)
             if inv is None or inv>=len(c)-1:continue
-            rs=[j for j in range(max(inv+1,len(c)-5),len(c)) if h[j]>=zl-tol and c[j]<=zl]
+            rs=[j for j in range(max(inv+1,len(c)-8),len(c)) if h[j]>=zl-tol and c[j]<=zh]
             if not rs:continue
             j=rs[-1]
-            if not (c[j]<o[j] or c[-1]<zl):continue
         candidates.append({"valid":True,"direction":direction,"zone_low":zl,"zone_high":zh,"fvg_index":i,"invert_index":inv,"retest_index":j,"age":len(c)-1-j,"atr":atr})
     return candidates[-1] if candidates else {"valid":False,"direction":direction,"atr":atr}
 
 
 def _micro_confirm(candles,direction,ifvg):
-    """Require a fresh M1 BOS after the IFVG retest; returns confirmation swing."""
-    if not ifvg.get("valid"):return {"confirmed":False,"direction":direction,"reason":"NO_IFVG"}
+    if not ifvg.get("valid"):return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"NO_IFVG"}
     h=_series(candles,"high",2); l=_series(candles,"low",3); c=_series(candles,"close",4)
-    ret=int(ifvg.get("retest_index",len(c)-1)); start=max(3,ret-12)
-    ph=[p for p in _pivots(h,"high",1,1) if start<=p[0]<ret]
-    pl=[p for p in _pivots(l,"low",1,1) if start<=p[0]<ret]
+    _,atr=_atr(candles); ret=int(ifvg.get("retest_index",len(c)-1)); start=max(3,ret-12)
+    ph=[p for p in _pivots(h,"high",1,1) if start<=p[0]<ret]; pl=[p for p in _pivots(l,"low",1,1) if start<=p[0]<ret]
     if direction=="LONG":
-        if not ph:return {"confirmed":False,"direction":direction,"reason":"NO_MICRO_HIGH"}
+        if not ph:return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"NO_MICRO_HIGH"}
         level=ph[-1][1]; breaks=[i for i in range(ret+1,len(c)) if c[i]>level]
-        if not breaks:return {"confirmed":False,"direction":direction,"reason":"WAIT_BOS_UP","level":level}
-        bi=breaks[0]; swing=min(l[max(start,ret-2):bi+1])
+        if not breaks:return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"WAIT_BOS_UP","level":level}
+        bi=breaks[0]; swing=min(l[max(start,ret-2):bi+1]); age=len(c)-1-bi; armed=age<=BOS_ARM_BARS
+        # Do not market-chase the breakout. Price must pull back near the IFVG.
+        distance=max(0.0,c[-1]-float(ifvg["zone_high"])); near=distance<=NO_CHASE_ATR1*atr
+        retest_now=l[-1]<=float(ifvg["zone_high"])+NO_CHASE_ATR1*atr and c[-1]>=float(ifvg["zone_low"])
+        ready=armed and near and retest_now
     else:
-        if not pl:return {"confirmed":False,"direction":direction,"reason":"NO_MICRO_LOW"}
+        if not pl:return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"NO_MICRO_LOW"}
         level=pl[-1][1]; breaks=[i for i in range(ret+1,len(c)) if c[i]<level]
-        if not breaks:return {"confirmed":False,"direction":direction,"reason":"WAIT_BOS_DOWN","level":level}
-        bi=breaks[0]; swing=max(h[max(start,ret-2):bi+1])
-    # Confirmation must remain fresh; otherwise we are chasing a move that left the IFVG.
-    age=len(c)-1-bi
-    return {"confirmed":age<=2,"direction":direction,"reason":"MICRO_BOS" if age<=2 else "BOS_STALE","level":level,"break_index":bi,"break_age":age,"swing":swing}
+        if not breaks:return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"WAIT_BOS_DOWN","level":level}
+        bi=breaks[0]; swing=max(h[max(start,ret-2):bi+1]); age=len(c)-1-bi; armed=age<=BOS_ARM_BARS
+        distance=max(0.0,float(ifvg["zone_low"])-c[-1]); near=distance<=NO_CHASE_ATR1*atr
+        retest_now=h[-1]>=float(ifvg["zone_low"])-NO_CHASE_ATR1*atr and c[-1]<=float(ifvg["zone_high"])
+        ready=armed and near and retest_now
+    reason="PULLBACK_READY" if ready else "WAIT_PULLBACK" if armed else "BOS_STALE"
+    return {"confirmed":True,"armed":armed,"entry_ready":ready,"direction":direction,"reason":reason,"level":level,"break_index":bi,"break_age":age,"swing":swing,"distance_atr":distance/max(atr,1e-12)}
+
+
+def _runner_trails(c5m, atr5):
+    h=_series(c5m,"high",2); l=_series(c5m,"low",3); ph=_pivots(h,"high",1,1); pl=_pivots(l,"low",1,1)
+    long_trail=(pl[-1][1]-RUNNER_ATR5_BUFFER*atr5) if pl else 0.0
+    short_trail=(ph[-1][1]+RUNNER_ATR5_BUFFER*atr5) if ph else 0.0
+    return long_trail,short_trail
 
 
 def compute(c1m,c5m=None,c15m=None,c4h=None):
@@ -179,18 +201,17 @@ def compute(c1m,c5m=None,c15m=None,c4h=None):
     tss=_tss_4h(c4h); ms=_structure_15m(c15m); amd=_amd_5m(c5m)
     il=_ifvg_1m(c1m,"LONG"); is_=_ifvg_1m(c1m,"SHORT"); ml=_micro_confirm(c1m,"LONG",il); ms1=_micro_confirm(c1m,"SHORT",is_)
     c1=_series(c1m,"close",4); o1=_series(c1m,"open",1); h1=_series(c1m,"high",2); l1=_series(c1m,"low",3); v1=_series(c1m,"volume",5)
-    c15=_series(c15m,"close",4); e15=ema(c15,20); _,a1=_atr(c1m); r=_rsi(c1); _,a5=_atr(c5m)
-    long_sig=tss.get("bias")=="LONG" and ms.get("allow_long") and amd.get("long_ready") and il.get("valid") and ml.get("confirmed")
-    short_sig=tss.get("bias")=="SHORT" and ms.get("allow_short") and amd.get("short_ready") and is_.get("valid") and ms1.get("confirmed")
+    c15=_series(c15m,"close",4); e15=ema(c15,20); _,a1=_atr(c1m); r=_rsi(c1); _,a5=_atr(c5m); rtl,rts=_runner_trails(c5m,a5)
+    long_sig=tss.get("bias")=="LONG" and ms.get("allow_long") and amd.get("long_ready") and il.get("valid") and ml.get("entry_ready")
+    short_sig=tss.get("bias")=="SHORT" and ms.get("allow_short") and amd.get("short_ready") and is_.get("valid") and ms1.get("entry_ready")
     d="LONG" if long_sig else "SHORT" if short_sig else "NONE"; chosen=il if d=="LONG" else is_ if d=="SHORT" else {}; micro=ml if d=="LONG" else ms1 if d=="SHORT" else {}
-    sl=0.0
+    sl=0.0; cycle=""
     if d=="LONG":
-        # Lower of M5 manipulation and M1 confirmation swing, then volatility buffer.
-        structural=min(float(amd["manipulation_low"]),float(micro["swing"])); sl=structural-.15*a5
+        structural=min(float(amd["manipulation_low"]),float(micro["swing"])); sl=structural-.15*a5; cycle=amd.get("long_cycle_id","")
     elif d=="SHORT":
-        structural=max(float(amd["manipulation_high"]),float(micro["swing"])); sl=structural+.15*a5
-    trigger=f"4H {tss['bias']} → M15 {ms['state']} → M5 {amd['phase']} → M1 IFVG → MICRO BOS {d}" if d!="NONE" else ""
-    return {"schema":ENGINE_SCHEMA,"timeframe":"1M_EXECUTION_V7_1","open":o1[-1],"high":h1[-1],"low":l1[-1],"close":c1[-1],"volume":v1[-1],"atr1":a1,"atr5":a5,"rsi1":r[-1],"m15_close":c15[-1],"m15_ema20":e15[-1],"tss_bias":tss.get("bias","NEUTRAL"),"tss_score":float(tss.get("score",0)),"tss":tss,"structure":ms.get("state","UNKNOWN"),"structure_bias":ms.get("bias","NEUTRAL"),"m15":ms,"amd_phase":amd.get("phase","WAIT"),"amd":amd,"ifvg_long":il,"ifvg_short":is_,"micro_long":ml,"micro_short":ms1,"micro_confirmed":bool(micro.get("confirmed")),"micro_level":float(micro.get("level",0) or 0),"micro_swing":float(micro.get("swing",0) or 0),"ifvg_valid":bool(chosen.get("valid")),"ifvg_low":float(chosen.get("zone_low",0) or 0),"ifvg_high":float(chosen.get("zone_high",0) or 0),"manipulation_low":float(amd.get("manipulation_low",0) or 0),"manipulation_high":float(amd.get("manipulation_high",0) or 0),"sl":sl,"long_signal":long_sig,"short_signal":short_sig,"direction":d,"trigger":trigger,"runner_exit_long":bool(ms.get("choch_down")) or amd.get("phase")=="DISTRIBUTION_SHORT","runner_exit_short":bool(ms.get("choch_up")) or amd.get("phase")=="DISTRIBUTION_LONG"}
+        structural=max(float(amd["manipulation_high"]),float(micro["swing"])); sl=structural+.15*a5; cycle=amd.get("short_cycle_id","")
+    trigger=f"4H {tss['bias']} → M15 {ms['state']} → M5 {amd['phase']} → M1 IFVG → MICRO BOS → PULLBACK {d}" if d!="NONE" else ""
+    return {"schema":ENGINE_SCHEMA,"timeframe":"1M_EXECUTION_V7_2","open":o1[-1],"high":h1[-1],"low":l1[-1],"close":c1[-1],"volume":v1[-1],"atr1":a1,"atr5":a5,"rsi1":r[-1],"m15_close":c15[-1],"m15_ema20":e15[-1],"tss_bias":tss.get("bias","NEUTRAL"),"tss_score":float(tss.get("score",0)),"tss":tss,"structure":ms.get("state","UNKNOWN"),"structure_bias":ms.get("bias","NEUTRAL"),"m15":ms,"amd_phase":amd.get("phase","WAIT"),"amd":amd,"amd_cycle_id":cycle,"ifvg_long":il,"ifvg_short":is_,"micro_long":ml,"micro_short":ms1,"micro_confirmed":bool(micro.get("confirmed")),"micro_armed":bool(micro.get("armed")),"pullback_ready":bool(micro.get("entry_ready")),"micro_level":float(micro.get("level",0) or 0),"micro_swing":float(micro.get("swing",0) or 0),"ifvg_valid":bool(chosen.get("valid")),"ifvg_low":float(chosen.get("zone_low",0) or 0),"ifvg_high":float(chosen.get("zone_high",0) or 0),"manipulation_low":float(amd.get("manipulation_low",0) or 0),"manipulation_high":float(amd.get("manipulation_high",0) or 0),"runner_trail_long":rtl,"runner_trail_short":rts,"sl":sl,"long_signal":long_sig,"short_signal":short_sig,"direction":d,"trigger":trigger,"runner_exit_long":bool(ms.get("choch_down")),"runner_exit_short":bool(ms.get("choch_up"))}
 
 
 class IndicatorEngine:
