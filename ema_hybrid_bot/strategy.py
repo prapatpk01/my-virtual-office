@@ -1,4 +1,4 @@
-"""EMA Hybrid balanced MTF execution with three 5M entry setups.
+"""EMA Hybrid balanced MTF execution with two 5M entry setups.
 
 15M = light directional bias only:
 - LONG bias: close > SMA14 and RSI14 >= 50
@@ -11,11 +11,8 @@ B) PULLBACK RECLAIM
    - EMA8/13 trend remains intact
    - price recently pulls into EMA13 zone
    - fresh EMA13 reclaim or micro BOS in the bias direction
-C) RSI/SMA REVERSAL
-   - RSI14 and SMA14-of-RSI recently both <= 35 for LONG, then RSI crosses up
-   - RSI14 and SMA14-of-RSI recently both >= 70 for SHORT, then RSI crosses down
 
-All 5M setups keep the existing quality gate:
+Both setups keep the existing quality gate:
 - ADX >= 12
 - CHOP <= 65
 
@@ -58,13 +55,11 @@ class TriggerView:
     chop: float
     setup: str
     trigger: str
-    rsi: float
-    rsi_sma: float
     reason: str
 
 
 class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
-    """15M bias + three 5M execution setups."""
+    """15M bias + Setup A EMA cross + Setup B pullback reclaim/BOS."""
 
     SL_BUFFER_ATR = float(os.getenv("EMA_ADV_SL_BUFFER_ATR", "0.25"))
     TP2_MIN_RR = float(os.getenv("EMA_ADV_TP2_MIN_RR", "1.30"))
@@ -76,12 +71,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
     RSI_LEN = int(os.getenv("EMA_15M_RSI_LEN", "14"))
     SMA_LEN = int(os.getenv("EMA_15M_SMA_LEN", "14"))
     BIAS_RSI_MID = float(os.getenv("EMA_15M_RSI_MID", "50"))
-
-    RSI5_LEN = int(os.getenv("EMA_5M_RSI_LEN", "14"))
-    RSI5_SMA_LEN = int(os.getenv("EMA_5M_RSI_SMA_LEN", "14"))
-    RSI_OS = float(os.getenv("EMA_5M_RSI_OS", "35"))
-    RSI_OB = float(os.getenv("EMA_5M_RSI_OB", "70"))
-    RSI_REV_LOOKBACK = max(2, int(os.getenv("EMA_5M_RSI_REV_LOOKBACK", "4")))
 
     PULLBACK_LOOKBACK = max(3, int(os.getenv("EMA_5M_PULLBACK_LOOKBACK", "6")))
     PULLBACK_TOUCH_ATR = float(os.getenv("EMA_5M_PULLBACK_TOUCH_ATR", "0.20"))
@@ -125,10 +114,6 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         d["ema_fast"] = self._ema(c, self.EMA_FAST)
         d["ema_slow"] = self._ema(c, self.EMA_SLOW)
         d["atr"] = self._atr(d, self.cfg.atr_len)
-        d["rsi5"] = self._rsi(c, self.RSI5_LEN)
-        d["rsi_sma"] = d["rsi5"].rolling(
-            self.RSI5_SMA_LEN, min_periods=self.RSI5_SMA_LEN
-        ).mean()
         return d
 
     def _prep15(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -164,23 +149,12 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
     def _trigger5(self, df5: pd.DataFrame, bias_side: Optional[Side]) -> TriggerView:
         if len(df5) < 80 or bias_side is None:
-            return TriggerView(
-                None, False, 0.0, 100.0, "NONE", "NONE", 0.0, 0.0,
-                "5M WAIT: no valid 15M bias",
-            )
+            return TriggerView(None, False, 0.0, 100.0, "NONE", "NONE", "5M WAIT: no valid 15M bias")
 
         d = self._prep5(df5)
         r, p = d.iloc[-1], d.iloc[-2]
-        if pd.isna(r.rsi5) or pd.isna(r.rsi_sma) or pd.isna(p.rsi5) or pd.isna(p.rsi_sma):
-            return TriggerView(
-                bias_side, False, 0.0, 100.0, "NONE", "NONE", 0.0, 0.0,
-                "5M WARMUP: RSI/SMA",
-            )
-
         adx, chop = self._quality_values_5m(d)
         quality_ok = adx >= self.ADX_MIN and chop <= self.CHOP_MAX
-        rsi_now = float(r.rsi5)
-        rsi_sma_now = float(r.rsi_sma)
 
         # Setup A — fresh EMA8/13 cross.
         cross_up = float(p.ema_fast) <= float(p.ema_slow) and float(r.ema_fast) > float(r.ema_slow)
@@ -205,74 +179,43 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         pullback_long = long_trend_intact and long_touch and (long_reclaim or long_bos)
         pullback_short = short_trend_intact and short_touch and (short_reclaim or short_bos)
 
-        # Setup C — RSI14 crosses its SMA14 after both were in an extreme zone.
-        rev_window = d.iloc[-(self.RSI_REV_LOOKBACK + 1):-1]
-        recent_os = bool(((rev_window.rsi5 <= self.RSI_OS) & (rev_window.rsi_sma <= self.RSI_OS)).any())
-        recent_ob = bool(((rev_window.rsi5 >= self.RSI_OB) & (rev_window.rsi_sma >= self.RSI_OB)).any())
-        rsi_cross_up = float(p.rsi5) <= float(p.rsi_sma) and rsi_now > rsi_sma_now
-        rsi_cross_down = float(p.rsi5) >= float(p.rsi_sma) and rsi_now < rsi_sma_now
-        rsi_long = recent_os and rsi_cross_up and float(r.close) > float(p.close)
-        rsi_short = recent_ob and rsi_cross_down and float(r.close) < float(p.close)
-
         if bias_side == Side.LONG:
             if cross_up and quality_ok:
                 return TriggerView(
                     Side.LONG, True, adx, chop, "A_EMA_CROSS", "EMA5M_CROSS_UP",
-                    rsi_now, rsi_sma_now, "5M READY LONG: Setup A EMA8/13 CROSS UP",
-                )
-            if rsi_long and quality_ok:
-                return TriggerView(
-                    Side.LONG, True, adx, chop, "C_RSI_SMA_REVERSAL", "RSI_SMA_OS_REVERSAL_LONG",
-                    rsi_now, rsi_sma_now,
-                    f"5M READY LONG: Setup C RSI/SMA reversal from OS<={self.RSI_OS:.0f}",
+                    "5M READY LONG: Setup A EMA8/13 CROSS UP",
                 )
             if pullback_long and quality_ok:
                 event = "RECLAIM" if long_reclaim else "MICRO_BOS"
                 return TriggerView(
                     Side.LONG, True, adx, chop, "B_PULLBACK_RECLAIM", f"PULLBACK_{event}_LONG",
-                    rsi_now, rsi_sma_now, f"5M READY LONG: Setup B {event}",
+                    f"5M READY LONG: Setup B {event}",
                 )
 
-            filtered = (
-                "EMA_CROSS" if cross_up else
-                "RSI_OS_REV" if rsi_long else
-                "PULLBACK" if pullback_long else
-                "WAIT"
-            )
+            filtered = "EMA_CROSS" if cross_up else "PULLBACK" if pullback_long else "WAIT"
             suffix = " FILTERED" if filtered != "WAIT" and not quality_ok else ""
             return TriggerView(
-                Side.LONG, False, adx, chop, "NONE", "NONE", rsi_now, rsi_sma_now,
-                f"5M {filtered}{suffix} LONG | RSI={rsi_now:.1f}/SMA={rsi_sma_now:.1f}",
+                Side.LONG, False, adx, chop, "NONE", "NONE",
+                f"5M {filtered}{suffix} LONG",
             )
 
         if cross_down and quality_ok:
             return TriggerView(
                 Side.SHORT, True, adx, chop, "A_EMA_CROSS", "EMA5M_CROSS_DOWN",
-                rsi_now, rsi_sma_now, "5M READY SHORT: Setup A EMA8/13 CROSS DOWN",
-            )
-        if rsi_short and quality_ok:
-            return TriggerView(
-                Side.SHORT, True, adx, chop, "C_RSI_SMA_REVERSAL", "RSI_SMA_OB_REVERSAL_SHORT",
-                rsi_now, rsi_sma_now,
-                f"5M READY SHORT: Setup C RSI/SMA reversal from OB>={self.RSI_OB:.0f}",
+                "5M READY SHORT: Setup A EMA8/13 CROSS DOWN",
             )
         if pullback_short and quality_ok:
             event = "RECLAIM" if short_reclaim else "MICRO_BOS"
             return TriggerView(
                 Side.SHORT, True, adx, chop, "B_PULLBACK_RECLAIM", f"PULLBACK_{event}_SHORT",
-                rsi_now, rsi_sma_now, f"5M READY SHORT: Setup B {event}",
+                f"5M READY SHORT: Setup B {event}",
             )
 
-        filtered = (
-            "EMA_CROSS" if cross_down else
-            "RSI_OB_REV" if rsi_short else
-            "PULLBACK" if pullback_short else
-            "WAIT"
-        )
+        filtered = "EMA_CROSS" if cross_down else "PULLBACK" if pullback_short else "WAIT"
         suffix = " FILTERED" if filtered != "WAIT" and not quality_ok else ""
         return TriggerView(
-            Side.SHORT, False, adx, chop, "NONE", "NONE", rsi_now, rsi_sma_now,
-            f"5M {filtered}{suffix} SHORT | RSI={rsi_now:.1f}/SMA={rsi_sma_now:.1f}",
+            Side.SHORT, False, adx, chop, "NONE", "NONE",
+            f"5M {filtered}{suffix} SHORT",
         )
 
     def _structure_stop(self, d: pd.DataFrame, side: Side, entry: float) -> tuple[float, float]:
@@ -337,8 +280,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         structure_px = sl + self.SL_BUFFER_ATR * atr if trigger.side == Side.LONG else sl - self.SL_BUFFER_ATR * atr
 
         reason = (
-            f"EMA Hybrid MULTI-SETUP | {bias.reason} | {trigger.setup} | {trigger.trigger} | "
-            f"RSI5M={trigger.rsi:.1f} RSI-SMA={trigger.rsi_sma:.1f} | "
+            f"EMA Hybrid A+B | {bias.reason} | {trigger.setup} | {trigger.trigger} | "
             f"ADX5M={trigger.adx:.1f} CHOP5M={trigger.chop:.1f} | "
             f"SL=5M structure+{self.SL_BUFFER_ATR:.2f}ATR | "
             f"TP1=1R trim60% + SL BE+0.15R | TP2={target_type} {rr:.2f}R"
@@ -359,9 +301,8 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         side = bias.side.value if bias.side is not None else "NEUTRAL"
 
         return (
-            f"MULTI-SETUP MTF | 15M Bias={side} Close={bias.close:.6g} SMA14={bias.sma14:.6g} RSI14={bias.rsi:.1f} | "
+            f"A+B MTF | 15M Bias={side} Close={bias.close:.6g} SMA14={bias.sma14:.6g} RSI14={bias.rsi:.1f} | "
             f"5M={trigger.reason} ADX={trigger.adx:.1f} CHOP={trigger.chop:.1f} | "
             f"A=EMA{self.EMA_FAST}/{self.EMA_SLOW} Cross | B=Pullback Reclaim/BOS | "
-            f"C=RSI{self.RSI5_LEN}/SMA{self.RSI5_SMA_LEN} OS<={self.RSI_OS:.0f} OB>={self.RSI_OB:.0f} reversal | "
             f"Quality ADX>={self.ADX_MIN:.0f} CHOP<={self.CHOP_MAX:.0f} | Schedule={sched}"
         )
