@@ -1,9 +1,11 @@
-"""EMA Hybrid A+B Quality V2.1 runtime wrapper.
+"""EMA Hybrid A+B+C Quality V2.2 runtime wrapper.
 
-Keeps the proven EMA Hybrid runtime/journal/Telegram lifecycle code in main_core.py
-and adds quality-v2 startup diagnostics plus the XAU/XAG same-direction exposure guard.
-Also normalizes legacy client helpers that may be synchronous even though the EMA
-runtime awaits them, preventing NoneType/tuple await crashes during position management.
+A = EMA8/13 cross
+B = pullback reclaim / strict micro BOS
+C = Bollinger + MACD + KDJ trend-aligned reversal confirmation
+
+Keeps the proven EMA Hybrid runtime/journal/Telegram lifecycle code in main_core.py,
+plus XAU/XAG correlation protection and sync/async client compatibility.
 """
 from __future__ import annotations
 
@@ -11,10 +13,43 @@ import asyncio
 import inspect
 import os
 import signal
+from datetime import datetime, timezone
 
 import main_core as core
+import strategy_c as setup_c
 
 _LOG = core._LOG
+
+
+# Extend the existing runtime attribution without rewriting main_core.py.
+_BASE_SETUP_KEY = core._setup_key_from_trigger
+_BASE_SETUP_LABEL = core._setup_label_from_trigger
+_BASE_SETUP_TEXT = core._setup_label_from_text
+
+
+def _setup_key_from_trigger(trigger: str) -> str:
+    t = str(trigger or "").upper()
+    if "BOLL_MACD_KDJ_" in t:
+        return "C_BOLL_MACD_KDJ"
+    return _BASE_SETUP_KEY(trigger)
+
+
+def _setup_label_from_trigger(trigger: str) -> str:
+    if _setup_key_from_trigger(trigger) == "C_BOLL_MACD_KDJ":
+        return "C · BOLL+MACD+KDJ REVERSAL"
+    return _BASE_SETUP_LABEL(trigger)
+
+
+def _setup_label_from_text(text: str) -> str | None:
+    upper = str(text or "").upper()
+    if "BOLL_MACD_KDJ_" in upper:
+        return "C · BOLL+MACD+KDJ REVERSAL"
+    return _BASE_SETUP_TEXT(text)
+
+
+core._setup_key_from_trigger = _setup_key_from_trigger
+core._setup_label_from_trigger = _setup_label_from_trigger
+core._setup_label_from_text = _setup_label_from_text
 
 
 class Bot(core.Bot):
@@ -24,6 +59,8 @@ class Bot(core.Bot):
 
     def __init__(self):
         super().__init__()
+        # Replace only the strategy object; all proven execution/journal/TG lifecycle stays in core.Bot.
+        self.strat = setup_c.EMAHybridProStrategy(self.cfg.strategy_config())
         self._install_client_await_compat()
         self.strat.correlation_guard = self._metal_correlation_blocked
 
@@ -90,6 +127,48 @@ class Bot(core.Bot):
             )
         return blocked
 
+    async def _build_stats_report(self) -> str:
+        """Add Setup C attribution to the existing A/B advanced stats."""
+        report = await super()._build_stats_report()
+        if not self.cfg.paper:
+            return report
+
+        now = datetime.now(timezone.utc)
+        month_start = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        c_rows = [
+            r for r in self.ema_journal
+            if int(r.get("close_ms") or 0) >= month_start
+            and (
+                str(r.get("setup") or "") == "C_BOLL_MACD_KDJ"
+                or "BOLL_MACD_KDJ_" in str(r.get("trigger") or "").upper()
+            )
+        ]
+        if not c_rows:
+            return report
+
+        wins = sum(1 for r in c_rows if float(r.get("pnl") or 0.0) > 0)
+        net = sum(float(r.get("pnl") or 0.0) for r in c_rows)
+        gross_win = sum(float(r.get("pnl") or 0.0) for r in c_rows if float(r.get("pnl") or 0.0) > 0)
+        gross_loss = abs(sum(float(r.get("pnl") or 0.0) for r in c_rows if float(r.get("pnl") or 0.0) < 0))
+        pf = gross_win / gross_loss if gross_loss > 1e-12 else (float("inf") if gross_win > 0 else 0.0)
+        wr = wins / len(c_rows) * 100.0
+        pf_text = "∞" if pf == float("inf") else f"{pf:.2f}"
+        c_line = f"C BOLL/MACD/KDJ {len(c_rows)} | {wr:.0f}% WR | PF {pf_text} | ${net:+.2f}"
+
+        lines = report.splitlines()
+        section = next((i for i, line in enumerate(lines) if line.startswith("BY SETUP —")), None)
+        if section is None:
+            return report
+
+        insert_at = section + 2
+        while insert_at < len(lines) and lines[insert_at] != "":
+            if lines[insert_at].startswith("(no completed"):
+                lines.pop(insert_at)
+                continue
+            insert_at += 1
+        lines.insert(insert_at, c_line)
+        return "\n".join(lines)
+
     async def start(self):
         problems = self.cfg.validate_live()
         if problems:
@@ -99,7 +178,7 @@ class Bot(core.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== EMA HYBRID A+B QUALITY V2.1 [%s] symbols=%s margin=$%.2f "
+            "=== EMA HYBRID A+B+C QUALITY V2.2 [%s] symbols=%s margin=$%.2f "
             "leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE",
             self.cfg.symbols,
@@ -116,7 +195,7 @@ class Bot(core.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"📈 *EMA Hybrid A+B Quality V2.1 — {mode}*\n"
+                f"📈 *EMA Hybrid A+B+C Quality V2.2 — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
@@ -124,20 +203,23 @@ class Bot(core.Bot):
                 f"+ SMA slope UP | SHORT Close<SMA{self.strat.SMA_LEN} + RSI≤`{self.strat.BIAS_RSI_SHORT_MAX:.0f}` "
                 "+ SMA slope DOWN\n"
                 f"A: EMA{self.strat.EMA_FAST}/{self.strat.EMA_SLOW} fresh cross + direction candle + expanding spread\n"
+                f"C: BOLL({self.strat.BOLL_LEN},{self.strat.BOLL_STD:g}) band re-entry + MACD({self.strat.MACD_FAST},{self.strat.MACD_SLOW},{self.strat.MACD_SIGNAL}) momentum + "
+                f"KDJ({self.strat.KDJ_LEN},{self.strat.KDJ_SMOOTH_K},{self.strat.KDJ_SMOOTH_D}) OS≤`{self.strat.KDJ_OS:.0f}`/OB≥`{self.strat.KDJ_OB:.0f}` cross\n"
+                f"C Guard: BB width `≥{self.strat.C_BOLL_MIN_WIDTH_PCT*100:.2f}%` + ADX `≥{self.strat.ADX_MIN:.0f}` + CHOP `≤{self.strat.CHOP_MAX:.0f}` + price confirmation\n"
                 f"B1 Reclaim: EMA13 ±`{self.strat.PULLBACK_TOUCH_ATR:.2f} ATR` true-zone + EMA13 slope + ADX `≥{self.strat.ADX_MIN:.0f}` + CHOP `≤{self.strat.CHOP_MAX:.0f}`\n"
-                f"B2 Micro BOS: break `≥{self.strat.MICRO_BOS_BREAK_ATR:.2f} ATR` beyond structure + EMA spread expanding + ADX `≥{self.strat.MICRO_BOS_ADX_MIN:.0f}` rising + CHOP `≤{self.strat.MICRO_BOS_CHOP_MAX:.0f}`\n"
-                f"SL Gate: `{self.strat.SL_MIN_PCT*100:.2f}%–{self.strat.SL_MAX_PCT*100:.2f}%` "
-                f"| Structure buffer `{self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
+                f"B2 Micro BOS: break `≥{self.strat.MICRO_BOS_BREAK_ATR:.2f} ATR` + spread expanding + ADX `≥{self.strat.MICRO_BOS_ADX_MIN:.0f}` rising + CHOP `≤{self.strat.MICRO_BOS_CHOP_MAX:.0f}`\n"
+                "Priority: `A > C > B` when multiple setups fire on the same 5M close\n"
+                f"SL Gate: `{self.strat.SL_MIN_PCT*100:.2f}%–{self.strat.SL_MAX_PCT*100:.2f}%` | Structure buffer `{self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
                 f"TP1: `+{self.TP1_R:.1f}R` → trim `{self.TP1_TRIM_PCT*100:.0f}%` → SL `BE+{self.TP1_LOCK_R:.2f}R`\n"
                 f"TP2: next 5M liquidity/swing with room `≥{self.strat.TP2_MIN_RR:.1f}R`\n"
                 f"XAU/XAG same-direction guard: `{'ON' if self.METAL_CORR_GUARD else 'OFF'}`\n"
-                "Telegram: Entry + Setup Engine + TP1 + TP2/SL/TP1_LOCK alerts\n"
+                "Telegram: Entry + Setup A/B/C + TP1 + TP2/SL/TP1_LOCK alerts\n"
                 "PAPER entries: `24/7` | LIVE entries: `24/5` | Open positions managed: `24/7`"
             )
 
         _LOG.info(
-            "EMA Hybrid A+B Quality V2.1 startup complete: strict Micro BOS, "
-            "15M bias, SL sanity, metal correlation guard and await-compat active"
+            "EMA Hybrid A+B+C Quality V2.2 active: A>C>B priority, triple-confirm C, "
+            "strict B2, SL sanity, metal correlation guard and await-compat"
         )
 
 
