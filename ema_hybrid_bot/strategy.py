@@ -1,4 +1,4 @@
-"""EMA Hybrid A+B Quality V2.
+"""EMA Hybrid A+B Quality V2.1.
 
 15M bias:
 - LONG: close > SMA14, RSI14 >= 52, SMA14 slope > 0
@@ -10,12 +10,19 @@
 - EMA spread is expanding
 - ADX >= 15, CHOP <= 60
 
-5M setup B:
+5M setup B1 RECLAIM:
 - EMA8/13 trend intact
 - EMA13 slope agrees with direction
 - recent candle overlaps the true EMA13 +/- 0.20 ATR pullback zone
-- fresh EMA13 reclaim or micro BOS
+- fresh EMA13 reclaim
 - ADX >= 15, CHOP <= 60
+
+5M setup B2 MICRO BOS:
+- same pullback/trend requirements as B1
+- close must clear the prior micro structure by >= 0.10 ATR
+- EMA spread must be expanding
+- ADX >= 18 and rising
+- CHOP <= 55
 
 Risk:
 - SL = recent 5M structure +/- 0.25 ATR
@@ -62,7 +69,7 @@ class TriggerView:
 
 
 class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
-    """15M quality bias + Setup A EMA cross + Setup B pullback reclaim/BOS."""
+    """15M quality bias + Setup A cross + Setup B reclaim/strict micro BOS."""
 
     SL_BUFFER_ATR = float(os.getenv("EMA_ADV_SL_BUFFER_ATR", "0.25"))
     SL_MIN_PCT = float(os.getenv("EMA_5M_SL_MIN_PCT", "0.0035"))
@@ -85,6 +92,9 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
 
     ADX_MIN = float(os.getenv("EMA_5M_ADX_MIN", "15"))
     CHOP_MAX = float(os.getenv("EMA_5M_CHOP_MAX", "60"))
+    MICRO_BOS_ADX_MIN = float(os.getenv("EMA_5M_MICRO_BOS_ADX_MIN", "18"))
+    MICRO_BOS_CHOP_MAX = float(os.getenv("EMA_5M_MICRO_BOS_CHOP_MAX", "55"))
+    MICRO_BOS_BREAK_ATR = float(os.getenv("EMA_5M_MICRO_BOS_BREAK_ATR", "0.10"))
 
     SWING_LOOKBACK = max(20, int(os.getenv("EMA_5M_SWING_LOOKBACK", "48")))
     STRUCTURE_LOOKBACK = max(6, int(os.getenv("EMA_5M_STRUCTURE_LOOKBACK", "12")))
@@ -175,7 +185,13 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         d = self._prep5(df5)
         r, p = d.iloc[-1], d.iloc[-2]
         adx, chop = self._quality_values_5m(d)
+        prev_adx, _ = self._quality_values_5m(d.iloc[:-1])
         quality_ok = adx >= self.ADX_MIN and chop <= self.CHOP_MAX
+        micro_bos_quality_ok = (
+            adx >= self.MICRO_BOS_ADX_MIN
+            and adx > prev_adx
+            and chop <= self.MICRO_BOS_CHOP_MAX
+        )
 
         fast_now = float(r.ema_fast)
         slow_now = float(r.ema_slow)
@@ -196,7 +212,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         setup_a_long = cross_up and bull_candle and long_spread_expanding
         setup_a_short = cross_down and bear_candle and short_spread_expanding
 
-        # Setup B — true EMA13 +/- ATR zone + trend/slope + reclaim or micro BOS.
+        # Setup B — true EMA13 +/- ATR zone + trend/slope + reclaim or strict micro BOS.
         atr = max(float(r.atr), 1e-12)
         pb_window = d.iloc[-(self.PULLBACK_LOOKBACK + 1):-1]
         prior_high = float(d.high.iloc[-(self.BOS_LOOKBACK + 1):-1].max())
@@ -215,13 +231,28 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         ema13_slope = slow_now - slow_prev
         long_reclaim = float(p.close) <= slow_prev and float(r.close) > slow_now
         short_reclaim = float(p.close) >= slow_prev and float(r.close) < slow_now
-        long_bos = float(r.close) > prior_high and float(p.close) <= prior_high
-        short_bos = float(r.close) < prior_low and float(p.close) >= prior_low
+
+        raw_long_bos = float(r.close) > prior_high and float(p.close) <= prior_high
+        raw_short_bos = float(r.close) < prior_low and float(p.close) >= prior_low
+        break_buffer = self.MICRO_BOS_BREAK_ATR * atr
+        strict_long_bos = (
+            raw_long_bos
+            and float(r.close) >= prior_high + break_buffer
+            and long_spread_expanding
+        )
+        strict_short_bos = (
+            raw_short_bos
+            and float(r.close) <= prior_low - break_buffer
+            and short_spread_expanding
+        )
+
         long_trend_intact = fast_now > slow_now and ema13_slope > 0
         short_trend_intact = fast_now < slow_now and ema13_slope < 0
 
-        pullback_long = long_trend_intact and true_zone_touch and (long_reclaim or long_bos)
-        pullback_short = short_trend_intact and true_zone_touch and (short_reclaim or short_bos)
+        reclaim_long = long_trend_intact and true_zone_touch and long_reclaim
+        reclaim_short = short_trend_intact and true_zone_touch and short_reclaim
+        micro_bos_long = long_trend_intact and true_zone_touch and strict_long_bos
+        micro_bos_short = short_trend_intact and true_zone_touch and strict_short_bos
 
         if bias_side == Side.LONG:
             if setup_a_long and quality_ok:
@@ -229,14 +260,23 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
                     Side.LONG, True, adx, chop, "A_EMA_CROSS", "EMA5M_CROSS_UP",
                     "5M READY LONG: A cross + bullish candle + spread expanding",
                 )
-            if pullback_long and quality_ok:
-                event = "RECLAIM" if long_reclaim else "MICRO_BOS"
+            if reclaim_long and quality_ok:
                 return TriggerView(
-                    Side.LONG, True, adx, chop, "B_PULLBACK_RECLAIM", f"PULLBACK_{event}_LONG",
-                    f"5M READY LONG: B true-zone pullback + {event} + EMA13 slope UP",
+                    Side.LONG, True, adx, chop, "B_PULLBACK_RECLAIM", "PULLBACK_RECLAIM_LONG",
+                    "5M READY LONG: B1 true-zone RECLAIM + EMA13 slope UP",
+                )
+            if micro_bos_long and micro_bos_quality_ok:
+                return TriggerView(
+                    Side.LONG, True, adx, chop, "B_PULLBACK_RECLAIM", "PULLBACK_MICRO_BOS_LONG",
+                    f"5M READY LONG: B2 MICRO_BOS break>={self.MICRO_BOS_BREAK_ATR:.2f}ATR + spread expanding + ADX rising",
                 )
 
-            raw = "EMA_CROSS" if cross_up else "PULLBACK" if pullback_long else "WAIT"
+            if raw_long_bos and true_zone_touch and long_trend_intact:
+                return TriggerView(
+                    Side.LONG, False, adx, chop, "NONE", "NONE",
+                    f"5M MICRO_BOS_FILTERED LONG | ADX={adx:.1f} prev={prev_adx:.1f} CHOP={chop:.1f}",
+                )
+            raw = "EMA_CROSS" if cross_up else "PULLBACK_RECLAIM" if reclaim_long else "WAIT"
             if cross_up and not setup_a_long:
                 raw = "EMA_CROSS_CONFIRM"
             suffix = " FILTERED" if raw != "WAIT" and not quality_ok else ""
@@ -250,14 +290,23 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
                 Side.SHORT, True, adx, chop, "A_EMA_CROSS", "EMA5M_CROSS_DOWN",
                 "5M READY SHORT: A cross + bearish candle + spread expanding",
             )
-        if pullback_short and quality_ok:
-            event = "RECLAIM" if short_reclaim else "MICRO_BOS"
+        if reclaim_short and quality_ok:
             return TriggerView(
-                Side.SHORT, True, adx, chop, "B_PULLBACK_RECLAIM", f"PULLBACK_{event}_SHORT",
-                f"5M READY SHORT: B true-zone pullback + {event} + EMA13 slope DOWN",
+                Side.SHORT, True, adx, chop, "B_PULLBACK_RECLAIM", "PULLBACK_RECLAIM_SHORT",
+                "5M READY SHORT: B1 true-zone RECLAIM + EMA13 slope DOWN",
+            )
+        if micro_bos_short and micro_bos_quality_ok:
+            return TriggerView(
+                Side.SHORT, True, adx, chop, "B_PULLBACK_RECLAIM", "PULLBACK_MICRO_BOS_SHORT",
+                f"5M READY SHORT: B2 MICRO_BOS break>={self.MICRO_BOS_BREAK_ATR:.2f}ATR + spread expanding + ADX rising",
             )
 
-        raw = "EMA_CROSS" if cross_down else "PULLBACK" if pullback_short else "WAIT"
+        if raw_short_bos and true_zone_touch and short_trend_intact:
+            return TriggerView(
+                Side.SHORT, False, adx, chop, "NONE", "NONE",
+                f"5M MICRO_BOS_FILTERED SHORT | ADX={adx:.1f} prev={prev_adx:.1f} CHOP={chop:.1f}",
+            )
+        raw = "EMA_CROSS" if cross_down else "PULLBACK_RECLAIM" if reclaim_short else "WAIT"
         if cross_down and not setup_a_short:
             raw = "EMA_CROSS_CONFIRM"
         suffix = " FILTERED" if raw != "WAIT" and not quality_ok else ""
@@ -344,7 +393,7 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
         )
 
         reason = (
-            f"EMA Hybrid A+B QUALITY V2 | {bias.reason} | {trigger.setup} | {trigger.trigger} | "
+            f"EMA Hybrid A+B QUALITY V2.1 | {bias.reason} | {trigger.setup} | {trigger.trigger} | "
             f"ADX5M={trigger.adx:.1f} CHOP5M={trigger.chop:.1f} | "
             f"SL={risk_pct*100:.2f}% ({self.SL_MIN_PCT*100:.2f}-{self.SL_MAX_PCT*100:.2f}% gate) | "
             f"TP1=1R trim60% + SL BE+0.15R | TP2={target_type} {rr:.2f}R"
@@ -373,11 +422,11 @@ class EMAHybridProStrategy(base.PrecisionTrendStructureV12):
             sl_note = f" | SL={'PASS' if sl_ok else 'BLOCK'} {risk_pct*100:.2f}%"
 
         return (
-            f"A+B QUALITY V2 | 15M Bias={side} Close={bias.close:.6g} SMA{self.SMA_LEN}={bias.sma14:.6g} "
+            f"A+B QUALITY V2.1 | 15M Bias={side} Close={bias.close:.6g} SMA{self.SMA_LEN}={bias.sma14:.6g} "
             f"RSI{self.RSI_LEN}={bias.rsi:.1f} Slope={bias.slope:.6g} | "
             f"5M={trigger.reason} ADX={trigger.adx:.1f} CHOP={trigger.chop:.1f}{sl_note} | "
             f"A=EMA{self.EMA_FAST}/{self.EMA_SLOW} Cross+confirm+spread | "
-            f"B=EMA13 true-zone pullback+reclaim/BOS+slope | "
-            f"Quality ADX>={self.ADX_MIN:.0f} CHOP<={self.CHOP_MAX:.0f} | "
+            f"B1=EMA13 reclaim ADX>={self.ADX_MIN:.0f}/CHOP<={self.CHOP_MAX:.0f} | "
+            f"B2=MicroBOS break>={self.MICRO_BOS_BREAK_ATR:.2f}ATR + ADX>={self.MICRO_BOS_ADX_MIN:.0f} rising + CHOP<={self.MICRO_BOS_CHOP_MAX:.0f} + spread | "
             f"SL {self.SL_MIN_PCT*100:.2f}-{self.SL_MAX_PCT*100:.2f}% | Schedule={sched}"
         )
