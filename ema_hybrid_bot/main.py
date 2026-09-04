@@ -1,4 +1,4 @@
-"""EMA Hybrid A+B Quality V2 runtime wrapper.
+"""EMA Hybrid A+B Quality V2.1 runtime wrapper.
 
 Keeps the proven EMA Hybrid runtime/journal/Telegram lifecycle code in main_core.py
 and adds quality-v2 startup diagnostics plus the XAU/XAG same-direction exposure guard.
@@ -99,7 +99,7 @@ class Bot(core.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== EMA HYBRID A+B QUALITY V2 [%s] symbols=%s margin=$%.2f "
+            "=== EMA HYBRID A+B QUALITY V2.1 [%s] symbols=%s margin=$%.2f "
             "leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE",
             self.cfg.symbols,
@@ -116,7 +116,7 @@ class Bot(core.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"📈 *EMA Hybrid A+B Quality V2 — {mode}*\n"
+                f"📈 *EMA Hybrid A+B Quality V2.1 — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
@@ -124,8 +124,8 @@ class Bot(core.Bot):
                 f"+ SMA slope UP | SHORT Close<SMA{self.strat.SMA_LEN} + RSI≤`{self.strat.BIAS_RSI_SHORT_MAX:.0f}` "
                 "+ SMA slope DOWN\n"
                 f"A: EMA{self.strat.EMA_FAST}/{self.strat.EMA_SLOW} fresh cross + direction candle + expanding spread\n"
-                f"B: EMA13 ±`{self.strat.PULLBACK_TOUCH_ATR:.2f} ATR` true-zone pullback + EMA13 slope + reclaim/micro BOS\n"
-                f"5M Quality: ADX `≥{self.strat.ADX_MIN:.0f}` | CHOP `≤{self.strat.CHOP_MAX:.0f}`\n"
+                f"B1 Reclaim: EMA13 ±`{self.strat.PULLBACK_TOUCH_ATR:.2f} ATR` true-zone + EMA13 slope + ADX `≥{self.strat.ADX_MIN:.0f}` + CHOP `≤{self.strat.CHOP_MAX:.0f}`\n"
+                f"B2 Micro BOS: break `≥{self.strat.MICRO_BOS_BREAK_ATR:.2f} ATR` beyond structure + EMA spread expanding + ADX `≥{self.strat.MICRO_BOS_ADX_MIN:.0f}` rising + CHOP `≤{self.strat.MICRO_BOS_CHOP_MAX:.0f}`\n"
                 f"SL Gate: `{self.strat.SL_MIN_PCT*100:.2f}%–{self.strat.SL_MAX_PCT*100:.2f}%` "
                 f"| Structure buffer `{self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
                 f"TP1: `+{self.TP1_R:.1f}R` → trim `{self.TP1_TRIM_PCT*100:.0f}%` → SL `BE+{self.TP1_LOCK_R:.2f}R`\n"
@@ -136,8 +136,8 @@ class Bot(core.Bot):
             )
 
         _LOG.info(
-            "EMA Hybrid A+B Quality V2 startup complete: 15M hysteresis, "
-            "5M quality, SL sanity, metal correlation guard and await-compat active"
+            "EMA Hybrid A+B Quality V2.1 startup complete: strict Micro BOS, "
+            "15M bias, SL sanity, metal correlation guard and await-compat active"
         )
 
 
