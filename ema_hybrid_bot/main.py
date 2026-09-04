@@ -1,7 +1,7 @@
-"""EMA Hybrid A+B+C Quality V2.2 runtime wrapper.
+"""EMA Hybrid A+B+C Quality V2.3 runtime wrapper.
 
 A = EMA8/13 cross
-B = pullback reclaim / strict micro BOS
+B = precision pullback reclaim / strict micro BOS
 C = Bollinger + MACD + KDJ trend-aligned reversal confirmation
 
 Keeps the proven EMA Hybrid runtime/journal/Telegram lifecycle code in main_core.py,
@@ -59,7 +59,6 @@ class Bot(core.Bot):
 
     def __init__(self):
         super().__init__()
-        # Replace only the strategy object; all proven execution/journal/TG lifecycle stays in core.Bot.
         self.strat = setup_c.EMAHybridProStrategy(self.cfg.strategy_config())
         self._install_client_await_compat()
         self.strat.correlation_guard = self._metal_correlation_blocked
@@ -178,7 +177,7 @@ class Bot(core.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== EMA HYBRID A+B+C QUALITY V2.2 [%s] symbols=%s margin=$%.2f "
+            "=== EMA HYBRID A+B+C QUALITY V2.3 [%s] symbols=%s margin=$%.2f "
             "leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE",
             self.cfg.symbols,
@@ -195,7 +194,7 @@ class Bot(core.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"📈 *EMA Hybrid A+B+C Quality V2.2 — {mode}*\n"
+                f"📈 *EMA Hybrid A+B+C Quality V2.3 — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
@@ -206,8 +205,10 @@ class Bot(core.Bot):
                 f"C: BOLL({self.strat.BOLL_LEN},{self.strat.BOLL_STD:g}) band re-entry + MACD({self.strat.MACD_FAST},{self.strat.MACD_SLOW},{self.strat.MACD_SIGNAL}) momentum + "
                 f"KDJ({self.strat.KDJ_LEN},{self.strat.KDJ_SMOOTH_K},{self.strat.KDJ_SMOOTH_D}) OS≤`{self.strat.KDJ_OS:.0f}`/OB≥`{self.strat.KDJ_OB:.0f}` cross\n"
                 f"C Guard: BB width `≥{self.strat.C_BOLL_MIN_WIDTH_PCT*100:.2f}%` + ADX `≥{self.strat.ADX_MIN:.0f}` + CHOP `≤{self.strat.CHOP_MAX:.0f}` + price confirmation\n"
-                f"B1 Reclaim: EMA13 ±`{self.strat.PULLBACK_TOUCH_ATR:.2f} ATR` true-zone + EMA13 slope + ADX `≥{self.strat.ADX_MIN:.0f}` + CHOP `≤{self.strat.CHOP_MAX:.0f}`\n"
-                f"B2 Micro BOS: break `≥{self.strat.MICRO_BOS_BREAK_ATR:.2f} ATR` + spread expanding + ADX `≥{self.strat.MICRO_BOS_ADX_MIN:.0f}` rising + CHOP `≤{self.strat.MICRO_BOS_CHOP_MAX:.0f}`\n"
+                f"B Core: fresh pullback `≤{self.strat.B_FRESH_LOOKBACK}` bars | EMA13 zone `±{self.strat.PULLBACK_TOUCH_ATR:.2f} ATR` | max depth `{self.strat.B_MAX_PULLBACK_DEPTH_ATR:.2f} ATR`\n"
+                f"B1 Reclaim: candle confirm + close beyond EMA13 `≥{self.strat.B1_RECLAIM_BUFFER_ATR:.2f} ATR` + spread not contracting + entry `≤{self.strat.B1_MAX_ENTRY_ATR:.2f} ATR` | "
+                f"ADX `≥{self.strat.B1_ADX_MIN:.0f}` (if <`{self.strat.B1_ADX_FREEPASS:.0f}` must rise) | CHOP `≤{self.strat.B1_CHOP_MAX:.0f}`\n"
+                f"B2 Micro BOS: break `≥{self.strat.MICRO_BOS_BREAK_ATR:.2f} ATR` + spread expanding + ADX `≥{self.strat.MICRO_BOS_ADX_MIN:.0f}` rising + CHOP `≤{self.strat.MICRO_BOS_CHOP_MAX:.0f}` + entry `≤{self.strat.B2_MAX_ENTRY_ATR:.2f} ATR`\n"
                 "Priority: `A > C > B` when multiple setups fire on the same 5M close\n"
                 f"SL Gate: `{self.strat.SL_MIN_PCT*100:.2f}%–{self.strat.SL_MAX_PCT*100:.2f}%` | Structure buffer `{self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
                 f"TP1: `+{self.TP1_R:.1f}R` → trim `{self.TP1_TRIM_PCT*100:.0f}%` → SL `BE+{self.TP1_LOCK_R:.2f}R`\n"
@@ -218,8 +219,8 @@ class Bot(core.Bot):
             )
 
         _LOG.info(
-            "EMA Hybrid A+B+C Quality V2.2 active: A>C>B priority, triple-confirm C, "
-            "strict B2, SL sanity, metal correlation guard and await-compat"
+            "EMA Hybrid A+B+C Quality V2.3 active: A>C>B priority, triple-confirm C, "
+            "precision B quality gates, SL sanity, metal correlation guard and await-compat"
         )
 
 
