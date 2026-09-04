@@ -1,10 +1,11 @@
-"""EMA Hybrid Setup C — Bollinger + MACD + KDJ triple-confirmation reversal.
+"""EMA Hybrid Setup C + Setup B Quality V2.3.
 
-This module extends the deployed Quality V2.1 A/B strategy without changing A or B.
-Priority is A > C > B when multiple setups are valid on the same closed 5M bar.
+Extends the deployed A/B strategy with:
+- Setup C: Bollinger + MACD + KDJ trend-aligned reversal confirmation.
+- Setup B quality gate: fresh/shallow pullback, stronger reclaim confirmation,
+  ADX/CHOP quality, EMA-spread health and anti-chase distance limits.
 
-Setup C is trend-aligned with the existing 15M bias. It is intentionally a
-pullback/reversal timing engine, not a counter-trend mean-reversion system.
+Priority remains A > C > B when multiple setups are valid on the same closed 5M bar.
 """
 from __future__ import annotations
 
@@ -28,8 +29,9 @@ TriggerView = _BASE.TriggerView
 
 
 class EMAHybridProStrategy(_BASE.EMAHybridProStrategy):
-    """Quality V2.1 A/B plus Setup C BOLL+MACD+KDJ reversal confirmation."""
+    """Quality V2.3: A + stricter B + C BOLL/MACD/KDJ."""
 
+    # Setup C ---------------------------------------------------------------
     C_ENABLED = os.getenv("EMA_5M_SETUP_C_ENABLED", "true").strip().lower() in {
         "1", "true", "yes", "on",
     }
@@ -49,6 +51,18 @@ class EMAHybridProStrategy(_BASE.EMAHybridProStrategy):
     KDJ_ZONE_LOOKBACK = max(2, int(os.getenv("EMA_5M_C_KDJ_ZONE_LOOKBACK", "4")))
     KDJ_OS = float(os.getenv("EMA_5M_C_KDJ_OS", "20"))
     KDJ_OB = float(os.getenv("EMA_5M_C_KDJ_OB", "80"))
+
+    # Setup B Quality V2.3 --------------------------------------------------
+    B_FRESH_LOOKBACK = max(1, int(os.getenv("EMA_5M_B_FRESH_LOOKBACK", "3")))
+    B_MAX_PULLBACK_DEPTH_ATR = float(os.getenv("EMA_5M_B_MAX_DEPTH_ATR", "0.40"))
+
+    B1_RECLAIM_BUFFER_ATR = float(os.getenv("EMA_5M_B1_RECLAIM_BUFFER_ATR", "0.05"))
+    B1_MAX_ENTRY_ATR = float(os.getenv("EMA_5M_B1_MAX_ENTRY_ATR", "0.60"))
+    B1_ADX_MIN = float(os.getenv("EMA_5M_B1_ADX_MIN", "16"))
+    B1_ADX_FREEPASS = float(os.getenv("EMA_5M_B1_ADX_FREEPASS", "20"))
+    B1_CHOP_MAX = float(os.getenv("EMA_5M_B1_CHOP_MAX", "58"))
+
+    B2_MAX_ENTRY_ATR = float(os.getenv("EMA_5M_B2_MAX_ENTRY_ATR", "0.80"))
 
     def _prep5(self, frame: pd.DataFrame) -> pd.DataFrame:
         d = super()._prep5(frame)
@@ -71,7 +85,7 @@ class EMAHybridProStrategy(_BASE.EMAHybridProStrategy):
         d["macd_signal"] = d["macd"].ewm(span=self.MACD_SIGNAL, adjust=False).mean()
         d["macd_hist"] = d["macd"] - d["macd_signal"]
 
-        # KDJ (9,3,3 by default). EWM smoothing gives stable K/D and an expressive J.
+        # KDJ (9,3,3 by default).
         low_n = d["low"].astype(float).rolling(self.KDJ_LEN, min_periods=self.KDJ_LEN).min()
         high_n = d["high"].astype(float).rolling(self.KDJ_LEN, min_periods=self.KDJ_LEN).max()
         span = (high_n - low_n).replace(0.0, 1e-12)
@@ -185,17 +199,120 @@ class EMAHybridProStrategy(_BASE.EMAHybridProStrategy):
 
         return None
 
+    def _filter_b_quality(self, df5: pd.DataFrame, view: TriggerView) -> TriggerView:
+        """Apply V2.3 precision filters only to Setup B after the base B trigger fires."""
+        if not view.ready or view.setup != "B_PULLBACK_RECLAIM":
+            return view
+
+        trigger = str(view.trigger or "").upper()
+        if "PULLBACK_RECLAIM_" not in trigger and "PULLBACK_MICRO_BOS_" not in trigger:
+            return view
+
+        d = self._prep5(df5)
+        if len(d) < self.B_FRESH_LOOKBACK + 3:
+            return TriggerView(view.side, False, view.adx, view.chop, "NONE", "NONE", "5M B_FILTERED: warmup")
+
+        r, p = d.iloc[-1], d.iloc[-2]
+        atr = max(float(r.atr), 1e-12)
+        fast_now, slow_now = float(r.ema_fast), float(r.ema_slow)
+        fast_prev, slow_prev = float(p.ema_fast), float(p.ema_slow)
+        close_now = float(r.close)
+        adx, chop = self._quality_values_5m(d)
+        prev_adx, _ = self._quality_values_5m(d.iloc[:-1])
+
+        fresh = d.iloc[-(self.B_FRESH_LOOKBACK + 1):-1]
+        fresh_atr = fresh["atr"].astype(float).clip(lower=1e-12)
+        touch_band = self.PULLBACK_TOUCH_ATR * fresh_atr
+        zone_low = fresh["ema_slow"].astype(float) - touch_band
+        zone_high = fresh["ema_slow"].astype(float) + touch_band
+        fresh_touch = bool(
+            (
+                fresh["low"].astype(float).le(zone_high)
+                & fresh["high"].astype(float).ge(zone_low)
+            ).any()
+        )
+
+        if view.side == Side.LONG:
+            depth_floor = fresh["ema_slow"].astype(float) - self.B_MAX_PULLBACK_DEPTH_ATR * fresh_atr
+            depth_ok = bool(fresh["low"].astype(float).ge(depth_floor).all())
+            entry_atr = (close_now - slow_now) / atr
+            directional_candle = close_now > float(r.open)
+            reclaim_buffer_ok = close_now >= slow_now + self.B1_RECLAIM_BUFFER_ATR * atr
+            spread_now = fast_now - slow_now
+            spread_prev = fast_prev - slow_prev
+            spread_healthy = spread_now > 0 and spread_now >= spread_prev
+        else:
+            depth_ceiling = fresh["ema_slow"].astype(float) + self.B_MAX_PULLBACK_DEPTH_ATR * fresh_atr
+            depth_ok = bool(fresh["high"].astype(float).le(depth_ceiling).all())
+            entry_atr = (slow_now - close_now) / atr
+            directional_candle = close_now < float(r.open)
+            reclaim_buffer_ok = close_now <= slow_now - self.B1_RECLAIM_BUFFER_ATR * atr
+            spread_now = slow_now - fast_now
+            spread_prev = slow_prev - fast_prev
+            spread_healthy = spread_now > 0 and spread_now >= spread_prev
+
+        fresh_ok = fresh_touch and depth_ok
+
+        if "PULLBACK_RECLAIM_" in trigger:
+            adx_ok = adx >= self.B1_ADX_MIN and (adx >= self.B1_ADX_FREEPASS or adx > prev_adx)
+            chop_ok = chop <= self.B1_CHOP_MAX
+            distance_ok = 0.0 <= entry_atr <= self.B1_MAX_ENTRY_ATR
+            passed = (
+                fresh_ok
+                and directional_candle
+                and reclaim_buffer_ok
+                and spread_healthy
+                and adx_ok
+                and chop_ok
+                and distance_ok
+            )
+            if passed:
+                return TriggerView(
+                    view.side, True, adx, chop, view.setup, view.trigger,
+                    f"5M READY {view.side.value.upper()}: B1 QUALITY RECLAIM | fresh<={self.B_FRESH_LOOKBACK} bars "
+                    f"depth<={self.B_MAX_PULLBACK_DEPTH_ATR:.2f}ATR reclaim>={self.B1_RECLAIM_BUFFER_ATR:.2f}ATR "
+                    f"entry={entry_atr:.2f}ATR ADX={adx:.1f} prev={prev_adx:.1f} CHOP={chop:.1f} spread=OK",
+                )
+            return TriggerView(
+                view.side, False, adx, chop, "NONE", "NONE",
+                f"5M B1_FILTERED {view.side.value.upper()} | fresh={fresh_touch} depth={depth_ok} "
+                f"candle={directional_candle} reclaimBuf={reclaim_buffer_ok} spread={spread_healthy} "
+                f"entry={entry_atr:.2f}/{self.B1_MAX_ENTRY_ATR:.2f}ATR ADX={adx:.1f}/{self.B1_ADX_MIN:.0f} "
+                f"prev={prev_adx:.1f} CHOP={chop:.1f}/{self.B1_CHOP_MAX:.0f}",
+            )
+
+        # B2 keeps the base strict Micro-BOS checks (ADX>=18 rising, CHOP<=55,
+        # >=0.10ATR structure break and expanding spread) and adds fresh/depth/anti-chase gates.
+        distance_ok = 0.0 <= entry_atr <= self.B2_MAX_ENTRY_ATR
+        passed = fresh_ok and distance_ok
+        if passed:
+            return TriggerView(
+                view.side, True, adx, chop, view.setup, view.trigger,
+                f"5M READY {view.side.value.upper()}: B2 QUALITY MICRO_BOS | fresh<={self.B_FRESH_LOOKBACK} bars "
+                f"depth<={self.B_MAX_PULLBACK_DEPTH_ATR:.2f}ATR entry={entry_atr:.2f}/{self.B2_MAX_ENTRY_ATR:.2f}ATR | "
+                f"base strict BOS confirmed",
+            )
+        return TriggerView(
+            view.side, False, adx, chop, "NONE", "NONE",
+            f"5M B2_FILTERED {view.side.value.upper()} | fresh={fresh_touch} depth={depth_ok} "
+            f"entry={entry_atr:.2f}/{self.B2_MAX_ENTRY_ATR:.2f}ATR",
+        )
+
     def _trigger5(self, df5: pd.DataFrame, bias_side):
-        # Preserve Setup A as first priority.
+        # Base engine evaluates A/B. Preserve A as first priority.
         base_view = super()._trigger5(df5, bias_side)
         if base_view.ready and base_view.setup == "A_EMA_CROSS":
             return base_view
 
+        # Setup C is second priority.
         c_view = self._trigger_c(df5, bias_side)
         if c_view is not None and c_view.ready:
             return c_view
 
-        # Setup B remains valid when C is absent or filtered.
+        # Setup B is third priority and must pass the additional V2.3 quality gate.
+        if base_view.ready and base_view.setup == "B_PULLBACK_RECLAIM":
+            return self._filter_b_quality(df5, base_view)
+
         if base_view.ready:
             return base_view
         if c_view is not None:
@@ -209,4 +326,7 @@ class EMAHybridProStrategy(_BASE.EMAHybridProStrategy):
             + f" | C=BOLL{self.BOLL_LEN},{self.BOLL_STD:g}+MACD{self.MACD_FAST}/{self.MACD_SLOW}/{self.MACD_SIGNAL}"
             + f"+KDJ{self.KDJ_LEN}/{self.KDJ_SMOOTH_K}/{self.KDJ_SMOOTH_D}"
             + f" OS<={self.KDJ_OS:.0f} OB>={self.KDJ_OB:.0f} BBW>={self.C_BOLL_MIN_WIDTH_PCT*100:.2f}%"
+            + f" | BQ=fresh<={self.B_FRESH_LOOKBACK} depth<={self.B_MAX_PULLBACK_DEPTH_ATR:.2f}ATR"
+            + f" B1:ADX>={self.B1_ADX_MIN:.0f}/CHOP<={self.B1_CHOP_MAX:.0f}/entry<={self.B1_MAX_ENTRY_ATR:.2f}ATR"
+            + f" B2:entry<={self.B2_MAX_ENTRY_ATR:.2f}ATR"
         )
