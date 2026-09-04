@@ -2,10 +2,13 @@
 
 Keeps the proven EMA Hybrid runtime/journal/Telegram lifecycle code in main_core.py
 and adds quality-v2 startup diagnostics plus the XAU/XAG same-direction exposure guard.
+Also normalizes legacy client helpers that may be synchronous even though the EMA
+runtime awaits them, preventing NoneType/tuple await crashes during position management.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import signal
 
@@ -21,7 +24,29 @@ class Bot(core.Bot):
 
     def __init__(self):
         super().__init__()
+        self._install_client_await_compat()
         self.strat.correlation_guard = self._metal_correlation_blocked
+
+    def _install_client_await_compat(self) -> None:
+        """Wrap legacy sync helpers so awaited EMA lifecycle code is safe."""
+        quantize = getattr(self.client, "quantize_amount", None)
+        if callable(quantize) and not inspect.iscoroutinefunction(quantize):
+            async def _quantize_amount(*args, __fn=quantize, **kwargs):
+                result = __fn(*args, **kwargs)
+                if result is None:
+                    _LOG.warning("[EMA COMPAT] quantize_amount returned None; using zero-sized result")
+                    return 0.0, 0.0
+                return result
+            self.client.quantize_amount = _quantize_amount
+            _LOG.info("[EMA COMPAT] wrapped sync quantize_amount as awaitable")
+
+        move_sl = getattr(self.client, "move_sl_to_breakeven", None)
+        if callable(move_sl) and not inspect.iscoroutinefunction(move_sl):
+            async def _move_sl_to_breakeven(*args, __fn=move_sl, **kwargs):
+                result = __fn(*args, **kwargs)
+                return bool(result) if result is not None else False
+            self.client.move_sl_to_breakeven = _move_sl_to_breakeven
+            _LOG.info("[EMA COMPAT] wrapped sync move_sl_to_breakeven as awaitable")
 
     async def _entry_frames(self, symbol: str):
         frames = await super()._entry_frames(symbol)
@@ -112,7 +137,7 @@ class Bot(core.Bot):
 
         _LOG.info(
             "EMA Hybrid A+B Quality V2 startup complete: 15M hysteresis, "
-            "5M quality, SL sanity and metal correlation guard active"
+            "5M quality, SL sanity, metal correlation guard and await-compat active"
         )
 
 
