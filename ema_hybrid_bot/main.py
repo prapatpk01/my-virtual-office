@@ -1,8 +1,9 @@
-"""EMA Hybrid A+B+C Quality V2.3 runtime wrapper.
+"""EMA Hybrid A+B+C+D Quality V2.4 runtime wrapper.
 
 A = EMA8/13 cross
 B = precision pullback reclaim / strict micro BOS
 C = Bollinger + MACD + KDJ trend-aligned reversal confirmation
+D = MA5/MA20 trend pullback + candle/volume confirmation
 
 Keeps the proven EMA Hybrid runtime/journal/Telegram lifecycle code in main_core.py,
 plus XAU/XAG correlation protection and sync/async client compatibility.
@@ -16,7 +17,7 @@ import signal
 from datetime import datetime, timezone
 
 import main_core as core
-import strategy_c as setup_c
+import strategy_d as setup_d
 
 _LOG = core._LOG
 
@@ -29,19 +30,26 @@ _BASE_SETUP_TEXT = core._setup_label_from_text
 
 def _setup_key_from_trigger(trigger: str) -> str:
     t = str(trigger or "").upper()
+    if "MA5_MA20_" in t:
+        return "D_MA5_MA20"
     if "BOLL_MACD_KDJ_" in t:
         return "C_BOLL_MACD_KDJ"
     return _BASE_SETUP_KEY(trigger)
 
 
 def _setup_label_from_trigger(trigger: str) -> str:
-    if _setup_key_from_trigger(trigger) == "C_BOLL_MACD_KDJ":
+    key = _setup_key_from_trigger(trigger)
+    if key == "D_MA5_MA20":
+        return "D · MA5/MA20 TREND PULLBACK"
+    if key == "C_BOLL_MACD_KDJ":
         return "C · BOLL+MACD+KDJ REVERSAL"
     return _BASE_SETUP_LABEL(trigger)
 
 
 def _setup_label_from_text(text: str) -> str | None:
     upper = str(text or "").upper()
+    if "MA5_MA20_" in upper:
+        return "D · MA5/MA20 TREND PULLBACK"
     if "BOLL_MACD_KDJ_" in upper:
         return "C · BOLL+MACD+KDJ REVERSAL"
     return _BASE_SETUP_TEXT(text)
@@ -59,7 +67,7 @@ class Bot(core.Bot):
 
     def __init__(self):
         super().__init__()
-        self.strat = setup_c.EMAHybridProStrategy(self.cfg.strategy_config())
+        self.strat = setup_d.EMAHybridProStrategy(self.cfg.strategy_config())
         self._install_client_await_compat()
         self.strat.correlation_guard = self._metal_correlation_blocked
 
@@ -127,32 +135,48 @@ class Bot(core.Bot):
         return blocked
 
     async def _build_stats_report(self) -> str:
-        """Add Setup C attribution to the existing A/B advanced stats."""
+        """Add Setup C/D attribution to the existing A/B advanced stats."""
         report = await super()._build_stats_report()
         if not self.cfg.paper:
             return report
 
         now = datetime.now(timezone.utc)
         month_start = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp() * 1000)
-        c_rows = [
-            r for r in self.ema_journal
-            if int(r.get("close_ms") or 0) >= month_start
-            and (
-                str(r.get("setup") or "") == "C_BOLL_MACD_KDJ"
-                or "BOLL_MACD_KDJ_" in str(r.get("trigger") or "").upper()
-            )
-        ]
-        if not c_rows:
-            return report
+        month_rows = [r for r in self.ema_journal if int(r.get("close_ms") or 0) >= month_start]
 
-        wins = sum(1 for r in c_rows if float(r.get("pnl") or 0.0) > 0)
-        net = sum(float(r.get("pnl") or 0.0) for r in c_rows)
-        gross_win = sum(float(r.get("pnl") or 0.0) for r in c_rows if float(r.get("pnl") or 0.0) > 0)
-        gross_loss = abs(sum(float(r.get("pnl") or 0.0) for r in c_rows if float(r.get("pnl") or 0.0) < 0))
-        pf = gross_win / gross_loss if gross_loss > 1e-12 else (float("inf") if gross_win > 0 else 0.0)
-        wr = wins / len(c_rows) * 100.0
-        pf_text = "∞" if pf == float("inf") else f"{pf:.2f}"
-        c_line = f"C BOLL/MACD/KDJ {len(c_rows)} | {wr:.0f}% WR | PF {pf_text} | ${net:+.2f}"
+        def metrics(block: list[dict]):
+            wins = sum(1 for r in block if float(r.get("pnl") or 0.0) > 0)
+            net = sum(float(r.get("pnl") or 0.0) for r in block)
+            gross_win = sum(float(r.get("pnl") or 0.0) for r in block if float(r.get("pnl") or 0.0) > 0)
+            gross_loss = abs(sum(float(r.get("pnl") or 0.0) for r in block if float(r.get("pnl") or 0.0) < 0))
+            pf = gross_win / gross_loss if gross_loss > 1e-12 else (float("inf") if gross_win > 0 else 0.0)
+            wr = wins / len(block) * 100.0 if block else 0.0
+            pf_text = "∞" if pf == float("inf") else f"{pf:.2f}"
+            return wr, pf_text, net
+
+        specs = (
+            (
+                "C BOLL/MACD/KDJ",
+                lambda r: str(r.get("setup") or "") == "C_BOLL_MACD_KDJ"
+                or "BOLL_MACD_KDJ_" in str(r.get("trigger") or "").upper(),
+            ),
+            (
+                "D MA5/MA20",
+                lambda r: str(r.get("setup") or "") == "D_MA5_MA20"
+                or "MA5_MA20_" in str(r.get("trigger") or "").upper(),
+            ),
+        )
+
+        extra_lines = []
+        for label, predicate in specs:
+            block = [r for r in month_rows if predicate(r)]
+            if not block:
+                continue
+            wr, pf_text, net = metrics(block)
+            extra_lines.append(f"{label:16s} {len(block)} | {wr:.0f}% WR | PF {pf_text} | ${net:+.2f}")
+
+        if not extra_lines:
+            return report
 
         lines = report.splitlines()
         section = next((i for i, line in enumerate(lines) if line.startswith("BY SETUP —")), None)
@@ -165,7 +189,9 @@ class Bot(core.Bot):
                 lines.pop(insert_at)
                 continue
             insert_at += 1
-        lines.insert(insert_at, c_line)
+        for line in extra_lines:
+            lines.insert(insert_at, line)
+            insert_at += 1
         return "\n".join(lines)
 
     async def start(self):
@@ -177,7 +203,7 @@ class Bot(core.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== EMA HYBRID A+B+C QUALITY V2.3 [%s] symbols=%s margin=$%.2f "
+            "=== EMA HYBRID A+B+C+D QUALITY V2.4 [%s] symbols=%s margin=$%.2f "
             "leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE",
             self.cfg.symbols,
@@ -194,7 +220,7 @@ class Bot(core.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"📈 *EMA Hybrid A+B+C Quality V2.3 — {mode}*\n"
+                f"📈 *EMA Hybrid A+B+C+D Quality V2.4 — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
@@ -204,23 +230,25 @@ class Bot(core.Bot):
                 f"A: EMA{self.strat.EMA_FAST}/{self.strat.EMA_SLOW} fresh cross + direction candle + expanding spread\n"
                 f"C: BOLL({self.strat.BOLL_LEN},{self.strat.BOLL_STD:g}) band re-entry + MACD({self.strat.MACD_FAST},{self.strat.MACD_SLOW},{self.strat.MACD_SIGNAL}) momentum + "
                 f"KDJ({self.strat.KDJ_LEN},{self.strat.KDJ_SMOOTH_K},{self.strat.KDJ_SMOOTH_D}) OS≤`{self.strat.KDJ_OS:.0f}`/OB≥`{self.strat.KDJ_OB:.0f}` cross\n"
-                f"C Guard: BB width `≥{self.strat.C_BOLL_MIN_WIDTH_PCT*100:.2f}%` + ADX `≥{self.strat.ADX_MIN:.0f}` + CHOP `≤{self.strat.CHOP_MAX:.0f}` + price confirmation\n"
+                f"D: MA{self.strat.D_MA_FAST}/MA{self.strat.D_MA_SLOW} recent cross → wait pullback → candle confirm + volume `≥{self.strat.D_VOLUME_RATIO_MIN:.2f}x` avg\n"
+                f"D Guard: MA20 slope with bias + ADX `≥{self.strat.D_ADX_MIN:.0f}` + CHOP `≤{self.strat.D_CHOP_MAX:.0f}` + spread `≥{self.strat.D_MIN_SPREAD_ATR:.2f} ATR` + entry `≤{self.strat.D_MAX_ENTRY_ATR:.2f} ATR`\n"
                 f"B Core: fresh pullback `≤{self.strat.B_FRESH_LOOKBACK}` bars | EMA13 zone `±{self.strat.PULLBACK_TOUCH_ATR:.2f} ATR` | max depth `{self.strat.B_MAX_PULLBACK_DEPTH_ATR:.2f} ATR`\n"
                 f"B1 Reclaim: candle confirm + close beyond EMA13 `≥{self.strat.B1_RECLAIM_BUFFER_ATR:.2f} ATR` + spread not contracting + entry `≤{self.strat.B1_MAX_ENTRY_ATR:.2f} ATR` | "
                 f"ADX `≥{self.strat.B1_ADX_MIN:.0f}` (if <`{self.strat.B1_ADX_FREEPASS:.0f}` must rise) | CHOP `≤{self.strat.B1_CHOP_MAX:.0f}`\n"
                 f"B2 Micro BOS: break `≥{self.strat.MICRO_BOS_BREAK_ATR:.2f} ATR` + spread expanding + ADX `≥{self.strat.MICRO_BOS_ADX_MIN:.0f}` rising + CHOP `≤{self.strat.MICRO_BOS_CHOP_MAX:.0f}` + entry `≤{self.strat.B2_MAX_ENTRY_ATR:.2f} ATR`\n"
-                "Priority: `A > C > B` when multiple setups fire on the same 5M close\n"
+                "Priority: `A > C > D > B` when multiple setups fire on the same 5M close\n"
                 f"SL Gate: `{self.strat.SL_MIN_PCT*100:.2f}%–{self.strat.SL_MAX_PCT*100:.2f}%` | Structure buffer `{self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
                 f"TP1: `+{self.TP1_R:.1f}R` → trim `{self.TP1_TRIM_PCT*100:.0f}%` → SL `BE+{self.TP1_LOCK_R:.2f}R`\n"
                 f"TP2: next 5M liquidity/swing with room `≥{self.strat.TP2_MIN_RR:.1f}R`\n"
                 f"XAU/XAG same-direction guard: `{'ON' if self.METAL_CORR_GUARD else 'OFF'}`\n"
-                "Telegram: Entry + Setup A/B/C + TP1 + TP2/SL/TP1_LOCK alerts\n"
+                "Telegram: Entry + Setup A/B/C/D + TP1 + TP2/SL/TP1_LOCK alerts\n"
                 "PAPER entries: `24/7` | LIVE entries: `24/5` | Open positions managed: `24/7`"
             )
 
         _LOG.info(
-            "EMA Hybrid A+B+C Quality V2.3 active: A>C>B priority, triple-confirm C, "
-            "precision B quality gates, SL sanity, metal correlation guard and await-compat"
+            "EMA Hybrid A+B+C+D Quality V2.4 active: A>C>D>B priority, "
+            "MA5/20 pullback D, precision B, triple-confirm C, SL sanity, "
+            "metal correlation guard and await-compat"
         )
 
 
