@@ -1,9 +1,10 @@
-"""EMA Hybrid A+B+C+D Quality V2.4 runtime wrapper.
+"""EMA Hybrid A+B+C+D+E Quality V2.5 runtime wrapper.
 
-A = EMA8/13 cross
-B = precision pullback reclaim / strict micro BOS
+A = EMA8/13 cross + 5M RSI/SMA confirmation
+B = precision pullback reclaim / strict micro BOS + 5M RSI/SMA confirmation
 C = Bollinger + MACD + KDJ trend-aligned reversal confirmation
 D = MA5/MA20 trend pullback + candle/volume confirmation
+E = MACD cross/divergence + Volume + Price Action confirmation
 
 Keeps the proven EMA Hybrid runtime/journal/Telegram lifecycle code in main_core.py,
 plus XAU/XAG correlation protection and sync/async client compatibility.
@@ -17,7 +18,7 @@ import signal
 from datetime import datetime, timezone
 
 import main_core as core
-import strategy_d as setup_d
+import strategy_e as setup_e
 
 _LOG = core._LOG
 
@@ -30,6 +31,8 @@ _BASE_SETUP_TEXT = core._setup_label_from_text
 
 def _setup_key_from_trigger(trigger: str) -> str:
     t = str(trigger or "").upper()
+    if "MACD_VOLUME_" in t:
+        return "E_MACD_VOLUME"
     if "MA5_MA20_" in t:
         return "D_MA5_MA20"
     if "BOLL_MACD_KDJ_" in t:
@@ -39,6 +42,8 @@ def _setup_key_from_trigger(trigger: str) -> str:
 
 def _setup_label_from_trigger(trigger: str) -> str:
     key = _setup_key_from_trigger(trigger)
+    if key == "E_MACD_VOLUME":
+        return "E · MACD+VOLUME CONFIRM"
     if key == "D_MA5_MA20":
         return "D · MA5/MA20 TREND PULLBACK"
     if key == "C_BOLL_MACD_KDJ":
@@ -48,6 +53,8 @@ def _setup_label_from_trigger(trigger: str) -> str:
 
 def _setup_label_from_text(text: str) -> str | None:
     upper = str(text or "").upper()
+    if "MACD_VOLUME_" in upper:
+        return "E · MACD+VOLUME CONFIRM"
     if "MA5_MA20_" in upper:
         return "D · MA5/MA20 TREND PULLBACK"
     if "BOLL_MACD_KDJ_" in upper:
@@ -67,7 +74,7 @@ class Bot(core.Bot):
 
     def __init__(self):
         super().__init__()
-        self.strat = setup_d.EMAHybridProStrategy(self.cfg.strategy_config())
+        self.strat = setup_e.EMAHybridProStrategy(self.cfg.strategy_config())
         self._install_client_await_compat()
         self.strat.correlation_guard = self._metal_correlation_blocked
 
@@ -135,7 +142,7 @@ class Bot(core.Bot):
         return blocked
 
     async def _build_stats_report(self) -> str:
-        """Add Setup C/D attribution to the existing A/B advanced stats."""
+        """Add Setup C/D/E attribution to the existing A/B advanced stats."""
         report = await super()._build_stats_report()
         if not self.cfg.paper:
             return report
@@ -164,6 +171,11 @@ class Bot(core.Bot):
                 "D MA5/MA20",
                 lambda r: str(r.get("setup") or "") == "D_MA5_MA20"
                 or "MA5_MA20_" in str(r.get("trigger") or "").upper(),
+            ),
+            (
+                "E MACD/VOLUME",
+                lambda r: str(r.get("setup") or "") == "E_MACD_VOLUME"
+                or "MACD_VOLUME_" in str(r.get("trigger") or "").upper(),
             ),
         )
 
@@ -203,7 +215,7 @@ class Bot(core.Bot):
 
         balance = await self.client.fetch_balance_usdt()
         _LOG.info(
-            "=== EMA HYBRID A+B+C+D QUALITY V2.4 [%s] symbols=%s margin=$%.2f "
+            "=== EMA HYBRID A+B+C+D+E QUALITY V2.5 [%s] symbols=%s margin=$%.2f "
             "leverage=x%d max_pos=%d balance=%.2f ===",
             "PAPER" if self.cfg.paper else "LIVE",
             self.cfg.symbols,
@@ -220,35 +232,37 @@ class Bot(core.Bot):
             asyncio.create_task(self._command_loop())
             mode = "PAPER" if self.cfg.paper else "LIVE"
             await self.tg.send_text(
-                f"📈 *EMA Hybrid A+B+C+D Quality V2.4 — {mode}*\n"
+                f"📈 *EMA Hybrid A+B+C+D+E Quality V2.5 — {mode}*\n"
                 f"Symbols: `{', '.join(self.cfg.symbols)}`\n"
                 f"Balance: `{balance:.2f}` USDT | Margin `${self.cfg.margin_per_position_usd:.2f}`/position "
                 f"| Leverage `x{self.cfg.leverage}` | Max `{self.cfg.max_positions}` positions\n\n"
                 f"15M Bias: LONG Close>SMA{self.strat.SMA_LEN} + RSI≥`{self.strat.BIAS_RSI_LONG_MIN:.0f}` "
                 f"+ SMA slope UP | SHORT Close<SMA{self.strat.SMA_LEN} + RSI≤`{self.strat.BIAS_RSI_SHORT_MAX:.0f}` "
                 "+ SMA slope DOWN\n"
-                f"A: EMA{self.strat.EMA_FAST}/{self.strat.EMA_SLOW} fresh cross + direction candle + expanding spread\n"
+                f"A: EMA{self.strat.EMA_FAST}/{self.strat.EMA_SLOW} fresh cross + candle/spread + 5M SMA{self.strat.AB_SMA_LEN} + RSI{self.strat.AB_RSI_LEN}/RSI-SMA{self.strat.AB_RSI_SMA_LEN} confirm\n"
+                f"E: MACD cross or confirmed divergence + Volume `≥{self.strat.E_VOLUME_RATIO_MIN:.2f}x` prior `{self.strat.E_VOLUME_LEN}`-bar avg + price action\n"
+                f"E Guard: ADX `≥{self.strat.E_ADX_MIN:.0f}` + CHOP `≤{self.strat.E_CHOP_MAX:.0f}` + 15M bias alignment\n"
                 f"C: BOLL({self.strat.BOLL_LEN},{self.strat.BOLL_STD:g}) band re-entry + MACD({self.strat.MACD_FAST},{self.strat.MACD_SLOW},{self.strat.MACD_SIGNAL}) momentum + "
                 f"KDJ({self.strat.KDJ_LEN},{self.strat.KDJ_SMOOTH_K},{self.strat.KDJ_SMOOTH_D}) OS≤`{self.strat.KDJ_OS:.0f}`/OB≥`{self.strat.KDJ_OB:.0f}` cross\n"
                 f"D: MA{self.strat.D_MA_FAST}/MA{self.strat.D_MA_SLOW} recent cross → wait pullback → candle confirm + volume `≥{self.strat.D_VOLUME_RATIO_MIN:.2f}x` avg\n"
                 f"D Guard: MA20 slope with bias + ADX `≥{self.strat.D_ADX_MIN:.0f}` + CHOP `≤{self.strat.D_CHOP_MAX:.0f}` + spread `≥{self.strat.D_MIN_SPREAD_ATR:.2f} ATR` + entry `≤{self.strat.D_MAX_ENTRY_ATR:.2f} ATR`\n"
                 f"B Core: fresh pullback `≤{self.strat.B_FRESH_LOOKBACK}` bars | EMA13 zone `±{self.strat.PULLBACK_TOUCH_ATR:.2f} ATR` | max depth `{self.strat.B_MAX_PULLBACK_DEPTH_ATR:.2f} ATR`\n"
-                f"B1 Reclaim: candle confirm + close beyond EMA13 `≥{self.strat.B1_RECLAIM_BUFFER_ATR:.2f} ATR` + spread not contracting + entry `≤{self.strat.B1_MAX_ENTRY_ATR:.2f} ATR` | "
-                f"ADX `≥{self.strat.B1_ADX_MIN:.0f}` (if <`{self.strat.B1_ADX_FREEPASS:.0f}` must rise) | CHOP `≤{self.strat.B1_CHOP_MAX:.0f}`\n"
-                f"B2 Micro BOS: break `≥{self.strat.MICRO_BOS_BREAK_ATR:.2f} ATR` + spread expanding + ADX `≥{self.strat.MICRO_BOS_ADX_MIN:.0f}` rising + CHOP `≤{self.strat.MICRO_BOS_CHOP_MAX:.0f}` + entry `≤{self.strat.B2_MAX_ENTRY_ATR:.2f} ATR`\n"
-                "Priority: `A > C > D > B` when multiple setups fire on the same 5M close\n"
+                f"B Confirm: existing B1/B2 precision gates + 5M SMA{self.strat.AB_SMA_LEN} + RSI{self.strat.AB_RSI_LEN}/RSI-SMA{self.strat.AB_RSI_SMA_LEN} momentum\n"
+                f"B1 Reclaim: close beyond EMA13 `≥{self.strat.B1_RECLAIM_BUFFER_ATR:.2f} ATR` + entry `≤{self.strat.B1_MAX_ENTRY_ATR:.2f} ATR` | ADX `≥{self.strat.B1_ADX_MIN:.0f}` (if <`{self.strat.B1_ADX_FREEPASS:.0f}` must rise) | CHOP `≤{self.strat.B1_CHOP_MAX:.0f}`\n"
+                f"B2 Micro BOS: break `≥{self.strat.MICRO_BOS_BREAK_ATR:.2f} ATR` + ADX `≥{self.strat.MICRO_BOS_ADX_MIN:.0f}` rising + CHOP `≤{self.strat.MICRO_BOS_CHOP_MAX:.0f}` + entry `≤{self.strat.B2_MAX_ENTRY_ATR:.2f} ATR`\n"
+                "Priority: `A > E > C > D > B` when multiple setups fire on the same 5M close\n"
                 f"SL Gate: `{self.strat.SL_MIN_PCT*100:.2f}%–{self.strat.SL_MAX_PCT*100:.2f}%` | Structure buffer `{self.strat.SL_BUFFER_ATR:.2f} ATR`\n"
                 f"TP1: `+{self.TP1_R:.1f}R` → trim `{self.TP1_TRIM_PCT*100:.0f}%` → SL `BE+{self.TP1_LOCK_R:.2f}R`\n"
                 f"TP2: next 5M liquidity/swing with room `≥{self.strat.TP2_MIN_RR:.1f}R`\n"
                 f"XAU/XAG same-direction guard: `{'ON' if self.METAL_CORR_GUARD else 'OFF'}`\n"
-                "Telegram: Entry + Setup A/B/C/D + TP1 + TP2/SL/TP1_LOCK alerts\n"
+                "Telegram: Entry + Setup A/B/C/D/E + TP1 + TP2/SL/TP1_LOCK alerts\n"
                 "PAPER entries: `24/7` | LIVE entries: `24/5` | Open positions managed: `24/7`"
             )
 
         _LOG.info(
-            "EMA Hybrid A+B+C+D Quality V2.4 active: A>C>D>B priority, "
-            "MA5/20 pullback D, precision B, triple-confirm C, SL sanity, "
-            "metal correlation guard and await-compat"
+            "EMA Hybrid A+B+C+D+E Quality V2.5 active: A>E>C>D>B priority, "
+            "A/B RSI-SMA confirmation, MACD+Volume E, MA5/20 D, precision B, "
+            "triple-confirm C, SL sanity, metal correlation guard and await-compat"
         )
 
 
