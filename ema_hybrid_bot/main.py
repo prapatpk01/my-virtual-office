@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 import signal
 from datetime import datetime, timezone
 
@@ -27,6 +28,7 @@ _LOG = core._LOG
 _BASE_SETUP_KEY = core._setup_key_from_trigger
 _BASE_SETUP_LABEL = core._setup_label_from_trigger
 _BASE_SETUP_TEXT = core._setup_label_from_text
+_BASE_RUNTIME_TEXT = core._ema_runtime_text
 
 
 def _setup_key_from_trigger(trigger: str) -> str:
@@ -62,9 +64,39 @@ def _setup_label_from_text(text: str) -> str | None:
     return _BASE_SETUP_TEXT(text)
 
 
+def _v25_runtime_text(text: str) -> str:
+    """Normalize inherited alert text to the active V2.5 strategy and remove stale HMA context."""
+    text = _BASE_RUNTIME_TEXT(text)
+    if not isinstance(text, str):
+        return text
+
+    text = re.sub(
+        r"EMA Hybrid A\+B QUALITY V2\.1",
+        "EMA Hybrid A+B+C+D+E QUALITY V2.5",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\bA\+B QUALITY V2\.1\b",
+        "A+B+C+D+E QUALITY V2.5",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = []
+    for line in text.splitlines():
+        plain = line.replace("`", "").strip()
+        # Legacy inherited HMA line. EMA Hybrid V2.5 no longer uses 4H/1H to decide entries.
+        if plain.startswith("4H ") and "1H Q" in plain:
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
 core._setup_key_from_trigger = _setup_key_from_trigger
 core._setup_label_from_trigger = _setup_label_from_trigger
 core._setup_label_from_text = _setup_label_from_text
+core._ema_runtime_text = _v25_runtime_text
 
 
 class Bot(core.Bot):
