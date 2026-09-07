@@ -1,16 +1,14 @@
-"""Adaptive SMC MTF V7.2 indicator engine.
+"""Adaptive SMC MTF V7.3 indicator engine.
 
-Closed-candle pipeline:
+Pipeline (closed candles only):
   4H  TSS-style direction (EMA20/50 + HMA16 slope)
   15M Market Structure (HH/HL, LH/LL, BOS/CHOCH)
   5M  AMD liquidity setup
+  5M/1M Momentum Quality (RSI/SMA, MACD histogram, ADX, Bollinger)
   1M  IFVG -> micro BOS -> pullback/no-chase execution
 
-V7.2 keeps the V7.1 confirmation, but refuses to chase price after the micro
-BOS.  A setup stays armed briefly and entry is allowed only when price pulls
-back close to the IFVG while preserving the confirmed direction.  The engine
-also exports a stable AMD-cycle id for loss re-arm protection and an M5 swing
-trail for post-TP1 runner management.
+KDJ is intentionally a veto only.  It is not another hard trigger.  This keeps
+V7.3 selective without returning to the over-filtered behaviour of older bots.
 """
 from __future__ import annotations
 from typing import Any, Dict, List
@@ -20,6 +18,7 @@ ENGINE_SCHEMA = "adaptive-smc-mtf-v1"
 NO_CHASE_ATR1 = 0.50
 BOS_ARM_BARS = 8
 RUNNER_ATR5_BUFFER = 0.12
+QUALITY_MIN = 65.0
 
 
 def _v(c: Any, name: str, idx: int) -> float:
@@ -43,6 +42,14 @@ def ema(values: List[float], length: int) -> List[float]:
     if not values: return []
     a = 2.0 / (length + 1.0); out = [float(values[0])]
     for v in values[1:]: out.append(a * float(v) + (1-a) * out[-1])
+    return out
+
+
+def _sma(values, length):
+    if not values: return []
+    length=max(1,int(length)); out=[]
+    for i in range(len(values)):
+        w=values[max(0,i-length+1):i+1]; out.append(sum(w)/len(w))
     return out
 
 
@@ -85,6 +92,43 @@ def _rsi(c,length=14):
         x=c[i]-c[i-1]; g.append(max(x,0)); d.append(max(-x,0))
     ag=_rma(g,length); ad=_rma(d,length); out=[]
     for x,y in zip(ag,ad): out.append(100.0 if y<=1e-12 and x>0 else 50.0 if y<=1e-12 else 100-100/(1+x/y))
+    return out
+
+
+def _macd_hist(c):
+    if not c:return []
+    e12=ema(c,12); e26=ema(c,26); mac=[a-b for a,b in zip(e12,e26)]; sig=ema(mac,9)
+    return [a-b for a,b in zip(mac,sig)]
+
+
+def _adx(candles,length=14):
+    h=_series(candles,"high",2); l=_series(candles,"low",3); c=_series(candles,"close",4)
+    if len(c)<2:return []
+    tr=[max(h[0]-l[0],0.0)]; pdm=[0.0]; mdm=[0.0]
+    for i in range(1,len(c)):
+        up=h[i]-h[i-1]; dn=l[i-1]-l[i]
+        pdm.append(up if up>dn and up>0 else 0.0); mdm.append(dn if dn>up and dn>0 else 0.0)
+        tr.append(max(h[i]-l[i],abs(h[i]-c[i-1]),abs(l[i]-c[i-1])))
+    atr=_rma(tr,length); p=_rma(pdm,length); m=_rma(mdm,length); dx=[]
+    for a,x,y in zip(atr,p,m):
+        pdi=100*x/max(a,1e-12); mdi=100*y/max(a,1e-12); dx.append(100*abs(pdi-mdi)/max(pdi+mdi,1e-12))
+    return _rma(dx,length)
+
+
+def _bollinger(c,length=20,mult=2.0):
+    mid=_sma(c,length); upper=[]; lower=[]; width=[]
+    for i,v in enumerate(c):
+        w=c[max(0,i-length+1):i+1]; mean=mid[i]; sd=math.sqrt(sum((x-mean)**2 for x in w)/max(len(w),1))
+        u=mean+mult*sd; lo=mean-mult*sd; upper.append(u); lower.append(lo); width.append((u-lo)/max(abs(mean),1e-12))
+    return mid,upper,lower,width
+
+
+def _kdj(candles,length=9):
+    h=_series(candles,"high",2); l=_series(candles,"low",3); c=_series(candles,"close",4)
+    k=50.0; d=50.0; out=[]
+    for i,px in enumerate(c):
+        hi=max(h[max(0,i-length+1):i+1]); lo=min(l[max(0,i-length+1):i+1]); rsv=50.0 if hi<=lo else 100*(px-lo)/(hi-lo)
+        k=(2*k+rsv)/3; d=(2*d+k)/3; j=3*k-2*d; out.append((k,d,j))
     return out
 
 
@@ -164,18 +208,16 @@ def _ifvg_1m(candles,direction):
 
 def _micro_confirm(candles,direction,ifvg):
     if not ifvg.get("valid"):return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"NO_IFVG"}
-    h=_series(candles,"high",2); l=_series(candles,"low",3); c=_series(candles,"close",4)
-    _,atr=_atr(candles); ret=int(ifvg.get("retest_index",len(c)-1)); start=max(3,ret-12)
+    h=_series(candles,"high",2); l=_series(candles,"low",3); c=_series(candles,"close",4); _,atr=_atr(candles)
+    ret=int(ifvg.get("retest_index",len(c)-1)); start=max(3,ret-12)
     ph=[p for p in _pivots(h,"high",1,1) if start<=p[0]<ret]; pl=[p for p in _pivots(l,"low",1,1) if start<=p[0]<ret]
     if direction=="LONG":
         if not ph:return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"NO_MICRO_HIGH"}
         level=ph[-1][1]; breaks=[i for i in range(ret+1,len(c)) if c[i]>level]
         if not breaks:return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"WAIT_BOS_UP","level":level}
         bi=breaks[0]; swing=min(l[max(start,ret-2):bi+1]); age=len(c)-1-bi; armed=age<=BOS_ARM_BARS
-        # Do not market-chase the breakout. Price must pull back near the IFVG.
         distance=max(0.0,c[-1]-float(ifvg["zone_high"])); near=distance<=NO_CHASE_ATR1*atr
         retest_now=l[-1]<=float(ifvg["zone_high"])+NO_CHASE_ATR1*atr and c[-1]>=float(ifvg["zone_low"])
-        ready=armed and near and retest_now
     else:
         if not pl:return {"confirmed":False,"armed":False,"entry_ready":False,"direction":direction,"reason":"NO_MICRO_LOW"}
         level=pl[-1][1]; breaks=[i for i in range(ret+1,len(c)) if c[i]<level]
@@ -183,16 +225,48 @@ def _micro_confirm(candles,direction,ifvg):
         bi=breaks[0]; swing=max(h[max(start,ret-2):bi+1]); age=len(c)-1-bi; armed=age<=BOS_ARM_BARS
         distance=max(0.0,float(ifvg["zone_low"])-c[-1]); near=distance<=NO_CHASE_ATR1*atr
         retest_now=h[-1]>=float(ifvg["zone_low"])-NO_CHASE_ATR1*atr and c[-1]<=float(ifvg["zone_high"])
-        ready=armed and near and retest_now
-    reason="PULLBACK_READY" if ready else "WAIT_PULLBACK" if armed else "BOS_STALE"
+    ready=armed and near and retest_now; reason="PULLBACK_READY" if ready else "WAIT_PULLBACK" if armed else "BOS_STALE"
     return {"confirmed":True,"armed":armed,"entry_ready":ready,"direction":direction,"reason":reason,"level":level,"break_index":bi,"break_age":age,"swing":swing,"distance_atr":distance/max(atr,1e-12)}
+
+
+def _momentum_quality(c1m,c5m,direction):
+    c1=_series(c1m,"close",4); c5=_series(c5m,"close",4)
+    r1=_rsi(c1); r5=_rsi(c5); rs1=_sma(r1,14); rs5=_sma(r5,14)
+    mh=_macd_hist(c5); adx=_adx(c5m); mid,up,lo,bw=_bollinger(c5); kdj=_kdj(c5m)
+    long=direction=="LONG"; score=0.0; parts={}
+
+    # RSI/SMA = 35 points. M5 alignment is primary; fresh M1 alignment can rescue timing.
+    rsi_ok=(r5[-1]>rs5[-1] and r5[-1]<70) if long else (r5[-1]<rs5[-1] and r5[-1]>30)
+    cross1=(r1[-1]>rs1[-1] and r1[-2]<=rs1[-2]) if long else (r1[-1]<rs1[-1] and r1[-2]>=rs1[-2])
+    m1_ok=(r1[-1]>rs1[-1] and r1[-1]<72) if long else (r1[-1]<rs1[-1] and r1[-1]>28)
+    rsi_points=35.0 if rsi_ok else 25.0 if (m1_ok or cross1) else 0.0; score+=rsi_points; parts["rsi_sma"]=rsi_points
+
+    # MACD histogram slope = 25 points. Cross above/below zero is not required.
+    macd_ok=(mh[-1]>mh[-2] and mh[-2]>=mh[-3]) if long else (mh[-1]<mh[-2] and mh[-2]<=mh[-3])
+    macd_soft=(mh[-1]>mh[-2]) if long else (mh[-1]<mh[-2])
+    macd_points=25.0 if macd_ok else 15.0 if macd_soft else 0.0; score+=macd_points; parts["macd_hist"]=macd_points
+
+    # ADX = 20 points: trending or clearly rising is enough.
+    adx_now=adx[-1] if adx else 0.0; adx_rising=len(adx)>=3 and adx[-1]>adx[-2]>adx[-3]
+    adx_points=20.0 if adx_now>=18 else 12.0 if adx_rising else 0.0; score+=adx_points; parts["adx"]=adx_points
+
+    # Bollinger = 20 points: avoid extreme chase and dead compression.
+    width_ok=bw[-1]>=0.003
+    bb_ok=(c5[-1]<=up[-1] and c5[-1]>=mid[-1]-0.35*(mid[-1]-lo[-1])) if long else (c5[-1]>=lo[-1] and c5[-1]<=mid[-1]+0.35*(up[-1]-mid[-1]))
+    bb_points=20.0 if width_ok and bb_ok else 10.0 if width_ok else 0.0; score+=bb_points; parts["bollinger"]=bb_points
+
+    k,d,j=kdj[-1] if kdj else (50.0,50.0,50.0)
+    veto=(long and k>90 and j>100) or ((not long) and k<10 and j<0)
+    return {"score":score,"pass":score>=QUALITY_MIN and not veto,"veto":veto,"parts":parts,
+            "rsi1":r1[-1],"rsi1_sma":rs1[-1],"rsi5":r5[-1],"rsi5_sma":rs5[-1],
+            "macd_hist":mh[-1],"macd_hist_prev":mh[-2],"adx":adx_now,"bb_width":bw[-1],
+            "bb_mid":mid[-1],"bb_upper":up[-1],"bb_lower":lo[-1],"kdj_k":k,"kdj_d":d,"kdj_j":j}
 
 
 def _runner_trails(c5m, atr5):
     h=_series(c5m,"high",2); l=_series(c5m,"low",3); ph=_pivots(h,"high",1,1); pl=_pivots(l,"low",1,1)
-    long_trail=(pl[-1][1]-RUNNER_ATR5_BUFFER*atr5) if pl else 0.0
-    short_trail=(ph[-1][1]+RUNNER_ATR5_BUFFER*atr5) if ph else 0.0
-    return long_trail,short_trail
+    return ((pl[-1][1]-RUNNER_ATR5_BUFFER*atr5) if pl else 0.0,
+            (ph[-1][1]+RUNNER_ATR5_BUFFER*atr5) if ph else 0.0)
 
 
 def compute(c1m,c5m=None,c15m=None,c4h=None):
@@ -200,18 +274,31 @@ def compute(c1m,c5m=None,c15m=None,c4h=None):
     if len(c1m)<70 or len(c5m)<50 or len(c15m)<50 or len(c4h)<60:return {}
     tss=_tss_4h(c4h); ms=_structure_15m(c15m); amd=_amd_5m(c5m)
     il=_ifvg_1m(c1m,"LONG"); is_=_ifvg_1m(c1m,"SHORT"); ml=_micro_confirm(c1m,"LONG",il); ms1=_micro_confirm(c1m,"SHORT",is_)
+    ql=_momentum_quality(c1m,c5m,"LONG"); qs=_momentum_quality(c1m,c5m,"SHORT")
     c1=_series(c1m,"close",4); o1=_series(c1m,"open",1); h1=_series(c1m,"high",2); l1=_series(c1m,"low",3); v1=_series(c1m,"volume",5)
-    c15=_series(c15m,"close",4); e15=ema(c15,20); _,a1=_atr(c1m); r=_rsi(c1); _,a5=_atr(c5m); rtl,rts=_runner_trails(c5m,a5)
-    long_sig=tss.get("bias")=="LONG" and ms.get("allow_long") and amd.get("long_ready") and il.get("valid") and ml.get("entry_ready")
-    short_sig=tss.get("bias")=="SHORT" and ms.get("allow_short") and amd.get("short_ready") and is_.get("valid") and ms1.get("entry_ready")
-    d="LONG" if long_sig else "SHORT" if short_sig else "NONE"; chosen=il if d=="LONG" else is_ if d=="SHORT" else {}; micro=ml if d=="LONG" else ms1 if d=="SHORT" else {}
+    c15=_series(c15m,"close",4); e15=ema(c15,20); _,a1=_atr(c1m); _,a5=_atr(c5m); rtl,rts=_runner_trails(c5m,a5)
+    long_base=tss.get("bias")=="LONG" and ms.get("allow_long") and amd.get("long_ready") and il.get("valid") and ml.get("entry_ready")
+    short_base=tss.get("bias")=="SHORT" and ms.get("allow_short") and amd.get("short_ready") and is_.get("valid") and ms1.get("entry_ready")
+    long_sig=long_base and ql.get("pass"); short_sig=short_base and qs.get("pass")
+    d="LONG" if long_sig else "SHORT" if short_sig else "NONE"; chosen=il if d=="LONG" else is_ if d=="SHORT" else {}; micro=ml if d=="LONG" else ms1 if d=="SHORT" else {}; quality=ql if d=="LONG" else qs if d=="SHORT" else {}
     sl=0.0; cycle=""
     if d=="LONG":
         structural=min(float(amd["manipulation_low"]),float(micro["swing"])); sl=structural-.15*a5; cycle=amd.get("long_cycle_id","")
     elif d=="SHORT":
         structural=max(float(amd["manipulation_high"]),float(micro["swing"])); sl=structural+.15*a5; cycle=amd.get("short_cycle_id","")
-    trigger=f"4H {tss['bias']} → M15 {ms['state']} → M5 {amd['phase']} → M1 IFVG → MICRO BOS → PULLBACK {d}" if d!="NONE" else ""
-    return {"schema":ENGINE_SCHEMA,"timeframe":"1M_EXECUTION_V7_2","open":o1[-1],"high":h1[-1],"low":l1[-1],"close":c1[-1],"volume":v1[-1],"atr1":a1,"atr5":a5,"rsi1":r[-1],"m15_close":c15[-1],"m15_ema20":e15[-1],"tss_bias":tss.get("bias","NEUTRAL"),"tss_score":float(tss.get("score",0)),"tss":tss,"structure":ms.get("state","UNKNOWN"),"structure_bias":ms.get("bias","NEUTRAL"),"m15":ms,"amd_phase":amd.get("phase","WAIT"),"amd":amd,"amd_cycle_id":cycle,"ifvg_long":il,"ifvg_short":is_,"micro_long":ml,"micro_short":ms1,"micro_confirmed":bool(micro.get("confirmed")),"micro_armed":bool(micro.get("armed")),"pullback_ready":bool(micro.get("entry_ready")),"micro_level":float(micro.get("level",0) or 0),"micro_swing":float(micro.get("swing",0) or 0),"ifvg_valid":bool(chosen.get("valid")),"ifvg_low":float(chosen.get("zone_low",0) or 0),"ifvg_high":float(chosen.get("zone_high",0) or 0),"manipulation_low":float(amd.get("manipulation_low",0) or 0),"manipulation_high":float(amd.get("manipulation_high",0) or 0),"runner_trail_long":rtl,"runner_trail_short":rts,"sl":sl,"long_signal":long_sig,"short_signal":short_sig,"direction":d,"trigger":trigger,"runner_exit_long":bool(ms.get("choch_down")),"runner_exit_short":bool(ms.get("choch_up"))}
+    trigger=f"4H {tss['bias']} → M15 {ms['state']} → M5 {amd['phase']} → Q {quality.get('score',0):.0f} → M1 IFVG → MICRO BOS → PULLBACK {d}" if d!="NONE" else ""
+    return {"schema":ENGINE_SCHEMA,"timeframe":"1M_EXECUTION_V7_3","open":o1[-1],"high":h1[-1],"low":l1[-1],"close":c1[-1],"volume":v1[-1],"atr1":a1,"atr5":a5,
+            "m15_close":c15[-1],"m15_ema20":e15[-1],"tss_bias":tss.get("bias","NEUTRAL"),"tss_score":float(tss.get("score",0)),"tss":tss,
+            "structure":ms.get("state","UNKNOWN"),"structure_bias":ms.get("bias","NEUTRAL"),"m15":ms,"amd_phase":amd.get("phase","WAIT"),"amd":amd,
+            "amd_cycle_id":cycle,"ifvg_long":il,"ifvg_short":is_,"micro_long":ml,"micro_short":ms1,"quality_long":ql,"quality_short":qs,
+            "quality_score":float(quality.get("score",0) or 0),"quality_pass":bool(quality.get("pass")),"quality_veto":bool(quality.get("veto")),
+            "micro_confirmed":bool(micro.get("confirmed")),"micro_armed":bool(micro.get("armed")),"pullback_ready":bool(micro.get("entry_ready")),
+            "micro_level":float(micro.get("level",0) or 0),"micro_swing":float(micro.get("swing",0) or 0),"ifvg_valid":bool(chosen.get("valid")),
+            "ifvg_low":float(chosen.get("zone_low",0) or 0),"ifvg_high":float(chosen.get("zone_high",0) or 0),"manipulation_low":float(amd.get("manipulation_low",0) or 0),
+            "manipulation_high":float(amd.get("manipulation_high",0) or 0),"runner_trail_long":rtl,"runner_trail_short":rts,
+            "runner_momentum_long":bool(ql.get("score",0)>=65 and not ql.get("veto")),"runner_momentum_short":bool(qs.get("score",0)>=65 and not qs.get("veto")),
+            "sl":sl,"long_signal":long_sig,"short_signal":short_sig,"direction":d,"trigger":trigger,
+            "runner_exit_long":bool(ms.get("choch_down")),"runner_exit_short":bool(ms.get("choch_up"))}
 
 
 class IndicatorEngine:
