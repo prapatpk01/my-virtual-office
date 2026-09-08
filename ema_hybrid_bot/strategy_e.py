@@ -258,6 +258,7 @@ class EMAHybridProStrategy(_BASE.EMAHybridProStrategy):
 
     def entry_status(self, df4h, df1h, df15, df5):
         base_text = super().entry_status(df4h, df1h, df15, df5)
+        base_text = base_text.replace("A+B QUALITY V2.1", "A+B+C+D+E QUALITY V2.5", 1)
         return (
             base_text
             + f" | A/B Confirm=Price-SMA{self.AB_SMA_LEN}+RSI{self.AB_RSI_LEN}/RSI-SMA{self.AB_RSI_SMA_LEN}"
