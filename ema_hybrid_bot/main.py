@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 import main_core as core
 import strategy_e as setup_e
+from entry_alert_guard import EntryAlertGuardMixin
 
 _LOG = core._LOG
 
@@ -99,13 +100,14 @@ core._setup_label_from_text = _setup_label_from_text
 core._ema_runtime_text = _v25_runtime_text
 
 
-class Bot(core.Bot):
+class Bot(EntryAlertGuardMixin, core.Bot):
     METAL_CORR_GUARD = os.getenv("EMA_METAL_CORR_GUARD", "true").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
     def __init__(self):
         super().__init__()
+        self._ema_alert_logger = _LOG
         self.strat = setup_e.EMAHybridProStrategy(self.cfg.strategy_config())
         self._install_client_await_compat()
         self.strat.correlation_guard = self._metal_correlation_blocked
@@ -288,13 +290,14 @@ class Bot(core.Bot):
                 f"TP2: next 5M liquidity/swing with room `≥{self.strat.TP2_MIN_RR:.1f}R`\n"
                 f"XAU/XAG same-direction guard: `{'ON' if self.METAL_CORR_GUARD else 'OFF'}`\n"
                 "Telegram: Entry + Setup A/B/C/D/E + TP1 + TP2/SL/TP1_LOCK alerts\n"
+                "Entry delivery: guaranteed photo → text fallback → recovery alert if post-order delivery is missing\n"
                 "PAPER entries: `24/7` | LIVE entries: `24/5` | Open positions managed: `24/7`"
             )
 
         _LOG.info(
             "EMA Hybrid A+B+C+D+E Quality V2.5 active: A>E>C>D>B priority, "
             "A/B RSI-SMA confirmation, MACD+Volume E, MA5/20 D, precision B, "
-            "triple-confirm C, SL sanity, metal correlation guard and await-compat"
+            "triple-confirm C, guaranteed entry alerts, SL sanity, metal correlation guard and await-compat"
         )
 
 
