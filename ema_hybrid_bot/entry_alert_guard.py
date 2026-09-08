@@ -1,16 +1,22 @@
-"""Guaranteed entry-alert delivery for EMA Hybrid A-E.
+"""Guaranteed entry-alert delivery + persistent PAPER state for EMA Hybrid A-E.
 
 The inherited HMA entry path persists a newly opened position before rendering /
-sending its Telegram chart.  That is correct for trade safety, but a downstream
+sending its Telegram chart. That is correct for trade safety, but a downstream
 chart or Telegram failure can leave a real/open PAPER position with no visible
-entry notification.  This mixin makes notification delivery observable and
+entry notification. This mixin makes notification delivery observable and
 recovers it without changing entry, risk, TP or SL logic.
+
+It also keeps PAPER balance/positions on disk and rewrites /stats so A-E are
+always reported separately. With STATE_DIR on a Railway persistent volume,
+balance, positions, local state and the EMA journal survive redeploys.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 
 from chart_engine import build_entry_chart
 
@@ -48,7 +54,7 @@ def _setup_label(trigger: str) -> str:
 
 
 class EntryAlertGuardMixin:
-    """Guarantee that every newly opened A-E position gets an entry alert."""
+    """Entry-alert guarantee + PAPER persistence + unified A-E statistics."""
 
     ENTRY_ALERT_DELIVERY_WINDOW_SEC = float(
         os.getenv("EMA_ENTRY_ALERT_DELIVERY_WINDOW_SEC", "120")
@@ -59,23 +65,212 @@ class EntryAlertGuardMixin:
     ENTRY_ALERT_EXISTING_MAX_AGE_SEC = float(
         os.getenv("EMA_ENTRY_ALERT_EXISTING_MAX_AGE_SEC", str(6 * 60 * 60))
     )
+    PAPER_START_BALANCE = float(os.getenv("EMA_PAPER_START_BALANCE", "10000"))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._ema_entry_delivery: dict[tuple[str, str], float] = {}
         self._install_entry_delivery_guard()
+        self._install_paper_persistence()
 
     @staticmethod
     def _root(symbol: str) -> str:
         return str(symbol or "").split("/")[0].upper()
 
+    # ------------------------------------------------------------------
+    # PAPER account persistence
+    # ------------------------------------------------------------------
+    def _paper_account_file(self) -> str:
+        return os.path.join(self.cfg.state_dir, "ema_hybrid_paper_account.json")
+
+    def _paper_migration_snapshot(self) -> tuple[float, dict]:
+        """Best-effort one-time reconstruction when no account file exists yet."""
+        balance = self.PAPER_START_BALANCE
+        try:
+            balance += sum(float(r.get("pnl") or 0.0) for r in getattr(self, "ema_journal", []))
+        except Exception:
+            pass
+
+        positions: dict[str, dict] = {}
+        fee_rate = float(getattr(self.cfg, "fee_rate", 0.0) or 0.0)
+        for symbol in getattr(self.cfg, "symbols", []):
+            pos = ((getattr(self, "state", {}) or {}).get(symbol) or {}).get("pos") or {}
+            side = str(pos.get("side") or "").lower()
+            entry = float(pos.get("entry") or 0.0)
+            amount = float(pos.get("amount") or 0.0)
+            if side not in {"long", "short"} or entry <= 0 or amount <= 0:
+                continue
+            positions[f"{symbol}||{side}"] = {
+                "entry": entry,
+                "amount": amount,
+                "tp": float(pos.get("tp") or 0.0) or None,
+                "sl": float(pos.get("sl") or 0.0) or None,
+            }
+            initial_amount = float(pos.get("initial_amount") or amount)
+            balance -= initial_amount * entry * fee_rate
+            balance += float(pos.get("tp1_net_pnl") or 0.0)
+        return balance, positions
+
+    def _save_paper_account(self) -> None:
+        if not bool(getattr(self.cfg, "paper", False)):
+            return
+        path = self._paper_account_file()
+        try:
+            os.makedirs(self.cfg.state_dir, exist_ok=True)
+            payload = {
+                "version": 1,
+                "updated_ms": int(time.time() * 1000),
+                "balance": dict(getattr(self.client, "_paper_balance", {}) or {}),
+                "positions": dict(getattr(self.client, "_paper_positions", {}) or {}),
+            }
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except Exception as exc:
+            self._entry_alert_log("error", "PAPER account save failed: %s", exc, exc_info=True)
+
+    def _install_paper_persistence(self) -> None:
+        if not bool(getattr(self.cfg, "paper", False)):
+            return
+
+        path = self._paper_account_file()
+        loaded = False
+        try:
+            with open(path) as f:
+                payload = json.load(f)
+            balance = payload.get("balance") or {}
+            positions = payload.get("positions") or {}
+            if isinstance(balance, dict) and isinstance(positions, dict):
+                self.client._paper_balance = {
+                    "USDT": float(balance.get("USDT", self.PAPER_START_BALANCE))
+                }
+                self.client._paper_positions = positions
+                loaded = True
+                self._entry_alert_log(
+                    "info", "loaded persistent PAPER account balance=%.2f positions=%d from %s",
+                    self.client._paper_balance["USDT"], len(positions), path,
+                )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            self._entry_alert_log(
+                "error", "PAPER account load failed; using migration snapshot: %s", exc,
+                exc_info=True,
+            )
+
+        if not loaded:
+            balance, positions = self._paper_migration_snapshot()
+            self.client._paper_balance = {"USDT": float(balance)}
+            self.client._paper_positions = positions
+            self._entry_alert_log(
+                "warning",
+                "created persistent PAPER account from local state balance=%.2f positions=%d",
+                balance, len(positions),
+            )
+
+        original_paper_order = getattr(self.client, "_paper_order", None)
+        if callable(original_paper_order):
+            async def persistent_paper_order(*args, __fn=original_paper_order, **kwargs):
+                result = __fn(*args, **kwargs)
+                if hasattr(result, "__await__"):
+                    result = await result
+                self._save_paper_account()
+                return result
+            self.client._paper_order = persistent_paper_order
+
+        self._save_paper_account()
+
+    # ------------------------------------------------------------------
+    # Unified A-E stats
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _row_setup_key(row: dict) -> str:
+        stored = str(row.get("setup") or "").upper()
+        if stored in {
+            "A_EMA_CROSS", "B_PULLBACK_RECLAIM", "C_BOLL_MACD_KDJ",
+            "D_MA5_MA20", "E_MACD_VOLUME",
+        }:
+            return stored
+        return _setup_key(str(row.get("trigger") or ""))
+
+    @staticmethod
+    def _setup_metrics(rows: list[dict]) -> tuple[int, float, str, float]:
+        total = len(rows)
+        if total == 0:
+            return 0, 0.0, "—", 0.0
+        wins = sum(1 for r in rows if float(r.get("pnl") or 0.0) > 0)
+        gross_win = sum(float(r.get("pnl") or 0.0) for r in rows if float(r.get("pnl") or 0.0) > 0)
+        gross_loss = abs(sum(float(r.get("pnl") or 0.0) for r in rows if float(r.get("pnl") or 0.0) < 0))
+        net = sum(float(r.get("pnl") or 0.0) for r in rows)
+        wr = wins / total * 100.0
+        if gross_loss > 1e-12:
+            pf_text = f"{gross_win / gross_loss:.2f}"
+        elif gross_win > 0:
+            pf_text = "∞"
+        else:
+            pf_text = "0.00"
+        return total, wr, pf_text, net
+
+    async def _build_stats_report(self) -> str:
+        report = await super()._build_stats_report()
+        if not bool(getattr(self.cfg, "paper", False)):
+            return report
+
+        now = datetime.now(timezone.utc)
+        month_start = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        month_rows = [
+            r for r in getattr(self, "ema_journal", [])
+            if int(r.get("close_ms") or 0) >= month_start
+        ]
+        specs = (
+            ("A_EMA_CROSS", "A EMA CROSS"),
+            ("B_PULLBACK_RECLAIM", "B PULLBACK"),
+            ("C_BOLL_MACD_KDJ", "C BOLL/MACD/KDJ"),
+            ("D_MA5_MA20", "D MA5/MA20"),
+            ("E_MACD_VOLUME", "E MACD/VOLUME"),
+        )
+
+        setup_lines: list[str] = []
+        for key, label in specs:
+            block = [r for r in month_rows if self._row_setup_key(r) == key]
+            total, wr, pf_text, net = self._setup_metrics(block)
+            if total:
+                setup_lines.append(
+                    f"{label:17s} {total} | {wr:.0f}% WR | PF {pf_text} | ${net:+.2f}"
+                )
+            else:
+                setup_lines.append(f"{label:17s} 0 | — WR | PF — | $+0.00")
+
+        lines = report.splitlines()
+        section = next((i for i, line in enumerate(lines) if line.startswith("BY SETUP —")), None)
+        since = next(
+            (i for i, line in enumerate(lines) if line.startswith("SINCE ") and (section is None or i > section)),
+            None,
+        )
+        if section is None or since is None:
+            return report
+
+        sep = "――――――――――――――――"
+        start = section - 1 if section > 0 and lines[section - 1] == sep else section
+        end = since - 1 if since > 0 and lines[since - 1] == sep else since
+        block = [
+            sep,
+            f"BY SETUP — {now.strftime('%b %Y')}",
+            sep,
+            *setup_lines,
+            "",
+        ]
+        return "\n".join(lines[:start] + block + lines[end:])
+
+    # ------------------------------------------------------------------
+    # Entry alert guarantee
+    # ------------------------------------------------------------------
     def _entry_identity_from_text(self, text: str):
         if not isinstance(text, str):
             return None
         plain = text.replace("`", "").replace("*", "")
         upper = plain.upper()
-        # Only treat true entry captions as delivery confirmations.  TP/SL/status
-        # messages may also contain a symbol/side but do not contain this pair.
         if "STRUCTURE SL" not in upper or "MARGIN $" not in upper:
             return None
         for symbol in getattr(self.cfg, "symbols", []):
@@ -96,7 +291,6 @@ class EntryAlertGuardMixin:
         return ts is not None and time.monotonic() - ts <= self.ENTRY_ALERT_DELIVERY_WINDOW_SEC
 
     def _install_entry_delivery_guard(self) -> None:
-        """Track success and force text fallback when photo delivery returns False."""
         previous_text = self.tg.send_text
         previous_photo = self.tg._send_photo
 
@@ -131,8 +325,7 @@ class EntryAlertGuardMixin:
 
             if not ok:
                 self._entry_alert_log(
-                    "warning",
-                    "entry photo delivery returned false; forcing text fallback",
+                    "warning", "entry photo delivery returned false; forcing text fallback",
                 )
                 try:
                     result = previous_text(caption)
@@ -156,8 +349,6 @@ class EntryAlertGuardMixin:
     def _entry_alert_log(self, level: str, message: str, *args, **kwargs) -> None:
         logger = getattr(self, "_ema_alert_logger", None)
         if logger is None:
-            # Every inherited EMA runtime exposes its logger through the class
-            # module; standard print is intentionally avoided in production.
             try:
                 import logging
                 logger = logging.getLogger("precision_structure")
@@ -210,16 +401,8 @@ class EntryAlertGuardMixin:
                 sl = float(pos.get("sl") or 0.0)
                 tp = float(pos.get("tp") or 0.0)
                 chart = build_entry_chart(
-                    symbol,
-                    df5,
-                    side,
-                    entry,
-                    sl,
-                    tp,
-                    tp,
-                    ema_fast_len=8,
-                    ema_slow_len=13,
-                    tf_label="5M",
+                    symbol, df5, side, entry, sl, tp, tp,
+                    ema_fast_len=8, ema_slow_len=13, tf_label="5M",
                 )
         except Exception as exc:
             self._entry_alert_log(
@@ -257,7 +440,6 @@ class EntryAlertGuardMixin:
         return ok
 
     async def _look_for_entry(self, symbol: str, st: dict):
-        """Run inherited entry execution then verify visible delivery A-E."""
         before_open = bool(st.get("pos"))
         try:
             result = await super()._look_for_entry(symbol, st)
@@ -265,11 +447,8 @@ class EntryAlertGuardMixin:
             pos = st.get("pos") or {}
             if not before_open and pos:
                 self._entry_alert_log(
-                    "error",
-                    "post-order entry pipeline failed for %s; recovering alert: %s",
-                    symbol,
-                    exc,
-                    exc_info=True,
+                    "error", "post-order entry pipeline failed for %s; recovering alert: %s",
+                    symbol, exc, exc_info=True,
                 )
                 if self._correct_position_setup(pos):
                     self._save_state()
@@ -287,11 +466,8 @@ class EntryAlertGuardMixin:
                     changed = True
             else:
                 self._entry_alert_log(
-                    "warning",
-                    "position opened but no confirmed entry delivery: %s setup=%s trigger=%s",
-                    symbol,
-                    _setup_key(str(pos.get("trigger") or "")),
-                    pos.get("trigger"),
+                    "warning", "position opened but no confirmed entry delivery: %s setup=%s trigger=%s",
+                    symbol, _setup_key(str(pos.get("trigger") or "")), pos.get("trigger"),
                 )
                 await self._send_entry_recovery_alert(symbol, pos)
             if changed:
@@ -299,7 +475,6 @@ class EntryAlertGuardMixin:
         return result
 
     async def _manage(self, symbol: str, st: dict):
-        """One-time recovery for a recent pre-fix silent Setup-E position."""
         pos = st.get("pos") or {}
         trigger = str(pos.get("trigger") or "").upper()
         if (
