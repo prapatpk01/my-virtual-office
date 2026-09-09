@@ -1,780 +1,420 @@
-"""Sentinel V1.11 — hybrid 1H S/R + fast 15M execution + dynamic proximity.
+"""Sentinel V9 Clean Core.
 
-Core rules
-- 1H RAW OHLC is the primary S1/S2/R1/R2 map and ATR14 source.
-- 1H Heiken Ashi pivots are a fallback only when RAW OHLC has no valid level on that side.
-- 15M RAW OHLC ONLY executes proximity rejection / reclaim / displacement.
-- LONG requires only 1H S1. S2 is preferred but is NOT required.
-  If S2 exists, SL sits below S2 + buffer. If S2 is missing, SL falls back to
-  S1 - configurable ATR distance. If R1 exists it remains the TP and actual RR
-  must pass; if R1 does not exist after RAW+HA fallback, LONG is OPEN_SKY.
-- SHORT requires only 1H R1. R2 is preferred but is NOT required.
-  If R2 exists, SL sits above R2 + buffer. If R2 is missing, SL falls back to
-  R1 + configurable ATR distance. If S1 exists it remains the TP and actual RR
-  must pass; if S1 does not exist after RAW+HA fallback, SHORT is OPEN_FLOOR.
-- Normal mapped proximity is 0.30 ATR while S1-R1 room is <= 3.0 ATR.
-- If mapped room is > 3.0 ATR, proximity expands to room/5, capped at 1.00 ATR.
-- OPEN_SKY/OPEN_FLOOR use MCDX-directional dynamic proximity: base 0.60 ATR,
-  continuously expanding with score, dominance gap and flow, capped at 1.50 ATR.
-- MCDX relative dominance: LONG L>=45, L-S>10, flow>52; SHORT S>=45, S-L>10, flow<48.
+Single-purpose architecture:
+15M = analysis/setup/score/location -> 5M = execution trigger.
+No 1H/4H direction, no MCDX, no legacy overlays, no V10 engines.
+
+15M evidence:
+- EMA20/50 trend + EMA200 macro bonus
+- EMA slopes + HMA16
+- RSI14 vs SMA14
+- MACD 12/26/9
+- ADX/DMI + CHOP + ATR activity
+- confirmed swing structure / BOS / CHoCH / liquidity sweep
+- S/R + Fib 38.2/50/61.8 location
+
+Setup families and minimum score:
+PB 6.0 | LQ 6.0 | BO_RETEST 6.5 | BO_DIRECT 7.0 | REV 7.5
+
+5M execution:
+PULLBACK_RECLAIM | MICRO_BREAKOUT | SWEEP_RECLAIM
+with ADX/CHOP/ATR gate, candle quality and anti-chase.
+
+Risk:
+structure SL + 0.18 ATR, bounded 0.90..1.80 ATR;
+TP1 +1.0R closes 50%, runner stop +0.15R; TP2 1.5..2.5R, fallback 2R.
+
+Only closed candles are used for decisions.
 """
 from __future__ import annotations
 
+import math
+import time
 from typing import Optional
+
 import numpy as np
 
 from .base import BaseStrategy, Signal, SignalType
+from ..engines.position_manager import PositionUpdate
 
 
 class SentinelStrategy(BaseStrategy):
-    VERSION = "1.11"
+    VERSION = "9.1-CLEAN"
     entry_tf = "15m"
 
-    def __init__(
-        self,
-        symbol: str,
-        params: Optional[dict] = None,
-        min_context_score: float = 45.0,
-        mcdx_dominance_gap: float = 10.0,
-        long_flow_min: float = 52.0,
-        short_flow_max: float = 48.0,
-        min_location_atr: float = 1.20,
-        min_rr: float = 1.50,
-        entry_zone_atr: float = 0.30,
-        reversal_proximity_atr: float = 0.30,
-        open_ended_proximity_atr: float = 0.60,
-        open_ended_max_proximity_atr: float = 1.50,
-        sl_buffer_atr: float = 0.15,
-        missing_outer_sl_atr: float = 0.30,
-        pivot_span: int = 3,
-    ):
+    # Market gate
+    ADX_MIN = 12.0
+    CHOP_MAX = 64.0
+    ATR_ACTIVITY_MIN = 0.65
+
+    # Structure
+    PIVOT_SPAN = 2
+    BOS_BUFFER_ATR = 0.05
+    SWEEP_BUFFER_ATR = 0.05
+
+    # Setup scores
+    SCORE_MIN = {
+        "PB": 6.0,
+        "LQ": 6.0,
+        "BO_RETEST": 6.5,
+        "BO_DIRECT": 7.0,
+        "REV": 7.5,
+    }
+
+    # Execution
+    MAX_CHASE_ATR = 0.30
+    SL_BUFFER_ATR = 0.18
+    MIN_SL_ATR = 0.90
+    MAX_SL_ATR = 1.80
+    MIN_ECONOMIC_RISK_PCT = 0.0040
+
+    # Position management
+    TP1_R = 1.0
+    TP1_CLOSE_PCT = 0.50
+    TP1_LOCK_R = 0.15
+    TP2_MIN_R = 1.50
+    TP2_MAX_R = 2.50
+    TP2_FALLBACK_R = 2.00
+
+    HARD_SL_COOLDOWN_5M = 3
+    NORMAL_COOLDOWN_5M = 1
+
+    SETUP_PRIORITY = ("PB", "LQ", "REV", "BO_RETEST", "BO_DIRECT")
+
+    def __init__(self, symbol: str, params: Optional[dict] = None, **kwargs):
         super().__init__(symbol, params)
-        self.min_context_score = float(min_context_score)
-        self.mcdx_dominance_gap = max(0.0, float(mcdx_dominance_gap))
-        self.long_flow_min = float(long_flow_min)
-        self.short_flow_max = float(short_flow_max)
-        self.min_location_atr = float(min_location_atr)
-        self.min_rr = float(min_rr)
-        self.entry_zone_atr = float(entry_zone_atr)
-        self.reversal_proximity_atr = max(0.05, float(reversal_proximity_atr))
-        self.open_ended_proximity_atr = max(self.reversal_proximity_atr, float(open_ended_proximity_atr))
-        self.open_ended_max_proximity_atr = max(
-            self.open_ended_proximity_atr,
-            min(1.50, float(open_ended_max_proximity_atr)),
-        )
-        self.sl_buffer_atr = max(0.0, float(sl_buffer_atr))
-        self.missing_outer_sl_atr = max(0.10, float(missing_outer_sl_atr))
-        self.pivot_span = max(2, int(pivot_span))
-        self.name = f"Sentinel({symbol})"
+        self.name = f"SentinelV9({symbol})"
+        self._entry_threshold_bonus = 0.0
         self._open_position: Optional[str] = None
         self._entry_price: Optional[float] = None
         self._entry_sl: Optional[float] = None
-        self._open_ended: bool = False
-        self._latest_15m: list = []
-        self._latest_mtf: dict = {}
-        self._latest_sr: dict = {}
-        self._latest_sx: dict = {}
-        self._latest_mc: dict = {}
+        self._entry_tp: Optional[float] = None
+        self._initial_risk: Optional[float] = None
+        self._tp1_done = False
+        self._pending_entry = False
+        self._last_entry_15m_ts: Optional[int] = None
+        self._last_exit_bar_ts: Optional[int] = None
+        self._last_hard_sl_bar_ts: Optional[int] = None
+        self._latest_analysis: dict = {}
+
+    # ---------------------------- generic helpers ----------------------------
+    @staticmethod
+    def _finite(*xs) -> bool:
+        return all(np.isfinite(float(x)) for x in xs)
 
     @staticmethod
-    def _clamp(x: float, lo: float, hi: float) -> float:
+    def _clamp(x, lo, hi):
         return max(lo, min(hi, x))
 
     @staticmethod
-    def _confirmed_pivots(candles: list, span: int) -> tuple[list[float], list[float]]:
-        highs: list[float] = []
-        lows: list[float] = []
-        if len(candles) < span * 2 + 3:
-            return highs, lows
+    def _bar_ts(c):
+        return int(getattr(c, "timestamp", 0) or 0)
+
+    @staticmethod
+    def _confirmed_pivots(candles, span=2):
+        highs, lows = [], []
         for i in range(span, len(candles) - span):
-            hi = float(candles[i].high)
-            lo = float(candles[i].low)
-            if hi >= max(float(c.high) for c in candles[i-span:i]) and hi >= max(float(c.high) for c in candles[i+1:i+span+1]):
-                highs.append(hi)
-            if lo <= min(float(c.low) for c in candles[i-span:i]) and lo <= min(float(c.low) for c in candles[i+1:i+span+1]):
-                lows.append(lo)
+            h = float(candles[i].high); l = float(candles[i].low)
+            hw = [float(x.high) for x in candles[i-span:i+span+1]]
+            lw = [float(x.low) for x in candles[i-span:i+span+1]]
+            if h >= max(hw): highs.append((i, h))
+            if l <= min(lw): lows.append((i, l))
         return highs, lows
 
     @staticmethod
-    def _heikin_ashi_pivots(candles: list, span: int) -> tuple[list[float], list[float]]:
-        """Return confirmed pivot highs/lows from synthetic 1H Heiken Ashi bars.
-
-        HA is used only for finding a fallback map level. Execution and ATR remain RAW OHLC.
-        """
-        if len(candles) < span * 2 + 3:
-            return [], []
-
-        ha_highs: list[float] = []
-        ha_lows: list[float] = []
-        prev_ha_open: Optional[float] = None
-        prev_ha_close: Optional[float] = None
-
-        for i, c in enumerate(candles):
-            op = float(c.open)
-            hi = float(c.high)
-            lo = float(c.low)
-            cl = float(c.close)
-            ha_close = (op + hi + lo + cl) / 4.0
-            if i == 0 or prev_ha_open is None or prev_ha_close is None:
-                ha_open = (op + cl) / 2.0
-            else:
-                ha_open = (prev_ha_open + prev_ha_close) / 2.0
-            ha_high = max(hi, ha_open, ha_close)
-            ha_low = min(lo, ha_open, ha_close)
-            ha_highs.append(ha_high)
-            ha_lows.append(ha_low)
-            prev_ha_open = ha_open
-            prev_ha_close = ha_close
-
-        pivot_highs: list[float] = []
-        pivot_lows: list[float] = []
-        for i in range(span, len(ha_highs) - span):
-            hi = ha_highs[i]
-            lo = ha_lows[i]
-            if hi >= max(ha_highs[i-span:i]) and hi >= max(ha_highs[i+1:i+span+1]):
-                pivot_highs.append(float(hi))
-            if lo <= min(ha_lows[i-span:i]) and lo <= min(ha_lows[i+1:i+span+1]):
-                pivot_lows.append(float(lo))
-        return pivot_highs, pivot_lows
-
-    def _structure(self, candles: list) -> str:
-        hs, ls = self._confirmed_pivots(candles[-80:], 3)
-        if len(hs) >= 2 and len(ls) >= 2:
-            if hs[-1] > hs[-2] and ls[-1] > ls[-2]:
-                return "BULL"
-            if hs[-1] < hs[-2] and ls[-1] < ls[-2]:
-                return "BEAR"
-        return "MIXED"
-
-    def _sr_map_1h(self, mtf: dict, price: float) -> dict:
-        h1 = list((mtf or {}).get("1h") or [])
-        if len(h1) < 60:
-            return {"ready": False, "reason": "1H S/R warmup", "bars_1h": len(h1)}
-
-        atr_arr = self.atr(h1, 14)
-        atr_1h = float(atr_arr[-1]) if len(atr_arr) and np.isfinite(atr_arr[-1]) else 0.0
-        if atr_1h <= 0:
-            return {"ready": False, "reason": "1H ATR unavailable", "bars_1h": len(h1)}
-
-        raw_h, raw_l = self._confirmed_pivots(h1[-180:], self.pivot_span)
-        ha_h, ha_l = self._heikin_ashi_pivots(h1[-180:], self.pivot_span)
-
-        raw_res = sorted({float(x) for x in raw_h if float(x) > price})
-        raw_sup = sorted({float(x) for x in raw_l if float(x) < price}, reverse=True)
-        ha_res = sorted({float(x) for x in ha_h if float(x) > price})
-        ha_sup = sorted({float(x) for x in ha_l if float(x) < price}, reverse=True)
-
-        # RAW OHLC is primary. HA only fills a missing side, then may fill the outer level.
-        if raw_res:
-            r1 = raw_res[0]
-            r1_source = "OHLC"
-        elif ha_res:
-            r1 = ha_res[0]
-            r1_source = "HA_FALLBACK"
-        else:
-            r1 = None
-            r1_source = "NONE"
-
-        if raw_sup:
-            s1 = raw_sup[0]
-            s1_source = "OHLC"
-        elif ha_sup:
-            s1 = ha_sup[0]
-            s1_source = "HA_FALLBACK"
-        else:
-            s1 = None
-            s1_source = "NONE"
-
-        r2 = None
-        r2_source = "NONE"
-        if r1 is not None:
-            eps = max(atr_1h * 0.01, 1e-9)
-            raw_outer = [x for x in raw_res if x > float(r1) + eps]
-            ha_outer = [x for x in ha_res if x > float(r1) + eps]
-            candidates = sorted(set(raw_outer + ha_outer))
-            if candidates:
-                r2 = candidates[0]
-                r2_source = "OHLC" if any(abs(r2 - x) <= eps for x in raw_outer) else "HA_FALLBACK"
-
-        s2 = None
-        s2_source = "NONE"
-        if s1 is not None:
-            eps = max(atr_1h * 0.01, 1e-9)
-            raw_outer = [x for x in raw_sup if x < float(s1) - eps]
-            ha_outer = [x for x in ha_sup if x < float(s1) - eps]
-            candidates = sorted(set(raw_outer + ha_outer), reverse=True)
-            if candidates:
-                s2 = candidates[0]
-                s2_source = "OHLC" if any(abs(s2 - x) <= eps for x in raw_outer) else "HA_FALLBACK"
-
-        return {
-            "ready": True,
-            "s1": s1,
-            "s2": s2,
-            "r1": r1,
-            "r2": r2,
-            "s1_source": s1_source,
-            "s2_source": s2_source,
-            "r1_source": r1_source,
-            "r2_source": r2_source,
-            "atr_1h": atr_1h,
-            "bars_1h": len(h1),
-            "source_tf": "1H_HYBRID",
-            "long_map_ready": s1 is not None,
-            "long_has_s2": s2 is not None,
-            "short_map_ready": r1 is not None,
-            "short_has_r2": r2 is not None,
-            "open_sky_long": s1 is not None and r1 is None,
-            "open_floor_short": r1 is not None and s1 is None,
-        }
+    def _nearest_above(levels, price):
+        xs = [float(x) for x in levels if float(x) > price]
+        return min(xs) if xs else None
 
     @staticmethod
-    def _norm(v: float, lo: float, hi: float) -> float:
-        if not np.isfinite(v) or not np.isfinite(lo) or not np.isfinite(hi) or hi == lo:
-            return 50.0
-        return max(0.0, min(100.0, (v-lo)/(hi-lo)*100.0))
+    def _nearest_below(levels, price):
+        xs = [float(x) for x in levels if float(x) < price]
+        return max(xs) if xs else None
 
-    def _mcdx_context(self, candles: list, mtf: dict) -> dict:
-        n = len(candles)
-        if n < 120:
-            return {"long_score": 0.0, "short_score": 0.0, "smart_flow": 50.0, "ready": False}
+    @staticmethod
+    def _chop(candles, period=14):
+        if len(candles) < period + 1: return float("nan")
+        trs = []
+        for i in range(len(candles)-period, len(candles)):
+            c = candles[i]; p = candles[i-1]
+            trs.append(max(float(c.high)-float(c.low), abs(float(c.high)-float(p.close)), abs(float(c.low)-float(p.close))))
+        hi = max(float(c.high) for c in candles[-period:])
+        lo = min(float(c.low) for c in candles[-period:])
+        if hi <= lo: return 100.0
+        return 100.0 * math.log10(sum(trs) / (hi-lo)) / math.log10(period)
 
-        closes = np.asarray([float(c.close) for c in candles], dtype=float)
-        highs = np.asarray([float(c.high) for c in candles], dtype=float)
-        lows = np.asarray([float(c.low) for c in candles], dtype=float)
-        vols = np.asarray([max(0.0, float(c.volume)) for c in candles], dtype=float)
+    # ---------------------------- 15M analysis ----------------------------
+    def _analyze_15m(self, candles):
+        if len(candles) < 70:
+            return {"ready": False, "reason": "15M_WARMUP"}
 
-        lo50 = float(np.min(lows[-50:]))
-        hi50 = float(np.max(highs[-50:]))
-        rng = max(hi50-lo50, 1e-12)
-        smart = self._clamp(((closes[-1]*0.96)-lo50)/rng*100.0, 0, 100)
-        float_total = self._clamp(((closes[-1]*1.04)-lo50)/rng*100.0, 0, 100)
-        retail = self._clamp(100.0-float_total, 0, 100)
-
-        signed = np.sign(np.diff(closes, prepend=closes[0]))*vols
-        obv = np.cumsum(signed)
-        obv20 = obv[-20:]
-        std = float(np.std(obv20))
-        obv_z = 0.0 if std <= 1e-12 else (float(obv[-1])-float(np.mean(obv20)))/std
-        obv_norm = self._clamp((obv_z+3.0)/6.0*100.0, 0, 100)
-        pv = closes[-80:]*vols[-80:]
-        vwap = float(np.sum(pv)/max(float(np.sum(vols[-80:])), 1e-12))
-        dev = float(np.std(closes[-20:]-vwap))
-        vwap_score = self._clamp(50+(closes[-1]-vwap)/max(dev, 1e-9)*20, 0, 100)
-        upvol = float(np.sum(vols[-20:][np.diff(closes[-21:]) > 0]))
-        dnvol = float(np.sum(vols[-20:][np.diff(closes[-21:]) < 0]))
-        vol_agree = 50.0 if upvol+dnvol <= 0 else 100.0*upvol/(upvol+dnvol)
-        volume_flow = 0.50*vol_agree+0.30*obv_norm+0.20*vwap_score
-
-        rsi_arr = self.rsi(list(closes), 14)
-        _, _, hist = self.macd(list(closes), 12, 26, 9)
-        rsi = float(rsi_arr[-1]) if np.isfinite(rsi_arr[-1]) else 50.0
-        hh = hist[-100:][np.isfinite(hist[-100:])]
-        macd_score = 50.0 if len(hh) == 0 else self._norm(float(hist[-1]), float(np.min(hh)), float(np.max(hh)))
-        momentum = 0.45*rsi+0.55*macd_score
-
-        h1 = list((mtf or {}).get("1h") or [])
-        htf_bull = htf_bear = False
-        mtf_score = 50.0
-        if len(h1) >= 55:
-            hc = [float(c.close) for c in h1]
-            he20 = self.ema(hc, 20)
-            he50 = self.ema(hc, 50)
-            htf_bull = hc[-1] > he20[-1] > he50[-1]
-            htf_bear = hc[-1] < he20[-1] < he50[-1]
-            mtf_score = 80.0 if htf_bull else 20.0 if htf_bear else 50.0
-
-        structure = self._structure(candles)
-        struct_bias = 1 if structure == "BULL" else -1 if structure == "BEAR" else 0
-        e20 = self.ema(list(closes), 20)
-        e50 = self.ema(list(closes), 50)
-        trend_score = 75.0 if e20[-1] > e50[-1] else 25.0 if e20[-1] < e50[-1] else 50.0
-        chip_score = 0.70*smart+0.30*(100-retail)
-        smart_flow = self._clamp(chip_score*0.35+volume_flow*0.25+momentum*0.15+trend_score*0.15+mtf_score*0.10, 0, 100)
-
-        long_score = (
-            (30.0 if smart >= 55 else 18.0 if smart >= 50 else 0.0)
-            + (25.0 if smart_flow >= 60 else 15.0 if smart_flow >= 52 else 0.0)
-            + (20.0 if struct_bias == 1 else 8.0 if struct_bias == 0 else 0.0)
-            + (10.0 if htf_bull else 0.0)
-        )
-        short_score = (
-            (30.0 if smart <= 45 else 18.0 if smart <= 50 else 0.0)
-            + (25.0 if smart_flow <= 40 else 15.0 if smart_flow <= 48 else 0.0)
-            + (20.0 if struct_bias == -1 else 8.0 if struct_bias == 0 else 0.0)
-            + (10.0 if htf_bear else 0.0)
-        )
-        return {
-            "long_score": round(long_score, 1),
-            "short_score": round(short_score, 1),
-            "smart_money": round(smart, 1),
-            "smart_flow": round(smart_flow, 1),
-            "structure": structure,
-            "ready": True,
-        }
-
-    def _sentinel_context(self, candles: list, mtf: dict) -> dict:
         closes = [float(c.close) for c in candles]
-        if len(closes) < 60:
-            return {"bias": "NEUTRAL", "structure": "MIXED", "ready": False}
-        e20 = self.ema(closes, 20)
-        e50 = self.ema(closes, 50)
+        opens = [float(c.open) for c in candles]
+        highs = [float(c.high) for c in candles]
+        lows = [float(c.low) for c in candles]
+        vols = [float(c.volume or 0) for c in candles]
+
+        e20 = self.ema(closes, 20); e50 = self.ema(closes, 50)
+        e200 = self.ema(closes, 200) if len(closes) >= 205 else np.full(len(closes), np.nan)
         hma16 = self.hma(closes, 16)
-        structure = self._structure(candles)
-        bull = bool(e20[-1] >= e50[-1] and e20[-1] > e20[-4] and closes[-1] >= e20[-1])
-        bear = bool(e20[-1] <= e50[-1] and e20[-1] < e20[-4] and closes[-1] <= e20[-1])
-        _, _, hist = self.macd(closes, 12, 26, 9)
-        r = self.rsi(closes, 14)
-        fast = float(hma16[-1]-hma16[-3]) if np.isfinite(hma16[-1]) and np.isfinite(hma16[-3]) else 0.0
-        histv = float(hist[-1]) if np.isfinite(hist[-1]) else 0.0
-        rsiv = float(r[-1]) if np.isfinite(r[-1]) else 50.0
-        return {
-            "bias": "BULL" if bull else "BEAR" if bear else "BALANCED",
-            "structure": structure,
-            "sme_bull": fast > 0 and histv >= 0 and rsiv >= 45,
-            "sme_bear": fast < 0 and histv <= 0 and rsiv <= 55,
-            "ready": True,
+        atr = self.atr(candles, 14)
+        rsi = self.rsi(closes, 14); rsi_sma = self.sma(list(rsi), 14)
+        macd, macd_sig, hist = self.macd(closes, 12, 26, 9)
+        adx, dip, dim = self.adx(candles, 14)
+        chop = self._chop(candles, 14)
+
+        vals = [e20[-1], e50[-1], hma16[-1], atr[-1], rsi[-1], rsi_sma[-1], macd[-1], macd_sig[-1], hist[-1], adx[-1], dip[-1], dim[-1], chop]
+        if not self._finite(*vals): return {"ready": False, "reason": "15M_INDICATOR_NA"}
+
+        c = closes[-1]; o = opens[-1]; h = highs[-1]; l = lows[-1]
+        a = max(float(atr[-1]), 1e-12)
+        ema20 = float(e20[-1]); ema50 = float(e50[-1]); ema200 = float(e200[-1]) if np.isfinite(e200[-1]) else None
+        r = float(rsi[-1]); rs = float(rsi_sma[-1]); m = float(macd[-1]); ms = float(macd_sig[-1]); mh = float(hist[-1])
+        adxv = float(adx[-1]); plus = float(dip[-1]); minus = float(dim[-1]); ch = float(chop)
+        slope20 = (ema20 - float(e20[-4])) / a
+        slope50 = (ema50 - float(e50[-6])) / a
+        hma_slope = (float(hma16[-1]) - float(hma16[-3])) / a
+        rng = max(h-l, 1e-12); body_atr = abs(c-o)/a; close_pos = (c-l)/rng
+
+        ph, pl = self._confirmed_pivots(candles, self.PIVOT_SPAN)
+        last_ph = ph[-1] if ph else None; prev_ph = ph[-2] if len(ph) > 1 else None
+        last_pl = pl[-1] if pl else None; prev_pl = pl[-2] if len(pl) > 1 else None
+        hh = bool(last_ph and prev_ph and last_ph[1] > prev_ph[1])
+        lh = bool(last_ph and prev_ph and last_ph[1] < prev_ph[1])
+        hl = bool(last_pl and prev_pl and last_pl[1] > prev_pl[1])
+        ll = bool(last_pl and prev_pl and last_pl[1] < prev_pl[1])
+        structure = 2 if hh and hl else -2 if lh and ll else 1 if (hh or hl) else -1 if (lh or ll) else 0
+
+        ph_level = float(last_ph[1]) if last_ph else None
+        pl_level = float(last_pl[1]) if last_pl else None
+        prev_c = closes[-2]
+        bos_up = bool(ph_level is not None and c > ph_level + self.BOS_BUFFER_ATR*a and prev_c <= ph_level and body_atr >= .30)
+        bos_dn = bool(pl_level is not None and c < pl_level - self.BOS_BUFFER_ATR*a and prev_c >= pl_level and body_atr >= .30)
+        choch_up = structure <= 0 and bos_up
+        choch_dn = structure >= 0 and bos_dn
+        sweep_low = bool(pl_level is not None and l < pl_level-self.SWEEP_BUFFER_ATR*a and c > pl_level and c > o and close_pos >= .58)
+        sweep_high = bool(ph_level is not None and h > ph_level+self.SWEEP_BUFFER_ATR*a and c < ph_level and c < o and close_pos <= .42)
+
+        resist = self._nearest_above([x[1] for x in ph[-10:]], c)
+        support = self._nearest_below([x[1] for x in pl[-10:]], c)
+        room_long = 5.0 if resist is None else max(0.0, (resist-c)/a)
+        room_short = 5.0 if support is None else max(0.0, (c-support)/a)
+        near_res = resist is not None and abs(resist-c) <= .50*a
+        near_sup = support is not None and abs(c-support) <= .50*a
+
+        # Fib value from latest completed impulse leg.
+        fib_long = fib_short = False
+        fib_levels = {}
+        if last_ph:
+            lows_before = [x for x in pl if x[0] < last_ph[0]]
+            if lows_before and last_ph[1] > lows_before[-1][1]:
+                lo = lows_before[-1][1]; hi = last_ph[1]; d = hi-lo
+                fib_levels["long"] = [hi-d*.382, hi-d*.50, hi-d*.618]
+                fib_long = any(abs(c-x) <= .22*a for x in fib_levels["long"])
+        if last_pl:
+            highs_before = [x for x in ph if x[0] < last_pl[0]]
+            if highs_before and highs_before[-1][1] > last_pl[1]:
+                hi = highs_before[-1][1]; lo = last_pl[1]; d = hi-lo
+                fib_levels["short"] = [lo+d*.382, lo+d*.50, lo+d*.618]
+                fib_short = any(abs(c-x) <= .22*a for x in fib_levels["short"])
+
+        bull = ema20 > ema50 and slope20 >= -.02 and c >= ema50
+        bear = ema20 < ema50 and slope20 <= .02 and c <= ema50
+        macro_bull = ema200 is not None and ema50 > ema200
+        macro_bear = ema200 is not None and ema50 < ema200
+
+        # Evidence score: 5 independent 0..2 blocks.
+        trend_l = (2 if bull and macro_bull else 1 if bull else 0) + (1 if slope20 > .05 else 0)
+        trend_s = (2 if bear and macro_bear else 1 if bear else 0) + (1 if slope20 < -.05 else 0)
+        trend_l = min(2.0, trend_l); trend_s = min(2.0, trend_s)
+
+        quality_l = (1 if adxv >= 18 and plus > minus else 0) + (1 if ch < 55 and adxv >= self.ADX_MIN else 0)
+        quality_s = (1 if adxv >= 18 and minus > plus else 0) + (1 if ch < 55 and adxv >= self.ADX_MIN else 0)
+        structure_l = min(2.0, (1 if hh or hl else 0) + (1 if bos_up or choch_up or sweep_low else 0))
+        structure_s = min(2.0, (1 if lh or ll else 0) + (1 if bos_dn or choch_dn or sweep_high else 0))
+        location_l = min(2.0, (1 if near_sup or fib_long or abs(c-ema20) <= .28*a else 0) + (1 if room_long >= 1.2 else 0))
+        location_s = min(2.0, (1 if near_res or fib_short or abs(c-ema20) <= .28*a else 0) + (1 if room_short >= 1.2 else 0))
+        momentum_l = min(2.0, (1 if r > rs else 0) + (1 if m > ms or mh > 0 else 0))
+        momentum_s = min(2.0, (1 if r < rs else 0) + (1 if m < ms or mh < 0 else 0))
+        score_l = trend_l + quality_l + structure_l + location_l + momentum_l
+        score_s = trend_s + quality_s + structure_s + location_s + momentum_s
+
+        # Setup detection. Exact setup takes precedence over generic bias.
+        setups = []
+        if bull and (abs(c-ema20) <= .40*a or fib_long or near_sup) and not near_res and (r >= rs or hma_slope >= 0):
+            setups.append(("PB", score_l))
+        if sweep_low and (r >= rs or hma_slope >= 0): setups.append(("LQ", score_l + .25))
+        if bos_up and room_long >= 1.2 and body_atr >= .35 and not near_res: setups.append(("BO_DIRECT", score_l + .25))
+        if ph_level is not None and c > ph_level and not bos_up and room_long >= 1.0:
+            # A breakout that occurred recently but is no longer the first bar is a retest candidate.
+            setups.append(("BO_RETEST", score_l))
+        if choch_up and (sweep_low or near_sup or fib_long): setups.append(("REV", score_l + .50))
+        if bear and (abs(c-ema20) <= .40*a or fib_short or near_res) and not near_sup and (r <= rs or hma_slope <= 0):
+            setups.append(("PB", score_s))
+        if sweep_high and (r <= rs or hma_slope <= 0): setups.append(("LQ", score_s + .25))
+        if bos_dn and room_short >= 1.2 and body_atr >= .35 and not near_sup: setups.append(("BO_DIRECT", score_s + .25))
+        if pl_level is not None and c < pl_level and not bos_dn and room_short >= 1.0: setups.append(("BO_RETEST", score_s))
+        if choch_dn and (sweep_high or near_res or fib_short): setups.append(("REV", score_s + .50))
+
+        qualified = []
+        for setup, sc in setups:
+            if sc >= self.SCORE_MIN[setup]:
+                direction = "long" if (setup in ("LQ","REV") and sweep_low) or score_l >= score_s else "short"
+                if setup == "PB": direction = "long" if bull else "short"
+                if setup in ("BO_DIRECT","BO_RETEST"): direction = "long" if c >= ema50 else "short"
+                qualified.append((setup, direction, float(sc)))
+
+        selected = None
+        for name in self.SETUP_PRIORITY:
+            candidates = [x for x in qualified if x[0] == name]
+            if candidates:
+                selected = max(candidates, key=lambda x: x[2]); break
+
+        regime = (1 if adxv >= self.ADX_MIN else 0) + (1 if ch < self.CHOP_MAX else 0) + (1 if len(vols) >= 21 and vols[-1] >= .65*np.median(vols[-21:-1]) else 0)
+        direction = selected[1] if selected else ("long" if score_l-score_s >= 1.5 and score_l >= 6.5 else "short" if score_s-score_l >= 1.5 and score_s >= 6.5 else None)
+
+        out = {
+            "ready": True, "direction": direction, "setup": selected[0] if selected else None,
+            "score": round(float(selected[2]),2) if selected else 0.0,
+            "long_score": round(float(score_l),2), "short_score": round(float(score_s),2),
+            "adx": round(adxv,2), "chop": round(ch,2), "atr": a, "atr_activity": regime,
+            "rsi": round(r,2), "rsi_sma": round(rs,2), "macd_hist": round(mh,6),
+            "ema20": ema20, "ema50": ema50, "ema20_slope_atr": round(slope20,3),
+            "hma16_slope_atr": round(hma_slope,3), "structure": structure,
+            "bos_up": bos_up, "bos_dn": bos_dn, "choch_up": choch_up, "choch_dn": choch_dn,
+            "sweep_low": sweep_low, "sweep_high": sweep_high,
+            "support": support, "resistance": resist, "room_long_atr": room_long, "room_short_atr": room_short,
+            "fib_long": fib_long, "fib_short": fib_short,
+            "reason": f"{selected[0]} {selected[1].upper()} score={selected[2]:.2f}" if selected else "NO_QUALIFIED_SETUP",
         }
+        self._latest_analysis = out
+        return out
 
-    def _entry_triggers_15m(
-        self,
-        candles: list,
-        s1,
-        r1,
-        atr_1h: float,
-        long_proximity_atr: Optional[float] = None,
-        short_proximity_atr: Optional[float] = None,
-    ) -> dict:
-        bar = candles[-1]
-        prev = candles[-2]
-        close = float(bar.close)
-        op = float(bar.open)
-        high = float(bar.high)
-        low = float(bar.low)
-        prev_close = float(prev.close)
-        prev_high = float(prev.high)
-        prev_low = float(prev.low)
-        long_p = self.reversal_proximity_atr if long_proximity_atr is None else float(long_proximity_atr)
-        short_p = self.reversal_proximity_atr if short_proximity_atr is None else float(short_proximity_atr)
-        long_proximity = max(0.05, long_p)*atr_1h
-        short_proximity = max(0.05, short_p)*atr_1h
-        zone = self.entry_zone_atr*atr_1h
-
-        long_trigger = False
-        long_name = ""
-        if s1 is not None:
-            near_now = low >= s1 and low <= s1+long_proximity
-            rejection = near_now and close > s1+0.05*atr_1h and close > op
-            reclaim = low <= s1+max(zone, long_proximity) and close >= s1 and close > op
-            prev_near = prev_low >= s1 and prev_low <= s1+long_proximity
-            displacement = prev_near and close > s1+0.20*atr_1h and close > prev_close and close > op and (close-op) >= 0.20*atr_1h
-            if rejection:
-                long_trigger = True
-                long_name = "1H_S1__15M_REJECTION"
-            elif displacement:
-                long_trigger = True
-                long_name = "1H_S1__15M_DISPLACEMENT"
-            elif reclaim:
-                long_trigger = True
-                long_name = "1H_S1__15M_RECLAIM"
-
-        short_trigger = False
-        short_name = ""
-        if r1 is not None:
-            near_now = high <= r1 and high >= r1-short_proximity
-            rejection = near_now and close < r1-0.05*atr_1h and close < op
-            reclaim = high >= r1-max(zone, short_proximity) and close <= r1 and close < op
-            prev_near = prev_high <= r1 and prev_high >= r1-short_proximity
-            displacement = prev_near and close < r1-0.20*atr_1h and close < prev_close and close < op and (op-close) >= 0.20*atr_1h
-            if rejection:
-                short_trigger = True
-                short_name = "1H_R1__15M_REJECTION"
-            elif displacement:
-                short_trigger = True
-                short_name = "1H_R1__15M_DISPLACEMENT"
-            elif reclaim:
-                short_trigger = True
-                short_name = "1H_R1__15M_RECLAIM"
-
-        return {
-            "long": long_trigger,
-            "long_name": long_name,
-            "short": short_trigger,
-            "short_name": short_name,
-            "long_proximity_atr": round(long_p, 2),
-            "short_proximity_atr": round(short_p, 2),
-        }
-
-    def _mapped_proximity_atr(self, s1, r1, atr_1h: float) -> tuple[float, Optional[float]]:
-        if s1 is None or r1 is None or atr_1h <= 0:
-            return self.reversal_proximity_atr, None
-        room_atr = (float(r1)-float(s1))/atr_1h
-        if room_atr > 3.0:
-            return min(room_atr/5.0, 1.0), room_atr
-        return self.reversal_proximity_atr, room_atr
-
-    def _open_ended_dynamic_proximity(
-        self,
-        direction: str,
-        long_score: float,
-        short_score: float,
-        smart_flow: float,
-    ) -> tuple[float, float]:
-        """Scale OPEN_SKY/FLOOR proximity from 0.60 toward 1.50 ATR using MCDX strength."""
-        if direction == "long":
-            directional_score = long_score
-            gap = long_score-short_score
-            score_strength = self._clamp((directional_score-self.min_context_score)/25.0, 0.0, 1.0)
-            gap_strength = self._clamp((gap-self.mcdx_dominance_gap)/25.0, 0.0, 1.0)
-            flow_strength = self._clamp((smart_flow-self.long_flow_min)/13.0, 0.0, 1.0)
+    # ---------------------------- 5M execution ----------------------------
+    def _execution_5m(self, candles, direction, setup, current_price):
+        if len(candles) < 30 or direction not in ("long", "short"):
+            return {"ready": False, "reason": "5M_WARMUP"}
+        closes = [float(c.close) for c in candles]; highs=[float(c.high) for c in candles]; lows=[float(c.low) for c in candles]; opens=[float(c.open) for c in candles]
+        vols=[float(c.volume or 0) for c in candles]
+        e20=self.ema(closes,20); atr=self.atr(candles,14); adx,dp,dm=self.adx(candles,14); ch=self._chop(candles,14)
+        if not self._finite(e20[-1],e20[-4],atr[-1],adx[-1],dp[-1],dm[-1],ch): return {"ready":False,"reason":"5M_INDICATOR_NA"}
+        a=max(float(atr[-1]),1e-12); c=closes[-1]; o=opens[-1]; h=highs[-1]; l=lows[-1]
+        rng=max(h-l,1e-12); body=abs(c-o)/a; pos=(c-l)/rng; slope=(float(e20[-1])-float(e20[-4]))/a
+        prev_hi=max(highs[-5:-1]); prev_lo=min(lows[-5:-1])
+        sweep_l=l < prev_lo-.03*a and c > prev_lo and c > o
+        sweep_s=h > prev_hi+.03*a and c < prev_hi and c < o
+        reclaim_l=c>float(e20[-1]) and c>o and pos>=.55
+        reclaim_s=c<float(e20[-1]) and c<o and pos<=.45
+        breakout_l=c>prev_hi and c>o and body>=.25
+        breakout_s=c<prev_lo and c<o and body>=.25
+        if direction=="long":
+            if sweep_l: trigger="SWEEP_RECLAIM"
+            elif breakout_l: trigger="MICRO_BREAKOUT"
+            elif reclaim_l and abs(c-float(e20[-1]))<=1.0*a: trigger="PULLBACK_RECLAIM"
+            else: trigger=None
         else:
-            directional_score = short_score
-            gap = short_score-long_score
-            score_strength = self._clamp((directional_score-self.min_context_score)/25.0, 0.0, 1.0)
-            gap_strength = self._clamp((gap-self.mcdx_dominance_gap)/25.0, 0.0, 1.0)
-            flow_strength = self._clamp((self.short_flow_max-smart_flow)/13.0, 0.0, 1.0)
+            if sweep_s: trigger="SWEEP_RECLAIM"
+            elif breakout_s: trigger="MICRO_BREAKOUT"
+            elif reclaim_s and abs(c-float(e20[-1]))<=1.0*a: trigger="PULLBACK_RECLAIM"
+            else: trigger=None
+        median_vol=np.median(vols[-21:-1]) if len(vols)>=21 else 0
+        vol_ratio=(vols[-1]/median_vol) if median_vol>0 else 1.0
+        blocks=[]
+        if adx[-1] < self.ADX_MIN: blocks.append("ADX")
+        if ch >= self.CHOP_MAX: blocks.append("CHOP")
+        if trigger is None: blocks.append("NO_5M_TRIGGER")
+        if abs(c-float(e20[-1]))/a > self.MAX_CHASE_ATR: blocks.append("ANTI_CHASE")
+        if trigger=="MICRO_BREAKOUT" and vol_ratio < .65: blocks.append("BREAKOUT_VOLUME")
+        if trigger=="MICRO_BREAKOUT" and (slope <= 0 if direction=="long" else slope >= 0): blocks.append("5M_SLOPE")
+        if direction=="long" and pos < .55: blocks.append("WEAK_CLOSE")
+        if direction=="short" and pos > .45: blocks.append("WEAK_CLOSE")
+        return {"ready":not blocks,"trigger":trigger,"blocks":blocks,"atr":a,"ema20":float(e20[-1]),"slope":slope,"body_atr":body,"volume_ratio":vol_ratio,"bar_ts":self._bar_ts(candles[-1]),"reason":"5M_EXECUTION_READY" if not blocks else ",".join(blocks)}
 
-        strength = 0.40*score_strength + 0.35*gap_strength + 0.25*flow_strength
-        proximity = self.open_ended_proximity_atr + strength*(self.open_ended_max_proximity_atr-self.open_ended_proximity_atr)
-        proximity = self._clamp(proximity, self.open_ended_proximity_atr, self.open_ended_max_proximity_atr)
-        return proximity, strength
+    # ---------------------------- risk / targets ----------------------------
+    def _make_levels(self, candles5, direction, setup, entry, analysis):
+        a=max(float(self.atr(candles5,14)[-1]),1e-12)
+        lookback=5 if setup in ("PB","LQ","REV") else 3
+        lo=min(float(c.low) for c in candles5[-lookback:]); hi=max(float(c.high) for c in candles5[-lookback:])
+        if direction=="long":
+            raw_sl=lo-self.SL_BUFFER_ATR*a
+            risk=entry-raw_sl
+            sl_atr=risk/a
+            if sl_atr < self.MIN_SL_ATR: raw_sl=entry-self.MIN_SL_ATR*a
+            elif sl_atr > self.MAX_SL_ATR: raw_sl=entry-self.MAX_SL_ATR*a
+            risk=entry-raw_sl
+            candidates=[x for x in (analysis.get("resistance"),) if x is not None and x>entry]
+            tp2=min(candidates) if candidates else entry+self.TP2_FALLBACK_R*risk
+            if candidates and (tp2-entry)/risk < self.TP2_MIN_R: tp2=entry+self.TP2_MIN_R*risk
+            tp2=min(tp2,entry+self.TP2_MAX_R*risk)
+        else:
+            raw_sl=hi+self.SL_BUFFER_ATR*a
+            risk=raw_sl-entry
+            sl_atr=risk/a
+            if sl_atr < self.MIN_SL_ATR: raw_sl=entry+self.MIN_SL_ATR*a
+            elif sl_atr > self.MAX_SL_ATR: raw_sl=entry+self.MAX_SL_ATR*a
+            risk=raw_sl-entry
+            candidates=[x for x in (analysis.get("support"),) if x is not None and x<entry]
+            tp2=max(candidates) if candidates else entry-self.TP2_FALLBACK_R*risk
+            if candidates and (entry-tp2)/risk < self.TP2_MIN_R: tp2=entry-self.TP2_MIN_R*risk
+            tp2=max(tp2,entry-self.TP2_MAX_R*risk)
+        if risk/entry < self.MIN_ECONOMIC_RISK_PCT: return None
+        tp1=entry+self.TP1_R*risk if direction=="long" else entry-self.TP1_R*risk
+        return {"sl":float(raw_sl),"tp1":float(tp1),"tp2":float(tp2),"risk":float(risk),"risk_atr":float(risk/a)}
 
-    async def analyze(self, candles: list, current_price: float, mtf_candles: dict = None) -> Signal:
-        if len(candles) < 120:
-            return Signal(
-                SignalType.HOLD,
-                self.symbol,
-                current_price,
-                0.0,
-                "15M Sentinel warmup",
-                metadata={"strategy": "SENTINEL", "version": self.VERSION},
-            )
-
-        mtf = mtf_candles or {}
-        self._latest_15m = list(candles)
-        self._latest_mtf = mtf
-        close = float(candles[-1].close)
-        sr = self._sr_map_1h(mtf, close)
-        meta = {"strategy": "SENTINEL", "version": self.VERSION, "sr_tf": "1H_HYBRID", "entry_tf": "15M_RAW"}
-        meta.update({k: v for k, v in sr.items() if k != "ready"})
-        if not sr.get("ready"):
-            return Signal(SignalType.HOLD, self.symbol, current_price, 0.0, sr.get("reason", "1H map unavailable"), metadata=meta)
-
-        self._latest_sr = sr
-        atr_1h = float(sr["atr_1h"])
-        s1, s2, r1, r2 = sr.get("s1"), sr.get("s2"), sr.get("r1"), sr.get("r2")
-        sx = self._sentinel_context(candles, mtf)
-        mc = self._mcdx_context(candles, mtf)
-        self._latest_sx = sx
-        self._latest_mc = mc
-        meta.update({"sentinel_x": sx, "mcdx": mc, "atr_1h": round(atr_1h, 8)})
+    # ---------------------------- public strategy interface ----------------------------
+    async def analyze(self, candles:list, current_price:float, mtf_candles:dict=None) -> Signal:
+        a=self._analyze_15m(candles)
+        if not a.get("ready"):
+            return Signal(SignalType.HOLD,self.symbol,float(current_price),0,reason=a.get("reason","HOLD"),confidence=.0,metadata=a)
         if self._open_position is not None:
-            return Signal(SignalType.HOLD, self.symbol, current_price, 0.0, f"Managing {self._open_position.upper()} | open_ended={self._open_ended}", metadata=meta)
+            return Signal(SignalType.HOLD,self.symbol,float(current_price),0,reason="POSITION_OPEN",confidence=0,metadata=a)
+        if a.get("direction") not in ("long","short") or not a.get("setup"):
+            return Signal(SignalType.HOLD,self.symbol,float(current_price),0,reason=a.get("reason","NO_SETUP"),confidence=0,metadata=a)
+        c5=(mtf_candles or {}).get("5m") or (mtf_candles or {}).get("5M") or []
+        ex=self._execution_5m(c5,a["direction"],a["setup"],current_price)
+        if not ex.get("ready"):
+            md={**a,"execution":ex}
+            return Signal(SignalType.HOLD,self.symbol,float(current_price),0,reason=f"WAIT_5M:{ex.get('reason')}",confidence=min(1,a["score"]/10),metadata=md)
+        levels=self._make_levels(c5,a["direction"],a["setup"],float(current_price),a)
+        if not levels:
+            return Signal(SignalType.HOLD,self.symbol,float(current_price),0,reason="FEE_EDGE_TOO_TIGHT",confidence=0,metadata={**a,"execution":ex})
+        side=SignalType.BUY if a["direction"]=="long" else SignalType.SELL
+        confidence=self._clamp((a["score"]/10)*.75 + min(1,a["atr_activity"]/3)*.15 + (.10 if ex["trigger"] else 0),0,1)
+        md={**a,"execution":ex,"sl":levels["sl"],"tp1":levels["tp1"],"tp2":levels["tp2"],"initial_risk":levels["risk"],"setup_engine":a["setup"],"execution_engine":ex["trigger"],"forecast_engine":"STRUCTURE/FIB_TARGET"}
+        self._pending_entry=True
+        return Signal(side,self.symbol,float(current_price),0,reason=f"{a['setup']} {a['direction'].upper()} score={a['score']:.2f} | {ex['trigger']}",confidence=confidence,metadata=md)
 
-        long_score = float(mc.get("long_score", 0) or 0)
-        short_score = float(mc.get("short_score", 0) or 0)
-        smart_flow = float(mc.get("smart_flow", 50) or 50)
-        long_gap = long_score-short_score
-        short_gap = short_score-long_score
-        mcdx_long_pass = bool(long_score >= self.min_context_score and long_gap > self.mcdx_dominance_gap and smart_flow > self.long_flow_min)
-        mcdx_short_pass = bool(short_score >= self.min_context_score and short_gap > self.mcdx_dominance_gap and smart_flow < self.short_flow_max)
-        meta["mcdx_gate"] = {
-            "long_pass": mcdx_long_pass,
-            "short_pass": mcdx_short_pass,
-            "long_score": round(long_score, 1),
-            "short_score": round(short_score, 1),
-            "long_gap": round(long_gap, 1),
-            "short_gap": round(short_gap, 1),
-            "min_score_gte": self.min_context_score,
-            "dominance_gap_strict_gt": self.mcdx_dominance_gap,
-            "long_flow_strict_gt": self.long_flow_min,
-            "short_flow_strict_lt": self.short_flow_max,
-        }
+    # ---------------------------- lifecycle ----------------------------
+    def attach_existing_position(self,direction:str,entry_price:float,stop_loss:Optional[float]=None,take_profit:Optional[float]=None):
+        self._open_position=direction.lower(); self._entry_price=float(entry_price); self._entry_sl=float(stop_loss) if stop_loss is not None else None; self._entry_tp=float(take_profit) if take_profit is not None else None
+        self._initial_risk=abs(self._entry_price-self._entry_sl) if self._entry_sl is not None else None
+        self._tp1_done=False; self._pending_entry=False
 
-        mapped_prox, room_for_prox = self._mapped_proximity_atr(s1, r1, atr_1h)
-        open_long_prox, open_long_strength = self._open_ended_dynamic_proximity("long", long_score, short_score, smart_flow)
-        open_short_prox, open_short_strength = self._open_ended_dynamic_proximity("short", long_score, short_score, smart_flow)
+    def _reset_position_state(self):
+        self._open_position=None; self._entry_price=None; self._entry_sl=None; self._entry_tp=None; self._initial_risk=None; self._tp1_done=False; self._pending_entry=False
 
-        long_prox = open_long_prox if sr.get("open_sky_long") else mapped_prox
-        short_prox = open_short_prox if sr.get("open_floor_short") else mapped_prox
-        long_proximity_mode = (
-            "OPEN_SKY_MCDX_DYNAMIC"
-            if sr.get("open_sky_long")
-            else ("WIDE_ROOM_1_5" if room_for_prox is not None and room_for_prox > 3.0 else "NORMAL_0.30")
-        )
-        short_proximity_mode = (
-            "OPEN_FLOOR_MCDX_DYNAMIC"
-            if sr.get("open_floor_short")
-            else ("WIDE_ROOM_1_5" if room_for_prox is not None and room_for_prox > 3.0 else "NORMAL_0.30")
-        )
+    def on_entry_filled(self,entry_price:float,stop_loss:Optional[float]=None,take_profit:Optional[float]=None,direction:Optional[str]=None):
+        if direction: self._open_position=direction.lower()
+        self._entry_price=float(entry_price); self._entry_sl=float(stop_loss) if stop_loss is not None else None; self._entry_tp=float(take_profit) if take_profit is not None else None
+        self._initial_risk=abs(self._entry_price-self._entry_sl) if self._entry_sl is not None else None; self._tp1_done=False; self._pending_entry=False
 
-        trg = self._entry_triggers_15m(
-            candles,
-            s1,
-            r1,
-            atr_1h,
-            long_proximity_atr=long_prox,
-            short_proximity_atr=short_prox,
-        )
-        meta.update({
-            "long_entry_proximity_atr": round(long_prox, 2),
-            "short_entry_proximity_atr": round(short_prox, 2),
-            "long_proximity_mode": long_proximity_mode,
-            "short_proximity_mode": short_proximity_mode,
-            "proximity_room_atr": round(room_for_prox, 2) if room_for_prox is not None else None,
-            "open_sky_mcdx_strength": round(open_long_strength, 3),
-            "open_floor_mcdx_strength": round(open_short_strength, 3),
-        })
+    def tick_open_position(self,current_price:float,position_key:Optional[str]=None):
+        if self._open_position is None or self._entry_price is None or self._initial_risk is None or self._initial_risk<=0: return None
+        side=self._open_position; p=float(current_price); entry=self._entry_price; risk=self._initial_risk
+        profit=p-entry if side=="long" else entry-p; r=profit/risk
+        if not self._tp1_done and r>=self.TP1_R:
+            lock=entry+self.TP1_LOCK_R*risk if side=="long" else entry-self.TP1_LOCK_R*risk
+            self._tp1_done=True; self._entry_sl=lock
+            return PositionUpdate(action="partial_tp",close_pct=self.TP1_CLOSE_PCT,new_sl=round(lock,8),reason=f"Sentinel TP1 +{r:.2f}R: close 50%; runner SL +{self.TP1_LOCK_R:.2f}R")
+        if self._entry_tp is not None:
+            hit=(side=="long" and p>=self._entry_tp) or (side=="short" and p<=self._entry_tp)
+            if hit:
+                return PositionUpdate(action="close",reason=f"Sentinel TP2 hit +{r:.2f}R")
+        if self._entry_sl is not None:
+            hit=(side=="long" and p<=self._entry_sl) or (side=="short" and p>=self._entry_sl)
+            if hit:
+                return PositionUpdate(action="close",reason="Sentinel Stop-Loss")
+        return None
 
-        long_context = (
-            sx.get("bias") != "BEAR"
-            and sx.get("structure") != "BEAR"
-            and (sx.get("sme_bull") or sx.get("bias") == "BULL")
-            and mcdx_long_pass
-        )
-        short_context = (
-            sx.get("bias") != "BULL"
-            and sx.get("structure") != "BULL"
-            and (sx.get("sme_bear") or sx.get("bias") == "BEAR")
-            and mcdx_short_pass
-        )
-
-        if sr.get("long_map_ready") and trg["long"] and long_context:
-            if s2 is not None:
-                long_sl = float(s2)-self.sl_buffer_atr*atr_1h
-                long_stop_basis = "BELOW_1H_S2"
-            else:
-                long_sl = float(s1)-self.missing_outer_sl_atr*atr_1h
-                long_stop_basis = f"S1_MINUS_{self.missing_outer_sl_atr:.2f}ATR1H"
-            long_risk = close-long_sl
-            meta.update({"planned_long_sl": round(long_sl, 8), "long_stop_basis": long_stop_basis})
-            if long_risk > 0:
-                if r1 is None:
-                    self._open_position = "long"
-                    self._entry_price = close
-                    self._entry_sl = long_sl
-                    self._open_ended = True
-                    meta.update({
-                        "entry_location": "1H_S1",
-                        "entry_trigger": trg["long_name"],
-                        "stop_loss": long_sl,
-                        "take_profit": None,
-                        "open_ended_tp": True,
-                        "tp_basis": "DYNAMIC_R1_OR_STRUCTURE_EXIT",
-                        "stop_basis": long_stop_basis,
-                        "room_mode": "OPEN_SKY",
-                        "entry_proximity_atr": round(long_prox, 2),
-                    })
-                    return Signal(
-                        SignalType.BUY,
-                        self.symbol,
-                        current_price,
-                        0.0,
-                        f"SENTINEL LONG {trg['long_name']} | OPEN_SKY prox {long_prox:.2f}ATR MCDXstr={open_long_strength:.0%} | SL {long_stop_basis} | MCDX L={long_score:.1f} S={short_score:.1f} Δ={long_gap:.1f} flow={smart_flow:.1f}",
-                        confidence=min(1.0, 0.50+long_score/200.0),
-                        metadata=meta,
-                    )
-
-                location_atr = (float(r1)-float(s1))/atr_1h
-                long_reward = float(r1)-close
-                long_rr = long_reward/long_risk if long_risk > 0 else 0.0
-                meta.update({"location_atr": round(location_atr, 2), "long_rr": round(long_rr, 2), "planned_long_tp": float(r1)})
-                if location_atr >= self.min_location_atr and long_reward > 0 and long_rr >= self.min_rr:
-                    self._open_position = "long"
-                    self._entry_price = close
-                    self._entry_sl = long_sl
-                    self._open_ended = False
-                    meta.update({
-                        "entry_location": "1H_S1",
-                        "entry_trigger": trg["long_name"],
-                        "stop_loss": long_sl,
-                        "take_profit": float(r1),
-                        "open_ended_tp": False,
-                        "tp_basis": "1H_R1",
-                        "stop_basis": long_stop_basis,
-                        "rr_ratio": round(long_rr, 2),
-                        "room_mode": "FIXED_R1",
-                        "entry_proximity_atr": round(long_prox, 2),
-                    })
-                    return Signal(
-                        SignalType.BUY,
-                        self.symbol,
-                        current_price,
-                        0.0,
-                        f"SENTINEL LONG {trg['long_name']} | room {location_atr:.2f}ATR | prox {long_prox:.2f}ATR | RR {long_rr:.2f} | MCDX L={long_score:.1f} S={short_score:.1f} Δ={long_gap:.1f} flow={smart_flow:.1f}",
-                        confidence=min(1.0, 0.50+long_score/200.0),
-                        metadata=meta,
-                    )
-
-        if sr.get("short_map_ready") and trg["short"] and short_context:
-            if r2 is not None:
-                short_sl = float(r2)+self.sl_buffer_atr*atr_1h
-                short_stop_basis = "ABOVE_1H_R2"
-            else:
-                short_sl = float(r1)+self.missing_outer_sl_atr*atr_1h
-                short_stop_basis = f"R1_PLUS_{self.missing_outer_sl_atr:.2f}ATR1H"
-            short_risk = short_sl-close
-            meta.update({"planned_short_sl": round(short_sl, 8), "short_stop_basis": short_stop_basis})
-            if short_risk > 0:
-                if s1 is None:
-                    self._open_position = "short"
-                    self._entry_price = close
-                    self._entry_sl = short_sl
-                    self._open_ended = True
-                    meta.update({
-                        "entry_location": "1H_R1",
-                        "entry_trigger": trg["short_name"],
-                        "stop_loss": short_sl,
-                        "take_profit": None,
-                        "open_ended_tp": True,
-                        "tp_basis": "DYNAMIC_S1_OR_STRUCTURE_EXIT",
-                        "stop_basis": short_stop_basis,
-                        "room_mode": "OPEN_FLOOR",
-                        "entry_proximity_atr": round(short_prox, 2),
-                    })
-                    return Signal(
-                        SignalType.SELL,
-                        self.symbol,
-                        current_price,
-                        0.0,
-                        f"SENTINEL SHORT {trg['short_name']} | OPEN_FLOOR prox {short_prox:.2f}ATR MCDXstr={open_short_strength:.0%} | SL {short_stop_basis} | MCDX S={short_score:.1f} L={long_score:.1f} Δ={short_gap:.1f} flow={smart_flow:.1f}",
-                        confidence=min(1.0, 0.50+short_score/200.0),
-                        metadata=meta,
-                    )
-
-                location_atr = (float(r1)-float(s1))/atr_1h
-                short_reward = close-float(s1)
-                short_rr = short_reward/short_risk if short_risk > 0 else 0.0
-                meta.update({"location_atr": round(location_atr, 2), "short_rr": round(short_rr, 2), "planned_short_tp": float(s1)})
-                if location_atr >= self.min_location_atr and short_reward > 0 and short_rr >= self.min_rr:
-                    self._open_position = "short"
-                    self._entry_price = close
-                    self._entry_sl = short_sl
-                    self._open_ended = False
-                    meta.update({
-                        "entry_location": "1H_R1",
-                        "entry_trigger": trg["short_name"],
-                        "stop_loss": short_sl,
-                        "take_profit": float(s1),
-                        "open_ended_tp": False,
-                        "tp_basis": "1H_S1",
-                        "stop_basis": short_stop_basis,
-                        "rr_ratio": round(short_rr, 2),
-                        "room_mode": "FIXED_S1",
-                        "entry_proximity_atr": round(short_prox, 2),
-                    })
-                    return Signal(
-                        SignalType.SELL,
-                        self.symbol,
-                        current_price,
-                        0.0,
-                        f"SENTINEL SHORT {trg['short_name']} | room {location_atr:.2f}ATR | prox {short_prox:.2f}ATR | RR {short_rr:.2f} | MCDX S={short_score:.1f} L={long_score:.1f} Δ={short_gap:.1f} flow={smart_flow:.1f}",
-                        confidence=min(1.0, 0.50+short_score/200.0),
-                        metadata=meta,
-                    )
-
-        reasons = []
-        if sr.get("r1_source") == "HA_FALLBACK":
-            reasons.append(f"R1 HA_FALLBACK={float(r1):.6f}")
-        if sr.get("s1_source") == "HA_FALLBACK":
-            reasons.append(f"S1 HA_FALLBACK={float(s1):.6f}")
-        if not sr.get("long_map_ready"):
-            reasons.append("LONG needs 1H S1 after OHLC+HA")
-        elif s2 is None:
-            reasons.append(f"LONG S1-only ready; fallback SL=S1-{self.missing_outer_sl_atr:.2f}ATR1H")
-        if not sr.get("short_map_ready"):
-            reasons.append("SHORT needs 1H R1 after OHLC+HA")
-        elif r2 is None:
-            reasons.append(f"SHORT R1-only ready; fallback SL=R1+{self.missing_outer_sl_atr:.2f}ATR1H")
-        if room_for_prox is not None:
-            reasons.append(
-                f"PROX {'WIDE_ROOM_1_5' if room_for_prox > 3.0 else 'NORMAL_0.30'}: room={room_for_prox:.2f}ATR -> zone={mapped_prox:.2f}ATR"
-            )
-        if sr.get("open_sky_long"):
-            reasons.append(
-                f"LONG OPEN_SKY dynamic zone <= {long_prox:.2f}ATR1H (MCDX strength={open_long_strength:.0%}, cap={self.open_ended_max_proximity_atr:.2f}) from S1"
-            )
-        if sr.get("open_floor_short"):
-            reasons.append(
-                f"SHORT OPEN_FLOOR dynamic zone <= {short_prox:.2f}ATR1H (MCDX strength={open_short_strength:.0%}, cap={self.open_ended_max_proximity_atr:.2f}) from R1"
-            )
-        if not mcdx_long_pass and not mcdx_short_pass:
-            reasons.append(
-                f"MCDX wait L={long_score:.1f} S={short_score:.1f} ΔL={long_gap:.1f} ΔS={short_gap:.1f} flow={smart_flow:.1f}"
-            )
-        if not reasons:
-            reasons.append("WAIT 15M trigger/context at 1H S1/R1")
-        return Signal(SignalType.HOLD, self.symbol, current_price, 0.0, "; ".join(reasons), metadata=meta)
-
-    def tick_open_position(self, current_price: float, position_key: Optional[str] = None):
-        if self._open_position is None:
-            return None
-        from ..engines.position_manager import PositionUpdate
-        if not self._open_ended:
-            return PositionUpdate(action="hold", reason=f"Sentinel {self._open_position.upper()} fixed 1H target active")
-        sr = self._latest_sr or {}
-        atr_1h = float(sr.get("atr_1h") or 0.0)
-        candles = self._latest_15m or []
-        if atr_1h <= 0 or len(candles) < 3:
-            return PositionUpdate(action="hold", reason="Sentinel open-ended runner: waiting refreshed 1H/15M map")
-        structure = self._structure(candles)
-        bar = candles[-1]
-        prev = candles[-2]
-        close = float(bar.close)
-        op = float(bar.open)
-        high = float(bar.high)
-        low = float(bar.low)
-        prev_close = float(prev.close)
-        proximity = self.reversal_proximity_atr*atr_1h
-
-        if self._open_position == "long":
-            r1 = sr.get("r1")
-            if r1 is None:
-                return PositionUpdate(action="hold", reason="LONG OPEN_SKY: no 1H R1 yet — keep runner")
-            near_r = high >= float(r1)-proximity
-            bearish_reversal = near_r and close < float(r1)-0.05*atr_1h and close < op and close < prev_close
-            if bearish_reversal or structure == "BEAR":
-                reason = (
-                    f"OPEN_SKY exit: 1H R1 formed at {float(r1):.6f} + 15M bearish reversal"
-                    if bearish_reversal
-                    else f"OPEN_SKY exit: 1H R1 formed at {float(r1):.6f} + 15M structure BEAR"
-                )
-                self._reset_position_state()
-                return PositionUpdate(action="close", close_pct=1.0, reason=reason)
-            return PositionUpdate(action="hold", reason=f"LONG OPEN_SKY: 1H R1={float(r1):.6f} formed; waiting 15M reversal/BEAR structure")
-
-        s1 = sr.get("s1")
-        if s1 is None:
-            return PositionUpdate(action="hold", reason="SHORT OPEN_FLOOR: no 1H S1 yet — keep runner")
-        near_s = low <= float(s1)+proximity
-        bullish_reversal = near_s and close > float(s1)+0.05*atr_1h and close > op and close > prev_close
-        if bullish_reversal or structure == "BULL":
-            reason = (
-                f"OPEN_FLOOR exit: 1H S1 formed at {float(s1):.6f} + 15M bullish reversal"
-                if bullish_reversal
-                else f"OPEN_FLOOR exit: 1H S1 formed at {float(s1):.6f} + 15M structure BULL"
-            )
-            self._reset_position_state()
-            return PositionUpdate(action="close", close_pct=1.0, reason=reason)
-        return PositionUpdate(action="hold", reason=f"SHORT OPEN_FLOOR: 1H S1={float(s1):.6f} formed; waiting 15M reversal/BULL structure")
-
-    def attach_existing_position(
-        self,
-        direction: str,
-        entry_price: float,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-    ) -> None:
-        self._open_position = str(direction).lower()
-        self._entry_price = float(entry_price)
-        self._entry_sl = float(stop_loss) if stop_loss is not None else None
-        self._open_ended = take_profit is None
-
-    def cancel_pending_entry(self, reason: str = "") -> None:
-        self._reset_position_state()
-
-    def _reset_position_state(self) -> None:
-        self._open_position = None
-        self._entry_price = None
-        self._entry_sl = None
-        self._open_ended = False
+    def exit_cooldown_bars(self,hard_sl:bool=False):
+        return self.HARD_SL_COOLDOWN_5M if hard_sl else self.NORMAL_COOLDOWN_5M
